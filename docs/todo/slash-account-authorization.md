@@ -10,13 +10,13 @@ There is also no config-side notion of "which account is authorized." No `allowe
 
 ## Why it's blocked
 
-1. **Sender identity does not reach `SlashHandler`.** The trait signature needs to grow a principal argument (or an auth context struct) so the dispatcher can see *who* invoked the command, not just *what*. This is a cross-crate surface change: `aura-channels`, every adapter, and `aura-cli`'s `CliSlashHandler` all move together.
+1. **Sender identity does not reach `SlashHandler`.** The trait signature needs to grow a principal argument (or an auth context struct) so the dispatcher can see *who* invoked the command, not just *what*. This is a cross-crate surface change: `baybo-channels`, every adapter, and `baybo-cli`'s `CliSlashHandler` all move together.
 
-2. **No authorization model in config.** There is no `AuraConfig` section declaring the workspace owner, nor per-channel `allowed_users` lists. `docs/todo/config-wire-remaining-sections.md` already flags that several config sections are missing — auth should land in the same batch so the schema commitment is made once.
+2. **No authorization model in config.** There is no `BayboConfig` section declaring the workspace owner, nor per-channel `allowed_users` lists. `docs/todo/config-wire-remaining-sections.md` already flags that several config sections are missing — auth should land in the same batch so the schema commitment is made once.
 
 3. **`CommandContext::invocation` is too coarse.** It distinguishes `Argv` vs `Slash` but has no principal. Handlers that want to gate on "this is the owner" have nowhere to read it from. The `confirmed: bool` field follows the same pattern — an auth principal slot next to it is the natural shape.
 
-4. **CLI/stdin vs chat channels need different defaults.** A local `aura` CLI invocation is implicitly authorized (the process runs as the operator); a Telegram message is not. Any design has to let the CLI adapter inject a "local owner" principal without making chat adapters silently inherit that trust.
+4. **CLI/stdin vs chat channels need different defaults.** A local `baybo` CLI invocation is implicitly authorized (the process runs as the operator); a Telegram message is not. Any design has to let the CLI adapter inject a "local owner" principal without making chat adapters silently inherit that trust.
 
 ## Proposed direction
 
@@ -61,7 +61,7 @@ channel = "discord"
 user_id = "987654321"
 ```
 
-Validated in `aura-config::validate` the same way other allow-list sections are. Exposed as `Arc<AccessPolicy>` on `CommandContext`.
+Validated in `baybo-config::validate` the same way other allow-list sections are. Exposed as `Arc<AccessPolicy>` on `CommandContext`.
 
 ### Stage 3 — enforcement
 
@@ -76,7 +76,7 @@ Record every rejection through the recorder with the principal fields redacted t
 ## Design constraints
 
 - **Fail closed.** An empty or missing `[access]` section must reject chat-originated slash commands, not allow them. A "wide-open by default" knob is a foot-gun on a framework that also ships a Telegram adapter.
-- **CLI path stays usable without config.** The local operator running `aura` from their shell must not need to write an allowlist entry to use slash commands. The `PrincipalSource::Cli` branch exists for this.
+- **CLI path stays usable without config.** The local operator running `baybo` from their shell must not need to write an allowlist entry to use slash commands. The `PrincipalSource::Cli` branch exists for this.
 - **No leak via error messages.** Unauthorized senders get one flat message; do not echo the attempted command back. The rejection path is also a side-channel — rate-limit or swallow entirely if the channel is known-spammy.
 - **Secrets redaction still applies.** Principal ids in logs/traces follow the existing sanitized-placeholder rule; do not dump raw Telegram user ids into trace output.
 - **Cron revalidation.** A scheduled slash command must re-check authorization at fire time, not just at schedule time — the allowlist can shrink between the two.

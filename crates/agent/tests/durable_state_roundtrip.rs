@@ -15,11 +15,11 @@
 
 use std::sync::Arc;
 
-use aura_agent::state::DurableActorState;
-use aura_model::{ChannelType, SessionId, User};
-use aura_session::SessionManager;
-use aura_session::SessionStore;
-use aura_session::test_support::{
+use baybo_agent::state::DurableActorState;
+use baybo_model::{ChannelType, SessionId, User};
+use baybo_session::SessionManager;
+use baybo_session::SessionStore;
+use baybo_session::test_support::{
     MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
 };
 
@@ -37,18 +37,18 @@ fn test_user() -> User {
 /// type level — this test exercises it at the value level.
 #[test]
 fn durable_actor_state_json_roundtrip_preserves_all_fields() {
-    let session = aura_model::Session {
+    let session = baybo_model::Session {
         id: SessionId::from("session-rt"),
         user: test_user(),
         channel: ChannelType::tui(),
         created_at: chrono::Utc::now(),
         last_active: chrono::Utc::now(),
-        state: aura_model::SessionState {
+        state: baybo_model::SessionState {
             compression_count: 7,
             ..Default::default()
         },
         root_session_id: SessionId::from("session-rt"),
-        trigger: aura_model::TriggerSource::User,
+        trigger: baybo_model::TriggerSource::User,
         lineage: None,
         hidden: false,
         pinned: false,
@@ -123,7 +123,7 @@ async fn rehydrate_after_idle_eviction_preserves_session_state() {
 /// responsible for upholding.
 #[tokio::test]
 async fn pending_background_results_survive_session_round_trip() {
-    use aura_model::{PendingBackgroundResult, SessionId, SubagentExitStatus};
+    use baybo_model::{PendingBackgroundResult, SessionId, SubagentExitStatus};
 
     let session_store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
     let summary_store = Arc::new(MemorySessionSummaryStore::new());
@@ -163,7 +163,7 @@ async fn pending_background_results_survive_session_round_trip() {
     assert_eq!(entry.summary_text, "found three matches");
     assert!(matches!(
         &entry.kind,
-        aura_model::BackgroundJobKind::Subagent { subagent_type, .. }
+        baybo_model::BackgroundJobKind::Subagent { subagent_type, .. }
             if subagent_type == "general-purpose"
     ));
     assert!(matches!(entry.status, SubagentExitStatus::Completed));

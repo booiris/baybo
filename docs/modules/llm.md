@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `llm` crate is Aura's infrastructure layer for LLM calls, wrapping the **rig** framework into a unified `LlmClient` interface.
+The `llm` crate is Baybo's infrastructure layer for LLM calls, wrapping the **rig** framework into a unified `LlmClient` interface.
 
 Core responsibilities:
 
@@ -10,7 +10,7 @@ Core responsibilities:
 - Hide provider differences behind registry-style extension via `LlmProviderRegistry`
 - Leverage rig's native function calling for structured tool-use responses
 
-**Design constraint**: this crate is pure infrastructure with no business logic. It does not depend on `tools` or `skills`. It does depend on `aura-security` — the `openai-subscription` provider reads its OAuth bundle from the `SecretVault`.
+**Design constraint**: this crate is pure infrastructure with no business logic. It does not depend on `tools` or `skills`. It does depend on `baybo-security` — the `openai-subscription` provider reads its OAuth bundle from the `SecretVault`.
 
 ## Design Decisions
 
@@ -24,7 +24,7 @@ Subprocess-driven agents (the `claude` binary) are **not** LLM providers and liv
 
 ### Streaming
 
-`LlmClient::chat_stream()` returns `LlmStream`, a type-erased `futures::Stream<Item = Result<StreamEvent>>`. `StreamEvent` has five variants: `Text`, `ToolCall`, `Reasoning` (incremental delta), `ThinkingBlock(aura_model::ContentBlock)` (complete structured reasoning block, preserved for providers that require thinking to be echoed back), and `Usage`. The stream maps rig's `StreamedAssistantContent` to these unified events, hiding provider-specific response types.
+`LlmClient::chat_stream()` returns `LlmStream`, a type-erased `futures::Stream<Item = Result<StreamEvent>>`. `StreamEvent` has five variants: `Text`, `ToolCall`, `Reasoning` (incremental delta), `ThinkingBlock(baybo_model::ContentBlock)` (complete structured reasoning block, preserved for providers that require thinking to be echoed back), and `Usage`. The stream maps rig's `StreamedAssistantContent` to these unified events, hiding provider-specific response types.
 
 ### Provider registry pattern
 
@@ -32,7 +32,7 @@ Subprocess-driven agents (the `claude` binary) are **not** LLM providers and liv
 
 ### Multimodal support
 
-A `multimodal` module converts Aura's `ContentBlock` types into text representations for the LLM. Non-text blocks (images, audio, files) are rendered as descriptive placeholders. `extract_text` joins text blocks for system/assistant message conversion.
+A `multimodal` module converts Baybo's `ContentBlock` types into text representations for the LLM. Non-text blocks (images, audio, files) are rendered as descriptive placeholders. `extract_text` joins text blocks for system/assistant message conversion.
 
 ### Observability constraints
 
@@ -44,9 +44,9 @@ Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` thr
 
 ## Constraints
 
-- Depends on `model` and `aura-security` (the latter for the `openai-subscription` OAuth token vault), plus external crates `rig-core`, `reqwest`, `futures`, `serde`, `tokio`, `chrono`, `url`, and similar HTTP/serialization utilities
+- Depends on `model` and `baybo-security` (the latter for the `openai-subscription` OAuth token vault), plus external crates `rig-core`, `reqwest`, `futures`, `serde`, `tokio`, `chrono`, `url`, and similar HTTP/serialization utilities
 - Does not depend on `cost` — instead, `cost` consumes `TokenUsage` produced by `llm`, assembled by `agent`
-- Does not depend on `aura-storage` / `aura-session`
+- Does not depend on `baybo-storage` / `baybo-session`
 - API keys should use environment-variable placeholders and must not be stored directly in config files
 
 ## Collaboration

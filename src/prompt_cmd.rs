@@ -1,15 +1,15 @@
-//! Headless one-shot prompt mode (`aura prompt`), the non-interactive
-//! sibling of `aura tui`.
+//! Headless one-shot prompt mode (`baybo prompt`), the non-interactive
+//! sibling of `baybo tui`.
 //!
 //! Hybrid runtime selection keyed off the workspace singleton lock:
 //!
-//! * **A gateway is running** (it holds `<workspace>/state/aura.lock`):
+//! * **A gateway is running** (it holds `<workspace>/state/baybo.lock`):
 //!   route the turn through it over the same WS+MessagePack transport the
 //!   TUI uses. One owner of the session state, no contention.
 //! * **No gateway** (the lock is free): acquire it and build the agent
 //!   runtime in-process for this one turn via [`crate::runtime`], run the
-//!   message to completion, then tear down. This is what lets `aura
-//!   prompt` work standalone, without first starting `aura gateway`.
+//!   message to completion, then tear down. This is what lets `baybo
+//!   prompt` work standalone, without first starting `baybo gateway`.
 //!
 //! Either way the answer streams to stdout, logs go to stderr, and a
 //! `--json` run emits one structured object. Resume is a pinned session
@@ -27,15 +27,15 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_agent::service::ShutdownSignal;
-use aura_channels::{
+use baybo_agent::service::ShutdownSignal;
+use baybo_channels::{
     AgentEvent, Connection, ConnectionSink, IncomingMessage, Message, NoticeLevel, SendOutcome,
     SessionEvent,
 };
-use aura_config::AuraConfig;
-use aura_model::{ChannelType, ContentBlock, MessageMetadata, SessionId, User};
-use aura_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ApprovalRequest, AutoDenyGate};
-use aura_tui::{TransportEvent, TransportEventStream};
+use baybo_config::BayboConfig;
+use baybo_model::{ChannelType, ContentBlock, MessageMetadata, SessionId, User};
+use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ApprovalRequest, AutoDenyGate};
+use baybo_tui::{TransportEvent, TransportEventStream};
 use chrono::Utc;
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -107,7 +107,7 @@ async fn await_turn(
 /// Run a single prompt and return once the turn completes. Picks the
 /// gateway-backed or in-process path based on whether a gateway holds the
 /// workspace singleton lock.
-pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
+pub async fn run(config: Arc<BayboConfig>, opts: Options) -> anyhow::Result<()> {
     // stdout is reserved for the assistant's answer; logs + notices → stderr.
     let _guards = init_tracing(TracingMode::Stderr);
 
@@ -127,7 +127,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     // only when none is running. Acquire on the exact path the gateway
     // uses (`gateway_cmd::start`) so the flock actually collides.
     let workspace_paths =
-        aura_workspace::WorkspacePaths::new(std::path::PathBuf::from(&config.workspace.path));
+        baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from(&config.workspace.path));
     let result = match crate::singleton::acquire(workspace_paths.root()) {
         Ok(lock) => {
             info!("no running gateway; serving the prompt in-process");
@@ -156,7 +156,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
 // --------------------------------------------------------------------------
 
 async fn run_via_gateway(
-    config: Arc<AuraConfig>,
+    config: Arc<BayboConfig>,
     opts: Options,
     session_id: SessionId,
 ) -> anyhow::Result<()> {
@@ -228,9 +228,9 @@ async fn consume_ws_turn(
 // --------------------------------------------------------------------------
 
 async fn run_in_process(
-    config: Arc<AuraConfig>,
+    config: Arc<BayboConfig>,
     opts: Options,
-    // Held for the whole turn so no gateway / another `aura prompt` can
+    // Held for the whole turn so no gateway / another `baybo prompt` can
     // race the workspace. Dropped on return, releasing the flock.
     _lock: crate::singleton::WorkspaceLock,
     session_id: SessionId,
@@ -272,10 +272,9 @@ async fn run_in_process(
     tokio::spawn(handle.router.run(handle.incoming_rx, handle.response_rx));
 
     incoming_tx
-        .send(aura_channels::RouterInbound::One(Box::new(build_incoming(
-            &session_id,
-            &opts.prompt,
-        ))))
+        .send(baybo_channels::RouterInbound::One(Box::new(
+            build_incoming(&session_id, &opts.prompt),
+        )))
         .await
         .map_err(|e| anyhow::anyhow!("failed to submit prompt to router: {e}"))?;
 
@@ -307,11 +306,11 @@ async fn run_in_process(
 /// subscribe it to `session_id`, returning the receiver the turn's
 /// [`SessionEvent`]s arrive on.
 fn attach_inprocess_sink(
-    channels: &aura_channels::ChannelRegistry,
+    channels: &baybo_channels::ChannelRegistry,
     session_id: &SessionId,
 ) -> anyhow::Result<mpsc::Receiver<SessionEvent>> {
     let channel = channels.get(&ChannelType::tui()).ok_or_else(|| {
-        anyhow::anyhow!("CLI channel not installed; set channels.cli.enabled = true in aura.json")
+        anyhow::anyhow!("CLI channel not installed; set channels.cli.enabled = true in baybo.json")
     })?;
     let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(INPROCESS_EVENT_CAPACITY);
     let conn = Arc::new(Connection::new(Arc::new(InProcessSink { event_tx })));
@@ -376,7 +375,7 @@ impl ConnectionSink for InProcessSink {
         }
     }
 
-    fn try_send_frame(&self, _frame: aura_channels::wire::Frame) -> SendOutcome {
+    fn try_send_frame(&self, _frame: baybo_channels::wire::Frame) -> SendOutcome {
         // Control frames (Reset / SessionActivity / …) aren't needed for a
         // one-shot turn; the consumer reads SessionEvents only.
         SendOutcome::Sent
@@ -534,7 +533,7 @@ fn build_incoming(session_id: &SessionId, prompt: &str) -> IncomingMessage {
 fn cli_user() -> User {
     let id = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "aura-cli".to_string());
+        .unwrap_or_else(|_| "baybo-cli".to_string());
     User {
         id,
         name: None,
@@ -543,7 +542,7 @@ fn cli_user() -> User {
 }
 
 /// Concatenate the text blocks of a response, ignoring non-text (media)
-/// blocks — `aura prompt` is a text surface.
+/// blocks — `baybo prompt` is a text surface.
 fn blocks_text(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
@@ -557,7 +556,7 @@ fn blocks_text(blocks: &[ContentBlock]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_channels::{AgentOutput, OutgoingMessage, Result as ChannelResult};
+    use baybo_channels::{AgentOutput, OutgoingMessage, Result as ChannelResult};
 
     fn text_blocks(s: &str) -> Vec<ContentBlock> {
         vec![ContentBlock::Text(s.to_owned())]

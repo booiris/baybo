@@ -5,12 +5,12 @@
 
 use std::time::Duration;
 
-use aura_channels::{AgentEvent, AgentOutput};
-use aura_llm::{LlmError, StreamEvent, ToolCallInfo};
-use aura_model::{ContentBlock, GoalStatus, MessageSource, TriggerSource};
+use baybo_channels::{AgentEvent, AgentOutput};
+use baybo_llm::{LlmError, StreamEvent, ToolCallInfo};
+use baybo_model::{ContentBlock, GoalStatus, MessageSource, TriggerSource};
 use serde_json::json;
 
-use aura_integration_tests::{AgentTestHarness, SessionBuilder};
+use baybo_integration_tests::{AgentTestHarness, SessionBuilder};
 
 const DRAIN: Duration = Duration::from_millis(800);
 

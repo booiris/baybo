@@ -6,10 +6,10 @@ import tailwindcss from '@tailwindcss/vite';
 // React bundle. When iterating on the UI via `npm run dev`, forward
 // every privileged path to the gateway so the browser only talks to
 // the Vite origin — no CORS allow-list, no baseUrl override. Override
-// the target with `AURA_GATEWAY_URL` when running against a non-local
+// the target with `BAYBO_GATEWAY_URL` when running against a non-local
 // gateway. `/assets/...` is intentionally NOT proxied: those belong to
 // Vite's module graph.
-const gatewayTarget = process.env.AURA_GATEWAY_URL ?? 'http://127.0.0.1:8888';
+const gatewayTarget = process.env.BAYBO_GATEWAY_URL ?? 'http://127.0.0.1:8888';
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],

@@ -160,7 +160,7 @@ impl LlmCompletion for StubLlm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChatMessage, ContentBlock};
+    use baybo_model::{ChatMessage, ContentBlock};
     use futures::StreamExt;
 
     fn req() -> ChatRequest {

@@ -1,7 +1,7 @@
 //! Autonomous persistent objectives (`/goal`): the tool family, the
 //! [`GoalService`] facade, and the verbatim continuation steering prompts.
 //! This crate persists nothing itself — [`GoalService`] writes through an
-//! `aura_store::GoalStore`; the continuation loop lives in `aura-agent`.
+//! `baybo_store::GoalStore`; the continuation loop lives in `baybo-agent`.
 //! See `docs/modules/goal.md`.
 
 pub mod prompts;

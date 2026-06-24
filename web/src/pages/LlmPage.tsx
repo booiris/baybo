@@ -39,7 +39,7 @@ type PricingParse =
 // "cleared" and any non-empty unparseable / negative value is `invalid`
 // so the form can reject the submit instead of silently wiping the
 // override. Lossy across the float boundary by design — matches how
-// operators type pricing in `aura.json`.
+// operators type pricing in `baybo.json`.
 function parseUsdInput(raw: string): PricingParse {
   const trimmed = raw.trim();
   if (trimmed === '') return { kind: 'empty' };
@@ -195,7 +195,7 @@ export function LlmPage() {
           <RiCpuLine className="text-6xl text-ink-soft mb-4" />
           <p className="text-ink-soft font-bold uppercase">No LLM entries configured</p>
           <p className="text-ink-soft text-[0.85rem] mt-2">
-            Add an entry to <code>aura.json</code> or run <code>aura llm add</code>.
+            Add an entry to <code>baybo.json</code> or run <code>baybo llm add</code>.
           </p>
         </div>
       ) : (
@@ -583,7 +583,7 @@ function EditLlmModal({
 
         <div className="px-6 py-4 space-y-5">
           <p className="text-[0.85rem] text-ink-soft bg-yellow-50 border-2 border-black px-3 py-2 rounded">
-            Edits persist to <code>aura.json</code> immediately. Most fields take effect only after a
+            Edits persist to <code>baybo.json</code> immediately. Most fields take effect only after a
             gateway restart — the active runtime keeps its current configuration until then.
           </p>
 

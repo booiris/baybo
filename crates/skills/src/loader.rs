@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use aura_model::{ArtifactSource, TrustLevel};
+use baybo_model::{ArtifactSource, TrustLevel};
 use tracing::warn;
 
 use crate::validation::{normalize_line_endings, validate_skill_name, validate_skill_version};

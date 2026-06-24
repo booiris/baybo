@@ -1,5 +1,5 @@
 [package]
-name = "aura-tools"
+name = "baybo-tools"
 version.workspace = true
 edition.workspace = true
 
@@ -9,15 +9,15 @@ doctest = false
 [features]
 # Exposes `EchoTool` and `RecordingTool` (test stubs) to downstream
 # crates' tests. Pull in via:
-#   aura-tools = { workspace = true, features = ["test-support"] }
+#   baybo-tools = { workspace = true, features = ["test-support"] }
 # inside the consumer's `[dev-dependencies]`.
 test-support = []
 # `BashTool`'s bench profile — raw exec inside a disposable container (no uv, no
 # work-dir jail, inherited cwd, dedicated prompt). Off by default; see the root
 # crate's `bench-bash`.
 bench-bash = []
-# Emits ts-rs-generated TypeScript definitions for the Aura-specific
-# `_meta.aura.*` annotations the embedded MCP servers carry on each
+# Emits ts-rs-generated TypeScript definitions for the Baybo-specific
+# `_meta.baybo.*` annotations the embedded MCP servers carry on each
 # tool descriptor. Kept behind a feature so release builds don't pull
 # in ts-rs. Generated files land under
 # `tool-src/browser/src/generated/` so the browser sidecar imports the
@@ -26,14 +26,14 @@ bench-bash = []
 ts-export = ["dep:ts-rs"]
 
 [dependencies]
-aura-llm = { workspace = true }
-aura-model = { workspace = true }
-aura-security = { workspace = true }
-aura-session = { workspace = true }
-aura-storage = { workspace = true }
-aura-store = { workspace = true }
-aura-trace = { workspace = true }
-aura-workspace = { workspace = true }
+baybo-llm = { workspace = true }
+baybo-model = { workspace = true }
+baybo-security = { workspace = true }
+baybo-session = { workspace = true }
+baybo-storage = { workspace = true }
+baybo-store = { workspace = true }
+baybo-trace = { workspace = true }
+baybo-workspace = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 chrono = { workspace = true }
@@ -56,7 +56,7 @@ url = { workspace = true }
 dom_smoothie = { workspace = true }
 htmd = { workspace = true }
 # MCP client + OAuth: rmcp owns the protocol/transport surface, oauth2
-# powers the authorization-code+PKCE flow inside `aura mcp add`, `open`
+# powers the authorization-code+PKCE flow inside `baybo mcp add`, `open`
 # launches the user's browser at authorization time, base64 encodes the
 # PKCE challenge.
 rmcp = { workspace = true }
@@ -74,7 +74,7 @@ uuid = { workspace = true }
 ts-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
-aura-llm = { workspace = true, features = ["test-support"] }
-aura-session = { workspace = true, features = ["test-support"] }
-aura-storage = { workspace = true, features = ["test-support"] }
+baybo-llm = { workspace = true, features = ["test-support"] }
+baybo-session = { workspace = true, features = ["test-support"] }
+baybo-storage = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

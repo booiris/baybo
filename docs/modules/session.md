@@ -2,13 +2,13 @@
 
 ## Overview
 
-The `session` crate owns the session lifecycle vertical: `SessionError` and the `SessionManager` business-logic facade. The `SessionStore` / `SessionSummaryStore` traits and their per-row `StoredMessage` / `SessionSummaryRow` value types live in the `aura-store` ports crate; domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`, `LineageKind`) live in `aura-model`. The libsql implementations of both store traits live in `aura-storage`, which implements the `aura-store` contracts; `aura-session` calls them.
+The `session` crate owns the session lifecycle vertical: `SessionError` and the `SessionManager` business-logic facade. The `SessionStore` / `SessionSummaryStore` traits and their per-row `StoredMessage` / `SessionSummaryRow` value types live in the `baybo-store` ports crate; domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`, `LineageKind`) live in `baybo-model`. The libsql implementations of both store traits live in `baybo-storage`, which implements the `baybo-store` contracts; `baybo-session` calls them.
 
 A `Session` is the top of one trace tree. There is exactly one trace per session — subagent and maintenance spawn create new sessions with `Lineage` pointers, never new trees rooted in the same session.
 
-The conversation transcript itself is **not** carried on `Session`. It lives in `aura_context::ContextManager` while the actor is alive; the agent loop persists each appended message and each `/compact` apply through `SessionManager::append_session_message` / `apply_session_compaction`, and the router seeds it from `load_active_session_messages` on cold start.
+The conversation transcript itself is **not** carried on `Session`. It lives in `baybo_context::ContextManager` while the actor is alive; the agent loop persists each appended message and each `/compact` apply through `SessionManager::append_session_message` / `apply_session_compaction`, and the router seeds it from `load_active_session_messages` on cold start.
 
-**Design principle**: each domain crate owns its business-logic vertical (manager + error + test-support fake) while the `*Store` trait contract lives in the `aura-store` ports crate. Downstream callers depend on the manager crate for logic and on `aura-store` for the trait. `aura-storage` keeps only the libsql implementations and exposes a `Store` bundle for assembly-layer wiring. Higher-level orchestration (Router, Actor) lives in `agent`, which re-exports `SessionManager` for convenience.
+**Design principle**: each domain crate owns its business-logic vertical (manager + error + test-support fake) while the `*Store` trait contract lives in the `baybo-store` ports crate. Downstream callers depend on the manager crate for logic and on `baybo-store` for the trait. `baybo-storage` keeps only the libsql implementations and exposes a `Store` bundle for assembly-layer wiring. Higher-level orchestration (Router, Actor) lives in `agent`, which re-exports `SessionManager` for convenience.
 
 ## Manager surface
 
@@ -60,7 +60,7 @@ When a session with an in-flight subagent is deleted, the subagent's cancellatio
 
 - `compression_count`: incremented after each successful context compression. Used by monitoring / strategy switching to detect runaway growth.
 - `approved_resources`: tool resources the user has granted permanent approval for in this session, populated on each `ApproveAlways` decision. See [`tools.md`](tools.md).
-- `last_llm`: per-session LLM pin — the `aura.json` entry name this session's turns resolve against, or `None` to follow `default-llm`. Read by the actor spawner as the loop's `initial_llm`; a live actor is re-pinned via `AgentMessage::SetModel`. Set from the chat UI via `PUT /v1/chat/sessions/:id/model`. See [`agent.md`](agent.md) "Per-session model selection".
+- `last_llm`: per-session LLM pin — the `baybo.json` entry name this session's turns resolve against, or `None` to follow `default-llm`. Read by the actor spawner as the loop's `initial_llm`; a live actor is re-pinned via `AgentMessage::SetModel`. Set from the chat UI via `PUT /v1/chat/sessions/:id/model`. See [`agent.md`](agent.md) "Per-session model selection".
 - `extra`: reserved extension fields for experimental features or plugin state.
 
 ### Idle actor reaping — never row deletion
@@ -77,7 +77,7 @@ Session rows and their transcripts are core user data and are **never** dropped 
 | Module    | Role                                                                                                |
 | --------- | --------------------------------------------------------------------------------------------------- |
 | `model`   | Defines `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`               |
-| `storage` | Implements `SessionStore` / `SessionSummaryStore` against libsql; pulls the traits from `aura-store` (no `aura-session` dependency) |
+| `storage` | Implements `SessionStore` / `SessionSummaryStore` against libsql; pulls the traits from `baybo-store` (no `baybo-session` dependency) |
 | `context` | Owns the in-memory transcript via `ContextManager`; agent loop brokers persistence via this crate  |
 | `agent`   | Re-exports `SessionManager`; Router calls it; `AgentActor` holds the `Session` instance            |
-| `cli` / `gateway` | Operator-facing surfaces consume `aura_agent::SessionManager`                              |
+| `cli` / `gateway` | Operator-facing surfaces consume `baybo_agent::SessionManager`                              |

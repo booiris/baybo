@@ -1,10 +1,10 @@
-# Aura Web Design System
+# Baybo Web Design System
 
-This document outlines the design principles, visual identity, and component patterns used in the Aura Dashboard.
+This document outlines the design principles, visual identity, and component patterns used in the Baybo Dashboard.
 
 ## Design Aesthetic: Neo-Brutalism
 
-The Aura Dashboard follows a **warm** "Neo-Brutalist" design language characterized by:
+The Baybo Dashboard follows a **warm** "Neo-Brutalist" design language characterized by:
 
 - **Warm, high contrast:** A cream canvas with warm near-black ink/borders and an amber action color (a deliberate warm-yellow lean, not the original cool blue).
 - **Heavy Borders:** Consistent use of 2px or 3px solid borders. `border-black` is revalued to warm near-black (`#2a2520`) globally, so existing utilities pick up the warm tone without a per-component sweep.

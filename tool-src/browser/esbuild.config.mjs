@@ -12,16 +12,16 @@
 //
 // So our `dist/bundle.mjs` is intentionally tiny: it imports from a
 // sibling `cddm/build/src/index.js` that the gateway materialises
-// alongside the bundle (declared via `aura.auxAssets` in
+// alongside the bundle (declared via `baybo.auxAssets` in
 // package.json). At runtime the layout in
-// `$XDG_CACHE_HOME/aura/sidecars/browser-<hash>/` is:
+// `$XDG_CACHE_HOME/baybo/sidecars/browser-<hash>/` is:
 //
 //   bundle.mjs            <- this output (esbuilds src/server.ts)
 //   cddm/build/src/...    <- CDDM's published artifact, copied verbatim
 //
 // `src/server.ts` imports `chrome-devtools-mcp` by its package name;
 // esbuild rewrites that to a relative `./cddm/build/src/index.js`
-// path via the `auraResolveCddm` plugin below.
+// path via the `bayboResolveCddm` plugin below.
 
 import { build } from "esbuild";
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
@@ -35,7 +35,7 @@ const cddmDist = resolve(distDir, "cddm/build");
 
 if (!existsSync(cddmSrc)) {
   console.error(
-    "chrome-devtools-mcp/build/ missing — run `pnpm install --filter @aura/tool-browser` first",
+    "chrome-devtools-mcp/build/ missing — run `pnpm install --filter @baybo/tool-browser` first",
   );
   process.exit(1);
 }
@@ -49,7 +49,7 @@ const readabilityPath = resolve(
 );
 if (!existsSync(readabilityPath)) {
   console.error(
-    "@mozilla/readability/Readability.js missing — run `pnpm install --filter @aura/tool-browser` first",
+    "@mozilla/readability/Readability.js missing — run `pnpm install --filter @baybo/tool-browser` first",
   );
   process.exit(1);
 }
@@ -60,8 +60,8 @@ rmSync(resolve(distDir, "cddm"), { recursive: true, force: true });
 mkdirSync(cddmDist, { recursive: true });
 cpSync(cddmSrc, cddmDist, { recursive: true });
 
-const auraResolveCddm = {
-  name: "aura-resolve-cddm",
+const bayboResolveCddm = {
+  name: "baybo-resolve-cddm",
   setup(build) {
     build.onResolve({ filter: /^chrome-devtools-mcp$/ }, () => ({
       path: "./cddm/build/src/index.js",
@@ -92,15 +92,15 @@ const result = await build({
   },
   banner: {
     js: [
-      `import { createRequire as __auraCreateRequire } from "node:module";`,
-      `import { fileURLToPath as __auraFileURLToPath } from "node:url";`,
-      `import { dirname as __auraDirname } from "node:path";`,
-      `const require = __auraCreateRequire(import.meta.url);`,
-      `const __filename = __auraFileURLToPath(import.meta.url);`,
-      `const __dirname = __auraDirname(__filename);`,
+      `import { createRequire as __bayboCreateRequire } from "node:module";`,
+      `import { fileURLToPath as __bayboFileURLToPath } from "node:url";`,
+      `import { dirname as __bayboDirname } from "node:path";`,
+      `const require = __bayboCreateRequire(import.meta.url);`,
+      `const __filename = __bayboFileURLToPath(import.meta.url);`,
+      `const __dirname = __bayboDirname(__filename);`,
     ].join("\n"),
   },
-  plugins: [auraResolveCddm],
+  plugins: [bayboResolveCddm],
   logLevel: "info",
 });
 const ms = Date.now() - start;

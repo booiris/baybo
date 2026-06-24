@@ -5,7 +5,7 @@ use crate::error::Result;
 /// [`crate::test_support::MockPrompter`].
 ///
 /// `Send` is required so the channel-step adapter can satisfy
-/// `aura_channels::registration::Prompter`'s own `Send` bound.
+/// `baybo_channels::registration::Prompter`'s own `Send` bound.
 pub trait Prompter: Send {
     fn select(&mut self, label: &str, options: &[&str]) -> Result<usize>;
     /// Multi-select checkbox picker. `initial[i]` seeds option `i`'s

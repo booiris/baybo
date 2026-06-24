@@ -73,8 +73,8 @@ pub trait SandboxRunner: Send + Sync {
 
 /// A live, detached sandboxed child the caller streams + awaits out of band
 /// (the agent's "Bash timeout → background" path). Mirrors
-/// `aura_tools::RunningChild` — the agent's `SandboxAdapter` wraps one in the
-/// other — and is defined here so `aura-sandbox` stays free of an `aura-tools`
+/// `baybo_tools::RunningChild` — the agent's `SandboxAdapter` wraps one in the
+/// other — and is defined here so `baybo-sandbox` stays free of an `baybo-tools`
 /// dependency. Backends own the kill semantics: bwrap just signals the child;
 /// the Docker backend must `docker rm -f` the container (a SIGKILL of the
 /// `docker run` client would orphan it).

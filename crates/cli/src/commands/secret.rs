@@ -1,4 +1,4 @@
-//! `aura secret add | list | delete` — user-managed env-style secrets.
+//! `baybo secret add | list | delete` — user-managed env-style secrets.
 //!
 //! The value is only ever read through masked terminal input (never an argv
 //! or slash argument, which would leak into shell history / the transcript),
@@ -9,7 +9,7 @@
 use std::io::{BufReader, stderr, stdin};
 use std::sync::Arc;
 
-use aura_security::{AddOutcome, UserSecretManager};
+use baybo_security::{AddOutcome, UserSecretManager};
 use serde_json::json;
 
 use crate::cli::SecretCmd;
@@ -23,7 +23,7 @@ use crate::format::CommandOutput;
 fn manager(ctx: &CommandContext) -> Result<UserSecretManager> {
     let vault = ctx.secret_vault.as_ref().ok_or_else(|| {
         CliError::Config(
-            "secret vault unavailable — run from the workspace root with a valid aura.json".into(),
+            "secret vault unavailable — run from the workspace root with a valid baybo.json".into(),
         )
     })?;
     Ok(UserSecretManager::new(Arc::clone(vault)))
@@ -40,7 +40,7 @@ pub async fn handle(ctx: &CommandContext, cmd: SecretCmd) -> Result<CommandOutpu
 async fn add(ctx: &CommandContext, name: Option<String>, force: bool) -> Result<CommandOutput> {
     if ctx.invocation == Invocation::Slash {
         return Err(CliError::NotAvailableInSlash(
-            "secret add reads a masked value from the terminal — run `aura secret add`".into(),
+            "secret add reads a masked value from the terminal — run `baybo secret add`".into(),
         ));
     }
     let mgr = manager(ctx)?;

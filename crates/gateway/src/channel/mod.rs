@@ -1,7 +1,7 @@
 //! Gateway-side WebSocket channel server.
 //!
 //! Implements the server side of the wire protocol in
-//! [`aura_channels::wire`]: a `/v1/channel-ws` endpoint mounted on
+//! [`baybo_channels::wire`]: a `/v1/channel-ws` endpoint mounted on
 //! the channel TCP listener ([`crate::channel_listener`]), where
 //! authenticated subprocess sidecars can register as dynamic
 //! channels and exchange MessagePack-framed
@@ -9,7 +9,7 @@
 //! package under `sdks/channel-ts/`; the built-in TUI has its own
 //! private Rust WS client. Each accepted connection spawns a
 //! per-connection [`adapter::Sidecar`] that plugs into the workspace
-//! [`aura_channels::ChannelRegistry`] and tears itself down on
+//! [`baybo_channels::ChannelRegistry`] and tears itself down on
 //! disconnect.
 //!
 //! Streaming: every `SessionEvent` (including `AgentEvent::AnswerDelta`,

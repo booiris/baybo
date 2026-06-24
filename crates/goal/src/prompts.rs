@@ -4,7 +4,7 @@
 //! row — a `Role::User` turn, never `Role::System` — and treats the objective
 //! as untrusted user data, not higher-priority instructions.
 
-use aura_model::Goal;
+use baybo_model::Goal;
 
 /// Injected at the top of every `Active` continuation turn.
 /// `{{objective}}` is the only placeholder.
@@ -85,7 +85,7 @@ pub fn frame_objective_updated(objective: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{GoalId, GoalStatus};
+    use baybo_model::{GoalId, GoalStatus};
     use chrono::Utc;
 
     fn goal(objective: &str, budget: Option<u64>, used: u64) -> Goal {

@@ -1,13 +1,13 @@
 //! Optional outbound HTTP proxy.
 //!
-//! When set, every outbound HTTP call Aura makes — LLM providers, model
+//! When set, every outbound HTTP call Baybo makes — LLM providers, model
 //! discovery, OpenRouter pricing, MCP HTTP servers, WebFetch, the CLI/TUI
 //! gateway probes — and every spawned child that does its own HTTP (bun
 //! channel sidecars, node MCP/browser stdio servers, external-agent CLIs)
 //! routes through this proxy. Unset → direct connections (today's behavior).
 //!
-//! The *runtime* form is `aura_security::http::ProxySettings`; the boot layer
-//! maps this config struct into it, keeping `aura-config` free of a `reqwest`
+//! The *runtime* form is `baybo_security::http::ProxySettings`; the boot layer
+//! maps this config struct into it, keeping `baybo-config` free of a `reqwest`
 //! dependency.
 
 use serde::{Deserialize, Serialize};

@@ -6,7 +6,7 @@
 # Per-run result JSONs: summary + every answer/judge reason. Large,
 # LLM-generated, and rewritten each run — regenerate with run-bench.sh.
 /results/
-# Per-run aura workspaces the bench generates (config + vault + sessions.db +
+# Per-run baybo workspaces the bench generates (config + vault + sessions.db +
 # logs) — the run environment. Disposable scratch, regenerated each run.
 /runs/
 # Per-question transcripts + call-tree traces (regenerated; embed full conversations).

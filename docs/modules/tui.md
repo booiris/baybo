@@ -2,7 +2,7 @@
 
 ## Overview
 
-`TuiAdapter` is the interactive channel for Aura, launched via `aura tui`. Bare `aura` prints `--help`; the TUI is an explicit opt-in to avoid surprising users with a full-screen app. It is implemented with [Ratatui] over a [Crossterm] async event stream and lives in its own crate (`crates/tui/`, published as `aura-tui`). It depends on `aura-channels` for shared type definitions (`SlashHandler`, `DashboardProvider`, `IncomingMessage`, `wire`) but nothing in `aura-channels` depends back on it.
+`TuiAdapter` is the interactive channel for Baybo, launched via `baybo tui`. Bare `baybo` prints `--help`; the TUI is an explicit opt-in to avoid surprising users with a full-screen app. It is implemented with [Ratatui] over a [Crossterm] async event stream and lives in its own crate (`crates/tui/`, published as `baybo-tui`). It depends on `baybo-channels` for shared type definitions (`SlashHandler`, `DashboardProvider`, `IncomingMessage`, `wire`) but nothing in `baybo-channels` depends back on it.
 
 The layout is intentionally minimal:
 
@@ -10,17 +10,17 @@ The layout is intentionally minimal:
 - **Input line** — editor with emacs-style cursor motions, a history ring, and a compact current-model footer below it when the gateway reports one.
 - **Dashboard view** (modal) — opened by dashboard-style slash commands; returns to chat on `Esc`.
 
-No sidebars. Aura's operator surface lives in the CLI subcommands; the TUI only hosts the conversation, the current-model footer, and a handful of read-only views.
+No sidebars. Baybo's operator surface lives in the CLI subcommands; the TUI only hosts the conversation, the current-model footer, and a handful of read-only views.
 
-`aura tui` is a thin `/v1/channel-ws` client of `aura gateway`,
+`baybo tui` is a thin `/v1/channel-ws` client of `baybo gateway`,
 speaking the same WebSocket + MessagePack protocol every out-of-process
-sidecar uses ([`aura_channels::wire`]). The TUI ships its own private
+sidecar uses ([`baybo_channels::wire`]). The TUI ships its own private
 `WsClient` (`crates/tui/src/client/ws.rs`); the only public-SDK form
 of this protocol is the TypeScript package under `sdks/channel-ts/`.
 It does **not** take the
 workspace singleton lock, does **not** build a manager graph, and does
-**not** own a local `Router`. One workspace runs a long-lived `aura
-gateway` as a service and opens `aura tui` against it — the gateway is
+**not** own a local `Router`. One workspace runs a long-lived `baybo
+gateway` as a service and opens `baybo tui` against it — the gateway is
 the only process that holds state. See [Boot flow](#boot-flow) for
 endpoint and token resolution; see [`gateway.md`](./gateway.md) for the
 server side.
@@ -39,10 +39,10 @@ server side.
 - Chat scrolling is the terminal's own (mouse wheel / the emulator's scrollback); the TUI keeps no scroll offset for chat. `PageUp`/`PageDown` page the **dashboard** table only (`DashboardPageUp`/`DashboardPageDown`, ±10 rows).
 - While the LLM is responding, an ephemeral streaming buffer is drawn immediately below the scrollback tail. Each `AgentEvent::AnswerDelta` extends it; complete lines are committed to the terminal scrollback (`insert_before`) as they arrive, leaving only the trailing partial in the buffer. The agent loop streams deltas on **every** iteration, so a final answer that lands after tool calls still streams.
 - The final `AgentEvent::Message` does **not** replace the streamed text — those lines are already committed. `finalize_stream` (via the pure `finalize_lines`) commits the trailing partial plus any non-text extras the stream didn't carry (e.g. the CronCreate hint). When the response **never streamed** — the non-streaming delivery path, where the agent loop ran with `delta_tx = None` (cron fires, subagent-notification turns) and only a final Message arrives — it renders the full message body from the blocks so the text isn't dropped.
-- **Message styling.** There are no `you>` / `aura>` prefixes. A user message is a **full-width highlighted bar** — bright white background, black text (not `REVERSED`, which renders muted on many terminals) — with a `> ` quote leader, the row padded with spaces (via `render_user_lines(text, width)`) so the background spans the whole line. Everything else leads with a same-size `●` dot: an assistant answer (**pale `●`**, continuation lines indented under it), the tool line (cyan `●`), the resolved-approval summary, and the `cooked for` footer using the answer text foreground.
+- **Message styling.** There are no `you>` / `baybo>` prefixes. A user message is a **full-width highlighted bar** — bright white background, black text (not `REVERSED`, which renders muted on many terminals) — with a `> ` quote leader, the row padded with spaces (via `render_user_lines(text, width)`) so the background spans the whole line. Everything else leads with a same-size `●` dot: an assistant answer (**pale `●`**, continuation lines indented under it), the tool line (cyan `●`), the resolved-approval summary, and the `cooked for` footer using the answer text foreground.
 - **Spacing (leading separators, no trailing blanks).** Blocks are separated by **exactly one** blank row via a *leading* separator: `begin_block(kind)` emits one blank when the block kind changes (always for `Other`; same-kind `Answer`/`Tool` lines stack tight as one block). It's deduped against `AppState.last_row_blank` so it never doubles, and there are **no** trailing blanks — the reserved working row (below) separates the last block from the input, and the next block adds its own leading separator. `AppState.last_block: Option<BlockKind>` tracks the kind.
 - **Turn-done footer.** When a turn (job) finishes, `finalize_stream` commits a `● cooked for <elapsed>` stamp (same foreground as answer text) with its own deduped separator above it, so it sits one blank below the answer/tool block. It's the turn's wall-clock from when its `working_since` clock armed; only turns the TUI actually clocked get it (a cancelled `/stop` turn or a non-streaming cron delivery does not).
-- **Model footer.** At startup `aura tui` queries the gateway admin endpoint `GET /v1/llm` with the local admin bearer token and passes the active `provider/model_id` label into `TuiAdapter::with_model_label`. When present, `AppState.model_label` adds one dim, slightly indented row below the input box (`chat::model_footer_height`); if the query fails, the footer is omitted and chat continues normally.
+- **Model footer.** At startup `baybo tui` queries the gateway admin endpoint `GET /v1/llm` with the local admin bearer token and passes the active `provider/model_id` label into `TuiAdapter::with_model_label`. When present, `AppState.model_label` adds one dim, slightly indented row below the input box (`chat::model_footer_height`); if the query fails, the footer is omitted and chat continues normally.
 - **Turn-progress events** (see [`docs/turn-progress-events.md`](../turn-progress-events.md)) interleave with the answer, so a turn reads as `● answer → ● Tool(label) → ⎿ summary → ● answer`. A tool's scrollback block is **deferred and committed as one unit on completion**: `ToolStarted` records a `RunningTool` (rendered live in the working zone — see [Working indicator & mid-turn steering](#working-indicator--mid-turn-steering)) but commits nothing; `ToolCompleted` (matched by `call_id`) pops it and commits the whole `Tool` block at once — the `● tool(label)` head, any resolved-approval line buffered mid-call, then the `⎿ summary` (`chat::tool_completed_block`). This is the fix for the **concurrent-tool ordering bug**: the agent emits *every* `ToolStarted` for a response up front, runs the calls in parallel, then emits *every* `ToolCompleted` — so committing the `●` head at start would strand all the `⎿` results below all the heads in append-only native scrollback (`insert_before` can't insert under an earlier line). Deferring keeps each result directly under its own tool. A `ToolCompleted` whose `call_id` matches **no** tracked `RunningTool` is **dropped**, not rendered headless — after `/stop`, `reset_working` clears the running set, but a tool that observed cancellation can still emit a late completion, and committing it would strand a stray `⎿` result in the now-idle scrollback. The final `Message`'s `ToolUse` blocks are **not** a duplicate source — `render_block` only renders the CronCreate hint, never general tool calls.
 - **Reasoning is not rendered.** `Frame::Reasoning` ("thinking") chunks are dropped by the WS pump (`map_frame` returns `None`); the TUI shows an animated *working* indicator in the live region instead of the model's reasoning trace. The wire frame still flows to other channels (e.g. the web UI). See [Working indicator & mid-turn steering](#working-indicator--mid-turn-steering).
 
@@ -85,7 +85,7 @@ Typing while the agent is busy no longer parks the message in a hidden queue wit
 - Backed by a `DashboardSnapshot { title, columns, rows, footer }` value fetched from a `DashboardProvider`.
 - Refresh (`r`) re-fetches on a background task; the snapshot swap is transactional (existing selection clamps to the new row count).
 - Three built-in views map to `ViewKind::{Skills, Jobs, Sessions}`.
-- `TuiDashboardProvider` (`crates/tui/src/client/dashboard.rs`) renders each view as an admin-only placeholder: title and column headers for the requested `ViewKind`, an empty `rows: Vec::new()`, and a footer pointing the operator at the `aura` CLI. The TUI's channel surface no longer carries session / job / skill CRUD — those views live in the CLI subcommands.
+- `TuiDashboardProvider` (`crates/tui/src/client/dashboard.rs`) renders each view as an admin-only placeholder: title and column headers for the requested `ViewKind`, an empty `rows: Vec::new()`, and a footer pointing the operator at the `baybo` CLI. The TUI's channel surface no longer carries session / job / skill CRUD — those views live in the CLI subcommands.
 
 ### Persistent input history
 
@@ -95,9 +95,9 @@ encrypted at rest rather than in a plaintext history file — but the TUI
 process itself never opens the vault. The gateway is the single writer,
 and the TUI exchanges the ring over the channel WS like any other state.
 
-- Wire protocol: two `aura_channels::wire::Frame` variants carry the history end-to-end. `Frame::HistorySnapshot { session_id, entries }` is pushed from the server once, right after `Frame::RegisterAck { ok: true }`, for session-scoped TUI clients only — sidecars never see it. `Frame::HistoryAppend { session_id, entry }` is sent by the TUI after every accepted submission.
-- Gateway side: `aura_gateway::channel::TuiHistoryStore` (`crates/gateway/src/channel/history.rs`) wraps `Arc<SecretVault>` behind a `tokio::sync::Mutex`, so concurrent appends from multiple TUIs on the same gateway serialize into the same vault blob. It reads the current ring from the fixed key `aura.tui.input_history`, pushes the new entry (de-duping consecutive duplicates), caps the ring at 500 newest entries, and writes it back (see [`security.md`](./security.md)). Load failures or write errors are logged `warn!` and are non-fatal.
-- TUI side: `WsTransport` (`crates/tui/src/client/ws.rs`, `transport.rs`) buffers the one-shot snapshot inside `initial_history: Mutex<Option<Vec<String>>>` during `connect_tui`. The main loop calls `ctx.input.take_history_snapshot().await` before the first `terminal.draw`, so the prior ring is populated when the input box first renders. `Action::Submit` calls `ctx.input.append_history(&entry)` in a detached `tokio::spawn` — no vault handle, no lock file, no local `aura-security` dependency.
+- Wire protocol: two `baybo_channels::wire::Frame` variants carry the history end-to-end. `Frame::HistorySnapshot { session_id, entries }` is pushed from the server once, right after `Frame::RegisterAck { ok: true }`, for session-scoped TUI clients only — sidecars never see it. `Frame::HistoryAppend { session_id, entry }` is sent by the TUI after every accepted submission.
+- Gateway side: `baybo_gateway::channel::TuiHistoryStore` (`crates/gateway/src/channel/history.rs`) wraps `Arc<SecretVault>` behind a `tokio::sync::Mutex`, so concurrent appends from multiple TUIs on the same gateway serialize into the same vault blob. It reads the current ring from the fixed key `baybo.tui.input_history`, pushes the new entry (de-duping consecutive duplicates), caps the ring at 500 newest entries, and writes it back (see [`security.md`](./security.md)). Load failures or write errors are logged `warn!` and are non-fatal.
+- TUI side: `WsTransport` (`crates/tui/src/client/ws.rs`, `transport.rs`) buffers the one-shot snapshot inside `initial_history: Mutex<Option<Vec<String>>>` during `connect_tui`. The main loop calls `ctx.input.take_history_snapshot().await` before the first `terminal.draw`, so the prior ring is populated when the input box first renders. `Action::Submit` calls `ctx.input.append_history(&entry)` in a detached `tokio::spawn` — no vault handle, no lock file, no local `baybo-security` dependency.
 - The TUI crate no longer carries an `InputHistoryStore` trait or any history builder on `TuiAdapter`. The store is implicit in the transport; tests that construct an adapter without a live gateway just get no snapshot and no-op appends.
 
 ## Slash Commands
@@ -186,11 +186,11 @@ none of those exist on the TUI side.
    There is no port file and no `channel.port` discovery step.
 2. **Resolve the bearer tokens** — open the workspace secret vault via
    `crate::runtime::build_secret_vault(config)` and read
-   `aura_gateway::TUI_TOKEN_VAULT_KEY` (`"gateway.tui_token"`) for
+   `baybo_gateway::TUI_TOKEN_VAULT_KEY` (`"gateway.tui_token"`) for
    `/v1/channel-ws`. The vault open is best-effort; a missing TUI token
    is treated as `ChannelError::NotReachable` so it flows into the same
    fallback path as an unreachable admin listener. The admin bearer token
-   is also read through `aura_gateway::AdminToken` for the optional
+   is also read through `baybo_gateway::AdminToken` for the optional
    active-model lookup.
 3. **Connection probe** — `WsTransport::connect(addr, tui_token,
    session_id)` dials the resolved admin `addr`'s `/v1/channel-ws`
@@ -200,8 +200,8 @@ none of those exist on the TUI side.
    produces a concrete error block:
 
    ```
-   no aura gateway reachable at <addr>
-     - start it with:       aura gateway start
+   no baybo gateway reachable at <addr>
+     - start it with:       baybo gateway start
      (underlying error: ...)
    ```
 4. **Session resolution** — `--session <id>` pins an explicit id (for
@@ -305,7 +305,7 @@ Single-consumer ordering on the mpsc keeps delta/response ordering correct as WS
 
 Writing `tracing` records to stdout while ratatui owns raw mode corrupts the frame. Chat mode therefore uses a two-layer subscriber:
 
-- **File layer** — `tracing_appender::rolling::daily("<workspace>/logs", "aura.log")` wrapped in a non-blocking writer. A `WorkerGuard` held on the stack of `main` flushes pending lines on shutdown.
+- **File layer** — `tracing_appender::rolling::daily("<workspace>/logs", "baybo.log")` wrapped in a non-blocking writer. A `WorkerGuard` held on the stack of `main` flushes pending lines on shutdown.
 - **TUI echo layer** — `TuiLogLayer` (`src/tui_log.rs`) filters **tracing** events to `WARN` and `ERROR` (lower `tracing` levels stay in the file only), extracts `message` + structured fields, and forwards them through `TuiLogSink::emit` as `AppEvent::Log(LogRecord)`. The event loop pushes the record onto the scrollback as a coloured line (`warn` yellow, `error` red, with the event `target` in grey).
 
 The `WARN`/`ERROR` cut applies only to this tracing-echo layer. Agent **notices** take a separate route: the transport maps `Frame::Notice` → `TransportEvent::Notice` → `AppEvent::Log` (see [Output path](#output-path)), preserving all three `NoticeLevel`s — `Info` notices reach the same `LogRecord` surface and render as a cyan `info` line (`LogLevel::Info`), so an agent-emitted info notice is not filtered out the way a `tracing` INFO event is.
@@ -333,23 +333,23 @@ Argv mode keeps the old stdout layer — one-shot commands don't own the termina
 | `model`    | `ContentBlock` for rendering assistant messages; `ChannelType::tui()`, `User` used when constructing `IncomingMessage` |
 | `gateway`  | Server-side owner of sessions, approvals, outbound frame fan-out, and the vault-encrypted input-history store. The TUI talks to it over `/v1/channel-ws` (WebSocket + MessagePack) |
 | `channels` | Trait definitions only: `SlashHandler`, `SlashOutcome`, `ViewKind`, `DashboardProvider`, `DashboardSnapshot`, `IncomingMessage`, `NoticeLevel`, `ChannelError`. No TUI code. |
-| `tools`    | Approval-prompt machinery: `ApprovalQueue` (re-exported via `pub use aura_tools::ApprovalQueue`), `ApprovalDecision`, `ApprovalRequest`, `ResourceAccess`. The transport mirrors gateway `Frame::ApprovalRequested` into a local `ApprovalQueue` and the modal renders/resolves from it. |
+| `tools`    | Approval-prompt machinery: `ApprovalQueue` (re-exported via `pub use baybo_tools::ApprovalQueue`), `ApprovalDecision`, `ApprovalRequest`, `ResourceAccess`. The transport mirrors gateway `Frame::ApprovalRequested` into a local `ApprovalQueue` and the modal renders/resolves from it. |
 
 ## Verification
 
 ```bash
-cargo test -p aura-tui             # keymap, AppState, transport, slash, frame codec, WS client
+cargo test -p baybo-tui             # keymap, AppState, transport, slash, frame codec, WS client
 cargo run -- gateway start         # terminal A: long-lived backend
 cargo run -- tui                   # terminal B: WS+MessagePack client
 ```
 
 Manual smoke:
 
-- `aura tui` against a running `aura gateway` opens the Ratatui UI and the chat pane is live. Bare `aura` prints help instead.
-- With no gateway reachable, `aura tui` exits with the concrete "no aura gateway reachable at <addr>" block.
+- `baybo tui` against a running `baybo gateway` opens the Ratatui UI and the chat pane is live. Bare `baybo` prints help instead.
+- With no gateway reachable, `baybo tui` exits with the concrete "no baybo gateway reachable at <addr>" block.
 - `cargo run -- tui --dev-auto-gateway` (debug build) in a fresh workspace with no gateway running spawns the backend inline, prints the banner, and connects.
 - Typing + `Enter` appends a user line and sends a `Frame::Message` to the gateway; inbound `Frame::AnswerDelta`s render live and commit to scrollback line-by-line, and the final `Frame::Message` only finalises the trailing partial (it does **not** replace the already-committed lines).
-- `/skills` opens the admin-placeholder skills view (footer points at the `aura` CLI); `r` refreshes; `Esc` returns to chat.
+- `/skills` opens the admin-placeholder skills view (footer points at the `baybo` CLI); `r` refreshes; `Esc` returns to chat.
 - A tool call that requires approval queues an inline prompt; `a` resolves it, the gateway-side gate unblocks, and the tool result renders.
 - Killing the gateway mid-session surfaces the next inbound frame as an error notice rather than crashing the TUI.
 - `Ctrl-C` on an empty input line exits cleanly with the terminal restored.

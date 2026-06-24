@@ -12,13 +12,13 @@ pub mod subagent;
 pub mod supervisor;
 
 use crate::runtime::agent_loop::InterjectionSource;
-use aura_channels::{
+use baybo_channels::{
     AgentEvent, AgentOutput, COMPACT_COMMAND, GOAL_COMMAND, GOAL_COMMAND_NAME, IncomingMessage,
     NoticeLevel, OutgoingMessage,
 };
-use aura_goal::{PauseOutcome, ResumeOutcome};
-use aura_job::JobInput;
-use aura_model::{
+use baybo_goal::{PauseOutcome, ResumeOutcome};
+use baybo_job::JobInput;
+use baybo_model::{
     ContentBlock, ControlEventKind, Goal, GoalStatus, LlmEntryName, PendingBackgroundResult,
     Session, TriggerSource,
 };
@@ -64,7 +64,7 @@ use crate::actor::goal::{
 };
 use crate::actor::state::{DurableActorState, VolatileResources};
 use crate::actor::supervisor::ActorRegistryGuard;
-use aura_trace::{GoalSteeringAudit, GoalSteeringKind};
+use baybo_trace::{GoalSteeringAudit, GoalSteeringKind};
 
 /// Messages that can be sent to an AgentActor.
 #[derive(Debug, Clone)]
@@ -89,7 +89,7 @@ pub enum AgentMessage {
     /// `create_spawned_session`), with no payload/trigger pairing constraint.
     SubagentSpawned {
         initial_message: Box<IncomingMessage>,
-        parent_job_id: aura_model::JobId,
+        parent_job_id: baybo_model::JobId,
     },
     /// A `background: true` subagent dispatched from this session
     /// reached a terminal state. The wait task posts this to the parent
@@ -99,7 +99,7 @@ pub enum AgentMessage {
     /// `SubagentNotification` turn.
     BackgroundJobFinished(Box<PendingBackgroundResult>),
     /// Re-pin the session's LLM (chat per-session model switch). `llm`
-    /// is the `aura.json` entry name to resolve against, or `None` to
+    /// is the `baybo.json` entry name to resolve against, or `None` to
     /// revert to `default-llm`. The handler re-pins the live loop in
     /// place and persists `session.state.last_llm` so the choice
     /// survives eviction. Processed at a turn boundary (the mailbox is
@@ -216,8 +216,8 @@ pub(crate) fn goal_eligible(session: &Session) -> bool {
 /// cap that retrying before it resets would only busy-loop on. Maps to
 /// `SpendCapped`.
 fn is_cost_gate_denial(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<aura_llm::LlmError>()
-        .is_some_and(|e| matches!(e, aura_llm::LlmError::GuardRejected(_)))
+    err.downcast_ref::<baybo_llm::LlmError>()
+        .is_some_and(|e| matches!(e, baybo_llm::LlmError::GuardRejected(_)))
 }
 
 /// Typed marker for a turn cancelled via its cancel token (`/stop` or parent
@@ -605,12 +605,12 @@ impl AgentActor {
     /// Run the loop on the session's *current* context. The triggering
     /// message must already be appended (the callers do this via
     /// `AgentLoop::append_user_message` / `append_cron_fire` /
-    /// `append_subagent_notification`) so framing lives in `aura-context`
+    /// `append_subagent_notification`) so framing lives in `baybo-context`
     /// and the loop just iterates.
     async fn run_agent_loop(
         &mut self,
         job_input: JobInput,
-        parent_job_id: Option<aura_model::JobId>,
+        parent_job_id: Option<baybo_model::JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         interjections: Option<&mut dyn crate::runtime::agent_loop::InterjectionSource>,
         // Set to whether this turn ended via cancellation (`/stop` / shutdown),
@@ -619,7 +619,7 @@ impl AgentActor {
         // returns, so it covers every cancellation path (incl. mid-LLM-call).
         stopped_out: Option<&mut bool>,
     ) -> anyhow::Result<OutgoingMessage> {
-        let is_user_turn = matches!(job_input.input_kind(), aura_job::JobInputKind::UserChat);
+        let is_user_turn = matches!(job_input.input_kind(), baybo_job::JobInputKind::UserChat);
         // Kept so the error path below can tell a user `/stop` (token
         // tripped via the job cancel) apart from a genuine failure.
         let turn_token = self.volatile.actor_token.child_token();
@@ -679,7 +679,7 @@ impl AgentActor {
     ///
     /// The cron fire mints a Cron-rooted session, so the job records
     /// `origin = Cron`. The content the LLM sees is framed + appended by
-    /// `AgentLoop::append_cron_fire` (which uses `aura_context::prompts::cron`)
+    /// `AgentLoop::append_cron_fire` (which uses `baybo_context::prompts::cron`)
     /// so the model treats it as a task to perform now rather than a live
     /// user message.
     async fn dispatch_cron_prompt(&mut self, prompt: &str, job_id: &str) -> anyhow::Result<()> {
@@ -1056,7 +1056,7 @@ impl AgentActor {
         if pending.is_empty() {
             return;
         }
-        let content = aura_context::prompts::subagent::build_notification_content(&pending);
+        let content = baybo_context::prompts::subagent::build_notification_content(&pending);
         // Commit the drained (now-empty) buffer to the row BEFORE the
         // fallible turn: a crash mid-turn must not leave the results in the
         // row to be replayed as a DUPLICATE notification on restart. On an
@@ -1214,7 +1214,7 @@ impl AgentActor {
     async fn handle_subagent_spawned(
         &mut self,
         incoming: IncomingMessage,
-        parent_job_id: aura_model::JobId,
+        parent_job_id: baybo_model::JobId,
     ) -> anyhow::Result<()> {
         let content = incoming.message.content;
         let response_tx = self.volatile.response_tx.clone();
@@ -1346,13 +1346,13 @@ impl AgentActor {
         }
         let mut text = String::new();
         let kind = if let Some(new_objective) = self.goal.pending_objective_update.take() {
-            text.push_str(&aura_goal::prompts::frame_objective_updated(&new_objective));
+            text.push_str(&baybo_goal::prompts::frame_objective_updated(&new_objective));
             text.push_str("\n\n");
             GoalSteeringKind::ObjectiveUpdated
         } else {
             GoalSteeringKind::Continuation
         };
-        text.push_str(&aura_goal::prompts::frame_continuation(&goal));
+        text.push_str(&baybo_goal::prompts::frame_continuation(&goal));
         let audit = steering_audit(kind, &goal, &text);
         let content = vec![ContentBlock::Text(text)];
 
@@ -1420,7 +1420,7 @@ impl AgentActor {
     /// write fails — so a still-`Active` goal backs off instead of being claimed
     /// stopped on a row that would immediately re-fire.
     async fn run_goal_winddown(&mut self, goal: &Goal) -> GoalTurnOutcome {
-        let text = aura_goal::prompts::frame_budget_limit(goal);
+        let text = baybo_goal::prompts::frame_budget_limit(goal);
         let audit = steering_audit(GoalSteeringKind::BudgetLimit, goal, &text);
         let content = vec![ContentBlock::Text(text)];
         // Best-effort: the loop stops regardless of how the wind-down turn ends.
@@ -1828,8 +1828,8 @@ mod tests {
     }
 
     fn incoming(body: &str) -> IncomingMessage {
-        use aura_channels::Message;
-        use aura_model::{ChannelType, User};
+        use baybo_channels::Message;
+        use baybo_model::{ChannelType, User};
         IncomingMessage {
             message: Message {
                 id: "m".into(),

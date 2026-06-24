@@ -2,13 +2,13 @@
 //!
 //! Channels that multiplex many tenants over one sidecar (Telegram
 //! bots, future Discord guilds, …) look up the active tenant set
-//! here. The token itself lives in `aura_security::SecretVault` —
+//! here. The token itself lives in `baybo_security::SecretVault` —
 //! this table just records which bot ids exist and when they were
 //! created. Callers join the two at runtime via a well-known secret
 //! name pattern (`channel.<channel_type>.bot.<bot_id>.token`).
 
 use async_trait::async_trait;
-use aura_model::ChannelType;
+use baybo_model::ChannelType;
 
 use crate::StorageError;
 

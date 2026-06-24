@@ -1,18 +1,18 @@
-//! LLM provider step. Mutates `AuraConfig::llm` in place; never writes
-//! `aura.json` itself.
+//! LLM provider step. Mutates `BayboConfig::llm` in place; never writes
+//! `baybo.json` itself.
 
 use std::sync::Arc;
 
-use aura_config::{AuraConfig, LlmEntry};
-use aura_llm::credentials::{resolve_api_key, vault_api_key_name};
-use aura_llm::providers::openai_subscription::{
+use baybo_config::{BayboConfig, LlmEntry};
+use baybo_llm::credentials::{resolve_api_key, vault_api_key_name};
+use baybo_llm::providers::openai_subscription::{
     DeviceCode, PROVIDER_NAME as SUB_PROVIDER_NAME, VAULT_KEY_TOKENS, VaultTokenStore,
     device_code_login, pkce_login,
 };
-use aura_llm::{
+use baybo_llm::{
     LiveModelInfo, LlmProviderConfig, LlmProviderRegistry, default_base_url_for_provider,
 };
-use aura_security::SecretVault;
+use baybo_security::SecretVault;
 
 use crate::error::{Result, SetupError};
 use crate::prompt::Prompter;
@@ -26,7 +26,7 @@ pub enum LlmStepOutcome {
 pub async fn configure_llm_step<P: Prompter>(
     prompter: &mut P,
     vault: &Arc<SecretVault>,
-    config: &mut AuraConfig,
+    config: &mut BayboConfig,
     allow_skip: bool,
 ) -> Result<LlmStepOutcome> {
     let has_existing = !config.llm.is_empty();
@@ -44,7 +44,7 @@ pub async fn configure_llm_step<P: Prompter>(
         prompter,
         label,
         add_label,
-        "Skip — configure later with `aura llm add`",
+        "Skip — configure later with `baybo llm add`",
         allow_skip,
     )? {
         return Ok(LlmStepOutcome::Skipped);
@@ -55,15 +55,15 @@ pub async fn configure_llm_step<P: Prompter>(
 async fn add_entry<P: Prompter>(
     prompter: &mut P,
     vault: &Arc<SecretVault>,
-    config: &mut AuraConfig,
+    config: &mut BayboConfig,
 ) -> Result<LlmStepOutcome> {
-    // If the operator has already set a proxy (e.g. pre-edited aura.json),
+    // If the operator has already set a proxy (e.g. pre-edited baybo.json),
     // route setup's own HTTP — OAuth login + live model discovery — through
     // it too, so discovery works behind a firewall.
     let proxy = config
         .proxy
         .as_ref()
-        .map(|p| aura_security::http::ProxySettings {
+        .map(|p| baybo_security::http::ProxySettings {
             url: p.url.clone(),
             no_proxy: p.no_proxy.clone(),
         });
@@ -158,7 +158,7 @@ async fn add_entry<P: Prompter>(
 
     // Reasoning effort: only meaningful for openai-subscription.
     let reasoning_effort = if provider == SUB_PROVIDER_NAME {
-        let levels = aura_llm::providers::openai_subscription::allowed_efforts_for(&model);
+        let levels = baybo_llm::providers::openai_subscription::allowed_efforts_for(&model);
         let labels: Vec<&str> = levels.to_vec();
         let idx = prompter.select("Reasoning effort:", &labels)?;
         Some(levels[idx].to_string())
@@ -219,7 +219,7 @@ fn unique_default_name(provider: &str, existing: &[LlmEntry]) -> String {
 async fn fetch_live_models(
     entry: &LlmEntry,
     vault: Option<Arc<SecretVault>>,
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
 ) -> Result<Vec<LiveModelInfo>> {
     let registry = LlmProviderRegistry::with_default_providers();
     let cfg = LlmProviderConfig {
@@ -255,10 +255,10 @@ async fn fetch_live_models(
 async fn run_subscription_login<P: Prompter>(
     prompter: &mut P,
     vault: &Arc<SecretVault>,
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
 ) -> Result<()> {
     let store = VaultTokenStore::new(vault.clone());
-    let http = aura_security::http::client(proxy.as_ref())
+    let http = baybo_security::http::client(proxy.as_ref())
         .map_err(|e| SetupError::Llm(format!("build proxied http client: {e}")))?;
     // PKCE wants a browser that can reach 127.0.0.1; device code only
     // needs a browser somewhere. Both modes are offered so the user

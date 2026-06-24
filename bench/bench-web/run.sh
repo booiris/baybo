@@ -45,17 +45,17 @@ fi
 # list reads tiny precomputed counts instead of re-parsing traces that can
 # be hundreds of MB. Incremental: only new/changed traces are parsed.
 echo "==> precomputing tool-count sidecars (incremental)…" >&2
-cargo run "${PROFILE[@]}" -q -p aura-bench-web --bin precompute_tool_counts -- --root "$BENCH_ROOT" || \
+cargo run "${PROFILE[@]}" -q -p baybo-bench-web --bin precompute_tool_counts -- --root "$BENCH_ROOT" || \
   echo "   (tool-count precompute failed — list tool chips may be empty; non-fatal)" >&2
 
 if [[ "$DEV" == "1" ]]; then
   echo "==> dev mode: starting API backend on :$PORT + Vite dev server on :5173" >&2
-  cargo run "${PROFILE[@]}" -p aura-bench-web -- --root "$BENCH_ROOT" --port "$PORT" &
+  cargo run "${PROFILE[@]}" -p baybo-bench-web -- --root "$BENCH_ROOT" --port "$PORT" &
   backend=$!
   # Stop the backend when the dev server exits (Ctrl-C included).
   trap 'kill "$backend" 2>/dev/null || true' EXIT INT TERM
-  BENCH_WEB_URL="http://127.0.0.1:$PORT" pnpm --filter aura-bench-web dev
+  BENCH_WEB_URL="http://127.0.0.1:$PORT" pnpm --filter baybo-bench-web dev
 else
   echo "==> building + serving bench-web on http://127.0.0.1:$PORT (root: $BENCH_ROOT)" >&2
-  exec cargo run "${PROFILE[@]}" -p aura-bench-web -- --root "$BENCH_ROOT" --port "$PORT"
+  exec cargo run "${PROFILE[@]}" -p baybo-bench-web -- --root "$BENCH_ROOT" --port "$PORT"
 fi

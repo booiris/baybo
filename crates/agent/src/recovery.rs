@@ -39,9 +39,9 @@
 
 use std::sync::Arc;
 
-use aura_job::{CancelReason, JobLifecycle};
-use aura_model::{JobId, SessionId};
-use aura_trace::{LifecycleOutcome, LifecycleState, Span, Step, TraceError, TraceStore};
+use baybo_job::{CancelReason, JobLifecycle};
+use baybo_model::{JobId, SessionId};
+use baybo_trace::{LifecycleOutcome, LifecycleState, Span, Step, TraceError, TraceStore};
 use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
@@ -355,11 +355,11 @@ async fn pick_span_close_time(
     trace_store: &Arc<dyn TraceStore>,
     span: &Span,
 ) -> Result<DateTime<Utc>, TraceError> {
-    let events: Vec<aura_trace::SpanEvent> = trace_store
+    let events: Vec<baybo_trace::SpanEvent> = trace_store
         .list_span_events(&span.id)
         .await?
         .into_iter()
-        .map(aura_trace::SpanEvent::from_row)
+        .map(baybo_trace::SpanEvent::from_row)
         .collect::<std::result::Result<_, _>>()?;
     let mut at = span.started_at;
     for ev in &events {
@@ -373,14 +373,14 @@ async fn pick_span_close_time(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_job::test_support::MemoryJobStore;
-    use aura_job::{Job, JobInput, JobShape, JobStatus, JobStore};
-    use aura_model::{
+    use baybo_job::test_support::MemoryJobStore;
+    use baybo_job::{Job, JobInput, JobShape, JobStatus, JobStore};
+    use baybo_model::{
         ApprovalDecision, ContentBlock, ParallelGroup, ResourceAccess, SessionId, SpanId, StepId,
         TriggerKind,
     };
-    use aura_trace::test_support::MemoryTraceStore;
-    use aura_trace::{
+    use baybo_trace::test_support::MemoryTraceStore;
+    use baybo_trace::{
         LlmCallBegin, LlmCallInputs, SpanEvent, SpanEventKind, SpanKind, StepKind, ToolCallBegin,
     };
     use chrono::Duration;

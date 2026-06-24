@@ -2,9 +2,9 @@
 //!
 //! Every shell-needing command runs through bwrap (Linux) /
 //! sandbox-exec (macOS) / docker, EXCEPT invocations of the local
-//! `aura` CLI (any sub-command whose argv0 is
-//! [`aura_workspace::paths::BIN_NAME`]). The sandbox masks the Aura
-//! state dir (`~/.aura`/`$AURA_HOME`), so a sandboxed `aura …` call
+//! `baybo` CLI (any sub-command whose argv0 is
+//! [`baybo_workspace::paths::BIN_NAME`]). The sandbox masks the Baybo
+//! state dir (`~/.baybo`/`$BAYBO_HOME`), so a sandboxed `baybo …` call
 //! can't see the parent gateway's config or session store — running
 //! it sandboxed is broken by construction, so the agent's own CLI
 //! gets the unsandboxed `sh -c` path directly.
@@ -15,8 +15,8 @@
 //! `/run/systemd/resolve`) stay RO so installed binaries and
 //! resolv.conf still work; credential vaults (`~/.ssh`, `~/.aws`,
 //! `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`,
-//! `~/.docker`, `~/.kube`, and the Aura state dir under
-//! `~/.aura`/`$AURA_HOME`) are masked with per-call empty `tmpfs`;
+//! `~/.docker`, `~/.kube`, and the Baybo state dir under
+//! `~/.baybo`/`$BAYBO_HOME`) are masked with per-call empty `tmpfs`;
 //! `/dev` is a fresh minimal devtmpfs (no host raw devices); network
 //! is enabled. Anything outside `workspace_root + $HOME + FHS-RO` is
 //! invisible inside the sandbox.
@@ -41,14 +41,14 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_workspace::{WorkspacePaths, absolutise};
+use baybo_workspace::{WorkspacePaths, absolutise};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::paths::require_absolute;
 use std::sync::Arc;
 
-use aura_model::new_background_handle;
+use baybo_model::new_background_handle;
 
 use crate::{
     ApprovalDecision, BackgroundJobSink, DetachedCommand, NoticeLevel, ResourceAccess,
@@ -81,7 +81,7 @@ Reserve Bash for system commands, git operations, build/test, and terminal tasks
 
 {{approval}}
 
-DEFAULT CWD: If `cwd` is omitted, Aura runs the command from {{work_dir}} and exports `PWD` with the same value.
+DEFAULT CWD: If `cwd` is omitted, Baybo runs the command from {{work_dir}} and exports `PWD` with the same value.
 
 PATHS: Any directory or file argument inside the command (cd, ls, mkdir, rm, mv, cp, find, …) MUST be an absolute path. The optional `cwd` parameter MUST also be absolute when provided — relative values are rejected. Always quote file paths that contain spaces with double quotes (e.g. `cd "/path with spaces/file.txt"`).
 
@@ -96,7 +96,7 @@ ENVIRONMENT:
 - Platform: {{platform}}"#;
 
 #[cfg(not(feature = "bench-bash"))]
-const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Aura state dir under `~/.aura`/`$AURA_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled."#;
+const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Baybo state dir under `~/.baybo`/`$BAYBO_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled."#;
 
 #[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only inside the workspace work directory ({{work_dir}}). The read-only `skills/` subtree is the one exception you may name in a command — an installed skill's bundled script can be executed in place from there (writes to it still fail). Any other absolute path argument under the workspace root but outside `work/` and `skills/` (the sibling subtrees `profile/`, `config/`, `state/`, `logs/`, `.key/`) is rejected up front, and `cwd` is held to the work-dir rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}."#;
@@ -153,8 +153,8 @@ fn mode_runs_judge(mode: BashSandboxMode) -> bool {
     !BENCH && mode == BashSandboxMode::Auto
 }
 
-/// How the Bash tool isolates a command, mirroring `aura_config::SandboxMode`
-/// without taking a dep on `aura-config`. The wiring layer maps between them.
+/// How the Bash tool isolates a command, mirroring `baybo_config::SandboxMode`
+/// without taking a dep on `baybo-config`. The wiring layer maps between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BashSandboxMode {
@@ -227,7 +227,7 @@ pub struct BashTool {
     /// any `uv` invocation caches inside the workspace rather than
     /// `~/.cache/uv` / `~/.local/share/uv`. Non-uv processes inherit and
     /// ignore the variables — same loose-coupling rationale as
-    /// [`inject_aura_env`].
+    /// [`inject_baybo_env`].
     uv_env_prefix: String,
     /// Shared, hot-swappable sandbox mode. Read on every call (and by
     /// [`Tool::description`]); a config reload swaps it via [`LiveSandboxMode::set`].
@@ -288,12 +288,12 @@ impl BashTool {
     }
 
     /// Prefix `command` with the workspace-scoped UV exports and the
-    /// Aura-CLI env injection. Two callers (the sandboxed `execute` path
+    /// Baybo-CLI env injection. Two callers (the sandboxed `execute` path
     /// and the unsandboxed retry below) compose the same `sh -c` body —
     /// keep the ordering in one place so a future reshuffle doesn't
     /// drift between them.
     fn wrap_command(&self, command: &str) -> String {
-        let injected = inject_aura_env(command);
+        let injected = inject_baybo_env(command);
         // Only the bench profile skips the uv shims/exports: that container ships
         // its own python/pip and has no `uv`, so the `python() { uv run python …; }`
         // shim would turn every `python`/`pip` into `uv run …` → `uv: not found`.
@@ -409,7 +409,7 @@ const UV_SHELL_SHIMS: &str = "python() { uv run python \"$@\"; }; \
 /// resolved off the gateway's `$PATH`; it is folded onto the front of the
 /// in-sandbox `$PATH` so the python/pip shims can find `uv` even though the
 /// bwrap sandbox hands the command a `--clearenv`'d, hardcoded
-/// `PATH=/usr/bin:/bin:/usr/sbin:/sbin` (`aura-sandbox`) that omits the
+/// `PATH=/usr/bin:/bin:/usr/sbin:/sbin` (`baybo-sandbox`) that omits the
 /// `~/.local/bin` location uv's own installer uses. `None` (uv not on PATH)
 /// leaves PATH untouched — the shims then fail only if the agent actually
 /// invokes python.
@@ -696,23 +696,23 @@ impl Tool for BashTool {
             )));
         }
 
-        let aura_resolution = classify_aura_command(&command);
-        if matches!(aura_resolution, AuraResolution::RequireAbsolutePath) {
-            // The agent is clearly trying to invoke aura (basename
+        let baybo_resolution = classify_baybo_command(&command);
+        if matches!(baybo_resolution, BayboResolution::RequireAbsolutePath) {
+            // The agent is clearly trying to invoke baybo (basename
             // match) but used a bare/relative/wrong-absolute argv0.
             // Sandboxing would just fail opaquely on the masked
             // state dir; surface a precise instruction with the
             // correct absolute path so the agent can self-correct.
-            let bin_display = AURA_BIN
+            let bin_display = BAYBO_BIN
                 .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "<unknown>".into());
             return Err(ToolError::InvalidParams(format!(
-                "Aura CLI invocations must use the absolute path of the gateway binary. \
+                "Baybo CLI invocations must use the absolute path of the gateway binary. \
                  Replace the argv0 with `{bin_display}` (e.g. \
-                 `{bin_display} cost` instead of `aura cost`). \
+                 `{bin_display} cost` instead of `baybo cost`). \
                  Bare-name and relative-path invocations are rejected so the \
-                 unsandboxed shell never resolves `aura` through `$PATH`."
+                 unsandboxed shell never resolves `baybo` through `$PATH`."
             )));
         }
 
@@ -730,21 +730,21 @@ impl Tool for BashTool {
                 )
             })?;
             tracing::info!(
-                target: "aura::tools::bash",
+                target: "baybo::tools::bash",
                 secrets = ?p.secret_env,
                 "bash: injecting user secrets as environment variables"
             );
             handle.resolve_env(&p.secret_env).await?
         };
 
-        // An absolute-path `aura …` self-invocation runs unsandboxed by
-        // construction: the OS sandbox masks `~/.aura`/`$AURA_HOME`, so a
+        // An absolute-path `baybo …` self-invocation runs unsandboxed by
+        // construction: the OS sandbox masks `~/.baybo`/`$BAYBO_HOME`, so a
         // sandboxed call can't reach the gateway's config / session store, and
         // argv0 is already the canonical gateway path so `sh -c` execve's it with
         // no `$PATH` consultation. It is never a sandboxed run — no judge, no
         // escalation, no timeout-to-background — so run it directly and return
         // here, keeping the rest of `execute` free of the `bypass` concept.
-        if matches!(aura_resolution, AuraResolution::Bypass) {
+        if matches!(baybo_resolution, BayboResolution::Bypass) {
             let out = self
                 .run_unsandboxed_wrapped(&command, cwd_ref, &extra_env, timeout, ctx)
                 .await?;
@@ -815,7 +815,7 @@ impl Tool for BashTool {
         let out = if skip_sandbox {
             // The bench profile / `mode = none` run directly via `sh -c` — there
             // is no OS sandbox to wrap with (the bench container is already
-            // disposable; `none` opts out on the host). (An `aura …`
+            // disposable; `none` opts out on the host). (An `baybo …`
             // self-invocation also runs unsandboxed, but it returned early above.)
             tokio::select! {
                 _ = ctx.cancellation_token.cancelled() => {
@@ -827,7 +827,7 @@ impl Tool for BashTool {
             let Some(sandbox) = ctx.sandbox.as_ref() else {
                 return Err(ToolError::Execution(
                     "OS sandbox unavailable: install bwrap (Linux: `apt install bubblewrap`) \
-                     or sandbox-exec (macOS, ships with the system) and restart aura"
+                     or sandbox-exec (macOS, ships with the system) and restart baybo"
                         .into(),
                 ));
             };
@@ -1001,7 +1001,7 @@ async fn run_detached(
 ) -> crate::Result<Option<ToolOutput>> {
     // Only sandboxed runs reach here — the unsandboxed cases (`mode = none` /
     // bench keep to the blocking path via the caller's `!skip_sandbox` guard;
-    // an `aura …` bypass returned even earlier). So detach via the OS sandbox.
+    // an `baybo …` bypass returned even earlier). So detach via the OS sandbox.
     let mut child: Box<dyn RunningChild> = {
         let Some(sandbox) = ctx.sandbox.as_ref() else {
             return Ok(None);
@@ -1240,53 +1240,53 @@ fn is_file_tool_redirect(command: &str) -> bool {
     first_token(command).is_some_and(|t| FILE_TOOL_REDIRECT_COMMANDS.contains(&t))
 }
 
-/// Prefix `command` with `export AURA_HELP_AGENT=1; export
-/// AURA_CONFIG_PATH=…;` when the command contains the cargo bin name
-/// (`aura_workspace::paths::BIN_NAME`). This gives the subshell two
+/// Prefix `command` with `export BAYBO_HELP_AGENT=1; export
+/// BAYBO_CONFIG_PATH=…;` when the command contains the cargo bin name
+/// (`baybo_workspace::paths::BIN_NAME`). This gives the subshell two
 /// things the agent would otherwise be missing:
 ///
 /// 1. The extended-help inventory (hidden subcommands like `cost`,
 ///    `log`, `session`, `job`, `cron`, `config`). See
-///    `aura_cli::cli::ENV_HELP_AGENT` for the reader contract.
+///    `baybo_cli::cli::ENV_HELP_AGENT` for the reader contract.
 /// 2. The same config file the running gateway is using. Reads
-///    `AURA_CONFIG_PATH` from the parent process when set, falls
-///    back to [`aura_workspace::paths::default_config_file`]
+///    `BAYBO_CONFIG_PATH` from the parent process when set, falls
+///    back to [`baybo_workspace::paths::default_config_file`]
 ///    otherwise. The path is always resolved to an absolute form so
-///    a relative debug-mode default (`./.aura/config/aura.json`)
+///    a relative debug-mode default (`./.baybo/config/baybo.json`)
 ///    keeps pointing at the right workspace even when the bash tool
 ///    spawns the child with a different cwd.
 ///
-/// The substring match is intentionally loose: non-aura processes
+/// The substring match is intentionally loose: non-baybo processes
 /// inherit the variables and ignore them, so a false-positive
-/// injection (e.g. `cd /data/aura && cargo build`) has no observable
-/// effect. The win is that the agent can compose `aura …` commands
+/// injection (e.g. `cd /data/baybo && cargo build`) has no observable
+/// effect. The win is that the agent can compose `baybo …` commands
 /// naturally — no per-call argv token, no LLM tool-shape change.
-fn inject_aura_env(command: &str) -> String {
-    let raw = std::env::var_os(aura_workspace::paths::ENV_CONFIG_PATH)
+fn inject_baybo_env(command: &str) -> String {
+    let raw = std::env::var_os(baybo_workspace::paths::ENV_CONFIG_PATH)
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(aura_workspace::paths::default_config_file);
+        .unwrap_or_else(baybo_workspace::paths::default_config_file);
     // Syntactic absolutize — fast, doesn't touch the FS, doesn't
     // fail when the file is missing (which is the normal case in
-    // fresh deployments before `aura setup` runs).
+    // fresh deployments before `baybo setup` runs).
     let abs = std::path::absolute(&raw).unwrap_or(raw);
-    inject_aura_env_with(command, abs.as_os_str())
+    inject_baybo_env_with(command, abs.as_os_str())
 }
 
-/// Pure variant of [`inject_aura_env`] that takes an already-resolved
+/// Pure variant of [`inject_baybo_env`] that takes an already-resolved
 /// config path. Split out so tests don't have to mutate process env.
 ///
 /// The "does this command invoke the CLI" check is a substring match
-/// against `aura_workspace::paths::BIN_NAME` — that const is the
+/// against `baybo_workspace::paths::BIN_NAME` — that const is the
 /// single source of truth for the cargo `[[bin]]` name, so renaming
 /// the binary changes the trigger token automatically.
-fn inject_aura_env_with(command: &str, config_path: &std::ffi::OsStr) -> String {
-    if !command.contains(aura_workspace::paths::BIN_NAME) {
+fn inject_baybo_env_with(command: &str, config_path: &std::ffi::OsStr) -> String {
+    if !command.contains(baybo_workspace::paths::BIN_NAME) {
         return command.to_string();
     }
     format!(
-        "export AURA_HELP_AGENT=1; export {}={}; {command}",
-        aura_workspace::paths::ENV_CONFIG_PATH,
+        "export BAYBO_HELP_AGENT=1; export {}={}; {command}",
+        baybo_workspace::paths::ENV_CONFIG_PATH,
         sh_quote(&config_path.to_string_lossy()),
     )
 }
@@ -1345,65 +1345,65 @@ const WRAPPER_COMMANDS: &[&str] = &[
 ];
 
 /// Canonical absolute path of the running gateway binary, cached on
-/// first read. Drives the aura sandbox-bypass match in
-/// [`classify_aura_command`]: path-like argv0s (`/usr/local/bin/aura`,
-/// `./target/debug/aura`) are compared against THIS path, not against
-/// the literal string `"aura"`, so an unrelated binary that happens
-/// to be named `aura` somewhere else on disk does NOT trigger the
+/// first read. Drives the baybo sandbox-bypass match in
+/// [`classify_baybo_command`]: path-like argv0s (`/usr/local/bin/baybo`,
+/// `./target/debug/baybo`) are compared against THIS path, not against
+/// the literal string `"baybo"`, so an unrelated binary that happens
+/// to be named `baybo` somewhere else on disk does NOT trigger the
 /// bypass.
 ///
 /// Falls back to the raw `current_exe()` path if `canonicalize` fails
 /// (binary deleted post-exec, etc.); returns `None` only if
 /// `current_exe()` itself errors, which is rare enough that we treat
-/// it as "no aura CLI is locatable, sandbox every command".
-static AURA_BIN: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+/// it as "no baybo CLI is locatable, sandbox every command".
+static BAYBO_BIN: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
     let exe = std::env::current_exe().ok()?;
     Some(std::fs::canonicalize(&exe).unwrap_or(exe))
 });
 
 /// How [`BashTool::execute`] should treat a shell command relative to
-/// the gateway's own `aura` CLI.
+/// the gateway's own `baybo` CLI.
 ///
-/// The sandbox masks the Aura state dir (`~/.aura`/`$AURA_HOME`), so a
-/// sandboxed `aura …` can't reach the gateway's config or session
+/// The sandbox masks the Baybo state dir (`~/.baybo`/`$BAYBO_HOME`), so a
+/// sandboxed `baybo …` can't reach the gateway's config or session
 /// store. That makes the bypass logic worth getting right in three
 /// directions:
 ///
-/// - [`Bypass`](AuraResolution::Bypass): the command is a single,
-///   safe aura invocation written with the **absolute path** of the
+/// - [`Bypass`](BayboResolution::Bypass): the command is a single,
+///   safe baybo invocation written with the **absolute path** of the
 ///   gateway binary. Run unsandboxed.
-/// - [`RequireAbsolutePath`](AuraResolution::RequireAbsolutePath):
-///   the command is clearly trying to invoke aura (its argv0's
+/// - [`RequireAbsolutePath`](BayboResolution::RequireAbsolutePath):
+///   the command is clearly trying to invoke baybo (its argv0's
 ///   `file_name` matches the gateway binary), but the caller used a
 ///   bare/relative/wrong-absolute path. Refuse with an error that
 ///   tells the caller the correct path — this is more useful than
 ///   sandboxing it (which would just fail opaquely on the masked
 ///   state dir).
-/// - [`Sandbox`](AuraResolution::Sandbox): aura isn't the leading
+/// - [`Sandbox`](BayboResolution::Sandbox): baybo isn't the leading
 ///   sub-command (or doesn't appear at all), OR an unsafe-env shape
-///   we don't want to bypass even with an absolute-path aura argv0.
-enum AuraResolution {
+///   we don't want to bypass even with an absolute-path baybo argv0.
+enum BayboResolution {
     Bypass,
     RequireAbsolutePath,
     Sandbox,
 }
 
-fn classify_aura_command(command: &str) -> AuraResolution {
-    let Some(bin) = AURA_BIN.as_deref() else {
-        return AuraResolution::Sandbox;
+fn classify_baybo_command(command: &str) -> BayboResolution {
+    let Some(bin) = BAYBO_BIN.as_deref() else {
+        return BayboResolution::Sandbox;
     };
-    classify_aura_command_with_bin(command, bin)
+    classify_baybo_command_with_bin(command, bin)
 }
 
-fn classify_aura_command_with_bin(command: &str, bin: &Path) -> AuraResolution {
+fn classify_baybo_command_with_bin(command: &str, bin: &Path) -> BayboResolution {
     // Only the FIRST sub-command's argv0 matters: if the user opens
-    // the command line with an absolute-path aura invocation, the
+    // the command line with an absolute-path baybo invocation, the
     // whole `sh -c` string runs unsandboxed (compound forms like
-    // `aura … && cat /etc/passwd`, `aura … | jq`, `$(aura …)`
-    // included). A non-aura leader keeps the sandbox.
+    // `baybo … && cat /etc/passwd`, `baybo … | jq`, `$(baybo …)`
+    // included). A non-baybo leader keeps the sandbox.
     let subs = split_into_subcommands(command);
     let Some(tokens) = subs.first() else {
-        return AuraResolution::Sandbox;
+        return BayboResolution::Sandbox;
     };
 
     let mut unquoted: Vec<String> = Vec::with_capacity(tokens.len());
@@ -1412,7 +1412,7 @@ fn classify_aura_command_with_bin(command: &str, bin: &Path) -> AuraResolution {
             Ok(mut words) if words.len() <= 1 => {
                 unquoted.push(words.pop().unwrap_or_default());
             }
-            _ => return AuraResolution::Sandbox,
+            _ => return BayboResolution::Sandbox,
         }
     }
     let mut i = 0;
@@ -1420,49 +1420,49 @@ fn classify_aura_command_with_bin(command: &str, bin: &Path) -> AuraResolution {
         if !is_env_assignment(tok) {
             break;
         }
-        if !is_safe_aura_env_assignment(tok) {
-            return AuraResolution::Sandbox;
+        if !is_safe_baybo_env_assignment(tok) {
+            return BayboResolution::Sandbox;
         }
         i += 1;
     }
     let Some(argv0) = unquoted.get(i) else {
-        return AuraResolution::Sandbox;
+        return BayboResolution::Sandbox;
     };
 
-    // "Looks like aura" — basename of argv0 matches the gateway
-    // binary's basename. Catches bare `aura`, relative `./aura`,
-    // and wrong absolute paths (`/opt/imposter/aura`) — every form
-    // where the caller appears to be trying to spawn the aura CLI.
+    // "Looks like baybo" — basename of argv0 matches the gateway
+    // binary's basename. Catches bare `baybo`, relative `./baybo`,
+    // and wrong absolute paths (`/opt/imposter/baybo`) — every form
+    // where the caller appears to be trying to spawn the baybo CLI.
     let argv0_filename = Path::new(argv0).file_name();
     let bin_filename = bin.file_name();
-    let looks_like_aura = match (argv0_filename, bin_filename) {
+    let looks_like_baybo = match (argv0_filename, bin_filename) {
         (Some(a), Some(b)) => a == b,
         _ => false,
     };
-    if !looks_like_aura {
-        return AuraResolution::Sandbox;
+    if !looks_like_baybo {
+        return BayboResolution::Sandbox;
     }
 
-    if argv0_is_absolute_aura_path(argv0, bin) {
-        AuraResolution::Bypass
+    if argv0_is_absolute_baybo_path(argv0, bin) {
+        BayboResolution::Bypass
     } else {
-        AuraResolution::RequireAbsolutePath
+        BayboResolution::RequireAbsolutePath
     }
 }
 
-/// Env assignments allowed as a prefix on an aura invocation without
+/// Env assignments allowed as a prefix on an baybo invocation without
 /// forfeiting the sandbox bypass. The whitelist is intentionally narrow:
-/// the `AURA_` family (gateway-owned config the CLI reads) and the two
+/// the `BAYBO_` family (gateway-owned config the CLI reads) and the two
 /// `RUST_*` knobs the agent commonly uses to surface tracing. Anything
 /// else — `PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_*`,
 /// `HOME`/`XDG_*`, locale vars, … — could redirect command resolution
 /// or library loading and so must force the sandbox path.
-fn is_safe_aura_env_assignment(tok: &str) -> bool {
+fn is_safe_baybo_env_assignment(tok: &str) -> bool {
     let Some(eq) = tok.find('=') else {
         return false;
     };
     let key = &tok[..eq];
-    key.starts_with("AURA_") || matches!(key, "RUST_LOG" | "RUST_BACKTRACE")
+    key.starts_with("BAYBO_") || matches!(key, "RUST_LOG" | "RUST_BACKTRACE")
 }
 
 /// True when `argv0` is a literal absolute path that resolves to the
@@ -1470,7 +1470,7 @@ fn is_safe_aura_env_assignment(tok: &str) -> bool {
 /// rejected outright — the bypass requires the caller to have spelled
 /// out the absolute path, so the unsandboxed shell's `execve` never
 /// consults `$PATH` or the current working directory.
-fn argv0_is_absolute_aura_path(argv0: &str, bin: &Path) -> bool {
+fn argv0_is_absolute_baybo_path(argv0: &str, bin: &Path) -> bool {
     let argv0_path = Path::new(argv0);
     if !argv0_path.is_absolute() {
         return false;
@@ -1978,7 +1978,7 @@ impl BashTool {
     /// tests) and the structured log, so a sandbox escape is never silent.
     fn notify_escape(&self, ctx: &ToolContext, command: &str, rationale: &str) {
         tracing::warn!(
-            target: "aura::tools::bash",
+            target: "baybo::tools::bash",
             command = %command,
             rationale = %rationale,
             "auto mode: running a failed command outside the OS sandbox"
@@ -2146,7 +2146,7 @@ mod tests {
     use crate::SandboxedOutput;
     use crate::test_support::{FakeApprovalGate, FakeExecSandbox};
     use crate::{ApprovalHandle, ApprovedResource};
-    use aura_model::{ChannelType, User};
+    use baybo_model::{ChannelType, User};
     use parking_lot::Mutex;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
@@ -2162,7 +2162,7 @@ mod tests {
     #[tokio::test]
     async fn unsandboxed_timeout_reaps_whole_process_group() {
         let pidfile = std::env::temp_dir().join(format!(
-            "aura-pgkill-{}-{}.pid",
+            "baybo-pgkill-{}-{}.pid",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2171,7 +2171,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&pidfile);
 
-        // `sleep 30` is the grandchild (aura -> sh -> sleep); it inherits sh's
+        // `sleep 30` is the grandchild (baybo -> sh -> sleep); it inherits sh's
         // new process group. `wait` keeps sh alive so the command hits the
         // timeout instead of exiting on its own.
         let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
@@ -2215,28 +2215,28 @@ mod tests {
     }
 
     #[test]
-    fn inject_aura_env_prefixes_aura_commands() {
-        let c = cfg("/data/aura/aura.json");
-        let out = inject_aura_env_with("aura cost show", c.as_os_str());
+    fn inject_baybo_env_prefixes_baybo_commands() {
+        let c = cfg("/data/baybo/baybo.json");
+        let out = inject_baybo_env_with("baybo cost show", c.as_os_str());
         assert!(
-            out.starts_with("export AURA_HELP_AGENT=1; "),
-            "expected AURA_HELP_AGENT export prefix, got: {out}"
+            out.starts_with("export BAYBO_HELP_AGENT=1; "),
+            "expected BAYBO_HELP_AGENT export prefix, got: {out}"
         );
         assert!(
-            out.contains("export AURA_CONFIG_PATH='/data/aura/aura.json'"),
+            out.contains("export BAYBO_CONFIG_PATH='/data/baybo/baybo.json'"),
             "expected config-path export, got: {out}"
         );
-        assert!(out.ends_with("; aura cost show"));
+        assert!(out.ends_with("; baybo cost show"));
     }
 
     #[test]
-    fn inject_aura_env_quotes_config_path_with_spaces_and_quotes() {
+    fn inject_baybo_env_quotes_config_path_with_spaces_and_quotes() {
         // Path with a space + an embedded single quote — the latter
         // is rare on disk but the escape path must still work.
-        let c = cfg("/tmp/aura's space/aura.json");
-        let out = inject_aura_env_with("aura doctor", c.as_os_str());
+        let c = cfg("/tmp/baybo's space/baybo.json");
+        let out = inject_baybo_env_with("baybo doctor", c.as_os_str());
         assert!(
-            out.contains("export AURA_CONFIG_PATH='/tmp/aura'\\''s space/aura.json'"),
+            out.contains("export BAYBO_CONFIG_PATH='/tmp/baybo'\\''s space/baybo.json'"),
             "expected POSIX-quoted path, got: {out}"
         );
     }
@@ -2278,39 +2278,39 @@ mod tests {
     }
 
     #[test]
-    fn inject_aura_env_leaves_unrelated_commands_alone() {
-        let c = cfg("/x/aura.json");
-        assert_eq!(inject_aura_env_with("ls -la", c.as_os_str()), "ls -la");
+    fn inject_baybo_env_leaves_unrelated_commands_alone() {
+        let c = cfg("/x/baybo.json");
+        assert_eq!(inject_baybo_env_with("ls -la", c.as_os_str()), "ls -la");
         assert_eq!(
-            inject_aura_env_with("git status", c.as_os_str()),
+            inject_baybo_env_with("git status", c.as_os_str()),
             "git status"
         );
     }
 
     #[test]
-    fn inject_aura_env_triggers_inside_pipelines_and_chains() {
-        let c = cfg("/x/aura.json");
+    fn inject_baybo_env_triggers_inside_pipelines_and_chains() {
+        let c = cfg("/x/baybo.json");
         for cmd in [
-            "aura status --live | jq .",
-            "cd /tmp && aura cost show",
-            "for i in 1 2; do aura job list; done",
+            "baybo status --live | jq .",
+            "cd /tmp && baybo cost show",
+            "for i in 1 2; do baybo job list; done",
         ] {
-            let out = inject_aura_env_with(cmd, c.as_os_str());
+            let out = inject_baybo_env_with(cmd, c.as_os_str());
             assert!(
-                out.starts_with("export AURA_HELP_AGENT=1; "),
+                out.starts_with("export BAYBO_HELP_AGENT=1; "),
                 "expected env prefix for {cmd:?}, got: {out}"
             );
             assert!(
-                out.contains("export AURA_CONFIG_PATH="),
+                out.contains("export BAYBO_CONFIG_PATH="),
                 "expected config-path export for {cmd:?}, got: {out}"
             );
         }
     }
 
     #[test]
-    fn inject_aura_env_falls_back_to_default_config_when_env_unset() {
+    fn inject_baybo_env_falls_back_to_default_config_when_env_unset() {
         // Exercises the public wrapper rather than the pure helper —
-        // verifies that an unset `AURA_CONFIG_PATH` still produces an
+        // verifies that an unset `BAYBO_CONFIG_PATH` still produces an
         // export pointing at the workspace default. We can't safely
         // mutate process env in a parallel test, so we settle for
         // asserting the export is present + absolute.
@@ -2318,18 +2318,18 @@ mod tests {
         // is not initialized, no concurrent reader is observing the
         // var while we mutate it.
         unsafe {
-            std::env::remove_var(aura_workspace::paths::ENV_CONFIG_PATH);
+            std::env::remove_var(baybo_workspace::paths::ENV_CONFIG_PATH);
         }
-        let out = inject_aura_env("aura status");
+        let out = inject_baybo_env("baybo status");
         assert!(
-            out.contains("export AURA_CONFIG_PATH='"),
+            out.contains("export BAYBO_CONFIG_PATH='"),
             "default config should still be exported, got: {out}"
         );
         // The default workspace root is absolute in release and
         // resolves to absolute via `std::path::absolute` in debug —
         // either way the exported path starts with `/`.
         let after_eq = out
-            .split("AURA_CONFIG_PATH='")
+            .split("BAYBO_CONFIG_PATH='")
             .nth(1)
             .expect("export present");
         assert!(
@@ -2340,22 +2340,22 @@ mod tests {
 
     #[test]
     fn build_uv_env_exports_points_at_workspace_subdirs() {
-        let paths = WorkspacePaths::new("/var/aura");
+        let paths = WorkspacePaths::new("/var/baybo");
         let prefix = build_uv_env_exports(&paths, None);
         assert!(
-            prefix.contains("export UV_CACHE_DIR='/var/aura/work/.uv/cache'"),
+            prefix.contains("export UV_CACHE_DIR='/var/baybo/work/.uv/cache'"),
             "UV_CACHE_DIR missing or wrong, got: {prefix}",
         );
         assert!(
-            prefix.contains("export UV_PYTHON_INSTALL_DIR='/var/aura/work/.uv/python'"),
+            prefix.contains("export UV_PYTHON_INSTALL_DIR='/var/baybo/work/.uv/python'"),
             "UV_PYTHON_INSTALL_DIR missing or wrong, got: {prefix}",
         );
         assert!(
-            prefix.contains("export UV_TOOL_DIR='/var/aura/work/.uv/tools'"),
+            prefix.contains("export UV_TOOL_DIR='/var/baybo/work/.uv/tools'"),
             "UV_TOOL_DIR missing or wrong, got: {prefix}",
         );
         assert!(
-            prefix.contains("export UV_TOOL_BIN_DIR='/var/aura/work/.uv/bin'"),
+            prefix.contains("export UV_TOOL_BIN_DIR='/var/baybo/work/.uv/bin'"),
             "UV_TOOL_BIN_DIR missing or wrong, got: {prefix}",
         );
         assert!(
@@ -2378,17 +2378,17 @@ mod tests {
 
     #[test]
     fn build_uv_env_exports_quotes_paths_with_special_chars() {
-        let paths = WorkspacePaths::new("/tmp/aura's space");
+        let paths = WorkspacePaths::new("/tmp/baybo's space");
         let prefix = build_uv_env_exports(&paths, None);
         assert!(
-            prefix.contains("export UV_CACHE_DIR='/tmp/aura'\\''s space/work/.uv/cache'"),
+            prefix.contains("export UV_CACHE_DIR='/tmp/baybo'\\''s space/work/.uv/cache'"),
             "UV_CACHE_DIR must be POSIX-quoted, got: {prefix}",
         );
     }
 
     #[test]
     fn build_uv_env_exports_prepends_resolved_uv_dir_to_path() {
-        let paths = WorkspacePaths::new("/var/aura");
+        let paths = WorkspacePaths::new("/var/baybo");
         let prefix = build_uv_env_exports(&paths, Some(Path::new("/home/u/.local/bin")));
         assert!(
             prefix.contains(r#"export PATH='/home/u/.local/bin':"$PATH"; "#),
@@ -2406,7 +2406,7 @@ mod tests {
 
     #[test]
     fn build_uv_env_exports_omits_path_when_uv_absent() {
-        let paths = WorkspacePaths::new("/var/aura");
+        let paths = WorkspacePaths::new("/var/baybo");
         let prefix = build_uv_env_exports(&paths, None);
         assert!(
             !prefix.contains("export PATH="),
@@ -2445,256 +2445,256 @@ mod tests {
         assert_eq!(uv_bin_dir_in(&path), None);
     }
 
-    fn classify(command: &str, bin: &Path) -> AuraResolution {
-        classify_aura_command_with_bin(command, bin)
+    fn classify(command: &str, bin: &Path) -> BayboResolution {
+        classify_baybo_command_with_bin(command, bin)
     }
 
     #[test]
-    fn classify_aura_bypasses_only_absolute_canonical_path() {
+    fn classify_baybo_bypasses_only_absolute_canonical_path() {
         // Core invariant: ONLY a literal absolute-path argv0 that
         // canonicalises to the gateway binary bypasses the sandbox.
-        let bin = Path::new("/usr/local/bin/aura");
+        let bin = Path::new("/usr/local/bin/baybo");
         assert!(matches!(
-            classify("/usr/local/bin/aura cost", bin),
-            AuraResolution::Bypass
+            classify("/usr/local/bin/baybo cost", bin),
+            BayboResolution::Bypass
         ));
         assert!(matches!(
-            classify("/usr/local/bin/aura", bin),
-            AuraResolution::Bypass
+            classify("/usr/local/bin/baybo", bin),
+            BayboResolution::Bypass
         ));
         assert!(matches!(
-            classify("/usr/local/bin/aura status --live", bin),
-            AuraResolution::Bypass
+            classify("/usr/local/bin/baybo status --live", bin),
+            BayboResolution::Bypass
         ));
         // Quoted forms still bypass — shell_words::split strips the
         // wrapping single quotes before the canonical compare.
         assert!(matches!(
-            classify("'/usr/local/bin/aura' cost", bin),
-            AuraResolution::Bypass
+            classify("'/usr/local/bin/baybo' cost", bin),
+            BayboResolution::Bypass
         ));
         // Whitelisted env prefixes preserve the bypass.
         assert!(matches!(
-            classify("AURA_LOG=trace /usr/local/bin/aura log", bin),
-            AuraResolution::Bypass
+            classify("BAYBO_LOG=trace /usr/local/bin/baybo log", bin),
+            BayboResolution::Bypass
         ));
         assert!(matches!(
             classify(
-                "AURA_LOG=trace AURA_HOME=/x /usr/local/bin/aura status",
+                "BAYBO_LOG=trace BAYBO_HOME=/x /usr/local/bin/baybo status",
                 bin
             ),
-            AuraResolution::Bypass
+            BayboResolution::Bypass
         ));
         assert!(matches!(
-            classify("RUST_LOG=debug /usr/local/bin/aura status", bin),
-            AuraResolution::Bypass
+            classify("RUST_LOG=debug /usr/local/bin/baybo status", bin),
+            BayboResolution::Bypass
         ));
     }
 
     #[test]
-    fn classify_aura_demands_absolute_path_for_bare_or_relative_argv0() {
-        // The user-asked behaviour: anything that LOOKS like an aura
+    fn classify_baybo_demands_absolute_path_for_bare_or_relative_argv0() {
+        // The user-asked behaviour: anything that LOOKS like an baybo
         // invocation (basename match) but isn't spelled out as an
         // absolute path must error rather than silently sandbox.
         // BashTool::execute surfaces this as `InvalidParams` so the
         // agent self-corrects to the canonical absolute path.
-        let bin = Path::new("/usr/local/bin/aura");
+        let bin = Path::new("/usr/local/bin/baybo");
         assert!(matches!(
-            classify("aura", bin),
-            AuraResolution::RequireAbsolutePath
+            classify("baybo", bin),
+            BayboResolution::RequireAbsolutePath
         ));
         assert!(matches!(
-            classify("aura cost", bin),
-            AuraResolution::RequireAbsolutePath
+            classify("baybo cost", bin),
+            BayboResolution::RequireAbsolutePath
         ));
         assert!(matches!(
-            classify("aura status --live", bin),
-            AuraResolution::RequireAbsolutePath
+            classify("baybo status --live", bin),
+            BayboResolution::RequireAbsolutePath
         ));
-        // Relative path forms still look like aura but aren't
+        // Relative path forms still look like baybo but aren't
         // absolute → require absolute path.
         assert!(matches!(
-            classify("./aura cost", bin),
-            AuraResolution::RequireAbsolutePath
+            classify("./baybo cost", bin),
+            BayboResolution::RequireAbsolutePath
         ));
-        // Quoted bare name normalises to bare `aura`.
+        // Quoted bare name normalises to bare `baybo`.
         assert!(matches!(
-            classify("'aura' cost", bin),
-            AuraResolution::RequireAbsolutePath
+            classify("'baybo' cost", bin),
+            BayboResolution::RequireAbsolutePath
         ));
         // Whitelisted env + bare argv0 — still require absolute
         // path; safe env doesn't excuse the missing path.
         assert!(matches!(
-            classify("AURA_LOG=trace aura log", bin),
-            AuraResolution::RequireAbsolutePath
+            classify("BAYBO_LOG=trace baybo log", bin),
+            BayboResolution::RequireAbsolutePath
         ));
     }
 
     #[test]
-    fn classify_aura_demands_absolute_path_for_wrong_absolute_path() {
+    fn classify_baybo_demands_absolute_path_for_wrong_absolute_path() {
         // An absolute path whose `file_name` matches but which doesn't
         // resolve to our gateway binary is also a misuse: the caller
-        // is trying to spawn "aura", but the path points elsewhere.
+        // is trying to spawn "baybo", but the path points elsewhere.
         // Surface the corrective error rather than sandboxing the
         // imposter binary.
-        let bin = Path::new("/usr/local/bin/aura");
+        let bin = Path::new("/usr/local/bin/baybo");
         assert!(matches!(
-            classify("/opt/imposter/aura --steal", bin),
-            AuraResolution::RequireAbsolutePath
+            classify("/opt/imposter/baybo --steal", bin),
+            BayboResolution::RequireAbsolutePath
         ));
     }
 
     #[test]
-    fn classify_aura_sandbox_for_non_aura_commands() {
-        let bin = Path::new("/usr/local/bin/aura");
-        assert!(matches!(classify("ls -la", bin), AuraResolution::Sandbox));
+    fn classify_baybo_sandbox_for_non_baybo_commands() {
+        let bin = Path::new("/usr/local/bin/baybo");
+        assert!(matches!(classify("ls -la", bin), BayboResolution::Sandbox));
         assert!(matches!(
             classify("git status", bin),
-            AuraResolution::Sandbox
+            BayboResolution::Sandbox
         ));
-        // Different basename → not an aura attempt at all.
+        // Different basename → not an baybo attempt at all.
         assert!(matches!(
-            classify("aurality cost", bin),
-            AuraResolution::Sandbox
+            classify("baybolity cost", bin),
+            BayboResolution::Sandbox
         ));
         assert!(matches!(
-            classify("echo aura", bin),
-            AuraResolution::Sandbox
+            classify("echo baybo", bin),
+            BayboResolution::Sandbox
         ));
-        // Wrappers — argv0 is the wrapper, not `aura`, so we don't
-        // treat this as an aura attempt. (The wrapped sandbox call
+        // Wrappers — argv0 is the wrapper, not `baybo`, so we don't
+        // treat this as an baybo attempt. (The wrapped sandbox call
         // will fail because the state dir is masked; the agent
         // learns to drop the wrapper.)
         assert!(matches!(
-            classify("nohup aura cost", bin),
-            AuraResolution::Sandbox
+            classify("nohup baybo cost", bin),
+            BayboResolution::Sandbox
         ));
         assert!(matches!(
-            classify("xargs aura", bin),
-            AuraResolution::Sandbox
+            classify("xargs baybo", bin),
+            BayboResolution::Sandbox
         ));
     }
 
     #[test]
-    fn classify_aura_bypasses_compound_commands_led_by_aura() {
+    fn classify_baybo_bypasses_compound_commands_led_by_baybo() {
         // Only the FIRST sub-command's argv0 is inspected — when it
-        // is the absolute-path aura binary, the entire `sh -c`
+        // is the absolute-path baybo binary, the entire `sh -c`
         // string runs unsandboxed, trailing segments included.
-        let bin = Path::new("/usr/local/bin/aura");
+        let bin = Path::new("/usr/local/bin/baybo");
         assert!(matches!(
-            classify("/usr/local/bin/aura status; cat /home/u/.ssh/id_rsa", bin),
-            AuraResolution::Bypass
+            classify("/usr/local/bin/baybo status; cat /home/u/.ssh/id_rsa", bin),
+            BayboResolution::Bypass
         ));
         assert!(matches!(
-            classify("/usr/local/bin/aura status && curl evil", bin),
-            AuraResolution::Bypass
+            classify("/usr/local/bin/baybo status && curl evil", bin),
+            BayboResolution::Bypass
         ));
         assert!(matches!(
-            classify("/usr/local/bin/aura status || true", bin),
-            AuraResolution::Bypass
+            classify("/usr/local/bin/baybo status || true", bin),
+            BayboResolution::Bypass
         ));
         assert!(matches!(
-            classify("/usr/local/bin/aura cost | head", bin),
-            AuraResolution::Bypass
+            classify("/usr/local/bin/baybo cost | head", bin),
+            BayboResolution::Bypass
         ));
         assert!(matches!(
-            classify("/usr/local/bin/aura & disown", bin),
-            AuraResolution::Bypass
+            classify("/usr/local/bin/baybo & disown", bin),
+            BayboResolution::Bypass
         ));
     }
 
     #[test]
-    fn classify_aura_sandbox_when_aura_not_leading() {
-        // Non-aura leaders keep the sandbox even when aura appears
+    fn classify_baybo_sandbox_when_baybo_not_leading() {
+        // Non-baybo leaders keep the sandbox even when baybo appears
         // later in the pipeline — the leader's argv0 is what drives
         // the classification.
-        let bin = Path::new("/usr/local/bin/aura");
+        let bin = Path::new("/usr/local/bin/baybo");
         assert!(matches!(
-            classify("echo $(/usr/local/bin/aura status)", bin),
-            AuraResolution::Sandbox
+            classify("echo $(/usr/local/bin/baybo status)", bin),
+            BayboResolution::Sandbox
         ));
         assert!(matches!(
-            classify("echo `/usr/local/bin/aura status`", bin),
-            AuraResolution::Sandbox
+            classify("echo `/usr/local/bin/baybo status`", bin),
+            BayboResolution::Sandbox
         ));
         assert!(matches!(
-            classify("cd /tmp && /usr/local/bin/aura status", bin),
-            AuraResolution::Sandbox
+            classify("cd /tmp && /usr/local/bin/baybo status", bin),
+            BayboResolution::Sandbox
         ));
     }
 
     #[test]
-    fn classify_aura_sandbox_for_unsafe_env_prefixes() {
+    fn classify_baybo_sandbox_for_unsafe_env_prefixes() {
         // Codex P1 fix: env vars outside the whitelist could subvert
-        // the aura process even with an absolute-path argv0
+        // the baybo process even with an absolute-path argv0
         // (`LD_PRELOAD` injection, `HOME` redirection, etc.). Force
         // the sandbox path rather than raising the absolute-path
         // error — fixing the path alone wouldn't make the command
         // safe.
-        let bin = Path::new("/usr/local/bin/aura");
+        let bin = Path::new("/usr/local/bin/baybo");
         assert!(matches!(
             classify(
-                "PATH=/tmp/malicious:/usr/bin /usr/local/bin/aura status",
+                "PATH=/tmp/malicious:/usr/bin /usr/local/bin/baybo status",
                 bin
             ),
-            AuraResolution::Sandbox
+            BayboResolution::Sandbox
         ));
         assert!(matches!(
-            classify("LD_PRELOAD=/tmp/evil.so /usr/local/bin/aura status", bin),
-            AuraResolution::Sandbox
+            classify("LD_PRELOAD=/tmp/evil.so /usr/local/bin/baybo status", bin),
+            BayboResolution::Sandbox
         ));
         assert!(matches!(
-            classify("LD_LIBRARY_PATH=/tmp/evil /usr/local/bin/aura status", bin),
-            AuraResolution::Sandbox
+            classify("LD_LIBRARY_PATH=/tmp/evil /usr/local/bin/baybo status", bin),
+            BayboResolution::Sandbox
         ));
         assert!(matches!(
             classify(
-                "DYLD_INSERT_LIBRARIES=/tmp/evil.dylib /usr/local/bin/aura status",
+                "DYLD_INSERT_LIBRARIES=/tmp/evil.dylib /usr/local/bin/baybo status",
                 bin
             ),
-            AuraResolution::Sandbox
+            BayboResolution::Sandbox
         ));
         assert!(matches!(
-            classify("HOME=/tmp /usr/local/bin/aura status", bin),
-            AuraResolution::Sandbox
+            classify("HOME=/tmp /usr/local/bin/baybo status", bin),
+            BayboResolution::Sandbox
         ));
         // Quote-stripped form must reach the same conclusion.
         assert!(matches!(
-            classify("'PATH=/tmp' /usr/local/bin/aura status", bin),
-            AuraResolution::Sandbox
+            classify("'PATH=/tmp' /usr/local/bin/baybo status", bin),
+            BayboResolution::Sandbox
         ));
         // Mixed prefix: an unsafe key anywhere in the chain kills
         // the bypass.
         assert!(matches!(
-            classify("AURA_LOG=trace PATH=/tmp /usr/local/bin/aura status", bin),
-            AuraResolution::Sandbox
+            classify("BAYBO_LOG=trace PATH=/tmp /usr/local/bin/baybo status", bin),
+            BayboResolution::Sandbox
         ));
     }
 
     #[test]
-    fn classify_aura_uses_bin_file_name() {
+    fn classify_baybo_uses_bin_file_name() {
         // If the gateway was installed under a different file_name
-        // (`aura2`), `aura` is no longer an aura attempt — it's just
+        // (`baybo2`), `baybo` is no longer an baybo attempt — it's just
         // an unrelated command → sandbox. The new basename drives
-        // both the `looks like aura` check and the canonical-path
+        // both the `looks like baybo` check and the canonical-path
         // bypass.
-        let bin = Path::new("/usr/local/bin/aura2");
+        let bin = Path::new("/usr/local/bin/baybo2");
         assert!(matches!(
-            classify("aura cost", bin),
-            AuraResolution::Sandbox
+            classify("baybo cost", bin),
+            BayboResolution::Sandbox
         ));
         assert!(matches!(
-            classify("aura2 cost", bin),
-            AuraResolution::RequireAbsolutePath
+            classify("baybo2 cost", bin),
+            BayboResolution::RequireAbsolutePath
         ));
         assert!(matches!(
-            classify("/usr/local/bin/aura2 cost", bin),
-            AuraResolution::Bypass
+            classify("/usr/local/bin/baybo2 cost", bin),
+            BayboResolution::Bypass
         ));
     }
 
     #[test]
     fn sandboxed_description_renders_without_leftover_placeholders() {
-        let d = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws")).description();
+        let d = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws")).description();
         assert!(
             !d.contains("{{"),
             "unfilled placeholder in description:\n{d}"
@@ -2709,7 +2709,7 @@ mod tests {
         let _ = std::fs::create_dir_all(work);
         // `none` Bash + a context with NO sandbox backend: it runs directly (no
         // OS sandbox), but the work-dir jail is still enforced at the tool layer.
-        let tool = BashTool::new(aura_workspace::WorkspacePaths::new("/tmp"))
+        let tool = BashTool::new(baybo_workspace::WorkspacePaths::new("/tmp"))
             .with_mode(BashSandboxMode::None);
         let ctx = ctx_with(None);
 
@@ -2737,7 +2737,7 @@ mod tests {
 
     #[test]
     fn none_description_drops_only_the_os_sandbox() {
-        let none = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws"))
+        let none = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
             .with_mode(BashSandboxMode::None);
         let d = none.description();
         assert!(
@@ -2766,7 +2766,7 @@ mod tests {
 
     #[test]
     fn auto_description_advertises_the_risk_judge() {
-        let auto = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws"))
+        let auto = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
             .with_mode(BashSandboxMode::Auto);
         let d = auto.description();
         assert!(
@@ -2788,7 +2788,7 @@ mod tests {
     #[test]
     fn mode_hot_swap_reskins_description_and_behavior() {
         let handle = Arc::new(LiveSandboxMode::new(BashSandboxMode::Sandboxed));
-        let tool = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws"))
+        let tool = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
             .with_mode_handle(Arc::clone(&handle));
         // Sandboxed: masked surface, OS sandbox on.
         assert!(tool.description().contains("masked with empty tmpfs"));
@@ -2812,7 +2812,7 @@ mod tests {
     fn none_keeps_uv_shims_in_wrap_command() {
         // `none` drops only the OS sandbox; python is still uv-shimmed (unlike
         // the bench profile). The uv exports + shim must survive.
-        let none = BashTool::new(aura_workspace::WorkspacePaths::new("/tmp"))
+        let none = BashTool::new(baybo_workspace::WorkspacePaths::new("/tmp"))
             .with_mode(BashSandboxMode::None);
         let wrapped = none.wrap_command("python -c 'x'");
         assert!(
@@ -2825,7 +2825,7 @@ mod tests {
         );
     }
 
-    /// The `bench-bash` profile (compile-time): run `cargo test -p aura-tools
+    /// The `bench-bash` profile (compile-time): run `cargo test -p baybo-tools
     /// --features bench-bash bench_profile` to exercise these. They assert the
     /// raw container behavior the feature switches on; the mode-specific tests
     /// above assume the feature is OFF (the default `cargo test`).
@@ -2836,7 +2836,7 @@ mod tests {
         #[test]
         fn description_is_the_raw_bench_prompt() {
             let cwd = std::env::current_dir().expect("cwd");
-            let d = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws")).description();
+            let d = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws")).description();
             assert!(!d.contains("{{"), "unfilled placeholder");
             assert!(
                 d.contains(&cwd.display().to_string()),
@@ -2852,7 +2852,7 @@ mod tests {
 
         #[test]
         fn wrap_command_skips_uv() {
-            let w = BashTool::new(aura_workspace::WorkspacePaths::new("/tmp"))
+            let w = BashTool::new(baybo_workspace::WorkspacePaths::new("/tmp"))
                 .wrap_command("python -c 'x'");
             assert!(!w.contains("uv run"), "bench leaked uv shim: {w}");
             assert!(!w.contains("UV_CACHE_DIR"), "bench leaked uv exports: {w}");
@@ -2862,8 +2862,8 @@ mod tests {
     fn ctx_with(sandbox: Option<Arc<dyn crate::ExecSandbox>>) -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -2872,7 +2872,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox,
             approval: None,
             notifier: None,
@@ -2919,9 +2919,9 @@ mod tests {
 
     /// A `BilledChat` that replies with one canned verdict, for driving the
     /// risk judge deterministically.
-    fn judge_llm(reply: &str) -> Arc<dyn aura_llm::BilledChat> {
-        use aura_llm::test_support::StubLlm;
-        use aura_llm::{BillableLlm, LlmCompletion, LlmResponse, TokenUsage};
+    fn judge_llm(reply: &str) -> Arc<dyn baybo_llm::BilledChat> {
+        use baybo_llm::test_support::StubLlm;
+        use baybo_llm::{BillableLlm, LlmCompletion, LlmResponse, TokenUsage};
         let stub = Arc::new(StubLlm::new());
         stub.push_response(LlmResponse {
             content: reply.to_string(),
@@ -3197,11 +3197,11 @@ mod tests {
     /// `logs_dir()/background` is writable) with a recording sink wired in.
     #[allow(clippy::type_complexity)]
     fn ctx_for_detached() -> (ToolContext, Arc<Mutex<Option<(String, String)>>>) {
-        let tmp = std::env::temp_dir().join(format!("aura-bgtest-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("baybo-bgtest-{}", uuid::Uuid::new_v4()));
         // `run_detached` detaches through `ctx.sandbox`; the fake spawns the
         // command directly so the test needs no real OS sandbox.
         let mut ctx = ctx_with(Some(Arc::new(FakeExecSandbox::new())));
-        ctx.workspace_paths = aura_workspace::WorkspacePaths::new(&tmp);
+        ctx.workspace_paths = baybo_workspace::WorkspacePaths::new(&tmp);
         let seen = Arc::new(Mutex::new(None));
         ctx.background_jobs = Some(Arc::new(RecordingSink {
             seen: Arc::clone(&seen),
@@ -3273,7 +3273,7 @@ mod tests {
     #[test]
     fn prune_outputs_respects_cutoff() {
         use std::time::{Duration as Dur, SystemTime};
-        let dir = std::env::temp_dir().join(format!("aura-prune-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("baybo-prune-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("job.out");
         std::fs::write(&f, b"x").unwrap();
@@ -3328,7 +3328,7 @@ mod tests {
             _name: &str,
             _value: &[u8],
             _overwrite: bool,
-        ) -> crate::Result<aura_security::AddOutcome> {
+        ) -> crate::Result<baybo_security::AddOutcome> {
             unreachable!("bash never adds secrets")
         }
         async fn list_names(&self) -> crate::Result<Vec<String>> {
@@ -3449,7 +3449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_rejects_bare_aura_with_absolute_path_error() {
+    async fn execute_rejects_bare_baybo_with_absolute_path_error() {
         // When the agent invokes the gateway binary by bare name
         // (basename match, no leading `/`), `execute` must refuse
         // with an `InvalidParams` error that names the correct
@@ -3481,9 +3481,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aura_invocations_bypass_the_sandbox() {
-        // `aura …` commands must NOT consult the sandbox: the sandbox
-        // masks `~/.aura`/`$AURA_HOME`, so a sandboxed aura process
+    async fn baybo_invocations_bypass_the_sandbox() {
+        // `baybo …` commands must NOT consult the sandbox: the sandbox
+        // masks `~/.baybo`/`$BAYBO_HOME`, so a sandboxed baybo process
         // can't see the gateway's config or session store. Two
         // assertions:
         //   1. The fake sandbox is never invoked.
@@ -3492,7 +3492,7 @@ mod tests {
         //
         // The match is keyed off the running binary's `current_exe()`
         // — under `cargo test` that's the test harness binary (e.g.
-        // `aura_tools-XXXX`), NOT `aura`. So we drive the bypass with
+        // `baybo_tools-XXXX`), NOT `baybo`. So we drive the bypass with
         // the absolute test-binary path; the underlying `sh -c` will
         // try to run the test binary with a non-existent arg, which
         // exits quickly without re-entering test discovery.
@@ -3505,30 +3505,30 @@ mod tests {
             stderr: Vec::new(),
             timed_out: false,
         });
-        let cmd = format!("{exe_path} --aura-bypass-probe-nonexistent-arg");
+        let cmd = format!("{exe_path} --baybo-bypass-probe-nonexistent-arg");
         let out = BashTool::for_test()
             .execute(
                 json!({ "command": cmd, "timeout_ms": 5000 }),
                 &ctx_with(Some(sandbox)),
             )
             .await
-            .expect("aura command must run unsandboxed");
+            .expect("baybo command must run unsandboxed");
         let ToolOutput::Json(_) = out else { panic!() };
         assert!(
             fake.calls().is_empty(),
-            "aura invocations must skip the sandbox: {:?}",
+            "baybo invocations must skip the sandbox: {:?}",
             fake.calls()
         );
 
         // And the bypass works even when no sandbox is installed.
-        let cmd = format!("{exe_path} --aura-bypass-probe-nonexistent-arg");
+        let cmd = format!("{exe_path} --baybo-bypass-probe-nonexistent-arg");
         BashTool::for_test()
             .execute(
                 json!({ "command": cmd, "timeout_ms": 5000 }),
                 &ctx_with(None),
             )
             .await
-            .expect("aura command must run even without a sandbox");
+            .expect("baybo command must run even without a sandbox");
     }
 
     #[tokio::test]
@@ -4515,7 +4515,10 @@ mod tests {
     #[tokio::test]
     async fn unsandboxed_runner_injects_extra_env() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let extra = [("AURA_TEST_SECRET".to_string(), "injected-value".to_string())];
+        let extra = [(
+            "BAYBO_TEST_SECRET".to_string(),
+            "injected-value".to_string(),
+        )];
         let out = run_unsandboxed(
             "env",
             &[],
@@ -4529,7 +4532,7 @@ mod tests {
         assert!(
             stdout
                 .lines()
-                .any(|l| l == "AURA_TEST_SECRET=injected-value"),
+                .any(|l| l == "BAYBO_TEST_SECRET=injected-value"),
             "injected env var must reach the child:\n{stdout}"
         );
     }

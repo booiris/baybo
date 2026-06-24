@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use aura_config::AuraConfig;
-use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
+use baybo_config::BayboConfig;
+use baybo_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 
 use crate::cli::ConfigCmd;
 use crate::context::{CommandContext, Invocation};
@@ -47,7 +47,7 @@ async fn validate(ctx: &CommandContext, file: Option<String>) -> Result<CommandO
         .or_else(|| std::env::var(ENV_CONFIG_PATH).ok().map(PathBuf::from))
         .unwrap_or_else(default_config_file);
 
-    match AuraConfig::load_from_file(&path).await {
+    match BayboConfig::load_from_file(&path).await {
         Ok(_) => Ok(CommandOutput::structured(
             format!("{} is valid", path.display()),
             &serde_json::json!({
@@ -80,7 +80,7 @@ fn file(ctx: &CommandContext) -> Result<CommandOutput> {
 }
 
 fn schema() -> Result<CommandOutput> {
-    let default = AuraConfig::default();
+    let default = BayboConfig::default();
     let value = serde_json::to_value(&default)?;
     let human = serde_json::to_string_pretty(&value)?;
     Ok(CommandOutput {
@@ -146,8 +146,8 @@ fn get(ctx: &CommandContext, path: &str) -> Result<CommandOutput> {
 }
 
 /// Parse `raw` as JSON; on failure, treat it as a bare string literal. This
-/// keeps `aura config set llm.model gpt-5` ergonomic while still supporting
-/// `aura config set agent.max_iterations 100` and `aura config set cost.enabled true`.
+/// keeps `baybo config set llm.model gpt-5` ergonomic while still supporting
+/// `baybo config set agent.max_iterations 100` and `baybo config set cost.enabled true`.
 fn parse_value(raw: &str) -> serde_json::Value {
     match serde_json::from_str::<serde_json::Value>(raw) {
         Ok(v) => v,

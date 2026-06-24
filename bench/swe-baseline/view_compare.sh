@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# One-click: regenerate the aura-vs-mini-swe-agent trajectory comparison and
+# One-click: regenerate the baybo-vs-mini-swe-agent trajectory comparison and
 # (optionally) serve it. Runs all three exporters in order:
-#   ../swe/export_aura_trajs.py   aura trace .messages.json  -> per-instance .md
+#   ../swe/export_baybo_trajs.py   baybo trace .messages.json  -> per-instance .md
 #   ./export_trajs.py             mini .traj.json            -> per-instance .md
 #   ./compare_arms.py             both .md sets              -> _compare/compare.html
 #
@@ -12,7 +12,7 @@
 #   bench/swe-baseline/view_compare.sh                 # latest runs, serve on :8091
 #   PORT=9000 bench/swe-baseline/view_compare.sh       # different port
 #   SERVE=0   bench/swe-baseline/view_compare.sh       # just regenerate, don't serve
-#   AURA_RID=full300-… MINI_RID=baseline-full300-… bench/swe-baseline/view_compare.sh  # pin runs
+#   BAYBO_RID=full300-… MINI_RID=baseline-full300-… bench/swe-baseline/view_compare.sh  # pin runs
 set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,20 +23,20 @@ PY="${PY:-python3}"   # all three scripts are stdlib-only
 
 # resolve run ids from the latest-* result symlinks (override via env) ---------
 derive() { local t; t="$(basename "$(readlink -f "$1")")"; t="${t#"$2"}"; echo "${t%.json}"; }
-: "${AURA_RID:=$(derive "$SWE_DIR/results/latest-agent.json" results-agent-)}"
+: "${BAYBO_RID:=$(derive "$SWE_DIR/results/latest-agent.json" results-agent-)}"
 : "${MINI_RID:=$(derive "$BASE_DIR/results/latest-baseline.json" results-baseline-)}"
-echo ">> aura run: $AURA_RID"
+echo ">> baybo run: $BAYBO_RID"
 echo ">> mini run: $MINI_RID"
 
-echo ">> export aura trajectories"
-( cd "$SWE_DIR" && "$PY" export_aura_trajs.py --run-id "$AURA_RID" )
+echo ">> export baybo trajectories"
+( cd "$SWE_DIR" && "$PY" export_baybo_trajs.py --run-id "$BAYBO_RID" )
 echo ">> export mini trajectories"
 ( cd "$BASE_DIR" && "$PY" export_trajs.py --run-id "$MINI_RID" )
 echo ">> build side-by-side compare.html"
 ( cd "$BASE_DIR" && "$PY" compare_arms.py \
-    --aura-export "$SWE_DIR/trace/$AURA_RID/_export" \
+    --baybo-export "$SWE_DIR/trace/$BAYBO_RID/_export" \
     --mini-export "runs/$MINI_RID/_export" \
-    --aura-results "$SWE_DIR/results/results-agent-$AURA_RID.json" \
+    --baybo-results "$SWE_DIR/results/results-agent-$BAYBO_RID.json" \
     --mini-results "results/results-baseline-$MINI_RID.json" \
     --out _compare/compare.html )
 

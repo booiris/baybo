@@ -2,8 +2,8 @@
 //!
 //! Every type that appears in an admin-API response lives here and
 //! derives [`utoipa::ToSchema`] so `crate::openapi` can emit a spec
-//! matching the wire format. Domain types in `aura-model`, `aura-job`,
-//! `aura-cron`, `aura-tools` deliberately stay free of utoipa so
+//! matching the wire format. Domain types in `baybo-model`, `baybo-job`,
+//! `baybo-cron`, `baybo-tools` deliberately stay free of utoipa so
 //! changes over there don't silently reshape the HTTP surface — every
 //! field crossing the API boundary has an explicit DTO mirror plus a
 //! `From` conversion, and the drift test picks up any schema change.
@@ -11,7 +11,7 @@
 //! When a domain type changes:
 //!
 //! * If the DTO should follow, update the mirror here and its `From`
-//!   impl, then run `UPDATE_OPENAPI=1 cargo test -p aura-gateway
+//!   impl, then run `UPDATE_OPENAPI=1 cargo test -p baybo-gateway
 //!   --test openapi_spec_sync` + `cd web && npm run gen:api`.
 //! * If the DTO should stay fixed (back-compat), the conversion
 //!   absorbs the rename/removal here, keeping clients stable.
@@ -68,7 +68,7 @@ pub struct ErrorBody {
 
 // ── ChannelType ──────────────────────────────────────────────────────
 
-/// Admin-surface mirror of [`aura_model::ChannelType`]. Transparent
+/// Admin-surface mirror of [`baybo_model::ChannelType`]. Transparent
 /// wrapper around a snake_case string so the OpenAPI surface stays
 /// stable while the core type is open-ended (runtime-registered
 /// sidecars like `"slack"` pass through unchanged).
@@ -77,15 +77,15 @@ pub struct ErrorBody {
 #[schema(value_type = String)]
 pub struct ChannelType(pub String);
 
-impl From<aura_model::ChannelType> for ChannelType {
-    fn from(v: aura_model::ChannelType) -> Self {
+impl From<baybo_model::ChannelType> for ChannelType {
+    fn from(v: baybo_model::ChannelType) -> Self {
         Self(v.into_string())
     }
 }
 
-impl From<ChannelType> for aura_model::ChannelType {
+impl From<ChannelType> for baybo_model::ChannelType {
     fn from(v: ChannelType) -> Self {
-        aura_model::ChannelType::from(v.0)
+        baybo_model::ChannelType::from(v.0)
     }
 }
 
@@ -153,7 +153,7 @@ pub struct GoalItem {
 }
 
 impl GoalItem {
-    pub fn from_goal(session_id: &aura_model::SessionId, goal: &aura_model::Goal) -> Self {
+    pub fn from_goal(session_id: &baybo_model::SessionId, goal: &baybo_model::Goal) -> Self {
         Self {
             session_id: session_id.as_str().to_string(),
             objective: goal.objective.clone(),
@@ -193,7 +193,7 @@ pub struct MutateResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetConfigRequest {
     pub path: String,
-    /// JSON value written at `path`. Shape validated by `AuraConfig`.
+    /// JSON value written at `path`. Shape validated by `BayboConfig`.
     #[schema(value_type = Object)]
     pub value: serde_json::Value,
 }
@@ -214,28 +214,28 @@ pub struct LlmInfo {
 // ── Models dashboard ─────────────────────────────────────────────────
 
 /// Per-entry pricing override fields. Wire shape mirrors
-/// [`aura_model::LlmPricingOverride`]; each field is integer micro-USD
+/// [`baybo_model::LlmPricingOverride`]; each field is integer micro-USD
 /// per 1M tokens (1 USD = 1_000_000). The DTO exists separately from
 /// the canonical struct only so we can derive `ToSchema` for utoipa
-/// without leaking that derive into `aura-model`.
+/// without leaking that derive into `baybo-model`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
 pub struct LlmPricingOverrideDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<i64>)]
-    pub input_per_1m_tokens: Option<aura_model::MicroUsd>,
+    pub input_per_1m_tokens: Option<baybo_model::MicroUsd>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<i64>)]
-    pub output_per_1m_tokens: Option<aura_model::MicroUsd>,
+    pub output_per_1m_tokens: Option<baybo_model::MicroUsd>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<i64>)]
-    pub cached_input_per_1m_tokens: Option<aura_model::MicroUsd>,
+    pub cached_input_per_1m_tokens: Option<baybo_model::MicroUsd>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<i64>)]
-    pub cache_write_per_1m_tokens: Option<aura_model::MicroUsd>,
+    pub cache_write_per_1m_tokens: Option<baybo_model::MicroUsd>,
 }
 
-impl From<aura_model::LlmPricingOverride> for LlmPricingOverrideDto {
-    fn from(v: aura_model::LlmPricingOverride) -> Self {
+impl From<baybo_model::LlmPricingOverride> for LlmPricingOverrideDto {
+    fn from(v: baybo_model::LlmPricingOverride) -> Self {
         Self {
             input_per_1m_tokens: v.input_per_1m_tokens,
             output_per_1m_tokens: v.output_per_1m_tokens,
@@ -245,7 +245,7 @@ impl From<aura_model::LlmPricingOverride> for LlmPricingOverrideDto {
     }
 }
 
-impl From<LlmPricingOverrideDto> for aura_model::LlmPricingOverride {
+impl From<LlmPricingOverrideDto> for baybo_model::LlmPricingOverride {
     fn from(v: LlmPricingOverrideDto) -> Self {
         Self {
             input_per_1m_tokens: v.input_per_1m_tokens,
@@ -261,15 +261,15 @@ impl From<LlmPricingOverrideDto> for aura_model::LlmPricingOverride {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
 pub struct LlmModelPricingDto {
     #[schema(value_type = i64)]
-    pub input_per_1m_tokens: aura_model::MicroUsd,
+    pub input_per_1m_tokens: baybo_model::MicroUsd,
     #[schema(value_type = i64)]
-    pub output_per_1m_tokens: aura_model::MicroUsd,
+    pub output_per_1m_tokens: baybo_model::MicroUsd,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<i64>)]
-    pub cached_input_per_1m_tokens: Option<aura_model::MicroUsd>,
+    pub cached_input_per_1m_tokens: Option<baybo_model::MicroUsd>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<i64>)]
-    pub cache_write_per_1m_tokens: Option<aura_model::MicroUsd>,
+    pub cache_write_per_1m_tokens: Option<baybo_model::MicroUsd>,
 }
 
 /// One row in `GET /v1/llm/models`. Carries both the raw config (so the
@@ -404,7 +404,7 @@ pub struct LlmModelUsage {
     pub cached_input_tokens: usize,
     pub cache_creation_input_tokens: usize,
     #[schema(value_type = i64)]
-    pub cost_micro_usd: aura_model::MicroUsd,
+    pub cost_micro_usd: baybo_model::MicroUsd,
 }
 
 /// `GET /v1/llm/usage` response.
@@ -451,7 +451,7 @@ pub struct SendMessageResponse {
 }
 
 /// `POST /v1/cron` body. Schedule format is the standard 5-field cron
-/// string accepted by [`aura_cron`].
+/// string accepted by [`baybo_cron`].
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateCronRequest {
     pub schedule: String,
@@ -470,7 +470,7 @@ pub struct CreateCronRequest {
 
 // ── Job ──────────────────────────────────────────────────────────────
 
-/// Wire mirror of [`aura_job::JobStatus`]. Carries the same payload
+/// Wire mirror of [`baybo_job::JobStatus`]. Carries the same payload
 /// the domain enum carries (cancel reason, partial-artifact span IDs);
 /// the wire shape collapses inner-variant content into `Option`-typed
 /// fields so HTTP clients can decode without needing the full Rust
@@ -498,20 +498,20 @@ pub enum JobStatusKind {
     Completed,
 }
 
-impl From<aura_job::JobStatusKind> for JobStatusKind {
-    fn from(v: aura_job::JobStatusKind) -> Self {
+impl From<baybo_job::JobStatusKind> for JobStatusKind {
+    fn from(v: baybo_job::JobStatusKind) -> Self {
         match v {
-            aura_job::JobStatusKind::Pending => Self::Pending,
-            aura_job::JobStatusKind::InProgress => Self::InProgress,
-            aura_job::JobStatusKind::Stuck => Self::Stuck,
-            aura_job::JobStatusKind::Cancelled => Self::Cancelled,
-            aura_job::JobStatusKind::Failed => Self::Failed,
-            aura_job::JobStatusKind::Completed => Self::Completed,
+            baybo_job::JobStatusKind::Pending => Self::Pending,
+            baybo_job::JobStatusKind::InProgress => Self::InProgress,
+            baybo_job::JobStatusKind::Stuck => Self::Stuck,
+            baybo_job::JobStatusKind::Cancelled => Self::Cancelled,
+            baybo_job::JobStatusKind::Failed => Self::Failed,
+            baybo_job::JobStatusKind::Completed => Self::Completed,
         }
     }
 }
 
-impl From<JobStatusKind> for aura_job::JobStatusKind {
+impl From<JobStatusKind> for baybo_job::JobStatusKind {
     fn from(v: JobStatusKind) -> Self {
         match v {
             JobStatusKind::Pending => Self::Pending,
@@ -524,19 +524,19 @@ impl From<JobStatusKind> for aura_job::JobStatusKind {
     }
 }
 
-impl From<aura_job::JobStatus> for JobStatus {
-    fn from(v: aura_job::JobStatus) -> Self {
+impl From<baybo_job::JobStatus> for JobStatus {
+    fn from(v: baybo_job::JobStatus) -> Self {
         let kind = JobStatusKind::from(v.kind());
         match v {
-            aura_job::JobStatus::Pending
-            | aura_job::JobStatus::InProgress
-            | aura_job::JobStatus::Completed => Self {
+            baybo_job::JobStatus::Pending
+            | baybo_job::JobStatus::InProgress
+            | baybo_job::JobStatus::Completed => Self {
                 kind,
                 reason: None,
                 cancel_reason: None,
                 partial_artifacts: Vec::new(),
             },
-            aura_job::JobStatus::Stuck { reason } | aura_job::JobStatus::Failed { reason } => {
+            baybo_job::JobStatus::Stuck { reason } | baybo_job::JobStatus::Failed { reason } => {
                 Self {
                     kind,
                     reason: Some(reason),
@@ -544,7 +544,7 @@ impl From<aura_job::JobStatus> for JobStatus {
                     partial_artifacts: Vec::new(),
                 }
             }
-            aura_job::JobStatus::Cancelled {
+            baybo_job::JobStatus::Cancelled {
                 reason,
                 partial_artifacts,
             } => Self {
@@ -560,7 +560,7 @@ impl From<aura_job::JobStatus> for JobStatus {
     }
 }
 
-/// Wire mirror of [`aura_job::JobInputKind`] — what payload fed the job.
+/// Wire mirror of [`baybo_job::JobInputKind`] — what payload fed the job.
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobInputKind {
@@ -572,21 +572,21 @@ pub enum JobInputKind {
     GoalContinuation,
 }
 
-impl From<aura_job::JobInputKind> for JobInputKind {
-    fn from(v: aura_job::JobInputKind) -> Self {
+impl From<baybo_job::JobInputKind> for JobInputKind {
+    fn from(v: baybo_job::JobInputKind) -> Self {
         match v {
-            aura_job::JobInputKind::UserChat => Self::UserChat,
-            aura_job::JobInputKind::Cron => Self::Cron,
-            aura_job::JobInputKind::System => Self::System,
-            aura_job::JobInputKind::Spawned => Self::Spawned,
-            aura_job::JobInputKind::SubagentNotification => Self::SubagentNotification,
-            aura_job::JobInputKind::GoalContinuation => Self::GoalContinuation,
+            baybo_job::JobInputKind::UserChat => Self::UserChat,
+            baybo_job::JobInputKind::Cron => Self::Cron,
+            baybo_job::JobInputKind::System => Self::System,
+            baybo_job::JobInputKind::Spawned => Self::Spawned,
+            baybo_job::JobInputKind::SubagentNotification => Self::SubagentNotification,
+            baybo_job::JobInputKind::GoalContinuation => Self::GoalContinuation,
         }
     }
 }
 
 /// Wire mirror of a job's origin (the owning session's root trigger,
-/// [`aura_model::TriggerKind`]).
+/// [`baybo_model::TriggerKind`]).
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobOrigin {
@@ -596,18 +596,18 @@ pub enum JobOrigin {
     Spawned,
 }
 
-impl From<aura_model::TriggerKind> for JobOrigin {
-    fn from(v: aura_model::TriggerKind) -> Self {
+impl From<baybo_model::TriggerKind> for JobOrigin {
+    fn from(v: baybo_model::TriggerKind) -> Self {
         match v {
-            aura_model::TriggerKind::User => Self::User,
-            aura_model::TriggerKind::Cron => Self::Cron,
-            aura_model::TriggerKind::System => Self::System,
-            aura_model::TriggerKind::Spawned => Self::Spawned,
+            baybo_model::TriggerKind::User => Self::User,
+            baybo_model::TriggerKind::Cron => Self::Cron,
+            baybo_model::TriggerKind::System => Self::System,
+            baybo_model::TriggerKind::Spawned => Self::Spawned,
         }
     }
 }
 
-/// Wire mirror of [`aura_job::JobShape`] — turn vs maintenance.
+/// Wire mirror of [`baybo_job::JobShape`] — turn vs maintenance.
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobShape {
@@ -615,16 +615,16 @@ pub enum JobShape {
     Maintenance,
 }
 
-impl From<aura_job::JobShape> for JobShape {
-    fn from(v: aura_job::JobShape) -> Self {
+impl From<baybo_job::JobShape> for JobShape {
+    fn from(v: baybo_job::JobShape) -> Self {
         match v {
-            aura_job::JobShape::Turn => Self::Turn,
-            aura_job::JobShape::Maintenance => Self::Maintenance,
+            baybo_job::JobShape::Turn => Self::Turn,
+            baybo_job::JobShape::Maintenance => Self::Maintenance,
         }
     }
 }
 
-/// Wire mirror of [`aura_job::Job`]. Inner shape reflects the new
+/// Wire mirror of [`baybo_job::Job`]. Inner shape reflects the new
 /// state machine (Q6) — `final_result` replaces `output`/`error`,
 /// `emitted_span_ids` replaces `trace_span_id`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -647,8 +647,8 @@ pub struct Job {
     pub ended_at: Option<DateTime<Utc>>,
 }
 
-impl From<aura_job::Job> for Job {
-    fn from(v: aura_job::Job) -> Self {
+impl From<baybo_job::Job> for Job {
+    fn from(v: baybo_job::Job) -> Self {
         Self {
             id: v.id.to_string(),
             session_id: v.session_id.to_string(),
@@ -674,7 +674,7 @@ impl From<aura_job::Job> for Job {
 
 // ── CronJob ──────────────────────────────────────────────────────────
 
-/// Mirror of [`aura_cron::CronStatus`].
+/// Mirror of [`baybo_cron::CronStatus`].
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CronStatus {
@@ -683,17 +683,17 @@ pub enum CronStatus {
     Executed,
 }
 
-impl From<aura_cron::CronStatus> for CronStatus {
-    fn from(v: aura_cron::CronStatus) -> Self {
+impl From<baybo_cron::CronStatus> for CronStatus {
+    fn from(v: baybo_cron::CronStatus) -> Self {
         match v {
-            aura_cron::CronStatus::Enabled => Self::Enabled,
-            aura_cron::CronStatus::Disabled => Self::Disabled,
-            aura_cron::CronStatus::Executed => Self::Executed,
+            baybo_cron::CronStatus::Enabled => Self::Enabled,
+            baybo_cron::CronStatus::Disabled => Self::Disabled,
+            baybo_cron::CronStatus::Executed => Self::Executed,
         }
     }
 }
 
-/// Mirror of [`aura_cron::CronSchedule`].
+/// Mirror of [`baybo_cron::CronSchedule`].
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CronSchedule {
@@ -701,16 +701,16 @@ pub enum CronSchedule {
     At { time: DateTime<Utc> },
 }
 
-impl From<aura_cron::CronSchedule> for CronSchedule {
-    fn from(v: aura_cron::CronSchedule) -> Self {
+impl From<baybo_cron::CronSchedule> for CronSchedule {
+    fn from(v: baybo_cron::CronSchedule) -> Self {
         match v {
-            aura_cron::CronSchedule::Cron { expr } => Self::Cron { expr },
-            aura_cron::CronSchedule::At { time } => Self::At { time },
+            baybo_cron::CronSchedule::Cron { expr } => Self::Cron { expr },
+            baybo_cron::CronSchedule::At { time } => Self::At { time },
         }
     }
 }
 
-/// Mirror of [`aura_cron::CronJob`].
+/// Mirror of [`baybo_cron::CronJob`].
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CronJob {
     pub id: String,
@@ -728,8 +728,8 @@ pub struct CronJob {
     pub origin_session_id: Option<String>,
 }
 
-impl From<aura_cron::CronJob> for CronJob {
-    fn from(v: aura_cron::CronJob) -> Self {
+impl From<baybo_cron::CronJob> for CronJob {
+    fn from(v: baybo_cron::CronJob) -> Self {
         Self {
             id: v.id,
             user_id: v.user_id,
@@ -802,7 +802,7 @@ pub struct LogEntry {
     pub timestamp: DateTime<Utc>,
     pub level: LogLevel,
     /// Tracing target that emitted the record (e.g.
-    /// `aura_gateway::server`). Rendered as "source" in the UI.
+    /// `baybo_gateway::server`). Rendered as "source" in the UI.
     pub target: String,
     pub message: String,
     pub fields: Vec<LogField>,
@@ -856,7 +856,7 @@ pub struct LogsResponse {
 
 // ── Trace session summary (list view) ───────────────────────────────
 
-/// Wire mirror of [`aura_query::SessionKind`]. Coarse trigger/lineage
+/// Wire mirror of [`baybo_query::SessionKind`]. Coarse trigger/lineage
 /// label for the trace browser list view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -866,17 +866,17 @@ pub enum SessionKind {
     Subagent,
 }
 
-impl From<aura_query::SessionKind> for SessionKind {
-    fn from(v: aura_query::SessionKind) -> Self {
+impl From<baybo_query::SessionKind> for SessionKind {
+    fn from(v: baybo_query::SessionKind) -> Self {
         match v {
-            aura_query::SessionKind::User => Self::User,
-            aura_query::SessionKind::Cron => Self::Cron,
-            aura_query::SessionKind::Subagent => Self::Subagent,
+            baybo_query::SessionKind::User => Self::User,
+            baybo_query::SessionKind::Cron => Self::Cron,
+            baybo_query::SessionKind::Subagent => Self::Subagent,
         }
     }
 }
 
-impl From<SessionKind> for aura_query::SessionKind {
+impl From<SessionKind> for baybo_query::SessionKind {
     fn from(v: SessionKind) -> Self {
         match v {
             SessionKind::User => Self::User,
@@ -913,7 +913,7 @@ pub struct TracesListQuery {
 }
 
 /// One row of the trace browser list view. Mirrors
-/// [`aura_query::SessionSummary`] for the wire.
+/// [`baybo_query::SessionSummary`] for the wire.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TraceSessionSummary {
     pub session_id: String,
@@ -933,8 +933,8 @@ pub struct TraceSessionSummary {
     pub cache_creation_input_tokens: usize,
 }
 
-impl From<aura_query::SessionSummary> for TraceSessionSummary {
-    fn from(v: aura_query::SessionSummary) -> Self {
+impl From<baybo_query::SessionSummary> for TraceSessionSummary {
+    fn from(v: baybo_query::SessionSummary) -> Self {
         Self {
             session_id: v.session_id.to_string(),
             created_at: v.created_at,
@@ -986,12 +986,12 @@ pub struct AnalyticsDayBucket {
     pub cache_creation_input_tokens: usize,
     /// Spend for the day, in **micro-USD** (1 USD = 1_000_000).
     #[schema(value_type = i64)]
-    pub cost_micro_usd: aura_model::MicroUsd,
+    pub cost_micro_usd: baybo_model::MicroUsd,
     pub sessions_created: usize,
 }
 
-impl From<aura_query::AnalyticsDayBucket> for AnalyticsDayBucket {
-    fn from(v: aura_query::AnalyticsDayBucket) -> Self {
+impl From<baybo_query::AnalyticsDayBucket> for AnalyticsDayBucket {
+    fn from(v: baybo_query::AnalyticsDayBucket) -> Self {
         Self {
             date: v.date,
             input_tokens: v.input_tokens,
@@ -1014,12 +1014,12 @@ pub struct AnalyticsModelBucket {
     pub cache_creation_input_tokens: usize,
     /// Spend for the model, in **micro-USD** (1 USD = 1_000_000).
     #[schema(value_type = i64)]
-    pub cost_micro_usd: aura_model::MicroUsd,
+    pub cost_micro_usd: baybo_model::MicroUsd,
     pub call_count: usize,
 }
 
-impl From<aura_query::AnalyticsModelBucket> for AnalyticsModelBucket {
-    fn from(v: aura_query::AnalyticsModelBucket) -> Self {
+impl From<baybo_query::AnalyticsModelBucket> for AnalyticsModelBucket {
+    fn from(v: baybo_query::AnalyticsModelBucket) -> Self {
         Self {
             model: v.model,
             input_tokens: v.input_tokens,
@@ -1043,12 +1043,12 @@ pub struct AnalyticsReasonBucket {
     pub cache_creation_input_tokens: usize,
     /// Spend for the reason, in **micro-USD** (1 USD = 1_000_000).
     #[schema(value_type = i64)]
-    pub cost_micro_usd: aura_model::MicroUsd,
+    pub cost_micro_usd: baybo_model::MicroUsd,
     pub call_count: usize,
 }
 
-impl From<aura_query::AnalyticsReasonBucket> for AnalyticsReasonBucket {
-    fn from(v: aura_query::AnalyticsReasonBucket) -> Self {
+impl From<baybo_query::AnalyticsReasonBucket> for AnalyticsReasonBucket {
+    fn from(v: baybo_query::AnalyticsReasonBucket) -> Self {
         Self {
             reason: v.reason.to_token().into_owned(),
             input_tokens: v.input_tokens,
@@ -1074,7 +1074,7 @@ pub struct AnalyticsResponse {
     pub total_cache_creation_input_tokens: usize,
     /// Total spend across the window, in **micro-USD** (1 USD = 1_000_000).
     #[schema(value_type = i64)]
-    pub total_cost_micro_usd: aura_model::MicroUsd,
+    pub total_cost_micro_usd: baybo_model::MicroUsd,
     pub total_record_count: usize,
     pub daily: Vec<AnalyticsDayBucket>,
     pub by_model: Vec<AnalyticsModelBucket>,
@@ -1083,7 +1083,7 @@ pub struct AnalyticsResponse {
 
 // ── ToolDefinition ───────────────────────────────────────────────────
 
-/// Mirror of [`aura_tools::ToolDefinition`].
+/// Mirror of [`baybo_tools::ToolDefinition`].
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ToolDefinition {
     pub name: String,
@@ -1092,8 +1092,8 @@ pub struct ToolDefinition {
     pub parameters_schema: serde_json::Value,
 }
 
-impl From<aura_tools::ToolDefinition> for ToolDefinition {
-    fn from(v: aura_tools::ToolDefinition) -> Self {
+impl From<baybo_tools::ToolDefinition> for ToolDefinition {
+    fn from(v: baybo_tools::ToolDefinition) -> Self {
         Self {
             name: v.name,
             description: v.description,

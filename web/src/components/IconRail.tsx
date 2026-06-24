@@ -41,7 +41,7 @@ export function IconRail({ version }: { version?: string }) {
     <aside className="w-12 shrink-0 bg-brand border-r-2 border-black flex flex-col items-center gap-3 pt-3 pb-3">
       <NavLink
         to="/chat"
-        title={version ? `Chat · Aura v${version}` : 'Chat'}
+        title={version ? `Chat · Baybo v${version}` : 'Chat'}
         className={({ isActive }) =>
           `flex h-8 w-8 items-center justify-center rounded-brutal border-2 border-black font-bold text-base text-ink transition-[transform,box-shadow] duration-100 ${
             isActive

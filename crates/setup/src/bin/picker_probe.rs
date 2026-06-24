@@ -2,7 +2,7 @@
 //! `test-support` feature (see the `required-features` gate in
 //! `Cargo.toml`) so it never ships in a release build, and launched inside
 //! a tmux pane by `crates/setup/tests/picker_render.rs` (via
-//! `aura-term-harness`) so the crossterm picker can be driven and its
+//! `baybo-term-harness`) so the crossterm picker can be driven and its
 //! rendered frames captured.
 //!
 //! Usage: `picker_probe <select|multi> <label> [option...]`
@@ -18,7 +18,7 @@
 
 use std::io::{BufRead, Write};
 
-use aura_setup::{Prompter, TtyPrompter};
+use baybo_setup::{Prompter, TtyPrompter};
 
 fn main() {
     let mut args = std::env::args().skip(1);

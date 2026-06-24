@@ -1,7 +1,7 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "Aura Admin API",
+    "title": "Baybo Admin API",
     "description": "TCP + bearer-token surface: config, jobs, cron, traces, skills, tools, channels, LLM.",
     "license": {
       "name": ""
@@ -1153,7 +1153,7 @@
         "operationId": "get_config",
         "responses": {
           "200": {
-            "description": "Current in-memory config. Secret fields are redacted by `AuraConfig`'s serde impl.",
+            "description": "Current in-memory config. Secret fields are redacted by `BayboConfig`'s serde impl.",
             "content": {
               "application/json": {
                 "schema": {}
@@ -1361,7 +1361,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "Mirror of [`aura_cron::CronJob`].",
+                        "description": "Mirror of [`baybo_cron::CronJob`].",
                         "required": [
                           "id",
                           "user_id",
@@ -1715,7 +1715,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "Wire mirror of [`aura_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
+                        "description": "Wire mirror of [`baybo_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
                         "required": [
                           "id",
                           "session_id",
@@ -2539,7 +2539,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "Mirror of [`aura_tools::ToolDefinition`].",
+                        "description": "Mirror of [`baybo_tools::ToolDefinition`].",
                         "required": [
                           "name",
                           "description",
@@ -3046,7 +3046,7 @@
       },
       "ChannelType": {
         "type": "string",
-        "description": "Admin-surface mirror of [`aura_model::ChannelType`]. Transparent\nwrapper around a snake_case string so the OpenAPI surface stays\nstable while the core type is open-ended (runtime-registered\nsidecars like `\"slack\"` pass through unchanged)."
+        "description": "Admin-surface mirror of [`baybo_model::ChannelType`]. Transparent\nwrapper around a snake_case string so the OpenAPI surface stays\nstable while the core type is open-ended (runtime-registered\nsidecars like `\"slack\"` pass through unchanged)."
       },
       "ChatCronMessage": {
         "type": "object",
@@ -3075,7 +3075,7 @@
           },
           "prompt": {
             "type": "string",
-            "description": "The user-facing prompt for this fire. Truncated to\n[`PREVIEW_MAX_CHARS`]. The persisted user row carries the cron\ndispatcher's fire-time framing; `aura_context::prompts::cron::original_cron_prompt`\nrecovers the instruction as configured so the panel shows that,\nnot the framing boilerplate."
+            "description": "The user-facing prompt for this fire. Truncated to\n[`PREVIEW_MAX_CHARS`]. The persisted user row carries the cron\ndispatcher's fire-time framing; `baybo_context::prompts::cron::original_cron_prompt`\nrecovers the instruction as configured so the panel shows that,\nnot the framing boilerplate."
           },
           "response": {
             "type": [
@@ -3158,7 +3158,7 @@
               "string",
               "null"
             ],
-            "description": "Per-session LLM pin (`session.state.last_llm`): the `aura.json`\nentry name this session's turns resolve against, or `null` to\nfollow `default-llm`. Drives the chat header model picker's\ninitial selection. Set via `PUT /v1/chat/sessions/{id}/model`."
+            "description": "Per-session LLM pin (`session.state.last_llm`): the `baybo.json`\nentry name this session's turns resolve against, or `null` to\nfollow `default-llm`. Drives the chat header model picker's\ninitial selection. Set via `PUT /v1/chat/sessions/{id}/model`."
           },
           "newest_ordinal": {
             "type": [
@@ -3364,7 +3364,7 @@
       },
       "CreateCronRequest": {
         "type": "object",
-        "description": "`POST /v1/cron` body. Schedule format is the standard 5-field cron\nstring accepted by [`aura_cron`].",
+        "description": "`POST /v1/cron` body. Schedule format is the standard 5-field cron\nstring accepted by [`baybo_cron`].",
         "required": [
           "schedule",
           "user_id",
@@ -3423,7 +3423,7 @@
       },
       "CronJob": {
         "type": "object",
-        "description": "Mirror of [`aura_cron::CronJob`].",
+        "description": "Mirror of [`baybo_cron::CronJob`].",
         "required": [
           "id",
           "user_id",
@@ -3527,11 +3527,11 @@
             }
           }
         ],
-        "description": "Mirror of [`aura_cron::CronSchedule`]."
+        "description": "Mirror of [`baybo_cron::CronSchedule`]."
       },
       "CronStatus": {
         "type": "string",
-        "description": "Mirror of [`aura_cron::CronStatus`].",
+        "description": "Mirror of [`baybo_cron::CronStatus`].",
         "enum": [
           "enabled",
           "disabled",
@@ -3672,7 +3672,7 @@
       },
       "Job": {
         "type": "object",
-        "description": "Wire mirror of [`aura_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
+        "description": "Wire mirror of [`baybo_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
         "required": [
           "id",
           "session_id",
@@ -3745,7 +3745,7 @@
       },
       "JobInputKind": {
         "type": "string",
-        "description": "Wire mirror of [`aura_job::JobInputKind`] — what payload fed the job.",
+        "description": "Wire mirror of [`baybo_job::JobInputKind`] — what payload fed the job.",
         "enum": [
           "user_chat",
           "cron",
@@ -3757,7 +3757,7 @@
       },
       "JobOrigin": {
         "type": "string",
-        "description": "Wire mirror of a job's origin (the owning session's root trigger,\n[`aura_model::TriggerKind`]).",
+        "description": "Wire mirror of a job's origin (the owning session's root trigger,\n[`baybo_model::TriggerKind`]).",
         "enum": [
           "user",
           "cron",
@@ -3767,7 +3767,7 @@
       },
       "JobShape": {
         "type": "string",
-        "description": "Wire mirror of [`aura_job::JobShape`] — turn vs maintenance.",
+        "description": "Wire mirror of [`baybo_job::JobShape`] — turn vs maintenance.",
         "enum": [
           "turn",
           "maintenance"
@@ -3775,7 +3775,7 @@
       },
       "JobStatus": {
         "type": "object",
-        "description": "Wire mirror of [`aura_job::JobStatus`]. Carries the same payload\nthe domain enum carries (cancel reason, partial-artifact span IDs);\nthe wire shape collapses inner-variant content into `Option`-typed\nfields so HTTP clients can decode without needing the full Rust\nenum machinery.",
+        "description": "Wire mirror of [`baybo_job::JobStatus`]. Carries the same payload\nthe domain enum carries (cancel reason, partial-artifact span IDs);\nthe wire shape collapses inner-variant content into `Option`-typed\nfields so HTTP clients can decode without needing the full Rust\nenum machinery.",
         "required": [
           "kind"
         ],
@@ -3825,7 +3825,7 @@
             "type": "array",
             "items": {
               "type": "object",
-              "description": "Wire DTO for slash command entries. Mirror of\n[`aura_channels::wire::SlashCommandSpec`] so the OpenAPI surface\nstays inside this crate's DTOs (the wire type lives in\n`aura-channels` for sidecar reuse).",
+              "description": "Wire DTO for slash command entries. Mirror of\n[`baybo_channels::wire::SlashCommandSpec`] so the OpenAPI surface\nstays inside this crate's DTOs (the wire type lives in\n`baybo-channels` for sidecar reuse).",
               "required": [
                 "command",
                 "description"
@@ -4105,7 +4105,7 @@
       },
       "LlmPricingOverrideDto": {
         "type": "object",
-        "description": "Per-entry pricing override fields. Wire shape mirrors\n[`aura_model::LlmPricingOverride`]; each field is integer micro-USD\nper 1M tokens (1 USD = 1_000_000). The DTO exists separately from\nthe canonical struct only so we can derive `ToSchema` for utoipa\nwithout leaking that derive into `aura-model`.",
+        "description": "Per-entry pricing override fields. Wire shape mirrors\n[`baybo_model::LlmPricingOverride`]; each field is integer micro-USD\nper 1M tokens (1 USD = 1_000_000). The DTO exists separately from\nthe canonical struct only so we can derive `ToSchema` for utoipa\nwithout leaking that derive into `baybo-model`.",
         "properties": {
           "cache_write_per_1m_tokens": {
             "type": [
@@ -4195,7 +4195,7 @@
           },
           "target": {
             "type": "string",
-            "description": "Tracing target that emitted the record (e.g.\n`aura_gateway::server`). Rendered as \"source\" in the UI."
+            "description": "Tracing target that emitted the record (e.g.\n`baybo_gateway::server`). Rendered as \"source\" in the UI."
           },
           "timestamp": {
             "type": "string",
@@ -4357,7 +4357,7 @@
       },
       "SessionKind": {
         "type": "string",
-        "description": "Wire mirror of [`aura_query::SessionKind`]. Coarse trigger/lineage\nlabel for the trace browser list view.",
+        "description": "Wire mirror of [`baybo_query::SessionKind`]. Coarse trigger/lineage\nlabel for the trace browser list view.",
         "enum": [
           "user",
           "cron",
@@ -4377,7 +4377,7 @@
           },
           "value": {
             "type": "object",
-            "description": "JSON value written at `path`. Shape validated by `AuraConfig`."
+            "description": "JSON value written at `path`. Shape validated by `BayboConfig`."
           }
         }
       },
@@ -4415,7 +4415,7 @@
               "string",
               "null"
             ],
-            "description": "`aura.json` LLM entry name to pin this session to, or `null`\n(absent) to clear the pin and follow `default-llm`. Must match a\nconfigured entry — see `GET /v1/llm/models` → `items[].name`."
+            "description": "`baybo.json` LLM entry name to pin this session to, or `null`\n(absent) to clear the pin and follow `default-llm`. Must match a\nconfigured entry — see `GET /v1/llm/models` → `items[].name`."
           }
         }
       },
@@ -4453,7 +4453,7 @@
       },
       "SlashCommandEntry": {
         "type": "object",
-        "description": "Wire DTO for slash command entries. Mirror of\n[`aura_channels::wire::SlashCommandSpec`] so the OpenAPI surface\nstays inside this crate's DTOs (the wire type lives in\n`aura-channels` for sidecar reuse).",
+        "description": "Wire DTO for slash command entries. Mirror of\n[`baybo_channels::wire::SlashCommandSpec`] so the OpenAPI surface\nstays inside this crate's DTOs (the wire type lives in\n`baybo-channels` for sidecar reuse).",
         "required": [
           "command",
           "description"
@@ -4495,7 +4495,7 @@
       },
       "TraceSessionSummary": {
         "type": "object",
-        "description": "One row of the trace browser list view. Mirrors\n[`aura_query::SessionSummary`] for the wire.",
+        "description": "One row of the trace browser list view. Mirrors\n[`baybo_query::SessionSummary`] for the wire.",
         "required": [
           "session_id",
           "created_at",
@@ -4705,7 +4705,7 @@
     },
     {
       "name": "config",
-      "description": "Read and mutate on-disk AuraConfig"
+      "description": "Read and mutate on-disk BayboConfig"
     },
     {
       "name": "jobs",

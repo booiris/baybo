@@ -1,5 +1,5 @@
 [package]
-name = "aura-gateway"
+name = "baybo-gateway"
 version.workspace = true
 edition.workspace = true
 # See `crates/integration-tests/Cargo.toml` for the rationale: aggregating
@@ -24,32 +24,32 @@ linux = []
 # Compile-in macOS-specific code paths (currently: launchd installer).
 macos = []
 # Exposes test helpers to downstream crate-level tests. Never enabled in
-# release builds. Pulls in `aura-llm/test-support` so the gateway's own
+# release builds. Pulls in `baybo-llm/test-support` so the gateway's own
 # test fixtures can construct `BillableLlm::passthrough`.
-test-support = ["aura-llm/test-support"]
+test-support = ["baybo-llm/test-support"]
 
 [dependencies]
-aura-agent = { workspace = true }
-aura-channels = { workspace = true }
+baybo-agent = { workspace = true }
+baybo-channels = { workspace = true }
 # Cron-fire prompt reverse-parser for the admin chat panel.
-aura-context = { workspace = true }
-aura-config = { workspace = true }
-aura-cron = { workspace = true }
-aura-cost = { workspace = true }
-aura-goal = { workspace = true }
-aura-job = { workspace = true }
-aura-llm = { workspace = true }
-aura-model = { workspace = true }
-aura-query = { workspace = true }
-aura-pairing = { workspace = true }
-aura-security = { workspace = true }
-aura-session = { workspace = true }
-aura-skills = { workspace = true }
-aura-storage = { workspace = true }
-aura-store = { workspace = true }
-aura-tools = { workspace = true }
-aura-trace = { workspace = true }
-aura-workspace = { workspace = true, features = ["io"] }
+baybo-context = { workspace = true }
+baybo-config = { workspace = true }
+baybo-cron = { workspace = true }
+baybo-cost = { workspace = true }
+baybo-goal = { workspace = true }
+baybo-job = { workspace = true }
+baybo-llm = { workspace = true }
+baybo-model = { workspace = true }
+baybo-query = { workspace = true }
+baybo-pairing = { workspace = true }
+baybo-security = { workspace = true }
+baybo-session = { workspace = true }
+baybo-skills = { workspace = true }
+baybo-storage = { workspace = true }
+baybo-store = { workspace = true }
+baybo-tools = { workspace = true }
+baybo-trace = { workspace = true }
+baybo-workspace = { workspace = true, features = ["io"] }
 
 anyhow = { workspace = true }
 dashmap = { workspace = true }
@@ -96,11 +96,11 @@ zstd = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-aura-gateway = { workspace = true, features = ["test-support"] }
-aura-security = { workspace = true, features = ["test-support"] }
-aura-storage = { workspace = true, features = ["test-support"] }
-aura-config = { workspace = true }
-aura-model = { workspace = true }
+baybo-gateway = { workspace = true, features = ["test-support"] }
+baybo-security = { workspace = true, features = ["test-support"] }
+baybo-storage = { workspace = true, features = ["test-support"] }
+baybo-config = { workspace = true }
+baybo-model = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

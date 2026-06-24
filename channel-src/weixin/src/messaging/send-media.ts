@@ -6,7 +6,7 @@
  *   - `image/*` → `uploadImageToWeixin` + `sendImageMessage`
  *   - else     → `uploadFileAttachmentToWeixin` + `sendFileMessage`
  */
-import type { Logger } from "@aura/channel-sdk";
+import type { Logger } from "@baybo/channel-sdk";
 
 import type { WeixinApiOptions } from "../api/endpoints.js";
 import {

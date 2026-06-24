@@ -3,17 +3,17 @@
 //! drives these; keeping the stateless parse/render layer here keeps that engine
 //! readable.
 
-use aura_channels::{
+use baybo_channels::{
     GOAL_BUDGET_FLAG, GOAL_CLEAR_SUBCOMMAND, GOAL_PAUSE_SUBCOMMAND, GOAL_RESUME_SUBCOMMAND,
 };
-use aura_model::Goal;
-use aura_trace::{GoalSteeringAudit, GoalSteeringKind};
+use baybo_model::Goal;
+use baybo_trace::{GoalSteeringAudit, GoalSteeringKind};
 use sha2::{Digest, Sha256};
 
 /// Build the trace audit for a rendered goal-continuation steering: the template
 /// `kind`, the live goal snapshot whose values it interpolated, and a SHA-256
 /// fingerprint of the rendered text. Recorded on the turn's `LlmCall` span (see
-/// [`aura_trace::GoalSteeringAudit`]) so the trace shows which steering the model
+/// [`baybo_trace::GoalSteeringAudit`]) so the trace shows which steering the model
 /// saw without persisting the full text to `session_messages`.
 pub(super) fn steering_audit(
     kind: GoalSteeringKind,
@@ -217,9 +217,9 @@ mod tests {
     fn steering_audit_captures_kind_snapshot_and_sha() {
         let now = chrono::Utc::now();
         let goal = Goal {
-            id: aura_model::GoalId::new(),
+            id: baybo_model::GoalId::new(),
             objective: "ship it".into(),
-            status: aura_model::GoalStatus::BudgetLimited,
+            status: baybo_model::GoalStatus::BudgetLimited,
             token_budget: Some(5_000),
             tokens_used: 1_234,
             time_used_seconds: 42,

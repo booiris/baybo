@@ -1,15 +1,15 @@
-//! CLI entrypoint for the interactive chat loop (`aura tui`).
+//! CLI entrypoint for the interactive chat loop (`baybo tui`).
 //!
-//! `aura tui` is a thin UI on top of a WS+MessagePack [`WsTransport`]
-//! pointed at `aura gateway`'s admin listener (which co-hosts the
+//! `baybo tui` is a thin UI on top of a WS+MessagePack [`WsTransport`]
+//! pointed at `baybo gateway`'s admin listener (which co-hosts the
 //! `/v1/channel-ws` upgrade alongside the bearer-auth admin REST API).
 //! Same address the browser-side web chat page uses — one public bind
 //! per gateway, no port-file discovery needed.
 //!
 //! TUI auth is a per-start temporary token the gateway publishes to
 //! the secret vault at `gateway.tui_token` (rotated on every
-//! `aura gateway start`); the TUI opens the same vault, reads the
-//! token, and presents it in the `x-aura-channel-token` header on the
+//! `baybo gateway start`); the TUI opens the same vault, reads the
+//! token, and presents it in the `x-baybo-channel-token` header on the
 //! WS upgrade. The token is bound to the `tui` label, so the channel-
 //! auth middleware admits it through the same path as a sidecar.
 //!
@@ -22,12 +22,12 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
-use aura_agent::service::ShutdownSignal;
-use aura_channels::ChannelError;
-use aura_config::AuraConfig;
-use aura_gateway::AdminToken;
-use aura_tui::client::{TuiDashboardProvider, TuiSlashHandler};
-use aura_tui::{TuiAdapter, TuiLogSink};
+use baybo_agent::service::ShutdownSignal;
+use baybo_channels::ChannelError;
+use baybo_config::BayboConfig;
+use baybo_gateway::AdminToken;
+use baybo_tui::client::{TuiDashboardProvider, TuiSlashHandler};
+use baybo_tui::{TuiAdapter, TuiLogSink};
 use tracing::info;
 
 use crate::gateway_client::{
@@ -48,16 +48,16 @@ pub struct Options {
 /// Run the interactive TUI to completion. Returns once the event
 /// loop exits (user typed `/quit`, adapter closed) or the shared
 /// shutdown signal fires (SIGINT/SIGTERM).
-pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
+pub async fn run(config: Arc<BayboConfig>, opts: Options) -> anyhow::Result<()> {
     let tui_log_sink: Arc<OnceLock<TuiLogSink>> = Arc::new(OnceLock::new());
     let _tracing_guards = init_tracing(TracingMode::Tui {
         tui_sink: Arc::clone(&tui_log_sink),
     });
-    info!("Aura - Intelligent Assistant Framework starting");
+    info!("Baybo - Intelligent Assistant Framework starting");
 
     let admin_addr = admin_addr_from_config(&config)?;
 
-    let session_id = aura_model::SessionId::from(
+    let session_id = baybo_model::SessionId::from(
         opts.session
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
@@ -135,7 +135,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
 
     info!(%session_id, "TUI session started");
 
-    let mut task_tracker = aura_agent::service::TaskTracker::new();
+    let mut task_tracker = baybo_agent::service::TaskTracker::new();
     install_signal_handler(&mut task_tracker, shutdown.clone());
 
     shutdown.wait().await;
@@ -151,7 +151,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn read_admin_token(config: &AuraConfig) -> Option<String> {
+async fn read_admin_token(config: &BayboConfig) -> Option<String> {
     let vault = match crate::runtime::build_secret_vault(config).await {
         Ok(v) => v,
         Err(e) => {
@@ -268,7 +268,7 @@ mod tests {
 
 #[cfg(debug_assertions)]
 mod dev_auto {
-    //! Dev-only: spawn an `aura gateway start` subprocess so a fresh
+    //! Dev-only: spawn an `baybo gateway start` subprocess so a fresh
     //! dev workspace doesn't need a second terminal to run the TUI.
     //! Deliberately isolated in its own module so stripping the
     //! feature also strips the `std::process::Command` call site.
@@ -300,7 +300,7 @@ mod dev_auto {
         }
     }
 
-    /// Spawn `aura gateway start` as a subprocess and poll the admin
+    /// Spawn `baybo gateway start` as a subprocess and poll the admin
     /// listener until a TCP connection succeeds (or the timeout
     /// elapses). A successful `TcpStream::connect` is enough evidence
     /// that the listener is accepting — the caller follows up with

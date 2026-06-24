@@ -6,13 +6,13 @@
 //! extraction, 401 paths, and the URI-sanitization contract that stops
 //! tokens leaking into structured logs.
 
-use aura_gateway::auth::admin::{AdminAuthState, require_admin_token};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode, header};
 use axum::middleware;
 use axum::routing::get;
+use baybo_gateway::auth::admin::{AdminAuthState, require_admin_token};
 use tower::ServiceExt;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

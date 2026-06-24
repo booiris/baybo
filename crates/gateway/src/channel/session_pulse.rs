@@ -31,9 +31,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aura_channels::wire::ActivityKind;
-use aura_channels::{AgentEvent, SessionEvent, SubscribedView};
-use aura_model::SessionId;
+use baybo_channels::wire::ActivityKind;
+use baybo_channels::{AgentEvent, SessionEvent, SubscribedView};
+use baybo_model::SessionId;
 use chrono::Utc;
 use dashmap::DashMap;
 

@@ -26,17 +26,17 @@
 
 use std::sync::Arc;
 
-use aura_channels::AgentOutput;
-use aura_model::Session;
+use baybo_channels::AgentOutput;
+use baybo_model::Session;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::supervisor::AgentSupervisor;
 use crate::runtime::agent_loop::AgentLoop;
-use aura_job::JobLifecycle;
-use aura_session::SessionManager;
-use aura_trace::SpanRecorder;
+use baybo_job::JobLifecycle;
+use baybo_session::SessionManager;
+use baybo_trace::SpanRecorder;
 
 pub mod marker;
 
@@ -105,12 +105,12 @@ pub struct VolatileResources {
     pub session_manager: Arc<SessionManager>,
     /// CRUD + transitions over this session's autonomous goal. Drives the
     /// turn-boundary continuation loop and the `/goal` command. Shares the
-    /// `session_goals` table with the goal tools (see `aura-goal`).
-    pub goal_service: Arc<aura_goal::GoalService>,
+    /// `session_goals` table with the goal tools (see `baybo-goal`).
+    pub goal_service: Arc<baybo_goal::GoalService>,
     /// Read side of the per-session token meter: the goal continuation loop
     /// samples `cost_manager.session_tokens(session_id)` before/after each goal
     /// turn and accrues the delta into the goal's `tokens_used`.
-    pub cost_manager: Arc<aura_cost::CostManager>,
+    pub cost_manager: Arc<baybo_cost::CostManager>,
 }
 
 /// Compile-time assertion: every field type of [`VolatileResources`]
@@ -129,8 +129,8 @@ const _ASSERT_VOLATILE_FIELDS: fn() = || {
     assert_volatile::<CancellationToken>();
     assert_volatile::<Option<AgentSupervisor>>();
     assert_volatile::<Arc<SessionManager>>();
-    assert_volatile::<Arc<aura_goal::GoalService>>();
-    assert_volatile::<Arc<aura_cost::CostManager>>();
+    assert_volatile::<Arc<baybo_goal::GoalService>>();
+    assert_volatile::<Arc<baybo_cost::CostManager>>();
 };
 
 /// Compile-time assertion: [`DurableActorState`] is fully

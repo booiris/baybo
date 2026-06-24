@@ -8,8 +8,8 @@
 //! on the same connection. The validator therefore no longer parses
 //! or returns a `session_id`.
 
-use aura_channels::wire::Frame;
-use aura_model::ChannelType;
+use baybo_channels::wire::Frame;
+use baybo_model::ChannelType;
 
 use crate::auth::{AuthedClient, ChannelTokenTable, TOOL_CLIENT_LABEL_PREFIX};
 
@@ -114,8 +114,8 @@ pub(crate) fn validate_register(
 mod tests {
     use super::*;
     use crate::auth::ClientIdentity;
-    use aura_channels::MessageRole;
-    use aura_channels::wire::Message as WireMessage;
+    use baybo_channels::MessageRole;
+    use baybo_channels::wire::Message as WireMessage;
 
     fn subprocess(pid: u32, label: &str) -> AuthedClient {
         AuthedClient::Subprocess {
@@ -246,7 +246,7 @@ mod tests {
         let tokens = ChannelTokenTable::new();
         let frame = Frame::Message(WireMessage {
             content: String::new(),
-            session_id: aura_model::SessionId::from(""),
+            session_id: baybo_model::SessionId::from(""),
             user_id: String::new(),
             channel_type: ChannelType::from("slack"),
             bot_id: String::new(),

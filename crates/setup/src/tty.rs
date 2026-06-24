@@ -70,7 +70,7 @@ impl Prompter for TtyPrompter {
 }
 
 // ---------------------------------------------------------------------------
-// Free helpers — same shapes as their `aura-cli` counterparts, with the
+// Free helpers — same shapes as their `baybo-cli` counterparts, with the
 // error type swapped for `SetupError`. Kept `pub(crate)` so other modules
 // in this crate can reuse them without going through `Prompter`.
 // ---------------------------------------------------------------------------

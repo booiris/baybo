@@ -28,8 +28,8 @@
 //! - Forward-slash paths so a cache written on Linux matches Windows.
 //! - Length-prefixed rel-paths to close the variable-field aliasing
 //!   hazard (`"foo" + "/bar"` vs `"foo/" + "bar"`).
-//! - Scope discriminator prefix (`aura.skill.full:v1` vs
-//!   `aura.skill.primary:v1`) so the two scopes never collide.
+//! - Scope discriminator prefix (`baybo.skill.full:v1` vs
+//!   `baybo.skill.primary:v1`) so the two scopes never collide.
 
 use std::fs;
 use std::io;
@@ -42,13 +42,15 @@ use sha2::{Digest, Sha256};
 /// with a scope-specific tag ensures the same on-disk content never
 /// collides across scopes — so a one-file skill can't have its
 /// `SKILL.md`-only hash and its full-dir hash coincide.
-const FULL_SCOPE_TAG: &[u8] = b"aura.skill.full:v1\n";
-const PRIMARY_SCOPE_TAG: &[u8] = b"aura.skill.primary:v1\n";
+const FULL_SCOPE_TAG: &[u8] = b"baybo.skill.full:v1\n";
+const PRIMARY_SCOPE_TAG: &[u8] = b"baybo.skill.primary:v1\n";
 
 /// The entrypoint file inspected by the primary-scope hash.
 pub(crate) const PRIMARY_FILE: &str = "SKILL.md";
 
-use aura_skills::{MAX_SKILL_DIR_BYTES as MAX_TOTAL_BYTES, MAX_SKILL_DIR_FILES as MAX_TOTAL_FILES};
+use baybo_skills::{
+    MAX_SKILL_DIR_BYTES as MAX_TOTAL_BYTES, MAX_SKILL_DIR_FILES as MAX_TOTAL_FILES,
+};
 
 /// Tiered-assessment thresholds under `Full` mode. A skill directory at
 /// or below both caps is small enough to classify synchronously; above

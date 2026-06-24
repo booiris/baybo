@@ -13,12 +13,12 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use aura_channels::{DashboardSnapshot, SlashCommand, ViewKind};
-use aura_model::SessionId;
+use baybo_channels::{DashboardSnapshot, SlashCommand, ViewKind};
+use baybo_model::SessionId;
 use ratatui::text::Line;
 use ratatui::widgets::TableState;
 
-use aura_tools::{ApprovalDecision, ApprovalQueue, ResourceAccess};
+use baybo_tools::{ApprovalDecision, ApprovalQueue, ResourceAccess};
 
 const HISTORY_CAP: usize = 500;
 
@@ -144,7 +144,7 @@ pub(crate) struct AppState {
     pub(crate) streaming: Option<String>,
     /// Whether the current agent response has already committed any
     /// line to scrollback. Drives the prefix choice: the very first
-    /// committed line uses `aura> ` (bold green), subsequent lines use
+    /// committed line uses `baybo> ` (bold green), subsequent lines use
     /// the `      ` (six-space) continuation indent so the conversation
     /// reads as one coherent block.
     pub(crate) streaming_committed_any: bool,
@@ -262,7 +262,7 @@ impl AppState {
     /// finish a response or for the user to resolve a pending approval.
     /// Submissions made while this is true should be queued rather than
     /// committed immediately, otherwise they'd interleave between the
-    /// streaming preview and the eventual `aura> …` reply in scrollback.
+    /// streaming preview and the eventual `baybo> …` reply in scrollback.
     pub(crate) fn is_busy(&self) -> bool {
         self.streaming.is_some()
             || self.pending_approval.is_some()

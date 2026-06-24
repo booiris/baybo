@@ -1,11 +1,11 @@
 //! `/v1/llm/*` admin-router integration tests.
 //!
 //! Constructs the admin router by hand (same pattern as
-//! `logs_endpoint.rs`), points it at a tempdir-backed `aura.json` plus
+//! `logs_endpoint.rs`), points it at a tempdir-backed `baybo.json` plus
 //! the test gateway's libsql cost store, then drives each endpoint via
 //! `tower::ServiceExt::oneshot`.
 //!
-//! Why these exist: `update_model` / `set_default` rewrite `aura.json`
+//! Why these exist: `update_model` / `set_default` rewrite `baybo.json`
 //! and the round-trip + validation rules are subtle (`Option<Option<T>>`
 //! "absent vs cleared", `context_window: Some(0)` → 400, default-llm
 //! cross-check). The original PR shipped without coverage and these
@@ -15,10 +15,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use aura_config::{AuraConfig, LlmEntry};
-use aura_cost::CostRecord;
-use aura_gateway::test_support::{TEST_ADMIN_TOKEN, build_test_deps};
-use aura_model::{CallReason, JobId, MicroUsd, SessionId, SpanId};
+use baybo_config::{BayboConfig, LlmEntry};
+use baybo_cost::CostRecord;
+use baybo_gateway::test_support::{TEST_ADMIN_TOKEN, build_test_deps};
+use baybo_model::{CallReason, JobId, MicroUsd, SessionId, SpanId};
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode, header};
 use chrono::Utc;
@@ -38,7 +38,7 @@ fn auth(req: Request<Body>) -> Request<Body> {
 /// Drop the test gateway's default config + path on disk, return a
 /// configured admin router and the tempdir / path so callers can
 /// re-read the file after a mutation.
-async fn router_with_seed_config(seed: AuraConfig) -> (axum::Router, TempDir, std::path::PathBuf) {
+async fn router_with_seed_config(seed: BayboConfig) -> (axum::Router, TempDir, std::path::PathBuf) {
     router_with_reloader(seed, None).await
 }
 
@@ -46,20 +46,20 @@ async fn router_with_seed_config(seed: AuraConfig) -> (axum::Router, TempDir, st
 /// `config_reloader` (e.g. one whose `dry_run` rejects) to exercise the
 /// admin endpoints' apply/pre-flight wiring.
 async fn router_with_reloader(
-    seed: AuraConfig,
-    reloader_override: Option<Arc<dyn aura_gateway::reload::ConfigReloader>>,
+    seed: BayboConfig,
+    reloader_override: Option<Arc<dyn baybo_gateway::reload::ConfigReloader>>,
 ) -> (axum::Router, TempDir, std::path::PathBuf) {
     let tg = build_test_deps(SocketAddr::from(([127, 0, 0, 1], 0))).await;
     let cfg_dir = tempfile::tempdir().expect("config tempdir");
-    let cfg_path = cfg_dir.path().join("aura.json");
+    let cfg_path = cfg_dir.path().join("baybo.json");
     seed.write_to_file(&cfg_path)
         .await
-        .expect("write seed aura.json");
+        .expect("write seed baybo.json");
 
-    use aura_gateway::auth::admin::{AdminAuthState, require_admin_token};
+    use baybo_gateway::auth::admin::{AdminAuthState, require_admin_token};
     let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
     let config_reloader = reloader_override.unwrap_or_else(|| tg.deps.config_reloader.clone());
-    let state = aura_gateway::server::AdminState {
+    let state = baybo_gateway::server::AdminState {
         config: Arc::new(seed),
         config_path: Some(cfg_path.clone()),
         session_manager: Arc::clone(&tg.deps.session_manager),
@@ -68,7 +68,7 @@ async fn router_with_reloader(
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
         goal_store: tg.deps.stores.goal.clone(),
-        query_api: Arc::new(aura_query::QueryApi::new(
+        query_api: Arc::new(baybo_query::QueryApi::new(
             tg.deps.session_manager.store(),
             Arc::clone(&tg.deps.job_lifecycle),
             tg.deps.stores.trace.clone(),
@@ -88,7 +88,7 @@ async fn router_with_reloader(
         web_chat_tokens: Arc::new(dashmap::DashMap::new()),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     };
-    let (admin_router, _spec) = aura_gateway::api::admin::v1_router_and_spec();
+    let (admin_router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();
     let admin_router = admin_router
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
@@ -117,8 +117,8 @@ fn entry(name: &str, provider: &str, model: &str) -> LlmEntry {
     }
 }
 
-fn seed_two_entries() -> AuraConfig {
-    AuraConfig {
+fn seed_two_entries() -> BayboConfig {
+    BayboConfig {
         llm: vec![
             entry("primary", "openai", "gpt-4o"),
             entry("secondary", "anthropic", "claude-sonnet-4-6"),
@@ -163,7 +163,7 @@ async fn list_models_returns_default_and_effective_fields() {
     assert_eq!(primary["name"], "primary");
     assert_eq!(primary["is_default"], true);
     // Factory default for openai with no snapshot hit is the constant
-    // we centralised in `aura_llm::factory_defaults_for`. The dashboard
+    // we centralised in `baybo_llm::factory_defaults_for`. The dashboard
     // must mirror it; a snapshot hit will only widen the value.
     assert!(primary["effective_context_window"].as_u64().unwrap() >= 128_000);
     assert_eq!(primary["effective_supports_vision"], true);
@@ -202,7 +202,7 @@ async fn update_model_persists_overrides_to_disk() {
     assert_eq!(resp["requires_restart"], false);
     assert_eq!(resp["path"], "llm[primary]");
 
-    let on_disk = AuraConfig::load_from_file(&path).await.expect("reload");
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
     let primary = on_disk.llm_entry("primary").expect("primary present");
     assert_eq!(primary.context_window, Some(64_000));
     assert_eq!(primary.supports_vision, Some(false));
@@ -242,7 +242,7 @@ async fn update_model_clears_override_on_explicit_null() {
     );
     let (status, _) = read_json(router.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK);
-    let on_disk = AuraConfig::load_from_file(&path).await.expect("reload");
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
     let primary = on_disk.llm_entry("primary").expect("primary present");
     assert_eq!(primary.context_window, None);
     assert_eq!(primary.supports_vision, None);
@@ -262,7 +262,7 @@ async fn update_model_rejects_zero_context_window() {
     );
     let (status, _) = read_json(router.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let on_disk = AuraConfig::load_from_file(&path).await.expect("reload");
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
     assert_eq!(on_disk.llm_entry("primary").unwrap().context_window, None);
 }
 
@@ -299,7 +299,7 @@ async fn set_default_persists_and_rejects_unknown_name() {
     let (status, resp) = read_json(router.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(resp["path"], "default-llm");
-    let on_disk = AuraConfig::load_from_file(&path).await.expect("reload");
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
     assert_eq!(on_disk.default_llm, "secondary");
 
     // Rejection: unknown name. Build a fresh router because oneshot
@@ -315,7 +315,7 @@ async fn set_default_persists_and_rejects_unknown_name() {
     );
     let (status, _) = read_json(router.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let on_disk = AuraConfig::load_from_file(&path).await.expect("reload");
+    let on_disk = BayboConfig::load_from_file(&path).await.expect("reload");
     assert_eq!(
         on_disk.default_llm, "primary",
         "default unchanged on rejection"
@@ -382,15 +382,15 @@ async fn get_usage_aggregates_by_model() {
         .unwrap();
 
     let cfg_dir = tempfile::tempdir().expect("config tempdir");
-    let cfg_path = cfg_dir.path().join("aura.json");
+    let cfg_path = cfg_dir.path().join("baybo.json");
     seed_two_entries()
         .write_to_file(&cfg_path)
         .await
         .expect("write seed");
 
-    use aura_gateway::auth::admin::{AdminAuthState, require_admin_token};
+    use baybo_gateway::auth::admin::{AdminAuthState, require_admin_token};
     let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
-    let state = aura_gateway::server::AdminState {
+    let state = baybo_gateway::server::AdminState {
         config: Arc::new(seed_two_entries()),
         config_path: Some(cfg_path.clone()),
         session_manager: Arc::clone(&tg.deps.session_manager),
@@ -399,7 +399,7 @@ async fn get_usage_aggregates_by_model() {
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
         goal_store: tg.deps.stores.goal.clone(),
-        query_api: Arc::new(aura_query::QueryApi::new(
+        query_api: Arc::new(baybo_query::QueryApi::new(
             tg.deps.session_manager.store(),
             Arc::clone(&tg.deps.job_lifecycle),
             tg.deps.stores.trace.clone(),
@@ -419,7 +419,7 @@ async fn get_usage_aggregates_by_model() {
         web_chat_tokens: Arc::new(dashmap::DashMap::new()),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     };
-    let (admin_router, _spec) = aura_gateway::api::admin::v1_router_and_spec();
+    let (admin_router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();
     let admin_router = admin_router
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
@@ -486,7 +486,7 @@ async fn rejected_dry_run_leaves_config_file_untouched() {
     let (router, _dir, cfg_path) = router_with_reloader(
         seed_two_entries(),
         Some(Arc::new(
-            aura_gateway::test_support::RejectingDryRunReloader,
+            baybo_gateway::test_support::RejectingDryRunReloader,
         )),
     )
     .await;
@@ -526,7 +526,7 @@ async fn rejected_dry_run_leaves_config_file_untouched() {
 async fn update_model_behind_pending_non_hot_field_reports_restart_not_400() {
     let (router, _dir, _path) = router_with_reloader(
         seed_two_entries(),
-        Some(Arc::new(aura_gateway::test_support::NonHotPendingReloader)),
+        Some(Arc::new(baybo_gateway::test_support::NonHotPendingReloader)),
     )
     .await;
 

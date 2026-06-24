@@ -1,27 +1,27 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{CronScheduler, SecurityGateway, SessionManager};
-use aura_channels::ChannelRegistry;
-use aura_config::AuraConfig;
-use aura_cost::CostStore;
-use aura_job::JobLifecycle;
-use aura_llm::BillableLlm;
-use aura_query::QueryApi;
-use aura_security::{LeakDetector, SecretVault};
-use aura_skills::SkillRegistry;
-use aura_skills_assessor::SkillAssessor;
-use aura_store::{ChannelBotStore, ChannelPairingStore};
-use aura_tools::ToolRegistry;
-use aura_trace::TraceStore;
-use aura_workspace::WorkspaceManager;
+use baybo_agent::{CronScheduler, SecurityGateway, SessionManager};
+use baybo_channels::ChannelRegistry;
+use baybo_config::BayboConfig;
+use baybo_cost::CostStore;
+use baybo_job::JobLifecycle;
+use baybo_llm::BillableLlm;
+use baybo_query::QueryApi;
+use baybo_security::{LeakDetector, SecretVault};
+use baybo_skills::SkillRegistry;
+use baybo_skills_assessor::SkillAssessor;
+use baybo_store::{ChannelBotStore, ChannelPairingStore};
+use baybo_tools::ToolRegistry;
+use baybo_trace::TraceStore;
+use baybo_workspace::WorkspaceManager;
 
 use crate::format::OutputFormat;
 
 /// Where a command was invoked from.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Invocation {
-    /// Invoked via `aura <cmd>` at the shell.
+    /// Invoked via `baybo <cmd>` at the shell.
     Argv,
     /// Invoked via `/<cmd>` in a chat channel.
     Slash,
@@ -32,7 +32,7 @@ pub enum Invocation {
 /// Constructed once at startup and reused for both argv and slash dispatch.
 /// All fields are `Arc` so the context itself is cheap to clone.
 pub struct CommandContext {
-    pub config: Arc<AuraConfig>,
+    pub config: Arc<BayboConfig>,
     pub config_path: Option<PathBuf>,
     pub skills: Arc<SkillRegistry>,
     pub tools: Arc<ToolRegistry>,
@@ -46,19 +46,19 @@ pub struct CommandContext {
     /// Pre-built `QueryApi` so trace / job / session commands don't
     /// allocate one per invocation. `None` when the context lacks any
     /// of session / job / trace (e.g. argv commands that don't touch
-    /// the trace surface — `aura skills info`).
+    /// the trace surface — `baybo skills info`).
     pub query_api: Option<Arc<QueryApi>>,
     pub security: Option<Arc<SecurityGateway>>,
     pub leak_detector: Option<Arc<LeakDetector>>,
     pub skill_assessor: Option<Arc<SkillAssessor>>,
     /// Per-tenant credential metadata. Populated for one-shot argv
-    /// commands that need to mutate or read the roster (`aura
+    /// commands that need to mutate or read the roster (`baybo
     /// channel list/add/remove …`); `None` during TUI / slash dispatch so those
     /// paths can't accidentally rotate tokens.
     pub channel_bot_store: Option<Arc<dyn ChannelBotStore>>,
     /// Per-user pairing gate store. Populated alongside
     /// `channel_bot_store` for one-shot CLI commands that drive
-    /// `aura pair {list,approve,revoke}`.
+    /// `baybo pair {list,approve,revoke}`.
     pub channel_pairing_store: Option<Arc<dyn ChannelPairingStore>>,
     /// Shared vault — populated for the same subset of commands as
     /// `channel_bot_store`. Used to read/write bot tokens keyed as
@@ -72,11 +72,11 @@ pub struct CommandContext {
 impl CommandContext {
     /// The optional egress proxy in runtime form, mapped from `config.proxy`.
     /// Every HTTP client a command builds threads this through.
-    pub fn proxy_settings(&self) -> Option<aura_security::http::ProxySettings> {
+    pub fn proxy_settings(&self) -> Option<baybo_security::http::ProxySettings> {
         self.config
             .proxy
             .as_ref()
-            .map(|p| aura_security::http::ProxySettings {
+            .map(|p| baybo_security::http::ProxySettings {
                 url: p.url.clone(),
                 no_proxy: p.no_proxy.clone(),
             })
@@ -103,7 +103,7 @@ impl CommandContext {
 /// `src/main.rs` populates the builder after bootstrapping the domain graph;
 /// each field corresponds to an `Arc` already held by the main process.
 pub struct ContextBuilder {
-    config: Arc<AuraConfig>,
+    config: Arc<BayboConfig>,
     config_path: Option<PathBuf>,
     skills: Option<Arc<SkillRegistry>>,
     tools: Option<Arc<ToolRegistry>>,
@@ -124,7 +124,7 @@ pub struct ContextBuilder {
 }
 
 impl ContextBuilder {
-    pub fn new(config: Arc<AuraConfig>) -> Self {
+    pub fn new(config: Arc<BayboConfig>) -> Self {
         Self {
             config,
             config_path: None,

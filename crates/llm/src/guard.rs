@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use aura_model::MicroUsd;
+use baybo_model::MicroUsd;
 
 use crate::billed::{Attribution, BoundBilledLlm, CostHooks, LlmCostRecorder};
 use crate::{ChatRequest, LlmCompletion, LlmError, LlmResponse, LlmStream, ModelInfo, TokenUsage};
@@ -105,13 +105,13 @@ impl BillableLlm {
 
     /// Issue a minimal chat request to verify provider connectivity
     /// and auth. Mirrors the previous `LlmClient::probe()` so the
-    /// `aura llm probe` / `aura doctor` paths still have a cheap
+    /// `baybo llm probe` / `baybo doctor` paths still have a cheap
     /// one-token check, but routed through the gate so the same
     /// budget / kill-switch policies apply.
     pub async fn probe(&self) -> crate::Result<crate::ProbeReport> {
         let req = ChatRequest {
-            messages: vec![aura_model::ChatMessage::agent_context(vec![
-                aura_model::ContentBlock::Text("ping".to_string()),
+            messages: vec![baybo_model::ChatMessage::agent_context(vec![
+                baybo_model::ContentBlock::Text("ping".to_string()),
             ])],
             temperature: Some(0.0),
             tools: vec![],

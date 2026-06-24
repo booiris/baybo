@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(
     name = "bench-web",
-    about = "Read-only web viewer for aura bench results + agent traces"
+    about = "Read-only web viewer for baybo bench results + agent traces"
 )]
 struct Args {
     /// Root directory holding the per-bench dirs (swe, terminal-bench-*,
@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("aura_bench_web=info")),
+                .unwrap_or_else(|_| EnvFilter::new("baybo_bench_web=info")),
         )
         .init();
 
@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .with_context(|| format!("invalid host/port {}:{}", args.host, args.port))?;
 
-    let app = aura_bench_web::api::router(root.clone());
+    let app = baybo_bench_web::api::router(root.clone());
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;

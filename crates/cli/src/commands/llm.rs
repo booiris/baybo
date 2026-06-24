@@ -3,15 +3,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aura_config::{AuraConfig, LlmEntry};
-use aura_llm::credentials::{resolve_api_key, vault_api_key_name};
-use aura_llm::providers::openai_subscription::{
+use baybo_config::{BayboConfig, LlmEntry};
+use baybo_llm::credentials::{resolve_api_key, vault_api_key_name};
+use baybo_llm::providers::openai_subscription::{
     DeviceCode, PROVIDER_NAME as SUB_PROVIDER_NAME, VAULT_KEY_TOKENS, VaultTokenStore,
     device_code_login, pkce_login, revoke,
 };
-use aura_llm::{LiveModelInfo, LlmProviderConfig, LlmProviderRegistry};
-use aura_security::SecretVault;
-use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
+use baybo_llm::{LiveModelInfo, LlmProviderConfig, LlmProviderRegistry};
+use baybo_security::SecretVault;
+use baybo_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 use serde_json::{Value, json};
 
 use crate::cli::LlmCmd;
@@ -26,7 +26,7 @@ use crate::format::CommandOutput;
 /// was signalled to hot-reload (none running, or the workspace lock
 /// could not be inspected). [`notify_running_gateway`] returns a
 /// "signalled pid N" message instead when it does signal one.
-const RESTART_HINT: &str = "\n(start or restart `aura gateway` to apply this change)";
+const RESTART_HINT: &str = "\n(start or restart `baybo gateway` to apply this change)";
 
 pub async fn handle(ctx: &CommandContext, cmd: LlmCmd) -> Result<CommandOutput> {
     match cmd {
@@ -92,7 +92,7 @@ async fn probe(ctx: &CommandContext, name: Option<String>) -> Result<CommandOutp
     let entries = &ctx.config.llm;
     if entries.is_empty() {
         return Err(CliError::Config(
-            "no LLM entries registered; run `aura llm add` first".into(),
+            "no LLM entries registered; run `baybo llm add` first".into(),
         ));
     }
     let entry = match name {
@@ -122,7 +122,7 @@ async fn probe(ctx: &CommandContext, name: Option<String>) -> Result<CommandOutp
         reasoning_effort: entry.reasoning_effort.clone(),
         vault: ctx.secret_vault.clone(),
     };
-    match registry.create_client(&cfg, None, aura_llm::CostHooks::passthrough()) {
+    match registry.create_client(&cfg, None, baybo_llm::CostHooks::passthrough()) {
         Err(e) => Err(CliError::Manager(format!(
             "build provider client for {}: {e}",
             entry.name
@@ -177,7 +177,7 @@ async fn live_model(ctx: &CommandContext, name: Option<String>) -> Result<Comman
     let entries = &ctx.config.llm;
     if entries.is_empty() {
         return Err(CliError::Config(
-            "no LLM entries registered; run `aura llm add` first".into(),
+            "no LLM entries registered; run `baybo llm add` first".into(),
         ));
     }
     let entry = match name {
@@ -231,12 +231,12 @@ async fn add(ctx: &CommandContext) -> Result<CommandOutput> {
     })?;
 
     require_tty()?;
-    let mut prompter = aura_setup::TtyPrompter::new()?;
-    let mut new_config: AuraConfig = ctx.config.as_ref().clone();
+    let mut prompter = baybo_setup::TtyPrompter::new()?;
+    let mut new_config: BayboConfig = ctx.config.as_ref().clone();
     // `allow_skip = false` makes the picker silent — the call always
     // runs the add flow and returns `Added`.
-    let aura_setup::flow::LlmStepOutcome::Added(entry) =
-        aura_setup::flow::configure_llm_step(&mut prompter, vault, &mut new_config, false).await?
+    let baybo_setup::flow::LlmStepOutcome::Added(entry) =
+        baybo_setup::flow::configure_llm_step(&mut prompter, vault, &mut new_config, false).await?
     else {
         unreachable!("configure_llm_step(allow_skip=false) must return Added");
     };
@@ -272,7 +272,7 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
     let entries = &ctx.config.llm;
     if entries.is_empty() {
         return Err(CliError::Config(
-            "no LLM entries to edit; run `aura llm add` first".into(),
+            "no LLM entries to edit; run `baybo llm add` first".into(),
         ));
     }
     let target = resolve_target_path(ctx)?;
@@ -381,7 +381,7 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
                     && let Some(current) = &working.reasoning_effort
                 {
                     let allowed =
-                        aura_llm::providers::openai_subscription::allowed_efforts_for(&new_model);
+                        baybo_llm::providers::openai_subscription::allowed_efforts_for(&new_model);
                     if !allowed.iter().any(|e| e.eq_ignore_ascii_case(current)) {
                         eprintln!(
                             "(reasoning effort {current:?} is not valid for {new_model}; reset to default)"
@@ -423,7 +423,7 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
             changed.push("oauth");
         } else if picked.starts_with("reasoning ") {
             let levels =
-                aura_llm::providers::openai_subscription::allowed_efforts_for(&working.model);
+                baybo_llm::providers::openai_subscription::allowed_efforts_for(&working.model);
             let labels: Vec<&str> = levels.to_vec();
             let li = select_one("Reasoning effort:", &labels)?;
             let new_effort = Some(levels[li].to_string());
@@ -453,7 +453,7 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
         });
     }
 
-    let mut new_config: AuraConfig = ctx.config.as_ref().clone();
+    let mut new_config: BayboConfig = ctx.config.as_ref().clone();
     if let Some(slot) = new_config.llm.iter_mut().find(|e| e.name == working.name) {
         *slot = working.clone();
     }
@@ -501,7 +501,7 @@ async fn remove(ctx: &CommandContext) -> Result<CommandOutput> {
 
     if entry_name == ctx.config.default_llm {
         return Err(CliError::Config(format!(
-            "{entry_name:?} is the current default-llm; switch with `aura llm default` before removing it"
+            "{entry_name:?} is the current default-llm; switch with `baybo llm default` before removing it"
         )));
     }
     if !confirm(&format!("Delete entry {entry_name:?}?"))? {
@@ -538,7 +538,7 @@ async fn remove(ctx: &CommandContext) -> Result<CommandOutput> {
         if !other_sub_entries {
             let store = VaultTokenStore::new(vault.clone());
             if let Ok(Some(bundle)) = store.load().await {
-                let http = aura_security::http::client(ctx.proxy_settings().as_ref())
+                let http = baybo_security::http::client(ctx.proxy_settings().as_ref())
                     .map_err(|e| CliError::Manager(format!("build proxied http client: {e}")))?;
                 match revoke(&bundle.refresh_token, &http).await {
                     Ok(()) => sub_revoked = true,
@@ -557,7 +557,7 @@ async fn remove(ctx: &CommandContext) -> Result<CommandOutput> {
         }
     }
 
-    let mut new_config: AuraConfig = ctx.config.as_ref().clone();
+    let mut new_config: BayboConfig = ctx.config.as_ref().clone();
     new_config.llm.retain(|e| e.name != entry_name);
     new_config
         .validate()
@@ -585,7 +585,7 @@ async fn set_default(ctx: &CommandContext) -> Result<CommandOutput> {
     let entries = &ctx.config.llm;
     if entries.is_empty() {
         return Err(CliError::Config(
-            "no LLM entries registered; run `aura llm add` first".into(),
+            "no LLM entries registered; run `baybo llm add` first".into(),
         ));
     }
     let target = resolve_target_path(ctx)?;
@@ -596,7 +596,7 @@ async fn set_default(ctx: &CommandContext) -> Result<CommandOutput> {
     let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     let idx = crate::commands::select::select_one("Set default-llm to:", &refs)?;
     let entry = &entries[idx];
-    let mut new_config: AuraConfig = ctx.config.as_ref().clone();
+    let mut new_config: BayboConfig = ctx.config.as_ref().clone();
     new_config.default_llm = entry.name.clone();
     new_config
         .validate()
@@ -701,7 +701,7 @@ fn pick_entry<'a>(entries: &'a [LlmEntry], prompt: &str) -> Result<&'a LlmEntry>
 async fn fetch_live_models(
     entry: &LlmEntry,
     vault: Option<Arc<SecretVault>>,
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
 ) -> Result<Vec<LiveModelInfo>> {
     let registry = LlmProviderRegistry::with_default_providers();
     let cfg = LlmProviderConfig {
@@ -751,7 +751,7 @@ fn resolve_target_path(ctx: &CommandContext) -> Result<PathBuf> {
 /// and the gateway records its own pid in the lock file on startup
 /// (`singleton::acquire`).
 ///
-/// The one false-positive is a sibling `aura` CLI that holds the lock for
+/// The one false-positive is a sibling `baybo` CLI that holds the lock for
 /// the microsecond of its own "acquired" branch below. To shrink that
 /// window, the acquired branch clears the stale pid (left by an exited
 /// gateway) before releasing, so a concurrent CLI is unlikely to observe
@@ -767,7 +767,7 @@ fn notify_running_gateway(ctx: &CommandContext) -> String {
     use std::fs::{OpenOptions, TryLockError};
 
     let lock_path =
-        aura_workspace::WorkspacePaths::new(ctx.workspace.root.clone()).singleton_lock();
+        baybo_workspace::WorkspacePaths::new(ctx.workspace.root.clone()).singleton_lock();
     let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
         return RESTART_HINT.to_string();
     };
@@ -780,7 +780,7 @@ fn notify_running_gateway(ctx: &CommandContext) -> String {
             let _ = file.set_len(0);
             RESTART_HINT.to_string()
         }
-        // Held ⇒ a live aura process owns the workspace; SIGHUP its pid.
+        // Held ⇒ a live baybo process owns the workspace; SIGHUP its pid.
         // The gateway's handler reloads instead of terminating.
         Err(TryLockError::WouldBlock) => {
             let pid: Option<i32> = std::fs::read_to_string(&lock_path)
@@ -810,10 +810,10 @@ fn require_tty() -> Result<()> {
 
 async fn run_subscription_login(
     vault: &Arc<SecretVault>,
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
 ) -> Result<()> {
     let store = VaultTokenStore::new(vault.clone());
-    let http = aura_security::http::client(proxy.as_ref())
+    let http = baybo_security::http::client(proxy.as_ref())
         .map_err(|e| CliError::Manager(format!("build proxied http client: {e}")))?;
     // PKCE wants a browser that can reach 127.0.0.1; device code
     // only needs a browser somewhere. On a headless SSH box the TTY

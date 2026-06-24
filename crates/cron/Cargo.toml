@@ -1,5 +1,5 @@
 [package]
-name = "aura-cron"
+name = "baybo-cron"
 version.workspace = true
 edition.workspace = true
 
@@ -8,15 +8,15 @@ doctest = false
 
 [features]
 # Exposes test fixtures (e.g. `NeverShutdown`) to downstream crates' tests.
-# Enable via `aura-cron = { workspace = true, features = ["test-support"] }`
+# Enable via `baybo-cron = { workspace = true, features = ["test-support"] }`
 # in a dev-dependency. Not enabled by default; production builds never see
 # these items.
 test-support = []
 
 [dependencies]
-aura-model = { workspace = true }
-aura-store = { workspace = true }
-aura-tools = { workspace = true }
+baybo-model = { workspace = true }
+baybo-store = { workspace = true }
+baybo-tools = { workspace = true }
 
 chrono = { workspace = true }
 chrono-tz = { workspace = true }

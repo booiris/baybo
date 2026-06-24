@@ -9,14 +9,14 @@
 //! hash) and hands [`ChannelSpawner`] a `Command` so every sidecar
 //! runs as a supervised subprocess.
 //!
-//! Layout on disk (`$XDG_CACHE_HOME/aura/` or `~/.cache/aura/`):
+//! Layout on disk (`$XDG_CACHE_HOME/baybo/` or `~/.cache/baybo/`):
 //!
 //! ```text
 //! sidecars/<channel>-<hash>/bundle.mjs   # bun-built, run by bun
 //! sidecars/<channel>-<hash>/<aux...>     # any aux assets (e.g. silk.wasm)
 //! ```
 //!
-//! Hash-keyed paths mean an aura upgrade lands a fresh bundle without
+//! Hash-keyed paths mean an baybo upgrade lands a fresh bundle without
 //! touching the old ones — intentional: a crashed or downgraded
 //! install can still fall back to whatever was there before.
 //!

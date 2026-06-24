@@ -2,11 +2,11 @@
 //! objective (`session_goals`).
 
 use async_trait::async_trait;
-use aura_model::{Goal, GoalId, GoalStatus, SessionId};
+use baybo_model::{Goal, GoalId, GoalStatus, SessionId};
 
 use super::LibsqlPool;
-use aura_store::StorageError;
-use aura_store::goal::{GoalPatch, GoalStore, Result};
+use baybo_store::StorageError;
+use baybo_store::goal::{GoalPatch, GoalStore, Result};
 
 pub struct LibsqlGoalStore {
     pool: LibsqlPool,
@@ -216,8 +216,8 @@ impl GoalStore for LibsqlGoalStore {
 mod tests {
     use super::*;
     use crate::libsql::session::LibsqlSessionStore;
-    use aura_model::{ChannelType, Session, SessionState, TriggerSource, User};
-    use aura_store::SessionStore;
+    use baybo_model::{ChannelType, Session, SessionState, TriggerSource, User};
+    use baybo_store::SessionStore;
     use chrono::Utc;
 
     fn make_session(id: &str) -> Session {

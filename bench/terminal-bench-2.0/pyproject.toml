@@ -1,7 +1,7 @@
 [project]
-name = "aura-bench-terminal-bench-2"
+name = "baybo-bench-terminal-bench-2"
 version = "0.1.0"
-description = "Run the real aura agent inside Harbor (Terminal-Bench 2.0) via an installed-agent adapter."
+description = "Run the real baybo agent inside Harbor (Terminal-Bench 2.0) via an installed-agent adapter."
 # harbor needs >=3.12; pin <3.14 since the host's 3.14 is too new for the stack.
 requires-python = ">=3.12,<3.14"
 dependencies = ["harbor>=0.13.2"]

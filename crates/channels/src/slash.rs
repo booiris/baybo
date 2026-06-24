@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aura_model::ContentBlock;
+use baybo_model::ContentBlock;
 
 /// Bare name (no leading `/`) of the compact slash command. Used by
 /// the gateway slash manifest to register the command with sidecars
@@ -100,7 +100,7 @@ pub enum SlashOutcome {
 /// slash counterpart bait operators with a TUI panel they can't
 /// reach via the chat surface, and conversely removing a slash
 /// family means dropping its view too (e.g. the former `Memory`
-/// view was retired when `aura memory` was deleted from the CLI).
+/// view was retired when `baybo memory` was deleted from the CLI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ViewKind {
     Skills,
@@ -122,7 +122,7 @@ pub struct DashboardSnapshot {
 
 /// Source of dashboard data for the TUI.
 ///
-/// Implementations live outside this crate (e.g. in `aura-cli`) and carry
+/// Implementations live outside this crate (e.g. in `baybo-cli`) and carry
 /// the necessary manager `Arc`s. Defining only the trait here keeps the
 /// `channels` crate free of upstream business dependencies.
 #[async_trait]
@@ -133,7 +133,7 @@ pub trait DashboardProvider: Send + Sync {
 
 /// Pluggable interceptor for in-conversation slash commands.
 ///
-/// Implementations live outside this crate (e.g. `aura-cli`). Defining the
+/// Implementations live outside this crate (e.g. `baybo-cli`). Defining the
 /// trait here keeps channel adapters independent of any specific command
 /// layer while letting every adapter hook into the same dispatcher.
 #[async_trait]

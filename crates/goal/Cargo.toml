@@ -1,5 +1,5 @@
 [package]
-name = "aura-goal"
+name = "baybo-goal"
 version.workspace = true
 edition.workspace = true
 
@@ -8,14 +8,14 @@ doctest = false
 
 [features]
 # Exposes the in-memory `MemoryGoalStore` fixture to downstream crates' tests.
-# Enable via `aura-goal = { workspace = true, features = ["test-support"] }`
+# Enable via `baybo-goal = { workspace = true, features = ["test-support"] }`
 # in a dev-dependency. Not enabled by default; production builds never see it.
 test-support = []
 
 [dependencies]
-aura-model = { workspace = true }
-aura-store = { workspace = true }
-aura-tools = { workspace = true }
+baybo-model = { workspace = true }
+baybo-store = { workspace = true }
+baybo-tools = { workspace = true }
 
 async-trait = { workspace = true }
 chrono = { workspace = true }
@@ -27,5 +27,5 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-aura-workspace = { workspace = true }
+baybo-workspace = { workspace = true }
 tokio-util = { workspace = true }

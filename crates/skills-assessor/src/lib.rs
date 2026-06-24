@@ -17,7 +17,7 @@
 //!
 //! The assessor deliberately does not own an in-process regex or
 //! heuristic ruleset — the value here is the LLM's ability to read the
-//! prompt body and flag intent. The deterministic `aura_skills::validation`
+//! prompt body and flag intent. The deterministic `baybo_skills::validation`
 //! layer still handles structural safety (name/version grammar,
 //! `<skill>` tag injection).
 
@@ -28,5 +28,5 @@ mod prompt;
 mod queue;
 
 pub use assessor::{AssessError, AssessedSkill, AssessmentMode, AssessmentScope, SkillAssessor};
-pub use aura_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
+pub use baybo_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 pub use hash::{hash_skill_dir, hash_skill_primary};

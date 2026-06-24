@@ -5,7 +5,7 @@
 //! the result **in-memory only** (rebuilt from the durable
 //! `pending_background_results` buffer on every retry) and never persists it.
 
-use aura_model::{BackgroundJobKind, ContentBlock, PendingBackgroundResult, SubagentExitStatus};
+use baybo_model::{BackgroundJobKind, ContentBlock, PendingBackgroundResult, SubagentExitStatus};
 
 /// Opening framing for a notification turn's content. Lives in per-turn
 /// content (never the system prompt) so the prompt-cache prefix is identical
@@ -135,7 +135,7 @@ mod tests {
             "h1",
             "claude",
             "do <stuff>",
-            aura_model::SessionId::from("child-1"),
+            baybo_model::SessionId::from("child-1"),
             "result & more",
             SubagentExitStatus::Completed,
         )];

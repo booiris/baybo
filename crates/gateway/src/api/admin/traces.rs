@@ -24,7 +24,7 @@ use serde_json::json;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use aura_query::{SessionSummaryFilter, SessionSummaryPage};
+use baybo_query::{SessionSummaryFilter, SessionSummaryPage};
 
 use crate::api::dto::{ErrorBody, TraceSessionSummary, TracesListQuery, TracesListResponse};
 use crate::server::AdminState;
@@ -103,7 +103,7 @@ async fn get_trace(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let typed_session = aura_model::SessionId::from(session_id.as_str());
+    let typed_session = baybo_model::SessionId::from(session_id.as_str());
     let overview = state
         .query_api
         .load_trace_overview(&typed_session)
@@ -165,7 +165,7 @@ async fn get_job_trace(
     State(state): State<AdminState>,
     Path((_session_id, job_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let parsed_job: aura_model::JobId = job_id
+    let parsed_job: baybo_model::JobId = job_id
         .parse()
         .map_err(|e| GatewayError::BadRequest(format!("invalid job id: {e}")))?;
     let job_trace = state

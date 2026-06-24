@@ -62,7 +62,7 @@ importers:
 
   channel-src/telegram:
     dependencies:
-      '@aura/channel-sdk':
+      '@baybo/channel-sdk':
         specifier: workspace:*
         version: link:../../sdks/channel-ts
       grammy:
@@ -81,7 +81,7 @@ importers:
 
   channel-src/weixin:
     dependencies:
-      '@aura/channel-sdk':
+      '@baybo/channel-sdk':
         specifier: workspace:*
         version: link:../../sdks/channel-ts
       qrcode-terminal:

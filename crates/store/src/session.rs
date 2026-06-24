@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aura_model::{
+use baybo_model::{
     ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId, LineageKind, LlmEntryName,
     Session, SessionId,
 };
@@ -31,7 +31,7 @@ pub struct StoredMessage {
 /// Persistence interface for sessions.
 ///
 /// `SessionId` is the caller-supplied opaque string (see
-/// `aura_model::SessionId`). Lineage relationships are stored inline on
+/// `baybo_model::SessionId`). Lineage relationships are stored inline on
 /// the session row (`root_session_id`, `lineage_*` columns).
 #[async_trait]
 pub trait SessionStore: Send + Sync {
@@ -108,7 +108,7 @@ pub trait SessionStore: Send + Sync {
     /// Return session ids whose `last_active` is older than `before`.
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>>;
     /// Return every live session, ordered by `last_active` descending.
-    /// Operator-facing: drives `aura session list`.
+    /// Operator-facing: drives `baybo session list`.
     async fn list_all(&self) -> Result<Vec<Session>>;
 
     /// Return live sessions whose `channel` equals `channel`,
@@ -194,7 +194,7 @@ pub trait SessionStore: Send + Sync {
 
     /// Highest `session_messages.ordinal` ever assigned for this
     /// session — i.e. the last row inserted, regardless of whether
-    /// it has since been superseded. Used by `aura-trace` to anchor
+    /// it has since been superseded. Used by `baybo-trace` to anchor
     /// `LlmCallInputs::Persisted` so a trace span can recover the
     /// active set the LLM saw at call time without snapshotting the
     /// messages inline. Returns `None` for a session with no rows

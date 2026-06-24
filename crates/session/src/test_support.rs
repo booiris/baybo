@@ -1,24 +1,24 @@
 //! In-memory `SessionStore` / `SessionSummaryStore` for downstream tests.
 //!
 //! Gated behind the `test-support` cargo feature so they never ship in
-//! release builds. Live in `aura-session` (next to the traits they
-//! implement) so crates that depend on `aura-session` but not on
-//! `aura-storage` can still spin up fake stores for unit tests.
+//! release builds. Live in `baybo-session` (next to the traits they
+//! implement) so crates that depend on `baybo-session` but not on
+//! `baybo-storage` can still spin up fake stores for unit tests.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use aura_model::{
+use baybo_model::{
     ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId, LineageKind, Session,
     SessionId,
 };
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
-use aura_store::StorageError;
-use aura_store::session::{Result, SessionStore, StoredMessage};
-use aura_store::session_folder::{SessionFolderRow, SessionFolderStore};
-use aura_store::session_summary::{SessionSummaryRow, SessionSummaryStore};
+use baybo_store::StorageError;
+use baybo_store::session::{Result, SessionStore, StoredMessage};
+use baybo_store::session_folder::{SessionFolderRow, SessionFolderStore};
+use baybo_store::session_summary::{SessionSummaryRow, SessionSummaryStore};
 
 /// One stored row in the in-memory session transcript log — mirrors
 /// the libsql layout closely enough that `apply_session_compaction`
@@ -34,7 +34,7 @@ struct StoredMessageRow {
 /// In-memory `SessionStore` for tests across the workspace. Lineage
 /// columns are stubbed (`list_lineage_children` returns empty) — tests
 /// that need that surface should use the real libsql store via
-/// `aura_storage::Store::open` against a tempfile.
+/// `baybo_storage::Store::open` against a tempfile.
 #[derive(Default)]
 pub struct MemorySessionStore {
     data: Mutex<HashMap<SessionId, Session>>,
@@ -103,7 +103,7 @@ impl SessionStore for MemorySessionStore {
     async fn set_folder(
         &self,
         session_id: &SessionId,
-        folder_id: Option<&aura_model::FolderId>,
+        folder_id: Option<&baybo_model::FolderId>,
     ) -> Result<bool> {
         let mut data = self.data.lock();
         match data.get_mut(session_id) {
@@ -118,7 +118,7 @@ impl SessionStore for MemorySessionStore {
     async fn set_last_llm(
         &self,
         session_id: &SessionId,
-        llm: Option<&aura_model::LlmEntryName>,
+        llm: Option<&baybo_model::LlmEntryName>,
     ) -> Result<bool> {
         let mut data = self.data.lock();
         match data.get_mut(session_id) {

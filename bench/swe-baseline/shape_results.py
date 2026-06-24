@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Shape a mini-swe-agent SWE-bench run + the official swebench grade into the
 same results JSON schema as `bench/swe` (so it's directly comparable and can
-feed bench-web), and print a baseline-vs-aura comparison.
+feed bench-web), and print a baseline-vs-baybo comparison.
 
 Inputs (under <runs-dir>/<run-id>/): `preds.json` (mini's predictions, dict
 keyed by instance_id), the harness report `<model_sanitized>.<run-id>.json`,
@@ -58,13 +58,22 @@ def _summarize_tests(tests):
     return s
 
 
-def failure_reason(inst_dir, instance_id):
+def read_instance_report(inst_dir, instance_id):
+    """Authoritative per-instance swebench verdict, or None if no report.json
+    (instance errored / produced no patch / wasn't graded this pass)."""
     rp = os.path.join(inst_dir, "report.json")
     if not os.path.isfile(rp):
         return None
     try:
-        rec = json.load(open(rp)).get(instance_id, {})
+        return json.load(open(rp)).get(instance_id, {})
     except Exception:
+        return None
+
+
+def failure_reason(inst_dir, instance_id, rec=None):
+    if rec is None:
+        rec = read_instance_report(inst_dir, instance_id)
+    if not rec:
         return None
     if rec.get("resolved") is True:
         return None
@@ -110,28 +119,37 @@ def main():
     ap.add_argument("--dataset-name", required=True)
     ap.add_argument("--split", required=True)
     ap.add_argument("--model", required=True)
-    ap.add_argument("--agent-results", default="")  # aura results JSON for comparison
+    ap.add_argument("--agent-results", default="")  # baybo results JSON for comparison
     a = ap.parse_args()
 
     sanitized = a.model.replace("/", "__")
     run_dir = os.path.join(a.runs_dir, a.run_id)
     preds = json.load(open(os.path.join(run_dir, "preds.json")))
+    # Per-instance report.json (below) is the source of truth; the summary
+    # run-report is only a fallback — it is silently absent/misnamed often
+    # enough that trusting it marks a whole pass unresolved (observed in the wild).
     resolved_ids, error_ids, empty_ids = load_report_ids(a.runs_dir, a.run_id, sanitized)
     logbase = os.path.join(run_dir, "logs", "run_evaluation", a.run_id, sanitized)
 
     results = []
     for iid in sorted(preds):
         patch = preds[iid].get("model_patch") or ""
+        inst_dir = os.path.join(logbase, iid)
+        rec = read_instance_report(inst_dir, iid)
+        if rec is not None:                      # graded => trust the per-instance verdict
+            resolved, errored = bool(rec.get("resolved")), False
+        else:                                    # no per-instance report => summary fallback
+            resolved, errored = iid in resolved_ids, iid in error_ids
         results.append({
             "instance_id": iid,
             "repo": repo_of(iid),
-            "resolved": iid in resolved_ids,
+            "resolved": resolved,
             "empty_patch": (iid in empty_ids) or (patch.strip() == ""),
-            "errored": iid in error_ids,
+            "errored": errored,
             "patch_bytes": len(patch.encode()),
             "latency_ms": 0, "input_tokens": 0, "output_tokens": 0,
             "cached_input_tokens": 0, "cost_micro_usd": 0, "error": None,
-            "failure_reason": failure_reason(os.path.join(logbase, iid), iid),
+            "failure_reason": failure_reason(inst_dir, iid, rec),
         })
 
     n = len(results)
@@ -171,13 +189,13 @@ def main():
         overlap = [r["instance_id"] for r in results if r["instance_id"] in ares]
         b_ok = sum(1 for i in overlap if next(r for r in results if r["instance_id"] == i)["resolved"])
         a_ok = sum(1 for i in overlap if ares[i].get("resolved"))
-        print(f"\n=== AURA vs BASELINE (on {len(overlap)} shared instances) ===")
-        print(f"  aura     : {a_ok}/{len(overlap)} = {100*a_ok/len(overlap):.1f}%")
+        print(f"\n=== BAYBO vs BASELINE (on {len(overlap)} shared instances) ===")
+        print(f"  baybo     : {a_ok}/{len(overlap)} = {100*a_ok/len(overlap):.1f}%")
         print(f"  baseline : {b_ok}/{len(overlap)} = {100*b_ok/len(overlap):.1f}%")
         # head-to-head
         only_a = [i for i in overlap if ares[i].get("resolved") and not next(r for r in results if r["instance_id"] == i)["resolved"]]
         only_b = [i for i in overlap if not ares[i].get("resolved") and next(r for r in results if r["instance_id"] == i)["resolved"]]
-        print(f"  aura-only solves: {len(only_a)}   baseline-only solves: {len(only_b)}")
+        print(f"  baybo-only solves: {len(only_a)}   baseline-only solves: {len(only_b)}")
 
     print(f"\nwrote {out}")
 

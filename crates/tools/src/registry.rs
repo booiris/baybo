@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aura_store::BlobStore;
-use aura_workspace::WorkspacePaths;
+use baybo_store::BlobStore;
+use baybo_workspace::WorkspacePaths;
 use parking_lot::RwLock;
 use serde_json::Value;
 
@@ -215,8 +215,8 @@ fn tool_definition_for(tool: &dyn Tool) -> ToolDefinition {
 mod tests {
     use std::sync::Arc;
 
-    use aura_storage::test_support::MemoryBlobStore;
-    use aura_store::BlobStore;
+    use baybo_storage::test_support::MemoryBlobStore;
+    use baybo_store::BlobStore;
 
     use super::ToolRegistry;
     use crate::ToolConcurrency;
@@ -225,7 +225,7 @@ mod tests {
         let blob_store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
         ToolRegistry::with_defaults(
             blob_store,
-            aura_workspace::WorkspacePaths::new("/tmp"),
+            baybo_workspace::WorkspacePaths::new("/tmp"),
             None,
             Arc::new(crate::builtin::LiveSandboxMode::new(
                 crate::builtin::BashSandboxMode::Sandboxed,

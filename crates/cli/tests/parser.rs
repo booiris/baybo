@@ -4,14 +4,14 @@
 //! manager. Behavioural tests for individual commands live next to the
 //! dispatcher in `dispatch_smoke.rs`.
 
-use aura_cli::cli::{
+use baybo_cli::cli::{
     ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, LogCmd,
     SessionCmd, ShellKind, SkillsCmd,
 };
 use clap::Parser;
 
 fn parse(argv: &[&str]) -> Cli {
-    let mut full = vec!["aura"];
+    let mut full = vec!["baybo"];
     full.extend_from_slice(argv);
     Cli::try_parse_from(full).expect("argv should parse")
 }
@@ -86,9 +86,11 @@ fn cost_show_scopes_are_mutually_exclusive() {
 
     // --user and --session / --job are mutually exclusive
     assert!(
-        Cli::try_parse_from(["aura", "cost", "show", "--user", "u", "--session", "s"]).is_err()
+        Cli::try_parse_from(["baybo", "cost", "show", "--user", "u", "--session", "s"]).is_err()
     );
-    assert!(Cli::try_parse_from(["aura", "cost", "show", "--session", "s", "--job", "j"]).is_err());
+    assert!(
+        Cli::try_parse_from(["baybo", "cost", "show", "--session", "s", "--job", "j"]).is_err()
+    );
 }
 
 #[test]
@@ -115,7 +117,7 @@ fn plain_and_no_color_are_global_flags() {
 
 #[test]
 fn skills_info_requires_name() {
-    assert!(Cli::try_parse_from(["aura", "skills", "info"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "skills", "info"]).is_err());
     let cli = parse(&["skills", "info", "echo"]);
     match cli.command {
         Some(Commands::Skills {
@@ -154,12 +156,12 @@ fn channels_bot_add_takes_no_args() {
 
     // The positional `telegram` form was removed in favour of an
     // interactive picker; clap should reject any extra positional.
-    assert!(Cli::try_parse_from(["aura", "channel", "add", "telegram"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "channel", "add", "telegram"]).is_err());
 }
 
 #[test]
 fn channel_bots_subcommand_removed() {
-    assert!(Cli::try_parse_from(["aura", "channel", "bots"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "channel", "bots"]).is_err());
 }
 
 #[test]
@@ -172,8 +174,8 @@ fn channel_remove_takes_no_args() {
         })
     ));
 
-    assert!(Cli::try_parse_from(["aura", "channel", "remove", "telegram"]).is_err());
-    assert!(Cli::try_parse_from(["aura", "channel", "remove", "telegram", "bot-1"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "channel", "remove", "telegram"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "channel", "remove", "telegram", "bot-1"]).is_err());
 }
 
 #[test]
@@ -239,10 +241,10 @@ fn llm_subcommands_parse() {
 #[test]
 fn workspace_is_no_longer_a_subcommand() {
     for argv in [
-        &["aura", "workspace"][..],
-        &["aura", "workspace", "show"][..],
+        &["baybo", "workspace"][..],
+        &["baybo", "workspace", "show"][..],
         &[
-            "aura",
+            "baybo",
             "workspace",
             "set-identity",
             "soul",
@@ -259,7 +261,7 @@ fn workspace_is_no_longer_a_subcommand() {
 
 #[test]
 fn completion_requires_shell_kind() {
-    assert!(Cli::try_parse_from(["aura", "completion"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "completion"]).is_err());
     for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
         let cli = parse(&["completion", shell]);
         assert!(matches!(cli.command, Some(Commands::Completion { .. })));
@@ -268,7 +270,7 @@ fn completion_requires_shell_kind() {
 
 #[test]
 fn completion_rejects_unknown_shell() {
-    assert!(Cli::try_parse_from(["aura", "completion", "nushell"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "completion", "nushell"]).is_err());
 }
 
 #[test]
@@ -289,11 +291,11 @@ fn config_validate_accepts_optional_file() {
             cmd: ConfigCmd::Validate { file: None }
         })
     ));
-    let cli = parse(&["config", "validate", "--file", "aura.json"]);
+    let cli = parse(&["config", "validate", "--file", "baybo.json"]);
     match cli.command {
         Some(Commands::Config {
             cmd: ConfigCmd::Validate { file },
-        }) => assert_eq!(file.as_deref(), Some("aura.json")),
+        }) => assert_eq!(file.as_deref(), Some("baybo.json")),
         other => panic!("unexpected: {other:?}"),
     }
 }
@@ -301,16 +303,16 @@ fn config_validate_accepts_optional_file() {
 #[test]
 fn unknown_subcommand_is_rejected() {
     // `mcp serve` (server side) stays deferred — only the client commands ship.
-    assert!(Cli::try_parse_from(["aura", "mcp", "serve"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "mcp", "serve"]).is_err());
     // `mcp login` was folded into `mcp add` (auth runs inline).
-    assert!(Cli::try_parse_from(["aura", "mcp", "login", "github"]).is_err());
-    assert!(Cli::try_parse_from(["aura", "gateway"]).is_err());
-    assert!(Cli::try_parse_from(["aura", "daemon", "start"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "mcp", "login", "github"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "gateway"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "daemon", "start"]).is_err());
 }
 
 #[test]
 fn mcp_add_http_parses() {
-    use aura_cli::cli::{McpCmd, McpTransportArg};
+    use baybo_cli::cli::{McpCmd, McpTransportArg};
     let cli = parse(&[
         "mcp",
         "add",
@@ -339,7 +341,7 @@ fn mcp_add_http_parses() {
 
 #[test]
 fn mcp_add_stdio_with_args_parses() {
-    use aura_cli::cli::{McpCmd, McpTransportArg};
+    use baybo_cli::cli::{McpCmd, McpTransportArg};
     let cli = parse(&[
         "mcp",
         "add",
@@ -373,7 +375,7 @@ fn mcp_add_stdio_with_args_parses() {
 
 #[test]
 fn mcp_list_get_remove_parse() {
-    use aura_cli::cli::McpCmd;
+    use baybo_cli::cli::McpCmd;
     // Default: probe is on (no_probe = false).
     let cli = parse(&["mcp", "list"]);
     match cli.command {
@@ -434,7 +436,7 @@ fn session_list_parses() {
 
 #[test]
 fn session_show_requires_id() {
-    assert!(Cli::try_parse_from(["aura", "session", "show"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "session", "show"]).is_err());
     let cli = parse(&["session", "show", "abc"]);
     match cli.command {
         Some(Commands::Session {
@@ -446,7 +448,7 @@ fn session_show_requires_id() {
 
 #[test]
 fn session_history_requires_id() {
-    assert!(Cli::try_parse_from(["aura", "session", "history"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "session", "history"]).is_err());
     let cli = parse(&["session", "history", "sid-1"]);
     match cli.command {
         Some(Commands::Session {
@@ -502,7 +504,7 @@ fn session_history_accepts_supersede_flags() {
     // Mutually exclusive — clap should reject both at once.
     assert!(
         Cli::try_parse_from([
-            "aura",
+            "baybo",
             "session",
             "history",
             "sid",
@@ -515,7 +517,7 @@ fn session_history_accepts_supersede_flags() {
 
 #[test]
 fn session_kill_is_no_longer_a_subcommand() {
-    assert!(Cli::try_parse_from(["aura", "session", "kill", "sid"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "session", "kill", "sid"]).is_err());
 }
 
 #[test]
@@ -542,12 +544,12 @@ fn job_list_accepts_status_filter() {
 
 #[test]
 fn job_list_rejects_unknown_status() {
-    assert!(Cli::try_parse_from(["aura", "job", "list", "--status", "bogus"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "job", "list", "--status", "bogus"]).is_err());
 }
 
 #[test]
 fn job_show_requires_id() {
-    assert!(Cli::try_parse_from(["aura", "job", "show"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "job", "show"]).is_err());
     let cli = parse(&["job", "show", "jid-1"]);
     match cli.command {
         Some(Commands::Job {
@@ -568,7 +570,7 @@ fn cron_list_parses() {
 
 #[test]
 fn cron_show_requires_id() {
-    assert!(Cli::try_parse_from(["aura", "cron", "show"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "cron", "show"]).is_err());
     let cli = parse(&["cron", "show", "c1"]);
     match cli.command {
         Some(Commands::Cron {
@@ -584,7 +586,7 @@ fn cron_mutating_subcommands_are_rejected() {
     // are LLM-only via the cron agent tools.
     for args in [
         &[
-            "aura",
+            "baybo",
             "cron",
             "add",
             "-u",
@@ -594,11 +596,11 @@ fn cron_mutating_subcommands_are_rejected() {
             "-p",
             "hi",
         ][..],
-        &["aura", "cron", "rm", "c1"],
-        &["aura", "cron", "enable", "c1"],
-        &["aura", "cron", "disable", "c1"],
-        &["aura", "cron", "run", "c1"],
-        &["aura", "cron", "runs", "--id", "c1"],
+        &["baybo", "cron", "rm", "c1"],
+        &["baybo", "cron", "enable", "c1"],
+        &["baybo", "cron", "disable", "c1"],
+        &["baybo", "cron", "run", "c1"],
+        &["baybo", "cron", "runs", "--id", "c1"],
     ] {
         assert!(
             Cli::try_parse_from(args).is_err(),
@@ -610,12 +612,12 @@ fn cron_mutating_subcommands_are_rejected() {
 #[test]
 fn memory_is_no_longer_a_subcommand() {
     for argv in [
-        &["aura", "memory"][..],
-        &["aura", "memory", "list"][..],
-        &["aura", "memory", "search", "rust"][..],
-        &["aura", "memory", "show", "mid"][..],
-        &["aura", "memory", "promote", "mid"][..],
-        &["aura", "memory", "clear", "--session", "sid"][..],
+        &["baybo", "memory"][..],
+        &["baybo", "memory", "list"][..],
+        &["baybo", "memory", "search", "rust"][..],
+        &["baybo", "memory", "show", "mid"][..],
+        &["baybo", "memory", "promote", "mid"][..],
+        &["baybo", "memory", "clear", "--session", "sid"][..],
     ] {
         assert!(
             Cli::try_parse_from(argv).is_err(),
@@ -694,10 +696,10 @@ fn trace_top_level_is_gone() {
     // arrive via `session show`; exporting the call tree is `session
     // export`. Anything beginning with `trace` is unknown.
     for argv in [
-        &["aura", "trace"][..],
-        &["aura", "trace", "list"][..],
-        &["aura", "trace", "show", "sid"][..],
-        &["aura", "trace", "export", "sid"][..],
+        &["baybo", "trace"][..],
+        &["baybo", "trace", "list"][..],
+        &["baybo", "trace", "show", "sid"][..],
+        &["baybo", "trace", "export", "sid"][..],
     ] {
         assert!(
             Cli::try_parse_from(argv).is_err(),
@@ -708,7 +710,7 @@ fn trace_top_level_is_gone() {
 
 #[test]
 fn config_get_requires_path() {
-    assert!(Cli::try_parse_from(["aura", "config", "get"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "config", "get"]).is_err());
     let cli = parse(&["config", "get", "llm.model"]);
     match cli.command {
         Some(Commands::Config {
@@ -720,8 +722,8 @@ fn config_get_requires_path() {
 
 #[test]
 fn config_set_requires_path_and_value() {
-    assert!(Cli::try_parse_from(["aura", "config", "set"]).is_err());
-    assert!(Cli::try_parse_from(["aura", "config", "set", "llm.model"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "config", "set"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "config", "set", "llm.model"]).is_err());
     let cli = parse(&["config", "set", "llm.model", "gpt-5"]);
     match cli.command {
         Some(Commands::Config {
@@ -783,7 +785,7 @@ fn skills_check_accepts_optional_name() {
 
 #[test]
 fn config_unset_requires_path() {
-    assert!(Cli::try_parse_from(["aura", "config", "unset"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "config", "unset"]).is_err());
     let cli = parse(&["config", "unset", "llm.model", "--yes"]);
     match cli.command {
         Some(Commands::Config {
@@ -835,7 +837,7 @@ fn log_main_accepts_optional_date_and_limit() {
 
 #[test]
 fn log_channel_requires_channel_name() {
-    assert!(Cli::try_parse_from(["aura", "log", "channel"]).is_err());
+    assert!(Cli::try_parse_from(["baybo", "log", "channel"]).is_err());
 
     let cli = parse(&["log", "channel", "telegram"]);
     match cli.command {
@@ -895,17 +897,17 @@ fn log_channel_rejects_path_traversal_and_other_unsafe_inputs() {
     // these at argv-parse time so neither the argv handler nor the
     // slash dispatcher ever builds the path.
     for argv in [
-        &["aura", "log", "channel", "../../../etc/passwd"][..],
-        &["aura", "log", "channel", "../etc"][..],
-        &["aura", "log", "channel", "tg/secret"][..],
-        &["aura", "log", "channel", "tg\\secret"][..],
-        &["aura", "log", "channel", "."][..],
-        &["aura", "log", "channel", ".."][..],
-        &["aura", "log", "channel", ".hidden"][..],
-        &["aura", "log", "channel", "tele.gram"][..],
-        &["aura", "log", "channel", "Telegram"][..], // uppercase
-        &["aura", "log", "channel", "tele gram"][..], // space
-        &["aura", "log", "channel", ""][..],
+        &["baybo", "log", "channel", "../../../etc/passwd"][..],
+        &["baybo", "log", "channel", "../etc"][..],
+        &["baybo", "log", "channel", "tg/secret"][..],
+        &["baybo", "log", "channel", "tg\\secret"][..],
+        &["baybo", "log", "channel", "."][..],
+        &["baybo", "log", "channel", ".."][..],
+        &["baybo", "log", "channel", ".hidden"][..],
+        &["baybo", "log", "channel", "tele.gram"][..],
+        &["baybo", "log", "channel", "Telegram"][..], // uppercase
+        &["baybo", "log", "channel", "tele gram"][..], // space
+        &["baybo", "log", "channel", ""][..],
     ] {
         assert!(
             Cli::try_parse_from(argv).is_err(),
@@ -915,10 +917,10 @@ fn log_channel_rejects_path_traversal_and_other_unsafe_inputs() {
 
     // Legitimate names still pass.
     for argv in [
-        &["aura", "log", "channel", "telegram"][..],
-        &["aura", "log", "channel", "slack"][..],
-        &["aura", "log", "channel", "tg_bot42"][..],
-        &["aura", "log", "channel", "openclaw-lark"][..],
+        &["baybo", "log", "channel", "telegram"][..],
+        &["baybo", "log", "channel", "slack"][..],
+        &["baybo", "log", "channel", "tg_bot42"][..],
+        &["baybo", "log", "channel", "openclaw-lark"][..],
     ] {
         assert!(
             Cli::try_parse_from(argv).is_ok(),

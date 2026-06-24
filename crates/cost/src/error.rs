@@ -11,10 +11,10 @@ pub enum CostError {
 
 pub type CostResult<T> = std::result::Result<T, CostError>;
 
-impl From<aura_store::StorageError> for CostError {
-    fn from(e: aura_store::StorageError) -> Self {
+impl From<baybo_store::StorageError> for CostError {
+    fn from(e: baybo_store::StorageError) -> Self {
         match e {
-            aura_store::StorageError::Internal(e) => CostError::Internal(e),
+            baybo_store::StorageError::Internal(e) => CostError::Internal(e),
             other => CostError::Storage(other.to_string()),
         }
     }

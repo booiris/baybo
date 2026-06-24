@@ -2,8 +2,8 @@ import type {
   Logger,
   StartBotCommand,
   WireAttachment,
-} from "@aura/channel-sdk";
-import { fetchBlob, StatusRateLimited, uploadBlob } from "@aura/channel-sdk";
+} from "@baybo/channel-sdk";
+import { fetchBlob, StatusRateLimited, uploadBlob } from "@baybo/channel-sdk";
 import type {
   BotInboundEvent,
   BotMediaPayload,
@@ -11,8 +11,8 @@ import type {
   BotStartHooks,
   SlashCommandSpec,
   StatusMessageId,
-} from "@aura/channel-sdk/bot";
-import { composeAuraUserId } from "@aura/channel-sdk/bot";
+} from "@baybo/channel-sdk/bot";
+import { composeBayboUserId } from "@baybo/channel-sdk/bot";
 import { Bot, type Context, GrammyError, HttpError } from "grammy";
 
 import {
@@ -268,13 +268,13 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
       // sent the media bare. We still upload the bytes either way so
       // the agent gets the full payload.
       const caption = message.caption ?? "";
-      // The blob upload header must carry the SAME composite aura
+      // The blob upload header must carry the SAME composite baybo
       // user id `BotChannel.ingest` will use when emitting the inbound
       // event — both run through the gateway's pairing gate, and the
       // text-message identity is what the user already approved.
       // Passing the raw `from.id` would land the upload in a fresh
       // Pending row even when the chat is already paired.
-      const auraUserId = composeAuraUserId(
+      const bayboUserId = composeBayboUserId(
         "telegram",
         botId,
         address,
@@ -283,7 +283,7 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
       const attachment = await this.downloadAndUpload(
         bot,
         botId,
-        auraUserId,
+        bayboUserId,
         media,
       );
       if (!attachment) {

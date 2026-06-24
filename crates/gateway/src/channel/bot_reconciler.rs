@@ -2,7 +2,7 @@
 //! sync with the `channel_bots` libsql table.
 //!
 //! Tokens live in the vault, rows in libsql describe which bots are
-//! live for a given `channel_type`. The CLI (`aura channel
+//! live for a given `channel_type`. The CLI (`baybo channel
 //! add/remove`) writes to those two stores directly; the gateway
 //! doesn't know when that happens. This loop polls every
 //! `reconcile_interval` and, per currently-connected sidecar, computes
@@ -24,11 +24,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_agent::service::ShutdownSignal;
-use aura_channels::wire::Frame;
-use aura_model::ChannelType;
-use aura_security::SecretVault;
-use aura_store::ChannelBotStore;
+use baybo_agent::service::ShutdownSignal;
+use baybo_channels::wire::Frame;
+use baybo_model::ChannelType;
+use baybo_security::SecretVault;
+use baybo_store::ChannelBotStore;
 use parking_lot::Mutex;
 
 use super::control::{ChannelControlError, ChannelControlRegistry};

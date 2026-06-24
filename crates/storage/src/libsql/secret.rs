@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use super::LibsqlPool;
-use aura_store::StorageError;
-use aura_store::secret::{Result, SecretStore};
+use baybo_store::StorageError;
+use baybo_store::secret::{Result, SecretStore};
 
 pub struct LibsqlSecretStore {
     pool: LibsqlPool,

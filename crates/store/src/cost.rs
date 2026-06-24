@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aura_model::{CostRecord, CostSummary, JobId, SessionId, TimeRange};
+use baybo_model::{CostRecord, CostSummary, JobId, SessionId, TimeRange};
 
 use crate::StorageError;
 

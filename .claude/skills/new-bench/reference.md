@@ -1,4 +1,4 @@
-# new-bench reference — boilerplate & the aura CLI contract
+# new-bench reference — boilerplate & the baybo CLI contract
 
 Copy-paste scaffolding for `SKILL.md`. Everything here is distilled from the
 three live benches; where a chunk is large and already unit-tested, this file
@@ -7,40 +7,40 @@ drift).
 
 ---
 
-## 1. The aura black-box CLI contract
+## 1. The baybo black-box CLI contract
 
-The bench only ever execs the `aura` binary. Config path is selected with the
-`AURA_CONFIG_PATH` env var. Three commands matter:
+The bench only ever execs the `baybo` binary. Config path is selected with the
+`BAYBO_CONFIG_PATH` env var. Three commands matter:
 
 **Run one agent turn (one-shot, in-container or in-process):**
 ```
-AURA_CONFIG_PATH=<cfg> aura prompt --json -y --session <id> --timeout <secs> -- <instruction>
+BAYBO_CONFIG_PATH=<cfg> baybo prompt --json -y --session <id> --timeout <secs> -- <instruction>
 ```
 - `--json` → the last stdout line that parses as a JSON object is the result:
   `{"session_id":…,"response":"…"}` on success, `{"session_id":…,"error":"…"}` if
   the runtime rejected the turn. Parse from the **last** `{`-line backwards;
   tolerate leading log lines.
 - `-y` auto-approves writes outside the workspace `work/` dir (needed so the agent
-  can edit the target tree). `--timeout 0` = no aura-side limit (let an external
+  can edit the target tree). `--timeout 0` = no baybo-side limit (let an external
   harness enforce its own); a positive value bounds the turn — still wrap the
   whole `docker exec` in a hard `tokio::time::timeout` above it as a safety net.
 - `--` so an instruction starting with `-` isn't parsed as a flag. Pass the
   (possibly multi-line) instruction as a single trailing argv element.
 
-**Gateway mode (many turns share one aura process):**
+**Gateway mode (many turns share one baybo process):**
 ```
-AURA_CONFIG_PATH=<cfg> aura gateway start            # spawn detached; killed on Drop
+BAYBO_CONFIG_PATH=<cfg> baybo gateway start            # spawn detached; killed on Drop
 # poll TcpStream::connect(gateway addr) until it accepts (catch early exit via try_wait)
-AURA_CONFIG_PATH=<cfg> USER=<scope> USERNAME=<scope> aura prompt --json --session <fresh> -- <q>
+BAYBO_CONFIG_PATH=<cfg> USER=<scope> USERNAME=<scope> baybo prompt --json --session <fresh> -- <q>
 ```
 - `USER`/`USERNAME` → `cli_user()` → message sender → `session.user.id` → the
   recall/isolation scope. Set it per item to the scope you populated.
-- All `aura prompt`s against the same config/workspace route over the running
+- All `baybo prompt`s against the same config/workspace route over the running
   gateway (it holds the workspace lock) instead of going in-process.
 
 **Read the turn's spend from the ledger (after each turn):**
 ```
-AURA_CONFIG_PATH=<cfg> RUST_LOG=off aura cost show --session <id> --json
+BAYBO_CONFIG_PATH=<cfg> RUST_LOG=off baybo cost show --session <id> --json
 ```
 - `RUST_LOG=off` keeps stdout pure JSON. Parse from the first `{`. Shape:
   `{"scope":…,"summary":{"cost_micro_usd":<i64>,"calls":<u64>,"input_tokens":<u64>,
@@ -51,8 +51,8 @@ AURA_CONFIG_PATH=<cfg> RUST_LOG=off aura cost show --session <id> --json
 
 **Export the session's verbatim transcript + call tree (after each turn):**
 ```
-AURA_CONFIG_PATH=<cfg> RUST_LOG=off aura session history <id> --include-superseded --json
-AURA_CONFIG_PATH=<cfg> RUST_LOG=off aura session export  <id> --json
+BAYBO_CONFIG_PATH=<cfg> RUST_LOG=off baybo session history <id> --include-superseded --json
+BAYBO_CONFIG_PATH=<cfg> RUST_LOG=off baybo session export  <id> --json
 ```
 - `session history --include-superseded --json` → `{"session":…,"messages":[…]}`,
   every message **incl. ones compaction later dropped** (truly verbatim). Without
@@ -80,10 +80,10 @@ files to `bench/<name>/trace/<run_id>/<arm>/<item>.{messages,trace}.json`:
   per-task `runs/` path into `trace/`; see `…::_export_trace`. *Terminal-Bench 2.0*
   runs on the **Harbor** framework (`harbor run -d terminal-bench/terminal-bench-2`):
   `bench/terminal-bench-2.0/harbor_adapter` is a `BaseInstalledAgent` — `install()`
-  `environment.upload_file`s the musl binary + a rendered `aura.json` + mints the
-  key (→ chown to the agent user), `run()` runs `aura prompt` and exports the trace
+  `environment.upload_file`s the musl binary + a rendered `baybo.json` + mints the
+  key (→ chown to the agent user), `run()` runs `baybo prompt` and exports the trace
   into Harbor's per-trial `/logs/agent` dir (which Harbor mounts to
-  `runs/<ts>/<trial>/agent/`, sibling to `verifier/`). Same `aura.json`
+  `runs/<ts>/<trial>/agent/`, sibling to `verifier/`). Same `baybo.json`
   (`sandbox.mode=none`) + provider/key handling as 1.0; only the harness API differs.
 
 **Clone these parsers verbatim** (stable, unit-tested) instead of rewriting:
@@ -93,32 +93,32 @@ files to `bench/<name>/trace/<run_id>/<arm>/<item>.{messages,trace}.json`:
 
 ---
 
-## 2. Self-contained `aura.json` (mint it; don't touch ~/.aura)
+## 2. Self-contained `baybo.json` (mint it; don't touch ~/.baybo)
 
 Create a fresh workspace dir, mint a 32-byte hex key from `/dev/urandom` into it
 (reuse the key file if it already exists — re-minting orphans an existing vault),
 and write one of these. Key is referenced **by file**, API key **by env-var name**.
 
-**Passthrough (aura runs inside a disposable container):**
+**Passthrough (baybo runs inside a disposable container):**
 ```json
 {
-  "llm": [{ "name": "bench", "provider": "<p>", "model": "<m>", "api_key_env": "AURA_API_KEY" }],
+  "llm": [{ "name": "bench", "provider": "<p>", "model": "<m>", "api_key_env": "BAYBO_API_KEY" }],
   "default-llm": "bench",
   "channels": { "cli": { "enabled": true } },
   "security": { "encryption_key_file": "<dir>/encryption.key", "leak_detection_enabled": true },
-  "workspace": { "path": "/aura-home" },
+  "workspace": { "path": "/baybo-home" },
   "sandbox": { "mode": "none" },
   "cost": { "rate_limit": { "max_requests": 1000000 } }
 }
 ```
-- `sandbox.mode = none` drops aura's OS sandbox (Bash runs via `sh -c` directly)
+- `sandbox.mode = none` drops baybo's OS sandbox (Bash runs via `sh -c` directly)
   but keeps the uv shim + the `work/` jail. For an **in-container** bench (bwrap
   can't nest) you also build `--features bench-bash` — the off-by-default bench
   profile that additionally lifts uv + the jail and inherits the container's cwd.
   Both together = raw exec. Omit the sandbox key (default `auto`) for a host bench
   with real isolation.
-- `workspace.path` MUST be **outside** the tree you grade (e.g. `/aura-home` while
-  the repo is `/testbed`), or aura's vault/sessions/logs pollute the captured diff.
+- `workspace.path` MUST be **outside** the tree you grade (e.g. `/baybo-home` while
+  the repo is `/testbed`), or baybo's vault/sessions/logs pollute the captured diff.
 - Add `"base_url"` to the llm entry only when set (omit → provider default).
 - An in-process-only run (no gateway) that still fails config validation for a
   missing `gateway` block: add a dummy `"gateway": {"bind_address":"127.0.0.1","port":<any>}`
@@ -141,9 +141,9 @@ and exported. Adapt the arms, the build line, and the table columns.
 
 ```bash
 #!/usr/bin/env bash
-# Run the aura <NAME> benchmark for one or more arms and print a comparison table.
-#   noop = floor, oracle = ceiling (neither needs aura or a key — run first),
-#   <real> = the measurement (needs the bench-feature aura + a model key).
+# Run the baybo <NAME> benchmark for one or more arms and print a comparison table.
+#   noop = floor, oracle = ceiling (neither needs baybo or a key — run first),
+#   <real> = the measurement (needs the bench-feature baybo + a model key).
 # See bench/<name>/README.md.
 set -euo pipefail
 # shellcheck disable=SC2086  # *_ARG vars are intentionally word-split.
@@ -155,15 +155,15 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 # ---- config (override via env) --------------------------------------------
 : "${ARMS:=noop oracle}"                 # space-separated: noop oracle <real>
 : "${CONCURRENCY:=4}"
-: "${AURA_MODEL:=deepseek/deepseek-v4-flash}"  # real arm LLM as <provider>/<model>
-: "${AURA_BASE_URL:=}"                          # empty => provider default endpoint
-: "${AURA_BIN:=}"                        # empty => build the bench-feature aura here
+: "${BAYBO_MODEL:=deepseek/deepseek-v4-flash}"  # real arm LLM as <provider>/<model>
+: "${BAYBO_BASE_URL:=}"                          # empty => provider default endpoint
+: "${BAYBO_BIN:=}"                        # empty => build the bench-feature baybo here
 : "${OUTDIR:=$BENCH_DIR/bench-out}"      # scratch (gitignored)
 : "${RESULTS_DIR:=$BENCH_DIR/results}"   # per-run result JSONs (gitignored)
 : "${RUN_ID:=<name>-$(date +%Y%m%d-%H%M%S)}"
 : "${DRY_RUN:=0}"
-: "${RUST_LOG:=aura_bench_<name>=info}"; export RUST_LOG
-PKG="aura-bench-<name>"
+: "${RUST_LOG:=baybo_bench_<name>=info}"; export RUST_LOG
+PKG="baybo-bench-<name>"
 # ---------------------------------------------------------------------------
 mkdir -p "$OUTDIR" "$RESULTS_DIR"
 
@@ -174,7 +174,7 @@ for arm in $ARMS; do case "$arm" in
 esac; done
 want_real=0; for a in $ARMS; do [ "$a" != noop ] && [ "$a" != oracle ] && want_real=1; done
 if [ "$DRY_RUN" != 1 ] && [ "$want_real" = 1 ]; then
-  : "${AURA_API_KEY:?the real arm needs the model key in \$AURA_API_KEY (set it in .env)}"
+  : "${BAYBO_API_KEY:?the real arm needs the model key in \$BAYBO_API_KEY (set it in .env)}"
 fi
 
 # ---- dry run: print each arm's plan, no spend ------------------------------
@@ -186,14 +186,14 @@ if [ "$DRY_RUN" = 1 ]; then
   exit 0
 fi
 
-# ---- build the bench bins (+ the feature-gated aura for the real arm) -------
+# ---- build the bench bins (+ the feature-gated baybo for the real arm) -------
 echo ">> building $PKG bins"; cargo build -p "$PKG" --bins
-if [ "$want_real" = 1 ] && [ -z "$AURA_BIN" ]; then
+if [ "$want_real" = 1 ] && [ -z "$BAYBO_BIN" ]; then
   # In-container bench → static musl (`--target x86_64-unknown-linux-musl`, needs
   # musl-gcc for libsql's bundled SQLite). In-process bench → a normal release build.
-  echo ">> building aura --features <bench-feature>"
-  cargo build --release -p aura --features <bench-feature>
-  AURA_BIN="$REPO_ROOT/target/release/aura"
+  echo ">> building baybo --features <bench-feature>"
+  cargo build --release -p baybo --features <bench-feature>
+  BAYBO_BIN="$REPO_ROOT/target/release/baybo"
 fi
 
 # ---- run each arm ----------------------------------------------------------
@@ -202,8 +202,8 @@ run_arm() {
   echo ">> [$arm] -> $results"
   local common=( --arm "$arm" --run-id "$RUN_ID" --out "$results" --concurrency "$CONCURRENCY" )
   if [ "$arm" != noop ] && [ "$arm" != oracle ]; then
-    local real=( --aura-bin "$AURA_BIN" --model "$AURA_MODEL" )
-    [ -n "$AURA_BASE_URL" ] && real+=( --base-url "$AURA_BASE_URL" )
+    local real=( --baybo-bin "$BAYBO_BIN" --model "$BAYBO_MODEL" )
+    [ -n "$BAYBO_BASE_URL" ] && real+=( --base-url "$BAYBO_BASE_URL" )
     cargo run -q -p "$PKG" --bin run -- "${common[@]}" "${real[@]}"
   else
     cargo run -q -p "$PKG" --bin run -- "${common[@]}"
@@ -234,11 +234,11 @@ A populate-then-query bench (clone `bench/memory/run-bench.sh`) inserts an
 **`Cargo.toml` (self-hosted Rust bench):**
 ```toml
 # <NAME> benchmark. NOT shipped and NOT on the CI/`cargo test` path: the `run`
-# bin drives a real `aura` against a model API (spends money) [/ starts Docker /
+# bin drives a real `baybo` against a model API (spends money) [/ starts Docker /
 # hits external servers]. Run it by hand. The library half (IR + pure helpers +
-# report) is unit-tested and has no Aura/Docker/Python dependency.
+# report) is unit-tested and has no Baybo/Docker/Python dependency.
 [package]
-name = "aura-bench-<name>"
+name = "baybo-bench-<name>"
 version.workspace = true
 edition.workspace = true
 publish = false
@@ -261,19 +261,19 @@ uuid = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-# Only if the bench must populate aura state directly (like memory's ingest):
-# aura-<backend> = { workspace = true }
+# Only if the bench must populate baybo state directly (like memory's ingest):
+# baybo-<backend> = { workspace = true }
 ```
 Also: add `"bench/<name>"` to the root `Cargo.toml` `[workspace] members`, and (if
-other crates reference it) `aura-bench-<name> = { path = "bench/<name>" }` to
+other crates reference it) `baybo-bench-<name> = { path = "bench/<name>" }` to
 `[workspace.dependencies]`.
 
 **Root `[features]` (the bench build feature, fail-closed):**
 ```toml
-# Build a benchmark-only `aura` that <does the dangerous thing>. Without this
+# Build a benchmark-only `baybo` that <does the dangerous thing>. Without this
 # feature the dangerous config is a hard startup error (never a silent
 # downgrade). NOT for production.
-bench-<cap> = ["aura-<crate>/bench-<cap>"]
+bench-<cap> = ["baybo-<crate>/bench-<cap>"]
 ```
 Then `bench-<cap> = []` in each owning crate's `[features]`, and gate the code
 with `#[cfg(feature = "bench-<cap>")]` so it isn't compiled otherwise.
@@ -295,27 +295,27 @@ only the real arm reads them (noop/oracle need none):
 
 | role | canonical var | notes |
 | --- | --- | --- |
-| the key | `AURA_API_KEY` | the one required value |
-| the model | `AURA_MODEL` | `<provider>/<model>`, e.g. `deepseek/deepseek-v4-flash` |
-| custom endpoint | `AURA_BASE_URL` | empty => provider default |
+| the key | `BAYBO_API_KEY` | the one required value |
+| the model | `BAYBO_MODEL` | `<provider>/<model>`, e.g. `deepseek/deepseek-v4-flash` |
+| custom endpoint | `BAYBO_BASE_URL` | empty => provider default |
 
-**The `AURA_` prefix namespaces the bench's vars** so a bare `API_KEY` / `MODEL`
+**The `BAYBO_` prefix namespaces the bench's vars** so a bare `API_KEY` / `MODEL`
 already in the environment can't clash with them. **No `*_API_KEY_ENV` knob:** the
-bench generates the config, so it fixes `api_key_env: "AURA_API_KEY"` in the
-`aura.json` it writes and injects the value under `AURA_API_KEY` — the env-var name
+bench generates the config, so it fixes `api_key_env: "BAYBO_API_KEY"` in the
+`baybo.json` it writes and injects the value under `BAYBO_API_KEY` — the env-var name
 is an internal constant, not a user choice. The user only supplies the *value*; to
-reuse a key already in another var, set `AURA_API_KEY=$DEEPSEEK_API_KEY` in `.env`
+reuse a key already in another var, set `BAYBO_API_KEY=$DEEPSEEK_API_KEY` in `.env`
 (it's shell-sourced, so it expands). This holds even for an external-harness adapter:
-`bench/terminal-bench-1.0` drives Terminal-Bench yet still uses the bare `AURA_API_KEY` /
-`AURA_MODEL` / `AURA_BASE_URL` (+ `AURA_BIN` for the binary) — no sub-namespace,
-since nothing else owns `AURA_*`.
+`bench/terminal-bench-1.0` drives Terminal-Bench yet still uses the bare `BAYBO_API_KEY` /
+`BAYBO_MODEL` / `BAYBO_BASE_URL` (+ `BAYBO_BIN` for the binary) — no sub-namespace,
+since nothing else owns `BAYBO_*`.
 
 Extend the set only when a bench genuinely has **more than one LLM role** — keep the
-`AURA_` prefix and give each role its own descriptive vars, so one key can serve both
+`BAYBO_` prefix and give each role its own descriptive vars, so one key can serve both
 (the one case where naming the key's env-var earns its place). `bench/memory`
 benchmarks memory backends with a fixed *answer* model **and** an LLM judge: the
-answerer gets `AURA_ANSWER_PROVIDER` / `AURA_ANSWER_MODEL` / `AURA_ANSWER_API_KEY_ENV`
-/ `AURA_ANSWER_BASE_URL` (the env knob defaulting to the judge's `DEEPSEEK_API_KEY` so
+answerer gets `BAYBO_ANSWER_PROVIDER` / `BAYBO_ANSWER_MODEL` / `BAYBO_ANSWER_API_KEY_ENV`
+/ `BAYBO_ANSWER_BASE_URL` (the env knob defaulting to the judge's `DEEPSEEK_API_KEY` so
 one key covers both), while the judge stays on `DEEPSEEK_API_KEY` and the backends on
 `OPENVIKING_*` / `MEM0_*` — provider/infra config has no canonical form.
 
@@ -325,19 +325,19 @@ Bench-specific backend/server config (endpoints, dims, auth tokens — e.g. memo
 ```bash
 # Environment for the <NAME> bench real arm. Auto-loaded + exported by run-bench.sh.
 # Only the real arm needs a key; noop/oracle run with none.
-AURA_API_KEY=
+BAYBO_API_KEY=
 # Optional (empty => the default in the comment):
-AURA_MODEL=     # deepseek/deepseek-v4-flash  (<provider>/<model>)
-AURA_BASE_URL=  # provider's built-in endpoint  (set for a proxy / gateway)
+BAYBO_MODEL=     # deepseek/deepseek-v4-flash  (<provider>/<model>)
+BAYBO_BASE_URL=  # provider's built-in endpoint  (set for a proxy / gateway)
 ```
 
 **`pyproject.toml` + `.python-version`** (only if the bench needs Python — a
 dataset export or an official grader). Deps-only env:
 ```toml
 [project]
-name = "aura-bench-<name>-pytools"
+name = "baybo-bench-<name>-pytools"
 version = "0.0.0"
-description = "Python tooling for the aura <NAME> bench."
+description = "Python tooling for the baybo <NAME> bench."
 requires-python = ">=3.11,<3.13"   # pin to what the external stack supports
 dependencies = [ "<the-official-harness-or-dataset-lib>" ]
 
@@ -353,12 +353,12 @@ or `bench/<name>/.venv/bin/python`; `uv sync` builds the reused `.venv` once.
 
 Mirror the existing READMEs (`bench/swe/README.md` is the fullest):
 
-1. **One-paragraph "measures whether the REAL Aura agent …"** + the faithfulness
+1. **One-paragraph "measures whether the REAL Baybo agent …"** + the faithfulness
    claim (runs inside the official image / drives the real loop / graded by the
    official harness).
-2. **Arms table** — arm · what it grades · needs aura? · needs a key? — and the
+2. **Arms table** — arm · what it grades · needs baybo? · needs a key? — and the
    "run noop/oracle first, offline & unpriced" note.
-3. **"You must build aura with `--features <bench-feature>`"** — what the feature
+3. **"You must build baybo with `--features <bench-feature>`"** — what the feature
    does and why a normal build refuses the config (the fail-closed lock); the
    musl note if in-container.
 4. **Prerequisites** (Docker / uv / external servers).

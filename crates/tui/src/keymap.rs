@@ -196,7 +196,7 @@ fn translate_approval(key: KeyEvent) -> Action {
 mod tests {
     use super::*;
     use crate::app::AppState;
-    use aura_channels::DashboardSnapshot;
+    use baybo_channels::DashboardSnapshot;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -263,7 +263,7 @@ mod tests {
             Action::Nothing
         );
         app.enter_dashboard(
-            aura_channels::ViewKind::Skills,
+            baybo_channels::ViewKind::Skills,
             DashboardSnapshot {
                 title: "s".into(),
                 columns: vec![],
@@ -387,7 +387,7 @@ mod tests {
     fn up_arrow_scrolls_rows_in_dashboard_not_history() {
         let mut app = AppState::new();
         app.enter_dashboard(
-            aura_channels::ViewKind::Skills,
+            baybo_channels::ViewKind::Skills,
             DashboardSnapshot {
                 title: "s".into(),
                 columns: vec![],

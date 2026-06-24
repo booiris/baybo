@@ -1,5 +1,5 @@
-use aura_job::{CancelReason, JobStatusKind};
-use aura_model::JobId;
+use baybo_job::{CancelReason, JobStatusKind};
+use baybo_model::JobId;
 use serde_json::{Value, json};
 
 use crate::cli::{JobCmd, JobStatusArg};
@@ -15,7 +15,7 @@ pub async fn handle(ctx: &CommandContext, cmd: JobCmd) -> Result<CommandOutput> 
     }
 }
 
-fn jobs(ctx: &CommandContext) -> Result<&aura_job::JobLifecycle> {
+fn jobs(ctx: &CommandContext) -> Result<&baybo_job::JobLifecycle> {
     ctx.job
         .as_deref()
         .ok_or_else(|| CliError::Manager("job manager is not available in this invocation".into()))
@@ -44,7 +44,7 @@ async fn list(ctx: &CommandContext, status: Option<JobStatusKind>) -> Result<Com
     let jobs = mgr
         .list(status)
         .await
-        .map_err(|e: aura_job::JobError| CliError::Manager(format!("list jobs: {e}")))?;
+        .map_err(|e: baybo_job::JobError| CliError::Manager(format!("list jobs: {e}")))?;
 
     if jobs.is_empty() {
         let label = status
@@ -96,7 +96,7 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     let job = mgr
         .get(&job_id)
         .await
-        .map_err(|e: aura_job::JobError| CliError::Manager(format!("get job: {e}")))?
+        .map_err(|e: baybo_job::JobError| CliError::Manager(format!("get job: {e}")))?
         .ok_or_else(|| CliError::Manager(format!("job {id} not found")))?;
 
     let value = json!({
@@ -152,11 +152,11 @@ async fn cancel(ctx: &CommandContext, id: &str, yes: bool) -> Result<CommandOutp
     let job_id = parse_id(id)?;
     mgr.cancel(&job_id, CancelReason::OperatorCancel, vec![])
         .await
-        .map_err(|e: aura_job::JobError| CliError::Manager(format!("cancel job: {e}")))?;
+        .map_err(|e: baybo_job::JobError| CliError::Manager(format!("cancel job: {e}")))?;
     let job = mgr
         .get(&job_id)
         .await
-        .map_err(|e: aura_job::JobError| CliError::Manager(format!("reload job: {e}")))?
+        .map_err(|e: baybo_job::JobError| CliError::Manager(format!("reload job: {e}")))?
         .ok_or_else(|| CliError::Manager(format!("job {id} not found after cancel")))?;
 
     Ok(CommandOutput {

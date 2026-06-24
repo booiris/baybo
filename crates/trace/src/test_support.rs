@@ -1,16 +1,16 @@
 //! In-memory `TraceStore` for downstream tests.
 //!
 //! Gated behind the `test-support` cargo feature so it never ships in
-//! release builds. Lives in `aura-trace` (next to the row conversions)
-//! so crates that depend on `aura-trace` can spin up a fake store
+//! release builds. Lives in `baybo-trace` (next to the row conversions)
+//! so crates that depend on `baybo-trace` can spin up a fake store
 //! without pulling the libsql adapter.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use aura_model::{JobId, SpanId, StepId};
-use aura_store::trace::Result;
-use aura_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
+use baybo_model::{JobId, SpanId, StepId};
+use baybo_store::trace::Result;
+use baybo_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
 use parking_lot::Mutex;
 
 use crate::{Span, Step};

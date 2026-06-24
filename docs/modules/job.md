@@ -4,7 +4,7 @@
 
 The `job` crate is the home for the Job concept: domain types (`Job`, `JobStatus`, `JobInputKind`, `JobShape`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `JobError`), the row conversions that persist them, and the `JobLifecycle` persistence orchestrator. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself; `JobLifecycle` wraps the `JobStore` with the cancel state machine, lifecycle-event bus, and `JobId → CancellationToken` registry the in-flight execution path subscribes to.
 
-The `JobStore` trait itself lives in the `aura-store` ports crate and trades in row DTOs — `JobRow` (the queryable columns plus the serialized `Job` in `data`) and `JobTransitionRow`. This crate owns the `Job::to_row` / `Job::from_row` conversions, so the state machine stays here while the trait sits in a leaf crate every store consumer can reach. `aura-storage` provides the libsql implementation, shuttling rows without depending on `aura-job` (it converts in its tests only). `impl From<aura_store::StorageError> for JobError` bridges errors at the call sites.
+The `JobStore` trait itself lives in the `baybo-store` ports crate and trades in row DTOs — `JobRow` (the queryable columns plus the serialized `Job` in `data`) and `JobTransitionRow`. This crate owns the `Job::to_row` / `Job::from_row` conversions, so the state machine stays here while the trait sits in a leaf crate every store consumer can reach. `baybo-storage` provides the libsql implementation, shuttling rows without depending on `baybo-job` (it converts in its tests only). `impl From<baybo_store::StorageError> for JobError` bridges errors at the call sites.
 
 Job answers **"what step is this operation at"**, not "what exactly did it do." Detailed input/output is recorded by `trace`. Each job carries its own `final_result` for the final contractual value, but progress messages emitted mid-job live in the trace tree — `Job.emitted_span_ids` is an index, not a copy. Spans completed before a cancel are tracked separately on `JobStatus::Cancelled { reason, partial_artifacts }`, not as a top-level `Job` field.
 
@@ -34,7 +34,7 @@ Every transition is validated strictly. Illegal transitions return errors, never
 
 `Cancelled` carries a `reason: CancelReason` (`UserPreempt`, `SystemCrash`, `SubagentTimeout`, `ParentCancelled`, `ParentDeleted`, `OperatorCancel`, `UserStopped`) and `partial_artifacts: Vec<SpanId>` — the spans that completed (or partially completed) before the cancel. Both fields are nested **inside** the `JobStatus::Cancelled { reason, partial_artifacts }` variant; the top-level `Job` exposes `emitted_span_ids` for general progress indexing. The next job's prompt-assembly step reads `partial_artifacts` and renders a "previously completed steps:" preamble so the LLM has context. Content lives only in the trace; the field is indices.
 
-`SystemCrash` is used when Aura owns the cleanup after execution disappeared:
+`SystemCrash` is used when Baybo owns the cleanup after execution disappeared:
 the boot recovery sweep rolls jobs left non-terminal by a prior process death to
 `Cancelled { SystemCrash }`, and the in-process actor panic runner does the same
 for the panicked session's active turn jobs.
@@ -54,7 +54,7 @@ pub enum JobShape { Turn, Maintenance }
 ```
 
 - **input kind** (`JobInputKind`) — `Job::input_kind()`, projected from `JobInput`. `JobInput` is a strongly typed payload enum whose variants line up 1:1 with `JobInputKind`.
-- **origin** (`aura_model::TriggerKind`, stored on `Job.origin`) — the owning session's root trigger, recorded **as-is** at creation. It is *not* asserted against the payload: background compression runs inside a `User`-trigger session and records `origin = User` while carrying a `System` input. Subagent jobs record `origin = Spawned` (their session's inherited root).
+- **origin** (`baybo_model::TriggerKind`, stored on `Job.origin`) — the owning session's root trigger, recorded **as-is** at creation. It is *not* asserted against the payload: background compression runs inside a `User`-trigger session and records `origin = User` while carrying a `System` input. Subagent jobs record `origin = Spawned` (their session's inherited root).
 - **shape** (`JobShape`, stored on `Job.shape`) — **declared by the code path that runs the job**, not inferred from the payload: `run()` mints `Turn`; both background compression and the foreground `/compact` mint `Maintenance` (the latter despite its `UserChat` input — inferring shape from the input would mislabel it a turn). `Job::is_turn()` reads it. A session serialises its turns (≤1 active turn-job) but may run a concurrent `Maintenance` job, which is why `list_active_by_session` returns a `Vec`.
 
 `JobOutput` does not split this way — it has only `Message` and `Structured`, the two shapes any job can produce.
@@ -85,7 +85,7 @@ This keeps the state machine invariants co-located with the type and makes them 
 ### Recovery
 
 The state-machine and storage shape support recovery of non-terminal jobs
-(`Pending` / `InProgress` / `Stuck`). `aura_agent::recovery` owns the cross-table
+(`Pending` / `InProgress` / `Stuck`). `baybo_agent::recovery` owns the cross-table
 repair because it has both job and trace stores:
 
 - Boot recovery scans all non-terminal jobs from the prior process, closes any
@@ -123,15 +123,15 @@ Distinct from a new trigger arriving, the out-of-band `/stop` control command ca
 | Key fields     | `status`, timestamps, hierarchy, `final_result`      | `step_id`, `span_id`, kind-specific input/output/provenance |
 | Sensitive data | Sanitized JSON only                                  | Sanitized payloads/summaries only                           |
 
-`JobLifecycle` lives in this crate; `SpanRecorder` (still in `agent`, pending its own extraction to `aura-trace`) is its peer facade. They do not share a transaction; cross-table consistency is reconciled by the recovery scan (per-table transactions, eventually consistent).
+`JobLifecycle` lives in this crate; `SpanRecorder` (still in `agent`, pending its own extraction to `baybo-trace`) is its peer facade. They do not share a transaction; cross-table consistency is reconciled by the recovery scan (per-table transactions, eventually consistent).
 
 ## Constraints
 
 - `input` / `final_result` / `JobStatus::Cancelled.partial_artifacts` store sanitized JSON / span-id lists only — sensitive values must already be placeholders
 - `save()` and `record_transition()` should run in the same transaction (enforced by `JobLifecycle`)
 - `Job.origin` and `Job.shape` are both supplied by the caller at `JobLifecycle::start_job` (via `JobSpec.origin` / `JobSpec.shape`) and passed straight into `Job::new`; neither is validated against the payload — input kind, origin, and shape are independent. Only `input_kind` is projected from `input`
-- Does not depend on `trace`, `llm`, `tools`, or `agent`. Depends only on `aura-model` for IDs.
-- `test_support::MemoryJobStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `aura-job = { workspace = true, features = ["test-support"] }`.
+- Does not depend on `trace`, `llm`, `tools`, or `agent`. Depends only on `baybo-model` for IDs.
+- `test_support::MemoryJobStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `baybo-job = { workspace = true, features = ["test-support"] }`.
 
 ## Collaboration
 
@@ -140,5 +140,5 @@ Distinct from a new trigger arriving, the out-of-band `/stop` control command ca
 | `agent`   | Consumes `JobLifecycle` to drive jobs through the agent loop; supplies the cancellation tokens that `register_running` tracks |
 | `trace`   | Provides `SpanId`; `JobStatus::Cancelled.partial_artifacts` references trace spans; recovery coordinates with the trace scan    |
 | `store`   | Owns the `JobStore` trait + its `JobRow` / `JobTransitionRow` DTOs and `StorageError`; this crate converts `Job` ↔ rows |
-| `storage` | Provides the libsql implementation of `JobStore` (from `aura-store`), shuttling rows; depends on `aura-job` only as a dev-dependency |
+| `storage` | Provides the libsql implementation of `JobStore` (from `baybo-store`), shuttling rows; depends on `baybo-job` only as a dev-dependency |
 | `session` | `Session.trigger.kind()` is recorded as `Job.origin`; `Lineage` consumes `parent_job_id`                       |

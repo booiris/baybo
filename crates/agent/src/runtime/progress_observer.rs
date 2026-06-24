@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
-use aura_llm::{Attribution, BillableLlm, ChatRequest, ModelInfo};
-use aura_model::{ChannelType, JobId, SessionId};
-use aura_trace::{
+use baybo_llm::{Attribution, BillableLlm, ChatRequest, ModelInfo};
+use baybo_model::{ChannelType, JobId, SessionId};
+use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallInputs, LlmCallResult, SpanRecorder, StepKind,
 };
 use tokio_util::sync::CancellationToken;
@@ -156,7 +156,7 @@ impl ProgressObserverRunner {
             cancel_token,
         } = self;
 
-        let cancel_ctx = Some((&cancel_token, aura_job::CancelReason::ParentCancelled));
+        let cancel_ctx = Some((&cancel_token, baybo_job::CancelReason::ParentCancelled));
         let begin = LlmCallBegin {
             model_id: model_info.id.clone(),
             provider: model_info.provider.clone(),
@@ -189,7 +189,7 @@ impl ProgressObserverRunner {
                             session_id: session_id.clone(),
                             job_id,
                             span_id: span.span_id,
-                            reason: aura_llm::CallReason::ProgressObserver,
+                            reason: baybo_llm::CallReason::ProgressObserver,
                         });
                         match bound.chat(&request).await {
                             Ok(billed) => {
@@ -237,7 +237,7 @@ mod gate_tests {
     use super::{
         OBSERVER_APPEAR_AFTER, OBSERVER_MIN_INTERVAL, channel_wants_progress, should_fire_observer,
     };
-    use aura_model::ChannelType;
+    use baybo_model::ChannelType;
     use std::time::{Duration, Instant};
 
     #[test]

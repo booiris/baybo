@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_model::{ChatMessage, ContentBlock};
+use baybo_model::{ChatMessage, ContentBlock};
 use parking_lot::Mutex;
 
 use crate::{Memory, MemoryContext, RecalledMemory, Result};

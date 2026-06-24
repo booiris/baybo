@@ -14,7 +14,7 @@ Reproduced on:
 - `gemini-2.5-flash` — 2 calls, prefix ≈ 8.4k tokens, second call cached=0.
 
 Both runs send 41 `function_declarations` (Bash, Read, Write, browser/*, …).
-Aura-side prefix stability has been audited and is not the cause:
+Baybo-side prefix stability has been audited and is not the cause:
 
 - `crates/agent/src/soul.rs:73` env block contains only workdir + platform — no
   timestamps, no UUIDs.
@@ -86,7 +86,7 @@ implicit caching. Cheapest; only viable if Gemini stays a side experiment.
 ## Design constraints
 
 - **No silent regressions**. Whatever path lands, `cost_records.cached_input_tokens`
-  must remain accurate — the column is what `aura cost` and any future quota
+  must remain accurate — the column is what `baybo cost` and any future quota
   logic key on. Don't fabricate cache hits we didn't get.
 - **TTL accounting**. Explicit cache costs *whether or not it gets hit*. A
   session that ends after one turn pays storage for nothing. Cache lifecycle

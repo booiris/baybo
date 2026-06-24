@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `cron` crate owns scheduled recurring work end-to-end: the `CronScheduler` (`scheduler.rs`) that ticks against the store, the `Shutdown` trait (`shutdown.rs`) used to bound the scheduler's tick loop, and `CronError`. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`) live in `aura-model` (re-exported here for back-compat); the `CronStore` persistence trait lives in the `aura-store` ports crate. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs. The libsql implementation of `CronStore` lives in `aura-storage`; the LLM-invocable cron tools (`CronCreate` / `CronDelete` / `CronList`) live in `aura-cron::tools` (the crate depends on `aura-tools` for the `Tool` trait). `aura-agent` re-exports `CronScheduler` and `CronTriggerEvent` for assembly-layer consumers.
+The `cron` crate owns scheduled recurring work end-to-end: the `CronScheduler` (`scheduler.rs`) that ticks against the store, the `Shutdown` trait (`shutdown.rs`) used to bound the scheduler's tick loop, and `CronError`. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`) live in `baybo-model` (re-exported here for back-compat); the `CronStore` persistence trait lives in the `baybo-store` ports crate. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs. The libsql implementation of `CronStore` lives in `baybo-storage`; the LLM-invocable cron tools (`CronCreate` / `CronDelete` / `CronList`) live in `baybo-cron::tools` (the crate depends on `baybo-tools` for the `Tool` trait). `baybo-agent` re-exports `CronScheduler` and `CronTriggerEvent` for assembly-layer consumers.
 
 CronJobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration. Each fire mints a brand-new session in the agent layer — one trigger = one session — so the run sees a clean transcript and fresh `SessionState`. A `CronJob` also records its `origin_session_id` — the session that created it — purely for traceability; trigger-time session creation is unaffected.
 
@@ -36,27 +36,27 @@ The `schedule` field is `CronSchedule`, a tagged enum with two variants: `Cron {
 
 A fire is delivered to the model as a *user* turn, so a bare prompt is ambiguous: a job created to "say 你好 in a minute" stores the prompt `你好`, and at fire time the model reads `你好` as the user greeting it and greets back instead of performing the send. Two layers keep the intent unambiguous:
 
-- **At creation**, the `CronCreate` tool (`aura-cron::tools`) steers the model to write `prompt` as a self-contained, imperative *task instruction* ("Send the user a greeting: 你好") rather than the literal phrase.
-- **At fire time**, the agent layer wraps `prompt` via `aura_context::prompts::cron::frame_cron_prompt` before it reaches the LLM. The framing states that this is a scheduled fire (not a live user message), that the prompt is an instruction to carry out now and report back, and that the `[cron:<job_id>]` routing tag is diagnostic-only and must never surface in the reply. `aura_context::prompts::cron::original_cron_prompt` reverses the framing for operator previews (the admin chat panel) and stays backward-compatible with legacy `[cron:<id>] <prompt>` rows.
+- **At creation**, the `CronCreate` tool (`baybo-cron::tools`) steers the model to write `prompt` as a self-contained, imperative *task instruction* ("Send the user a greeting: 你好") rather than the literal phrase.
+- **At fire time**, the agent layer wraps `prompt` via `baybo_context::prompts::cron::frame_cron_prompt` before it reaches the LLM. The framing states that this is a scheduled fire (not a live user message), that the prompt is an instruction to carry out now and report back, and that the `[cron:<job_id>]` routing tag is diagnostic-only and must never surface in the reply. `baybo_context::prompts::cron::original_cron_prompt` reverses the framing for operator previews (the admin chat panel) and stays backward-compatible with legacy `[cron:<id>] <prompt>` rows.
 
-### LLM-invocable cron tools live in aura-cron
+### LLM-invocable cron tools live in baybo-cron
 
-`tools::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` `Tool` implementations (each holding an `Arc<CronScheduler>`). They live in `aura-cron::tools` — the same pattern as `aura-skills::tools` — so the cron domain owns its own LLM surface. This is only possible because `CronStore` moved to the `aura-store` ports crate: the old `aura-storage → aura-cron` edge is gone, so `aura-cron` taking a dependency on `aura-tools` (for the `Tool` trait) no longer closes the cycle `aura-cron → aura-tools → aura-storage → aura-cron`. `src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
+`tools::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` `Tool` implementations (each holding an `Arc<CronScheduler>`). They live in `baybo-cron::tools` — the same pattern as `baybo-skills::tools` — so the cron domain owns its own LLM surface. This is only possible because `CronStore` moved to the `baybo-store` ports crate: the old `baybo-storage → baybo-cron` edge is gone, so `baybo-cron` taking a dependency on `baybo-tools` (for the `Tool` trait) no longer closes the cycle `baybo-cron → baybo-tools → baybo-storage → baybo-cron`. `src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
 
 ### Storage decoupling
 
-The `CronStore` trait lives in the `aura-store` ports crate (its libsql impl in `aura-storage`) and operates on the domain types directly — `CronJob` / `CronExecution` / `ExecutionStatus` rather than opaque row shapes. The libsql implementation in `aura-storage::libsql::cron` handles JSON serialization of the `data` column internally; the trait surface no longer leaks the row shape outside the backend. This is a deliberate change from the prior opaque-row design — the row-vs-domain dance has moved out of `aura-cron::scheduler` and into the libsql adapter where it belongs.
+The `CronStore` trait lives in the `baybo-store` ports crate (its libsql impl in `baybo-storage`) and operates on the domain types directly — `CronJob` / `CronExecution` / `ExecutionStatus` rather than opaque row shapes. The libsql implementation in `baybo-storage::libsql::cron` handles JSON serialization of the `data` column internally; the trait surface no longer leaks the row shape outside the backend. This is a deliberate change from the prior opaque-row design — the row-vs-domain dance has moved out of `baybo-cron::scheduler` and into the libsql adapter where it belongs.
 
 ## Constraints
 
-- No dependency on `agent` or `storage`. Depends on `aura-tools` (for the `Tool` trait the cron tools implement) and `aura-store` (the `CronStore` contract), so `aura-cron` is no longer a leaf — it mirrors `aura-skills`, which also carries its own `tools` module. No cycle: nothing in `aura-tools`'s dependency graph reaches back to `aura-cron`.
-- Depends on: `aura-model`, `aura-store`, `aura-tools`, `chrono`, `chrono-tz`, `cron`, `tokio`, `parking_lot`, `serde`, `serde_json`, `uuid`, `async-trait`, `thiserror`, `anyhow`, `tracing`
+- No dependency on `agent` or `storage`. Depends on `baybo-tools` (for the `Tool` trait the cron tools implement) and `baybo-store` (the `CronStore` contract), so `baybo-cron` is no longer a leaf — it mirrors `baybo-skills`, which also carries its own `tools` module. No cycle: nothing in `baybo-tools`'s dependency graph reaches back to `baybo-cron`.
+- Depends on: `baybo-model`, `baybo-store`, `baybo-tools`, `chrono`, `chrono-tz`, `cron`, `tokio`, `parking_lot`, `serde`, `serde_json`, `uuid`, `async-trait`, `thiserror`, `anyhow`, `tracing`
 
 ## Collaboration
 
 | Module | Role |
 |--------|------|
-| `storage` | `LibsqlCronStore` implements the `CronStore` trait (from `aura-store`) against libsql, over `aura-model` types; no dependency on `aura-cron` |
-| `tools`   | `aura-cron::tools` implements the `Tool` trait (`CronCreate` / `CronDelete` / `CronList`), bridging `Arc<CronScheduler>` to the registry; `src/runtime.rs` registers them |
+| `storage` | `LibsqlCronStore` implements the `CronStore` trait (from `baybo-store`) against libsql, over `baybo-model` types; no dependency on `baybo-cron` |
+| `tools`   | `baybo-cron::tools` implements the `Tool` trait (`CronCreate` / `CronDelete` / `CronList`), bridging `Arc<CronScheduler>` to the registry; `src/runtime.rs` registers them |
 | `agent`   | Re-exports `CronScheduler` / `CronTriggerEvent`; `Router` consumes the event stream, resolves sessions, and routes `AgentMessage::CronTrigger` to actors |
 | `job`     | `OperationKind::CronExecution` tracks cron-triggered operations |

@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_model::{ChannelType, SessionId};
+use baybo_model::{ChannelType, SessionId};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use tokio::sync::mpsc;
@@ -10,8 +10,8 @@ use tracing::{debug, error, info};
 
 use crate::error::CronError;
 use crate::shutdown::Shutdown;
-use aura_model::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
-use aura_store::CronStore;
+use baybo_model::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
+use baybo_store::CronStore;
 
 type Result<T> = std::result::Result<T, CronError>;
 
@@ -534,8 +534,8 @@ mod tests {
     use super::*;
     use crate::shutdown::NeverShutdown;
     use async_trait::async_trait;
-    use aura_store::StorageError;
-    use aura_store::cron::Result;
+    use baybo_store::StorageError;
+    use baybo_store::cron::Result;
     use parking_lot::Mutex;
 
     /// In-memory CronStore for testing.

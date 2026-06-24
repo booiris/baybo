@@ -16,7 +16,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use aura_model::ChannelType;
+use baybo_model::ChannelType;
 use parking_lot::Mutex;
 
 /// Cap on the number of recently-seen `(channel_type, bot_id, msg_id)`

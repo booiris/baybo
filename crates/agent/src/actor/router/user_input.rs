@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use aura_channels::{
+use baybo_channels::{
     AgentEvent, AgentOutput, IncomingMessage, NoticeLevel, OutgoingMessage, STOP_COMMAND_NAME,
 };
-use aura_job::{CancelReason, JobStatusKind};
-use aura_model::{ChannelType, ContentBlock, ControlEventKind, JobId, MessageMetadata, SessionId};
+use baybo_job::{CancelReason, JobStatusKind};
+use baybo_model::{ChannelType, ContentBlock, ControlEventKind, JobId, MessageMetadata, SessionId};
 use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
@@ -33,7 +33,7 @@ impl Router {
         if let Err(e) = &result {
             // A pre-actor rejection (rate limit, cost cap, sanitizer, store
             // error, route failure) otherwise sends nothing back: a
-            // request/response client like `aura prompt` then blocks for the
+            // request/response client like `baybo prompt` then blocks for the
             // whole timeout, and a live channel just shows silence. Emit a
             // terminal `AgentEvent::Message` (via `From<OutgoingMessage>`) so
             // the turn closes with a visible reason.
@@ -303,7 +303,7 @@ impl Router {
     async fn route_one_to_actor(
         &self,
         session_id: &SessionId,
-        session: &aura_model::Session,
+        session: &baybo_model::Session,
         message: AgentMessage,
     ) -> bool {
         let response_tx = self.supervisor.response_tx().clone();
@@ -555,7 +555,7 @@ fn build_stop_notice(cancelled_turn: bool, background: &[(SessionId, InFlightJob
     }
     let mut lines = vec!["Stopped.".to_string()];
     if cancelled_turn {
-        lines.push(aura_channels::STOP_CANCELLED_REPLY_LINE.to_string());
+        lines.push(baybo_channels::STOP_CANCELLED_REPLY_LINE.to_string());
     }
     if !background.is_empty() {
         lines.push(format!(

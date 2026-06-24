@@ -1,13 +1,13 @@
 //! [`GoalService`] — the CRUD + status-transition facade over an
-//! `aura_store::GoalStore` that both the goal tools and the `aura-agent`
+//! `baybo_store::GoalStore` that both the goal tools and the `baybo-agent`
 //! continuation runtime drive. It is the single home of the "one current goal
 //! per session" policy and the read-modify-write usage accounting, so neither
 //! the tools nor the actor duplicate that logic.
 
 use std::sync::Arc;
 
-use aura_model::{Goal, GoalId, GoalStatus, SessionId};
-use aura_store::goal::{GoalPatch, GoalStore};
+use baybo_model::{Goal, GoalId, GoalStatus, SessionId};
+use baybo_store::goal::{GoalPatch, GoalStore};
 use chrono::Utc;
 use thiserror::Error;
 

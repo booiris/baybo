@@ -1,5 +1,5 @@
 #!/bin/sh
-# Aura browser-sidecar container entrypoint.
+# Baybo browser-sidecar container entrypoint.
 #
 # Boot order:
 #   1. Sanity-check Chrome can load (`chrome --version`); on failure, ldd
@@ -52,14 +52,14 @@ log "chrome version: $(/usr/local/bin/chrome --version 2>&1 | tr -d '\n')"
 # Step 2 — profile dir writability. Bind-mounted from host; if the host
 # operator's UID doesn't match what wrote the dir, Chrome can't write its
 # profile and dies with no useful log (it just hangs in user-data-dir init).
-if ! touch /data/profile/.aura-write-test 2>/dev/null; then
+if ! touch /data/profile/.baybo-write-test 2>/dev/null; then
     log "/data/profile is not writable as uid $(id -u)"
     log "  dir owner: $(stat -c '%u:%g' /data/profile 2>/dev/null || echo '?')"
-    log "  fix: run Aura under the same OS user that owns the profile dir, or"
-    log "       remove the dir on the host and let Aura recreate it under your UID."
+    log "  fix: run Baybo under the same OS user that owns the profile dir, or"
+    log "       remove the dir on the host and let Baybo recreate it under your UID."
     fatal "cannot write to /data/profile"
 fi
-rm -f /data/profile/.aura-write-test
+rm -f /data/profile/.baybo-write-test
 
 # Step 2.5 — clear stale Chrome singleton locks. The profile dir is
 # bind-mounted from the host and may carry a `SingletonLock` symlink
@@ -72,8 +72,8 @@ rm -f /data/profile/.aura-write-test
 #
 # Inside this container we know we're not the host that wrote the lock
 # (different hostname) and the operator explicitly switched to docker
-# mode, which is mutually exclusive with host-headless inside one Aura
-# process. So a stale lock here is safe to clear; if a *different* Aura
+# mode, which is mutually exclusive with host-headless inside one Baybo
+# process. So a stale lock here is safe to clear; if a *different* Baybo
 # instance is sharing this profile that's a misconfiguration the
 # entrypoint can't detect either way.
 for lockname in SingletonLock SingletonCookie SingletonSocket; do
@@ -115,7 +115,7 @@ log "Xvfb ready on :99"
 # the host bind-mount custom fonts (e.g. CJK packs, brand fonts) without
 # rebuilding the image. Empty / missing → no override, just system fonts.
 if [ -d /data/fonts ] && [ -n "$(ls -A /data/fonts 2>/dev/null)" ]; then
-    FONTCONFIG_FILE=/tmp/aura-fonts.conf
+    FONTCONFIG_FILE=/tmp/baybo-fonts.conf
     cat > "$FONTCONFIG_FILE" <<EOF
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "fonts.dtd">

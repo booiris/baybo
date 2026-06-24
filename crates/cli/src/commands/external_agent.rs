@@ -1,13 +1,13 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use aura_agent::external_agent::{
+use baybo_agent::external_agent::{
     ExternalAgentError, claude_cli::ClaudeCliAgent, codex_cli::CodexCliAgent,
     gemini_cli::GeminiCliAgent,
 };
-use aura_config::AuraConfig;
-use aura_model::ExternalAgentKind;
-use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
+use baybo_config::BayboConfig;
+use baybo_model::ExternalAgentKind;
+use baybo_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 use serde_json::{Value, json};
 
 use crate::cli::ExternalAgentCmd;
@@ -18,7 +18,7 @@ use crate::error::{CliError, Result};
 use crate::format::CommandOutput;
 
 const RESTART_HINT: &str =
-    "\n(note: a running `aura gateway` keeps the old config; restart it to pick up)";
+    "\n(note: a running `baybo gateway` keeps the old config; restart it to pick up)";
 
 pub async fn handle(ctx: &CommandContext, cmd: ExternalAgentCmd) -> Result<CommandOutput> {
     match cmd {
@@ -109,7 +109,7 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
         }
     };
 
-    let mut new_config: AuraConfig = ctx.config.as_ref().clone();
+    let mut new_config: BayboConfig = ctx.config.as_ref().clone();
     match kind {
         ExternalAgentKind::Claude => {
             new_config.external_agents.claude.enabled = true;
@@ -200,7 +200,7 @@ async fn disable(ctx: &CommandContext) -> Result<CommandOutput> {
     }
     let kinds: Vec<ExternalAgentKind> = picks.iter().map(|&i| enabled[i]).collect();
 
-    let mut new_config: AuraConfig = ctx.config.as_ref().clone();
+    let mut new_config: BayboConfig = ctx.config.as_ref().clone();
     for kind in &kinds {
         match kind {
             ExternalAgentKind::Claude => new_config.external_agents.claude.enabled = false,
@@ -265,7 +265,7 @@ async fn set_default(ctx: &CommandContext) -> Result<CommandOutput> {
     let enabled = ctx.config.external_agents.enabled_kinds();
     if enabled.is_empty() {
         return Err(CliError::Config(
-            "no external agents are enabled; run `aura external-agent setup` first".into(),
+            "no external agents are enabled; run `baybo external-agent setup` first".into(),
         ));
     }
 
@@ -273,7 +273,7 @@ async fn set_default(ctx: &CommandContext) -> Result<CommandOutput> {
     let idx = select_one("Set the default external agent to:", &labels)?;
     let kind = enabled[idx];
 
-    let mut new_config: AuraConfig = ctx.config.as_ref().clone();
+    let mut new_config: BayboConfig = ctx.config.as_ref().clone();
     new_config.external_agents.default_external_agent = Some(kind);
     new_config
         .validate()

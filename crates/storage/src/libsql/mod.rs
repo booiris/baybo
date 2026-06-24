@@ -113,7 +113,7 @@ impl LibsqlPool {
     ///
     /// **Exception — trace tables (`steps`, `spans`).** The `started_at`
     /// / `ended_at` columns are TEXT generated columns extracted from
-    /// the JSON `data` blob via `json_extract`. `aura-trace` serialises
+    /// the JSON `data` blob via `json_extract`. `baybo-trace` serialises
     /// `chrono::DateTime<Utc>` as RFC3339 strings, so these columns
     /// hold RFC3339 — sortable lexicographically because the leading
     /// `YYYY-MM-DDTHH:MM:SS` prefix is fixed-width and any
@@ -216,7 +216,7 @@ impl LibsqlPool {
                     content       TEXT NOT NULL,
                     created_at    INTEGER NOT NULL,
                     superseded_by INTEGER,
-                    -- Provenance of the row (`aura_model::MessageSource`):
+                    -- Provenance of the row (`baybo_model::MessageSource`):
                     -- 'user' (a genuine channel input), 'cron' (a cron fire's
                     -- framed prompt), or 'agent' (everything else the agent
                     -- injects/produces). The agent appends several
@@ -240,7 +240,7 @@ impl LibsqlPool {
                 -- `session_messages.ordinal` the event follows, or -1 if none
                 -- yet) so they land in the right page on scroll-up too. `kind` is
                 -- one of 'command' / 'notice_info' / 'notice_warn' /
-                -- 'notice_error' (`aura_model::ControlEventKind`); `seq` is a
+                -- 'notice_error' (`baybo_model::ControlEventKind`); `seq` is a
                 -- per-session monotonic id (stable key + same-anchor tiebreak);
                 -- `created_at` is the event's own time, shown in the UI.
                 CREATE TABLE IF NOT EXISTS session_control_events (
@@ -397,7 +397,7 @@ impl LibsqlPool {
                 -- the virtual columns in lockstep with `data`, so there
                 -- is no two-side write contract for the storage layer
                 -- to enforce — adding a new field is a serde change in
-                -- `aura-trace`, no schema migration.
+                -- `baybo-trace`, no schema migration.
                 CREATE TABLE IF NOT EXISTS steps (
                     id         TEXT PRIMARY KEY,
                     data       TEXT NOT NULL,

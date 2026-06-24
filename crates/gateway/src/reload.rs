@@ -6,7 +6,7 @@
 //! pool. See `docs/config-hot-reload.md`.
 
 use async_trait::async_trait;
-use aura_config::AuraConfig;
+use baybo_config::BayboConfig;
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -62,7 +62,7 @@ pub trait ConfigReloader: Send + Sync {
     /// whitelist; that stays with `reload`, so a generic endpoint can
     /// still persist a non-hot field (restart-pending) after a clean
     /// dry-run.
-    async fn dry_run(&self, candidate: &AuraConfig) -> Result<(), ReloadError>;
+    async fn dry_run(&self, candidate: &BayboConfig) -> Result<(), ReloadError>;
 }
 
 impl From<ReloadError> for crate::error::GatewayError {

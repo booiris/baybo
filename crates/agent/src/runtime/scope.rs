@@ -12,7 +12,7 @@
 //! `LifecycleOutcome::Cancelled { reason }` and `Failed { reason }`
 //! are distinct terminal states with distinct downstream semantics
 //! (replay / cost-attribution UIs treat them differently — see
-//! `aura_trace::outcome` and `aura_job::CancelReason`). Callers that
+//! `baybo_trace::outcome` and `baybo_job::CancelReason`). Callers that
 //! run inside a cancellable scope pass `Some((token, reason))`; on
 //! `Err` the helper checks `token.is_cancelled()` and records the
 //! body's exit as `Cancelled { reason }` instead of `Failed`. Callers
@@ -30,9 +30,9 @@
 
 use std::future::Future;
 
-use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput, JobShape};
-use aura_model::{JobId, ParallelGroup, SessionId, TriggerKind};
-use aura_trace::{
+use baybo_job::{CancelReason, JobInput, JobLifecycle, JobOutput, JobShape};
+use baybo_model::{JobId, ParallelGroup, SessionId, TriggerKind};
+use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanHandle, SpanKind,
     SpanRecorder, StepHandle, StepKind,
 };
@@ -219,7 +219,7 @@ where
 ///
 /// Body returns `(SpanFinalize, LifecycleOutcome, T)` so the success
 /// path can record a non-`Ok` outcome too — a tool whose
-/// [`aura_tools::ToolOutput::Error`] arm should land as
+/// [`baybo_tools::ToolOutput::Error`] arm should land as
 /// `Failed { reason }` in the trace, or a subagent stub that mapped a
 /// `Cancelled` status, both ride this single shape. For the common
 /// case `(Ok, value)` just write `Ok((finalize, LifecycleOutcome::Ok, value))`.

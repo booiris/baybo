@@ -1,12 +1,12 @@
 //! Conversions between the rich `Job` / `JobTransition` domain types and
-//! the persistence rows (`aura_store::JobRow` / `JobTransitionRow`).
+//! the persistence rows (`baybo_store::JobRow` / `JobTransitionRow`).
 //!
-//! The `JobStore` trait itself lives in `aura-store` and trades in rows,
+//! The `JobStore` trait itself lives in `baybo-store` and trades in rows,
 //! so the job state machine stays in this crate while the store contract
 //! sits alongside every other one. Callers convert at the boundary.
 
 use crate::{Job, JobError, JobInputKind, JobTransition, Result};
-use aura_store::{JobRow, JobTransitionRow};
+use baybo_store::{JobRow, JobTransitionRow};
 
 /// Snake-case string for the denormalised `jobs.kind` column. The column
 /// is display-only (never filtered in SQL; `from_row` rebuilds the whole
@@ -64,11 +64,11 @@ impl JobTransition {
     }
 }
 
-impl From<aura_store::StorageError> for JobError {
-    fn from(e: aura_store::StorageError) -> Self {
+impl From<baybo_store::StorageError> for JobError {
+    fn from(e: baybo_store::StorageError) -> Self {
         match e {
-            aura_store::StorageError::NotFound(s) => JobError::NotFound(s),
-            aura_store::StorageError::Internal(e) => JobError::Internal(e),
+            baybo_store::StorageError::NotFound(s) => JobError::NotFound(s),
+            baybo_store::StorageError::Internal(e) => JobError::Internal(e),
             other => JobError::Storage(other.to_string()),
         }
     }

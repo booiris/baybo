@@ -4,15 +4,15 @@
 //! a single canonical JSON `data` blob; queryable fields surface as
 //! VIRTUAL generated columns derived from `json_extract`. SQLite keeps
 //! generated columns in lockstep with `data`, so writers only ever set
-//! `data` (plus the natural key) — `aura-trace` owns the rich-type <->
+//! `data` (plus the natural key) — `baybo-trace` owns the rich-type <->
 //! row conversion, this layer just shuttles rows.
 
 use async_trait::async_trait;
 
 use super::LibsqlPool;
-use aura_model::{JobId, SpanId, StepId};
-use aura_store::trace::Result;
-use aura_store::{SpanEventRow, SpanRow, StepRow, StorageError, TraceStore};
+use baybo_model::{JobId, SpanId, StepId};
+use baybo_store::trace::Result;
+use baybo_store::{SpanEventRow, SpanRow, StepRow, StorageError, TraceStore};
 
 pub struct LibsqlTraceStore {
     pool: LibsqlPool,
@@ -176,7 +176,7 @@ impl TraceStore for LibsqlTraceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_trace::{
+    use baybo_trace::{
         LifecycleState, LlmCallInputs, Span, SpanEvent, SpanEventKind, SpanKind, Step, StepKind,
         ToolCallOrigin,
     };
@@ -198,7 +198,7 @@ mod tests {
             id: SpanId::new(),
             step_id,
             kind: SpanKind::LlmCall {
-                begin: aura_trace::LlmCallBegin {
+                begin: baybo_trace::LlmCallBegin {
                     model_id: "claude".into(),
                     provider: "anthropic".into(),
                     provider_config_hash: "h".into(),
@@ -221,7 +221,7 @@ mod tests {
             id: SpanId::new(),
             step_id,
             kind: SpanKind::ToolCall {
-                begin: aura_trace::ToolCallBegin {
+                begin: baybo_trace::ToolCallBegin {
                     tool_name: "bash".into(),
                     tool_artifact_hash: "h".into(),
                     triggered_by: Some(ToolCallOrigin {
@@ -303,8 +303,8 @@ mod tests {
             span_id,
             0,
             SpanEventKind::Approval {
-                decision: aura_model::ApprovalDecision::Approve,
-                resource: aura_model::ResourceAccess::ReadFile {
+                decision: baybo_model::ApprovalDecision::Approve,
+                resource: baybo_model::ResourceAccess::ReadFile {
                     path: std::path::PathBuf::from("/tmp/foo"),
                 },
             },
@@ -320,7 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn span_event_kind_columns_index_by_variant() {
-        use aura_trace::ToolEventPayload;
+        use baybo_trace::ToolEventPayload;
 
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlTraceStore::new(pool.clone());
@@ -329,8 +329,8 @@ mod tests {
             span_id,
             0,
             SpanEventKind::Approval {
-                decision: aura_model::ApprovalDecision::Approve,
-                resource: aura_model::ResourceAccess::ReadFile {
+                decision: baybo_model::ApprovalDecision::Approve,
+                resource: baybo_model::ResourceAccess::ReadFile {
                     path: std::path::PathBuf::from("/tmp/foo"),
                 },
             },

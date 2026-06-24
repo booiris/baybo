@@ -1,6 +1,6 @@
 //! Process-wide pool of guarded LLM clients keyed by config entry name.
 //!
-//! Built once at startup from `AuraConfig.llm` and held on `ManagerGraph`
+//! Built once at startup from `BayboConfig.llm` and held on `ManagerGraph`
 //! so per-actor consumers can resolve a specific entry by name at turn
 //! dispatch time. `resolve(None)` returns the default entry;
 //! `resolve(Some(name))` returns that entry if present, otherwise the
@@ -8,14 +8,14 @@
 //!
 //! Optional `model_tiers` (Fast / Balanced / Deep → entry name) lets
 //! `spawn_subagent` ask for "a fast model" without knowing which
-//! `aura.json` entry happens to be wired to that tier. Unmapped tiers
+//! `baybo.json` entry happens to be wired to that tier. Unmapped tiers
 //! return `None` and the caller falls through to the pool default.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aura_llm::BillableLlm;
-use aura_model::{LlmEntryName, ModelTier};
+use baybo_llm::BillableLlm;
+use baybo_model::{LlmEntryName, ModelTier};
 use tracing::warn;
 
 /// Process-wide, hot-swappable handle to the [`LlmClientPool`]. A config
@@ -117,8 +117,8 @@ fn entry_names_csv(clients: &HashMap<LlmEntryName, Arc<BillableLlm>>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_llm::test_support::StubLlm;
-    use aura_llm::{LlmCompletion, ModelInfo, ModelPricing};
+    use baybo_llm::test_support::StubLlm;
+    use baybo_llm::{LlmCompletion, ModelInfo, ModelPricing};
     use std::sync::Arc;
 
     fn stub_with_id(id: &str) -> Arc<BillableLlm> {

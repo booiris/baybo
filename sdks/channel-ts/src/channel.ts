@@ -43,7 +43,7 @@ export interface AgentDelta {
 }
 
 /**
- * Out-of-band notice emitted by aura (skill warnings, degraded-mode
+ * Out-of-band notice emitted by baybo (skill warnings, degraded-mode
  * banners). `userId` identifies the platform user the notice is
  * addressed to — sidecars that fan notices to a single chat per user
  * consume it the same way `onMessage` consumes its `userId`.
@@ -109,7 +109,7 @@ export interface UserInbound {
   /**
    * Per-tenant credential that produced this inbound event, for
    * channels that multiplex many bots (Telegram, future Discord).
-   * Omit / empty string for channels without a bot concept. Aura's
+   * Omit / empty string for channels without a bot concept. Baybo's
    * pairing gate uses `(channelType, botId, userId)` as the triple.
    */
   botId?: string;
@@ -135,7 +135,7 @@ export interface ApprovalRequest {
   callId: string;
   sessionId: string;
   /**
-   * Aura user id (`<channelType>_<id>` — e.g. `telegram_<...>` — matching the inbound
+   * Baybo user id (`<channelType>_<id>` — e.g. `telegram_<...>` — matching the inbound
    * `UserInbound.userId`). Sidecars that route approval prompts by
    * platform user consume this directly; empty string when the tool
    * call isn't user-scoped (e.g. cron-triggered).
@@ -166,7 +166,7 @@ export type ApprovalDecision = "approve" | "approve_always" | "deny";
 export type NoticeLevel = "info" | "warn" | "error";
 
 /**
- * Control-plane: aura is telling the sidecar to attach a new
+ * Control-plane: baybo is telling the sidecar to attach a new
  * per-tenant credential. For the Telegram channel `botId` is an
  * operator-chosen label and `token` is the @BotFather token; other
  * sidecars can repurpose the same shape for whatever per-tenant
@@ -177,14 +177,14 @@ export interface StartBotCommand {
   token: string;
 }
 
-/** Control-plane: aura is telling the sidecar to detach a tenant. */
+/** Control-plane: baybo is telling the sidecar to detach a tenant. */
 export interface StopBotCommand {
   botId: string;
 }
 
 /**
  * Ack for a `Start`/`StopBot` command. `ok: false + message` surfaces
- * startup failures (invalid token, rate-limited, etc.) to aura so the
+ * startup failures (invalid token, rate-limited, etc.) to baybo so the
  * admin dashboard can render the reason instead of a silent failure.
  */
 export interface BotStatusReport {
@@ -254,20 +254,20 @@ export interface Channel {
   ): Promise<void>;
 
   /**
-   * Control-plane: aura is attaching a new per-tenant credential (bot
+   * Control-plane: baybo is attaching a new per-tenant credential (bot
    * token for Telegram / Discord / Slack, API key for an HTTP
    * channel, …). Return `ok: true` once the credential is live, or
-   * `ok: false + message` on failure so aura can surface the reason.
+   * `ok: false + message` on failure so baybo can surface the reason.
    * A sidecar that doesn't implement this hook can't host runtime-
-   * provisioned tenants; aura logs `unsupported` and moves on.
+   * provisioned tenants; baybo logs `unsupported` and moves on.
    */
   onStartBot?(cmd: StartBotCommand): Promise<BotStatusReport>;
 
   /**
-   * Control-plane: aura is detaching a previously-attached tenant.
+   * Control-plane: baybo is detaching a previously-attached tenant.
    * Implementations should tear down polling / connections for
    * `cmd.botId` and flush any in-flight state. `ok: false + message`
-   * for operator visibility; aura treats the bot as removed either way.
+   * for operator visibility; baybo treats the bot as removed either way.
    */
   onStopBot?(cmd: StopBotCommand): Promise<BotStatusReport>;
 
@@ -293,7 +293,7 @@ export interface RunOptions {
   /**
    * Explicit WebSocket URL (e.g. `ws://127.0.0.1:42111/v1/channel-ws`
    * for the default loopback deployment, or `wss://` for any custom
-   * remote gateway). Default: read from the `AURA_CHANNEL_URL` env
+   * remote gateway). Default: read from the `BAYBO_CHANNEL_URL` env
    * var — the gateway's sidecar supervisor sets it when it spawns
    * the child process.
    */
@@ -301,8 +301,8 @@ export interface RunOptions {
 
   /**
    * Capability token presented on the `Register` frame. Default:
-   * read from the `AURA_CHANNEL_TOKEN` env var (same launcher
-   * contract as `AURA_CHANNEL_URL`).
+   * read from the `BAYBO_CHANNEL_TOKEN` env var (same launcher
+   * contract as `BAYBO_CHANNEL_URL`).
    */
   token?: string;
 

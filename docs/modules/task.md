@@ -2,11 +2,11 @@
 
 ## Overview
 
-The `task` crate (`aura-task`) owns the planning-checklist tool family the LLM
+The `task` crate (`baybo-task`) owns the planning-checklist tool family the LLM
 uses to lay out and track a multi-step plan: **`TaskCreate`**, **`TaskGet`**,
 **`TaskList`**, and **`TaskUpdate`**. It mirrors
-`aura-cron` / `aura-skills` / `aura-subagent` — a domain crate that hosts its
-own `Tool` impls and depends on `aura-tools` for the trait; `aura-tools` never
+`baybo-cron` / `baybo-skills` / `baybo-subagent` — a domain crate that hosts its
+own `Tool` impls and depends on `baybo-tools` for the trait; `baybo-tools` never
 depends back.
 
 Modeled on Claude Code's `Task*` tools and Codex's `update_plan`: a small status
@@ -19,13 +19,13 @@ for a while) rather than on every turn.
 
 The layering follows the `session_summaries` precedent:
 
-- **`aura-model`** — the value types (`Task`, `TaskStatus`, `TaskId`) plus the
+- **`baybo-model`** — the value types (`Task`, `TaskStatus`, `TaskId`) plus the
   tool-name consts (`TASK_CREATE_TOOL_NAME`, …, `TASK_MUTATING_TOOL_NAMES`).
   Pure data, shared one-way like `PendingSubagentResult`.
-- **`aura-store`** — the `TaskStore` trait + `TaskPatch` (the ports contract).
-- **`aura-storage`** — `LibsqlTaskStore` over the dedicated `session_tasks`
+- **`baybo-store`** — the `TaskStore` trait + `TaskPatch` (the ports contract).
+- **`baybo-storage`** — `LibsqlTaskStore` over the dedicated `session_tasks`
   table.
-- **`aura-task`** — the `Tool` impls + the `tools::agent_tools` factory + a
+- **`baybo-task`** — the `Tool` impls + the `tools::agent_tools` factory + a
   `MemoryTaskStore` test fixture behind `#[cfg(any(test, feature = "test-support"))]`.
 
 ## Design Decisions
@@ -53,7 +53,7 @@ handler could write while the actor is mid-turn. This sidesteps the
 single-writer `mpsc` dance `spawn_subagent` needs (that exists only because
 spawning *creates* an actor + session, which only the router can do). Each tool
 holds an `Arc<dyn TaskStore>` as a constructor field; `tools::agent_tools` is
-the factory the runtime calls (mirrors `aura_cron::tools::agent_tools`). All
+the factory the runtime calls (mirrors `baybo_cron::tools::agent_tools`). All
 tools are `TrustLevel::Trusted` with **no** capabilities — they touch
 agent-internal state, not the host FS/network, so the approval gate is a no-op.
 
@@ -72,7 +72,7 @@ The agent loop owns the model-facing and user-facing surfacing (see
 - It loads the list at the start of each turn (and after any iteration that ran
   a mutating `Task*` tool, `TASK_MUTATING_TOOL_NAMES`) and calls
   `ContextManager::refresh_task_reminder`, which renders a transient
-  `<system-reminder>` (`aura_context::prompts::tasks::render_task_list`) kept
+  `<system-reminder>` (`baybo_context::prompts::tasks::render_task_list`) kept
   **out** of the stored transcript. When injected it rides the tail of the LLM
   request and survives compaction for free.
 - The model-facing reminder is **throttled** (mirrors Claude Code's
@@ -91,13 +91,13 @@ The agent loop owns the model-facing and user-facing surfacing (see
 
 `TaskStop` / `TaskOutput` operate on already-running background `spawn_subagent`
 work, which has no durable model yet. They remain `NotImplemented` stubs in
-`aura_tools::builtin::todo`; only the planning half is implemented here.
+`baybo_tools::builtin::todo`; only the planning half is implemented here.
 
 ## Constraints
 
-- Internal deps: `aura-model` (value types + tool-name consts), `aura-store`
-  (the `TaskStore` trait), `aura-tools` (the `Tool` trait). **No** dependency on
-  `aura-agent` / `aura-context` / `aura-storage` — those depend on the contracts,
+- Internal deps: `baybo-model` (value types + tool-name consts), `baybo-store`
+  (the `TaskStore` trait), `baybo-tools` (the `Tool` trait). **No** dependency on
+  `baybo-agent` / `baybo-context` / `baybo-storage` — those depend on the contracts,
   never the reverse.
 - The crate is pure tool logic; it persists nothing itself. `MemoryTaskStore`
   is `test-support`-gated so it never ships in release builds.
@@ -112,7 +112,7 @@ work, which has no durable model yet. They remain `NotImplemented` stubs in
 | `model` | Owns `Task` / `TaskStatus` / `TaskId` + the `TASK_*_TOOL_NAME` consts |
 | `store` | Owns the `TaskStore` trait + `TaskPatch` |
 | `storage` | `LibsqlTaskStore` + the `session_tasks` DDL; `task` field on the `Store` bundle |
-| `agent` | `src/runtime.rs` registers `aura_task::tools::agent_tools(stores.task)`; `AgentLoop` holds the `Arc<dyn TaskStore>`, refreshes the per-turn reminder, and emits `AgentEvent::TaskList` |
+| `agent` | `src/runtime.rs` registers `baybo_task::tools::agent_tools(stores.task)`; `AgentLoop` holds the `Arc<dyn TaskStore>`, refreshes the per-turn reminder, and emits `AgentEvent::TaskList` |
 | `context` | `ContextManager::refresh_task_reminder` + `prompts::tasks::render_task_list` render the transient reminder |
 | `channels` | `AgentEvent::TaskList` + the `Frame::TaskList` / `TaskView` wire types |
 | `gateway` | The channel adapter maps `AgentEvent::TaskList → Frame::TaskList`; the web dashboard renders the checklist |

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_security::SecretVault;
+use baybo_security::SecretVault;
 use rmcp::transport::auth::{AuthError, CredentialStore, StoredCredentials};
 
 use crate::mcp::vault_keys;

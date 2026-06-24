@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 #
-# Run the aura SWE-bench benchmark for one or more arms and print a comparison
+# Run the baybo SWE-bench benchmark for one or more arms and print a comparison
 # table. Grading always uses the OFFICIAL `swebench` harness (Docker), so:
 #   noop   = floor (empty patches → ~0%)
-#   oracle = ceiling (gold patches → ~100%)         [no aura, no keys]
-#   agent  = the real aura agent run inside each eval image (needs a key + musl)
+#   oracle = ceiling (gold patches → ~100%)         [no baybo, no keys]
+#   agent  = the real baybo agent run inside each eval image (needs a key + musl)
 #
 # noop/oracle validate the whole Docker + grader pipeline offline before the
 # agent arm spends anything. See bench/swe/README.md.
 #
 # Requirements: a running Docker daemon and `pip install swebench`. The agent arm
-# additionally needs a model key and a static-musl `aura` (built for you here).
+# additionally needs a model key and a static-musl `baybo` (built for you here).
 #
 # Quick start — offline floor vs ceiling on the first SWE-bench_Lite instance:
 #   bench/swe/run.sh
 #
-# A few specific instances, all three arms (agent needs AURA_API_KEY):
+# A few specific instances, all three arms (agent needs BAYBO_API_KEY):
 #   ARMS="noop oracle agent" INSTANCE_IDS="sympy__sympy-20590" bench/swe/run.sh
 #
 # Preview the plan (still needs swebench to resolve image keys, but no Docker/spend):
@@ -34,21 +34,21 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 
 # ---- config (override via env) --------------------------------------------
 : "${ARMS:=noop oracle}"                       # space-separated: noop oracle agent
-: "${DATASET_NAME:=princeton-nlp/SWE-bench_Lite}"
+: "${DATASET_NAME:=princeton-nlp/SWE-bench_Verified}"
 : "${SPLIT:=test}"
 : "${NAMESPACE:=swebench}"                      # swebench => pull prebuilt Hub images; none => local build
 : "${INSTANCE_IDS:=}"                           # space-separated; empty => first $LIMIT
 : "${LIMIT:=1}"                                 # how many instances when INSTANCE_IDS empty
 : "${CONCURRENCY:=4}"                           # agent eval containers in parallel
 : "${MAX_WORKERS:=4}"                           # grader harness workers
-: "${PROMPT_TIMEOUT:=1800}"                     # per-instance aura prompt ceiling (s)
-: "${AURA_MODEL:=deepseek/deepseek-v4-flash}"  # agent LLM as <provider>/<model>
-: "${AURA_BASE_URL:=}"                         # empty => provider default endpoint
+: "${PROMPT_TIMEOUT:=1800}"                     # per-instance baybo prompt ceiling (s)
+: "${BAYBO_MODEL:=deepseek/deepseek-v4-flash}"  # agent LLM as <provider>/<model>
+: "${BAYBO_BASE_URL:=}"                         # empty => provider default endpoint
 : "${PYTHON:=}"                                # empty => the uv-managed bench/swe/.venv
 : "${DOCKER:=docker}"
 : "${MUSL_TARGET:=x86_64-unknown-linux-musl}"
-: "${AURA_BIN:=}"                              # agent arm; empty => build static musl here
-: "${AURA_RG_BIN:=}"                           # agent arm; empty => fetch static-musl rg to bench-out/rg
+: "${BAYBO_BIN:=}"                              # agent arm; empty => build static musl here
+: "${BAYBO_RG_BIN:=}"                           # agent arm; empty => fetch static-musl rg to bench-out/rg
 : "${RG_VERSION:=14.1.1}"                       # ripgrep release bundled into eval images
 : "${OUTDIR:=$BENCH_DIR/bench-out}"            # scratch: instances.json (gitignored)
 : "${RESULTS_DIR:=$BENCH_DIR/results}"         # the final results JSON report only
@@ -56,9 +56,9 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${TRACE_DIR:=$BENCH_DIR/trace}"             # per-run transcripts + traces (gitignored); NO_TRACE=1 to disable
 : "${RUN_ID:=$(date +%Y-%m-%d__%H-%M-%S)}"
 : "${DRY_RUN:=0}"
-: "${RUST_LOG:=aura_bench_swe=info}"; export RUST_LOG
+: "${RUST_LOG:=baybo_bench_swe=info}"; export RUST_LOG
 INSTANCES="$OUTDIR/instances.json"
-PKG="aura-bench-swe"
+PKG="baybo-bench-swe"
 # ---------------------------------------------------------------------------
 
 mkdir -p "$OUTDIR" "$RESULTS_DIR" "$RUNS_DIR"
@@ -95,7 +95,7 @@ fi
 if [ "$DRY_RUN" != "1" ]; then
   $DOCKER info >/dev/null 2>&1 || { echo "Docker daemon not reachable ($DOCKER info failed)" >&2; exit 1; }
   if [ "$want_agent" = 1 ]; then
-    : "${AURA_API_KEY:?the agent arm needs the model key in \$AURA_API_KEY (set it in .env)}"
+    : "${BAYBO_API_KEY:?the agent arm needs the model key in \$BAYBO_API_KEY (set it in .env)}"
   fi
 fi
 
@@ -123,44 +123,44 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
-# ---- build the bench bin (+ the musl aura and images for the agent arm) ----
+# ---- build the bench bin (+ the musl baybo and images for the agent arm) ----
 echo ">> building $PKG bin"
 cargo build -p "$PKG" --bins
 
 if [ "$want_agent" = 1 ]; then
-  if [ -z "$AURA_BIN" ]; then
+  if [ -z "$BAYBO_BIN" ]; then
     rustup target list --installed 2>/dev/null | grep -q "$MUSL_TARGET" || {
       echo "musl target missing — run: rustup target add $MUSL_TARGET" >&2; exit 1; }
     musl_cc="$(command -v x86_64-linux-musl-gcc || command -v musl-gcc || true)"
     [ -n "$musl_cc" ] || {
       echo "musl C compiler missing (Arch: sudo pacman -S musl) — libsql's bundled SQLite needs it" >&2
       exit 1; }
-    echo ">> building static-musl aura (--features bench-bash)"
+    echo ">> building static-musl baybo (--features bench-bash)"
     CC_x86_64_unknown_linux_musl="$musl_cc" \
       cargo build --release --target "$MUSL_TARGET" --features bench-bash
-    AURA_BIN="$REPO_ROOT/target/$MUSL_TARGET/release/aura"
+    BAYBO_BIN="$REPO_ROOT/target/$MUSL_TARGET/release/baybo"
   fi
-  [ -x "$AURA_BIN" ] || { echo "aura binary not executable: $AURA_BIN" >&2; exit 1; }
-  # Bundle a static-musl ripgrep — the eval images don't ship `rg`, which aura's
+  [ -x "$BAYBO_BIN" ] || { echo "baybo binary not executable: $BAYBO_BIN" >&2; exit 1; }
+  # Bundle a static-musl ripgrep — the eval images don't ship `rg`, which baybo's
   # Grep tool needs (a glibc host rg won't load in the older-glibc images, same
-  # as aura). Cached in bench-out/ across runs.
-  if [ -z "$AURA_RG_BIN" ]; then
-    AURA_RG_BIN="$OUTDIR/rg"
-    if [ ! -x "$AURA_RG_BIN" ]; then
-      echo ">> fetching static-musl ripgrep $RG_VERSION -> $AURA_RG_BIN"
+  # as baybo). Cached in bench-out/ across runs.
+  if [ -z "$BAYBO_RG_BIN" ]; then
+    BAYBO_RG_BIN="$OUTDIR/rg"
+    if [ ! -x "$BAYBO_RG_BIN" ]; then
+      echo ">> fetching static-musl ripgrep $RG_VERSION -> $BAYBO_RG_BIN"
       rg_url="https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz"
       rg_tmp="$(mktemp -d)"
       if curl -fsSL --max-time 180 "$rg_url" -o "$rg_tmp/rg.tgz"; then
         tar -xzf "$rg_tmp/rg.tgz" -C "$rg_tmp"
-        cp "$rg_tmp"/ripgrep-*/rg "$AURA_RG_BIN" && chmod +x "$AURA_RG_BIN"
+        cp "$rg_tmp"/ripgrep-*/rg "$BAYBO_RG_BIN" && chmod +x "$BAYBO_RG_BIN"
       else
-        echo "failed to download ripgrep $RG_VERSION; set AURA_RG_BIN to a static-musl rg" >&2
+        echo "failed to download ripgrep $RG_VERSION; set BAYBO_RG_BIN to a static-musl rg" >&2
         rm -rf "$rg_tmp"; exit 1
       fi
       rm -rf "$rg_tmp"
     fi
   fi
-  [ -x "$AURA_RG_BIN" ] || { echo "rg binary not executable: $AURA_RG_BIN" >&2; exit 1; }
+  [ -x "$BAYBO_RG_BIN" ] || { echo "rg binary not executable: $BAYBO_RG_BIN" >&2; exit 1; }
   if [ "$NAMESPACE" = none ]; then
     echo ">> pre-building eval images locally (prepare_images; --namespace none)"
     $PYTHON -m swebench.harness.prepare_images \
@@ -184,10 +184,10 @@ run_arm() {
   )
   if [ "$arm" = agent ]; then
     local agent_args=(
-      --aura-bin "$AURA_BIN" --rg-bin "$AURA_RG_BIN" --model "$AURA_MODEL"
+      --baybo-bin "$BAYBO_BIN" --rg-bin "$BAYBO_RG_BIN" --model "$BAYBO_MODEL"
       --prompt-timeout "$PROMPT_TIMEOUT" --trace-dir "$TRACE_DIR"
     )
-    [ -n "$AURA_BASE_URL" ] && agent_args+=(--base-url "$AURA_BASE_URL")
+    [ -n "$BAYBO_BASE_URL" ] && agent_args+=(--base-url "$BAYBO_BASE_URL")
     [ -n "${NO_TRACE:-}" ] && agent_args+=(--no-trace)
     # live %bar: completed traces / total instances (the bin writes one per instance)
     local n_inst; n_inst=$(echo $IDS | wc -w)

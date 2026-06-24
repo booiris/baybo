@@ -19,13 +19,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aura_cost::{CostError, CostStore, CostSummary, TimeRange};
-use aura_job::{Job, JobError, JobInputKind, JobLifecycle, JobShape, JobStatus, JobStatusKind};
-use aura_model::{
+use baybo_cost::{CostError, CostStore, CostSummary, TimeRange};
+use baybo_job::{Job, JobError, JobInputKind, JobLifecycle, JobShape, JobStatus, JobStatusKind};
+use baybo_model::{
     CallReason, JobId, Lineage, LineageKind, MicroUsd, Session, SessionId, StepId, TriggerKind,
 };
-use aura_session::{SessionError, SessionStore, StoredMessage};
-use aura_trace::{Span, SpanEvent, Step, TraceError, TraceStore};
+use baybo_session::{SessionError, SessionStore, StoredMessage};
+use baybo_trace::{Span, SpanEvent, Step, TraceError, TraceStore};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -182,8 +182,8 @@ fn derive_session_kind(session: &Session) -> SessionKind {
         return SessionKind::Subagent;
     }
     match session.trigger {
-        aura_model::TriggerSource::Cron { .. } => SessionKind::Cron,
-        aura_model::TriggerSource::User => SessionKind::User,
+        baybo_model::TriggerSource::Cron { .. } => SessionKind::Cron,
+        baybo_model::TriggerSource::User => SessionKind::User,
     }
 }
 
@@ -307,7 +307,7 @@ pub struct ReplayStep {
     pub spans: Vec<Span>,
 }
 
-/// Wire-friendly mirror of [`aura_session::StoredMessage`]. Carried
+/// Wire-friendly mirror of [`baybo_session::StoredMessage`]. Carried
 /// once at the top of [`TraceOverview`] so the client can hydrate
 /// every `LlmCallInputs::Persisted { last_ordinal }` span locally
 /// instead of the server re-inlining the same prefix per span — the
@@ -318,7 +318,7 @@ pub struct SessionMessageRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<i64>,
     pub created_at: DateTime<Utc>,
-    pub message: aura_model::ChatMessage,
+    pub message: baybo_model::ChatMessage,
 }
 
 impl From<StoredMessage> for SessionMessageRow {
@@ -385,7 +385,7 @@ pub struct QueryApi {
     jobs: Arc<JobLifecycle>,
     trace: Arc<dyn TraceStore>,
     /// Optional. Callers that only need lineage / replay / job listing
-    /// (CLI `aura trace list/show/export`, gateway `/v1/traces/{id}`)
+    /// (CLI `baybo trace list/show/export`, gateway `/v1/traces/{id}`)
     /// pass `None`; cost_summary then returns `Unsupported`.
     costs: Option<Arc<dyn CostStore>>,
 }
@@ -1094,7 +1094,7 @@ impl QueryApi {
         log_session_id: &SessionId,
         jobs: &mut [ReplayJob],
     ) -> Result<()> {
-        use aura_trace::{LlmCallInputs, SpanKind};
+        use baybo_trace::{LlmCallInputs, SpanKind};
 
         let any_persisted = jobs.iter().any(|j| {
             j.steps.iter().any(|s| {
@@ -1147,7 +1147,7 @@ impl QueryApi {
                         // than misleading content from a different
                         // epoch.
                         let mismatch = candidates.iter().any(|m| m.created_at > span_started_at);
-                        let hydrated: Vec<aura_model::ChatMessage> = if mismatch {
+                        let hydrated: Vec<baybo_model::ChatMessage> = if mismatch {
                             tracing::warn!(
                                 log_session_id = %log_session_id,
                                 span_id = %span.id,
@@ -1160,7 +1160,7 @@ impl QueryApi {
                             // Active prefix (by ordinal) then the inline
                             // suffix (framing / sub-loop turns not in the
                             // log) — together the exact slice the LLM saw.
-                            let mut active: Vec<aura_model::ChatMessage> =
+                            let mut active: Vec<baybo_model::ChatMessage> =
                                 candidates.iter().map(|m| m.message.clone()).collect();
                             // Tripwire: the reconstructed prefix count must
                             // match what the writer recorded. A divergence
@@ -1201,8 +1201,8 @@ impl QueryApi {
 /// reconstructed prefix count didn't match the span's `prefix_len`
 /// tripwire. A `Role::System` message so trace viewers render it
 /// distinctly and `source == 'user'` prompt-detection never picks it up.
-fn reconstruction_warning(expected: usize, reconstructed: usize) -> aura_model::ChatMessage {
-    aura_model::ChatMessage::system(vec![aura_model::ContentBlock::Text(format!(
+fn reconstruction_warning(expected: usize, reconstructed: usize) -> baybo_model::ChatMessage {
+    baybo_model::ChatMessage::system(vec![baybo_model::ContentBlock::Text(format!(
         "⚠️ trace reconstruction inconsistent: expected {expected} prefix message(s) from \
          session_messages, reconstructed {reconstructed}. The log drifted under this span's \
          ordinal reference — the input shown may be incomplete or wrong."
@@ -1231,12 +1231,12 @@ fn filter_matches(j: &Job, f: &JobFilter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_cost::test_support::MemoryCostStore;
-    use aura_job::JobInput;
-    use aura_job::test_support::MemoryJobStore;
-    use aura_model::{ChannelType, ContentBlock, TriggerKind, TriggerSource};
-    use aura_session::SessionStore;
-    use aura_trace::test_support::MemoryTraceStore;
+    use baybo_cost::test_support::MemoryCostStore;
+    use baybo_job::JobInput;
+    use baybo_job::test_support::MemoryJobStore;
+    use baybo_model::{ChannelType, ContentBlock, TriggerKind, TriggerSource};
+    use baybo_session::SessionStore;
+    use baybo_trace::test_support::MemoryTraceStore;
     use std::sync::Arc;
 
     fn user_input() -> JobInput {
@@ -1261,13 +1261,13 @@ mod tests {
         async fn get(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<Option<Session>, aura_store::StorageError> {
+        ) -> std::result::Result<Option<Session>, baybo_store::StorageError> {
             Ok(self.sessions.lock().get(id).cloned())
         }
         async fn save(
             &self,
             session: &Session,
-        ) -> std::result::Result<(), aura_store::StorageError> {
+        ) -> std::result::Result<(), baybo_store::StorageError> {
             self.sessions
                 .lock()
                 .insert(session.id.clone(), session.clone());
@@ -1277,7 +1277,7 @@ mod tests {
             &self,
             id: &SessionId,
             hidden: bool,
-        ) -> std::result::Result<bool, aura_store::StorageError> {
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
             let mut data = self.sessions.lock();
             match data.get_mut(id) {
                 Some(s) => {
@@ -1290,8 +1290,8 @@ mod tests {
         async fn set_last_llm(
             &self,
             id: &SessionId,
-            llm: Option<&aura_model::LlmEntryName>,
-        ) -> std::result::Result<bool, aura_store::StorageError> {
+            llm: Option<&baybo_model::LlmEntryName>,
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
             let mut data = self.sessions.lock();
             match data.get_mut(id) {
                 Some(s) => {
@@ -1305,7 +1305,7 @@ mod tests {
             &self,
             id: &SessionId,
             pinned: bool,
-        ) -> std::result::Result<bool, aura_store::StorageError> {
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
             let mut data = self.sessions.lock();
             match data.get_mut(id) {
                 Some(s) => {
@@ -1318,8 +1318,8 @@ mod tests {
         async fn set_folder(
             &self,
             id: &SessionId,
-            folder_id: Option<&aura_model::FolderId>,
-        ) -> std::result::Result<bool, aura_store::StorageError> {
+            folder_id: Option<&baybo_model::FolderId>,
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
             let mut data = self.sessions.lock();
             match data.get_mut(id) {
                 Some(s) => {
@@ -1332,22 +1332,22 @@ mod tests {
         async fn delete(
             &self,
             _id: &SessionId,
-        ) -> std::result::Result<bool, aura_store::StorageError> {
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
             Ok(true)
         }
         async fn list_expired(
             &self,
             _before: DateTime<Utc>,
-        ) -> std::result::Result<Vec<SessionId>, aura_store::StorageError> {
+        ) -> std::result::Result<Vec<SessionId>, baybo_store::StorageError> {
             Ok(Vec::new())
         }
-        async fn list_all(&self) -> std::result::Result<Vec<Session>, aura_store::StorageError> {
+        async fn list_all(&self) -> std::result::Result<Vec<Session>, baybo_store::StorageError> {
             Ok(self.sessions.lock().values().cloned().collect())
         }
         async fn list_lineage_children(
             &self,
             parent: &SessionId,
-        ) -> std::result::Result<Vec<(SessionId, LineageKind)>, aura_store::StorageError> {
+        ) -> std::result::Result<Vec<(SessionId, LineageKind)>, baybo_store::StorageError> {
             Ok(self
                 .children
                 .lock()
@@ -1358,8 +1358,8 @@ mod tests {
         async fn append_session_message(
             &self,
             id: &SessionId,
-            message: &aura_model::ChatMessage,
-        ) -> std::result::Result<i64, aura_store::StorageError> {
+            message: &baybo_model::ChatMessage,
+        ) -> std::result::Result<i64, baybo_store::StorageError> {
             let mut guard = self.messages.lock();
             let log = guard.entry(id.clone()).or_default();
             let ordinal: i64 = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
@@ -1375,23 +1375,24 @@ mod tests {
             &self,
             _id: &SessionId,
             _after_ordinal: i64,
-            _kind: aura_model::ControlEventKind,
+            _kind: baybo_model::ControlEventKind,
             _text: &str,
             _created_at: DateTime<Utc>,
-        ) -> std::result::Result<i64, aura_store::StorageError> {
+        ) -> std::result::Result<i64, baybo_store::StorageError> {
             Ok(0)
         }
         async fn list_control_events(
             &self,
             _id: &SessionId,
-        ) -> std::result::Result<Vec<aura_model::ControlEvent>, aura_store::StorageError> {
+        ) -> std::result::Result<Vec<baybo_model::ControlEvent>, baybo_store::StorageError>
+        {
             Ok(Vec::new())
         }
         async fn apply_session_compaction(
             &self,
             id: &SessionId,
-            new_active: &[aura_model::ChatMessage],
-        ) -> std::result::Result<(), aura_store::StorageError> {
+            new_active: &[baybo_model::ChatMessage],
+        ) -> std::result::Result<(), baybo_store::StorageError> {
             let mut guard = self.messages.lock();
             let log = guard.entry(id.clone()).or_default();
             let next_ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
@@ -1414,7 +1415,7 @@ mod tests {
         async fn load_active_session_messages(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<Vec<aura_model::ChatMessage>, aura_store::StorageError> {
+        ) -> std::result::Result<Vec<baybo_model::ChatMessage>, baybo_store::StorageError> {
             Ok(self
                 .messages
                 .lock()
@@ -1430,7 +1431,7 @@ mod tests {
         async fn latest_session_ordinal(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<Option<i64>, aura_store::StorageError> {
+        ) -> std::result::Result<Option<i64>, baybo_store::StorageError> {
             Ok(self
                 .messages
                 .lock()
@@ -1440,14 +1441,14 @@ mod tests {
         async fn load_session_messages_with_supersede(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<Vec<StoredMessage>, aura_store::StorageError> {
+        ) -> std::result::Result<Vec<StoredMessage>, baybo_store::StorageError> {
             Ok(self.messages.lock().get(id).cloned().unwrap_or_default())
         }
         async fn active_index_of_ordinal(
             &self,
             id: &SessionId,
             ordinal: i64,
-        ) -> std::result::Result<Option<usize>, aura_store::StorageError> {
+        ) -> std::result::Result<Option<usize>, baybo_store::StorageError> {
             Ok(self.messages.lock().get(id).and_then(|log| {
                 log.iter()
                     .filter(|m| m.superseded_by.is_none())
@@ -1457,7 +1458,7 @@ mod tests {
         async fn count_active_messages(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<usize, aura_store::StorageError> {
+        ) -> std::result::Result<usize, baybo_store::StorageError> {
             Ok(self
                 .messages
                 .lock()
@@ -1469,7 +1470,7 @@ mod tests {
             &self,
             id: &SessionId,
             up_to_ordinal: i64,
-        ) -> std::result::Result<Vec<aura_model::ChatMessage>, aura_store::StorageError> {
+        ) -> std::result::Result<Vec<baybo_model::ChatMessage>, baybo_store::StorageError> {
             Ok(self
                 .messages
                 .lock()
@@ -1488,8 +1489,8 @@ mod tests {
             before_ordinal: Option<i64>,
             limit: usize,
         ) -> std::result::Result<
-            Vec<(i64, chrono::DateTime<chrono::Utc>, aura_model::ChatMessage)>,
-            aura_store::StorageError,
+            Vec<(i64, chrono::DateTime<chrono::Utc>, baybo_model::ChatMessage)>,
+            baybo_store::StorageError,
         > {
             if limit == 0 {
                 return Ok(Vec::new());
@@ -1520,7 +1521,7 @@ mod tests {
             id: &SessionId,
             after_ordinal: i64,
             limit: usize,
-        ) -> std::result::Result<Vec<(i64, aura_model::ChatMessage)>, aura_store::StorageError>
+        ) -> std::result::Result<Vec<(i64, baybo_model::ChatMessage)>, baybo_store::StorageError>
         {
             if limit == 0 {
                 return Ok(Vec::new());
@@ -1542,8 +1543,8 @@ mod tests {
             &self,
             id: &SessionId,
         ) -> std::result::Result<
-            Option<(chrono::DateTime<chrono::Utc>, aura_model::ChatMessage)>,
-            aura_store::StorageError,
+            Option<(chrono::DateTime<chrono::Utc>, baybo_model::ChatMessage)>,
+            baybo_store::StorageError,
         > {
             Ok(self.messages.lock().get(id).and_then(|log| {
                 log.iter()
@@ -1558,7 +1559,7 @@ mod tests {
         let id = SessionId::from(id);
         Session {
             id: id.clone(),
-            user: aura_model::User {
+            user: baybo_model::User {
                 id: "u1".into(),
                 name: None,
                 channel: ChannelType::tui(),
@@ -1593,47 +1594,47 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TraceStore for FailingTraceStore {
-        async fn save_step(&self, _: &aura_store::StepRow) -> aura_store::trace::Result<()> {
+        async fn save_step(&self, _: &baybo_store::StepRow) -> baybo_store::trace::Result<()> {
             Ok(())
         }
         async fn load_step(
             &self,
             _: &StepId,
-        ) -> aura_store::trace::Result<Option<aura_store::StepRow>> {
-            Err(aura_store::StorageError::Storage("boom".into()))
+        ) -> baybo_store::trace::Result<Option<baybo_store::StepRow>> {
+            Err(baybo_store::StorageError::Storage("boom".into()))
         }
         async fn list_steps_by_job(
             &self,
             _: &JobId,
-        ) -> aura_store::trace::Result<Vec<aura_store::StepRow>> {
-            Err(aura_store::StorageError::Storage("boom".into()))
+        ) -> baybo_store::trace::Result<Vec<baybo_store::StepRow>> {
+            Err(baybo_store::StorageError::Storage("boom".into()))
         }
-        async fn save_span(&self, _: &aura_store::SpanRow) -> aura_store::trace::Result<()> {
+        async fn save_span(&self, _: &baybo_store::SpanRow) -> baybo_store::trace::Result<()> {
             Ok(())
         }
         async fn load_span(
             &self,
-            _: &aura_model::SpanId,
-        ) -> aura_store::trace::Result<Option<aura_store::SpanRow>> {
-            Err(aura_store::StorageError::Storage("boom".into()))
+            _: &baybo_model::SpanId,
+        ) -> baybo_store::trace::Result<Option<baybo_store::SpanRow>> {
+            Err(baybo_store::StorageError::Storage("boom".into()))
         }
         async fn list_spans_by_step(
             &self,
             _: &StepId,
-        ) -> aura_store::trace::Result<Vec<aura_store::SpanRow>> {
-            Err(aura_store::StorageError::Storage("boom".into()))
+        ) -> baybo_store::trace::Result<Vec<baybo_store::SpanRow>> {
+            Err(baybo_store::StorageError::Storage("boom".into()))
         }
         async fn append_span_event(
             &self,
-            _: &aura_store::SpanEventRow,
-        ) -> aura_store::trace::Result<()> {
+            _: &baybo_store::SpanEventRow,
+        ) -> baybo_store::trace::Result<()> {
             Ok(())
         }
         async fn list_span_events(
             &self,
-            _: &aura_model::SpanId,
-        ) -> aura_store::trace::Result<Vec<aura_store::SpanEventRow>> {
-            Err(aura_store::StorageError::Storage("boom".into()))
+            _: &baybo_model::SpanId,
+        ) -> baybo_store::trace::Result<Vec<baybo_store::SpanEventRow>> {
+            Err(baybo_store::StorageError::Storage("boom".into()))
         }
     }
 
@@ -1725,7 +1726,7 @@ mod tests {
         lifecycle
             .complete(
                 &j2.id,
-                aura_job::JobOutput::Message {
+                baybo_job::JobOutput::Message {
                     content: vec![ContentBlock::Text("ok".into())],
                 },
             )
@@ -1806,7 +1807,7 @@ mod tests {
         lifecycle
             .complete(
                 &j_done.id,
-                aura_job::JobOutput::Message {
+                baybo_job::JobOutput::Message {
                     content: vec![ContentBlock::Text("ok".into())],
                 },
             )
@@ -1869,8 +1870,8 @@ mod tests {
     /// slice the LLM saw, without the prefix being cloned into span storage.
     #[tokio::test]
     async fn replay_appends_persisted_suffix() {
-        use aura_model::{ChatMessage, ContentBlock, SpanId, StepId};
-        use aura_trace::{
+        use baybo_model::{ChatMessage, ContentBlock, SpanId, StepId};
+        use baybo_trace::{
             LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
         };
 
@@ -2010,8 +2011,8 @@ mod tests {
     /// drift apart silently.
     #[tokio::test]
     async fn replay_matches_write_side_load_up_to_across_compaction() {
-        use aura_model::{ChatMessage, ContentBlock, SpanId, StepId};
-        use aura_trace::{
+        use baybo_model::{ChatMessage, ContentBlock, SpanId, StepId};
+        use baybo_trace::{
             LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
         };
         fn um(t: &str) -> ChatMessage {
@@ -2159,8 +2160,8 @@ mod tests {
     /// actually reconstruct.
     #[tokio::test]
     async fn replay_flags_prefix_len_tripwire_mismatch() {
-        use aura_model::{ChatMessage, ContentBlock, Role, SpanId, StepId};
-        use aura_trace::{
+        use baybo_model::{ChatMessage, ContentBlock, Role, SpanId, StepId};
+        use baybo_trace::{
             LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
         };
         fn um(t: &str) -> ChatMessage {
@@ -2302,8 +2303,8 @@ mod tests {
     /// the LLM saw.
     #[tokio::test]
     async fn replay_hydrates_persisted_inputs_across_compaction() {
-        use aura_model::{ChatMessage, ContentBlock, SpanId, StepId};
-        use aura_trace::{
+        use baybo_model::{ChatMessage, ContentBlock, SpanId, StepId};
+        use baybo_trace::{
             LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
         };
 
@@ -2570,7 +2571,7 @@ mod tests {
     /// No step/span data — that's the cheap-on-purpose contract.
     #[tokio::test]
     async fn load_trace_overview_returns_message_log_and_summaries() {
-        use aura_model::{ChatMessage, ContentBlock};
+        use baybo_model::{ChatMessage, ContentBlock};
 
         fn user_msg(text: &str) -> ChatMessage {
             ChatMessage::agent_context(vec![ContentBlock::Text(text.into())])
@@ -2645,8 +2646,8 @@ mod tests {
     /// served by `load_trace_overview`.
     #[tokio::test]
     async fn load_job_trace_preserves_persisted_inputs() {
-        use aura_model::{ChatMessage, ContentBlock, SpanId, StepId};
-        use aura_trace::{
+        use baybo_model::{ChatMessage, ContentBlock, SpanId, StepId};
+        use baybo_trace::{
             LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
         };
 

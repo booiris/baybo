@@ -15,7 +15,7 @@
 //! [`Memory::tools`].
 //!
 //! Recall results are injected into the prompt as a framed, persisted
-//! [`aura_model::MessageSource::RecalledMemory`] row, never a `Role::System`
+//! [`baybo_model::MessageSource::RecalledMemory`] row, never a `Role::System`
 //! message — see `docs/modules/memory.md` for the hard constraints carried
 //! forward from the retired heuristic pipeline.
 
@@ -30,10 +30,10 @@ pub mod test_support;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_llm::Attribution;
-use aura_model::{ChatMessage, ContentBlock, JobId, SessionId};
-use aura_tools::{Tool, ToolManifest};
-use aura_trace::{
+use baybo_llm::Attribution;
+use baybo_model::{ChatMessage, ContentBlock, JobId, SessionId};
+use baybo_tools::{Tool, ToolManifest};
+use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanKind, SpanRecorder, StepHandle,
 };
 
@@ -121,7 +121,7 @@ impl MemoryContext {
             session_id: self.session_id.clone(),
             job_id: self.job_id,
             span_id: span.span_id,
-            reason: aura_llm::CallReason::Memory,
+            reason: baybo_llm::CallReason::Memory,
         };
         let (call_result, value) = body(attribution).await;
         let outcome = match &value {
@@ -232,7 +232,7 @@ impl Memory for NoopMemory {
 
 /// Recall-only wrapper: forwards `recall` + `tools` to the inner backend but
 /// no-ops the write hooks (`on_job_complete` / `on_session_end`). Wired into
-/// `aura`'s runtime only under the `bench-readonly-memory` feature, so the
+/// `baybo`'s runtime only under the `bench-readonly-memory` feature, so the
 /// memory benchmark can drive the real agent end-to-end (recall + tools live)
 /// without QA turns writing into — and polluting — the recall scope. NOT a
 /// production path.

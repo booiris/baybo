@@ -5,9 +5,9 @@ pub mod retry;
 pub mod test_support;
 
 // Trait objects named by the `Store` DI bundle below. The contracts and
-// their row/DTO types live in the `aura-store` ports crate; consumers
-// import them from `aura_store` directly, not via this adapter.
-use aura_store::{
+// their row/DTO types live in the `baybo-store` ports crate; consumers
+// import them from `baybo_store` directly, not via this adapter.
+use baybo_store::{
     BlobStore, ChannelBotStore, ChannelPairingStore, ChannelSessionStore, CostStore, CronStore,
     GoalStore, JobStore, SecretStore, SessionFolderStore, SessionStore, SessionSummaryStore,
     SkillRiskStore, TaskStore, TraceStore,

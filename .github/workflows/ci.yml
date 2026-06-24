@@ -54,7 +54,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       # The grep builtin shells out to ripgrep, so its tests need `rg` on
-      # PATH; the real-terminal rendering tests (via aura-term-harness)
+      # PATH; the real-terminal rendering tests (via baybo-term-harness)
       # drive tmux. Both self-skip when their backend is absent, but we
       # install them so the suites actually run here. (Docker- and
       # bwrap-backed tests still self-skip — their backends aren't stock.)
@@ -84,7 +84,7 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # Build first: the sidecars import @aura/channel-sdk, and the
+      # Build first: the sidecars import @baybo/channel-sdk, and the
       # channel-src/* test suites import from the gitignored dist/, so the
       # SDK's .d.ts and each package's dist/ must exist before typecheck and
       # test. pnpm builds in dependency order; this also builds the web

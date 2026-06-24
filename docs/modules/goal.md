@@ -2,10 +2,10 @@
 
 ## Overview
 
-The `goal` crate (`aura-goal`) owns the autonomous-objective feature: a
+The `goal` crate (`baybo-goal`) owns the autonomous-objective feature: a
 **persistent goal** attached to a UserChat session that the agent **self-drives
 across turns** until it is verifiably complete, blocked, or spend-stopped. It is
-a faithful port of Codex's `ext/goal`, adapted to Aura's actor / cost /
+a faithful port of Codex's `ext/goal`, adapted to Baybo's actor / cost /
 multi-channel runtime.
 
 A goal is the answer to "keep working on X until it is actually done." While a
@@ -16,22 +16,22 @@ single reply. The loop ends only when the model proves completion
 the optional per-goal token budget is exhausted (`BudgetLimited`), or the global
 spend gate denies the next call (`SpendCapped`).
 
-Like `aura-cron` / `aura-skills` / `aura-subagent` / `aura-task`, it is a domain
+Like `baybo-cron` / `baybo-skills` / `baybo-subagent` / `baybo-task`, it is a domain
 crate that hosts its own `Tool` impls over a `*Store` trait and depends on
-`aura-tools` for the trait; `aura-tools` never depends back. The layering
+`baybo-tools` for the trait; `baybo-tools` never depends back. The layering
 follows the `session_tasks` precedent:
 
-- **`aura-model`** — the value types (`Goal`, `GoalStatus`, `GoalId`) plus the
+- **`baybo-model`** — the value types (`Goal`, `GoalStatus`, `GoalId`) plus the
   tool-name consts (`CREATE_GOAL_TOOL_NAME`, `GET_GOAL_TOOL_NAME`,
   `UPDATE_GOAL_TOOL_NAME`) and the `/goal` command consts. Pure data.
-- **`aura-store`** — the `GoalStore` trait + `GoalPatch` (the ports contract).
-- **`aura-storage`** — `LibsqlGoalStore` over the dedicated `session_goals`
+- **`baybo-store`** — the `GoalStore` trait + `GoalPatch` (the ports contract).
+- **`baybo-storage`** — `LibsqlGoalStore` over the dedicated `session_goals`
   table.
-- **`aura-goal`** — the three `Tool` impls + the `tools::agent_tools` factory,
+- **`baybo-goal`** — the three `Tool` impls + the `tools::agent_tools` factory,
   the verbatim steering-prompt consts, and a `GoalService` facade (CRUD + status
   transitions) the agent's continuation runtime drives. A `MemoryGoalStore` test
   fixture behind `#[cfg(any(test, feature = "test-support"))]`.
-- **`aura-agent`** — the continuation engine: the turn-boundary re-fire hook in
+- **`baybo-agent`** — the continuation engine: the turn-boundary re-fire hook in
   the actor, token/time accounting, failure handling, reaper exemption, and the
   `/goal` command + `/stop` interactions.
 
@@ -122,7 +122,7 @@ explicit `/goal resume`.
 
 `token_budget` is `Option` — omit it (the common case) and the goal runs until
 the model marks it complete/blocked. This mirrors Codex, which leaves the budget
-optional and relies on account-level usage limits as the real ceiling. Aura's
+optional and relies on account-level usage limits as the real ceiling. Baybo's
 analog is the existing **global daily/monthly spend gate** (`CostManager::check`,
 integer `MicroUsd`): every continuation turn's LLM call passes through it, so an
 unbudgeted goal still cannot run past the operator's spend cap. The two spend
@@ -187,7 +187,7 @@ gated the same way Codex gates `tools_available_for_thread`.
 Because `/goal` writes durable state and kicks the continuation loop, it is a
 **central built-in** matched in the actor (like `/compact` / `handle_compact`),
 not a skill. It is published in the gateway slash manifest (Telegram
-`setMyCommands`), the TUI slash list, and the `aura-channels` consts, so it
+`setMyCommands`), the TUI slash list, and the `baybo-channels` consts, so it
 completes from every channel.
 
 | User command | Effect |
@@ -224,7 +224,7 @@ not host FS/network), so the approval gate is a no-op; each holds an
 
 ### `/stop` and `/goal pause` are orthogonal
 
-This is the one interaction Codex (single-user TUI) never faced and Aura must
+This is the one interaction Codex (single-user TUI) never faced and Baybo must
 get right, because immediate-at-boundary continuation makes the naive reading of
 `/stop` useless:
 
@@ -270,7 +270,7 @@ audit" rule).
 
 The rigor of Codex's continuation prompt *is* the feature — it stops the model
 from quietly shrinking the objective to whatever is easy and declaring victory.
-The three prompts are ported faithfully into `aura-goal` as raw-string consts
+The three prompts are ported faithfully into `baybo-goal` as raw-string consts
 (`CONTINUATION_PROMPT`, `BUDGET_LIMIT_PROMPT`, `OBJECTIVE_UPDATED_PROMPT`) with
 `String::replace("{{placeholder}}", …)` substitution, preserving the full
 completion-audit (derive every requirement, demand authoritative evidence, treat
@@ -304,12 +304,12 @@ backstop; there is no per-feature kill switch.
 
 ## Constraints
 
-- Internal deps: `aura-model` (value types + consts), `aura-store` (the
-  `GoalStore` trait + `GoalPatch`), `aura-tools` (the `Tool` trait). **No**
-  dependency on `aura-agent` / `aura-context` / `aura-storage` — those depend on
+- Internal deps: `baybo-model` (value types + consts), `baybo-store` (the
+  `GoalStore` trait + `GoalPatch`), `baybo-tools` (the `Tool` trait). **No**
+  dependency on `baybo-agent` / `baybo-context` / `baybo-storage` — those depend on
   the contracts, never the reverse. The continuation runtime that needs actor
-  internals lives in `aura-agent`, consuming `aura-goal`'s `GoalService`.
-- `aura-goal` is pure tool + service + prompt logic; it persists nothing itself.
+  internals lives in `baybo-agent`, consuming `baybo-goal`'s `GoalService`.
+- `baybo-goal` is pure tool + service + prompt logic; it persists nothing itself.
   `MemoryGoalStore` is `test-support`-gated so it never ships in release builds.
 - Money/budget arithmetic on the cost path is integer `MicroUsd` — never floats.
 - A goal continuation turn enters Job and Trace like every other turn
@@ -324,7 +324,7 @@ backstop; there is no per-feature kill switch.
 | `store` | Owns the `GoalStore` trait + `GoalPatch` |
 | `storage` | `LibsqlGoalStore` + the `session_goals` DDL; `goal` field on the `Store` bundle |
 | `cost` | `CostManager::check` is the spend backstop (`SpendCapped`); per-turn token billing feeds `tokens_used` |
-| `agent` | `src/runtime.rs` registers `aura_goal::tools::agent_tools(stores.goal)`; the actor hosts the continuation loop (turn-boundary re-fire, accounting, failure/reaper handling), the `/goal` command, and the `/stop` interaction; `AgentLoop::set_goal_continuation_steering` frames the steering as a transient request tail |
+| `agent` | `src/runtime.rs` registers `baybo_goal::tools::agent_tools(stores.goal)`; the actor hosts the continuation loop (turn-boundary re-fire, accounting, failure/reaper handling), the `/goal` command, and the `/stop` interaction; `AgentLoop::set_goal_continuation_steering` frames the steering as a transient request tail |
 | `job` | `JobInput::GoalContinuation` — the self-initiated turn's job axis |
 | `channels` | `/goal` command consts + the `AgentEvent::Notice` lifecycle messages + the goal-banner wire types |
 | `gateway` | Publishes `/goal` in the slash manifest; the `GET` goal endpoint + goal-updated event; the web banner + dashboard goals column |

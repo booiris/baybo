@@ -40,10 +40,10 @@ pub struct SandboxSpec {
 /// command cannot even *enumerate* the directory contents.
 ///
 /// `home` is the user's `$HOME` (caller resolves `HOME` / falls back
-/// as appropriate); `aura_state` is `$AURA_HOME` or `~/.aura`.
+/// as appropriate); `baybo_state` is `$BAYBO_HOME` or `~/.baybo`.
 /// Non-existent entries are filtered later at adapter-build time, so
 /// it's safe to return paths that may not exist on every host.
-pub fn default_sensitive_denylist(home: Option<&Path>, aura_state: Option<&Path>) -> Vec<PathBuf> {
+pub fn default_sensitive_denylist(home: Option<&Path>, baybo_state: Option<&Path>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     if let Some(h) = home {
         out.push(h.join(".ssh"));
@@ -55,7 +55,7 @@ pub fn default_sensitive_denylist(home: Option<&Path>, aura_state: Option<&Path>
         out.push(h.join(".docker"));
         out.push(h.join(".kube"));
     }
-    if let Some(s) = aura_state {
+    if let Some(s) = baybo_state {
         out.push(s.to_path_buf());
     }
     out

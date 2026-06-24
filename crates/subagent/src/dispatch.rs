@@ -7,10 +7,10 @@
 //! alive at once). Both are soft, configurable cost guards.
 //!
 //! Lives in this leaf crate (alongside the profile registry) so both
-//! consumers share one definition without a cycle: `aura-tools`'
+//! consumers share one definition without a cycle: `baybo-tools`'
 //! `spawn_subagent` builtin holds an `Arc<dyn SubagentDispatchLimiter>`
-//! to reserve a slot, and `aura-agent`'s router releases it on the
-//! child's terminal event. `aura-subagent` depends on neither crate,
+//! to reserve a slot, and `baybo-agent`'s router releases it on the
+//! child's terminal event. `baybo-subagent` depends on neither crate,
 //! so neither direction closes a loop.
 //!
 //! Lifecycle contract:
@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use aura_model::SessionId;
+use baybo_model::SessionId;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 

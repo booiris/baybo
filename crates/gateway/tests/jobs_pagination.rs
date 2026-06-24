@@ -8,9 +8,9 @@ use axum::http::{Request, StatusCode, header};
 use serde_json::Value;
 use tower::ServiceExt;
 
-use aura_gateway::test_support::{TEST_ADMIN_TOKEN, build_test_deps};
-use aura_job::{JobInput, JobShape};
-use aura_model::{ContentBlock, SessionId, TriggerKind};
+use baybo_gateway::test_support::{TEST_ADMIN_TOKEN, build_test_deps};
+use baybo_job::{JobInput, JobShape};
+use baybo_model::{ContentBlock, SessionId, TriggerKind};
 
 fn auth(req: Request<Body>) -> Request<Body> {
     let (mut parts, body) = req.into_parts();
@@ -33,7 +33,7 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
                     action_payload: serde_json::json!({}),
                 },
                 TriggerKind::System => JobInput::System {
-                    payload: aura_model::BackgroundCompressionPayload { up_to_ordinal: 0 },
+                    payload: baybo_model::BackgroundCompressionPayload { up_to_ordinal: 0 },
                 },
                 TriggerKind::Spawned => JobInput::Spawned {
                     initial_prompt: vec![ContentBlock::Text("task".into())],
@@ -51,9 +51,9 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
         }
     }
 
-    use aura_gateway::auth::admin::{AdminAuthState, require_admin_token};
+    use baybo_gateway::auth::admin::{AdminAuthState, require_admin_token};
     let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
-    let state = aura_gateway::server::AdminState {
+    let state = baybo_gateway::server::AdminState {
         config: std::sync::Arc::clone(&tg.deps.config),
         config_path: tg.deps.config_path.clone(),
         session_manager: std::sync::Arc::clone(&tg.deps.session_manager),
@@ -62,7 +62,7 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
         goal_store: tg.deps.stores.goal.clone(),
-        query_api: std::sync::Arc::new(aura_query::QueryApi::new(
+        query_api: std::sync::Arc::new(baybo_query::QueryApi::new(
             tg.deps.session_manager.store(),
             std::sync::Arc::clone(&tg.deps.job_lifecycle),
             tg.deps.stores.trace.clone(),
@@ -82,7 +82,7 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
         web_chat_tokens: std::sync::Arc::new(dashmap::DashMap::new()),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     };
-    let (admin_router, _spec) = aura_gateway::api::admin::v1_router_and_spec();
+    let (admin_router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();
     admin_router
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(

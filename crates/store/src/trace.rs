@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aura_model::{JobId, SpanId, StepId};
+use baybo_model::{JobId, SpanId, StepId};
 
 use crate::StorageError;
 
@@ -7,7 +7,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Persistence row for a trace `Step`. The full `Step` is serialized into
 /// `data`; the backend derives its queryable columns (`job_id`,
-/// `started_at`) from that JSON. `aura-trace` owns the `Step` <-> row
+/// `started_at`) from that JSON. `baybo-trace` owns the `Step` <-> row
 /// conversion (`Step::to_row` / `Step::from_row`).
 #[derive(Debug, Clone)]
 pub struct StepRow {
@@ -32,9 +32,9 @@ pub struct SpanEventRow {
 }
 
 /// Persistence backend for the trace tables (`steps`, `spans`,
-/// `span_events`). Trades in rows; `aura-trace` converts to/from its rich
+/// `span_events`). Trades in rows; `baybo-trace` converts to/from its rich
 /// `Step` / `Span` / `SpanEvent` types at the boundary so the lifecycle
-/// recorder's logic stays in `aura-trace`.
+/// recorder's logic stays in `baybo-trace`.
 #[async_trait]
 pub trait TraceStore: Send + Sync {
     async fn save_step(&self, step: &StepRow) -> Result<()>;

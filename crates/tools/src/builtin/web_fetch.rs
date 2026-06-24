@@ -36,7 +36,7 @@
 //!  1. URL parse: `validate_url_with` rejects non-http(s) schemes, literal-IP
 //!     hosts in blocked ranges, and `localhost` aliases.
 //!  2. DNS resolution: a custom `reqwest::dns::Resolve` (`SafeResolver`) runs
-//!     `aura_security::is_blocked_ip` over every resolved address, so an
+//!     `baybo_security::is_blocked_ip` over every resolved address, so an
 //!     attacker-controlled hostname that resolves to a private/loopback/
 //!     metadata IP is dropped before the connector ever opens a socket.
 //!     Each redirect hop triggers a fresh resolution, so DNS rebinding inside
@@ -65,9 +65,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_llm::{BilledChat, ChatRequest};
-use aura_model::{ChatMessage, ContentBlock};
-use aura_store::BlobStore;
+use baybo_llm::{BilledChat, ChatRequest};
+use baybo_model::{ChatMessage, ContentBlock};
+use baybo_store::BlobStore;
 use dom_smoothie::Readability;
 use htmd::HtmlToMarkdown;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -75,7 +75,7 @@ use reqwest::redirect;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use aura_trace::ToolEventPayload;
+use baybo_trace::ToolEventPayload;
 
 use crate::{
     ResourceAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, start_timer,
@@ -155,7 +155,7 @@ fn validate_url_with(s: &str, allow_loopback: bool) -> Result<url::Url, String> 
         return Err(format!("host `{host}` blocked"));
     }
     if let Some(addr) = host_to_literal_ip(&host_lc)
-        && aura_security::is_blocked_ip(&addr, allow_loopback)
+        && baybo_security::is_blocked_ip(&addr, allow_loopback)
     {
         return Err(format!("ip `{addr}` blocked"));
     }
@@ -178,7 +178,7 @@ impl Resolve for SafeResolver {
                 .collect();
             let safe: Vec<SocketAddr> = resolved
                 .into_iter()
-                .filter(|sa| !aura_security::is_blocked_ip(&sa.ip(), allow_loopback))
+                .filter(|sa| !baybo_security::is_blocked_ip(&sa.ip(), allow_loopback))
                 .collect();
             if safe.is_empty() {
                 return Err(format!("host `{host}` resolved only to blocked IP ranges").into());
@@ -208,7 +208,7 @@ impl WebFetchTool {
     ) -> Self {
         let validator_lax = validator_allow_loopback;
         let mut builder = reqwest::Client::builder()
-            .user_agent(concat!("aura-webfetch/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("baybo-webfetch/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(CONNECT_TIMEOUT)
             .dns_resolver(Arc::new(SafeResolver {
                 allow_loopback: resolver_allow_loopback,
@@ -256,14 +256,14 @@ impl WebFetchTool {
     #[cfg(test)]
     fn for_testing() -> Self {
         let blob_store: Arc<dyn BlobStore> =
-            Arc::new(aura_storage::test_support::MemoryBlobStore::new());
+            Arc::new(baybo_storage::test_support::MemoryBlobStore::new());
         Self::build(blob_store, true, true, None)
     }
 
     #[cfg(test)]
     fn for_testing_strict_resolver() -> Self {
         let blob_store: Arc<dyn BlobStore> =
-            Arc::new(aura_storage::test_support::MemoryBlobStore::new());
+            Arc::new(baybo_storage::test_support::MemoryBlobStore::new());
         Self::build(blob_store, true, false, None)
     }
 
@@ -275,7 +275,7 @@ impl WebFetchTool {
     #[cfg(test)]
     fn for_testing_default() -> Self {
         let blob_store: Arc<dyn BlobStore> =
-            Arc::new(aura_storage::test_support::MemoryBlobStore::new());
+            Arc::new(baybo_storage::test_support::MemoryBlobStore::new());
         Self::build(blob_store, false, false, None)
     }
 }
@@ -362,7 +362,7 @@ Usage notes:
                 let Some(addr) = host_to_literal_ip(host) else {
                     return false;
                 };
-                !aura_security::is_blocked_ip(&addr, self.validator_allow_loopback)
+                !baybo_security::is_blocked_ip(&addr, self.validator_allow_loopback)
             })
             .map(|host| vec![ResourceAccess::Http { host }])
             .unwrap_or_default()
@@ -779,8 +779,6 @@ fn truncate_utf8(bytes: &[u8], max: usize) -> String {
 mod tests {
     use super::*;
     use crate::test_support::unbilled_chat;
-    use aura_llm::{BillableLlm, LlmCompletion};
-    use aura_model::{ChannelType, User};
     use axum::{
         Router,
         extract::State,
@@ -788,6 +786,8 @@ mod tests {
         response::{IntoResponse, Response},
         routing::get,
     };
+    use baybo_llm::{BillableLlm, LlmCompletion};
+    use baybo_model::{ChannelType, User};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -801,8 +801,8 @@ mod tests {
     fn ctx_with_timeout(timeout: Duration) -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -811,7 +811,7 @@ mod tests {
             timeout,
             cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,
@@ -830,11 +830,11 @@ mod tests {
 
     #[derive(Default)]
     struct RecorderStub {
-        entries: parking_lot::Mutex<Vec<(String, aura_trace::ToolEventPayload)>>,
+        entries: parking_lot::Mutex<Vec<(String, baybo_trace::ToolEventPayload)>>,
     }
 
     impl crate::ToolEventSink for RecorderStub {
-        fn emit(&self, action: &str, payload: aura_trace::ToolEventPayload) {
+        fn emit(&self, action: &str, payload: baybo_trace::ToolEventPayload) {
             self.entries.lock().push((action.to_string(), payload));
         }
     }
@@ -1180,7 +1180,7 @@ mod tests {
             .find(|(a, _)| a == "http_response")
             .expect("missing http_response entry");
         match &http_response.1 {
-            aura_trace::ToolEventPayload::HttpFetch {
+            baybo_trace::ToolEventPayload::HttpFetch {
                 status,
                 content_type,
                 body_preview,
@@ -1211,9 +1211,9 @@ mod tests {
     /// `<state>/blobs/<hex[..2]>/<hex>.md` layout.
     #[tokio::test]
     async fn raw_content_is_archived_before_summarisation() {
-        use aura_llm::test_support::StubLlm;
-        use aura_llm::{LlmResponse, TokenUsage};
-        use aura_storage::test_support::MemoryBlobStore;
+        use baybo_llm::test_support::StubLlm;
+        use baybo_llm::{LlmResponse, TokenUsage};
+        use baybo_storage::test_support::MemoryBlobStore;
 
         let stub = Arc::new(StubLlm::new());
         stub.push_response(LlmResponse {
@@ -1283,7 +1283,7 @@ mod tests {
         // survives extract_article + htmd).
         let captured = stub.captured_requests();
         assert_eq!(captured.len(), 1);
-        let aura_model::ContentBlock::Text(llm_input) = captured[0]
+        let baybo_model::ContentBlock::Text(llm_input) = captured[0]
             .messages
             .last()
             .expect("user msg")
@@ -1298,8 +1298,8 @@ mod tests {
 
     #[tokio::test]
     async fn timer_metrics_record_llm_summary_when_prompt_set() {
-        use aura_llm::test_support::StubLlm;
-        use aura_llm::{LlmResponse, TokenUsage};
+        use baybo_llm::test_support::StubLlm;
+        use baybo_llm::{LlmResponse, TokenUsage};
 
         let stub = Arc::new(StubLlm::new());
         stub.push_response(LlmResponse {
@@ -1347,11 +1347,11 @@ mod tests {
         let llm_call = entries
             .iter()
             .find(|(a, p)| {
-                a == "llm_summary" && matches!(p, aura_trace::ToolEventPayload::LlmCall { .. })
+                a == "llm_summary" && matches!(p, baybo_trace::ToolEventPayload::LlmCall { .. })
             })
             .expect("missing LlmCall payload");
         match &llm_call.1 {
-            aura_trace::ToolEventPayload::LlmCall {
+            baybo_trace::ToolEventPayload::LlmCall {
                 model,
                 input,
                 output,
@@ -1371,7 +1371,7 @@ mod tests {
     /// stub asserts no chat call was made.
     #[tokio::test]
     async fn short_content_skips_llm_even_with_prompt() {
-        use aura_llm::test_support::StubLlm;
+        use baybo_llm::test_support::StubLlm;
 
         let stub = Arc::new(StubLlm::new());
         // No `push_response` — a stray call would 500 the test.
@@ -1677,8 +1677,8 @@ mod tests {
     /// content actually flowed through.
     #[tokio::test]
     async fn prompt_with_llm_returns_summary() {
-        use aura_llm::test_support::StubLlm;
-        use aura_llm::{LlmResponse, TokenUsage};
+        use baybo_llm::test_support::StubLlm;
+        use baybo_llm::{LlmResponse, TokenUsage};
 
         let stub = Arc::new(StubLlm::new());
         stub.push_response(LlmResponse {
@@ -1731,12 +1731,12 @@ mod tests {
         // System prompt for extraction.
         assert!(matches!(
             req.messages.first().map(|m| m.role),
-            Some(aura_model::Role::System)
+            Some(baybo_model::Role::System)
         ));
         // User message carries both the prompt and the rendered markdown.
         let user = req.messages.last().expect("user msg");
-        assert!(matches!(user.role, aura_model::Role::User));
-        let aura_model::ContentBlock::Text(user_text) = user.content.first().expect("text block")
+        assert!(matches!(user.role, baybo_model::Role::User));
+        let baybo_model::ContentBlock::Text(user_text) = user.content.first().expect("text block")
         else {
             panic!("expected text block")
         };
@@ -1756,7 +1756,7 @@ mod tests {
     /// tokens on every fetch.
     #[tokio::test]
     async fn no_prompt_skips_llm_even_when_wired() {
-        use aura_llm::test_support::StubLlm;
+        use baybo_llm::test_support::StubLlm;
 
         let stub = Arc::new(StubLlm::new());
         // Intentionally no `push_response`: a stray call would 500.
@@ -1789,7 +1789,7 @@ mod tests {
     /// short-circuit to extracted text, no LLM call.
     #[tokio::test]
     async fn whitespace_prompt_skips_llm() {
-        use aura_llm::test_support::StubLlm;
+        use baybo_llm::test_support::StubLlm;
 
         let stub = Arc::new(StubLlm::new());
         let server = spawn(Router::new().route(
@@ -1824,8 +1824,8 @@ mod tests {
     /// the timeout/cancel buckets.
     #[tokio::test]
     async fn llm_error_returns_tool_output_error() {
-        use aura_llm::LlmError;
-        use aura_llm::test_support::StubLlm;
+        use baybo_llm::LlmError;
+        use baybo_llm::test_support::StubLlm;
 
         let stub = Arc::new(StubLlm::new());
         stub.push_response_err(LlmError::Transient("boom".into()));

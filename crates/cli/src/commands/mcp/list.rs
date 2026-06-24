@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_tools::mcp::McpServerEntry;
+use baybo_tools::mcp::McpServerEntry;
 use serde_json::json;
 
 use crate::context::CommandContext;

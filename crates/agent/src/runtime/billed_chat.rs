@@ -1,6 +1,6 @@
 //! Tool-facing billed-chat adapter.
 //!
-//! [`BoundBilledLlm`](aura_llm::BoundBilledLlm) is the billing
+//! [`BoundBilledLlm`](baybo_llm::BoundBilledLlm) is the billing
 //! chokepoint — it runs gate → call → record and returns the *raw*
 //! provider response. [`BilledChatRunner`] is the agent-side decorator a
 //! tool's `ctx.llm` resolves to: on top of a bound call it adds the
@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_llm::{BilledChat, BilledChatResponse, BoundBilledLlm, ChatRequest, ModelInfo};
+use baybo_llm::{BilledChat, BilledChatResponse, BoundBilledLlm, ChatRequest, ModelInfo};
 use tracing::warn;
 
 use crate::security::SecurityGateway;
@@ -75,12 +75,12 @@ impl BilledChat for BilledChatRunner {
 mod tests {
     use std::sync::Arc;
 
-    use aura_llm::test_support::StubLlm;
-    use aura_llm::{Attribution, BillableLlm, LlmCompletion, LlmResponse, TokenUsage};
-    use aura_model::{ChatMessage, ContentBlock};
-    use aura_security::leak_detector::{LeakAction, LeakDetectionRule, LeakDetector};
-    use aura_security::test_support::MemorySecretStore;
-    use aura_security::{EncryptionKey, SecretVault};
+    use baybo_llm::test_support::StubLlm;
+    use baybo_llm::{Attribution, BillableLlm, LlmCompletion, LlmResponse, TokenUsage};
+    use baybo_model::{ChatMessage, ContentBlock};
+    use baybo_security::leak_detector::{LeakAction, LeakDetectionRule, LeakDetector};
+    use baybo_security::test_support::MemorySecretStore;
+    use baybo_security::{EncryptionKey, SecretVault};
     use regex::Regex;
 
     use super::*;

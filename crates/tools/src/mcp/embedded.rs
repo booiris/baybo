@@ -8,8 +8,8 @@
 //! every tick.
 //!
 //! The struct is consumed by [`crate::mcp::McpReconciler::new`]; the
-//! gateway builds it from `aura_gateway::sidecar::SidecarRuntime` (which
-//! lives in `aura-gateway` and isn't visible from this crate).
+//! gateway builds it from `baybo_gateway::sidecar::SidecarRuntime` (which
+//! lives in `baybo-gateway` and isn't visible from this crate).
 
 use std::collections::HashMap;
 

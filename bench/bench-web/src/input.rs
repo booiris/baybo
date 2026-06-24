@@ -1,6 +1,6 @@
 //! Lightweight `Deserialize` mirrors of each bench's on-disk result
 //! JSON. Deliberately separate read-models from the producer types in
-//! `aura-bench-swe` / `aura-bench-memory`: depending on those crates
+//! `baybo-bench-swe` / `baybo-bench-memory`: depending on those crates
 //! would drag the whole agent runtime into this viewer's build, and the
 //! read side wants `#[serde(default)]` tolerance for fields that vary
 //! across schema versions and across arms.

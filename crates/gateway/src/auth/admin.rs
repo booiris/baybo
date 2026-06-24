@@ -7,12 +7,12 @@
 
 use std::sync::Arc;
 
-use aura_security::SecretVault;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
+use baybo_security::SecretVault;
 use rand::Rng;
 
 use crate::{GatewayError, Result};

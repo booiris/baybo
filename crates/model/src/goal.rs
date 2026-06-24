@@ -2,9 +2,9 @@
 //! `create_goal` / `get_goal` / `update_goal` tool family and the `/goal`
 //! continuation engine.
 //!
-//! Pure data. `aura-goal` (the tool boundary + service) and `aura-agent` (the
+//! Pure data. `baybo-goal` (the tool boundary + service) and `baybo-agent` (the
 //! continuation runtime) both reach for these; persistence lives in the
-//! dedicated `session_goals` table behind `aura_store::GoalStore`.
+//! dedicated `session_goals` table behind `baybo_store::GoalStore`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use crate::GoalId;
 
 /// Tool names for the goal lifecycle family. Defined here (next to the value
 /// types) so the agent loop can recognize a goal mutation without depending on
-/// the `aura-goal` crate — mirroring [`crate::task::TASK_CREATE_TOOL_NAME`].
+/// the `baybo-goal` crate — mirroring [`crate::task::TASK_CREATE_TOOL_NAME`].
 pub const CREATE_GOAL_TOOL_NAME: &str = "create_goal";
 pub const GET_GOAL_TOOL_NAME: &str = "get_goal";
 pub const UPDATE_GOAL_TOOL_NAME: &str = "update_goal";

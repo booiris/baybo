@@ -12,12 +12,12 @@
 //!   `pnpm install` (non-interactive) so the downstream pipelines
 //!   never trip over a stale workspace.
 //! * **WebUI** — watches the relevant `web/` sources, reruns
-//!   `pnpm --filter aura-web build` when those inputs change, then
+//!   `pnpm --filter baybo-web build` when those inputs change, then
 //!   zstd-compresses each emitted `web/dist` asset and writes
 //!   `$OUT_DIR/webui_assets.rs` with one compressed `include_bytes!`
 //!   arm per asset. The runtime lazily decompresses the table on first
 //!   request.
-//! * **Sidecars** — runs `pnpm --filter @aura/channel-<name> bundle`
+//! * **Sidecars** — runs `pnpm --filter @baybo/channel-<name> bundle`
 //!   (and the analogous tool-sidecar bundle scripts) to produce a
 //!   single self-contained ESM file at `dist/bundle.mjs`. Channel
 //!   sidecars in `channel-src/*` use `bun build`; tool sidecars in
@@ -202,9 +202,9 @@ fn embed_webui(ws_root: &Path) {
             &index,
             concat!(
                 "<!doctype html><html><head><meta charset=\"utf-8\">",
-                "<title>Aura WebUI</title></head><body style=\"font-family:monospace;padding:2rem\">",
-                "<h1>Aura WebUI not built</h1>",
-                "<p>Run <code>pnpm install &amp;&amp; pnpm --filter aura-web build</code> to embed the dashboard.</p>",
+                "<title>Baybo WebUI</title></head><body style=\"font-family:monospace;padding:2rem\">",
+                "<h1>Baybo WebUI not built</h1>",
+                "<p>Run <code>pnpm install &amp;&amp; pnpm --filter baybo-web build</code> to embed the dashboard.</p>",
                 "</body></html>",
             ),
         )
@@ -353,7 +353,7 @@ fn write_webui_build_stamp(cache_dir: &Path, fingerprint: &str) -> Result<(), St
 fn build_webui(ws_root: &Path) -> Result<(), String> {
     let output = Command::new("pnpm")
         .arg("--filter")
-        .arg("aura-web")
+        .arg("baybo-web")
         .arg("build")
         .current_dir(ws_root)
         .output()
@@ -447,26 +447,26 @@ fn list_dir_entries(dir: &Path) -> Vec<PathBuf> {
 const ZSTD_LEVEL: i32 = 19;
 const SIDECAR_CACHE_SCHEMA_VERSION: &str = "6";
 
-/// The pnpm package that channel sidecars import (`@aura/channel-sdk`).
+/// The pnpm package that channel sidecars import (`@baybo/channel-sdk`).
 /// Sidecar `bundle` scripts shell out to `bun build`, which resolves
 /// this dependency through the workspace symlink — but bun honors the
 /// SDK's `exports` map, which points exclusively at `./dist/*.js`. So
 /// the SDK must be compiled before any sidecar can be bundled. The
 /// gateway build script runs `pnpm --filter` against this name in the
 /// cache-miss path to guarantee `dist/` exists.
-const CHANNEL_SDK_PKG: &str = "@aura/channel-sdk";
+const CHANNEL_SDK_PKG: &str = "@baybo/channel-sdk";
 
 /// Each sidecar self-declares its **domain** — the business surface
 /// it belongs to (`channel` for Telegram/WeChat/TUI, `browser` for
 /// the Playwright tool, future domains for code-exec, db, …) — via
-/// its `package.json`'s `aura.domain` field. The runtime exposes
-/// per-domain iteration so `aura channel list/add` only sees the
+/// its `package.json`'s `baybo.domain` field. The runtime exposes
+/// per-domain iteration so `baybo channel list/add` only sees the
 /// `channel` domain, the browser supervisor only sees `browser`,
 /// and adding a future domain doesn't touch any of those code
 /// paths.
 ///
 /// Domain is a free string at the build/runtime layer; constants
-/// for the known ones live in `aura_gateway::sidecar::domains`.
+/// for the known ones live in `baybo_gateway::sidecar::domains`.
 struct AuxAsset {
     name: String,
     src: PathBuf,
@@ -507,7 +507,7 @@ fn embed_sidecars(ws_root: &Path) {
     // Collisions across pools are a build-time error.
     // Discovery is now agnostic about which top-level directory a
     // sidecar lives in. Each `package.json` self-declares its
-    // domain via `aura.domain`; the directory layout is just file-
+    // domain via `baybo.domain`; the directory layout is just file-
     // system organisation. Adding a third `<x>-src/` is one line
     // here.
     let mut sidecar_dirs: Vec<PathBuf> = Vec::new();
@@ -560,7 +560,7 @@ fn embed_sidecars(ws_root: &Path) {
         return;
     }
 
-    // Compile `@aura/channel-sdk` before bundling. Channel sidecars
+    // Compile `@baybo/channel-sdk` before bundling. Channel sidecars
     // import it, and `bun build` resolves the import through the
     // SDK's `exports` map → `./dist/*.js`; without `dist/` every
     // sidecar bundle fails with "Could not resolve". This runs only
@@ -734,7 +734,7 @@ fn embed_sidecars(ws_root: &Path) {
 /// `cargo:warning` + empty-asset degrade. The gateway binary boots fine
 /// without sidecars during local backend hacking, but a release build
 /// with no embedded channels is almost always a packaging mistake.
-const STRICT_SIDECARS_ENV: &str = "AURA_REQUIRE_SIDECARS";
+const STRICT_SIDECARS_ENV: &str = "BAYBO_REQUIRE_SIDECARS";
 
 fn sidecars_required() -> bool {
     matches!(
@@ -897,9 +897,9 @@ fn hash_path_state(hasher: &mut sha2::Sha256, ws_root: &Path, path: &Path) -> Re
     Ok(())
 }
 
-/// Read both the npm package name and the Aura `domain` field from
+/// Read both the npm package name and the Baybo `domain` field from
 /// a sidecar's `package.json`. Domain is mandatory — a missing
-/// `aura.domain` is a build-time error so a new sidecar can't
+/// `baybo.domain` is a build-time error so a new sidecar can't
 /// silently default into the wrong family.
 fn read_package_meta(package_json: &Path) -> Result<(String, String), String> {
     let raw = fs::read_to_string(package_json)
@@ -912,13 +912,13 @@ fn read_package_meta(package_json: &Path) -> Result<(String, String), String> {
         .ok_or_else(|| format!("{} has no string `name`", package_json.display()))?
         .to_owned();
     let domain = value
-        .get("aura")
+        .get("baybo")
         .and_then(|v| v.get("domain"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
             format!(
-                "{} has no string `aura.domain` (sidecars must declare a domain like \
-                 `\"aura\": {{ \"domain\": \"channel\" }}` so the runtime can iterate \
+                "{} has no string `baybo.domain` (sidecars must declare a domain like \
+                 `\"baybo\": {{ \"domain\": \"channel\" }}` so the runtime can iterate \
                  them per-family)",
                 package_json.display()
             )
@@ -930,14 +930,14 @@ fn read_package_meta(package_json: &Path) -> Result<(String, String), String> {
             .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
     {
         return Err(format!(
-            "{} has invalid `aura.domain` `{domain}` — must match [a-z0-9_]+",
+            "{} has invalid `baybo.domain` `{domain}` — must match [a-z0-9_]+",
             package_json.display()
         ));
     }
     Ok((name, domain))
 }
 
-/// Compile `@aura/channel-sdk` (`pnpm --filter <pkg> build`) so its
+/// Compile `@baybo/channel-sdk` (`pnpm --filter <pkg> build`) so its
 /// `dist/` exists before sidecar bundlers try to resolve it. `tsc` is
 /// incremental — on a no-op the cost is negligible — so it's safe to
 /// run this unconditionally on the cache-miss path.
@@ -1021,7 +1021,7 @@ fn sidecar_aux_assets(dir: &Path) -> Result<Vec<AuxAsset>, String> {
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", package_json.display()))?;
     let Some(assets) = value
-        .get("aura")
+        .get("baybo")
         .and_then(|v| v.get("auxAssets"))
         .and_then(|v| v.as_array())
     else {
@@ -1032,11 +1032,11 @@ fn sidecar_aux_assets(dir: &Path) -> Result<Vec<AuxAsset>, String> {
         let src = asset
             .get("src")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "aura.auxAssets entries require string `src`".to_string())?;
+            .ok_or_else(|| "baybo.auxAssets entries require string `src`".to_string())?;
         let name = asset
             .get("name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "aura.auxAssets entries require string `name`".to_string())?;
+            .ok_or_else(|| "baybo.auxAssets entries require string `name`".to_string())?;
         let recursive = asset
             .get("recursive")
             .and_then(|v| v.as_bool())

@@ -3,7 +3,7 @@ use thiserror::Error;
 /// Errors produced by the CLI layer.
 ///
 /// Specific manager errors are wrapped via `.to_string()` rather than `#[from]`
-/// so that `aura-cli` does not take a hard dependency on every domain crate's
+/// so that `baybo-cli` does not take a hard dependency on every domain crate's
 /// error enum.
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -47,15 +47,15 @@ impl From<serde_json::Error> for CliError {
     }
 }
 
-impl From<aura_config::ConfigError> for CliError {
-    fn from(err: aura_config::ConfigError) -> Self {
+impl From<baybo_config::ConfigError> for CliError {
+    fn from(err: baybo_config::ConfigError) -> Self {
         Self::Config(err.to_string())
     }
 }
 
-impl From<aura_setup::SetupError> for CliError {
-    fn from(err: aura_setup::SetupError) -> Self {
-        use aura_setup::SetupError as S;
+impl From<baybo_setup::SetupError> for CliError {
+    fn from(err: baybo_setup::SetupError) -> Self {
+        use baybo_setup::SetupError as S;
         match err {
             S::NotATerminal | S::Cancelled | S::Prompt(_) => Self::Config(err.to_string()),
             S::Io { .. } => Self::Io(err.to_string()),

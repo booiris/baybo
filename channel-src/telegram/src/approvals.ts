@@ -3,8 +3,8 @@ import type {
   ApprovalRequest,
   Logger,
   ResourceAccess,
-} from "@aura/channel-sdk";
-import type { BotRoute, PlatformApprovals } from "@aura/channel-sdk/bot";
+} from "@baybo/channel-sdk";
+import type { BotRoute, PlatformApprovals } from "@baybo/channel-sdk/bot";
 import type { Bot, Context } from "grammy";
 import { InlineKeyboard } from "grammy";
 
@@ -22,12 +22,12 @@ type PendingEntry = {
   resolve: (decision: ApprovalDecision) => void;
 };
 
-const CALLBACK_PREFIX = "aura:approve:";
+const CALLBACK_PREFIX = "baybo:approve:";
 
 /**
  * Interactive approval broker.
  *
- * Each `Frame::ApprovalRequested` from aura becomes an inline-keyboard
+ * Each `Frame::ApprovalRequested` from baybo becomes an inline-keyboard
  * prompt in the originating Telegram chat. A button tap resolves the
  * SDK's detached promise with the chosen decision; the SDK encodes it
  * as `ResolveApproval` on the wire.
@@ -206,7 +206,7 @@ function decisionIcon(decision: ApprovalDecision): string {
 }
 
 function formatPrompt(req: ApprovalRequest): string {
-  const lines = [`🔐 Aura wants to run \`${req.tool}\`.`];
+  const lines = [`🔐 Baybo wants to run \`${req.tool}\`.`];
   const body = formatBody(req);
   if (body.length > 0) {
     lines.push("", ...body);

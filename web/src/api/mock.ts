@@ -50,7 +50,7 @@ function generateMockLogs(count: number): LogEntry[] {
       message: messages[Math.floor(Math.random() * messages.length)],
       fields: [
         { name: 'pid', value: Math.floor(Math.random() * 10000).toString() },
-        { name: 'node', value: 'aura-node-01' },
+        { name: 'node', value: 'baybo-node-01' },
       ],
     });
   }
@@ -404,7 +404,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
     it1Llm.id,
     'tu_2',
     { path: 'README.md' },
-    { content: 'Aura — intelligent assistant framework. <api key: [{REDACTED_SECRET_a1b2}]>' },
+    { content: 'Baybo — intelligent assistant framework. <api key: [{REDACTED_SECRET_a1b2}]>' },
     new Date(t0 + 880),
     new Date(t0 + 1450),
     parallelGroup,
@@ -453,7 +453,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
       },
       interjectMsg('Actually, also tell me the package name.'),
     ],
-    'There are 3 entries: README.md, src/, package.json. README documents Aura. The package is "aura".',
+    'There are 3 entries: README.md, src/, package.json. README documents Baybo. The package is "baybo".',
     [],
     220,
     52,

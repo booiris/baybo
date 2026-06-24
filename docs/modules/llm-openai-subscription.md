@@ -2,7 +2,7 @@
 
 ## Goal
 
-Let aura users drive `gpt-5`-class models with their **OpenAI ChatGPT/Codex subscription** instead of an `OPENAI_API_KEY`. The HTTP path is `chatgpt.com/backend-api/codex/responses` (Codex Responses API), the credential is a ChatGPT OAuth bearer minted via PKCE against `auth.openai.com`. This is OpenClaw's "Codex OAuth via PI" route — the equivalent for aura's own agent runtime, not the heavier "wrap the Codex CLI app-server" route (that's the C track, deferred).
+Let baybo users drive `gpt-5`-class models with their **OpenAI ChatGPT/Codex subscription** instead of an `OPENAI_API_KEY`. The HTTP path is `chatgpt.com/backend-api/codex/responses` (Codex Responses API), the credential is a ChatGPT OAuth bearer minted via PKCE against `auth.openai.com`. This is OpenClaw's "Codex OAuth via PI" route — the equivalent for baybo's own agent runtime, not the heavier "wrap the Codex CLI app-server" route (that's the C track, deferred).
 
 Public-knowledge inputs: `client_id = app_EMoamEEZ73f0CkXaXp7hrann`, issuer `https://auth.openai.com`, scopes `openid profile email offline_access api.connectors.read api.connectors.invoke`, with the Codex CLI's extra parameters (`id_token_add_organizations=true`, `codex_cli_simplified_flow=true`, `originator=codex_cli_rs`). Source: `openai/codex` repo, `codex-rs/login/`.
 
@@ -17,7 +17,7 @@ Public-knowledge inputs: `client_id = app_EMoamEEZ73f0CkXaXp7hrann`, issuer `htt
 
 ### New provider id: `openai-subscription`
 
-Selected via `aura.json`:
+Selected via `baybo.json`:
 
 ```json
 {
@@ -28,16 +28,16 @@ Selected via `aura.json`:
 }
 ```
 
-Naming rationale: this is the explicit "use your OpenAI subscription" path, distinct from `openai` (API-key, pay-per-token billing). The leading `openai-` keeps it grouped with `openai`/`openai-codex`-style ids in `aura llm models` listings and avoids putting a vendor product brand (`chatgpt`) directly in operator-facing config. Open question — could equally be `chatgpt`, `openai-oauth`, or `openai-codex`; final decision deferred to review.
+Naming rationale: this is the explicit "use your OpenAI subscription" path, distinct from `openai` (API-key, pay-per-token billing). The leading `openai-` keeps it grouped with `openai`/`openai-codex`-style ids in `baybo llm models` listings and avoids putting a vendor product brand (`chatgpt`) directly in operator-facing config. Open question — could equally be `chatgpt`, `openai-oauth`, or `openai-codex`; final decision deferred to review.
 
-No `api_key_env` is consulted; tokens come from the vault. `base_url` defaults to `https://chatgpt.com/backend-api`. **Default-deny on the bearer destination**: an override is accepted only if the parsed host suffix is on the allowlist (`chatgpt.com` and its subdomains, `auth.openai.com`). Anything else fails at provider construction with `LlmError::Config` so the misconfiguration surfaces at boot rather than leaking the bearer at first request. To deliberately override (operator owns the TOS and credential-leak risk), set the env var `AURA_OPENAI_SUBSCRIPTION_UNSAFE_BASE_URL=1` — env rather than `aura.json` field on purpose, so flipping a bypass requires an explicit shell action.
+No `api_key_env` is consulted; tokens come from the vault. `base_url` defaults to `https://chatgpt.com/backend-api`. **Default-deny on the bearer destination**: an override is accepted only if the parsed host suffix is on the allowlist (`chatgpt.com` and its subdomains, `auth.openai.com`). Anything else fails at provider construction with `LlmError::Config` so the misconfiguration surfaces at boot rather than leaking the bearer at first request. To deliberately override (operator owns the TOS and credential-leak risk), set the env var `BAYBO_OPENAI_SUBSCRIPTION_UNSAFE_BASE_URL=1` — env rather than `baybo.json` field on purpose, so flipping a bypass requires an explicit shell action.
 
 ### Vault entry: `llm.openai-subscription.tokens`
 
-Single canonical key (single profile per aura process). Stored as a typed bundle:
+Single canonical key (single profile per baybo process). Stored as a typed bundle:
 
 ```rust
-// in aura-llm/src/providers/openai_subscription/token_bundle.rs
+// in baybo-llm/src/providers/openai_subscription/token_bundle.rs
 #[derive(Serialize, Deserialize, Clone)]
 pub struct OAuthTokenBundle {
     pub access_token: String,       // JWT, sent as Authorization: Bearer
@@ -52,27 +52,27 @@ pub struct OAuthTokenBundle {
 The vault gets a typed accessor pair so callers never see raw bytes:
 
 ```rust
-// in aura-security/src/secret_vault.rs (new)
+// in baybo-security/src/secret_vault.rs (new)
 impl SecretVault {
     pub async fn store_typed<T: Serialize>(&self, name: &str, value: &T) -> Result<()>;
     pub async fn get_typed<T: DeserializeOwned>(&self, name: &str) -> Result<Option<T>>;
 }
 ```
 
-Existing `store_secret` / `get_secret` (raw bytes) stay for symmetric-key style entries; typed accessors are layered on top with `serde_json` and the same AES-GCM encryption underneath. The bundle type itself stays in `aura-llm` — `aura-security` doesn't learn about OAuth.
+Existing `store_secret` / `get_secret` (raw bytes) stay for symmetric-key style entries; typed accessors are layered on top with `serde_json` and the same AES-GCM encryption underneath. The bundle type itself stays in `baybo-llm` — `baybo-security` doesn't learn about OAuth.
 
-### CLI surface (folded into `aura llm`)
+### CLI surface (folded into `baybo llm`)
 
 OAuth login is not a separate `auth` subcommand; it's wired into the existing entry-management flow. Picking the `openai-subscription` provider triggers an interactive login that mirrors what a dedicated `auth login` would do, and removal handles `revoke + clear` symmetrically.
 
 | Command | What it does |
 |---|---|
-| `aura llm add` (pick `openai-subscription` provider) | Prompts the operator to choose between two login methods: **PKCE** (default on a TTY) opens `https://auth.openai.com/oauth/authorize?...` and runs a one-shot HTTP listener on `127.0.0.1:1455` for the callback; **Device code** (auto-selected on non-TTY stdin, also offered on TTY for headless boxes) hits `/api/accounts/deviceauth/usercode` + polled `/deviceauth/token`. The exchanged bundle is persisted in the vault under a single shared key (one profile per workspace). After the login the flow continues with model + reasoning-effort selection. |
-| `aura llm edit` → `OAuth login (re-authenticate)` | Re-runs the same PKCE / device-code dialog and overwrites the vault bundle. Used to recover from a stale refresh token without removing the entry. |
-| `aura llm remove` (entry whose provider is `openai-subscription`) | Deletes the config entry; if no other `openai-subscription` entries remain, also calls `/oauth/revoke` (RFC 7009, best-effort — logs but does not fail the command) and clears the vault entry. **Vault clear failure is logged but not fatal**: the config entry is gone, so the runtime no longer routes through this provider; the next process won't see the token. Server-side revoke success is reflected in the JSON output (`subscription_revoked: true|false`). |
-| `aura llm status` | Lists every registered entry (name / provider / model / api_key_env). It does **not** surface OAuth token state (expiry, account email, plan type, override state) today — that data is printed once at login time and is otherwise only visible in tracing events. A richer status view is future work. |
+| `baybo llm add` (pick `openai-subscription` provider) | Prompts the operator to choose between two login methods: **PKCE** (default on a TTY) opens `https://auth.openai.com/oauth/authorize?...` and runs a one-shot HTTP listener on `127.0.0.1:1455` for the callback; **Device code** (auto-selected on non-TTY stdin, also offered on TTY for headless boxes) hits `/api/accounts/deviceauth/usercode` + polled `/deviceauth/token`. The exchanged bundle is persisted in the vault under a single shared key (one profile per workspace). After the login the flow continues with model + reasoning-effort selection. |
+| `baybo llm edit` → `OAuth login (re-authenticate)` | Re-runs the same PKCE / device-code dialog and overwrites the vault bundle. Used to recover from a stale refresh token without removing the entry. |
+| `baybo llm remove` (entry whose provider is `openai-subscription`) | Deletes the config entry; if no other `openai-subscription` entries remain, also calls `/oauth/revoke` (RFC 7009, best-effort — logs but does not fail the command) and clears the vault entry. **Vault clear failure is logged but not fatal**: the config entry is gone, so the runtime no longer routes through this provider; the next process won't see the token. Server-side revoke success is reflected in the JSON output (`subscription_revoked: true|false`). |
+| `baybo llm status` | Lists every registered entry (name / provider / model / api_key_env). It does **not** surface OAuth token state (expiry, account email, plan type, override state) today — that data is printed once at login time and is otherwise only visible in tracing events. A richer status view is future work. |
 
-All of the above lives in `crates/cli/src/commands/llm.rs`. The OAuth surface itself (`pkce_login`, `device_code_login`, `revoke`, `VaultTokenStore`) is exposed by `aura_llm::providers::openai_subscription` for the CLI to consume.
+All of the above lives in `crates/cli/src/commands/llm.rs`. The OAuth surface itself (`pkce_login`, `device_code_login`, `revoke`, `VaultTokenStore`) is exposed by `baybo_llm::providers::openai_subscription` for the CLI to consume.
 
 ## Architecture
 
@@ -117,9 +117,9 @@ OpenAiSubscription(crate::providers::openai_subscription::OpenAiSubscriptionComp
 2. `Authorization: Bearer <ChatGPT JWT>` plus `ChatGPT-Account-Id: <id>` is required; rig's openai client only knows API-key bearers.
 3. We need 401 → refresh-and-retry. rig won't.
 
-### Token store wiring — `aura-llm` depends on `aura-security`
+### Token store wiring — `baybo-llm` depends on `baybo-security`
 
-`aura-llm/Cargo.toml` gets `aura-security = { workspace = true }` added. This is the simplest plumbing path and matches the user-stated decision over the more ceremonial "register codex factory separately" alternative I'd previously considered.
+`baybo-llm/Cargo.toml` gets `baybo-security = { workspace = true }` added. This is the simplest plumbing path and matches the user-stated decision over the more ceremonial "register codex factory separately" alternative I'd previously considered.
 
 Concrete consequences:
 
@@ -128,7 +128,7 @@ Concrete consequences:
 - `boot::build_llm_client` gains a `vault: Arc<SecretVault>` parameter (touches every test fixture that builds an `LlmClient` — accepted cost per user).
 - The factory's `create()` does **not** read the vault — it just constructs the `VaultTokenStore` and the completion model (sync, no `block_on`). The bundle load is deferred to the async hot path: `ensure_fresh_bundle()` lazily reads the vault on the first request (and re-validates periodically), so a configured-but-not-yet-signed-in provider only errors when a call is actually attempted.
 
-`aura-llm` already depends on `tokio` for its streams, so the extra `aura-security` edge doesn't pull in a new ecosystem.
+`baybo-llm` already depends on `tokio` for its streams, so the extra `baybo-security` edge doesn't pull in a new ecosystem.
 
 ### Refresh policy
 
@@ -152,7 +152,7 @@ Authorization: Bearer <access_token>
 ChatGPT-Account-Id: <account_id>     // when present
 OpenAI-Beta: responses=experimental
 originator: codex_cli_rs              // anti-bot allowlist; required
-User-Agent: aura/<version> (...)
+User-Agent: baybo/<version> (...)
 Content-Type: application/json
 
 {
@@ -170,7 +170,7 @@ Content-Type: application/json
 
 Response is SSE; we parse `response.output_text.delta`, `response.function_call.*`, `response.completed`, `response.error` events into `StreamEvent`s.
 
-`originator: codex_cli_rs` is mandatory — Codex's edge rejects requests without it. Yes we're impersonating Codex CLI; the OpenClaw docs note this is the "explicitly supported" external-tool path. We do **not** spoof `User-Agent: codex_cli_rs/...`; aura sends its own UA. This is the minimum needed for the route, no more.
+`originator: codex_cli_rs` is mandatory — Codex's edge rejects requests without it. Yes we're impersonating Codex CLI; the OpenClaw docs note this is the "explicitly supported" external-tool path. We do **not** spoof `User-Agent: codex_cli_rs/...`; baybo sends its own UA. This is the minimum needed for the route, no more.
 
 ### Conversion: rig `CompletionRequest` → Codex `ResponsesApiRequest`
 
@@ -188,9 +188,9 @@ Tool-call return path: Responses API emits `response.function_call_arguments.del
 
 ## Error mapping
 
-| Source | aura `LlmError` |
+| Source | baybo `LlmError` |
 |---|---|
-| Vault returns None | `Config("openai-subscription: not signed in — add an entry via `aura llm add` (pick the openai-subscription provider) or re-authenticate an existing entry via `aura llm edit`")` |
+| Vault returns None | `Config("openai-subscription: not signed in — add an entry via `baybo llm add` (pick the openai-subscription provider) or re-authenticate an existing entry via `baybo llm edit`")` |
 | Bundle JSON parse error | `Config("openai-subscription: corrupt token bundle")` (then auto-clear vault entry) |
 | Refresh permanent failure | `Config("openai-subscription: refresh token expired/revoked — re-login required")` (auto-clear bundle) |
 | Refresh transient failure | surfaced as a rig `CompletionError::ProviderError`, classified to `LlmError::Transient` by `rig_completion_to_error` |
@@ -201,15 +201,15 @@ Tool-call return path: Responses API emits `response.function_call_arguments.del
 
 ## Security & TOS
 
-- **Endpoint allowlist** — *load-bearing trust boundary*: the factory rejects any `base_url` whose host doesn't match `chatgpt.com` (or subdomain) or `auth.openai.com`, returning `LlmError::Config`. The OAuth bearer is technically powerful enough to also authenticate against `api.openai.com/v1/*` or any third-party host, so a malicious or mis-edited `aura.json` that points `base_url` at an attacker host would otherwise hand the bearer to the attacker on the first LLM call. The allowlist closes that without trusting operators to read the warning.
-- **Forward-compat escape hatch**: if OpenAI moves the endpoint to a host outside the allowlist, the operator can set `AURA_OPENAI_SUBSCRIPTION_UNSAFE_BASE_URL=1` in the env to bypass validation. The bypass is an env var rather than a JSON field by design — flipping a credential-leak guard should require an explicit shell action, not slip in through a config edit. The bypass also emits a `tracing::warn!(event = "openai_subscription_unsafe_base_url")` so the override is auditable in logs.
+- **Endpoint allowlist** — *load-bearing trust boundary*: the factory rejects any `base_url` whose host doesn't match `chatgpt.com` (or subdomain) or `auth.openai.com`, returning `LlmError::Config`. The OAuth bearer is technically powerful enough to also authenticate against `api.openai.com/v1/*` or any third-party host, so a malicious or mis-edited `baybo.json` that points `base_url` at an attacker host would otherwise hand the bearer to the attacker on the first LLM call. The allowlist closes that without trusting operators to read the warning.
+- **Forward-compat escape hatch**: if OpenAI moves the endpoint to a host outside the allowlist, the operator can set `BAYBO_OPENAI_SUBSCRIPTION_UNSAFE_BASE_URL=1` in the env to bypass validation. The bypass is an env var rather than a JSON field by design — flipping a credential-leak guard should require an explicit shell action, not slip in through a config edit. The bypass also emits a `tracing::warn!(event = "openai_subscription_unsafe_base_url")` so the override is auditable in logs.
 - **Lookalike-host hardening**: the suffix match is `host == suffix || host.ends_with(".{suffix}")`, so `chatgpt.com.attacker.example` does NOT match `chatgpt.com`. Regression tested.
-- **User-facing transparency**: the `openai_subscription_unsafe_base_url` warn event makes the override state visible in tracing; a richer surface in `aura llm status` (default-allowed vs allowlisted-non-default vs unsafe-override-active) is future work.
+- **User-facing transparency**: the `openai_subscription_unsafe_base_url` warn event makes the override state visible in tracing; a richer surface in `baybo llm status` (default-allowed vs allowlisted-non-default vs unsafe-override-active) is future work.
 - **Single-flight refresh** — *load-bearing concurrency invariant*: every refresh path (just-in-time, reactive 401, background loop) funnels through one `do_single_flight_refresh()` helper that holds a process-wide `refresh_flight: Mutex<()>`. After acquiring the lock, the helper re-checks the cache: if the cached `refresh_token` differs from what the caller planned to send, someone else already rotated it and we reuse their bundle without a network call. Without the re-check, two concurrent paths would both call `refresh()` with the same token; the loser would hit `refresh_token_reused` → permanent failure → vault cleared → user logged out under nothing but normal load. Regression tested (`single_flight_refresh_dedups_after_concurrent_rotation`).
 - **HTTPS-only on the bearer transport** *(Codex R2-F2)*: the `base_url` validator rejects any non-HTTPS scheme **before** the host suffix check, so even an allowlisted host on `http://` is refused. Protects the bearer from on-path observers and TLS-decrypting proxies that the host allowlist alone wouldn't catch. The unsafe override env var doesn't relax this — it can only widen the host allowlist, never weaken the scheme requirement. Regression tested (`validate_base_url_rejects_http_with_allowlisted_host` + 3 sibling tests).
 - **Durable refresh persistence** *(Codex R2-F3)*: after a successful OAuth refresh, `save_with_retries()` writes the rotated bundle to vault with up to 3 attempts (100ms / 500ms / 2s backoff). If all attempts fail, the bundle is kept in memory but flagged `persisted: false` ("dirty"). The next refresh-path entry retries the save before doing anything else (self-heal); if it STILL can't persist, it refuses to rotate again — better to wait than chain unsaved bundles that all evaporate on process restart. Without this, a transient FS glitch during refresh would silently lose the rotated `refresh_token` and the next process to start would hit `refresh_token_reused` → forced re-login. Regression tested (`save_with_retries_recovers_within_budget`, `save_with_retries_gives_up_after_budget`, `single_flight_refresh_self_heals_dirty_save`, `single_flight_refresh_refuses_to_rotate_when_dirty_save_keeps_failing`).
-- **Cross-process logout invalidation** *(Codex R2-F1)*: every cache hit re-validates against the vault on a periodic interval (`CACHE_VAULT_REVALIDATE_INTERVAL_SECS = 60`). Within the window, repeat calls skip the vault read entirely (hot path stays cheap). Past the window, a missing vault entry drops the in-memory cached bundle so a `aura llm remove` run by another process (which clears the vault entry as part of removal) is honoured within ~60s. Without this, a CLI removal would only delete the on-disk vault entry while a running gateway / TUI keeps using its cached bundle (and 401 reactive refresh would even write a new bundle back into vault, partially undoing the logout). Regression tested (`ensure_fresh_bundle_invalidates_cache_when_vault_is_emptied`, `ensure_fresh_bundle_skips_vault_within_revalidate_interval`).
-- **Anti-impersonation**: aura sets `User-Agent: aura/...`. Only `originator: codex_cli_rs` mimics Codex (mandatory header for the route). Rationale documented inline.
+- **Cross-process logout invalidation** *(Codex R2-F1)*: every cache hit re-validates against the vault on a periodic interval (`CACHE_VAULT_REVALIDATE_INTERVAL_SECS = 60`). Within the window, repeat calls skip the vault read entirely (hot path stays cheap). Past the window, a missing vault entry drops the in-memory cached bundle so a `baybo llm remove` run by another process (which clears the vault entry as part of removal) is honoured within ~60s. Without this, a CLI removal would only delete the on-disk vault entry while a running gateway / TUI keeps using its cached bundle (and 401 reactive refresh would even write a new bundle back into vault, partially undoing the logout). Regression tested (`ensure_fresh_bundle_invalidates_cache_when_vault_is_emptied`, `ensure_fresh_bundle_skips_vault_within_revalidate_interval`).
+- **Anti-impersonation**: baybo sets `User-Agent: baybo/...`. Only `originator: codex_cli_rs` mimics Codex (mandatory header for the route). Rationale documented inline.
 - **Token at rest**: encrypted with the same AES-256-GCM master key as every other vault entry — same blast radius as a stored API key.
 - **Token in memory**: cached in an `Arc<tokio::sync::Mutex<Option<CachedBundle>>>` for the process lifetime (`CachedBundle` wraps the bundle plus `persisted` / `last_vault_check` bookkeeping); on logout we drop it and delete the vault entry.
 - **Audit log**: every refresh emits a tracing event with `event=openai_subscription_token_refresh`, `outcome=success|transient|permanent`, `account_id` (hashed), no token material in logs ever.

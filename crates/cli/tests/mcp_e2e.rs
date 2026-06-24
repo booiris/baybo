@@ -1,4 +1,4 @@
-//! End-to-end tests for `aura mcp {add, list, get, remove}` against a
+//! End-to-end tests for `baybo mcp {add, list, get, remove}` against a
 //! tmpdir workspace and an in-memory SecretVault. The full happy path
 //! is exercised by stdio entries (HTTP entries hit the network in `add`
 //! via the auth pre-check, so the network-free invariants are best
@@ -7,15 +7,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_cli::cli::{Commands, McpCmd, McpTransportArg, TrustLevelArg};
-use aura_cli::{ContextBuilder, Invocation, OutputFormat, dispatch};
-use aura_config::AuraConfig;
-use aura_security::test_support::MemorySecretStore;
-use aura_security::{EncryptionKey, SecretVault};
-use aura_tools::mcp::{McpFile, McpTransportConfig, vault_keys};
+use baybo_cli::cli::{Commands, McpCmd, McpTransportArg, TrustLevelArg};
+use baybo_cli::{ContextBuilder, Invocation, OutputFormat, dispatch};
+use baybo_config::BayboConfig;
+use baybo_security::test_support::MemorySecretStore;
+use baybo_security::{EncryptionKey, SecretVault};
+use baybo_tools::mcp::{McpFile, McpTransportConfig, vault_keys};
 
-fn make_ctx(tmpdir: &tempfile::TempDir) -> aura_cli::CommandContext {
-    let mut config = AuraConfig::default();
+fn make_ctx(tmpdir: &tempfile::TempDir) -> baybo_cli::CommandContext {
+    let mut config = BayboConfig::default();
     config.workspace.path = tmpdir.path().to_string_lossy().into_owned();
     let vault = Arc::new(SecretVault::new(
         EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap(),
@@ -23,7 +23,7 @@ fn make_ctx(tmpdir: &tempfile::TempDir) -> aura_cli::CommandContext {
     ));
     ContextBuilder::new(Arc::new(config))
         .secret_vault(vault)
-        .workspace(Arc::new(aura_workspace::WorkspaceManager::new(
+        .workspace(Arc::new(baybo_workspace::WorkspaceManager::new(
             tmpdir.path().to_path_buf(),
         )))
         .build()

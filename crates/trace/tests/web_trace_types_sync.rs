@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use aura_trace::{SpanKind, StepKind};
+use baybo_trace::{SpanKind, StepKind};
 
 /// The hand-maintained frontend mirror of this crate's trace types.
 fn web_trace_types() -> String {

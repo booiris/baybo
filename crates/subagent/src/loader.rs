@@ -6,13 +6,13 @@
 //! `version`); the body becomes [`SubagentProfile::system_prompt`] and
 //! is what REPLACES the parent's [`Soul`] inside the child actor.
 //!
-//! Parsing accepts the same YAML subset as `aura-skills::loader`: flow
+//! Parsing accepts the same YAML subset as `baybo-skills::loader`: flow
 //! scalars (optionally quoted), `true`/`false`, inline `[a, b]` lists,
 //! and block `- item` lists. Anything more exotic (anchors, folded
 //! blocks, nested maps) is rejected so misreads don't slip through.
 //!
 //! Disk layout: `<workspace>/agents/<name>.md`. One file per profile —
-//! no directory-per-profile ceremony like `aura-skills` because a
+//! no directory-per-profile ceremony like `baybo-skills` because a
 //! profile has no linked-files concern (the prompt body alone IS the
 //! whole thing).
 //!
@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use aura_model::{ArtifactSource, ModelTier, TrustLevel};
+use baybo_model::{ArtifactSource, ModelTier, TrustLevel};
 
 use crate::SubagentProfile;
 use crate::validation::{normalize_line_endings, validate_profile_name, validate_profile_version};

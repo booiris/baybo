@@ -1,9 +1,9 @@
 use async_trait::async_trait;
-use aura_model::{ChannelType, SessionId};
+use baybo_model::{ChannelType, SessionId};
 
 use super::LibsqlPool;
-use aura_store::StorageError;
-use aura_store::channel_session::{ChannelSessionStore, Result};
+use baybo_store::StorageError;
+use baybo_store::channel_session::{ChannelSessionStore, Result};
 
 pub struct LibsqlChannelSessionStore {
     pool: LibsqlPool,

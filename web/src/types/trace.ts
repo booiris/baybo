@@ -1,5 +1,5 @@
 /**
- * TypeScript mirror of the `aura-trace` domain types as they appear on
+ * TypeScript mirror of the `baybo-trace` domain types as they appear on
  * the `GET /v1/traces/{session_id}` wire (untyped JSON on the Rust side
  * by design — see `crates/gateway/src/api/admin/traces.rs`).
  *
@@ -58,11 +58,11 @@ export interface Step {
   outcome: LifecycleState;
 }
 
-// ── Message content (mirrors aura_model::ContentBlock) ────────────────
+// ── Message content (mirrors baybo_model::ContentBlock) ────────────────
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 
-// Provenance of a ChatMessage row (mirrors `aura_model::MessageSource`).
+// Provenance of a ChatMessage row (mirrors `baybo_model::MessageSource`).
 // Several origins ride as a `user` role, so role alone can't tell a genuine
 // prompt from a cron fire or an agent-injected reminder — this distinguishes
 // them. 'user' = human channel input; 'user_interjection' = a human message
@@ -122,7 +122,7 @@ export interface ToolCallOrigin {
 }
 
 /**
- * Mirrors `aura_trace::LlmCallInputs` (`#[serde(untagged)]`). The
+ * Mirrors `baybo_trace::LlmCallInputs` (`#[serde(untagged)]`). The
  * inline array variant matches the long-standing wire shape; the
  * `{ last_ordinal }` object variant is what the per-job trace endpoint
  * returns for spans whose transcript prefix lives in `session_messages`.
@@ -268,10 +268,10 @@ export interface ReplayStep {
   spans: Span[];
 }
 
-// ── Trace overview / per-job split (matches aura_query) ──────────────
+// ── Trace overview / per-job split (matches baybo_query) ──────────────
 
 /**
- * Mirrors `aura_session::StoredMessage` on the wire. Used to hydrate
+ * Mirrors `baybo_session::StoredMessage` on the wire. Used to hydrate
  * `LlmCallInputs::Persisted` slices in the client without the server
  * re-inlining the same prefix into every span.
  */

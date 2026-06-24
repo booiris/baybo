@@ -7,13 +7,13 @@
 //! token-authenticated flow — the gateway publishes a fresh per-start
 //! token to the secret vault under `gateway.tui_token`; the TUI reads
 //! it and presents it on the WS upgrade in the shared
-//! `x-aura-channel-token` header.
+//! `x-baybo-channel-token` header.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use aura_channels::wire::{self, Frame, Message};
-use aura_model::{ChannelType, SessionId};
+use baybo_channels::wire::{self, Frame, Message};
+use baybo_model::{ChannelType, SessionId};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use thiserror::Error;
@@ -24,10 +24,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{WebSocketStream, client_async};
 
 /// HTTP header carrying the channel-listener auth token on the WS
-/// upgrade request. Mirrors `aura_gateway::CHANNEL_TOKEN_HEADER`;
+/// upgrade request. Mirrors `baybo_gateway::CHANNEL_TOKEN_HEADER`;
 /// kept as a plain const so the TUI stays free of a runtime dep on
 /// the gateway crate.
-const CHANNEL_TOKEN_HEADER: &str = "x-aura-channel-token";
+const CHANNEL_TOKEN_HEADER: &str = "x-baybo-channel-token";
 
 type WsStream = WebSocketStream<TcpStream>;
 type WsSink = SplitSink<WsStream, WsMessage>;
@@ -59,7 +59,7 @@ pub enum WsClientError {
 }
 
 /// Post-handshake handle for sending/receiving `Message`s over the
-/// Aura channel WebSocket.
+/// Baybo channel WebSocket.
 ///
 /// Cheap to clone — the underlying sink and source each live behind
 /// an `Arc<Mutex<..>>` so independent send/recv tasks can hold their
@@ -72,7 +72,7 @@ pub struct WsClient {
 
 impl WsClient {
     /// Connect using the bundled-TUI vault-token flow: the handshake
-    /// presents the per-start TUI token in `x-aura-channel-token`, and
+    /// presents the per-start TUI token in `x-baybo-channel-token`, and
     /// the `Register` frame leaves the capability `token` empty because
     /// auth already happened on the upgrade request. `session_id` pins
     /// this TUI instance to a specific session — the gateway routes
@@ -190,7 +190,7 @@ impl WsClient {
         }
     }
 
-    /// Send one message to Aura.
+    /// Send one message to Baybo.
     pub async fn send(&self, msg: Message) -> Result<(), WsClientError> {
         self.send_frame(&Frame::Message(msg)).await
     }
@@ -201,7 +201,7 @@ impl WsClient {
         self.send_frame(frame).await
     }
 
-    /// Await the next raw wire frame from Aura. Exposes the full frame
+    /// Await the next raw wire frame from Baybo. Exposes the full frame
     /// surface (`AnswerDelta`, `Notice`, approval events, …) so streaming and
     /// approval-flow consumers can reconstruct them directly.
     pub async fn recv_any(&self) -> Result<Frame, WsClientError> {

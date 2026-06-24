@@ -1,6 +1,6 @@
 //! Channel auth middleware.
 //!
-//! Single authentication mode — the `x-aura-channel-token` header (or
+//! Single authentication mode — the `x-baybo-channel-token` header (or
 //! `?token=` query for runtimes that can't set custom headers on a WS
 //! upgrade). Every entry in [`ChannelTokenTable`] carries a
 //! [`ClientIdentity`] (pid + label); the middleware looks up the
@@ -11,7 +11,7 @@
 //! The TUI token is minted by the gateway at startup, written to the
 //! secret vault under [`super::token::TUI_TOKEN_VAULT_KEY`], and
 //! registered in the same [`ChannelTokenTable`] with
-//! [`TUI_CLIENT_LABEL`]. The bundled `aura tui` reads it back from
+//! [`TUI_CLIENT_LABEL`]. The bundled `baybo tui` reads it back from
 //! the vault and presents the same hex string. Subprocess sidecars
 //! get their token via env var (see [`crate::spawn`]); each
 //! [`crate::spawn::ChildHandle`] owns the
@@ -126,9 +126,9 @@ where
 /// Middleware: validates the channel token header (or `?token=` query),
 /// stashes [`AuthedClient`] in request extensions, forwards.
 ///
-/// All failure paths log at `debug!` under `aura_gateway::auth::channel`
+/// All failure paths log at `debug!` under `baybo_gateway::auth::channel`
 /// with enough context to diagnose "why 401?" without leaking the
-/// secret. Enable with `RUST_LOG=aura_gateway::auth::channel=debug`.
+/// secret. Enable with `RUST_LOG=baybo_gateway::auth::channel=debug`.
 pub async fn require_channel_auth(
     State(state): State<ChannelAuthState>,
     mut req: Request<Body>,
@@ -177,7 +177,7 @@ pub async fn require_channel_auth(
                 has_tok_query,
                 live_tokens = state.tokens.len(),
                 "channel auth: no credential; rejecting with 401 \
-                 (no x-aura-channel-token header and no ?token= query)",
+                 (no x-baybo-channel-token header and no ?token= query)",
             );
             Err(StatusCode::UNAUTHORIZED)
         }

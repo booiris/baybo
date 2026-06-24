@@ -70,15 +70,15 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aura_llm::{ChatRequest, LlmResponse};
-use aura_model::{BackgroundCompressionPayload, ChatMessage, ContentBlock, Role, SessionId};
-use aura_session::SessionManager;
-use aura_skills::render::{render_skill_block, render_skill_reminder};
-use aura_skills::{
+use baybo_llm::{ChatRequest, LlmResponse};
+use baybo_model::{BackgroundCompressionPayload, ChatMessage, ContentBlock, Role, SessionId};
+use baybo_session::SessionManager;
+use baybo_skills::render::{render_skill_block, render_skill_reminder};
+use baybo_skills::{
     SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry, SkillSummary,
     render_skill_for_slash,
 };
-use aura_trace::{GoalSteeringAudit, LlmCallInputs};
+use baybo_trace::{GoalSteeringAudit, LlmCallInputs};
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
@@ -145,7 +145,7 @@ pub enum CompressionOutcome {
 /// truncate fallback). See [`compressor`] for the flow contract.
 ///
 /// This is the **single owner** of `messages` for the actor handling
-/// one session. `Session` (in `aura-model`) carries only metadata.
+/// one session. `Session` (in `baybo-model`) carries only metadata.
 /// The split that previously had `Session` own `messages` and
 /// `ContextManager` shadow them via a token cache is folded into one
 /// owner here, eliminating the drift-detection logic.
@@ -154,7 +154,7 @@ pub struct ContextManager {
     /// Source of truth for per-session paths the compressor needs:
     /// `summary.md` for the fast-path stage, and the JSONL transcript
     /// referenced from the continuation-summary message.
-    pub(crate) workspace: Arc<aura_workspace::WorkspacePaths>,
+    pub(crate) workspace: Arc<baybo_workspace::WorkspacePaths>,
     /// Tail size for the truncate fallback and the pre-flight gate.
     pub(crate) keep_recent: usize,
     pub(crate) budget: TokenBudget,
@@ -195,7 +195,7 @@ pub struct ContextManager {
     /// [`Self::resolve_system_prompt`] for the seed and re-resolved by
     /// `reseed_system_row` after each compaction, so a source edit (workspace
     /// soul *or* subagent profile) lands on the next compaction.
-    subagent_profile: Option<(Arc<aura_subagent::SubagentRegistry>, String)>,
+    subagent_profile: Option<(Arc<baybo_subagent::SubagentRegistry>, String)>,
     /// Boundary the trigger gate measures from. Set to `messages.len()`
     /// after every compression apply and reconstructed from
     /// `session_summaries.cursor` on cold start.
@@ -254,11 +254,11 @@ pub struct ContextManagerConfig {
     /// Workspace paths handle. Used to resolve `summary.md` for the
     /// fast-path read and the JSONL transcript path referenced from
     /// the continuation-summary message.
-    pub workspace: Arc<aura_workspace::WorkspacePaths>,
+    pub workspace: Arc<baybo_workspace::WorkspacePaths>,
     pub keep_recent: usize,
     /// Fraction of the active model's context window at which the
     /// compression gate trips. Sourced from
-    /// `agent.context.compression_threshold` in `aura.json`. The
+    /// `agent.context.compression_threshold` in `baybo.json`. The
     /// budget's `max_tokens` is installed later via
     /// [`ContextManager::set_active_model_context_window`] once the
     /// owning `AgentLoop` resolves its LLM client.
@@ -273,7 +273,7 @@ pub struct ContextManagerConfig {
     /// workspace soul). The profile *name* is the parent's spawn-time choice;
     /// resolving it to a prompt is context's job, so an edited profile is
     /// picked up like an edited workspace soul.
-    pub subagent_profile: Option<(Arc<aura_subagent::SubagentRegistry>, String)>,
+    pub subagent_profile: Option<(Arc<baybo_subagent::SubagentRegistry>, String)>,
 }
 
 impl ContextManager {
@@ -333,8 +333,8 @@ impl ContextManager {
         let needs_framing = self.messages.iter().any(|m| {
             matches!(
                 m.source(),
-                aura_model::MessageSource::UserInterjection
-                    | aura_model::MessageSource::RecalledMemory
+                baybo_model::MessageSource::UserInterjection
+                    | baybo_model::MessageSource::RecalledMemory
             )
         });
         // The transient task reminder and goal steering are appended at the tail
@@ -361,7 +361,7 @@ impl ContextManager {
     /// the agent loop passes in. An empty `tasks` slice clears it. Never
     /// persisted and never added to `self.messages`, so it survives compaction
     /// for free and keeps the prompt-cache prefix stable.
-    pub fn refresh_task_reminder(&mut self, tasks: &[aura_model::Task]) {
+    pub fn refresh_task_reminder(&mut self, tasks: &[baybo_model::Task]) {
         self.task_reminder = if tasks.is_empty() {
             None
         } else {
@@ -511,14 +511,14 @@ impl ContextManager {
             .all_summaries_sorted()
             .into_iter()
             .filter(|s| {
-                s.agent_invocable && !matches!(s.trust_level, aura_model::TrustLevel::Untrusted)
+                s.agent_invocable && !matches!(s.trust_level, baybo_model::TrustLevel::Untrusted)
             })
             .collect()
     }
 
     /// If the trailing message is a user `/command` whose command matches an
     /// invocable skill, expand it: append that skill's body (via
-    /// `aura_skills::render_skill_for_slash`, `{{session_id}}` substituted) as a
+    /// `baybo_skills::render_skill_for_slash`, `{{session_id}}` substituted) as a
     /// hidden agent-context row (`MessageSource::Agent` — the next LLM turn sees
     /// it, but it isn't shown as a user bubble). No-op when the tail isn't a
     /// matching user `/command`. The appended row is persisted + JSONL-logged
@@ -553,8 +553,8 @@ impl ContextManager {
         let user_text = self
             .messages
             .last()
-            .filter(|m| m.source() == aura_model::MessageSource::User)
-            .map(|m| aura_llm::multimodal::extract_text(&m.content))?;
+            .filter(|m| m.source() == baybo_model::MessageSource::User)
+            .map(|m| baybo_llm::multimodal::extract_text(&m.content))?;
         let (skill_name, _args) =
             detect_slash_invocation(&user_text, &self.invocable_skill_summaries())?;
         let skill = self.skill_registry.get(&skill_name)?;
@@ -579,10 +579,10 @@ impl ContextManager {
         let mut called = scan_skill_calls(messages);
         let summaries = self.invocable_skill_summaries();
         for msg in messages {
-            if msg.source() != aura_model::MessageSource::User {
+            if msg.source() != baybo_model::MessageSource::User {
                 continue;
             }
-            let text = aura_llm::multimodal::extract_text(&msg.content);
+            let text = baybo_llm::multimodal::extract_text(&msg.content);
             if let Some((name, _)) = detect_slash_invocation(&text, &summaries) {
                 push_called_skill(&mut called, &name);
             }
@@ -778,12 +778,12 @@ impl ContextManager {
     /// anyway (`record_call_actual` resets the baseline after the next call).
     /// Everything else is the plain message count.
     fn message_budget_tokens(&self, msg: &ChatMessage) -> usize {
-        let text = aura_llm::multimodal::extract_text(&msg.content);
+        let text = baybo_llm::multimodal::extract_text(&msg.content);
         let framed_text = match msg.source() {
-            aura_model::MessageSource::UserInterjection => {
+            baybo_model::MessageSource::UserInterjection => {
                 crate::prompts::interjection::wrap_interjections(&[text])
             }
-            aura_model::MessageSource::RecalledMemory => {
+            baybo_model::MessageSource::RecalledMemory => {
                 crate::prompts::recalled_memory::wrap_recalled_memories(&[text])
             }
             _ => return self.tokenizer.count_message(msg),
@@ -820,7 +820,7 @@ impl ContextManager {
     /// [`crate::prompts::tool_output`]; this method resolves the spill
     /// location from the manager's own workspace handle. Injection scanning
     /// and the `<tool_output>` wrap stay separate — the caller runs the
-    /// `aura-security` scan and calls
+    /// `baybo-security` scan and calls
     /// [`crate::prompts::tool_output::wrap_tool_output`] with the capped text.
     pub async fn cap_tool_output(&self, content: String) -> String {
         use crate::prompts::tool_output;
@@ -1461,7 +1461,7 @@ pub fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
 /// blocks (images, tool_use, tool_result, thinking) are appended as-is so
 /// signatures, IDs, and modality data are preserved verbatim.
 /// Wire-only pass: collapse each maximal run of consecutive
-/// [`aura_model::MessageSource::UserInterjection`] rows into a single
+/// [`baybo_model::MessageSource::UserInterjection`] rows into a single
 /// `Role::User` message whose text is wrapped in the `<user_interjection>`
 /// steering envelope ([`crate::prompts::interjection`]). Re-derived on every
 /// LLM call from the source flag, so the framing survives compaction/rebuild
@@ -1471,20 +1471,20 @@ pub fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
 fn frame_interjections(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     frame_source_runs(
         messages,
-        aura_model::MessageSource::UserInterjection,
+        baybo_model::MessageSource::UserInterjection,
         crate::prompts::interjection::wrap_interjections,
     )
 }
 
 /// Wire-only twin of [`frame_interjections`] for
-/// [`aura_model::MessageSource::RecalledMemory`] rows: collapses each maximal run
+/// [`baybo_model::MessageSource::RecalledMemory`] rows: collapses each maximal run
 /// into one `Role::User` message wrapped in the `<recalled_memory>` envelope
 /// ([`crate::prompts::recalled_memory`]). Run alongside [`frame_interjections`];
 /// the two passes touch disjoint sources, so order is irrelevant.
 fn frame_recalled_memories(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     frame_source_runs(
         messages,
-        aura_model::MessageSource::RecalledMemory,
+        baybo_model::MessageSource::RecalledMemory,
         crate::prompts::recalled_memory::wrap_recalled_memories,
     )
 }
@@ -1497,7 +1497,7 @@ fn frame_recalled_memories(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 /// the source matched and the envelope applied.
 fn frame_source_runs(
     messages: &[ChatMessage],
-    source: aura_model::MessageSource,
+    source: baybo_model::MessageSource,
     wrap: fn(&[String]) -> String,
 ) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
@@ -1513,7 +1513,7 @@ fn frame_source_runs(
         let mut texts: Vec<String> = Vec::new();
         let mut extra_blocks: Vec<ContentBlock> = Vec::new();
         while i < messages.len() && messages[i].source() == source {
-            let text = aura_llm::multimodal::extract_text(&messages[i].content);
+            let text = baybo_llm::multimodal::extract_text(&messages[i].content);
             if !text.is_empty() {
                 texts.push(text);
             }
@@ -1563,7 +1563,7 @@ fn merge_for_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 #[cfg(test)]
 mod frame_interjections_tests {
     use super::frame_interjections;
-    use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
+    use baybo_model::{BlobRef, ChatMessage, ContentBlock, Role};
 
     fn txt(s: &str) -> Vec<ContentBlock> {
         vec![ContentBlock::Text(s.into())]
@@ -1659,7 +1659,7 @@ mod frame_recalled_memories_tests {
     //! pinning each independently means a refactor to one envelope can't
     //! silently regress the other.
     use super::frame_recalled_memories;
-    use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
+    use baybo_model::{BlobRef, ChatMessage, ContentBlock, Role};
 
     fn txt(s: &str) -> Vec<ContentBlock> {
         vec![ContentBlock::Text(s.into())]
@@ -1758,7 +1758,7 @@ mod frame_recalled_memories_tests {
 #[cfg(test)]
 mod merge_for_llm_tests {
     use super::merge_for_llm;
-    use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
+    use baybo_model::{BlobRef, ChatMessage, ContentBlock, Role};
 
     fn text(role: Role, body: &str) -> ChatMessage {
         let content = vec![ContentBlock::Text(body.into())];
@@ -2041,7 +2041,7 @@ pub(crate) fn estimate_skill_trailer_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ContentBlock, Role};
+    use baybo_model::{ContentBlock, Role};
 
     struct SimpleTokenizer;
 
@@ -2105,14 +2105,14 @@ mod tests {
         SessionId::from("test-session")
     }
 
-    fn test_sessions() -> Arc<aura_session::SessionManager> {
-        let store = Arc::new(aura_session::test_support::MemorySessionStore::new())
-            as Arc<dyn aura_session::SessionStore>;
-        let summary_store = Arc::new(aura_session::test_support::MemorySessionSummaryStore::new())
-            as Arc<dyn aura_session::SessionSummaryStore>;
-        let folder_store = Arc::new(aura_session::test_support::MemorySessionFolderStore::new())
-            as Arc<dyn aura_session::SessionFolderStore>;
-        Arc::new(aura_session::SessionManager::new(
+    fn test_sessions() -> Arc<baybo_session::SessionManager> {
+        let store = Arc::new(baybo_session::test_support::MemorySessionStore::new())
+            as Arc<dyn baybo_session::SessionStore>;
+        let summary_store = Arc::new(baybo_session::test_support::MemorySessionSummaryStore::new())
+            as Arc<dyn baybo_session::SessionSummaryStore>;
+        let folder_store = Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
+            as Arc<dyn baybo_session::SessionFolderStore>;
+        Arc::new(baybo_session::SessionManager::new(
             store,
             summary_store,
             folder_store,
@@ -2122,9 +2122,9 @@ mod tests {
     /// Workspace rooted at a non-existent path so the fast-path read
     /// hits `NotFound` and falls through cleanly. No tempdir to
     /// clean up.
-    fn test_workspace() -> Arc<aura_workspace::WorkspacePaths> {
-        Arc::new(aura_workspace::WorkspacePaths::new(
-            "/nonexistent-aura-test-workspace",
+    fn test_workspace() -> Arc<baybo_workspace::WorkspacePaths> {
+        Arc::new(baybo_workspace::WorkspacePaths::new(
+            "/nonexistent-baybo-test-workspace",
         ))
     }
 
@@ -2357,12 +2357,12 @@ mod tests {
         // A large workspace soul must NOT inflate `after_tokens` and turn a
         // real truncate compaction into a spurious NoSavings.
         let dir = tempfile::tempdir().expect("tempdir");
-        let workspace = Arc::new(aura_workspace::WorkspacePaths::new(
+        let workspace = Arc::new(baybo_workspace::WorkspacePaths::new(
             dir.path().to_path_buf(),
         ));
         // Distinctive + large: swapping it in before the savings gate (the old
         // bug) would exceed the one-message truncate savings and veto the apply.
-        let soul_path = workspace.identity_file(aura_workspace::IdentityKind::Soul);
+        let soul_path = workspace.identity_file(baybo_workspace::IdentityKind::Soul);
         std::fs::create_dir_all(soul_path.parent().expect("profile parent")).expect("profile dir");
         std::fs::write(
             &soul_path,
@@ -2412,23 +2412,23 @@ mod tests {
         // registry by name — at seed and re-resolved on every compaction —
         // NOT from the workspace soul.
         let dir = tempfile::tempdir().expect("tempdir");
-        let workspace = Arc::new(aura_workspace::WorkspacePaths::new(
+        let workspace = Arc::new(baybo_workspace::WorkspacePaths::new(
             dir.path().to_path_buf(),
         ));
         // A workspace soul that must NOT leak into a subagent session.
-        let soul_path = workspace.identity_file(aura_workspace::IdentityKind::Soul);
+        let soul_path = workspace.identity_file(baybo_workspace::IdentityKind::Soul);
         std::fs::create_dir_all(soul_path.parent().expect("profile parent")).expect("profile dir");
         std::fs::write(&soul_path, "WORKSPACE_SOUL_SHOULD_NOT_APPEAR").expect("write soul");
 
-        let registry = Arc::new(aura_subagent::SubagentRegistry::new());
-        registry.register(aura_subagent::SubagentProfile {
+        let registry = Arc::new(baybo_subagent::SubagentRegistry::new());
+        registry.register(baybo_subagent::SubagentProfile {
             name: "test-agent".into(),
             version: "1".into(),
             description: "test".into(),
             system_prompt: "SUBAGENT_PROFILE".into(),
             default_tier: None,
-            source: aura_model::ArtifactSource::Inline,
-            trust_level: aura_model::TrustLevel::Trusted,
+            source: baybo_model::ArtifactSource::Inline,
+            trust_level: baybo_model::TrustLevel::Trusted,
             source_path: None,
         });
 
@@ -2559,13 +2559,13 @@ mod tests {
         assert_eq!(ctx.count_tokens(), 5_000 + expected_delta);
     }
 
-    fn make_task(subject: &str) -> aura_model::Task {
+    fn make_task(subject: &str) -> baybo_model::Task {
         let now = chrono::Utc::now();
-        aura_model::Task {
-            id: aura_model::TaskId::new(),
+        baybo_model::Task {
+            id: baybo_model::TaskId::new(),
             subject: subject.into(),
             description: "body".into(),
-            status: aura_model::TaskStatus::Pending,
+            status: baybo_model::TaskStatus::Pending,
             depends_on: Vec::new(),
             created_at: now,
             updated_at: now,
@@ -2764,8 +2764,8 @@ mod tests {
 
     // ---------- Skill-trailer tests ----------
 
-    use aura_model::{ArtifactSource, TrustLevel};
-    use aura_skills::{SkillDefinition, SkillRequirements};
+    use baybo_model::{ArtifactSource, TrustLevel};
+    use baybo_skills::{SkillDefinition, SkillRequirements};
 
     /// Build a minimally-populated `SkillDefinition` so tests can
     /// register skills with a chosen body — the registry's renderer
@@ -2949,7 +2949,7 @@ mod tests {
         // appended the skill body as a hidden agent-context row after `/wx`
         assert_eq!(ctx.message_count(), 2);
         let appended = ctx.messages().last().expect("appended row");
-        assert_eq!(appended.source(), aura_model::MessageSource::Agent);
+        assert_eq!(appended.source(), baybo_model::MessageSource::Agent);
         let ContentBlock::Text(body) = &appended.content[0] else {
             panic!("expected a text block");
         };

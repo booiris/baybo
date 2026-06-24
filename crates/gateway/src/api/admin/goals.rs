@@ -1,6 +1,6 @@
 //! `/v1/goals` + per-session goal read/pause/clear endpoints.
 //!
-//! Pause/clear write the store via [`aura_goal::GoalService`]; the running actor
+//! Pause/clear write the store via [`baybo_goal::GoalService`]; the running actor
 //! reads live goal status at every turn boundary, so the store write is honoured
 //! on the next boundary without an actor round-trip. Resume is deliberately not
 //! an operator control: it must re-arm the continuation loop, which only the
@@ -13,8 +13,8 @@ use axum::extract::{Path, State};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use aura_goal::{GoalService, PauseOutcome};
-use aura_model::SessionId;
+use baybo_goal::{GoalService, PauseOutcome};
+use baybo_model::SessionId;
 
 use crate::api::dto::{ErrorBody, GoalItem, GoalsResponse, SessionGoalResponse};
 use crate::server::AdminState;

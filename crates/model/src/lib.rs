@@ -22,7 +22,7 @@ pub use control_event::{ControlEvent, ControlEventKind};
 pub use cost::{CallReason, CostRecord, CostSummary, TimeRange};
 pub use cron::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
 pub use external_agent::{
-    AURA_BACKEND_TAG, ExternalAgentKind, SubagentBackend, SubagentBackendKind, SubagentBackendTag,
+    BAYBO_BACKEND_TAG, ExternalAgentKind, SubagentBackend, SubagentBackendKind, SubagentBackendTag,
 };
 pub use folder::{FolderId, FolderSummary, MAX_FOLDER_NAME_LEN};
 pub use goal::{

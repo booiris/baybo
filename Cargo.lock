@@ -178,885 +178,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "aura"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-agent",
- "aura-channels",
- "aura-cli",
- "aura-config",
- "aura-context",
- "aura-cost",
- "aura-cron",
- "aura-gateway",
- "aura-goal",
- "aura-janitor",
- "aura-job",
- "aura-llm",
- "aura-memory",
- "aura-model",
- "aura-sandbox",
- "aura-security",
- "aura-setup",
- "aura-skills",
- "aura-skills-assessor",
- "aura-storage",
- "aura-store",
- "aura-subagent",
- "aura-task",
- "aura-tools",
- "aura-trace",
- "aura-tui",
- "aura-workspace",
- "chrono",
- "clap",
- "futures",
- "hex",
- "parking_lot",
- "regex",
- "reqwest 0.13.2",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "aura-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "aura-channels",
- "aura-context",
- "aura-cost",
- "aura-cron",
- "aura-goal",
- "aura-job",
- "aura-llm",
- "aura-memory",
- "aura-model",
- "aura-sandbox",
- "aura-security",
- "aura-session",
- "aura-skills",
- "aura-skills-assessor",
- "aura-storage",
- "aura-store",
- "aura-subagent",
- "aura-tools",
- "aura-trace",
- "aura-workspace",
- "chrono",
- "chrono-tz",
- "dashmap",
- "futures",
- "hex",
- "libc",
- "parking_lot",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "aura-bench-memory"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aura-memory",
- "chrono",
- "clap",
- "futures",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "aura-bench-swe"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "aura-bench-web"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "clap",
- "http-body-util",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
- "ts-rs",
- "zstd",
-]
-
-[[package]]
-name = "aura-channels"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-model",
- "aura-tools",
- "chrono",
- "dashmap",
- "parking_lot",
- "rmp-serde",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "ts-rs",
- "uuid",
-]
-
-[[package]]
-name = "aura-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-agent",
- "aura-channels",
- "aura-config",
- "aura-context",
- "aura-cost",
- "aura-cron",
- "aura-gateway",
- "aura-job",
- "aura-llm",
- "aura-memory",
- "aura-model",
- "aura-query",
- "aura-security",
- "aura-session",
- "aura-setup",
- "aura-skills",
- "aura-skills-assessor",
- "aura-storage",
- "aura-store",
- "aura-tools",
- "aura-trace",
- "aura-tui",
- "aura-workspace",
- "chrono",
- "clap",
- "clap_complete",
- "crossterm",
- "futures",
- "libc",
- "parking_lot",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "shell-words",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "aura-config"
-version = "0.1.0"
-dependencies = [
- "aura-model",
- "aura-tools",
- "aura-workspace",
- "parking_lot",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "aura-context"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-llm",
- "aura-model",
- "aura-session",
- "aura-skills",
- "aura-storage",
- "aura-subagent",
- "aura-tools",
- "aura-trace",
- "aura-workspace",
- "chrono",
- "hex",
- "parking_lot",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tiktoken-rs",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "aura-cost"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-llm",
- "aura-model",
- "aura-store",
- "chrono",
- "dashmap",
- "parking_lot",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "aura-cron"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-model",
- "aura-store",
- "aura-tools",
- "chrono",
- "chrono-tz",
- "cron",
- "parking_lot",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "aura-gateway"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "aura-agent",
- "aura-channels",
- "aura-config",
- "aura-context",
- "aura-cost",
- "aura-cron",
- "aura-gateway",
- "aura-goal",
- "aura-job",
- "aura-llm",
- "aura-model",
- "aura-pairing",
- "aura-query",
- "aura-security",
- "aura-session",
- "aura-skills",
- "aura-storage",
- "aura-store",
- "aura-tools",
- "aura-trace",
- "aura-workspace",
- "axum",
- "bytes",
- "chrono",
- "dashmap",
- "futures",
- "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "parking_lot",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-tungstenite 0.24.0",
- "tokio-util",
- "tower",
- "tower-http",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "utoipa",
- "utoipa-axum",
- "uuid",
- "zstd",
-]
-
-[[package]]
-name = "aura-goal"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "aura-model",
- "aura-store",
- "aura-tools",
- "aura-workspace",
- "chrono",
- "parking_lot",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "aura-integration-tests"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-agent",
- "aura-channels",
- "aura-cli",
- "aura-context",
- "aura-cost",
- "aura-gateway",
- "aura-goal",
- "aura-job",
- "aura-llm",
- "aura-memory",
- "aura-model",
- "aura-security",
- "aura-session",
- "aura-setup",
- "aura-skills",
- "aura-storage",
- "aura-store",
- "aura-subagent",
- "aura-task",
- "aura-tools",
- "aura-trace",
- "aura-workspace",
- "chrono",
- "futures",
- "parking_lot",
- "regex",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "aura-janitor"
-version = "0.1.0"
-dependencies = [
- "aura-model",
- "aura-store",
- "aura-workspace",
- "chrono",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "aura-job"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-model",
- "aura-store",
- "chrono",
- "parking_lot",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "aura-llm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "aura-model",
- "aura-security",
- "aura-storage",
- "aura-store",
- "base64",
- "bytes",
- "chrono",
- "futures",
- "parking_lot",
- "rand 0.10.1",
- "reqwest 0.13.2",
- "rig-core",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "aura-memory"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-config",
- "aura-llm",
- "aura-model",
- "aura-security",
- "aura-tools",
- "aura-trace",
- "aura-workspace",
- "axum",
- "hyper",
- "hyper-util",
- "parking_lot",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "aura-model"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "chrono-tz",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "ts-rs",
- "ulid",
- "uuid",
-]
-
-[[package]]
-name = "aura-pairing"
-version = "0.1.0"
-dependencies = [
- "aura-model",
- "aura-store",
- "chrono",
- "rand 0.10.1",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "aura-query"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "aura-cost",
- "aura-job",
- "aura-model",
- "aura-session",
- "aura-storage",
- "aura-store",
- "aura-trace",
- "chrono",
- "parking_lot",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "aura-sandbox"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "libc",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "aura-security"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "aho-corasick",
- "anyhow",
- "async-trait",
- "aura-model",
- "aura-security",
- "aura-store",
- "chrono",
- "hex",
- "hkdf",
- "hmac",
- "parking_lot",
- "rand 0.10.1",
- "regex",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "aura-session"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-model",
- "aura-store",
- "chrono",
- "futures",
- "parking_lot",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "aura-setup"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aura-agent",
- "aura-channels",
- "aura-config",
- "aura-gateway",
- "aura-llm",
- "aura-model",
- "aura-security",
- "aura-setup",
- "aura-storage",
- "aura-store",
- "aura-term-harness",
- "aura-workspace",
- "crossterm",
- "hex",
- "libc",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "aura-skills"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "aura-model",
- "aura-tools",
- "aura-workspace",
- "dashmap",
- "parking_lot",
- "regex",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "aura-skills-assessor"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "aura-llm",
- "aura-model",
- "aura-skills",
- "aura-store",
- "chrono",
- "hex",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "aura-storage"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-job",
- "aura-model",
- "aura-store",
- "aura-trace",
- "bytes",
- "chrono",
- "futures",
- "hex",
- "libc",
- "libsql",
- "parking_lot",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "aura-store"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-model",
- "bytes",
- "chrono",
- "futures",
- "serde",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "aura-subagent"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "aura-model",
- "aura-session",
- "aura-tools",
- "aura-workspace",
- "chrono",
- "dashmap",
- "parking_lot",
- "regex",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "aura-task"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "aura-model",
- "aura-store",
- "aura-tools",
- "aura-workspace",
- "chrono",
- "parking_lot",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "aura-term-harness"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "aura-tools"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-llm",
- "aura-model",
- "aura-security",
- "aura-session",
- "aura-storage",
- "aura-store",
- "aura-trace",
- "aura-workspace",
- "axum",
- "base64",
- "bytes",
- "chrono",
- "dashmap",
- "dom_smoothie",
- "futures",
- "glob",
- "hex",
- "htmd",
- "iana-time-zone",
- "libc",
- "oauth2",
- "open",
- "parking_lot",
- "rand 0.10.1",
- "reqwest 0.13.2",
- "rmcp",
- "serde",
- "serde_json",
- "sha2",
- "shell-words",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "ts-rs",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "aura-trace"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-job",
- "aura-model",
- "aura-store",
- "chrono",
- "parking_lot",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "aura-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aura-channels",
- "aura-model",
- "aura-term-harness",
- "aura-tools",
- "aura-tui",
- "chrono",
- "crossterm",
- "futures",
- "parking_lot",
- "ratatui",
- "serde",
- "shell-words",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-tungstenite 0.24.0",
- "tracing",
- "unicode-width",
- "uuid",
-]
-
-[[package]]
-name = "aura-workspace"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "tokio",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1144,6 +265,885 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "baybo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-agent",
+ "baybo-channels",
+ "baybo-cli",
+ "baybo-config",
+ "baybo-context",
+ "baybo-cost",
+ "baybo-cron",
+ "baybo-gateway",
+ "baybo-goal",
+ "baybo-janitor",
+ "baybo-job",
+ "baybo-llm",
+ "baybo-memory",
+ "baybo-model",
+ "baybo-sandbox",
+ "baybo-security",
+ "baybo-setup",
+ "baybo-skills",
+ "baybo-skills-assessor",
+ "baybo-storage",
+ "baybo-store",
+ "baybo-subagent",
+ "baybo-task",
+ "baybo-tools",
+ "baybo-trace",
+ "baybo-tui",
+ "baybo-workspace",
+ "chrono",
+ "clap",
+ "futures",
+ "hex",
+ "parking_lot",
+ "regex",
+ "reqwest 0.13.2",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "baybo-channels",
+ "baybo-context",
+ "baybo-cost",
+ "baybo-cron",
+ "baybo-goal",
+ "baybo-job",
+ "baybo-llm",
+ "baybo-memory",
+ "baybo-model",
+ "baybo-sandbox",
+ "baybo-security",
+ "baybo-session",
+ "baybo-skills",
+ "baybo-skills-assessor",
+ "baybo-storage",
+ "baybo-store",
+ "baybo-subagent",
+ "baybo-tools",
+ "baybo-trace",
+ "baybo-workspace",
+ "chrono",
+ "chrono-tz",
+ "dashmap",
+ "futures",
+ "hex",
+ "libc",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-bench-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "baybo-memory",
+ "chrono",
+ "clap",
+ "futures",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-bench-swe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-bench-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "ts-rs",
+ "zstd",
+]
+
+[[package]]
+name = "baybo-channels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-model",
+ "baybo-tools",
+ "chrono",
+ "dashmap",
+ "parking_lot",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "ts-rs",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-agent",
+ "baybo-channels",
+ "baybo-config",
+ "baybo-context",
+ "baybo-cost",
+ "baybo-cron",
+ "baybo-gateway",
+ "baybo-job",
+ "baybo-llm",
+ "baybo-memory",
+ "baybo-model",
+ "baybo-query",
+ "baybo-security",
+ "baybo-session",
+ "baybo-setup",
+ "baybo-skills",
+ "baybo-skills-assessor",
+ "baybo-storage",
+ "baybo-store",
+ "baybo-tools",
+ "baybo-trace",
+ "baybo-tui",
+ "baybo-workspace",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "crossterm",
+ "futures",
+ "libc",
+ "parking_lot",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "baybo-config"
+version = "0.1.0"
+dependencies = [
+ "baybo-model",
+ "baybo-tools",
+ "baybo-workspace",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "baybo-context"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-llm",
+ "baybo-model",
+ "baybo-session",
+ "baybo-skills",
+ "baybo-storage",
+ "baybo-subagent",
+ "baybo-tools",
+ "baybo-trace",
+ "baybo-workspace",
+ "chrono",
+ "hex",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tiktoken-rs",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-cost"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-llm",
+ "baybo-model",
+ "baybo-store",
+ "chrono",
+ "dashmap",
+ "parking_lot",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "baybo-cron"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-model",
+ "baybo-store",
+ "baybo-tools",
+ "chrono",
+ "chrono-tz",
+ "cron",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "baybo-agent",
+ "baybo-channels",
+ "baybo-config",
+ "baybo-context",
+ "baybo-cost",
+ "baybo-cron",
+ "baybo-gateway",
+ "baybo-goal",
+ "baybo-job",
+ "baybo-llm",
+ "baybo-model",
+ "baybo-pairing",
+ "baybo-query",
+ "baybo-security",
+ "baybo-session",
+ "baybo-skills",
+ "baybo-storage",
+ "baybo-store",
+ "baybo-tools",
+ "baybo-trace",
+ "baybo-workspace",
+ "bytes",
+ "chrono",
+ "dashmap",
+ "futures",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "parking_lot",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.24.0",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "utoipa",
+ "utoipa-axum",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
+name = "baybo-goal"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "baybo-model",
+ "baybo-store",
+ "baybo-tools",
+ "baybo-workspace",
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "baybo-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-agent",
+ "baybo-channels",
+ "baybo-cli",
+ "baybo-context",
+ "baybo-cost",
+ "baybo-gateway",
+ "baybo-goal",
+ "baybo-job",
+ "baybo-llm",
+ "baybo-memory",
+ "baybo-model",
+ "baybo-security",
+ "baybo-session",
+ "baybo-setup",
+ "baybo-skills",
+ "baybo-storage",
+ "baybo-store",
+ "baybo-subagent",
+ "baybo-task",
+ "baybo-tools",
+ "baybo-trace",
+ "baybo-workspace",
+ "chrono",
+ "futures",
+ "parking_lot",
+ "regex",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "baybo-janitor"
+version = "0.1.0"
+dependencies = [
+ "baybo-model",
+ "baybo-store",
+ "baybo-workspace",
+ "chrono",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-job"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-model",
+ "baybo-store",
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "baybo-llm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "base64",
+ "baybo-model",
+ "baybo-security",
+ "baybo-storage",
+ "baybo-store",
+ "bytes",
+ "chrono",
+ "futures",
+ "parking_lot",
+ "rand 0.10.1",
+ "reqwest 0.13.2",
+ "rig-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "baybo-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "baybo-config",
+ "baybo-llm",
+ "baybo-model",
+ "baybo-security",
+ "baybo-tools",
+ "baybo-trace",
+ "baybo-workspace",
+ "hyper",
+ "hyper-util",
+ "parking_lot",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-model"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ts-rs",
+ "ulid",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-pairing"
+version = "0.1.0"
+dependencies = [
+ "baybo-model",
+ "baybo-store",
+ "chrono",
+ "rand 0.10.1",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "baybo-query"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "baybo-cost",
+ "baybo-job",
+ "baybo-model",
+ "baybo-session",
+ "baybo-storage",
+ "baybo-store",
+ "baybo-trace",
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "baybo-sandbox"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "baybo-security"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "aho-corasick",
+ "anyhow",
+ "async-trait",
+ "baybo-model",
+ "baybo-security",
+ "baybo-store",
+ "chrono",
+ "hex",
+ "hkdf",
+ "hmac",
+ "parking_lot",
+ "rand 0.10.1",
+ "regex",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-model",
+ "baybo-store",
+ "chrono",
+ "futures",
+ "parking_lot",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-setup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "baybo-agent",
+ "baybo-channels",
+ "baybo-config",
+ "baybo-gateway",
+ "baybo-llm",
+ "baybo-model",
+ "baybo-security",
+ "baybo-setup",
+ "baybo-storage",
+ "baybo-store",
+ "baybo-term-harness",
+ "baybo-workspace",
+ "crossterm",
+ "hex",
+ "libc",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "baybo-skills"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "baybo-model",
+ "baybo-tools",
+ "baybo-workspace",
+ "dashmap",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "baybo-skills-assessor"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "baybo-llm",
+ "baybo-model",
+ "baybo-skills",
+ "baybo-store",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "baybo-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-job",
+ "baybo-model",
+ "baybo-store",
+ "baybo-trace",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "libc",
+ "libsql",
+ "parking_lot",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "baybo-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-model",
+ "bytes",
+ "chrono",
+ "futures",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "baybo-subagent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "baybo-model",
+ "baybo-session",
+ "baybo-tools",
+ "baybo-workspace",
+ "chrono",
+ "dashmap",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "baybo-task"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "baybo-model",
+ "baybo-store",
+ "baybo-tools",
+ "baybo-workspace",
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "baybo-term-harness"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "baybo-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "baybo-llm",
+ "baybo-model",
+ "baybo-security",
+ "baybo-session",
+ "baybo-storage",
+ "baybo-store",
+ "baybo-trace",
+ "baybo-workspace",
+ "bytes",
+ "chrono",
+ "dashmap",
+ "dom_smoothie",
+ "futures",
+ "glob",
+ "hex",
+ "htmd",
+ "iana-time-zone",
+ "libc",
+ "oauth2",
+ "open",
+ "parking_lot",
+ "rand 0.10.1",
+ "reqwest 0.13.2",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shell-words",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ts-rs",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-trace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-job",
+ "baybo-model",
+ "baybo-store",
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "baybo-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "baybo-channels",
+ "baybo-model",
+ "baybo-term-harness",
+ "baybo-tools",
+ "baybo-tui",
+ "chrono",
+ "crossterm",
+ "futures",
+ "parking_lot",
+ "ratatui",
+ "serde",
+ "shell-words",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "unicode-width",
+ "uuid",
+]
+
+[[package]]
+name = "baybo-workspace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+]
 
 [[package]]
 name = "bindgen"

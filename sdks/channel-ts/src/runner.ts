@@ -38,10 +38,10 @@ export async function runChannel(
   opts: RunOptions = {},
 ): Promise<void> {
   const wsUrl = opts.wsUrl ?? deriveWsUrl();
-  const token = opts.token ?? process.env["AURA_CHANNEL_TOKEN"];
+  const token = opts.token ?? process.env["BAYBO_CHANNEL_TOKEN"];
   if (!token) {
     throw new RunnerError(
-      "missing token: pass opts.token or set AURA_CHANNEL_TOKEN",
+      "missing token: pass opts.token or set BAYBO_CHANNEL_TOKEN",
       "config",
     );
   }
@@ -234,10 +234,10 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function deriveWsUrl(): string {
-  const url = process.env["AURA_CHANNEL_URL"];
+  const url = process.env["BAYBO_CHANNEL_URL"];
   if (!url) {
     throw new RunnerError(
-      "missing connection target: pass opts.wsUrl or set AURA_CHANNEL_URL",
+      "missing connection target: pass opts.wsUrl or set BAYBO_CHANNEL_URL",
       "config",
     );
   }
@@ -794,7 +794,7 @@ function dispatchFrame(
 
 /**
  * Run a bot-control hook and encode a `BotStatus` ack on the WS.
- * Errors thrown by the hook become `ok: false` acks so aura always
+ * Errors thrown by the hook become `ok: false` acks so baybo always
  * hears back about every `Start`/`StopBot` it dispatched. A sidecar
  * that doesn't implement the hook at all acks with `ok: false` and a
  * "not supported" message so the admin dashboard surfaces the gap

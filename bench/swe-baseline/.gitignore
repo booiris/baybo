@@ -3,7 +3,7 @@
 #              the swebench harness report (<model>.<run_id>.json) + its logs/
 #   results/ — the shaped per-run results-baseline-<run_id>.json report
 #   mini-config/ — scratch MSWEA global config dir (isolates from host state)
-#   _compare/ — generated aura-vs-mini side-by-side compare.html (compare_arms.py)
+#   _compare/ — generated baybo-vs-mini side-by-side compare.html (compare_arms.py)
 /runs/
 /results/
 /mini-config/

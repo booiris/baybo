@@ -1,6 +1,6 @@
 //! In-process config hot-reload orchestrator.
 //!
-//! Implements [`aura_gateway::ConfigReloader`]. Lives in the bin crate
+//! Implements [`baybo_gateway::ConfigReloader`]. Lives in the bin crate
 //! because rebuilding the LLM pool needs the application boot layer
 //! ([`crate::boot::build_llm_client_for_entry`]). A two-phase
 //! prepare→commit keeps the swap atomic: the fallible pool rebuild
@@ -13,16 +13,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_agent::router::LiveRateLimit;
-use aura_agent::service::ShutdownSignal;
-use aura_agent::{LlmClientPool, LlmPoolHandle};
-use aura_config::{AuraConfig, ConfigHandle, hot_reload_diff};
-use aura_cost::{CostManager, SpendingLimits, cost_hooks};
-use aura_gateway::{ConfigReloader, ReloadError, ReloadOutcome};
-use aura_llm::{BillableLlm, LlmProviderRegistry, ModelPricing};
-use aura_model::LlmEntryName;
-use aura_security::SecretVault;
-use aura_store::BlobStore;
+use baybo_agent::router::LiveRateLimit;
+use baybo_agent::service::ShutdownSignal;
+use baybo_agent::{LlmClientPool, LlmPoolHandle};
+use baybo_config::{BayboConfig, ConfigHandle, hot_reload_diff};
+use baybo_cost::{CostManager, SpendingLimits, cost_hooks};
+use baybo_gateway::{ConfigReloader, ReloadError, ReloadOutcome};
+use baybo_llm::{BillableLlm, LlmProviderRegistry, ModelPricing};
+use baybo_model::LlmEntryName;
+use baybo_security::SecretVault;
+use baybo_store::BlobStore;
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -35,7 +35,7 @@ use crate::boot;
 /// non-default failure is dropped with a `warn!` and its name returned
 /// in the second tuple element.
 pub(crate) async fn build_pool_clients(
-    config: &AuraConfig,
+    config: &BayboConfig,
     registry: &LlmProviderRegistry,
     blob: Arc<dyn BlobStore>,
     vault: Arc<SecretVault>,
@@ -87,7 +87,7 @@ pub(crate) async fn build_pool_clients(
 
 /// Pricing overlay (`model id → pricing`) harvested from built clients,
 /// keyed by `model_info.id` to match the cost lookup in
-/// `aura_agent`'s `billed_chat`.
+/// `baybo_agent`'s `billed_chat`.
 pub(crate) fn pricing_overlay(
     clients: &HashMap<LlmEntryName, Arc<BillableLlm>>,
 ) -> HashMap<String, ModelPricing> {
@@ -101,7 +101,7 @@ pub(crate) fn pricing_overlay(
 }
 
 /// `(provider, model)` pairs for the OpenRouter live-pricing refresh.
-pub(crate) fn refresh_pairs(config: &AuraConfig) -> Vec<(String, String)> {
+pub(crate) fn refresh_pairs(config: &BayboConfig) -> Vec<(String, String)> {
     config
         .llm
         .iter()
@@ -117,7 +117,7 @@ pub(crate) fn refresh_pairs(config: &AuraConfig) -> Vec<(String, String)> {
 pub(crate) fn spawn_pricing_refresh(
     cost_manager: &Arc<CostManager>,
     pairs: Vec<(String, String)>,
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
     shutdown: &ShutdownSignal,
 ) -> CancellationToken {
     let token = CancellationToken::new();
@@ -137,14 +137,14 @@ pub(crate) fn spawn_pricing_refresh(
                 .iter()
                 .map(|(p, m)| (p.as_str(), m.as_str()))
                 .collect();
-            let overlay = aura_llm::openrouter::fetch_overlay_for(&entries, proxy.as_ref()).await;
+            let overlay = baybo_llm::openrouter::fetch_overlay_for(&entries, proxy.as_ref()).await;
             let pricings = overlay
                 .into_iter()
                 .map(|(model, (pricing, _caps))| (model, pricing))
                 .collect();
             cm.merge_pricings(pricings);
             tokio::select! {
-                _ = tokio::time::sleep(aura_llm::openrouter::REFRESH_INTERVAL) => {}
+                _ = tokio::time::sleep(baybo_llm::openrouter::REFRESH_INTERVAL) => {}
                 _ = task_token.cancelled() => break,
                 _ = shutdown.wait() => break,
             }
@@ -165,7 +165,7 @@ pub(crate) struct LlmReloader {
     /// Egress proxy for the pricing-refresh loop. Fixed at boot — `proxy`
     /// is not hot-reloadable (a change rejects the reload), so the reloader
     /// keeps the boot value across pool swaps.
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
     refresh_cancel: Mutex<CancellationToken>,
 }
 
@@ -187,7 +187,7 @@ impl LlmReloader {
         vault: Arc<SecretVault>,
         shutdown: ShutdownSignal,
         initial_pairs: Vec<(String, String)>,
-        proxy: Option<aura_security::http::ProxySettings>,
+        proxy: Option<baybo_security::http::ProxySettings>,
     ) -> Self {
         let token = spawn_pricing_refresh(&cost_manager, initial_pairs, proxy.clone(), &shutdown);
         Self {
@@ -203,7 +203,7 @@ impl LlmReloader {
 
     /// Fallible: rebuild the pool from the new config. Aborts the whole
     /// reload if the default entry fails to build.
-    async fn prepare(&self, new: &AuraConfig) -> Result<PreparedLlm, String> {
+    async fn prepare(&self, new: &BayboConfig) -> Result<PreparedLlm, String> {
         let registry = LlmProviderRegistry::with_default_providers();
         let (clients, dropped) = build_pool_clients(
             new,
@@ -279,7 +279,7 @@ impl CostReloader {
         }
     }
 
-    fn prepare(&self, new: &AuraConfig) -> PreparedCost {
+    fn prepare(&self, new: &BayboConfig) -> PreparedCost {
         PreparedCost {
             limits: SpendingLimits {
                 daily_usd: new.cost.spending_limits.daily_usd,
@@ -307,7 +307,7 @@ pub struct RuntimeConfigReloader {
     cost: CostReloader,
     /// Shared Bash sandbox mode; a hot reload swaps it (see `commit` below) so
     /// running `BashTool`s pick up the new isolation + description live.
-    sandbox_mode: Arc<aura_tools::builtin::LiveSandboxMode>,
+    sandbox_mode: Arc<baybo_tools::builtin::LiveSandboxMode>,
 }
 
 impl RuntimeConfigReloader {
@@ -316,7 +316,7 @@ impl RuntimeConfigReloader {
         handle: ConfigHandle,
         llm: LlmReloader,
         cost: CostReloader,
-        sandbox_mode: Arc<aura_tools::builtin::LiveSandboxMode>,
+        sandbox_mode: Arc<baybo_tools::builtin::LiveSandboxMode>,
     ) -> Self {
         Self {
             config_path,
@@ -337,7 +337,7 @@ impl ConfigReloader for RuntimeConfigReloader {
         let _guard = self.reload_lock.lock().await;
 
         let new = Arc::new(
-            AuraConfig::load_from_file(path)
+            BayboConfig::load_from_file(path)
                 .await
                 .map_err(|e| ReloadError::Config(e.to_string()))?,
         );
@@ -395,7 +395,7 @@ impl ConfigReloader for RuntimeConfigReloader {
         Ok(outcome)
     }
 
-    async fn dry_run(&self, candidate: &AuraConfig) -> Result<(), ReloadError> {
+    async fn dry_run(&self, candidate: &BayboConfig) -> Result<(), ReloadError> {
         // Build the candidate's pool to confirm it's buildable, then discard
         // it (no swap, no pricing reseed, no refresh spawn). Serialized
         // against real reloads so a concurrent swap can't interleave.

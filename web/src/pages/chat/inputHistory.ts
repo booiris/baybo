@@ -11,7 +11,7 @@ import { useCallback, useMemo, useRef } from 'react';
 // `HISTORY_CAP` entries.
 
 export const HISTORY_CAP = 500;
-export const HISTORY_KEY = 'aura.inputHistory';
+export const HISTORY_KEY = 'baybo.inputHistory';
 
 /** Append `line` to the ring, mirroring `App::remember`: trim, drop a
  *  consecutive duplicate of the newest entry, and cap to the most recent

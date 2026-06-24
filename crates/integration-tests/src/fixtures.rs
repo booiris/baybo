@@ -2,16 +2,16 @@
 
 use std::sync::Arc;
 
-use aura_agent::SecurityGateway;
-use aura_model::{ChannelType, Session, SessionId, SessionState, TriggerSource, User};
-use aura_security::test_support::MemorySecretStore;
-use aura_security::{EncryptionKey, LeakDetector, SecretVault};
+use baybo_agent::SecurityGateway;
+use baybo_model::{ChannelType, Session, SessionId, SessionState, TriggerSource, User};
+use baybo_security::test_support::MemorySecretStore;
+use baybo_security::{EncryptionKey, LeakDetector, SecretVault};
 use chrono::Utc;
 
 /// Stable 32-byte key used by every fixture so placeholder hex values
 /// stay reproducible across runs and across test binaries.
 pub fn master_key_for_tests() -> EncryptionKey {
-    EncryptionKey::new(b"aura-it-master-key-32-bytes!!!!!".to_vec())
+    EncryptionKey::new(b"baybo-it-master-key-32-bytes!!!!".to_vec())
         .expect("32-byte test master key")
 }
 
@@ -27,7 +27,7 @@ pub fn gateway_with_memory_vault() -> (
     let store = Arc::new(MemorySecretStore::new());
     let vault = Arc::new(SecretVault::new(
         master_key_for_tests(),
-        store.clone() as Arc<dyn aura_store::SecretStore>,
+        store.clone() as Arc<dyn baybo_store::SecretStore>,
     ));
     let gateway = Arc::new(SecurityGateway::new(detector, vault.clone()));
     (gateway, store, vault)
@@ -38,7 +38,7 @@ pub fn gateway_with_memory_vault() -> (
 /// Defaults: id `"sess-it"`, user `"user-it"` on `ChannelType::tui()`,
 /// `created_at == last_active == Utc::now()`, default `SessionState`.
 /// Override only what the test cares about. Conversation transcripts
-/// now live on `aura_context::ContextManager`; tests that need
+/// now live on `baybo_context::ContextManager`; tests that need
 /// pre-seeded messages should call `ContextManager::restore_messages`
 /// separately.
 pub struct SessionBuilder {

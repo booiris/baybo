@@ -1,6 +1,6 @@
 //! Domain types for external-agent-backed subagents — i.e. sub-agents
 //! whose work is delegated to a subprocess (or other out-of-process
-//! driver) instead of running on an in-process aura `AgentActor`.
+//! driver) instead of running on an in-process baybo `AgentActor`.
 //!
 //! External agents are request-response: one task in, one final result
 //! out (their internal tool loop is invisible to the parent).
@@ -56,7 +56,7 @@ impl ExternalAgentKind {
 
 /// Which backend the spawn router should use for a `SubagentSpawnRequest`.
 ///
-/// `Aura` is the default and matches today's behaviour: spawn a full
+/// `Baybo` is the default and matches today's behaviour: spawn a full
 /// in-process `AgentActor` (multi-turn, transcript, skills, tools).
 ///
 /// `External` is one-shot and routes to the matching `ExternalAgent`
@@ -66,7 +66,7 @@ impl ExternalAgentKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SubagentBackend {
     #[default]
-    Aura,
+    Baybo,
     External {
         external_kind: ExternalAgentKind,
     },
@@ -79,7 +79,7 @@ impl SubagentBackend {
     /// router after the child Session exists.
     pub fn kind(&self) -> SubagentBackendKind {
         match self {
-            Self::Aura => SubagentBackendKind::Aura,
+            Self::Baybo => SubagentBackendKind::Baybo,
             Self::External { external_kind } => SubagentBackendKind::External(*external_kind),
         }
     }
@@ -98,7 +98,7 @@ impl SubagentBackend {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SubagentBackendTag {
-    Aura,
+    Baybo,
     External {
         external_kind: ExternalAgentKind,
         workspace_dir: String,
@@ -115,21 +115,21 @@ pub enum SubagentBackendTag {
 /// (or relevant) at that call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentBackendKind {
-    Aura,
+    Baybo,
     External(ExternalAgentKind),
 }
 
-/// Stable string used for the `aura` backend tag wherever the spawn
+/// Stable string used for the `baybo` backend tag wherever the spawn
 /// protocol's `backend` field is parsed/rendered (spawn_subagent tool
 /// schema, error messages, etc.).
-pub const AURA_BACKEND_TAG: &str = "aura";
+pub const BAYBO_BACKEND_TAG: &str = "baybo";
 
 impl SubagentBackendKind {
     /// Short label used in error messages and the spawn protocol's
     /// `backend` field. Matches the JSON schema's enum values.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Aura => AURA_BACKEND_TAG,
+            Self::Baybo => BAYBO_BACKEND_TAG,
             Self::External(k) => k.as_str(),
         }
     }
@@ -140,7 +140,7 @@ impl SubagentBackendTag {
     /// comparison.
     pub fn kind(&self) -> SubagentBackendKind {
         match self {
-            Self::Aura => SubagentBackendKind::Aura,
+            Self::Baybo => SubagentBackendKind::Baybo,
             Self::External { external_kind, .. } => SubagentBackendKind::External(*external_kind),
         }
     }

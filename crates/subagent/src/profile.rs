@@ -22,7 +22,7 @@
 
 use std::path::PathBuf;
 
-use aura_model::{ArtifactSource, ModelTier, TrustLevel};
+use baybo_model::{ArtifactSource, ModelTier, TrustLevel};
 use serde::{Deserialize, Serialize};
 
 /// Declarative subagent type definition. Cloneable so the registry can

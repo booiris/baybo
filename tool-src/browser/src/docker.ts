@@ -4,8 +4,8 @@
 //   1. checkDockerAvailable() — `docker info` with a 3s timeout. Returns
 //      `{ ok:false }` (with a reason string) when the daemon is missing,
 //      down, or unreachable. Caller falls back to host-headless.
-//   2. sweepStaleContainers() — list `aura.role=browser-sidecar` labelled
-//      containers, drop any whose `aura.pid` label points at a dead
+//   2. sweepStaleContainers() — list `baybo.role=browser-sidecar` labelled
+//      containers, drop any whose `baybo.pid` label points at a dead
 //      process. Cheap belt-and-braces against gateway crashes mid-run
 //      (the `--rm` flag handles the graceful path).
 //   3. spawnContainer() — compute the deterministic image tag (or take
@@ -20,12 +20,12 @@
 //
 // Why `--user $(id -u):$(id -g)`: profile files written under
 // /data/profile end up owned by the host operator's UID, so the same
-// `$XDG_CACHE_HOME/aura/browser/profile` round-trips cleanly between
+// `$XDG_CACHE_HOME/baybo/browser/profile` round-trips cleanly between
 // host-headless and docker modes. Without this, switching modes leaves
 // the operator unable to read their own profile.
 //
 // Why `-p 127.0.0.1::9222`: ephemeral host-side port chosen by docker
-// (read back via `docker port`), bound to loopback only. Multiple Aura
+// (read back via `docker port`), bound to loopback only. Multiple Baybo
 // instances on one host don't collide; CDP isn't reachable from off-box.
 
 import { execFile, spawn } from "node:child_process";
@@ -91,9 +91,9 @@ export async function sweepStaleContainers(): Promise<void> {
                 "ps",
                 "-a",
                 "--filter",
-                "label=aura.role=browser-sidecar",
+                "label=baybo.role=browser-sidecar",
                 "--format",
-                "{{.Names}}\t{{.Label \"aura.pid\"}}",
+                "{{.Names}}\t{{.Label \"baybo.pid\"}}",
             ],
             { timeout: 5000 },
         );
@@ -145,7 +145,7 @@ async function computeImageTag(dockerDir: string): Promise<string> {
     const hash = createHash("sha256");
     hash.update(await readFile(join(dockerDir, "Dockerfile")));
     hash.update(await readFile(join(dockerDir, "entrypoint.sh")));
-    return `aura-browser:${hash.digest("hex").slice(0, 12)}`;
+    return `baybo-browser:${hash.digest("hex").slice(0, 12)}`;
 }
 
 async function imageExists(tag: string): Promise<boolean> {
@@ -173,7 +173,7 @@ async function buildImage(dockerDir: string, tag: string): Promise<void> {
     log(`image ${tag} built`);
 }
 
-// Hard ceiling on how stale a cached aura-browser:* image we'll silently
+// Hard ceiling on how stale a cached baybo-browser:* image we'll silently
 // fall back to. Past this, the Chrome inside is likely missing a quarter
 // of security fixes; refusing the fallback forces the operator to either
 // fix the build (network/disk/apt) or explicitly opt into the old image
@@ -181,7 +181,7 @@ async function buildImage(dockerDir: string, tag: string): Promise<void> {
 const STALE_IMAGE_MAX_AGE_DAYS = 30;
 
 /**
- * Find the most recently created `aura-browser:*` image present locally.
+ * Find the most recently created `baybo-browser:*` image present locally.
  * Used as a fallback when the deterministic-tag image isn't built and the
  * Chrome stable resolver couldn't reach the network — better to run a
  * slightly-stale cached image than to fall back to host-headless.
@@ -190,7 +190,7 @@ const STALE_IMAGE_MAX_AGE_DAYS = 30;
  * silently-old images and surface a loud warning when an image is on
  * the older end of the acceptable window.
  */
-async function findCachedAuraBrowserImage(): Promise<
+async function findCachedBayboBrowserImage(): Promise<
     { tag: string; ageDays: number } | undefined
 > {
     let stdout: string;
@@ -199,7 +199,7 @@ async function findCachedAuraBrowserImage(): Promise<
             "docker",
             [
                 "images",
-                "aura-browser",
+                "baybo-browser",
                 "--format",
                 "{{.Repository}}:{{.Tag}}\t{{.CreatedAt}}",
             ],
@@ -212,7 +212,7 @@ async function findCachedAuraBrowserImage(): Promise<
     const lines = stdout
         .split("\n")
         .map((l) => l.trim())
-        .filter((l) => l.length > 0 && !l.startsWith("aura-browser:<none>"));
+        .filter((l) => l.length > 0 && !l.startsWith("baybo-browser:<none>"));
     // `docker images` already returns rows ordered most-recent first.
     const first = lines[0];
     if (!first) return undefined;
@@ -257,30 +257,30 @@ async function resolveImageTag(opts: DockerSpawnOptions): Promise<string> {
         return tag;
     } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);
-        log(`build of ${tag} failed (${reason}); looking for a cached aura-browser image`);
-        const cached = await findCachedAuraBrowserImage();
+        log(`build of ${tag} failed (${reason}); looking for a cached baybo-browser image`);
+        const cached = await findCachedBayboBrowserImage();
         if (cached && cached.ageDays <= STALE_IMAGE_MAX_AGE_DAYS) {
             const ageStr = cached.ageDays.toFixed(1);
             log(
                 `WARNING: build failed; falling back to cached image ${cached.tag} ` +
                     `(${ageStr} days old, contains a Chrome that may be missing recent ` +
                     `security fixes). Fix the build (network/apt/disk) or pin a known image ` +
-                    `via aura.json:browser.docker.image_tag.`,
+                    `via baybo.json:browser.docker.image_tag.`,
             );
             return cached.tag;
         }
         if (cached) {
             const ageStr = cached.ageDays.toFixed(1);
             throw new Error(
-                `image build failed and the only cached aura-browser:* image (${cached.tag}) is ` +
+                `image build failed and the only cached baybo-browser:* image (${cached.tag}) is ` +
                     `${ageStr} days old (cap is ${STALE_IMAGE_MAX_AGE_DAYS}d). Refusing the silent ` +
                     `fallback to a likely-vulnerable Chrome — fix the build, or set ` +
-                    `aura.json:browser.docker.image_tag to opt into the old image explicitly. ` +
+                    `baybo.json:browser.docker.image_tag to opt into the old image explicitly. ` +
                     `Build error: ${reason}`,
             );
         }
         throw new Error(
-            `image build failed and no cached aura-browser:* image found locally: ${reason}`,
+            `image build failed and no cached baybo-browser:* image found locally: ${reason}`,
         );
     }
 }
@@ -304,7 +304,7 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
     const { mkdirSync } = await import("node:fs");
     mkdirSync(opts.profileDir, { recursive: true });
 
-    const containerName = `aura-browser-${process.pid}-${randomBytes(3).toString("hex")}`;
+    const containerName = `baybo-browser-${process.pid}-${randomBytes(3).toString("hex")}`;
     const viewport = `${opts.viewport.width}x${opts.viewport.height}`;
     const uid = (typeof process.getuid === "function" ? process.getuid() : 1000) || 1000;
     const gid = (typeof process.getgid === "function" ? process.getgid() : 1000) || 1000;
@@ -323,9 +323,9 @@ export async function spawnContainer(opts: DockerSpawnOptions): Promise<DockerHa
         "--name",
         containerName,
         "--label",
-        "aura.role=browser-sidecar",
+        "baybo.role=browser-sidecar",
         "--label",
-        `aura.pid=${process.pid}`,
+        `baybo.pid=${process.pid}`,
         "--user",
         `${uid}:${gid}`,
         "--shm-size=2g",

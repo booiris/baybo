@@ -9,7 +9,7 @@
 //! clear`. The runtime never sweeps goals (session data is core data).
 
 use async_trait::async_trait;
-use aura_model::{Goal, GoalStatus, SessionId};
+use baybo_model::{Goal, GoalStatus, SessionId};
 
 use crate::StorageError;
 

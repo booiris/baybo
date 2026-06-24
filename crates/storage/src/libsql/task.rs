@@ -2,11 +2,11 @@
 //! checklist (`session_tasks`).
 
 use async_trait::async_trait;
-use aura_model::{SessionId, Task, TaskId, TaskStatus};
+use baybo_model::{SessionId, Task, TaskId, TaskStatus};
 
 use super::LibsqlPool;
-use aura_store::StorageError;
-use aura_store::task::{Result, TaskPatch, TaskStore};
+use baybo_store::StorageError;
+use baybo_store::task::{Result, TaskPatch, TaskStore};
 
 pub struct LibsqlTaskStore {
     pool: LibsqlPool,
@@ -219,8 +219,8 @@ impl TaskStore for LibsqlTaskStore {
 mod tests {
     use super::*;
     use crate::libsql::session::LibsqlSessionStore;
-    use aura_model::{ChannelType, Session, SessionState, TaskStatus, TriggerSource, User};
-    use aura_store::SessionStore;
+    use baybo_model::{ChannelType, Session, SessionState, TaskStatus, TriggerSource, User};
+    use baybo_store::SessionStore;
     use chrono::Utc;
 
     fn make_session(id: &str) -> Session {

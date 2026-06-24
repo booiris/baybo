@@ -2,7 +2,7 @@
 //! (`crates/tui`).
 //!
 //! The chat UI needs a gateway to render, so the `chat_smoke` probe stands
-//! up an in-process stub that speaks `aura_channels::wire` and drives the
+//! up an in-process stub that speaks `baybo_channels::wire` and drives the
 //! *real* `TuiAdapter` + `WsTransport`. This test launches that probe in a
 //! tmux pane and asserts on the captured frames in two complementary
 //! styles:
@@ -11,7 +11,7 @@
 //!   frames (initial banner, a plain reply) — normalized to mask the
 //!   version string and the volatile working-indicator timer, so they
 //!   catch *unanticipated* visual drift. Regenerate after an intentional
-//!   UI change with `UPDATE_CHAT_SNAPSHOT=1 cargo test -p aura-tui --test
+//!   UI change with `UPDATE_CHAT_SNAPSHOT=1 cargo test -p baybo-tui --test
 //!   chat_render`.
 //! - **Structural assertions** for the dynamic scenarios (tool call,
 //!   subagent-as-tool, approval modal, dropped task list), where a golden
@@ -34,8 +34,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use aura_term_harness::{HarnessError, Key, LaunchSpec, TmuxSession, tmux_available};
-use aura_tui::smoke_contract::*;
+use baybo_term_harness::{HarnessError, Key, LaunchSpec, TmuxSession, tmux_available};
+use baybo_tui::smoke_contract::*;
 use parking_lot::Mutex;
 
 /// Serializes the scenarios below. Each spins a full TUI + WS probe in a tmux
@@ -85,7 +85,7 @@ where
         let session =
             TmuxSession::launch(LaunchSpec::new(SMOKE_BIN, COLS, ROWS)).expect("launch chat_smoke");
         let result = wait_render(&session, "chat banner + input box", |c| {
-            c.contains("Aura TUI") && c.contains("input")
+            c.contains("Baybo TUI") && c.contains("input")
         })
         .and_then(|_| body(&session));
         match result {
@@ -215,7 +215,7 @@ fn snapshot_echo_reply_frame() {
 fn chat_ui_renders_banner_and_input_box() {
     run_chat("chat_ui_renders_banner_and_input_box", |s| {
         let frame = s.capture().map_err(|e| e.to_string())?;
-        assert!(frame.contains("Aura TUI"), "banner header:\n{frame}");
+        assert!(frame.contains("Baybo TUI"), "banner header:\n{frame}");
         assert!(
             frame.contains("session: smoke-session"),
             "banner shows the pinned session:\n{frame}"

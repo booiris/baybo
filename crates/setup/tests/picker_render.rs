@@ -4,7 +4,7 @@
 //! The picker draws raw crossterm escape sequences into the alternate
 //! screen and windows/​re-anchors itself on resize — behaviour that unit
 //! tests over [`Viewport`] math can't see. These drive the actual binary
-//! inside a tmux pane (via `aura-term-harness`) and assert on the real
+//! inside a tmux pane (via `baybo-term-harness`) and assert on the real
 //! captured frames, the same ground truth that ad-hoc probes used to catch
 //! the short-window clamp garble and the resize regression.
 //!
@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use aura_term_harness::{Key, LaunchSpec, TmuxSession, tmux_available};
+use baybo_term_harness::{Key, LaunchSpec, TmuxSession, tmux_available};
 
 /// Cargo builds the `picker_probe` bin (its `test-support` required-feature
 /// is on during `cargo test`) and hands us its path here — no nested cargo

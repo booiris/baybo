@@ -6,7 +6,7 @@
 //! `InjectionDetector::with_default_rules` should grow this corpus so
 //! they have at least one canonical sample.
 
-use aura_security::{InjectionDetector, InjectionSeverity};
+use baybo_security::{InjectionDetector, InjectionSeverity};
 
 struct Case {
     label: &'static str,

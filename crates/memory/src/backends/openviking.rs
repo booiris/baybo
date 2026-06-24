@@ -38,13 +38,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use aura_model::{ChatMessage, ContentBlock, TrustLevel};
-use aura_security::http::ProxySettings;
-use aura_security::{SecretVault, USER_SECRET_PREFIX};
-use aura_tools::{
+use baybo_model::{ChatMessage, ContentBlock, TrustLevel};
+use baybo_security::http::ProxySettings;
+use baybo_security::{SecretVault, USER_SECRET_PREFIX};
+use baybo_tools::{
     Tool, ToolCapability, ToolContext, ToolError, ToolEventSink, ToolManifest, ToolOutput,
 };
-use aura_trace::ToolEventPayload;
+use baybo_trace::ToolEventPayload;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -55,7 +55,7 @@ use crate::{Memory, MemoryContext, MemoryError, RecalledMemory, Result};
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:1933";
 const DEFAULT_ACCOUNT: &str = "default";
-const DEFAULT_AGENT: &str = "aura";
+const DEFAULT_AGENT: &str = "baybo";
 const DEFAULT_TOP_K: usize = 5;
 /// Default per-request budget for tool calls (model is already waiting).
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -69,7 +69,7 @@ const RECALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// `/sessions/{sid}/commit` triggers the 6-category server-side extraction
 /// (LLM-backed), which can be slow under load — give it a generous ceiling.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
-/// Default user-secret name (managed via `aura secret add`) holding the
+/// Default user-secret name (managed via `baybo secret add`) holding the
 /// OpenViking API key. Doubles as the process-env var name. Optional —
 /// when nothing is set the backend runs unauthenticated (local-dev mode).
 const DEFAULT_API_KEY_NAME: &str = "OPENVIKING_API_KEY";
@@ -130,7 +130,7 @@ pub struct OpenVikingConfig {
     pub endpoint: Option<String>,
     /// Name of the user secret holding the OpenViking API key. Resolution:
     /// vault entry `user_env.<api_key_name>` (managed via
-    /// `aura secret add <name>`), then process-env `<api_key_name>`.
+    /// `baybo secret add <name>`), then process-env `<api_key_name>`.
     /// `None` defaults the name to `"OPENVIKING_API_KEY"`. Leave the
     /// secret itself empty for unauthenticated local-dev servers.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,7 +159,7 @@ impl OpenVikingConfig {
 
 /// Resolve the OpenViking API key. Order:
 ///   1. User secret vault entry `user_env.<name>` (managed via
-///      `aura secret add <name>`).
+///      `baybo secret add <name>`).
 ///   2. Process env var of the same name.
 ///
 /// `<name>` is `cfg.api_key_name` or [`DEFAULT_API_KEY_NAME`] when unset.
@@ -525,7 +525,7 @@ pub struct OpenVikingMemory {
 
 impl OpenVikingMemory {
     /// Build the backend. `proxy` is threaded into the underlying
-    /// `reqwest::Client` via [`aura_security::http::client_builder`] — the
+    /// `reqwest::Client` via [`baybo_security::http::client_builder`] — the
     /// crate-wide outbound-egress chokepoint — so a deployment-configured
     /// proxy applies to recall/write/tool traffic. `ALWAYS_DIRECT`
     /// (`localhost,127.0.0.1,::1`) is honoured, so the default loopback
@@ -535,7 +535,7 @@ impl OpenVikingMemory {
         api_key: String,
         proxy: Option<&ProxySettings>,
     ) -> Result<Self> {
-        let client = aura_security::http::client_builder(proxy)
+        let client = baybo_security::http::client_builder(proxy)
             .map_err(|e| MemoryError::Backend(format!("openviking client build failed: {e}")))?
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -925,7 +925,7 @@ impl Tool for VikingRecallTool {
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
@@ -1014,7 +1014,7 @@ impl Tool for VikingStoreTool {
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let text = params
             .get("text")
             .and_then(|v| v.as_str())
@@ -1031,7 +1031,7 @@ impl Tool for VikingStoreTool {
             .get("sessionId")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("aura-store-{}", Uuid::new_v4().simple()));
+            .unwrap_or_else(|| format!("baybo-store-{}", Uuid::new_v4().simple()));
 
         let msg_path = format!("/api/v1/sessions/{session_id}/messages");
         let body = json!({"role": role, "content": text});
@@ -1093,7 +1093,7 @@ struct VikingForgetTool {
 }
 
 impl VikingForgetTool {
-    async fn delete_uri(&self, uri: &str, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn delete_uri(&self, uri: &str, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         self.inner
             .delete(
                 "/api/v1/fs",
@@ -1135,7 +1135,7 @@ impl Tool for VikingForgetTool {
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         if let Some(uri) = params.get("uri").and_then(|v| v.as_str()) {
             if !is_memory_uri(uri) {
                 return Ok(ToolOutput::Error(format!(
@@ -1236,7 +1236,7 @@ impl Tool for VikingArchiveExpandTool {
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let archive_id = params
             .get("archiveId")
             .and_then(|v| v.as_str())

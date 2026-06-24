@@ -74,7 +74,7 @@ function ClippedText({
 }
 
 /**
- * A tool result is an error when aura's `<tool_output name="X">` wrapper's
+ * A tool result is an error when baybo's `<tool_output name="X">` wrapper's
  * body starts with `Error:` (validation rejections + tool execution
  * failures). Success bodies never do.
  */

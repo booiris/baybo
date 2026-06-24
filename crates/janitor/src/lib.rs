@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aura_store::ChannelPairingStore;
-use aura_workspace::WorkspacePaths;
+use baybo_store::ChannelPairingStore;
+use baybo_workspace::WorkspacePaths;
 
 use fs_sweep::{DirSweep, is_log_file, sweep_directory};
 
@@ -25,11 +25,11 @@ const PAIRING_APPROVAL_TTL: Duration = Duration::from_secs(7 * 86_400);
 // rows between full sweeps.
 const PAIRING_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // Stale-sidecar-bundle window. The cache root is shared across every
-// Aura process running under the same UID, so the TTL also doubles as
-// a safety margin: a concurrent older-version Aura that's actively
+// Baybo process running under the same UID, so the TTL also doubles as
+// a safety margin: a concurrent older-version Baybo that's actively
 // using one of the dirs touches it (spawn child reads bundle.mjs, the
 // browser sidecar opens the docker/ aux dir on every `docker build`)
-// and will look fresh enough to skip. Operators running multiple Aura
+// and will look fresh enough to skip. Operators running multiple Baybo
 // versions side-by-side for >7 days without restarting either is well
 // outside the realistic case.
 const SIDECAR_CACHE_TTL: Duration = Duration::from_secs(7 * 86_400);
@@ -48,10 +48,10 @@ pub struct JanitorReport {
 }
 
 /// Live-set view consumed by the sidecar-cache sweep. `cache_root` is
-/// `$XDG_CACHE_HOME/aura/sidecars/`; `live_dirs` is the
-/// `<name>-<hash>` set the running Aura currently has materialised.
+/// `$XDG_CACHE_HOME/baybo/sidecars/`; `live_dirs` is the
+/// `<name>-<hash>` set the running Baybo currently has materialised.
 /// Anything else under `cache_root` whose mtime is older than the TTL
-/// is left over from a previous Aura version and gets removed.
+/// is left over from a previous Baybo version and gets removed.
 #[derive(Debug, Clone)]
 pub struct SidecarCache {
     pub cache_root: PathBuf,
@@ -259,8 +259,8 @@ mod tests {
         let channel_dir = paths.channel_logs_dir();
         std::fs::create_dir_all(&logs_dir).unwrap();
         std::fs::create_dir_all(&channel_dir).unwrap();
-        let stale_main = logs_dir.join("aura.log.2025-01-01");
-        let fresh_main = logs_dir.join("aura.log.2026-04-27");
+        let stale_main = logs_dir.join("baybo.log.2025-01-01");
+        let fresh_main = logs_dir.join("baybo.log.2026-04-27");
         let stale_chan = channel_dir.join("telegram.log.2025-01-01");
         std::fs::write(&stale_main, b"x").unwrap();
         std::fs::write(&fresh_main, b"x").unwrap();
@@ -284,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn sidecar_cache_sweep_removes_only_stale_non_live_dirs() {
-        // Three subdirs under the simulated $XDG_CACHE_HOME/aura/sidecars/:
+        // Three subdirs under the simulated $XDG_CACHE_HOME/baybo/sidecars/:
         //   browser-livehash : current build, must survive even when stale
         //   browser-oldhash  : prior build, age > TTL, must be removed
         //   browser-recent   : prior build, fresh mtime, must survive

@@ -1,7 +1,7 @@
 #![no_main]
 
-use aura_security::EncryptionKey;
-use aura_security::crypto::{decrypt, encrypt};
+use baybo_security::EncryptionKey;
+use baybo_security::crypto::{decrypt, encrypt};
 use libfuzzer_sys::fuzz_target;
 
 const KEY_LEN: usize = 32;

@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use aura_model::{SessionId, Task, TaskId};
-use aura_store::task::{Result, TaskPatch, TaskStore};
+use baybo_model::{SessionId, Task, TaskId};
+use baybo_store::task::{Result, TaskPatch, TaskStore};
 use parking_lot::Mutex;
 
 /// Maps each session to its checklist. Mirrors `LibsqlTaskStore` semantics:

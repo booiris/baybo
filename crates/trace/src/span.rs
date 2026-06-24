@@ -6,7 +6,7 @@
 //! but never nest. LLM ↔ tool pairing is by `ToolCallOrigin`, not by
 //! tree structure.
 
-use aura_model::{ChatMessage, ParallelGroup, SpanId, StepId};
+use baybo_model::{ChatMessage, ParallelGroup, SpanId, StepId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,7 +21,7 @@ use crate::outcome::{LifecycleOutcome, LifecycleState};
 /// the other. Recovery, storage rewrites, and replay all rely on this
 /// pairing.
 ///
-/// **Storage coupling:** the `spans` table in `aura-storage` derives its
+/// **Storage coupling:** the `spans` table in `baybo-storage` derives its
 /// indexed `step_id` / `started_at` columns from this struct's serialized
 /// JSON via `json_extract(data, '$.step_id')` (and `'$.started_at'`) —
 /// those field names are load-bearing for `list_spans_by_step` and ordering.
@@ -444,8 +444,8 @@ mod tests {
     /// `Persisted` is an object.
     #[test]
     fn llm_call_inputs_serializes_inline_as_bare_array() {
-        let inline = LlmCallInputs::Inline(vec![aura_model::ChatMessage::agent_context(vec![
-            aura_model::ContentBlock::Text("hi".into()),
+        let inline = LlmCallInputs::Inline(vec![baybo_model::ChatMessage::agent_context(vec![
+            baybo_model::ContentBlock::Text("hi".into()),
         ])]);
         let json = serde_json::to_value(&inline).unwrap();
         assert!(json.is_array(), "Inline must serialize as a bare array");
@@ -484,8 +484,8 @@ mod tests {
     /// and stays distinguishable from the bare-array `Inline` shape.
     #[test]
     fn persisted_suffix_round_trips() {
-        let suffix = vec![aura_model::ChatMessage::agent_context(vec![
-            aura_model::ContentBlock::Text("SUMMARIZE NOW".into()),
+        let suffix = vec![baybo_model::ChatMessage::agent_context(vec![
+            baybo_model::ContentBlock::Text("SUMMARIZE NOW".into()),
         ])];
         let persisted = LlmCallInputs::Persisted {
             last_ordinal: 42,

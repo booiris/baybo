@@ -7,11 +7,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_model::{
+use baybo_model::{
     CREATE_GOAL_TOOL_NAME, GET_GOAL_TOOL_NAME, Goal, GoalStatus, UPDATE_GOAL_TOOL_NAME,
 };
-use aura_store::goal::GoalStore;
-use aura_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
+use baybo_store::goal::GoalStore;
+use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -35,7 +35,7 @@ fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
     let manifest = ToolManifest {
         name: tool.name().to_string(),
         description: tool.description(),
-        trust_level: aura_model::TrustLevel::Trusted,
+        trust_level: baybo_model::TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![],
     };
@@ -111,10 +111,10 @@ impl Tool for CreateGoalTool {
         params
             .get("objective")
             .and_then(Value::as_str)
-            .and_then(aura_tools::progress::preview_arg)
+            .and_then(baybo_tools::progress::preview_arg)
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let p: CreateGoalParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         if p.objective.trim().is_empty() {
@@ -176,7 +176,7 @@ impl Tool for GetGoalTool {
         json!({ "type": "object", "properties": {} })
     }
 
-    async fn execute(&self, _params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, _params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let goal = self
             .service
             .current(&ctx.session_id)
@@ -234,10 +234,10 @@ impl Tool for UpdateGoalTool {
         params
             .get("status")
             .and_then(Value::as_str)
-            .and_then(aura_tools::progress::preview_arg)
+            .and_then(baybo_tools::progress::preview_arg)
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let p: UpdateGoalParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         let status = match p.status.as_str() {
@@ -276,14 +276,14 @@ impl Tool for UpdateGoalTool {
 mod tests {
     use super::*;
     use crate::test_support::MemoryGoalStore;
-    use aura_model::{ChannelType, User};
+    use baybo_model::{ChannelType, User};
     use std::time::Duration;
 
     fn ctx(session: &str) -> ToolContext {
         ToolContext {
             session_id: session.into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u1".into(),
                 name: None,
@@ -292,11 +292,11 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,
-            events: aura_tools::noop_event_sink(),
+            events: baybo_tools::noop_event_sink(),
             llm: None,
             secrets: None,
             virtual_reads: None,

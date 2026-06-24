@@ -48,7 +48,7 @@ impl Default for ShutdownSignal {
 }
 
 #[async_trait]
-impl aura_cron::Shutdown for ShutdownSignal {
+impl baybo_cron::Shutdown for ShutdownSignal {
     async fn wait(&self) {
         ShutdownSignal::wait(self).await;
     }

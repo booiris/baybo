@@ -1,5 +1,5 @@
 [package]
-name = "aura-security"
+name = "baybo-security"
 version.workspace = true
 edition.workspace = true
 
@@ -10,8 +10,8 @@ doctest = false
 test-support = ["dep:parking_lot"]
 
 [dependencies]
-aura-model = { workspace = true }
-aura-store = { workspace = true }
+baybo-model = { workspace = true }
+baybo-store = { workspace = true }
 parking_lot = { workspace = true, optional = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -31,7 +31,7 @@ reqwest = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-aura-security = { path = ".", features = ["test-support"] }
+baybo-security = { path = ".", features = ["test-support"] }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 chrono = { workspace = true }

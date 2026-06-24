@@ -251,7 +251,7 @@ async fn run_rg(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
     match p.output_mode.as_str() {
         "files_with_matches" => {
             for path in iter_null_paths(&stdout) {
-                if aura_security::is_sensitive_path(Path::new(&path)) {
+                if baybo_security::is_sensitive_path(Path::new(&path)) {
                     continue;
                 }
                 if !push(path, &mut kept, &mut hits_truncated) {
@@ -261,7 +261,7 @@ async fn run_rg(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         }
         "count" => {
             for (path, count) in iter_count_records(&stdout) {
-                if aura_security::is_sensitive_path(Path::new(&path)) {
+                if baybo_security::is_sensitive_path(Path::new(&path)) {
                     continue;
                 }
                 if !push(format!("{path}:{count}"), &mut kept, &mut hits_truncated) {
@@ -271,7 +271,7 @@ async fn run_rg(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         }
         "content" => {
             for hit in iter_json_matches(&stdout) {
-                if aura_security::is_sensitive_path(Path::new(&hit.path)) {
+                if baybo_security::is_sensitive_path(Path::new(&hit.path)) {
                     continue;
                 }
                 let row = format!("{}:{}:{}", hit.path, hit.line_number, hit.line_text);
@@ -368,15 +368,15 @@ fn iter_json_matches(stdout: &[u8]) -> impl Iterator<Item = ContentHit> + '_ {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, User};
+    use baybo_model::{ChannelType, User};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -385,7 +385,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,

@@ -1,4 +1,4 @@
-//! Bootstrap layer: `AuraConfig` → domain type translation.
+//! Bootstrap layer: `BayboConfig` → domain type translation.
 //!
 //! Everything in this module is a **pure mapping** from config to a domain
 //! type, or a small **loader** that resolves a config reference (env var or
@@ -10,24 +10,24 @@
 
 use std::path::{Path, PathBuf};
 
-use aura_config::{AuraConfig, LlmEntry, RiskCheckConfig, SecurityConfig, WorkspaceConfig};
-use aura_llm::credentials::resolve_api_key;
-use aura_llm::{BillableLlm, CostHooks, LlmProviderConfig, LlmProviderRegistry};
-use aura_security::{EncryptionKey, LeakDetector};
-use aura_skills_assessor::AssessmentMode;
-use aura_workspace::WorkspacePaths;
-use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
+use baybo_config::{BayboConfig, LlmEntry, RiskCheckConfig, SecurityConfig, WorkspaceConfig};
+use baybo_llm::credentials::resolve_api_key;
+use baybo_llm::{BillableLlm, CostHooks, LlmProviderConfig, LlmProviderRegistry};
+use baybo_security::{EncryptionKey, LeakDetector};
+use baybo_skills_assessor::AssessmentMode;
+use baybo_workspace::WorkspacePaths;
+use baybo_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Loaders (perform I/O)
 // ---------------------------------------------------------------------------
 
-/// Resolve the config path from `AURA_CONFIG_PATH`, else
-/// `<default_workspace_root>/config/aura.json`, else fall back to
-/// `AuraConfig::default()`. An explicit `AURA_CONFIG_PATH` that points at a
+/// Resolve the config path from `BAYBO_CONFIG_PATH`, else
+/// `<default_workspace_root>/config/baybo.json`, else fall back to
+/// `BayboConfig::default()`. An explicit `BAYBO_CONFIG_PATH` that points at a
 /// missing file is a hard error — silent fallback would hide typos.
-pub async fn load_config() -> anyhow::Result<AuraConfig> {
+pub async fn load_config() -> anyhow::Result<BayboConfig> {
     let explicit = std::env::var(ENV_CONFIG_PATH).ok();
     let path = explicit
         .as_deref()
@@ -42,24 +42,24 @@ pub async fn load_config() -> anyhow::Result<AuraConfig> {
             );
         }
         info!(
-            "no aura.json found at {}, using default configuration",
+            "no baybo.json found at {}, using default configuration",
             path.display()
         );
-        return Ok(AuraConfig::default());
+        return Ok(BayboConfig::default());
     }
 
     info!(path = %path.display(), "loading configuration");
-    AuraConfig::load_from_file(&path)
+    BayboConfig::load_from_file(&path)
         .await
         .map_err(|e| anyhow::anyhow!("failed to load config from {}: {e}", path.display()))
 }
 
-/// Resolve the effective `aura.json` path, if any.
+/// Resolve the effective `baybo.json` path, if any.
 ///
-/// Same precedence as [`load_config`]: `AURA_CONFIG_PATH` first, then
-/// `<default_workspace_root>/config/aura.json` (only if present). Returns
+/// Same precedence as [`load_config`]: `BAYBO_CONFIG_PATH` first, then
+/// `<default_workspace_root>/config/baybo.json` (only if present). Returns
 /// `None` when neither exists — callers running against
-/// `AuraConfig::default()` have no path to write back to, and mutation
+/// `BayboConfig::default()` have no path to write back to, and mutation
 /// endpoints reject accordingly.
 pub fn resolve_config_path() -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var(ENV_CONFIG_PATH) {
@@ -70,7 +70,7 @@ pub fn resolve_config_path() -> Option<PathBuf> {
 }
 
 /// Build an [`Arc<BillableLlm>`] from the `default-llm` entry of an
-/// `AuraConfig`, resolving the api key through env then vault. The
+/// `BayboConfig`, resolving the api key through env then vault. The
 /// returned handle is sealed: every `chat`/`chat_stream` runs through
 /// `guard` first.
 ///
@@ -88,20 +88,20 @@ pub fn resolve_config_path() -> Option<PathBuf> {
 ///
 /// `billing` carries the gate the resulting client runs before every
 /// LLM call and the recorder it runs after. Production wiring derives
-/// this from `CostManager` (`aura_cost::cost_hooks`); CLI `aura llm
+/// this from `CostManager` (`baybo_cost::cost_hooks`); CLI `baybo llm
 /// probe` and similar one-shot tools pass [`CostHooks::passthrough`] so
 /// the probe isn't gated or billed against anyone.
 pub async fn build_llm_client(
-    cfg: &AuraConfig,
+    cfg: &BayboConfig,
     registry: &LlmProviderRegistry,
-    blob_store: Option<std::sync::Arc<dyn aura_store::BlobStore>>,
-    vault: Option<std::sync::Arc<aura_security::SecretVault>>,
+    blob_store: Option<std::sync::Arc<dyn baybo_store::BlobStore>>,
+    vault: Option<std::sync::Arc<baybo_security::SecretVault>>,
     billing: CostHooks,
 ) -> anyhow::Result<std::sync::Arc<BillableLlm>> {
     let entry = cfg.default_llm_entry().ok_or_else(|| {
         if cfg.llm.is_empty() {
             anyhow::anyhow!(
-                "no LLM entries configured in aura.json — run `aura llm add` to register one"
+                "no LLM entries configured in baybo.json — run `baybo llm add` to register one"
             )
         } else {
             anyhow::anyhow!(
@@ -126,10 +126,10 @@ pub async fn build_llm_client(
 pub async fn build_llm_client_for_entry(
     entry: &LlmEntry,
     registry: &LlmProviderRegistry,
-    blob_store: Option<std::sync::Arc<dyn aura_store::BlobStore>>,
-    vault: Option<std::sync::Arc<aura_security::SecretVault>>,
+    blob_store: Option<std::sync::Arc<dyn baybo_store::BlobStore>>,
+    vault: Option<std::sync::Arc<baybo_security::SecretVault>>,
     billing: CostHooks,
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
 ) -> anyhow::Result<std::sync::Arc<BillableLlm>> {
     let api_key = resolve_api_key(
         entry.name.as_str(),
@@ -138,9 +138,11 @@ pub async fn build_llm_client_for_entry(
         vault.as_deref(),
     )
     .await;
-    let blob_fetcher: Option<std::sync::Arc<dyn aura_llm::BlobFetcher>> = blob_store.map(|store| {
-        std::sync::Arc::new(BlobStoreFetcher(store)) as std::sync::Arc<dyn aura_llm::BlobFetcher>
-    });
+    let blob_fetcher: Option<std::sync::Arc<dyn baybo_llm::BlobFetcher>> =
+        blob_store.map(|store| {
+            std::sync::Arc::new(BlobStoreFetcher(store))
+                as std::sync::Arc<dyn baybo_llm::BlobFetcher>
+        });
     registry
         .create_client(
             &LlmProviderConfig {
@@ -161,26 +163,26 @@ pub async fn build_llm_client_for_entry(
         .map_err(|e| anyhow::anyhow!("failed to build LLM client: {e}"))
 }
 
-/// Bridge `aura_store::BlobStore` into `aura_llm::BlobFetcher`. Lives
+/// Bridge `baybo_store::BlobStore` into `baybo_llm::BlobFetcher`. Lives
 /// here next to `build_llm_client` because both crates are framework-
 /// agnostic and shouldn't know about each other — the application
 /// boot layer is the only place that's allowed to glue them together.
-struct BlobStoreFetcher(std::sync::Arc<dyn aura_store::BlobStore>);
+struct BlobStoreFetcher(std::sync::Arc<dyn baybo_store::BlobStore>);
 
 #[async_trait::async_trait]
-impl aura_llm::BlobFetcher for BlobStoreFetcher {
-    async fn fetch(&self, blob_id: &str) -> aura_llm::Result<Vec<u8>> {
+impl baybo_llm::BlobFetcher for BlobStoreFetcher {
+    async fn fetch(&self, blob_id: &str) -> baybo_llm::Result<Vec<u8>> {
         self.0
             .get(blob_id)
             .await
-            .map_err(|e| aura_llm::LlmError::Transient(format!("blob fetch: {e}")))
+            .map_err(|e| baybo_llm::LlmError::Transient(format!("blob fetch: {e}")))
     }
 }
 
 /// Load the 32-byte encryption key from `security.encryption_key_file`
 /// (hex-encoded). `validate()` guarantees the field is set and absolute;
 /// a missing or malformed file is a hard error — there is no dev-key
-/// fallback. `aura setup` mints the file on first run.
+/// fallback. `baybo setup` mints the file on first run.
 pub fn load_encryption_key(cfg: &SecurityConfig) -> anyhow::Result<EncryptionKey> {
     let path = cfg
         .encryption_key_file
@@ -202,8 +204,8 @@ pub fn load_encryption_key(cfg: &SecurityConfig) -> anyhow::Result<EncryptionKey
 
 /// Path to the libsql database file, derived from the project root
 /// (`workspace.path`). Storage always lives at `<root>/state/storage.db`;
-/// the workspace root is itself the aura data directory (defaults to
-/// `~/.aura` in release, `./.aura` in debug).
+/// the workspace root is itself the baybo data directory (defaults to
+/// `~/.baybo` in release, `./.baybo` in debug).
 pub fn storage_db_path(cfg: &WorkspaceConfig) -> PathBuf {
     WorkspacePaths::new(PathBuf::from(&cfg.path)).storage_db()
 }
@@ -211,10 +213,10 @@ pub fn storage_db_path(cfg: &WorkspaceConfig) -> PathBuf {
 /// Map the optional `proxy` config into the runtime [`ProxySettings`] every
 /// HTTP client + spawned child threads through. `None` (no `proxy` block) =
 /// direct connections, today's behavior.
-pub fn proxy_settings(cfg: &AuraConfig) -> Option<aura_security::http::ProxySettings> {
+pub fn proxy_settings(cfg: &BayboConfig) -> Option<baybo_security::http::ProxySettings> {
     cfg.proxy
         .as_ref()
-        .map(|p| aura_security::http::ProxySettings {
+        .map(|p| baybo_security::http::ProxySettings {
             url: p.url.clone(),
             no_proxy: p.no_proxy.clone(),
         })
@@ -229,16 +231,16 @@ pub fn to_assessment_mode(cfg: RiskCheckConfig) -> AssessmentMode {
 }
 
 /// Map the config-layer sandbox mode onto the tool-layer one. The two are kept
-/// separate so `aura-tools` needn't depend on `aura-config`; this boot/wiring
+/// separate so `baybo-tools` needn't depend on `baybo-config`; this boot/wiring
 /// layer (which has both) is the one place that bridges them. Shared by initial
 /// wiring ([`crate::runtime`]) and hot-reload ([`crate::reload`]) so both map
 /// identically.
-pub fn to_bash_mode(mode: aura_config::SandboxMode) -> aura_tools::builtin::BashSandboxMode {
-    use aura_tools::builtin::BashSandboxMode;
+pub fn to_bash_mode(mode: baybo_config::SandboxMode) -> baybo_tools::builtin::BashSandboxMode {
+    use baybo_tools::builtin::BashSandboxMode;
     match mode {
-        aura_config::SandboxMode::None => BashSandboxMode::None,
-        aura_config::SandboxMode::Sandboxed => BashSandboxMode::Sandboxed,
-        aura_config::SandboxMode::Auto => BashSandboxMode::Auto,
+        baybo_config::SandboxMode::None => BashSandboxMode::None,
+        baybo_config::SandboxMode::Sandboxed => BashSandboxMode::Sandboxed,
+        baybo_config::SandboxMode::Auto => BashSandboxMode::Auto,
     }
 }
 
@@ -253,7 +255,7 @@ pub fn build_leak_detector(cfg: &SecurityConfig) -> LeakDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_config::{SecurityConfig, WorkspaceConfig};
+    use baybo_config::{SecurityConfig, WorkspaceConfig};
 
     #[test]
     fn storage_db_path_is_under_workspace_state_dir() {
@@ -268,8 +270,8 @@ mod tests {
 
     #[test]
     fn proxy_settings_maps_config_to_runtime() {
-        let cfg = AuraConfig {
-            proxy: Some(aura_config::ProxyConfig {
+        let cfg = BayboConfig {
+            proxy: Some(baybo_config::ProxyConfig {
                 url: "socks5://127.0.0.1:1080".into(),
                 no_proxy: Some(vec![".internal".into()]),
             }),
@@ -279,7 +281,7 @@ mod tests {
         assert_eq!(settings.url, "socks5://127.0.0.1:1080");
         assert_eq!(settings.no_proxy, Some(vec![".internal".to_string()]));
         assert!(
-            proxy_settings(&AuraConfig::default()).is_none(),
+            proxy_settings(&BayboConfig::default()).is_none(),
             "no proxy block ⇒ None ⇒ direct connections"
         );
     }

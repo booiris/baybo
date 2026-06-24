@@ -1,18 +1,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::{AgentOutput, IncomingMessage, Message};
-use aura_cost::CostManager;
-use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput, JobShape};
-use aura_llm::TokenUsage;
-use aura_model::{
+use baybo_channels::{AgentOutput, IncomingMessage, Message};
+use baybo_cost::CostManager;
+use baybo_job::{CancelReason, JobInput, JobLifecycle, JobOutput, JobShape};
+use baybo_llm::TokenUsage;
+use baybo_model::{
     BACKGROUND_DISPATCH_ACK_PREFIX, ChannelType, ChatMessage, ContentBlock, ExternalAgentKind,
     JobId, Lineage, LineageKind, MessageMetadata, OnTimeout, PendingBackgroundResult,
     SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend, SubagentExitStatus,
     SubagentParentContext, SubagentResult, SubagentSpawnRequest, TriggerKind, User,
 };
-use aura_session::SessionManager;
-use aura_workspace::WorkspacePaths;
+use baybo_session::SessionManager;
+use baybo_workspace::WorkspacePaths;
 use chrono::Utc;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
@@ -42,7 +42,7 @@ const SUBAGENT_OUTPUT_BUFFER: usize = 64;
 const SUBAGENT_FOREGROUND_WAIT: Duration = Duration::from_secs(120);
 
 /// Whether a parent session can host a background job — delegates to the
-/// shared [`aura_model::Session::supports_background_jobs`] so the router
+/// shared [`baybo_model::Session::supports_background_jobs`] so the router
 /// (subagent conversion) and the agent loop (bash sink injection) gate on
 /// one definition.
 fn parent_supports_background(session: &Session) -> bool {
@@ -54,7 +54,7 @@ fn parent_supports_background(session: &Session) -> bool {
 pub struct SubagentSpawnerConfig {
     pub session_manager: Arc<SessionManager>,
     pub supervisor: AgentSupervisor,
-    pub dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
+    pub dispatch_limiter: Arc<dyn baybo_subagent::SubagentDispatchLimiter>,
     pub cost_manager: Arc<CostManager>,
     pub job_lifecycle: Arc<JobLifecycle>,
     pub actor_parent_token: CancellationToken,
@@ -64,7 +64,7 @@ pub struct SubagentSpawnerConfig {
     pub actor_spawner: ActorSpawner,
 }
 
-/// Actor-backed [`aura_subagent::SubagentSpawner`]: materialises a child
+/// Actor-backed [`baybo_subagent::SubagentSpawner`]: materialises a child
 /// `AgentActor` (or routes to an external backend) for each
 /// `spawn_subagent` call. Lifted out of the router so the tool reaches it
 /// directly — there is no cross-actor channel. The child's agent loop
@@ -73,7 +73,7 @@ pub struct SubagentSpawnerConfig {
 pub struct ActorSubagentSpawner {
     session_manager: Arc<SessionManager>,
     supervisor: AgentSupervisor,
-    dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
+    dispatch_limiter: Arc<dyn baybo_subagent::SubagentDispatchLimiter>,
     cost_manager: Arc<CostManager>,
     job_lifecycle: Arc<JobLifecycle>,
     actor_parent_token: CancellationToken,
@@ -113,7 +113,7 @@ impl ActorSubagentSpawner {
 }
 
 #[async_trait::async_trait]
-impl aura_subagent::SubagentSpawner for ActorSubagentSpawner {
+impl baybo_subagent::SubagentSpawner for ActorSubagentSpawner {
     async fn spawn(
         &self,
         parent: SubagentParentContext,
@@ -166,7 +166,7 @@ impl ActorSubagentSpawner {
         // still-draining one. No-op for ungrouped spawns.
         let mut request = request;
         if let Some(group) = request.group.take() {
-            request.group = Some(aura_model::GroupState::cohort_key(parent_job_id, &group));
+            request.group = Some(baybo_model::GroupState::cohort_key(parent_job_id, &group));
         }
         let parent = match self.session_manager.get(&parent_session_id).await {
             Ok(Some(p)) => p,
@@ -185,8 +185,8 @@ impl ActorSubagentSpawner {
         };
 
         match request.backend.clone() {
-            SubagentBackend::Aura => {
-                self.spawn_aura_subagent(
+            SubagentBackend::Baybo => {
+                self.spawn_baybo_subagent(
                     parent,
                     parent_job_id,
                     parent_span_id,
@@ -213,8 +213,8 @@ impl ActorSubagentSpawner {
 
     /// In-process backend: spawn a full `AgentActor` for the child.
     /// Supports `background` fire-and-forget dispatch (result escorted
-    /// back to the parent's mailbox) and resume of a prior Aura child.
-    async fn spawn_aura_subagent(
+    /// back to the parent's mailbox) and resume of a prior Baybo child.
+    async fn spawn_baybo_subagent(
         &self,
         parent: Session,
         parent_job_id: JobId,
@@ -230,7 +230,7 @@ impl ActorSubagentSpawner {
                 parent_job_id,
                 parent_span_id,
                 &request,
-                aura_model::SubagentBackendKind::Aura,
+                baybo_model::SubagentBackendKind::Baybo,
             )
             .await
         {
@@ -390,7 +390,7 @@ impl ActorSubagentSpawner {
         }
 
         // Foreground dispatch under the shared wait/convert/kill policy. The
-        // terminal future is the Aura actor's terminal observer; the policy
+        // terminal future is the Baybo actor's terminal observer; the policy
         // (block for nested, or wait-then-convert/kill for a user parent) is
         // backend-agnostic and lives in `run_foreground_job`.
         let fut = await_subagent_terminal(
@@ -439,7 +439,7 @@ impl ActorSubagentSpawner {
         let fan_out_root = request.fan_out_root.clone();
         let Some(agent) = self.external_agents.get(kind) else {
             let _ = result_tx.send(SubagentResult::failed(format!(
-                "external agent {:?} is not registered (check `aura external-agent` config + boot logs)",
+                "external agent {:?} is not registered (check `baybo external-agent` config + boot logs)",
                 kind.as_str(),
             )));
             self.release_fan_out_slot(&fan_out_root);
@@ -452,7 +452,7 @@ impl ActorSubagentSpawner {
                 parent_job_id,
                 parent_span_id,
                 &request,
-                aura_model::SubagentBackendKind::External(kind),
+                baybo_model::SubagentBackendKind::External(kind),
             )
             .await
         {
@@ -464,7 +464,7 @@ impl ActorSubagentSpawner {
             }
         };
         let (dir_name, resume_key) = match &child_session.state.subagent_backend {
-            Some(aura_model::SubagentBackendTag::External {
+            Some(baybo_model::SubagentBackendTag::External {
                 workspace_dir,
                 resume_key,
                 ..
@@ -483,11 +483,11 @@ impl ActorSubagentSpawner {
         // runs are long; a converted one keeps running past the turn that
         // spawned it). A non-convertible foreground run stays on the parent's
         // per-job token (cancelled at the foreground-wait mark, or ends with the
-        // turn). Mirrors the Aura backend's anchoring.
+        // turn). Mirrors the Baybo backend's anchoring.
         let user_facing = parent_supports_background(&parent);
         // Non-user parents can't deliver a background notification, so an
         // explicit background / grouped external run from one is downgraded to
-        // a blocking foreground run (result returned inline). Mirrors the Aura
+        // a blocking foreground run (result returned inline). Mirrors the Baybo
         // backend's gate.
         let background = request.background && user_facing;
         let convertible =
@@ -560,7 +560,7 @@ impl ActorSubagentSpawner {
 
         // Foreground external run under the shared wait/convert/kill policy: a
         // user parent gets the same foreground-wait → convert-to-background
-        // behaviour as the Aura backend; a nested/cron parent blocks until the
+        // behaviour as the Baybo backend; a nested/cron parent blocks until the
         // run finishes (or hits `EXTERNAL_SUBAGENT_TIMEOUT`). The cancel token
         // is the foreground job's `child_token` so a `/stop` or `Kill`-timeout
         // reaches the in-flight subprocess.
@@ -602,7 +602,7 @@ impl ActorSubagentSpawner {
     /// parent's tool boundary and pin the parent against the idle reaper
     /// for the lifetime of the background child. Returns the synthetic
     /// handle id stamped on the ack (and later on the escorted result).
-    /// Shared by the Aura and External background paths.
+    /// Shared by the Baybo and External background paths.
     async fn ack_background_dispatch(
         &self,
         parent_id: &SessionId,
@@ -612,7 +612,7 @@ impl ActorSubagentSpawner {
         cancel_token: CancellationToken,
         result_tx: oneshot::Sender<SubagentResult>,
     ) -> String {
-        let handle_id = aura_model::new_background_handle();
+        let handle_id = baybo_model::new_background_handle();
         let ack_text = format!(
             "{BACKGROUND_DISPATCH_ACK_PREFIX}\n- handle: {handle_id}\n- subagent_type: {subagent_type}\n- child_session: {child_session_id}\n\nThe runtime will surface the subagent's final message as a system reminder prepended to your next user turn."
         );
@@ -649,7 +649,7 @@ impl ActorSubagentSpawner {
         parent_job_id: JobId,
         parent_span_id: SpanId,
         request: &SubagentSpawnRequest,
-        backend: aura_model::SubagentBackendKind,
+        backend: baybo_model::SubagentBackendKind,
     ) -> Result<Session, SubagentResult> {
         if let Some(resume_id) = request.resume_session_id.as_ref() {
             let child = match self.session_manager.get(resume_id).await {
@@ -694,9 +694,9 @@ impl ActorSubagentSpawner {
             // resolved once here from the child session id and reused
             // verbatim on every resume.
             child.state.subagent_backend = Some(match backend {
-                aura_model::SubagentBackendKind::Aura => aura_model::SubagentBackendTag::Aura,
-                aura_model::SubagentBackendKind::External(kind) => {
-                    aura_model::SubagentBackendTag::External {
+                baybo_model::SubagentBackendKind::Baybo => baybo_model::SubagentBackendTag::Baybo,
+                baybo_model::SubagentBackendKind::External(kind) => {
+                    baybo_model::SubagentBackendTag::External {
                         external_kind: kind,
                         workspace_dir: child.id.as_ref().to_string(),
                         resume_key: None,
@@ -720,7 +720,7 @@ impl ActorSubagentSpawner {
 /// `Arc<dyn SubagentDispatchLimiter>`, not `&self` — share the `&self`
 /// method's single implementation.
 fn release_reserved_slot(
-    limiter: &dyn aura_subagent::SubagentDispatchLimiter,
+    limiter: &dyn baybo_subagent::SubagentDispatchLimiter,
     root: &Option<SessionId>,
 ) {
     if let Some(id) = root {
@@ -742,7 +742,7 @@ async fn escort_background_terminal(
     task_summary: String,
     group: Option<String>,
     result: SubagentResult,
-    limiter: &Arc<dyn aura_subagent::SubagentDispatchLimiter>,
+    limiter: &Arc<dyn baybo_subagent::SubagentDispatchLimiter>,
     fan_out_root: &Option<SessionId>,
 ) {
     let child_session_id = result.child_session_id.clone();
@@ -783,7 +783,7 @@ struct ForegroundJob {
     child_session_id: SessionId,
     subagent_type: String,
     task_summary: String,
-    /// Cancels the underlying work — the child actor for the Aura backend, the
+    /// Cancels the underlying work — the child actor for the Baybo backend, the
     /// external subprocess for the External one. Registered on conversion so
     /// `/stop` reaches the now-background job, and fired directly on `Kill`.
     child_token: CancellationToken,
@@ -800,7 +800,7 @@ struct ForegroundJob {
 
 /// Run a foreground subagent's terminal `fut` under the foreground-wait
 /// policy — the half of foreground dispatch that's identical across backends
-/// (only `fut` differs: an Aura actor terminal vs an external-subprocess run,
+/// (only `fut` differs: an Baybo actor terminal vs an external-subprocess run,
 /// both resolving to a [`SubagentResult`]).
 ///
 /// A non-user parent blocks until terminal (no timer). A user-facing parent
@@ -813,9 +813,9 @@ async fn run_foreground_job(
     job: ForegroundJob,
     fut: impl std::future::Future<Output = SubagentResult>,
     supervisor: AgentSupervisor,
-    session_manager: Arc<aura_session::SessionManager>,
+    session_manager: Arc<baybo_session::SessionManager>,
     parent_id: SessionId,
-    limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
+    limiter: Arc<dyn baybo_subagent::SubagentDispatchLimiter>,
 ) {
     let ForegroundJob {
         user_facing,
@@ -919,7 +919,7 @@ async fn run_foreground_job(
 #[allow(clippy::too_many_arguments)]
 async fn convert_foreground_to_background(
     supervisor: &AgentSupervisor,
-    session_manager: &aura_session::SessionManager,
+    session_manager: &baybo_session::SessionManager,
     parent_id: &SessionId,
     child_session_id: &SessionId,
     subagent_type: &str,
@@ -927,7 +927,7 @@ async fn convert_foreground_to_background(
     child_token: CancellationToken,
     result_tx: oneshot::Sender<SubagentResult>,
 ) -> String {
-    let handle_id = aura_model::new_background_handle();
+    let handle_id = baybo_model::new_background_handle();
     let ack_text = format!(
         "[foreground subagent exceeded its {}s foreground wait — converted to background]\n- handle: {handle_id}\n- subagent_type: {subagent_type}\n- child_session: {child_session_id}\n\nIt keeps running; the runtime will surface its final message as a system reminder on a later turn.",
         SUBAGENT_FOREGROUND_WAIT.as_secs()
@@ -964,7 +964,7 @@ async fn convert_foreground_to_background(
 fn validate_resume_session(
     child: &Session,
     parent: &Session,
-    backend: aura_model::SubagentBackendKind,
+    backend: baybo_model::SubagentBackendKind,
     request_subagent_type: &str,
 ) -> Result<(), String> {
     let resume_id = &child.id;
@@ -1017,7 +1017,7 @@ fn validate_resume_session(
     // External resume requires the persisted resume_key. If `None`,
     // the prior call never reached its init event — resuming would
     // start a fresh conversation under the existing child_session_id.
-    if let aura_model::SubagentBackendTag::External {
+    if let baybo_model::SubagentBackendTag::External {
         external_kind,
         resume_key: None,
         ..
@@ -1046,7 +1046,7 @@ struct ExternalJobCtx {
 
 /// Wrap [`run_external_agent`] in a `Spawned` job so the external
 /// subagent's child session is visible/inspectable in the trace
-/// browser, mirroring how the in-process Aura backend's actor creates
+/// browser, mirroring how the in-process Baybo backend's actor creates
 /// a job per turn. The terminal `SubagentExitStatus` maps onto the
 /// job's terminal transition (Completed→complete, Failed→fail,
 /// Timeout→cancel(SubagentTimeout), Cancelled→cancel(ParentCancelled)).
@@ -1062,7 +1062,7 @@ async fn run_external_agent_job(
     kind: ExternalAgentKind,
     request: ExternalAgentRequest,
     child_session_id: SessionId,
-    session_manager: Arc<aura_session::SessionManager>,
+    session_manager: Arc<baybo_session::SessionManager>,
     job_ctx: ExternalJobCtx,
 ) -> SubagentResult {
     let cancel = request.cancel.clone();
@@ -1116,7 +1116,7 @@ async fn run_external_agent_job(
             job.session_id.clone(),
             job.id,
             SpanId::default(),
-            aura_llm::CallReason::Chat,
+            baybo_llm::CallReason::Chat,
             &format!("{} (external agent)", kind.as_str()),
             usage.input_tokens,
             usage.output_tokens,
@@ -1162,7 +1162,7 @@ async fn run_external_agent(
     kind: ExternalAgentKind,
     request: ExternalAgentRequest,
     child_session_id: SessionId,
-    session_manager: Arc<aura_session::SessionManager>,
+    session_manager: Arc<baybo_session::SessionManager>,
 ) -> (SubagentResult, Option<TokenUsage>) {
     // Persist the operator-supplied task up-front so the transcript
     // shows something even if the external agent crashes before
@@ -1285,7 +1285,7 @@ async fn run_external_agent(
 }
 
 async fn append_subagent_message(
-    session_manager: &Arc<aura_session::SessionManager>,
+    session_manager: &Arc<baybo_session::SessionManager>,
     session_id: &SessionId,
     msg: ChatMessage,
 ) {
@@ -1303,7 +1303,7 @@ async fn append_subagent_message(
 }
 
 async fn persist_resume_key(
-    session_manager: &Arc<aura_session::SessionManager>,
+    session_manager: &Arc<baybo_session::SessionManager>,
     session_id: &SessionId,
     kind: ExternalAgentKind,
     key: &str,
@@ -1315,7 +1315,7 @@ async fn persist_resume_key(
     // Read-modify-write: preserve workspace_dir (and bail loudly if
     // we're being called on a non-External session, which shouldn't
     // happen — only the External branch invokes this helper).
-    let Some(aura_model::SubagentBackendTag::External {
+    let Some(baybo_model::SubagentBackendTag::External {
         external_kind: stored_kind,
         resume_key,
         ..
@@ -1385,7 +1385,7 @@ async fn deliver_background_result(
 #[cfg(test)]
 mod resume_validation_tests {
     use super::*;
-    use aura_model::{ChannelType, JobId, SessionState, SpanId, TriggerSource, User};
+    use baybo_model::{ChannelType, JobId, SessionState, SpanId, TriggerSource, User};
     use chrono::Utc;
 
     fn mk_parent(id: &str) -> Session {
@@ -1413,7 +1413,7 @@ mod resume_validation_tests {
         id: &str,
         parent_id: &str,
         kind: LineageKind,
-        backend_tag: Option<aura_model::SubagentBackendTag>,
+        backend_tag: Option<baybo_model::SubagentBackendTag>,
     ) -> Session {
         let mut s = mk_parent(id);
         s.lineage = Some(Lineage {
@@ -1427,8 +1427,8 @@ mod resume_validation_tests {
         s
     }
 
-    fn aura_tag() -> aura_model::SubagentBackendTag {
-        aura_model::SubagentBackendTag::Aura
+    fn baybo_tag() -> baybo_model::SubagentBackendTag {
+        baybo_model::SubagentBackendTag::Baybo
     }
 
     #[test]
@@ -1438,7 +1438,7 @@ mod resume_validation_tests {
 
         // Subagent child: not convertible (its turn ends before a
         // notification could be delivered).
-        let child = mk_child("c", "p", LineageKind::Subagent, Some(aura_tag()));
+        let child = mk_child("c", "p", LineageKind::Subagent, Some(baybo_tag()));
         assert!(!parent_supports_background(&child));
 
         // Cron session: one-shot + unregistered, so notification can't
@@ -1450,28 +1450,28 @@ mod resume_validation_tests {
         assert!(!parent_supports_background(&cron));
     }
 
-    fn claude_tag(resume_key: Option<&str>) -> aura_model::SubagentBackendTag {
-        aura_model::SubagentBackendTag::External {
+    fn claude_tag(resume_key: Option<&str>) -> baybo_model::SubagentBackendTag {
+        baybo_model::SubagentBackendTag::External {
             external_kind: ExternalAgentKind::Claude,
             workspace_dir: "test-dir".into(),
             resume_key: resume_key.map(str::to_owned),
         }
     }
 
-    fn aura_request() -> aura_model::SubagentBackendKind {
-        aura_model::SubagentBackendKind::Aura
+    fn baybo_request() -> baybo_model::SubagentBackendKind {
+        baybo_model::SubagentBackendKind::Baybo
     }
 
-    fn claude_request() -> aura_model::SubagentBackendKind {
-        aura_model::SubagentBackendKind::External(ExternalAgentKind::Claude)
+    fn claude_request() -> baybo_model::SubagentBackendKind {
+        baybo_model::SubagentBackendKind::External(ExternalAgentKind::Claude)
     }
 
     #[test]
     fn rejects_hidden_child() {
         let parent = mk_parent("p");
-        let mut child = mk_child("c", "p", LineageKind::Subagent, Some(aura_tag()));
+        let mut child = mk_child("c", "p", LineageKind::Subagent, Some(baybo_tag()));
         child.hidden = true;
-        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
+        let err = validate_resume_session(&child, &parent, baybo_request(), "general-purpose")
             .expect_err("hidden child must reject");
         assert!(err.contains("hidden"), "got: {err}");
     }
@@ -1481,7 +1481,7 @@ mod resume_validation_tests {
         let parent = mk_parent("p");
         let mut child = mk_parent("c");
         child.lineage = None;
-        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
+        let err = validate_resume_session(&child, &parent, baybo_request(), "general-purpose")
             .expect_err("non-subagent child must reject");
         assert!(err.contains("is not a subagent"), "got: {err}");
     }
@@ -1493,9 +1493,9 @@ mod resume_validation_tests {
             "c",
             "different-parent",
             LineageKind::Subagent,
-            Some(aura_tag()),
+            Some(baybo_tag()),
         );
-        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
+        let err = validate_resume_session(&child, &parent, baybo_request(), "general-purpose")
             .expect_err("foreign-parent child must reject");
         assert!(err.contains("different parent"), "got: {err}");
     }
@@ -1507,14 +1507,14 @@ mod resume_validation_tests {
         // tag, no inference fallback.
         let parent = mk_parent("p");
         let child = mk_child("c", "p", LineageKind::Subagent, None);
-        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
+        let err = validate_resume_session(&child, &parent, baybo_request(), "general-purpose")
             .expect_err("untagged child must reject");
         assert!(err.contains("no recorded subagent_backend"), "got: {err}");
     }
 
     #[test]
-    fn aura_rejects_external_tagged_child() {
-        // Backend mismatch: child tagged External(Claude), resumed as Aura.
+    fn baybo_rejects_external_tagged_child() {
+        // Backend mismatch: child tagged External(Claude), resumed as Baybo.
         let parent = mk_parent("p");
         let child = mk_child(
             "c",
@@ -1522,19 +1522,19 @@ mod resume_validation_tests {
             LineageKind::Subagent,
             Some(claude_tag(Some("uuid"))),
         );
-        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
+        let err = validate_resume_session(&child, &parent, baybo_request(), "general-purpose")
             .expect_err("backend mismatch must reject");
         assert!(err.contains("backend="), "got: {err}");
         assert!(err.contains("claude"), "got: {err}");
     }
 
     #[test]
-    fn external_rejects_aura_tagged_child() {
-        // Reverse mismatch: child tagged Aura, resumed as External.
+    fn external_rejects_baybo_tagged_child() {
+        // Reverse mismatch: child tagged Baybo, resumed as External.
         let parent = mk_parent("p");
-        let child = mk_child("c", "p", LineageKind::Subagent, Some(aura_tag()));
+        let child = mk_child("c", "p", LineageKind::Subagent, Some(baybo_tag()));
         let err = validate_resume_session(&child, &parent, claude_request(), "general-purpose")
-            .expect_err("aura tag must not pass for external resume");
+            .expect_err("baybo tag must not pass for external resume");
         assert!(err.contains("backend="), "got: {err}");
     }
 
@@ -1567,11 +1567,11 @@ mod resume_validation_tests {
     }
 
     #[test]
-    fn aura_accepts_fresh_aura_child() {
+    fn baybo_accepts_fresh_baybo_child() {
         let parent = mk_parent("p");
-        let child = mk_child("c", "p", LineageKind::Subagent, Some(aura_tag()));
-        validate_resume_session(&child, &parent, aura_request(), "general-purpose")
-            .expect("aura→aura with matching tag must accept");
+        let child = mk_child("c", "p", LineageKind::Subagent, Some(baybo_tag()));
+        validate_resume_session(&child, &parent, baybo_request(), "general-purpose")
+            .expect("baybo→baybo with matching tag must accept");
     }
 
     #[test]
@@ -1580,9 +1580,9 @@ mod resume_validation_tests {
         // `general-purpose` — that would run a different profile's
         // prompt over the existing transcript.
         let parent = mk_parent("p");
-        let mut child = mk_child("c", "p", LineageKind::Subagent, Some(aura_tag()));
+        let mut child = mk_child("c", "p", LineageKind::Subagent, Some(baybo_tag()));
         child.state.subagent_type = Some("planner".into());
-        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
+        let err = validate_resume_session(&child, &parent, baybo_request(), "general-purpose")
             .expect_err("profile swap must reject");
         assert!(err.contains("planner"), "got: {err}");
         assert!(err.contains("general-purpose"), "got: {err}");
@@ -1591,9 +1591,9 @@ mod resume_validation_tests {
     #[test]
     fn accepts_resume_with_matching_subagent_type() {
         let parent = mk_parent("p");
-        let mut child = mk_child("c", "p", LineageKind::Subagent, Some(aura_tag()));
+        let mut child = mk_child("c", "p", LineageKind::Subagent, Some(baybo_tag()));
         child.state.subagent_type = Some("planner".into());
-        validate_resume_session(&child, &parent, aura_request(), "planner")
+        validate_resume_session(&child, &parent, baybo_request(), "planner")
             .expect("matching subagent_type must accept");
     }
 }
@@ -1601,11 +1601,11 @@ mod resume_validation_tests {
 #[cfg(test)]
 mod foreground_job_tests {
     //! Backend-agnostic foreground-wait policy ([`run_foreground_job`]), shared
-    //! by the Aura and External backends. The terminal future is faked here;
+    //! by the Baybo and External backends. The terminal future is faked here;
     //! the convert/escort plumbing it calls is exercised end-to-end by the
     //! integration suite.
     use super::*;
-    use aura_session::test_support::{
+    use baybo_session::test_support::{
         MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
     };
 
@@ -1660,7 +1660,7 @@ mod foreground_job_tests {
             test_supervisor(),
             test_session_manager(),
             SessionId::from("parent"),
-            aura_subagent::unbounded_limiter(),
+            baybo_subagent::unbounded_limiter(),
         ));
     }
 

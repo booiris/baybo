@@ -5,7 +5,7 @@
 // as consumer Chrome, minus auto-update + sign-in). Not Chromium (the
 // open-source upstream).
 //
-// The sidecar auto-downloads Chrome for Testing into Aura's cache on
+// The sidecar auto-downloads Chrome for Testing into Baybo's cache on
 // first boot (see `tool-src/browser/src/server.ts::findExistingChrome`),
 // so this script is **not required for normal operation**. Run it
 // only when you want to seed the cache before first agent use — e.g.
@@ -33,7 +33,7 @@ function xdgCacheHome() {
 }
 
 const cacheDir =
-  process.env["AURA_BROWSER_CACHE_DIR"] ?? join(xdgCacheHome(), "aura", "browser", "chrome");
+  process.env["BAYBO_BROWSER_CACHE_DIR"] ?? join(xdgCacheHome(), "baybo", "browser", "chrome");
 mkdirSync(cacheDir, { recursive: true });
 
 const platform = detectBrowserPlatform();

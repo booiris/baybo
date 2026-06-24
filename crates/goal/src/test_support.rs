@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use aura_model::{Goal, SessionId};
-use aura_store::goal::{GoalPatch, GoalStore, Result};
+use baybo_model::{Goal, SessionId};
+use baybo_store::goal::{GoalPatch, GoalStore, Result};
 use parking_lot::Mutex;
 
 /// Maps each session to its single current goal. Mirrors `LibsqlGoalStore`

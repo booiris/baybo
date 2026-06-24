@@ -2,7 +2,7 @@
 rustflags = [
     "-C",
     "link-arg=-fuse-ld=lld",
-    "--remap-path-prefix=/data=/aura-src",
+    "--remap-path-prefix=/data=/baybo-src",
 ]
 
 [build]

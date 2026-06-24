@@ -2,7 +2,7 @@
 //!
 //! All MCP-related secrets share the `mcp.<name>.…` prefix so a single
 //! enumeration scrubs every credential when a server is removed.
-//! Both `aura-cli` (writer) and the transport layer (reader) go through
+//! Both `baybo-cli` (writer) and the transport layer (reader) go through
 //! these helpers — never hand-format the strings.
 
 pub fn env_bag(name: &str) -> String {
@@ -27,7 +27,7 @@ pub fn oauth_credentials(name: &str) -> String {
 }
 
 /// All vault keys ever associated with a server, in the deletion order.
-/// `aura mcp remove` calls `delete_secret` on each in turn so a single
+/// `baybo mcp remove` calls `delete_secret` on each in turn so a single
 /// pass scrubs every secret the server ever stored.
 pub fn all_keys_for(name: &str) -> [String; 4] {
     [

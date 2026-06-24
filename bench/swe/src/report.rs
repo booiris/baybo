@@ -212,7 +212,7 @@ mod tests {
             dataset: "SWE-bench_Lite".to_string(),
             split: "test".to_string(),
             arm: "agent".to_string(),
-            model: "aura".to_string(),
+            model: "baybo".to_string(),
         }
     }
 

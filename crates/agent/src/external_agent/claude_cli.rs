@@ -3,7 +3,7 @@
 //!
 //! Security: hardcoded `--permission-mode bypassPermissions`. claude's
 //! interactive permission gates can't reach a non-TTY subprocess, so
-//! we opt into "trust the agent". aura's sandbox / sensitive_paths /
+//! we opt into "trust the agent". baybo's sandbox / sensitive_paths /
 //! approval gate do NOT apply to claude's internal tool calls. The
 //! per-spawn `--add-dir <workspace_dir>` only constrains claude's
 //! *default* working area, not its absolute-path reach.
@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_llm::TokenUsage;
-use aura_model::{ChatMessage, ContentBlock, ExternalAgentKind, ThinkingContent};
+use baybo_llm::TokenUsage;
+use baybo_model::{ChatMessage, ContentBlock, ExternalAgentKind, ThinkingContent};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -43,7 +43,7 @@ pub struct ClaudeCliAgent {
     model: String,
     /// Egress proxy injected into the child's env so the external CLI's
     /// own LLM calls route through it. `None` = inherit the parent env.
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
 }
 
 impl ClaudeCliAgent {
@@ -54,7 +54,7 @@ impl ClaudeCliAgent {
     /// this for fail-fast registration.
     pub fn probe_and_build(
         binary_path: Option<&str>,
-        proxy: Option<aura_security::http::ProxySettings>,
+        proxy: Option<baybo_security::http::ProxySettings>,
     ) -> Result<Arc<Self>> {
         let resolved = resolve_binary(
             binary_path,
@@ -421,7 +421,7 @@ enum AssistantBlock {
 }
 
 impl AssistantBlock {
-    /// Project the wire-format block into aura's `ContentBlock` shape.
+    /// Project the wire-format block into baybo's `ContentBlock` shape.
     /// Empty text / unknown variants drop out (`None`).
     fn into_content_block(self) -> Option<ContentBlock> {
         match self {
@@ -468,7 +468,7 @@ enum UserBlock {
 }
 
 /// claude allows `tool_result.content` to be either a plain string or
-/// an array of structured blocks (text/image). aura's `ToolResult`
+/// an array of structured blocks (text/image). baybo's `ToolResult`
 /// stores a single string, so the array form is JSON-stringified
 /// rather than dropped.
 #[derive(Debug, Default, Deserialize)]

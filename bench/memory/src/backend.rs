@@ -1,5 +1,5 @@
 //! Backend glue, all through the backends' concrete (context-free) methods in
-//! `aura_memory::backends` — no `MemoryContext`, no Aura agent/trace/tool stack.
+//! `baybo_memory::backends` — no `MemoryContext`, no Baybo agent/trace/tool stack.
 //! A [`BackendHandle`] unifies the two real backends behind the three things the
 //! harness needs: ingest a conversation, settle extraction to true completion,
 //! and recall (read-only).
@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use aura_memory::RecalledMemory;
-use aura_memory::backends::mem0::{Mem0Config, Mem0Memory};
-use aura_memory::backends::openviking::{OpenVikingConfig, OpenVikingMemory};
+use baybo_memory::RecalledMemory;
+use baybo_memory::backends::mem0::{Mem0Config, Mem0Memory};
+use baybo_memory::backends::openviking::{OpenVikingConfig, OpenVikingMemory};
 
 use crate::testset::{BenchConversation, BenchSample};
 use crate::{ConvScope, MEM0_API_KEY_ENV, scope_session_id};

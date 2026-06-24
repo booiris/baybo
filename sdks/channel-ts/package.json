@@ -1,8 +1,8 @@
 {
-  "name": "@aura/channel-sdk",
+  "name": "@baybo/channel-sdk",
   "version": "0.2.0",
   "private": true,
-  "description": "WebSocket + MessagePack channel SDK for Aura sidecars",
+  "description": "WebSocket + MessagePack channel SDK for Baybo sidecars",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -25,7 +25,7 @@
     "src"
   ],
   "scripts": {
-    "gen:types": "cd ../.. && cargo test -p aura-channels --features ts-export --lib wire::export",
+    "gen:types": "cd ../.. && cargo test -p baybo-channels --features ts-export --lib wire::export",
     "build": "tsc",
     "check": "tsc --noEmit",
     "test": "node --test 'test/**/*.test.mjs'"

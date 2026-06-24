@@ -4,7 +4,7 @@
 
 An **external agent** is a subagent backend whose work is delegated to a
 subprocess (or other out-of-process driver) instead of running on an
-in-process aura `AgentActor`. Three are registered today:
+in-process baybo `AgentActor`. Three are registered today:
 
 - **`claude`** drives `claude` (Anthropic Claude Code) — billed
   against the operator's Claude Code Max/Pro subscription.
@@ -13,8 +13,8 @@ in-process aura `AgentActor`. Three are registered today:
 - **`gemini`** drives `gemini` (Google Gemini CLI) — billed against
   the operator's Google account / Gemini API key.
 
-All three let an aura subagent's task be handled by the external
-agent's own autonomous loop without spending aura's own per-token API
+All three let an baybo subagent's task be handled by the external
+agent's own autonomous loop without spending baybo's own per-token API
 credit.
 
 Where the LLM crate handles "send messages, get back text" for HTTP
@@ -27,33 +27,33 @@ different flavor of LLM:
   terminating in `FinalContent`. There's no mailbox you keep poking;
   follow-ups happen via a fresh spawn with `resume_session_id`.
 - **Autonomous internal tool loop.** claude makes its own
-  `Bash`/`Read`/`Write`/`WebFetch` calls. aura's `sandbox` /
+  `Bash`/`Read`/`Write`/`WebFetch` calls. baybo's `sandbox` /
   `sensitive_paths` / `approval gate` do **not** apply to those tool
   calls — see the security note below.
 - **External-side state.** Resume continuity lives in the agent's own
   session store (e.g. claude's local session uuid), exposed via a
-  `resume_key` event that aura persists onto the child Session.
+  `resume_key` event that baybo persists onto the child Session.
 
 ## Where things live
 
-- `aura_model::SubagentBackend` — `Aura { llm: Option<String> } |
+- `baybo_model::SubagentBackend` — `Baybo { llm: Option<String> } |
   External { kind: ExternalAgentKind }`. Carried on
   `SubagentSpawnRequest.backend`.
-- `aura_model::ExternalAgentKind` — discriminator enum: `Claude`,
+- `baybo_model::ExternalAgentKind` — discriminator enum: `Claude`,
   `Codex`, `Gemini`. Carried on `SubagentBackendTag::External {
   external_kind, workspace_dir, resume_key }`.
-- `aura_model::SubagentBackendKind` — discriminator-only view of
+- `baybo_model::SubagentBackendKind` — discriminator-only view of
   `SubagentBackendTag` for runtime decisions that don't care about
   per-instance state (resume validation, error labels, dispatch).
-- `aura_agent::external_agent::ExternalAgent` — async trait with one
+- `baybo_agent::external_agent::ExternalAgent` — async trait with one
   method: `run(request) -> Result<Stream<ExternalAgentEvent>>`.
-- `aura_agent::external_agent::ExternalAgentRegistry` — built at boot
+- `baybo_agent::external_agent::ExternalAgentRegistry` — built at boot
   in `src/runtime.rs`; the spawn router looks impls up by kind.
-- `aura_agent::external_agent::claude_cli::ClaudeCliAgent` — concrete
+- `baybo_agent::external_agent::claude_cli::ClaudeCliAgent` — concrete
   impl for `claude -p` (subprocess + stream-json NDJSON parser +
   ETXTBSY-retrying existence check).
-- `aura_agent::actor::router::system_spawn::subagent` — branches on
-  `request.backend`: `Aura` takes the existing `AgentActor` spawn
+- `baybo_agent::actor::router::system_spawn::subagent` — branches on
+  `request.backend`: `Baybo` takes the existing `AgentActor` spawn
   path; `External` looks up the agent, builds a fresh child Session
   (or loads an existing one on resume), runs the agent, persists any
   emitted resume_key, returns a `SubagentResult`.
@@ -67,8 +67,8 @@ spawn_subagent({
   "timeout_secs": 600,
 
   // Backend selection:
-  "backend": "claude",         // or "aura" (default)
-  "llm": "fast",                   // only valid when backend = "aura"
+  "backend": "claude",         // or "baybo" (default)
+  "llm": "fast",                   // only valid when backend = "baybo"
 
   // Optional:
   "workspace_name": "...",         // human-readable working-dir slug
@@ -109,10 +109,10 @@ On a resume spawn, the router:
    (The spawn-tool parser rejects `workspace_name` combined with
    `resume_session_id` to make this explicit.)
 
-Continuity survives aura restarts because the child Session row is
+Continuity survives baybo restarts because the child Session row is
 durable.
 
-The same `resume_session_id` field also works for the Aura backend:
+The same `resume_session_id` field also works for the Baybo backend:
 the spawn router loads the existing child Session, the freshly-spawned
 one-shot `AgentActor` hydrates the prior transcript via
 `restore_transcript_from_store()`, and the new task lands on top of
@@ -124,7 +124,7 @@ identity tag — for External, this includes the resolved
 `workspace_dir` and `resume_key: None`. Resume validation reads that
 field and demands matching identity. Three rejection paths:
 
-1. Backend mismatch — Aura cannot be resumed as External (or vice
+1. Backend mismatch — Baybo cannot be resumed as External (or vice
    versa); kind mismatch within External rejected too. Compared by
    projecting both sides to `SubagentBackendKind`, which ignores
    `resume_key` and `workspace_dir`.
@@ -156,8 +156,8 @@ the child session's transcript looks like a normal agent loop:
   `Assistant Thinking::Summary`; `command_execution` and `file_change`
   emit a paired `Assistant ToolUse` + `Tool ToolResult`. Tool names
   are codex-prefixed (`codex_shell`, `codex_file_change`) so a reader
-  cannot mistake them for aura-routed tool invocations — these
-  bypass aura's sandbox + approval gate by design.
+  cannot mistake them for baybo-routed tool invocations — these
+  bypass baybo's sandbox + approval gate by design.
 - gemini: assistant `message` deltas → accumulated into one
   `Assistant Text` per run; `tool_use` / `tool_result` events emit a
   paired `Assistant ToolUse` + `Tool ToolResult` linked by `tool_id`,
@@ -170,7 +170,7 @@ treats it as a result signal only and does not double-write.
 
 `run_external_agent_job` wraps each run in a `Spawned` job
 (`JobLifecycle::start_job` → `start` → terminal transition), the same
-job kind the in-process Aura backend mints per turn. Without a job the
+job kind the in-process Baybo backend mints per turn. Without a job the
 child session is invisible to the trace browser:
 `QueryApi::list_session_summaries` drops zero-job sessions and
 `GET /v1/traces/{id}` 404s on them. The terminal `SubagentExitStatus`
@@ -182,7 +182,7 @@ subprocess.
 
 External runs record **no step/span tree** — the agent's internal
 loop is opaque, and faking `LlmCall` spans would pollute cost /
-analytics with calls aura never made. So the trace detail page
+analytics with calls baybo never made. So the trace detail page
 (`web/src/pages/TraceSessionPage.tsx`) falls back to rendering the
 persisted `session_messages` transcript directly when a job has zero
 steps. Net frontend behaviour: the external subagent appears in the
@@ -211,14 +211,14 @@ The `ExternalAgentEvent::Usage` the parser emits is captured by
 
 `claude -p` runs with `--permission-mode bypassPermissions`
 hardcoded. claude's interactive permission prompts can't reach
-aura's non-TTY subprocess; bypass means every file edit, bash
+baybo's non-TTY subprocess; bypass means every file edit, bash
 command, and network call claude decides to make happens with no
-further confirmation. **aura's `sandbox` / `sensitive_paths` /
+further confirmation. **baybo's `sandbox` / `sensitive_paths` /
 `approval gate` do NOT apply to claude's internal tool calls.** The
 per-spawn `--add-dir <workspace_dir>` only constrains claude's
 *default* working area, not its absolute-path reach. Treat
 `spawn_subagent(backend: "claude", ...)` as equivalent to
-running `claude -p '...'` in a shell on the aura host.
+running `claude -p '...'` in a shell on the baybo host.
 
 ## claude — where it runs
 
@@ -250,8 +250,8 @@ disk delete the dir manually.
 External agents are **disabled by default** even when their binary
 is installed on `PATH`. A claude/codex binary alone is not the
 trust signal — the operator must set `enabled: true` (via
-`aura external-agent setup`, `aura setup`, or by editing
-`aura.json`) to make the LLM able to invoke that backend.
+`baybo external-agent setup`, `baybo setup`, or by editing
+`baybo.json`) to make the LLM able to invoke that backend.
 
 At boot, when `enabled: true`, `ClaudeCliAgent::probe_and_build`
 resolves the binary, runs `claude --version` (with an ETXTBSY retry
@@ -288,7 +288,7 @@ Event mapping (vs claude's `stream-json`):
 - `item.completed { item: { type: "command_execution", … } }` →
   emit `Intermediate(Assistant ToolUse name="codex_shell")` followed by
   `Intermediate(Tool ToolResult)`. Name is codex-prefixed so transcript
-  readers don't confuse it with an aura-audited tool call.
+  readers don't confuse it with an baybo-audited tool call.
 - `item.completed { item: { type: "file_change", changes } }` →
   same `ToolUse` + `ToolResult` pair with `name="codex_file_change"`.
 - `turn.completed { usage }` → emit `Usage` + `FinalContent`.
@@ -357,7 +357,7 @@ Event mapping (vs claude's `stream-json` / codex's JSONL):
   spawn router already persisted the task).
 - `{"type":"tool_use","tool_name":…,"tool_id":…,"parameters":…}` →
   `Intermediate(Assistant ToolUse)`, name prefixed `gemini_` so a
-  transcript reader can't confuse it with an aura-audited tool call.
+  transcript reader can't confuse it with an baybo-audited tool call.
 - `{"type":"tool_result","tool_id":…,"status":…,"output":…}` →
   `Intermediate(Tool ToolResult)`, linked by `tool_id`. Output may be
   absent; the status string stands in.
@@ -413,11 +413,11 @@ may resolve it.
 
 ## CLI commands
 
-- `aura external-agent status` — show each kind's configured binary
+- `baybo external-agent status` — show each kind's configured binary
   path and an offline re-probe result (was the binary found and
   does `--version` execute?). Pure read; the running daemon's
   registry isn't affected.
-- `aura external-agent setup` — interactive wizard: single-select
+- `baybo external-agent setup` — interactive wizard: single-select
   one kind, prompt binary path (empty = PATH lookup), run the
   probe, then persist the **resolved absolute path** to
   `external_agents.<kind>.binary_path` on success. Even an empty
@@ -427,7 +427,7 @@ may resolve it.
   would leave multiple kinds configured without a default, the
   wizard also prompts for `default_external_agent`. Restarts the
   gateway to take effect.
-- `aura external-agent disable` — interactive multi-select: check the
+- `baybo external-agent disable` — interactive multi-select: check the
   currently-enabled kinds to turn off and set each
   `external_agents.<kind>.enabled = false`. If a disabled kind was
   `default_external_agent`, the default is re-resolved (cleared when
@@ -435,21 +435,21 @@ may resolve it.
   recorded `binary_path` is left intact for an easy re-enable. When
   nothing is enabled it's a no-op success — the feature is already
   off. Restarts the gateway to take effect.
-- `aura external-agent default` — interactive picker that sets
+- `baybo external-agent default` — interactive picker that sets
   `external_agents.default_external_agent` to one of the
   currently-enabled kinds. Errors when nothing is enabled. The
   default is an operator-facing designation (the spawn protocol
   still requires an explicit `backend`), so it only matters once
   more than one kind is enabled; nothing in the boot/spawn path
   reads it yet, so **no gateway restart** is needed.
-- `aura setup` (quick mode) probes every kind on PATH after the
+- `baybo setup` (quick mode) probes every kind on PATH after the
   other setup steps. Each detected binary triggers a y/n confirm;
   the operator picks which to enable. If multiple end up enabled,
   prompts for `default_external_agent` automatically.
 
 ## Adding a new external agent
 
-1. Add a variant to `aura_model::ExternalAgentKind`.
+1. Add a variant to `baybo_model::ExternalAgentKind`.
 2. Write a new module under `crates/agent/src/external_agent/`
    implementing the `ExternalAgent` trait. Emit `ResumeKey` if the
    underlying tool supports continuation; otherwise just emit

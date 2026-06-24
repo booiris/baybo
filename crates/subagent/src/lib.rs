@@ -12,10 +12,10 @@
 //!
 //! This crate owns the subagent domain end to end: profile
 //! definitions, the registry, the fan-out dispatch limiter, and the
-//! `spawn_subagent` tool itself. Like `aura-cron` and `aura-skills`, it
-//! depends on `aura-tools` for the `Tool` trait rather than letting its
-//! tool live in `aura-tools` — a domain crate owns its own tools, and
-//! `aura-tools` must not depend back on one (that would be a cycle).
+//! `spawn_subagent` tool itself. Like `baybo-cron` and `baybo-skills`, it
+//! depends on `baybo-tools` for the `Tool` trait rather than letting its
+//! tool live in `baybo-tools` — a domain crate owns its own tools, and
+//! `baybo-tools` must not depend back on one (that would be a cycle).
 
 mod builtin;
 mod dispatch;

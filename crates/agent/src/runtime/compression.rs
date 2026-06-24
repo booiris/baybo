@@ -1,8 +1,8 @@
 //! Agent-side wiring for both context-compression flows.
 //!
-//! `aura-context` deliberately doesn't know about `SpanRecorder`,
+//! `baybo-context` deliberately doesn't know about `SpanRecorder`,
 //! `CostManager`, or `JobId` — those are agent-layer concerns. The
-//! `ContextManager::maybe_compress` and `aura_context::run_background_summary`
+//! `ContextManager::maybe_compress` and `baybo_context::run_background_summary`
 //! APIs both take chat callbacks so the caller can inject all of that
 //! cross-cutting machinery without polluting the context crate.
 //!
@@ -15,7 +15,7 @@
 //! - [`BackgroundCompressionRunner`] is the in-actor background pass:
 //!   it gathers the agent-layer deps, adapts `CompressionRunner` to the
 //!   context callback shape, and delegates the rest of the flow to
-//!   [`aura_context::run_background_summary`]. The pass is spawned
+//!   [`baybo_context::run_background_summary`]. The pass is spawned
 //!   detached by [`crate::runtime::agent_loop::AgentLoop`].
 //! - [`reap_orphan_summaries`] is the startup cleanup pass that
 //!   removes FS-orphan summary directories from a previous boot.
@@ -24,14 +24,14 @@
 
 use std::sync::Arc;
 
-use aura_context::{
+use baybo_context::{
     BackgroundSummaryConfig, BackgroundSummaryOutcome, Tokenizer, run_background_summary,
 };
-use aura_llm::{Attribution, BillableLlm, ModelInfo};
-use aura_model::{BackgroundCompressionPayload, JobId, SessionId};
-use aura_session::SessionManager;
-use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepKind};
-use aura_workspace::WorkspacePaths;
+use baybo_llm::{Attribution, BillableLlm, ModelInfo};
+use baybo_model::{BackgroundCompressionPayload, JobId, SessionId};
+use baybo_session::SessionManager;
+use baybo_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepKind};
+use baybo_workspace::WorkspacePaths;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -71,9 +71,9 @@ impl CompressionRunner {
     /// method returns `Err`.
     pub(crate) async fn run(
         self,
-        request: aura_llm::ChatRequest,
-        input_marker: aura_trace::LlmCallInputs,
-    ) -> Result<aura_context::SummaryChatRun, aura_context::ContextError> {
+        request: baybo_llm::ChatRequest,
+        input_marker: baybo_trace::LlmCallInputs,
+    ) -> Result<baybo_context::SummaryChatRun, baybo_context::ContextError> {
         let CompressionRunner {
             llm_client,
             recorder,
@@ -85,7 +85,7 @@ impl CompressionRunner {
             cancel_token,
         } = self;
 
-        let cancel_ctx = Some((&cancel_token, aura_job::CancelReason::ParentCancelled));
+        let cancel_ctx = Some((&cancel_token, baybo_job::CancelReason::ParentCancelled));
         let begin = LlmCallBegin {
             model_id: model_info.id.clone(),
             provider: model_info.provider.clone(),
@@ -121,7 +121,7 @@ impl CompressionRunner {
                             session_id: session_id.clone(),
                             job_id,
                             span_id: span.span_id,
-                            reason: aura_llm::CallReason::Compression,
+                            reason: baybo_llm::CallReason::Compression,
                         });
                         match bound.chat(&request).await {
                             Ok(billed) => {
@@ -150,7 +150,7 @@ impl CompressionRunner {
                                 };
                                 (
                                     call_result,
-                                    Ok(aura_context::SummaryChatRun {
+                                    Ok(baybo_context::SummaryChatRun {
                                         response,
                                         span_id: span_id_str,
                                         cost_micros: billed.cost_micros.into_micros(),
@@ -171,14 +171,14 @@ impl CompressionRunner {
             },
         )
         .await
-        .map_err(|e| aura_context::ContextError::Compression(e.to_string()))
+        .map_err(|e| baybo_context::ContextError::Compression(e.to_string()))
     }
 }
 
 /// Inputs for one background-summary pass — all the agent-layer
 /// machinery the dedicated handler needs without dragging the entire
 /// `AgentLoop` surface in. The actual flow lives in
-/// [`aura_context::run_background_summary`]; this struct is the
+/// [`baybo_context::run_background_summary`]; this struct is the
 /// agent-side adapter.
 pub(crate) struct BackgroundCompressionRunner {
     pub llm_client: Arc<BillableLlm>,
@@ -199,7 +199,7 @@ pub(crate) struct BackgroundCompressionRunner {
 impl BackgroundCompressionRunner {
     /// Execute one background-summary pass. Adapts the agent-layer
     /// `CompressionRunner` to the context callback shape and delegates
-    /// the rest of the flow to [`aura_context::run_background_summary`].
+    /// the rest of the flow to [`baybo_context::run_background_summary`].
     pub async fn run(
         self,
         payload: BackgroundCompressionPayload,
@@ -235,7 +235,7 @@ impl BackgroundCompressionRunner {
         // outside; the closure rebuilds a fresh runner per call. The
         // runner's per-call `Compression` step + `LlmCall` span are
         // each treated as one iteration in telemetry.
-        let chat: aura_context::BackgroundSummaryCallback = Box::new(move |req, marker| {
+        let chat: baybo_context::BackgroundSummaryCallback = Box::new(move |req, marker| {
             let runner = CompressionRunner {
                 llm_client: llm_client.clone(),
                 recorder: recorder.clone(),

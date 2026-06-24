@@ -10,12 +10,12 @@
 
 use std::sync::Arc;
 
-use aura_channels::ChannelKind;
-use aura_config::ChannelsConfig;
-use aura_gateway::auth::WEB_CLIENT_LABEL_PREFIX;
-use aura_gateway::channel::boot;
-use aura_gateway::test_support::build_test_deps;
-use aura_model::{ChatMessage, ContentBlock, SessionId};
+use baybo_channels::ChannelKind;
+use baybo_config::ChannelsConfig;
+use baybo_gateway::auth::WEB_CLIENT_LABEL_PREFIX;
+use baybo_gateway::channel::boot;
+use baybo_gateway::test_support::build_test_deps;
+use baybo_model::{ChatMessage, ContentBlock, SessionId};
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
@@ -198,9 +198,9 @@ async fn chat_api_round_trip() {
 // ── helpers ─────────────────────────────────────────────────────────
 
 fn build_admin_state(
-    tg: &aura_gateway::test_support::TestGateway,
-) -> aura_gateway::server::AdminState {
-    aura_gateway::server::AdminState {
+    tg: &baybo_gateway::test_support::TestGateway,
+) -> baybo_gateway::server::AdminState {
+    baybo_gateway::server::AdminState {
         config: Arc::clone(&tg.deps.config),
         config_path: tg.deps.config_path.clone(),
         session_manager: Arc::clone(&tg.deps.session_manager),
@@ -209,7 +209,7 @@ fn build_admin_state(
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
         goal_store: tg.deps.stores.goal.clone(),
-        query_api: Arc::new(aura_query::QueryApi::new(
+        query_api: Arc::new(baybo_query::QueryApi::new(
             tg.deps.session_manager.store(),
             Arc::clone(&tg.deps.job_lifecycle),
             tg.deps.stores.trace.clone(),
@@ -231,8 +231,8 @@ fn build_admin_state(
     }
 }
 
-fn build_router(state: aura_gateway::server::AdminState) -> axum::Router {
-    let (router, _spec) = aura_gateway::api::admin::v1_router_and_spec();
+fn build_router(state: baybo_gateway::server::AdminState) -> axum::Router {
+    let (router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();
     router.with_state(state)
 }
 
@@ -468,7 +468,7 @@ async fn list_sessions_exposes_last_user_text_preview() {
 // `include_hidden`.
 #[tokio::test]
 async fn cron_sessions_split_into_dedicated_endpoint() {
-    use aura_model::{ChannelType, TriggerSource, User};
+    use baybo_model::{ChannelType, TriggerSource, User};
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
@@ -576,11 +576,11 @@ async fn cron_sessions_split_into_dedicated_endpoint() {
 // the protocol invariant that http is `Subscribed`.
 #[test]
 fn http_channel_kind_is_subscribed() {
-    let reg = Arc::new(aura_channels::ChannelRegistry::new());
+    let reg = Arc::new(baybo_channels::ChannelRegistry::new());
     let cfg = ChannelsConfig::default();
     boot::install_channels(&reg, &cfg).expect("install");
     let ch = reg
-        .get(&aura_model::ChannelType::http())
+        .get(&baybo_model::ChannelType::http())
         .expect("http channel exists");
     assert_eq!(ch.kind(), ChannelKind::Subscribed);
 }
@@ -591,12 +591,12 @@ fn http_channel_kind_is_subscribed() {
 // them.
 #[tokio::test]
 async fn channel_multi_attach_fans_out_to_all_subscribers() {
-    use aura_channels::wire::Frame;
-    use aura_channels::{
+    use baybo_channels::wire::Frame;
+    use baybo_channels::{
         AgentEvent, AgentOutput, Channel, ChannelKind, Connection, ConnectionSink, OutgoingMessage,
         SendOutcome, SessionEvent,
     };
-    use aura_model::{ChannelType, MessageMetadata};
+    use baybo_model::{ChannelType, MessageMetadata};
     use parking_lot::Mutex;
 
     struct VecSink {
@@ -639,7 +639,7 @@ async fn channel_multi_attach_fans_out_to_all_subscribers() {
         session_id: "sess-shared".into(),
         user_id: "u1".into(),
         channel: ChannelType::http(),
-        content: vec![aura_model::ContentBlock::Text("hi".into())],
+        content: vec![baybo_model::ContentBlock::Text("hi".into())],
         reply_to: None,
         metadata: MessageMetadata::default(),
         ordinal: None,
@@ -666,7 +666,7 @@ async fn channel_multi_attach_fans_out_to_all_subscribers() {
         user_id: String::new(),
         channel: ChannelType::http(),
         event: AgentEvent::Notice {
-            level: aura_channels::NoticeLevel::Info,
+            level: baybo_channels::NoticeLevel::Info,
             text: "ignored".into(),
         },
     });

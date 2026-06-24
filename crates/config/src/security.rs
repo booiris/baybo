@@ -1,4 +1,4 @@
-use aura_workspace::paths::{ENCRYPTION_KEY_FILE, KEY_DIR, default_workspace_root};
+use baybo_workspace::paths::{ENCRYPTION_KEY_FILE, KEY_DIR, default_workspace_root};
 use serde::{Deserialize, Serialize};
 
 /// Security-related configuration: encryption key location and leak detection.
@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 pub struct SecurityConfig {
     /// Absolute path to a file containing a 32-byte hex-encoded encryption
     /// key. Required: validation refuses to load a config without it.
-    /// `aura setup` mints one under `<workspace>/.key/encryption.key`
+    /// `baybo setup` mints one under `<workspace>/.key/encryption.key`
     /// (mode 0600) on first run; `Default` points at the same location
     /// derived from `default_workspace_root()` so a fresh
-    /// `AuraConfig::default()` still passes validation as long as the
+    /// `BayboConfig::default()` still passes validation as long as the
     /// file has been minted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption_key_file: Option<String>,

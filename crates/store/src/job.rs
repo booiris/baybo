@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aura_model::{JobId, SessionId};
+use baybo_model::{JobId, SessionId};
 use chrono::{DateTime, Utc};
 
 use crate::StorageError;
@@ -10,7 +10,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 ///
 /// The full domain `Job` (with its state machine and rich field types)
 /// is serialized into `data`; the remaining fields are projected out so
-/// the backend can index/filter without deserializing. `aura-job` owns
+/// the backend can index/filter without deserializing. `baybo-job` owns
 /// the `Job` type and converts to/from this row at the persistence
 /// boundary (`Job::to_row` / `Job::from_row`) — that keeps the job state
 /// machine out of this leaf crate while still letting `JobStore` live
@@ -43,7 +43,7 @@ pub struct JobTransitionRow {
 }
 
 /// Persistence backend for jobs and their transition audit log. Trades
-/// in [`JobRow`] / [`JobTransitionRow`] rather than the rich `aura-job`
+/// in [`JobRow`] / [`JobTransitionRow`] rather than the rich `baybo-job`
 /// types so the contract stays in this leaf crate.
 #[async_trait]
 pub trait JobStore: Send + Sync {

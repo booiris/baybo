@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `aura-memory` crate defines a **single pluggable [`Memory`] trait**. The
+The `baybo-memory` crate defines a **single pluggable [`Memory`] trait**. The
 system knows memory only through one `Arc<dyn Memory>` slot (not a many-registry
 like tools/channels): at most one implementation is registered at startup. The
 trait is intentionally thin and **storage-opaque** — an implementation owns its
@@ -85,8 +85,8 @@ span, attributed to the real user/session/job. The impl never constructs a bare
 Recalled memories enter the prompt as a **persisted, framed** block — never
 `Role::System`. The path mirrors the user-interjection pattern:
 
-- `MessageSource::RecalledMemory` (`aura-model`) + `ChatMessage::recalled_memory`.
-- `aura_context::prompts::recalled_memory` — a `<recalled_memory>` envelope,
+- `MessageSource::RecalledMemory` (`baybo-model`) + `ChatMessage::recalled_memory`.
+- `baybo_context::prompts::recalled_memory` — a `<recalled_memory>` envelope,
   re-derived wire-only in `ContextManager::messages_for_llm` (via
   `frame_recalled_memories`, alongside `frame_interjections` — both delegate to
   one `frame_source_runs` helper). The budget counts the framed size.
@@ -140,7 +140,7 @@ opened and nothing is billed, so the no-op path is genuinely inert.
 
 ## Config
 
-`MemoryConfig` on `AuraConfig` (`crates/config/src/memory.rs`): typed
+`MemoryConfig` on `BayboConfig` (`crates/config/src/memory.rs`): typed
 core-wiring knobs (`enabled`, `llm` entry name) **plus** an opaque
 `extra: serde_json::Value` passed through verbatim to the plug-in. The `extra`
 bag is a deliberate, documented exception to the "typed over `Value`" rule —
@@ -170,10 +170,10 @@ extraction to their respective servers, so neither uses
 [`MemoryConfig.llm`](../../crates/config/src/memory.rs) — the field stays on
 the typed config for future backends.
 
-### `mem0` (`aura_memory::mem0`)
+### `mem0` (`baybo_memory::mem0`)
 
 Hosted SaaS via the Mem0 Platform REST API. Per-user scope comes from the
-caller's `user_id` at every call; `agent_id` defaults to `"aura"` (deployment
+caller's `user_id` at every call; `agent_id` defaults to `"baybo"` (deployment
 identity) on writes and is overridable per tool call. Tool reads accept an
 optional `scope: "session"` that narrows to the current session via Mem0's
 `run_id` (sourced from `ToolContext::session_id`).
@@ -203,15 +203,15 @@ verbatim (`infer: false`) — the model already decided what is worth keeping.
 Failure handling: 5-failure / 120 s circuit breaker shared by every API call
 (pauses API calls after sustained outages). Recall failures are
 swallowed and logged at `warn`. API key resolution: vault entry
-`user_env.<api_key_name>` (managed via `aura secret add <name>`) → process
+`user_env.<api_key_name>` (managed via `baybo secret add <name>`) → process
 env `<api_key_name>`. `<name>` defaults to `MEM0_API_KEY` when
 `api_key_name` is unset in config.
 
-### `openviking` (`aura_memory::openviking`)
+### `openviking` (`baybo_memory::openviking`)
 
-Self-hosted context database. Aura `SessionId` maps 1:1 to the OpenViking
+Self-hosted context database. Baybo `SessionId` maps 1:1 to the OpenViking
 session id; `X-OpenViking-Account` (config) and `X-OpenViking-Agent`
-(hardcoded `"aura"`) carry deployment identity, `X-OpenViking-User` carries
+(hardcoded `"baybo"`) carry deployment identity, `X-OpenViking-User` carries
 `MemoryContext::user_id()` per call.
 
 | Hook | Behaviour |
@@ -232,15 +232,15 @@ The tool surface mirrors the official OpenViking `openclaw-plugin`, each
 | `viking_archive_expand` | `GET /api/v1/sessions/{sid}/archives/{id}` | Fetch the original messages from a compressed session archive. |
 
 API key is optional (local dev mode runs unauthenticated). Resolution:
-vault entry `user_env.<api_key_name>` (`aura secret add <name>`) → process
+vault entry `user_env.<api_key_name>` (`baybo secret add <name>`) → process
 env `<api_key_name>` → empty (unauthenticated). `<name>` defaults to
 `OPENVIKING_API_KEY` when `api_key_name` is unset in config. Startup health
 probe is `GET /health`; failure logs `warn` and continues.
 
 ### Operator CLI
 
-`aura memory {status, setup, test, disable}` — see
-[`docs/cli.md`](../cli.md#aura-memory). Configure is interactive (provider +
+`baybo memory {status, setup, test, disable}` — see
+[`docs/cli.md`](../cli.md#baybo-memory). Configure is interactive (provider +
 per-field prompts, vault-stash for the API key); memory config is **not**
 hot-reload, so `setup` prints a restart hint.
 

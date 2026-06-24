@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# Run the aura memory benchmark end-to-end for one or more arms and print a
-# comparison table. QA drives the REAL Aura agent (one `aura gateway` per arm +
-# a concurrent `aura prompt` per question). See bench/memory/README.md.
+# Run the baybo memory benchmark end-to-end for one or more arms and print a
+# comparison table. QA drives the REAL Baybo agent (one `baybo gateway` per arm +
+# a concurrent `baybo prompt` per question). See bench/memory/README.md.
 #   noop = floor (memory off), oracle = ceiling (whole convo in prompt),
 #   mem0 / openviking = real backends (an ingest pass runs first).
 #
 # Keys + endpoints live in bench/memory/.env (auto-loaded — copy from
 # .env.example and fill in). The agent is built read-only so QA turns don't
-# pollute the recall scope; this script builds `aura --features
+# pollute the recall scope; this script builds `baybo --features
 # bench-readonly-memory` for you. By default it generates a self-contained
-# config + workspace (no aura.json needed); set AURA_CONFIG to derive from yours.
+# config + workspace (no baybo.json needed); set BAYBO_CONFIG to derive from yours.
 #
 # Quick start — fill bench/memory/.env, then (floor vs ceiling, self-contained):
 #   bench/memory/run.sh
@@ -37,7 +37,7 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${CONVERSATIONS:=1}"
 : "${QUESTIONS:=}"                  # empty = all questions per conversation
 : "${CONCURRENCY:=4}"
-: "${GATEWAY_PORT:=0}"              # QA `aura gateway` port; 0 = auto-pick a free one
+: "${GATEWAY_PORT:=0}"              # QA `baybo gateway` port; 0 = auto-pick a free one
 : "${TOP_K:=10}"                    # ingest recall depth
 : "${SETTLE_TIMEOUT_SECS:=3600}"    # how long ingest waits for extraction to settle (1h)
 : "${ALLOW_UNSETTLED:=0}"           # 1 = run QA even if extraction never settled
@@ -48,20 +48,20 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${DATASET:=$OUTDIR/locomo10.json}"
 : "${RESULTS_DIR:=$BENCH_DIR/results}"   # per-run result JSONs (gitignored; regenerated each run)
 : "${TRACE_DIR:=$BENCH_DIR/trace}"       # per-question transcripts + traces (gitignored); NO_TRACE=1 to disable
-: "${WS_ROOT:=$BENCH_DIR/runs}"       # per-run aura workspaces (gitignored): config + vault + sessions + logs
+: "${WS_ROOT:=$BENCH_DIR/runs}"       # per-run baybo workspaces (gitignored): config + vault + sessions + logs
 : "${RUN_ID:=$(date +%Y-%m-%d__%H-%M-%S)}"
-: "${RUST_LOG:=aura_bench_memory=info}"; export RUST_LOG
+: "${RUST_LOG:=baybo_bench_memory=info}"; export RUST_LOG
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-: "${AURA_CONFIG:=}"               # base aura.json to derive from; empty = self-contained generated config
-: "${AURA_BIN:=$REPO_ROOT/target/release/aura}"   # built with the bench feature below
-# Self-contained answer model — the model Aura answers with (ignored when
-# AURA_CONFIG is set). Defaults = DeepSeek; repoint at any provider to compare.
-: "${AURA_ANSWER_MODEL:=deepseek-chat}"
-: "${AURA_ANSWER_PROVIDER:=deepseek}"
-: "${AURA_ANSWER_API_KEY_ENV:=DEEPSEEK_API_KEY}"   # env var holding the provider key
-: "${AURA_ANSWER_BASE_URL:=}"                       # empty = provider's built-in endpoint
+: "${BAYBO_CONFIG:=}"               # base baybo.json to derive from; empty = self-contained generated config
+: "${BAYBO_BIN:=$REPO_ROOT/target/release/baybo}"   # built with the bench feature below
+# Self-contained answer model — the model Baybo answers with (ignored when
+# BAYBO_CONFIG is set). Defaults = DeepSeek; repoint at any provider to compare.
+: "${BAYBO_ANSWER_MODEL:=deepseek-chat}"
+: "${BAYBO_ANSWER_PROVIDER:=deepseek}"
+: "${BAYBO_ANSWER_API_KEY_ENV:=DEEPSEEK_API_KEY}"   # env var holding the provider key
+: "${BAYBO_ANSWER_BASE_URL:=}"                       # empty = provider's built-in endpoint
 LOCOMO_URL="https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
-PKG="aura-bench-memory"
+PKG="baybo-bench-memory"
 # ---------------------------------------------------------------------------
 
 mkdir -p "$OUTDIR" "$RESULTS_DIR" "$WS_ROOT"
@@ -74,14 +74,14 @@ mkdir -p "$TRACE_DIR/$RUN_ID" && ln -sfn "$RUN_ID" "$TRACE_DIR/latest"
 # an empty value expands to no argument.
 Q_ARG=""
 if [ -n "$QUESTIONS" ]; then Q_ARG="--questions $QUESTIONS"; fi
-# Base config is optional: empty → the bench derives one from ~/.aura/config/aura.json.
+# Base config is optional: empty → the bench derives one from ~/.baybo/config/baybo.json.
 CFG_ARG=""
-if [ -n "$AURA_CONFIG" ]; then CFG_ARG="--aura-config $AURA_CONFIG"; fi
-# Self-contained answer model → CLI flags (skipped under --aura-config: yours wins).
+if [ -n "$BAYBO_CONFIG" ]; then CFG_ARG="--baybo-config $BAYBO_CONFIG"; fi
+# Self-contained answer model → CLI flags (skipped under --baybo-config: yours wins).
 ANSWER_ARG=""
-if [ -z "$AURA_CONFIG" ]; then
-  ANSWER_ARG="--answer-model $AURA_ANSWER_MODEL --answer-provider $AURA_ANSWER_PROVIDER --answer-api-key-env $AURA_ANSWER_API_KEY_ENV"
-  [ -n "$AURA_ANSWER_BASE_URL" ] && ANSWER_ARG="$ANSWER_ARG --answer-base-url $AURA_ANSWER_BASE_URL"
+if [ -z "$BAYBO_CONFIG" ]; then
+  ANSWER_ARG="--answer-model $BAYBO_ANSWER_MODEL --answer-provider $BAYBO_ANSWER_PROVIDER --answer-api-key-env $BAYBO_ANSWER_API_KEY_ENV"
+  [ -n "$BAYBO_ANSWER_BASE_URL" ] && ANSWER_ARG="$ANSWER_ARG --answer-base-url $BAYBO_ANSWER_BASE_URL"
 fi
 # Optional --allow-unsettled (run QA even if extraction never settled).
 UNSETTLED_ARG=""
@@ -117,9 +117,9 @@ done
 if [ "$DRY_RUN" != "1" ]; then
   : "${DEEPSEEK_API_KEY:?required — used by the judge model}"
   # Self-contained answer model needs its provider's API key present too.
-  if [ -z "$AURA_CONFIG" ]; then
-    answer_key="${!AURA_ANSWER_API_KEY_ENV:-}"
-    : "${answer_key:?required — \$$AURA_ANSWER_API_KEY_ENV holds the $AURA_ANSWER_PROVIDER answer-model key (or set AURA_CONFIG to use your own)}"
+  if [ -z "$BAYBO_CONFIG" ]; then
+    answer_key="${!BAYBO_ANSWER_API_KEY_ENV:-}"
+    : "${answer_key:?required — \$$BAYBO_ANSWER_API_KEY_ENV holds the $BAYBO_ANSWER_PROVIDER answer-model key (or set BAYBO_CONFIG to use your own)}"
   fi
   for arm in $ARMS; do
     case "$arm" in
@@ -152,11 +152,11 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
-# ---- build: the bench bins + a read-only `aura` the bench drives ----------
+# ---- build: the bench bins + a read-only `baybo` the bench drives ----------
 echo ">> building $PKG bins"
 cargo build -p "$PKG" --bins
-echo ">> building read-only aura (--features bench-readonly-memory) -> $AURA_BIN"
-cargo build --release -p aura --features bench-readonly-memory
+echo ">> building read-only baybo (--features bench-readonly-memory) -> $BAYBO_BIN"
+cargo build --release -p baybo --features bench-readonly-memory
 
 run_arm() {
   local arm="$1"
@@ -184,7 +184,7 @@ run_arm() {
         --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
         --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" --run-id "$RUN_ID" $Q_ARG $UNSETTLED_ARG $MEM0_ARG \
         $CFG_ARG $ANSWER_ARG --openviking-endpoint "$OPENVIKING_ENDPOINT" \
-        --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" \
+        --baybo-bin "$BAYBO_BIN" --workspace-root "$WS_ROOT" \
         --manifest "$manifest" --out "$results" --trace-dir "$TRACE_DIR" $TRACE_ARG
       ;;
     noop | oracle)
@@ -192,7 +192,7 @@ run_arm() {
       cargo run -q -p "$PKG" --bin run -- \
         --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
         --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" --run-id "$RUN_ID" $Q_ARG \
-        $CFG_ARG $ANSWER_ARG --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" --out "$results" \
+        $CFG_ARG $ANSWER_ARG --baybo-bin "$BAYBO_BIN" --workspace-root "$WS_ROOT" --out "$results" \
         --trace-dir "$TRACE_DIR" $TRACE_ARG
       ;;
   esac

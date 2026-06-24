@@ -18,9 +18,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_llm::{BoundBilledLlm, ChatRequest};
-use aura_skills::SkillDefinition;
-use aura_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
+use baybo_llm::{BoundBilledLlm, ChatRequest};
+use baybo_skills::SkillDefinition;
+use baybo_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 

@@ -58,7 +58,7 @@ pub(crate) fn rig_model_info(name: &str, model_id: &str, pricing: ModelPricing) 
 ///   and feeds `resolve_api_key`'s last-resort fallback.
 /// * `base_url = "https://…"` — default endpoint surfaced to the setup
 ///   wizard. Rig providers usually leave this off since rig's client
-///   has its own baked-in default — Aura doesn't need to mirror it.
+///   has its own baked-in default — Baybo doesn't need to mirror it.
 ///
 /// Cross-module callers also need `rig::client::CompletionClient` in scope
 /// (the macro calls `.completion_model(..)`); `optional_key` / `keyless`
@@ -200,7 +200,7 @@ pub(crate) use rig_provider_factory;
 // snapshot-backed flat-default pricing (see `openrouter_prefix.rs` + build.rs).
 // `api_key_env` follows each provider's documented convention where one
 // exists; `zai` / `xiaomimimo` don't have an established public env-var
-// name, so we adopt `<NAME>_API_KEY` as Aura's convention — operators
+// name, so we adopt `<NAME>_API_KEY` as Baybo's convention — operators
 // can override via `api_key_env` on the entry. `base_url` mirrors rig's
 // own baked-in `ProviderBuilder::BASE_URL` so the setup wizard prefills it
 // (without it operators saw an empty `Base URL: ` prompt and had to know
@@ -341,7 +341,7 @@ rig_provider_factory!(
 mod tests {
     use super::*;
     use crate::providers::gemini::GeminiProviderFactory;
-    use aura_model::MicroUsd;
+    use baybo_model::MicroUsd;
 
     fn config(provider: &str) -> LlmProviderConfig {
         LlmProviderConfig {

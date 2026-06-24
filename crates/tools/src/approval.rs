@@ -7,7 +7,7 @@
 //! call's resources into session state for the rest of the session.
 //!
 //! Pure value types ([`ResourceAccess`], [`ApprovedResource`],
-//! [`HostPattern`]) live in `aura-model` so session state can persist them
+//! [`HostPattern`]) live in `baybo-model` so session state can persist them
 //! without a cycle back through this crate.
 //!
 //! Implementations must be `Send + Sync` and safe to call concurrently — the
@@ -25,13 +25,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_model::{ChannelType, SessionId};
+use baybo_model::{ChannelType, SessionId};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-pub use aura_model::approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
+pub use baybo_model::approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -44,7 +44,7 @@ pub struct ApprovalRequest {
     /// Session the tool call runs under. Lets HTTP clients (e.g. the
     /// gateway-backed TUI) render approvals alongside the session they belong to.
     pub session_id: SessionId,
-    /// Aura user id the tool call is running on behalf of. Sidecars
+    /// Baybo user id the tool call is running on behalf of. Sidecars
     /// that route prompts by platform user (Telegram chat, Discord DM)
     /// use this instead of reverse-mapping from `session_id`. Empty
     /// string when no user context applies.

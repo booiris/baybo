@@ -2,7 +2,7 @@
 
 ## v1 Status (shipped)
 
-- `aura-sandbox` crate with `bwrap` (Linux), `sandbox-exec` (macOS),
+- `baybo-sandbox` crate with `bwrap` (Linux), `sandbox-exec` (macOS),
   and a cross-platform `docker` fallback, all behind matching Cargo
   features (default-on).
 - `SandboxRunner` trait + `current_platform_runner()` factory that
@@ -59,7 +59,7 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
 
 ## Deferred (post-v1)
 
-- **MCP stdio servers** (`aura-tools::mcp::transport::connect_stdio`,
+- **MCP stdio servers** (`baybo-tools::mcp::transport::connect_stdio`,
   exercised by `McpReconciler`). The reconciler spawns the configured
   binary directly via `tokio::process::Command` — outside the sandbox —
   even though stdio MCP servers are functionally `ExecCommand`-class
@@ -67,7 +67,7 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
   `ToolExecutor`-side capability check does not help here: the spawn
   happens at registration, before any tool call, and `McpTool::execute`
   never consults `ToolContext.sandbox`. **Path forward**: move the
-  spawn site itself behind `aura_sandbox::SandboxRunner` rather than
+  spawn site itself behind `baybo_sandbox::SandboxRunner` rather than
   trying to retrofit per-call sandboxing — the long-lived stdio
   transport doesn't fit the per-invocation model and needs a
   long-running variant of the runner. Until that lands, treat stdio
@@ -93,20 +93,20 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
   Install-time setup script (root, runs once via systemd unit):
 
   ```bash
-  ip netns add aura-sandbox
-  ip link add veth-aura-h type veth peer name veth-aura-s
-  ip link set veth-aura-s netns aura-sandbox
+  ip netns add baybo-sandbox
+  ip link add veth-baybo-h type veth peer name veth-baybo-s
+  ip link set veth-baybo-s netns baybo-sandbox
 
-  ip addr add 10.42.0.1/24 dev veth-aura-h
-  ip link set veth-aura-h up
+  ip addr add 10.42.0.1/24 dev veth-baybo-h
+  ip link set veth-baybo-h up
   sysctl -w net.ipv4.ip_forward=1
-  ip netns exec aura-sandbox ip addr add 10.42.0.2/24 dev veth-aura-s
-  ip netns exec aura-sandbox ip link set veth-aura-s up
-  ip netns exec aura-sandbox ip link set lo up
-  ip netns exec aura-sandbox ip route add default via 10.42.0.1
+  ip netns exec baybo-sandbox ip addr add 10.42.0.2/24 dev veth-baybo-s
+  ip netns exec baybo-sandbox ip link set veth-baybo-s up
+  ip netns exec baybo-sandbox ip link set lo up
+  ip netns exec baybo-sandbox ip route add default via 10.42.0.1
 
   iptables -t nat -A POSTROUTING -s 10.42.0.0/24 ! -d 10.42.0.0/24 -j MASQUERADE
-  for ip in $(resolve /etc/aura/sandbox-egress.conf); do
+  for ip in $(resolve /etc/baybo/sandbox-egress.conf); do
     iptables -A FORWARD -s 10.42.0.0/24 -d $ip -j ACCEPT
   done
   iptables -A FORWARD -s 10.42.0.0/24 -m conntrack \
@@ -114,11 +114,11 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
   iptables -A FORWARD -s 10.42.0.0/24 -j DROP
   ```
 
-  Runtime: aura's bwrap children inherit the pre-built netns (no
+  Runtime: baybo's bwrap children inherit the pre-built netns (no
   `--unshare-net`). The `setns()` privilege is owned by systemd via
-  `JoinsNamespaceOf=aura-sandbox-net.service` in `aura.service`
-  (so aura itself stays unprivileged), or via a small file-cap
-  helper (`setcap cap_sys_admin+ep`) if aura is not deployed as a
+  `JoinsNamespaceOf=baybo-sandbox-net.service` in `baybo.service`
+  (so baybo itself stays unprivileged), or via a small file-cap
+  helper (`setcap cap_sys_admin+ep`) if baybo is not deployed as a
   systemd service.
 
   - **Pros**: kernel line-rate; zero per-call setup cost; cleanup is
@@ -128,11 +128,11 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
     must be a subset of the static config or fail-closed; concurrent
     sandboxes share the netns (lo, conntrack, route table), so a
     long-running localhost server in sandbox A is reachable from
-    sandbox B; doesn't work when aura runs inside a container that
+    sandbox B; doesn't work when baybo runs inside a container that
     can't help bridge to its host.
   - **API impact**: agent's intent (`SandboxSpec.allowed_hosts`)
     becomes a *declaration*; operator's policy
-    (`/etc/aura/sandbox-egress.conf`) is the *enforcement*. Runtime
+    (`/etc/baybo/sandbox-egress.conf`) is the *enforcement*. Runtime
     intersects: spec must be a subset of policy or fail-closed. This
     keeps two layers honest — code says what it wants, ops says
     what's allowed.
@@ -164,7 +164,7 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
     namespace's "fake root" doesn't satisfy this — see below),
     which means setuid helper / sudo / privileged daemon — i.e.
     permanent privileged surface. iptables rule lifecycle is
-    fragile: a crashed aura leaves stale rules; concurrent calls
+    fragile: a crashed baybo leaves stale rules; concurrent calls
     race on rule numbering. Doesn't work in containers without
     additional plumbing.
 
@@ -183,7 +183,7 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
   userspace; Path C pays it on every call.
 
   ### Why not sudo
-  Direct `NOPASSWD: /sbin/iptables, /sbin/ip` is unsafe: aura runs
+  Direct `NOPASSWD: /sbin/iptables, /sbin/ip` is unsafe: baybo runs
   LLM-driven agents, command injection upstream becomes host root.
   A wrapper script with sudoers is acceptable but is just
   privileged-helper-shaped-as-shell — at which point Path A's
@@ -204,7 +204,7 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
   paths above achieve.
 
   ### Recommendation
-  Start with Path A. It matches aura's deployment reality (operator
+  Start with Path A. It matches baybo's deployment reality (operator
   installs as a service, allowed-hosts list is relatively static
   per-deployment) and avoids the dependency / overhead drawbacks of
   Path B. Revisit Path B only if a real use case needs per-call
@@ -213,7 +213,7 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
 
   Docker per-host enforcement is its own subtask. The same Path-A
   pattern adapts (operator pre-creates a docker network with
-  filtered egress, aura attaches every container to it), but
+  filtered egress, baybo attaches every container to it), but
   Docker's daemon owns the bridge plumbing so the install script
   uses `docker network create` + `iptables` in `DOCKER-USER` chain
   instead of raw `ip` / `iptables`.
@@ -224,17 +224,17 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
   pays the registry round-trip; what is left is exposing the image
   choice to operators (and shipping a pinned-by-digest default in
   source so the trust boundary is reproducible across fresh hosts).
-- `[sandbox]` config section in `aura.json` for timeouts, default
+- `[sandbox]` config section in `baybo.json` for timeouts, default
   resource limits (so operators can tighten or loosen the per-call
   defaults without editing source), extra readable paths (especially
   relevant for non-FHS distros like NixOS where `/usr` is essentially
   empty), and an explicit override for the sandbox FS root (currently
-  inferred from `current_dir()` at startup; useful when aura is
+  inferred from `current_dir()` at startup; useful when baybo is
   launched from a daemon manager whose cwd is `/`).
 
 ## Original Problem
 
-The previous `aura-sandbox` crate (WASM-based, `wasmtime`-backed) was
+The previous `baybo-sandbox` crate (WASM-based, `wasmtime`-backed) was
 removed because the abstraction was premature: it forced every tool
 through a WASM runtime while the real isolation need is per-tool-
 invocation OS-level containment for shell/filesystem/network side
@@ -243,13 +243,13 @@ not the host syscalls tools actually make.
 
 Today `ToolExecutor` runs tools directly in-process. Without OS-native
 isolation, any tool that shells out runs with the full privileges of
-the `aura` process.
+the `baybo` process.
 
 ## Direction
 
 Rebuild the sandbox as an OS-native isolation layer, selected per
 platform. Tool manifests declare the capabilities they need
-(`aura_tools::ToolCapability`); the executor wraps the tool invocation
+(`baybo_tools::ToolCapability`); the executor wraps the tool invocation
 in the platform's native sandbox with exactly those capabilities
 granted.
 
@@ -286,11 +286,11 @@ granted.
 
 ### Shared surface (implemented)
 
-- `aura-sandbox` exposes `SandboxRunner::run(spec)` returning a handle
+- `baybo-sandbox` exposes `SandboxRunner::run(spec)` returning a handle
   with stdout/stderr/exit. Implementation is `cfg(target_os)` gated:
   `linux` → bwrap backend, `macos` → sandbox-exec backend. Other
   platforms return `SandboxError::UnsupportedPlatform`.
-- `aura_tools::ToolCapability` (`ReadFile`, `WriteFile`, `Http`,
+- `baybo_tools::ToolCapability` (`ReadFile`, `WriteFile`, `Http`,
   `ExecCommand`) drives wrapping. The `ToolExecutor` consults the
   runner only for tools whose manifest declares `ExecCommand`.
   In-process Rust tools continue to run directly — sandboxing
@@ -307,7 +307,7 @@ granted.
   blast radius via PID namespace + `--die-with-parent`.
 - **Windows**: deferred — no planned support, `current_platform_runner()`
   returns `SandboxError::UnsupportedPlatform`.
-- **Bootstrap check**: implemented — `aura_sandbox::probe()` and
+- **Bootstrap check**: implemented — `baybo_sandbox::probe()` and
   `current_platform_runner()` return `SandboxError::BackendMissing`
   with an actionable install hint when the binary is absent.
 - **Config surface**: a `[sandbox]` section is deferred and would land

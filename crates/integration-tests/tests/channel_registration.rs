@@ -12,10 +12,10 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use aura_channels::Prompter;
-use aura_gateway::{SidecarError, SidecarRuntime};
-use aura_model::ChannelType;
-use aura_setup::flow::run_registration;
+use baybo_channels::Prompter;
+use baybo_gateway::{SidecarError, SidecarRuntime};
+use baybo_model::ChannelType;
+use baybo_setup::flow::run_registration;
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
 

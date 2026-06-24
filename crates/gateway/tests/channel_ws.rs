@@ -9,18 +9,18 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::wire::{self, Frame, Message as WireMessage, SessionPatch};
-use aura_channels::{
+use baybo_channels::wire::{self, Frame, Message as WireMessage, SessionPatch};
+use baybo_channels::{
     AgentEvent, AgentOutput, ChannelKind, MessageRole, OutgoingMessage, RouterInbound,
 };
-use aura_config::ChannelsConfig;
-use aura_gateway::auth::{
+use baybo_config::ChannelsConfig;
+use baybo_gateway::auth::{
     ChannelTokenTable, ClientIdentity, TokenHandle, WEB_CLIENT_LABEL_PREFIX, WEB_OPERATOR_USER_ID,
 };
-use aura_gateway::channel::{StashedTokenHandle, boot};
-use aura_gateway::channel_listener::ChannelServer;
-use aura_gateway::test_support::build_test_deps;
-use aura_model::{ChannelType, ChatMessage, ContentBlock, MessageMetadata, User};
+use baybo_gateway::channel::{StashedTokenHandle, boot};
+use baybo_gateway::channel_listener::ChannelServer;
+use baybo_gateway::test_support::build_test_deps;
+use baybo_model::{ChannelType, ChatMessage, ContentBlock, MessageMetadata, User};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::client_async;
@@ -187,12 +187,12 @@ async fn expect_idle_turn_state(
 async fn web_token_attaches_subscribes_and_receives_dispatch() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
-        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
 
     // Eagerly install the http channel — production wires this from
-    // ChannelsConfig at boot via `aura_gateway::channel::boot`.
+    // ChannelsConfig at boot via `baybo_gateway::channel::boot`.
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
@@ -235,7 +235,7 @@ async fn web_token_attaches_subscribes_and_receives_dispatch() {
     // and use it as the "subscribe processed" signal — `has_subscribers`
     // is true as soon as the snapshot lands on the wire.
     expect_empty_pending_snapshot(&mut client, "sess-1").await;
-    assert!(http_channel.has_subscribers(&aura_model::SessionId::from("sess-1")));
+    assert!(http_channel.has_subscribers(&baybo_model::SessionId::from("sess-1")));
 
     // Server-side dispatch reaches the subscribed client.
     let outgoing = OutgoingMessage {
@@ -279,7 +279,7 @@ async fn web_token_attaches_subscribes_and_receives_dispatch() {
 async fn subscribe_hydrates_durable_task_list_snapshot() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
-        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
@@ -297,11 +297,11 @@ async fn subscribe_hydrates_durable_task_list_snapshot() {
         .await
         .expect("create session");
     let now = chrono::Utc::now();
-    let task = aura_model::Task {
-        id: aura_model::TaskId::new(),
+    let task = baybo_model::Task {
+        id: baybo_model::TaskId::new(),
         subject: "write the table".into(),
         description: "create session_tasks".into(),
-        status: aura_model::TaskStatus::InProgress,
+        status: baybo_model::TaskStatus::InProgress,
         depends_on: Vec::new(),
         created_at: now,
         updated_at: now,
@@ -368,7 +368,7 @@ async fn subscribe_hydrates_durable_task_list_snapshot() {
 async fn subscribe_hydrates_turn_state_snapshot() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
-        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
@@ -438,9 +438,9 @@ async fn subscribe_hydrates_turn_state_snapshot() {
         .job_lifecycle
         .start_job(
             session.id.clone(),
-            aura_model::TriggerKind::User,
-            aura_job::JobShape::Turn,
-            aura_job::JobInput::UserChat { content: vec![] },
+            baybo_model::TriggerKind::User,
+            baybo_job::JobShape::Turn,
+            baybo_job::JobInput::UserChat { content: vec![] },
             None,
         )
         .await
@@ -480,7 +480,7 @@ async fn subscribe_hydrates_turn_state_snapshot() {
 async fn two_subscribers_to_same_session_both_receive_dispatch() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
-        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
@@ -566,7 +566,7 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
 async fn unsubscribed_session_does_not_receive_dispatch() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
-        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
@@ -613,7 +613,7 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
         user_id: String::new(),
         channel: ChannelType::http(),
         event: AgentEvent::Notice {
-            level: aura_channels::NoticeLevel::Info,
+            level: baybo_channels::NoticeLevel::Info,
             text: "for some other tab".into(),
         },
     });
@@ -627,7 +627,7 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
         } => {
             assert_eq!(session_id.as_str(), "unrelated", "activity session id");
             assert!(
-                matches!(source, aura_channels::wire::ActivityKind::Assistant),
+                matches!(source, baybo_channels::wire::ActivityKind::Assistant),
                 "activity source: {source:?}",
             );
         }
@@ -658,7 +658,7 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
     // polling.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
-        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
@@ -750,7 +750,7 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
     // streaming events like AnswerDelta deliberately don't pulse).
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
-        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
@@ -799,7 +799,7 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
         } => {
             assert_eq!(session_id.as_str(), "sess-bg", "assistant pulse session id");
             assert!(
-                matches!(source, aura_channels::wire::ActivityKind::Assistant),
+                matches!(source, baybo_channels::wire::ActivityKind::Assistant),
                 "expected Assistant source, got {source:?}",
             );
         }
@@ -810,20 +810,20 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
     // it via `SubscribedView::echo_inbound`, which dispatches a
     // `SessionEvent::UserEcho` — exactly the path the WS receive loop
     // takes when the agent router forwards an inbound `Frame::Message`.
-    let incoming = aura_channels::IncomingMessage {
-        message: aura_channels::Message {
+    let incoming = baybo_channels::IncomingMessage {
+        message: baybo_channels::Message {
             id: "msg-1".into(),
             session_id: "sess-bg".into(),
             channel: ChannelType::http(),
-            sender: aura_model::User {
+            sender: baybo_model::User {
                 id: WEB_OPERATOR_USER_ID.into(),
                 name: None,
                 channel: ChannelType::http(),
             },
-            content: vec![aura_model::ContentBlock::Text("user typed".into())],
+            content: vec![baybo_model::ContentBlock::Text("user typed".into())],
             timestamp: chrono::Utc::now(),
             reply_to: None,
-            metadata: aura_model::MessageMetadata::default(),
+            metadata: baybo_model::MessageMetadata::default(),
         },
         platform_msg_id: String::new(),
     };
@@ -843,7 +843,7 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
         } => {
             assert_eq!(session_id.as_str(), "sess-bg", "user pulse session id");
             assert!(
-                matches!(source, aura_channels::wire::ActivityKind::User),
+                matches!(source, baybo_channels::wire::ActivityKind::User),
                 "expected User source, got {source:?}",
             );
         }
@@ -865,7 +865,7 @@ async fn duplicate_platform_msg_id_drops_retry_on_subscribed_channel() {
     // inbound and the agent doesn't pay for two turns.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
-        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
@@ -975,7 +975,7 @@ async fn messages_batch_reaches_router_as_one_ordered_intake() {
     // actor's coalescing window.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
-        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
@@ -1077,7 +1077,7 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
     // to match what a continuously-connected client would have seen.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
-        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
@@ -1191,7 +1191,7 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
 async fn web_ws_close_restashes_token_so_reconnect_reuses_it() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
-        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();

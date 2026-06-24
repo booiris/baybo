@@ -1,5 +1,5 @@
 [package]
-name = "aura-store"
+name = "baybo-store"
 version.workspace = true
 edition.workspace = true
 
@@ -7,7 +7,7 @@ edition.workspace = true
 doctest = false
 
 [dependencies]
-aura-model = { workspace = true }
+baybo-model = { workspace = true }
 chrono = { workspace = true }
 
 anyhow = { workspace = true }

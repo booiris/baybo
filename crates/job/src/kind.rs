@@ -4,7 +4,7 @@
 //! source of truth:
 //! - **input kind** ([`JobInputKind`]) — what payload fed it; a
 //!   projection of [`JobInput`]. Display / denormalisation only.
-//! - **origin** ([`aura_model::TriggerKind`], stored on `Job`) — the
+//! - **origin** ([`baybo_model::TriggerKind`], stored on `Job`) — the
 //!   owning session's root trigger, recorded as-is at creation. Not
 //!   asserted against the payload: a maintenance job runs inside a
 //!   `User`-trigger session and records `origin = User` honestly.
@@ -14,7 +14,7 @@
 //!   background compression are both `Maintenance` even though only the
 //!   latter carries a `System` input.
 
-use aura_model::{BackgroundCompressionPayload, ContentBlock};
+use baybo_model::{BackgroundCompressionPayload, ContentBlock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -52,7 +52,7 @@ pub enum JobShape {
 ///
 /// `Cron::action_payload` is an opaque trace blob written by the cron
 /// router (currently `{cron_job_id, prompt}`). Kept as `Value` here so
-/// `aura-job` does not depend on `aura-cron`, which would invert the
+/// `baybo-job` does not depend on `baybo-cron`, which would invert the
 /// layer order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -81,7 +81,7 @@ pub enum JobInput {
     /// A self-initiated turn fired at the turn boundary while a `/goal` is
     /// `Active`: the agent keeps working toward the objective without a new
     /// user message. `content` is the framed continuation steering
-    /// (`aura_goal::prompts`). UserChat sessions only. See
+    /// (`baybo_goal::prompts`). UserChat sessions only. See
     /// `docs/modules/goal.md`.
     GoalContinuation {
         content: Vec<ContentBlock>,

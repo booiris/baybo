@@ -7,13 +7,13 @@ pub(crate) mod openai;
 pub(crate) mod rig_providers;
 
 // Public: the subscription provider's OAuth surface (PKCE / device-code
-// flows, vault token store) is consumed by `aura-cli` for the OAuth
-// branch of `aura llm add` / `aura llm edit` / `aura llm remove`, so
+// flows, vault token store) is consumed by `baybo-cli` for the OAuth
+// branch of `baybo llm add` / `baybo llm edit` / `baybo llm remove`, so
 // the module needs to be reachable as
-// `aura_llm::providers::openai_subscription`.
+// `baybo_llm::providers::openai_subscription`.
 pub mod openai_subscription;
 
-// Aura provider name -> OpenRouter prefix, shared with `build.rs`.
+// Baybo provider name -> OpenRouter prefix, shared with `build.rs`.
 pub(crate) mod openrouter_prefix;
 
 /// Per-provider flat-default pricing, generated at build time from the
@@ -21,7 +21,7 @@ pub(crate) mod openrouter_prefix;
 /// model under the provider's prefix by `input + output`.
 pub(crate) mod catalog {
     use crate::ModelPricing;
-    use aura_model::MicroUsd;
+    use baybo_model::MicroUsd;
 
     include!(concat!(env!("OUT_DIR"), "/provider_catalog.rs"));
 }
