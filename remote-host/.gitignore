@@ -1,0 +1,5 @@
+# Deploy secrets — never commit these.
+.env
+.env.*
+!.env.example
+*.p8
