@@ -17,6 +17,7 @@
 //! pumps each socket's binary frames into/out of a [`RelayLeg`].
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -24,6 +25,13 @@ use tokio::sync::mpsc;
 /// Per-leg channel capacity (opaque frames buffered toward the peer before
 /// backpressure).
 const LEG_CHANNEL_CAP: usize = 256;
+
+/// How long a parked leg waits for its partner before it's reaped. A WS upgrade
+/// that fails *after* the synchronous park leaves a half uncancelled (its
+/// `on_upgrade` cleanup never runs), and a signalled gateway might never dial
+/// its data leg; the sweep keeps those from accumulating. Well above any real
+/// rendezvous latency (both legs arrive within seconds).
+const PENDING_TTL: Duration = Duration::from_secs(120);
 
 /// One end of a matched relay pair. Frames written to [`to_peer`](Self::to_peer)
 /// surface at the partner leg's [`from_peer`](Self::from_peer), blind.
@@ -40,6 +48,8 @@ struct PendingHalf {
     from_first: mpsc::Receiver<Vec<u8>>,
     /// Second-leg → first-leg frames (the second leg writes these).
     to_first: mpsc::Sender<Vec<u8>>,
+    /// When this half was parked — used to reap it if no partner ever arrives.
+    parked_at: Instant,
 }
 
 /// Matches two legs by key and pipes opaque bytes between them, blind.
@@ -66,6 +76,10 @@ impl RelayBroker {
                 from_peer: half.from_first,
             }
         } else {
+            // About to park a new half: first reap any whose partner never
+            // arrived, so a dropped upgrade or a no-show gateway can't grow the
+            // map without bound. (Matching above is never swept — only parking.)
+            Self::sweep_pending(&mut pending, PENDING_TTL);
             let (first_to_second_tx, first_to_second_rx) = mpsc::channel(LEG_CHANNEL_CAP);
             let (second_to_first_tx, second_to_first_rx) = mpsc::channel(LEG_CHANNEL_CAP);
             pending.insert(
@@ -73,6 +87,7 @@ impl RelayBroker {
                 PendingHalf {
                     from_first: first_to_second_rx,
                     to_first: second_to_first_tx,
+                    parked_at: Instant::now(),
                 },
             );
             RelayLeg {
@@ -80,6 +95,23 @@ impl RelayBroker {
                 from_peer: second_to_first_rx,
             }
         }
+    }
+
+    /// Drop pending legs parked longer than `ttl` (their partner never arrived),
+    /// returning how many were reaped. Runs opportunistically on each [`join`]
+    /// that parks; also exposed directly for tests / an explicit sweep.
+    ///
+    /// [`join`]: Self::join
+    pub fn sweep(&self, ttl: Duration) -> usize {
+        let mut pending = self.pending.lock();
+        Self::sweep_pending(&mut pending, ttl)
+    }
+
+    fn sweep_pending(pending: &mut HashMap<String, PendingHalf>, ttl: Duration) -> usize {
+        let now = Instant::now();
+        let before = pending.len();
+        pending.retain(|_, half| now.duration_since(half.parked_at) < ttl);
+        before - pending.len()
     }
 
     /// Match an already-parked leg for `key` **without** parking a new one.
@@ -133,6 +165,22 @@ mod tests {
         let _a = broker.join("k1");
         let _b = broker.join("k2");
         assert_eq!(broker.pending_len(), 2);
+    }
+
+    #[test]
+    fn sweep_reaps_only_stale_pending_legs() {
+        let broker = RelayBroker::new();
+        let _a = broker.join("k1");
+        let _b = broker.join("k2");
+        assert_eq!(broker.pending_len(), 2);
+        // Nothing is older than a long TTL — both survive.
+        assert_eq!(broker.sweep(Duration::from_secs(3600)), 0);
+        assert_eq!(broker.pending_len(), 2);
+        // A zero TTL treats every parked leg as stale.
+        assert_eq!(broker.sweep(Duration::ZERO), 2);
+        assert_eq!(broker.pending_len(), 0);
+        // Sweeping an empty map is a no-op.
+        assert_eq!(broker.sweep(Duration::ZERO), 0);
     }
 
     #[tokio::test]

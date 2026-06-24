@@ -77,20 +77,30 @@ for host and `aarch64-apple-ios-sim`; real end-to-end delivery still needs #4
 
 ### 5. Hardening / smaller follow-ups
 
-- **Relay**: TTL sweep for stale parked broker legs — both the pairing
-  `/pair/host` legs **and** the content `/content/join` / `/content/host` legs
-  leak a parked entry if the partner never arrives or the WS upgrade fails after
-  the synchronous `broker.join` (a crashed/slow gateway, a client that drops
-  mid-handshake). A periodic sweep keyed on park-time is the systematic fix.
-  Also basic rate-limiting on `/pair/join` and `/content/join` (both park a leg
-  for an unauthenticated caller that knows only a code / `relay_node_id`).
-- **relay-pair host manager**: no shutdown signal — it dies with the process;
-  give it a `ShutdownSignal` if graceful drain matters.
-- **No automated cross-workspace e2e** for relay pairing (relay and gateway are
-  separate Cargo workspaces); the full path is only proven on deployment.
+- **Relay parked-leg TTL** ✅ done — `RelayBroker` stamps each parked half with
+  `parked_at` and reaps stale halves (TTL 120s) opportunistically on every
+  `join` that parks, so a WS upgrade that fails *after* the synchronous
+  `broker.join` (its `on_upgrade` cancel never runs) or a no-show gateway can't
+  grow the pending map without bound. (`remote-host/crates/relay/src/broker.rs`,
+  `sweep`.)
+- **Relay flood / rate-limiting** — lower priority now: `/pair/join` uses
+  `try_match` (never parks); `/content/join` parks only *after* `signal_open`
+  succeeds for a currently-connected gateway, and that gateway's control channel
+  is capped (32), so the park rate is already throttled; the TTL sweep bounds any
+  residue. A dedicated per-IP limiter / hard pending-cap remains optional.
+- **Graceful shutdown for the relay managers** — lower value now: the managers
+  (`relay_pair`, `relay_content`) spawn detached child tasks (per-slot pairing
+  drives, the content control pump), so a correct drain would track + abort them,
+  and the gateway process exits moments after the shutdown signal regardless. C
+  already self-heals from an abrupt gateway disconnect (the control idle-timeout
+  + the broker TTL sweep above), so the residual benefit is small.
+- **No automated cross-workspace e2e** for relay pairing/content (relay and
+  gateway are separate Cargo workspaces); each side is unit/integration-tested,
+  but the spliced path is only proven on deployment. A harness that boots
+  `remote-host-relay` + a test gateway + a mock app would close this.
 - **Multi-gateway persist**: the `PairedRecord` is stored under one fixed account
   (`baybo.paired-gateway`); pairing with a second gateway overwrites it. Key by
-  device id + a "current" pointer if multi-gateway is needed.
+  device id + a "current" pointer if multi-gateway is needed (a product call).
 - **PR #132** is closed; reopen or open a fresh PR when ready.
 
 ---
