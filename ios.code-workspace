@@ -1,8 +1,9 @@
 {
   "folders": [
-    { "path": "app/mobile/ios" }
+    { "path": "." }
   ],
   "settings": {
-    "rust-analyzer.cargo.target": "aarch64-apple-ios-sim"
+    "rust-analyzer.cargo.target": "aarch64-apple-ios-sim",
+    "rust-analyzer.linkedProjects": ["app/mobile/ios/Cargo.toml"]
   }
 }
