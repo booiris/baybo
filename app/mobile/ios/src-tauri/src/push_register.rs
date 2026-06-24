@@ -1,15 +1,33 @@
-//! iOS push registration.
+//! iOS push registration + APNs device-token capture.
 //!
-//! Requests **provisional** notification authorization so the system delivers
-//! `mutable-content` pushes to the NSE (provisional is granted silently — no
-//! permission prompt — and the notification arrives quietly in Notification
-//! Center / on the lock screen, which is exactly the lock-screen-preview path),
-//! and registers for remote notifications to kick off APNs device-token
-//! issuance. Capturing the token requires hooking the UIApplicationDelegate
-//! (owned by the Tauri/wry runtime) and is a follow-up for the real-APNs (M4)
-//! path; the trigger is here so registration begins at launch.
+//! Requests **provisional** notification authorization (granted silently, so the
+//! `mutable-content` push lands in Notification Center / on the lock screen — the
+//! lock-screen-preview path), registers for remote notifications to start APNs
+//! device-token issuance, and hooks the UIApplicationDelegate so the token that
+//! iOS delivers to `application:didRegisterForRemoteNotificationsWithDeviceToken:`
+//! is captured into a process-global ([`apns_token`]); pairing threads it into
+//! `DeviceHello`.
+//!
+//! The delegate is owned by the Tauri/wry runtime, so the two APNs callbacks are
+//! added to its class at launch via the Objective-C runtime (`class_addMethod`).
+//! The runtime delegate implements neither, so the add succeeds and the system
+//! then routes the token (and any failure) to us.
 //!
 //! No-op off iOS.
+
+use std::sync::Mutex;
+
+/// The captured APNs device token as lowercase hex, set once
+/// `didRegisterForRemoteNotifications` fires (a few seconds after launch). `None`
+/// until then, and always `None` off iOS.
+static APNS_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// The captured APNs device token (hex), if registration has completed. Pairing
+/// reads this for `DeviceHello.apns_token`; empty if the token hasn't arrived yet
+/// (the gateway re-registers an approved device out of band in that case).
+pub fn apns_token() -> Option<String> {
+    APNS_TOKEN.lock().ok().and_then(|t| t.clone())
+}
 
 #[cfg(target_os = "ios")]
 pub fn register() {
@@ -33,7 +51,111 @@ pub fn register() {
     // Remote-notification registration must run on the main thread.
     if let Some(mtm) = MainThreadMarker::new() {
         let app = UIApplication::sharedApplication(mtm);
+        // Install the token-capture callbacks BEFORE kicking off registration so
+        // the async token delivery can't race ahead of the method being added.
+        install_token_capture(&app);
         app.registerForRemoteNotifications();
+    }
+}
+
+#[cfg(target_os = "ios")]
+fn set_apns_token(hex: String) {
+    if let Ok(mut slot) = APNS_TOKEN.lock() {
+        *slot = Some(hex);
+    }
+}
+
+/// iOS delivers the APNs device token here; capture it as hex.
+#[cfg(target_os = "ios")]
+extern "C-unwind" fn did_register(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _app: *mut objc2::runtime::AnyObject,
+    token: *mut objc2_foundation::NSData,
+) {
+    if token.is_null() {
+        return;
+    }
+    let data: &objc2_foundation::NSData = unsafe { &*token };
+    set_apns_token(hex::encode(data.to_vec()));
+}
+
+/// iOS reports APNs registration failure here; log and leave the token unset
+/// (pairing then sends an empty token; the gateway re-registers out of band).
+#[cfg(target_os = "ios")]
+extern "C-unwind" fn did_fail(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _app: *mut objc2::runtime::AnyObject,
+    _error: *mut objc2_foundation::NSError,
+) {
+    eprintln!("baybo: APNs registration failed");
+}
+
+/// Add the two APNs delegate callbacks to the live app-delegate's class.
+#[cfg(target_os = "ios")]
+fn install_token_capture(app: &objc2_ui_kit::UIApplication) {
+    use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
+    use objc2::{ffi, msg_send, sel};
+
+    // Objective-C type encoding for both selectors: void return (`v`), then
+    // self (`@`), _cmd (`:`), and two object args (`@@`) — UIApplication* plus
+    // NSData* / NSError*.
+    const TYPES: &std::ffi::CStr = c"v@:@@";
+
+    let delegate: *mut AnyObject = unsafe { msg_send![app, delegate] };
+    if delegate.is_null() {
+        eprintln!("baybo: no app delegate; APNs token capture not installed");
+        return;
+    }
+    let cls = unsafe { ffi::object_getClass(delegate) } as *mut AnyClass;
+    if cls.is_null() {
+        return;
+    }
+
+    // SAFETY: the IMP signatures match the selectors' Objective-C signatures
+    // (the `v@:@@` encoding above), so the runtime invokes them correctly.
+    let did_register_imp: Imp = unsafe {
+        std::mem::transmute::<
+            extern "C-unwind" fn(
+                *mut AnyObject,
+                Sel,
+                *mut AnyObject,
+                *mut objc2_foundation::NSData,
+            ),
+            Imp,
+        >(did_register)
+    };
+    let did_fail_imp: Imp = unsafe {
+        std::mem::transmute::<
+            extern "C-unwind" fn(
+                *mut AnyObject,
+                Sel,
+                *mut AnyObject,
+                *mut objc2_foundation::NSError,
+            ),
+            Imp,
+        >(did_fail)
+    };
+
+    unsafe {
+        let added = ffi::class_addMethod(
+            cls,
+            sel!(application:didRegisterForRemoteNotificationsWithDeviceToken:),
+            did_register_imp,
+            TYPES.as_ptr(),
+        );
+        if !added.as_bool() {
+            eprintln!(
+                "baybo: APNs token capture not installed (delegate already implements the callback)"
+            );
+        }
+        let _ = ffi::class_addMethod(
+            cls,
+            sel!(application:didFailToRegisterForRemoteNotificationsWithError:),
+            did_fail_imp,
+            TYPES.as_ptr(),
+        );
     }
 }
 

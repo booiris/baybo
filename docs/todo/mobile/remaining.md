@@ -54,13 +54,17 @@ The app falls back via `connect_first` → `dial_relay`
 (`content_relay_splices_phone_and_gateway`) and on A
 (`relay_path_resolves_device_by_pubkey_and_round_trips`).
 
-### 3. Real APNs device token
+### 3. Real APNs device token ✅ done
 
-`app/mobile/ios/src-tauri/src/pairing.rs` `TODO(apns)`: the app sends an **empty**
-`apns_token` in `DeviceHello`. Wire it from
-`didRegisterForRemoteNotifications` (the token arrives async after
-`registerForRemoteNotifications` in `push_register.rs`) and thread it into the
-pairing request (or a later `/register`).
+`push_register.rs` hooks the (Tauri/wry-owned) `UIApplicationDelegate` at launch
+via `class_addMethod`, capturing the token iOS delivers to
+`didRegisterForRemoteNotificationsWithDeviceToken` (and logging the failure
+callback) into a process-global; `pair_begin` threads it (hex) + the build's
+APNs env into `DeviceHello`. Empty until the async token lands — registration
+fires at launch, so it's normally ready by pairing time, and a too-early pairing
+falls back to the gateway's out-of-band re-registration. Compiles + clippy-clean
+for host and `aarch64-apple-ios-sim`; real end-to-end delivery still needs #4
+(paid account + device).
 
 ### 4. External blockers (need resources, not just code)
 

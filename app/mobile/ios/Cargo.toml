@@ -41,7 +41,7 @@ core-foundation = "0.10"
 core-foundation-sys = "0.8"
 # iOS-only: provisional notification auth + remote-notification registration.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSError"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSError"] }
 objc2-ui-kit = { version = "0.3", features = ["UIApplication"] }
 objc2-user-notifications = { version = "0.3", features = ["UNUserNotificationCenter", "UNNotificationSettings"] }
 block2 = "0.6"

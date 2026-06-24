@@ -133,10 +133,17 @@ pub async fn pair_begin(
         device_id: device_id.clone(),
         label: label.to_string(),
         static_pubkey: keypair.public(),
-        // TODO(apns): the real APNs token comes from the app's
-        // didRegisterForRemoteNotifications; empty until that's wired.
-        apns_token: String::new(),
-        apns_env: ApnsEnv::Sandbox,
+        // Captured from `didRegisterForRemoteNotifications` (registration kicks
+        // off at launch, so by pairing time the token is normally ready); empty
+        // if it hasn't arrived yet, which the gateway re-registers out of band.
+        apns_token: crate::push_register::apns_token().unwrap_or_default(),
+        // A debug build's token is issued by the APNs sandbox; release/TestFlight
+        // by production. The gateway tracks this per-device to pick the right host.
+        apns_env: if cfg!(debug_assertions) {
+            ApnsEnv::Sandbox
+        } else {
+            ApnsEnv::Production
+        },
     };
 
     let (mut client, hello) = PairingClient::start(req);
@@ -184,7 +191,10 @@ pub async fn pair_confirm(
         .remove(device_id)
         .ok_or("no pending pairing session for this device")?;
 
-    let confirm = session.client.confirm(accepted).map_err(|e| e.to_string())?;
+    let confirm = session
+        .client
+        .confirm(accepted)
+        .map_err(|e| e.to_string())?;
     send(&mut session.ws, &confirm).await?;
     if !accepted {
         return Err("pairing cancelled".into());
@@ -218,8 +228,7 @@ pub async fn pair_confirm(
         noise_secret: session.keypair.secret(),
         noise_public: session.keypair.public(),
     };
-    let bytes =
-        serde_json::to_vec(&record).map_err(|e| format!("encode paired record: {e}"))?;
+    let bytes = serde_json::to_vec(&record).map_err(|e| format!("encode paired record: {e}"))?;
     crate::keychain::store_paired_record(&bytes)
         .map_err(|e| format!("persist paired record: {e}"))?;
 
