@@ -169,6 +169,11 @@ export default function App() {
   const [rememberedUser, setRememberedUser] = useState<string | null>(null);
   // Whether the chat view is open (a live content session).
   const [chatting, setChatting] = useState(false);
+  // While the QR scanner is open the page is made transparent so the native
+  // camera feed (drawn behind the webview by the windowed barcode scanner)
+  // shows through; `scanCancelled` suppresses the error toast on a user cancel.
+  const [scanning, setScanning] = useState(false);
+  const scanCancelled = useRef(false);
 
   useEffect(() => {
     invoke<string | null>("paired_user")
@@ -176,19 +181,50 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  useEffect(() => {
+    document.documentElement.classList.toggle("scanning", scanning);
+    return () => document.documentElement.classList.remove("scanning");
+  }, [scanning]);
+
   async function scan() {
-    setStatus("Opening scanner…");
+    scanCancelled.current = false;
     try {
-      const { scan, Format } = await import("@tauri-apps/plugin-barcode-scanner");
-      const res = await scan({ windowed: true, formats: [Format.QRCode] });
+      const bs = await import("@tauri-apps/plugin-barcode-scanner");
+      let perm: string = await bs.checkPermissions();
+      if (perm === "prompt" || perm === "prompt-with-rationale") {
+        perm = await bs.requestPermissions();
+      }
+      if (perm !== "granted") {
+        setStatus("Camera access is off — enable it for Baybo in Settings, then try again.");
+        await bs.openAppSettings().catch(() => {});
+        return;
+      }
+      // Go transparent only once permission is granted, right before the camera
+      // opens behind the webview.
+      setStatus(null);
+      setScanning(true);
+      const res = await bs.scan({ windowed: true, formats: [bs.Format.QRCode] });
       const parsed = parseScan(res.content);
       setCode(parsed.code);
       setRelay(parsed.relay);
       if (parsed.endpoint) setEndpoint(parsed.endpoint);
       setStatus("Scanned. Review and pair.");
     } catch (e) {
-      setStatus(`Scan failed: ${e}`);
+      setStatus(scanCancelled.current ? null : `Scan failed: ${e}`);
+    } finally {
+      setScanning(false);
     }
+  }
+
+  async function cancelScan() {
+    scanCancelled.current = true;
+    try {
+      const { cancel } = await import("@tauri-apps/plugin-barcode-scanner");
+      await cancel();
+    } catch {
+      // already stopped
+    }
+    setScanning(false);
   }
 
   // Phase 1: connect + SPAKE2 → get the confirmation code to show the user.
@@ -235,6 +271,16 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  if (scanning) {
+    return (
+      <div className="scan-overlay">
+        <p>Point the camera at the pairing QR code</p>
+        <div className="scan-frame" />
+        <button onClick={cancelScan}>Cancel</button>
+      </div>
+    );
   }
 
   if (chatting) {

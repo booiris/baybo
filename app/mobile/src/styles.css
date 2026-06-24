@@ -88,3 +88,45 @@ button:disabled { opacity: 0.5; }
 .composer { margin-top: 0; }
 .composer input { flex: 1; }
 .composer button { flex: 0 0 auto; }
+
+/* QR scanner: the windowed barcode scanner renders the camera feed BEHIND the
+   webview, so the page must be transparent while scanning for it to show
+   through. Without this the camera runs but is hidden under the opaque page. */
+html.scanning,
+html.scanning body,
+html.scanning #root {
+  background: transparent !important;
+}
+.scan-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  padding: calc(env(safe-area-inset-top, 1rem) + 3rem) 2rem
+    calc(env(safe-area-inset-bottom, 1rem) + 2rem);
+  pointer-events: none;
+}
+.scan-overlay p {
+  margin: 0;
+  color: #fff;
+  text-align: center;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
+}
+.scan-frame {
+  width: min(64vw, 240px);
+  aspect-ratio: 1;
+  border: 3px solid #fff;
+  border-radius: 1.25rem;
+  box-shadow: 0 0 0 4px rgba(0, 0, 0, 0.3);
+}
+.scan-overlay button {
+  pointer-events: auto;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  border-radius: 0.6rem;
+  padding: 0.6rem 1.6rem;
+  font-size: 1rem;
+}
