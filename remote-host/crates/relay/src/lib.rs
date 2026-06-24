@@ -7,12 +7,15 @@
 //! content runs Noise inside TLS, so C sees neither the code nor any plaintext —
 //! it only shuttles ciphertext.
 //!
-//! This crate is the matching + piping core; the production WebSocket transport
-//! (accepting two sockets and pumping their binary frames through a
-//! [`RelayLeg`]) layers on top.
+//! The matching + piping core is the broker; [`serve`] layers the production
+//! WebSocket transport on top (the `remote-host-relay` binary), hosting the
+//! pairing rendezvous with admission so only an admitted gateway can occupy a
+//! code.
 
 pub mod broker;
 pub mod control;
+pub mod error;
+pub mod serve;
 pub mod ws;
 
 pub use broker::{RelayBroker, RelayLeg};

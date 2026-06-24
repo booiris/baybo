@@ -6,11 +6,17 @@ edition.workspace = true
 [lib]
 doctest = false
 
+[[bin]]
+name = "remote-host-relay"
+path = "src/main.rs"
+
 [dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync"] }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
-# The data-leg WS adapter: pump axum WebSocket frames in/out of a RelayLeg.
+thiserror = { workspace = true }
+# The pairing-rendezvous + data-leg WS server: pump axum WebSocket frames in and
+# out of a RelayLeg.
 axum = { workspace = true, features = ["ws"] }
 futures = { workspace = true }
 

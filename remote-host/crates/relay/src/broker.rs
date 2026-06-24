@@ -82,6 +82,20 @@ impl RelayBroker {
         }
     }
 
+    /// Match an already-parked leg for `key` **without** parking a new one.
+    /// Returns the second leg if a host is waiting, else `None`.
+    ///
+    /// This is the asymmetric half of the pairing rendezvous: only an admitted
+    /// gateway [`join`](Self::join)s (parks) a code; an unauthenticated app uses
+    /// `try_match`, so it can pair with a waiting host but can never occupy a
+    /// code or flood the broker with parked legs.
+    pub fn try_match(&self, key: &str) -> Option<RelayLeg> {
+        self.pending.lock().remove(key).map(|half| RelayLeg {
+            to_peer: half.to_first,
+            from_peer: half.from_first,
+        })
+    }
+
     /// Drop a still-pending (unmatched) leg — a disconnect before the partner
     /// arrives, or a TTL sweep. Returns whether a parked leg was removed.
     pub fn cancel(&self, key: &str) -> bool {
@@ -138,5 +152,24 @@ mod tests {
         drop(app); // app disconnects
         // The peer's stream ends cleanly rather than hanging.
         assert!(gw.from_peer.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn try_match_pairs_with_host_but_never_parks() {
+        let broker = RelayBroker::new();
+        // No host yet → try_match parks nothing and returns None.
+        assert!(broker.try_match("code-1").is_none());
+        assert_eq!(broker.pending_len(), 0, "try_match never parks a leg");
+
+        // The admitted gateway hosts the code (parks); the app then matches.
+        let mut host = broker.join("code-1");
+        assert_eq!(broker.pending_len(), 1);
+        let mut app = broker.try_match("code-1").expect("host was waiting");
+        assert_eq!(broker.pending_len(), 0);
+
+        host.to_peer.send(b"a->p".to_vec()).await.unwrap();
+        assert_eq!(app.from_peer.recv().await.unwrap(), b"a->p");
+        app.to_peer.send(b"p->a".to_vec()).await.unwrap();
+        assert_eq!(host.from_peer.recv().await.unwrap(), b"p->a");
     }
 }
