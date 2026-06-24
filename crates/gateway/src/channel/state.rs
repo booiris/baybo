@@ -12,7 +12,7 @@ use baybo_agent::SessionManager;
 use baybo_channels::{ChannelRegistry, RouterInbound};
 use baybo_pairing::{DevicePairingService, PairingService};
 use baybo_security::SecretVault;
-use baybo_store::{BlobStore, ChannelBotStore, TaskStore};
+use baybo_store::{BlobStore, ChannelBotStore, DeviceStore, TaskStore};
 
 use tokio::sync::mpsc;
 
@@ -84,6 +84,10 @@ pub struct WsChannelState {
     /// `/v1/device/pair` WS route (A's static Noise key is loaded lazily from
     /// `secret_vault` per handshake).
     pub device_pairing: Arc<DevicePairingService>,
+    /// Persisted device registry. The `/v1/device/content` route re-fetches the
+    /// authenticated device's row to verify the Noise IK initiator's static key
+    /// equals the `device_pubkey` exchanged at pairing.
+    pub device_store: Arc<dyn DeviceStore>,
     /// Direct-reachability endpoints handed to a pairing device inside the
     /// SPAKE2 K-channel (`GatewayWelcome.direct_candidates`). Empty when
     /// `gateway.direct.enabled` is false.
@@ -151,13 +155,15 @@ impl WsChannelState {
                             url: p.url.clone(),
                             no_proxy: p.no_proxy.clone(),
                         });
-                baybo_security::http::client(proxy.as_ref()).ok().map(|client| {
-                    Arc::new(crate::push::HttpApnsRegistrar::new(
-                        &push.gateway_url,
-                        push.instance_key.clone(),
-                        client,
-                    )) as Arc<dyn crate::push::ApnsRegistrar>
-                })
+                baybo_security::http::client(proxy.as_ref())
+                    .ok()
+                    .map(|client| {
+                        Arc::new(crate::push::HttpApnsRegistrar::new(
+                            &push.gateway_url,
+                            push.instance_key.clone(),
+                            client,
+                        )) as Arc<dyn crate::push::ApnsRegistrar>
+                    })
             } else {
                 None
             };
@@ -176,6 +182,7 @@ impl WsChannelState {
             bot_reconciler: Arc::clone(&deps.bot_reconciler),
             pairing,
             device_pairing,
+            device_store: deps.stores.device.clone(),
             device_direct_candidates,
             apns_registrar,
             blob_store: deps.stores.blob.clone(),

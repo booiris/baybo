@@ -42,15 +42,29 @@ struct PairSession {
 /// reconnect and open a content session after a relaunch. Serialized into the
 /// App Group keychain (`keychain::store_paired_record`).
 #[derive(Debug, Serialize, Deserialize)]
-struct PairedRecord {
-    user_id: String,
-    device_id: String,
-    auth_token: String,
-    gateway_static_pubkey: [u8; 32],
-    direct_candidates: Vec<String>,
-    relay_node_id: String,
-    /// The app's long-term Noise static secret (its content-session identity).
-    noise_secret: [u8; 32],
+pub(crate) struct PairedRecord {
+    pub(crate) user_id: String,
+    pub(crate) device_id: String,
+    pub(crate) auth_token: String,
+    pub(crate) gateway_static_pubkey: [u8; 32],
+    pub(crate) direct_candidates: Vec<String>,
+    pub(crate) relay_node_id: String,
+    /// The app's long-term Noise static identity (its content-session identity):
+    /// the secret drives the IK initiator; the public half completes the keypair
+    /// `device-proto` expects (snow re-derives it from the secret regardless).
+    pub(crate) noise_secret: [u8; 32],
+    #[serde(default)]
+    pub(crate) noise_public: [u8; 32],
+}
+
+/// Load and decode the persisted pairing record, if the app is paired.
+pub(crate) fn load_paired_record() -> Result<Option<PairedRecord>, String> {
+    let Some(bytes) = crate::keychain::read_paired_record()? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("decode paired record: {e}"))
 }
 
 /// What `pair_begin` returns: the confirmation code to show the user + the
@@ -197,6 +211,7 @@ pub async fn pair_confirm(
         direct_candidates: paired.direct_candidates.clone(),
         relay_node_id: paired.relay_node_id.clone(),
         noise_secret: session.keypair.secret(),
+        noise_public: session.keypair.public(),
     };
     let bytes =
         serde_json::to_vec(&record).map_err(|e| format!("encode paired record: {e}"))?;
@@ -209,9 +224,7 @@ pub async fn pair_confirm(
 /// The owning user of the persisted pairing, if the app is already paired
 /// (so a relaunch can skip straight to "connected" instead of the scan form).
 pub fn paired_user() -> Option<String> {
-    let bytes = crate::keychain::read_paired_record().ok().flatten()?;
-    let record: PairedRecord = serde_json::from_slice(&bytes).ok()?;
-    Some(record.user_id)
+    load_paired_record().ok().flatten().map(|r| r.user_id)
 }
 
 type Ws =

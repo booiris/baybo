@@ -14,8 +14,9 @@
 //! [`device_proto`] + the `Frame` codec is [`wire`], so interop with
 //! the gateway is guaranteed by construction.
 
+use baybo_model::{ChannelType, SessionId};
 use device_proto::noise::StaticKeypair;
-use wire::{Frame, decode, encode};
+use wire::{Frame, Message, MessageRole, decode, encode};
 use snow::{HandshakeState, TransportState};
 
 use crate::error::MobileError;
@@ -78,11 +79,41 @@ impl ContentSession {
     }
 }
 
+/// A catch-up [`Frame::Subscribe`] for `session_id`. `since_ordinal` is the
+/// highest ordinal the app has already rendered (so the gateway replays only
+/// the gap); `None` is a fresh subscribe with no catch-up.
+pub fn subscribe_frame(session_id: &str, since_ordinal: Option<i64>) -> Frame {
+    Frame::Subscribe {
+        session_id: SessionId::from(session_id),
+        since_ordinal,
+    }
+}
+
+/// An outbound user-text [`Frame::Message`] on `session_id`. `platform_msg_id`
+/// is a client-chosen idempotency key (a fresh UUID per send) so a retry after
+/// a transport blip doesn't double-fire the agent.
+pub fn user_text_frame(
+    session_id: &str,
+    user_id: &str,
+    text: &str,
+    platform_msg_id: &str,
+) -> Frame {
+    Frame::Message(Message {
+        content: text.to_owned(),
+        session_id: SessionId::from(session_id),
+        user_id: user_id.to_owned(),
+        channel_type: ChannelType::ios(),
+        bot_id: String::new(),
+        attachments: Vec::new(),
+        platform_msg_id: platform_msg_id.to_owned(),
+        role: MessageRole::User,
+        ordinal: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use baybo_model::{ChannelType, SessionId};
-    use wire::{Message, MessageRole};
 
     /// The app's content session round-trips a self-pull against an in-process
     /// gateway (IK responder built from the same `device-proto`): the app

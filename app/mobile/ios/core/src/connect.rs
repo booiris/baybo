@@ -26,15 +26,22 @@ pub enum Endpoint {
 /// The ordered list of endpoints to try: every direct candidate first, then the
 /// relay (only if A advertised a `relay_node_id`).
 pub fn connection_plan(paired: &PairedGateway) -> Vec<Endpoint> {
-    let mut plan: Vec<Endpoint> = paired
-        .direct_candidates
+    endpoints(&paired.direct_candidates, &paired.relay_node_id)
+}
+
+/// Build the ordered endpoint list from the raw routing fields — every direct
+/// candidate first, then the relay if a `relay_node_id` was assigned. Lets the
+/// Tauri shell plan a connection straight from the persisted `PairedRecord`
+/// without reconstructing a full [`PairedGateway`].
+pub fn endpoints(direct_candidates: &[String], relay_node_id: &str) -> Vec<Endpoint> {
+    let mut plan: Vec<Endpoint> = direct_candidates
         .iter()
         .cloned()
         .map(Endpoint::Direct)
         .collect();
-    if !paired.relay_node_id.is_empty() {
+    if !relay_node_id.is_empty() {
         plan.push(Endpoint::Relay {
-            node_id: paired.relay_node_id.clone(),
+            node_id: relay_node_id.to_owned(),
         });
     }
     plan

@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useRef, useState } from "react";
+import { Channel, invoke } from "@tauri-apps/api/core";
 
 /// Mirror of `PairChallenge` returned by `pair_begin` (src-tauri): the
 /// confirmation code to compare + the device id to pass back to `pair_confirm`.
@@ -34,6 +34,128 @@ function parseScan(text: string): { endpoint?: string; code: string; relay: bool
   return { code: text.trim(), relay: false };
 }
 
+/// A decrypted wire `Frame` as it arrives over the Tauri content channel.
+/// MessagePack field names round-trip as snake_case JSON; we only model the few
+/// variants the chat view renders and tolerate the rest.
+type WireFrame =
+  | { kind: "message"; content: string; role?: "user" | "assistant"; platform_msg_id?: string }
+  | { kind: "answer_delta"; text: string }
+  | { kind: "turn_state"; active: boolean }
+  | { kind: "notice"; level: string; text: string }
+  | { kind: "reset"; reason: string }
+  // Frames we don't render (reasoning, tool progress, ping/pong, …) arrive with
+  // other `kind`s and fall through the switch's `default`.
+  | { kind: "other" };
+
+type ChatMsg = { id: string; role: "user" | "assistant" | "notice"; content: string };
+
+/// The post-pairing chat: opens a Noise content session for a fresh session id,
+/// renders the agent's streamed reply, and sends user messages.
+function ChatView({ onClose }: { onClose: () => void }) {
+  const [sessionId] = useState(() => crypto.randomUUID());
+  const [messages, setMessages] = useState<ChatMsg[]>([]);
+  const [streaming, setStreaming] = useState("");
+  const [turnActive, setTurnActive] = useState(false);
+  const [input, setInput] = useState("");
+  const [status, setStatus] = useState<string | null>("Connecting…");
+  // Idempotency keys we've optimistically rendered, so the server's echo of our
+  // own message doesn't render it a second time.
+  const sentIds = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    const channel = new Channel<WireFrame>();
+    channel.onmessage = (frame) => {
+      switch (frame.kind) {
+        case "message": {
+          const role = frame.role === "user" ? "user" : "assistant";
+          if (
+            role === "user" &&
+            frame.platform_msg_id &&
+            sentIds.current.has(frame.platform_msg_id)
+          ) {
+            return; // our own message, already shown optimistically
+          }
+          setStreaming("");
+          setMessages((m) => [
+            ...m,
+            { id: frame.platform_msg_id || crypto.randomUUID(), role, content: frame.content },
+          ]);
+          break;
+        }
+        case "answer_delta":
+          setStreaming((s) => s + frame.text);
+          break;
+        case "turn_state":
+          setTurnActive(frame.active);
+          break;
+        case "notice":
+          setMessages((m) => [
+            ...m,
+            { id: crypto.randomUUID(), role: "notice", content: frame.text },
+          ]);
+          break;
+        case "reset":
+          setStatus(`Stream reset: ${frame.reason}`);
+          break;
+        default:
+          break; // reasoning / tool progress / etc. not surfaced in phase 1
+      }
+    };
+    invoke("content_connect", { sessionId, onFrame: channel })
+      .then(() => setStatus(null))
+      .catch((e) => setStatus(`Connect failed: ${e}`));
+    return () => {
+      invoke("content_disconnect").catch(() => {});
+    };
+  }, [sessionId]);
+
+  async function send() {
+    const text = input.trim();
+    if (!text) return;
+    const msgId = crypto.randomUUID();
+    sentIds.current.add(msgId);
+    setMessages((m) => [...m, { id: msgId, role: "user", content: text }]);
+    setInput("");
+    try {
+      await invoke("content_send", { text, msgId });
+    } catch (e) {
+      setStatus(`Send failed: ${e}`);
+    }
+  }
+
+  return (
+    <main className="container chat">
+      <div className="chat-header">
+        <button onClick={onClose}>← Back</button>
+        <h1>Chat</h1>
+      </div>
+      <div className="chat-log">
+        {messages.map((m) => (
+          <div key={m.id} className={`bubble ${m.role}`}>
+            {m.content}
+          </div>
+        ))}
+        {streaming && <div className="bubble assistant streaming">{streaming}</div>}
+        {turnActive && !streaming && <div className="bubble assistant muted">…</div>}
+      </div>
+      {status && <p className="status">{status}</p>}
+      <div className="row composer">
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") send();
+          }}
+          placeholder="Message…"
+        />
+        <button onClick={send} disabled={!input.trim()}>
+          Send
+        </button>
+      </div>
+    </main>
+  );
+}
+
 export default function App() {
   const [endpoint, setEndpoint] = useState("wss://proxy.baybo.space:7777");
   const [relay, setRelay] = useState(true);
@@ -45,6 +167,8 @@ export default function App() {
   const [paired, setPaired] = useState<PairedSummary | null>(null);
   // On launch, a persisted pairing means we can skip straight to "connected".
   const [rememberedUser, setRememberedUser] = useState<string | null>(null);
+  // Whether the chat view is open (a live content session).
+  const [chatting, setChatting] = useState(false);
 
   useEffect(() => {
     invoke<string | null>("paired_user")
@@ -113,6 +237,10 @@ export default function App() {
     }
   }
 
+  if (chatting) {
+    return <ChatView onClose={() => setChatting(false)} />;
+  }
+
   if (paired) {
     return (
       <main className="container">
@@ -128,7 +256,10 @@ export default function App() {
           <dt>Direct candidates</dt>
           <dd>{paired.directCandidates.length ? paired.directCandidates.join(", ") : "—"}</dd>
         </dl>
-        <button onClick={() => setPaired(null)}>Pair another</button>
+        <div className="row">
+          <button onClick={() => setChatting(true)}>Open chat</button>
+          <button onClick={() => setPaired(null)}>Pair another</button>
+        </div>
       </main>
     );
   }
@@ -162,7 +293,10 @@ export default function App() {
         <p className="muted">
           Paired as {rememberedUser} (remembered from a previous session).
         </p>
-        <button onClick={() => setRememberedUser(null)}>Pair another device</button>
+        <div className="row">
+          <button onClick={() => setChatting(true)}>Open chat</button>
+          <button onClick={() => setRememberedUser(null)}>Pair another device</button>
+        </div>
       </main>
     );
   }

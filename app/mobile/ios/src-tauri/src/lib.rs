@@ -6,12 +6,16 @@
 //! Extension under `../apple`). The protocol/crypto live in the shared crates,
 //! so interop with the gateway is guaranteed by construction.
 
+mod content;
 mod keychain;
 mod pairing;
 mod push_register;
 
+use baybo_mobile_core::Frame;
+use content::ContentSessions;
 use pairing::{PairChallenge, PairedSummary, PairingSessions};
 use tauri::State;
+use tauri::ipc::Channel;
 
 /// Scan-to-connect, phase 1: dial the gateway, run SPAKE2 + send `DeviceHello`,
 /// and return the Bluetooth-style confirmation code the UI shows the user to
@@ -43,6 +47,36 @@ async fn pair_confirm(
 #[tauri::command]
 fn paired_user() -> Option<String> {
     pairing::paired_user()
+}
+
+/// Open the E2E content session for `sessionId`: connect to the paired gateway,
+/// run the Noise handshake, subscribe, and stream decrypted frames to the
+/// webview over `onFrame`.
+#[tauri::command]
+async fn content_connect(
+    sessions: State<'_, ContentSessions>,
+    session_id: String,
+    on_frame: Channel<Frame>,
+) -> Result<(), String> {
+    content::connect(&sessions, session_id, on_frame).await
+}
+
+/// Send a user message on the live content session. `msgId` is a fresh per-send
+/// idempotency key so a retry doesn't double-fire the agent.
+#[tauri::command]
+async fn content_send(
+    sessions: State<'_, ContentSessions>,
+    text: String,
+    msg_id: String,
+) -> Result<(), String> {
+    content::send(&sessions, text, msg_id).await
+}
+
+/// Tear down the live content session (the user left the chat view).
+#[tauri::command]
+async fn content_disconnect(sessions: State<'_, ContentSessions>) -> Result<(), String> {
+    content::disconnect(&sessions).await;
+    Ok(())
 }
 
 /// Debug-only: seed a known push key into the shared App Group keychain so the
@@ -93,13 +127,21 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
     let result = builder
         .manage(PairingSessions::default())
+        .manage(ContentSessions::default())
         .setup(|_app| {
             // Request provisional notification auth + remote-notification
             // registration once the app is up (main thread). No-op off iOS.
             push_register::register();
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![pair_begin, pair_confirm, paired_user])
+        .invoke_handler(tauri::generate_handler![
+            pair_begin,
+            pair_confirm,
+            paired_user,
+            content_connect,
+            content_send,
+            content_disconnect
+        ])
         .run(tauri::generate_context!());
     if let Err(e) = result {
         eprintln!("baybo: fatal error while running the app: {e}");

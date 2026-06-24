@@ -30,12 +30,99 @@ use baybo_channels::{
 use baybo_model::{ChannelType, ContentBlock};
 use baybo_store::BlobStore;
 use baybo_tools::ApprovalDecision;
-use futures::SinkExt;
-use futures::stream::SplitSink;
+use futures::stream::{SplitSink, SplitStream};
+use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 pub(crate) type WsSink = SplitSink<WebSocket, AxumWsMessage>;
+
+/// Outbound transport for a channel connection: MessagePack-encode a [`Frame`]
+/// and write it to the wire. The raw `/v1/channel-ws` path sends the bytes
+/// directly ([`WsFrameSink`]); the `/v1/device/content` path Noise-wraps them
+/// (`device_content::NoiseFrameSink`). Keeping the encode + write behind this
+/// seam lets the shared [`pump_loop`] stay transport-agnostic.
+#[async_trait::async_trait]
+pub(crate) trait FrameSink: Send + 'static {
+    /// Encode and send one frame. A recoverable per-frame error (e.g. an
+    /// un-encodable frame) returns `Ok(())` so the pump keeps running; `Err(())`
+    /// signals the wire is gone and the pump should stop.
+    async fn send_frame(&mut self, frame: &Frame) -> Result<(), ()>;
+    /// Best-effort close on pump shutdown.
+    async fn close(&mut self);
+}
+
+/// Raw WebSocket sink: encode the frame and send it as a binary message. Used by
+/// `/v1/channel-ws` (TUI, web chat, sidecars), where the transport is plain TLS.
+pub(crate) struct WsFrameSink(pub(crate) WsSink);
+
+#[async_trait::async_trait]
+impl FrameSink for WsFrameSink {
+    async fn send_frame(&mut self, frame: &Frame) -> Result<(), ()> {
+        let bytes = match wire::encode(frame) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "encode outbound frame");
+                return Ok(());
+            }
+        };
+        self.0
+            .send(AxumWsMessage::Binary(bytes.into()))
+            .await
+            .map_err(|e| tracing::debug!(error = %e, "ws sink error; pump exiting"))
+    }
+
+    async fn close(&mut self) {
+        let _ = self.0.close().await;
+    }
+}
+
+/// Inbound transport for a channel connection: yield the next decoded [`Frame`],
+/// or `None` when the connection is finished (clean close, read error, or
+/// unrecoverable transport error). Per-message decode errors are logged and
+/// skipped internally so the read loop keeps running. The raw `/v1/channel-ws`
+/// path decodes binary frames directly ([`WsFrameSource`]); the device-content
+/// path Noise-decrypts first (`device_content::NoiseFrameSource`). Symmetric to
+/// [`FrameSink`] so [`super::route::run_inbound_loop`] is transport-agnostic.
+#[async_trait::async_trait]
+pub(crate) trait FrameSource: Send {
+    async fn next_frame(&mut self) -> Option<Frame>;
+}
+
+/// Raw WebSocket source: a binary message is a MessagePack-encoded frame. Used
+/// by `/v1/channel-ws` (TUI, web chat, sidecars).
+pub(crate) struct WsFrameSource(pub(crate) SplitStream<WebSocket>);
+
+#[async_trait::async_trait]
+impl FrameSource for WsFrameSource {
+    async fn next_frame(&mut self) -> Option<Frame> {
+        loop {
+            let msg = match self.0.next().await {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => {
+                    tracing::debug!(error = %e, "ws read error; tearing down");
+                    return None;
+                }
+                None => return None,
+            };
+            match msg {
+                AxumWsMessage::Binary(bytes) => match wire::decode(&bytes) {
+                    Ok(frame) => return Some(frame),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "decode frame failed");
+                        continue;
+                    }
+                },
+                AxumWsMessage::Close(_) => return None,
+                AxumWsMessage::Ping(_) | AxumWsMessage::Pong(_) => continue,
+                AxumWsMessage::Text(_) => {
+                    tracing::warn!("unexpected text frame; closing");
+                    return None;
+                }
+            }
+        }
+    }
+}
 
 /// Outbound mpsc buffer. Large enough to absorb a short burst of
 /// deltas without back-pressuring the agent loop; small enough that a
@@ -82,10 +169,10 @@ impl Sidecar {
     /// surfaced lived in the channel resolve, which now runs in
     /// [`resolve_or_install_channel`] so the route can ack failures
     /// on the wire instead of dropping the socket silently.
-    pub(crate) fn build(
+    pub(crate) fn build<S: FrameSink>(
         channel_type: ChannelType,
         channel: Arc<Channel>,
-        sink: WsSink,
+        sink: S,
         blob_store: Arc<dyn BlobStore>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(OUTBOUND_BUFFER);
@@ -226,7 +313,7 @@ async fn translator_loop(
 /// so a single dropped frame doesn't trip it.
 const KEEPALIVE_PING_INTERVAL: Duration = Duration::from_secs(20);
 
-async fn pump_loop(mut sink: WsSink, mut frame_rx: mpsc::Receiver<Frame>) {
+async fn pump_loop<S: FrameSink>(mut sink: S, mut frame_rx: mpsc::Receiver<Frame>) {
     // First tick fires one interval out, not immediately, so a chatty
     // connection never carries a redundant startup Ping.
     let mut keepalive = tokio::time::interval_at(
@@ -242,19 +329,11 @@ async fn pump_loop(mut sink: WsSink, mut frame_rx: mpsc::Receiver<Frame>) {
             },
             _ = keepalive.tick() => Frame::Ping,
         };
-        let bytes = match wire::encode(&frame) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "encode outbound frame");
-                continue;
-            }
-        };
-        if let Err(e) = sink.send(AxumWsMessage::Binary(bytes.into())).await {
-            tracing::debug!(error = %e, "ws sink error; pump exiting");
+        if sink.send_frame(&frame).await.is_err() {
             break;
         }
     }
-    let _ = sink.close().await;
+    sink.close().await;
 }
 
 async fn session_event_to_frame(

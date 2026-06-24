@@ -54,6 +54,10 @@ baybo-workspace = { workspace = true, features = ["io"] }
 anyhow = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+# Noise IK responder for the device-content session (transport-wraps the
+# channel frame loop). Same major as device-proto so the handshake/transport
+# types unify across the two crates.
+snow = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["io"] }
 tokio-stream = { workspace = true }

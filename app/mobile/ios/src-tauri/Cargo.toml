@@ -22,7 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 futures-util = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
 tokio-tungstenite = { workspace = true }
 
 # The camera/barcode plugin only exists on mobile; on desktop the crate is empty.
