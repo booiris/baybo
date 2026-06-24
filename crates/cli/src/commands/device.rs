@@ -85,11 +85,14 @@ async fn pair(
     let payload = format!("baybo://pair?h={endpoint}&c={code}");
     eprintln!("Pairing a new device.\n");
     if let Some(qr) = render_pairing_qr(&payload) {
-        eprintln!("{qr}");
+        // Blank line after as well: the surrounding blank lines stand in for the
+        // (dropped) quiet zone so the matrix still scans against the terminal bg.
+        eprintln!("{qr}\n");
+    } else {
+        // QR couldn't render (shouldn't happen for this short payload) — fall
+        // back to the raw code so the operator can still pair manually.
+        eprintln!("endpoint: {endpoint}\ncode:     {code}\n");
     }
-    eprintln!("Scan in the Baybo app — or enter manually:");
-    eprintln!("    endpoint: {endpoint}");
-    eprintln!("    code:     {code}\n");
     eprintln!("Waiting for the device to scan…");
 
     // 1. Wait for the phone to scan + reach the confirm step: the gateway
@@ -207,17 +210,23 @@ fn pairing_endpoint(ctx: &CommandContext) -> String {
     DEFAULT_GATEWAY_ENDPOINT.to_string()
 }
 
-/// Render `payload` as a QR for the terminal (unicode half-blocks, inverted so
-/// it scans on a dark background). `None` if the payload won't fit a QR.
+/// Render `payload` as a QR for the terminal (unicode half-blocks). `None` if
+/// the payload won't fit a QR.
+///
+/// Natural polarity (dark modules filled `█`, light modules empty) so it shows
+/// as a normal black-on-white QR on a light terminal and an inverted (still
+/// scannable) one on a dark terminal. The built-in quiet zone is dropped so the
+/// matrix renders flush — the caller frames it with blank lines, which serve as
+/// the scan margin against the terminal background.
 fn render_pairing_qr(payload: &str) -> Option<String> {
     use qrcode::QrCode;
     use qrcode::render::unicode;
     let code = QrCode::new(payload).ok()?;
     Some(
         code.render::<unicode::Dense1x2>()
-            .dark_color(unicode::Dense1x2::Light)
-            .light_color(unicode::Dense1x2::Dark)
-            .quiet_zone(true)
+            .dark_color(unicode::Dense1x2::Dark)
+            .light_color(unicode::Dense1x2::Light)
+            .quiet_zone(false)
             .build(),
     )
 }
