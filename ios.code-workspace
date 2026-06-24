@@ -1,0 +1,8 @@
+{
+  "folders": [
+    { "path": "app/mobile/ios" }
+  ],
+  "settings": {
+    "rust-analyzer.cargo.target": "aarch64-apple-ios-sim"
+  }
+}
