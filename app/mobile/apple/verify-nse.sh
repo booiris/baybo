@@ -25,13 +25,13 @@
 # FAIL  = the placeholder:         New message / Open Baybo
 #         (NSE ran but couldn't read/decrypt — check the keychain self-check line)
 #
-# Usage:  app/mobile/ios/apple/verify-nse.sh
+# Usage:  app/mobile/apple/verify-nse.sh
 #   env:  BAYBO_SIGN_ID   override the signing identity (default: first "Apple Development")
 #         BAYBO_SIM_UDID  reuse an existing booted iOS 26 simulator
 
 set -euo pipefail
 
-IOS_DIR="$(cd "$(dirname "$0")/.." && pwd)"          # app/mobile/ios
+IOS_DIR="$(cd "$(dirname "$0")/.." && pwd)"          # app/mobile
 GEN="$IOS_DIR/src-tauri/gen/apple"
 APP="$GEN/build/arm64-sim/Baybo.app"
 

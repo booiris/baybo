@@ -1,6 +1,6 @@
 # Baybo iOS — Apple-side artifacts (NSE)
 
-The Rust client core (`app/mobile/ios/core`, crate `baybo-mobile-core`) is the
+The Rust client core (`app/mobile/core`, crate `baybo-mobile-core`) is the
 FFI-free, host-tested protocol engine: pairing (scan-to-connect), the Noise
 content session (self-pull), and the direct-first/relay-fallback connection
 policy. It cross-compiles to `aarch64-apple-ios` unchanged.
@@ -30,7 +30,7 @@ verifiable **without Xcode** — `verify-crypto.swift` runs the same
 `ChaChaPoly.SealedBox(combined:)` + `open` against the pinned fixture:
 
 ```
-$ swift app/mobile/ios/apple/verify-crypto.swift
+$ swift app/mobile/apple/verify-crypto.swift
 PASS: CryptoKit decrypt matches the Rust AEAD fixture (title=Baybo, body=The agent finished replying.)
 PASS: wrong key -> nil (placeholder kept)
 ```
@@ -68,7 +68,7 @@ the 32-byte push key for `bid`, nonce = `n`, empty AAD) into
 
 ## Wiring it into the Tauri app (needs the iOS toolchain)
 
-1. `cd app/mobile/ios && cargo tauri ios init` — generates the Xcode project
+1. `cd app/mobile && cargo tauri ios init` — generates the Xcode project
    under `src-tauri/gen/apple/` wrapping `baybo-mobile-core`.
 2. In Xcode, **File ▸ New ▸ Target ▸ Notification Service Extension**; replace
    its generated `NotificationService.swift` with the two `.swift` sources here

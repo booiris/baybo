@@ -10,7 +10,7 @@ Phase 1 ships an iOS companion app for Baybo with two user-facing features:
    gateway encrypts, the operator's relay forwards ciphertext blind, and the
    phone decrypts locally in a Notification Service Extension (NSE).
 
-The app is a **Tauri 2** shell (`app/mobile/ios`) over a host-tested,
+The app is a **Tauri 2** shell (`app/mobile`) over a host-tested,
 FFI-free Rust core (`baybo-mobile-core`); the protocol + crypto live in shared
 crates so the phone and the gateway agree by construction.
 
@@ -42,12 +42,12 @@ crate — its `/notify` + `/register` payloads are a JSON contract, so the
   (`serve.rs`), token store.
 - `remote-host/crates/relay` — C-side blind byte-pipe + SPAKE2 rendezvous (the
   relay-fallback data leg).
-- `app/mobile/ios/core` (`baybo-mobile-core`) — P-side: `PairingClient`,
+- `app/mobile/core` (`baybo-mobile-core`) — P-side: `PairingClient`,
   `ContentSession` (Noise self-pull), and the direct-first/relay-fallback
   `connect` policy. No FFI, no platform APIs — fully host-unit-testable.
-- `app/mobile/ios/src-tauri` — the Tauri shell: the `pair` command, push-key
+- `app/mobile/src-tauri` — the Tauri shell: the `pair` command, push-key
   keychain persistence (`keychain.rs`), and push registration (`push_register.rs`).
-- `app/mobile/ios/apple/NotificationExtension` — the NSE (`NotificationService.swift`,
+- `app/mobile/apple/NotificationExtension` — the NSE (`NotificationService.swift`,
   `PushKeyStore.swift`), plus `verify-crypto.swift` and `verify-nse.sh`.
 
 ## Wire & crypto contracts

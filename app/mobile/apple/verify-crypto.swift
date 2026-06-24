@@ -6,7 +6,7 @@
 // ships with macOS. Proves the Swift consumer agrees with the Rust producer
 // byte-for-byte.
 //
-//   $ swift app/mobile/ios/apple/verify-crypto.swift
+//   $ swift app/mobile/apple/verify-crypto.swift
 //
 // Pairs with the Rust test `device_proto::fixtures::pinned_vector_is_reproduced`.
 // If the AEAD output ever drifts, update CIPHERTEXT_HEX in BOTH places together.

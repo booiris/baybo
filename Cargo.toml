@@ -38,7 +38,7 @@ members = [
     "bench/swe",
     "bench/bench-web",
 ]
-exclude = ["crates/security/fuzz", "remote-host", "app/mobile/ios"]
+exclude = ["crates/security/fuzz", "remote-host", "app/mobile"]
 
 [workspace.package]
 version = "0.1.0"

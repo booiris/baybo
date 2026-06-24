@@ -333,6 +333,6 @@
     "rust-analyzer.linkedProjects": [
         "Cargo.toml",
         "remote-host/Cargo.toml",
-        "app/mobile/ios/Cargo.toml"
+        "app/mobile/Cargo.toml"
     ]
 }

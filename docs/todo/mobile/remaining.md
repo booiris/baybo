@@ -32,7 +32,7 @@ workspaces, tsc on the frontend, 13 relay tests).
 Gateway `/v1/device/content` Noise-IK responder (+ the transport-generic
 `FrameSink`/`FrameSource` seam in `channel/adapter.rs`) + Tauri content wiring +
 chat UI. See `crates/gateway/src/channel/device_content.rs`,
-`app/mobile/ios/src-tauri/src/content.rs`, `app/mobile/ios/src/App.tsx`. (Known
+`app/mobile/src-tauri/src/content.rs`, `app/mobile/src/App.tsx`. (Known
 limit: one frame ≤ the Noise ~64 KiB ceiling; chunking is a follow-up.)
 
 ### 2. Content relay — content traffic for a NAT'd gateway ✅ done
