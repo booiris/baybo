@@ -88,17 +88,17 @@ async fn approved_device_authenticates_channel_ws_upgrade() {
     let _ = handle.await;
 }
 
-/// A still-**pending** (un-approved) device is rejected at the same gate — its
-/// `auth_token` is inert until the operator approves.
+/// A **revoked** device is rejected at the same gate — its `auth_token` no
+/// longer authenticates anything (the only inert state now that pairing lands
+/// rows already-approved).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pending_device_token_is_rejected_on_channel_ws() {
+async fn revoked_device_token_is_rejected_on_channel_ws() {
     let (_dir, pf) = port_file();
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     boot::install_channels(&tg.deps.channel_registry, &ChannelsConfig::default()).expect("install");
-    let mut pending = approved_device("pending-token");
-    pending.status = DeviceStatus::Pending;
-    pending.approved_at = None;
-    tg.deps.stores.device.create(&pending).await.unwrap();
+    let mut revoked = approved_device("revoked-token");
+    revoked.status = DeviceStatus::Revoked;
+    tg.deps.stores.device.create(&revoked).await.unwrap();
 
     let shutdown = tg.shutdown.clone();
     let server = ChannelServer::bind_with_device_store(
@@ -115,8 +115,8 @@ async fn pending_device_token_is_rejected_on_channel_ws() {
     });
 
     assert!(
-        !upgrade_accepted(port, "pending-token").await,
-        "an unapproved device token must NOT authenticate the channel WS upgrade",
+        !upgrade_accepted(port, "revoked-token").await,
+        "a revoked device token must NOT authenticate the channel WS upgrade",
     );
 
     shutdown.trigger();

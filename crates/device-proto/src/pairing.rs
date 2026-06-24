@@ -61,13 +61,22 @@ pub struct GatewayWelcome {
     pub direct_candidates: Vec<String>,
     /// Owning principal on the gateway.
     pub user_id: String,
-    /// The retained SPAKE2 code, used by the operator as the approval handle
-    /// (`baybo device approve <code>`).
+    /// The SPAKE2 code this device paired under, retained for audit / the
+    /// operator's device list (no longer an approval handle).
     pub pairing_code: String,
-    /// The device's bearer token for the scoped REST/WS surface. **Inert until
-    /// the operator approves** — the app stores it and presents it on
-    /// `/v1/channel-ws` once approved.
+    /// The device's bearer token for the scoped REST/WS surface. Active the
+    /// moment this `GatewayWelcome` is sent — the gateway only seals it after
+    /// both the phone user and the operator confirmed the pairing.
     pub auth_token: String,
+}
+
+/// App → gateway, inside the K-channel: the phone user's pairing decision after
+/// comparing the displayed confirmation code (see [`crate::kdf::derive_confirm_code`]).
+/// Sealed under the channel key so a blind relay can neither forge an acceptance
+/// nor flip a decline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceConfirm {
+    pub accepted: bool,
 }
 
 /// On-wire envelope for the device-pairing handshake over the `/v1/device/pair`
@@ -78,8 +87,10 @@ pub struct GatewayWelcome {
 ///    [`PairFrame::Reject`] on a bad/expired code).
 /// 3. P → A [`PairFrame::Sealed`] — the [`DeviceHello`], AEAD-sealed under the
 ///    derived channel key.
-/// 4. A → P [`PairFrame::Sealed`] — the [`GatewayWelcome`], likewise sealed
-///    (or [`PairFrame::Reject`]).
+/// 4. P → A [`PairFrame::Sealed`] — the [`DeviceConfirm`] (the phone user's
+///    decision after comparing the confirmation code on both screens).
+/// 5. A → P [`PairFrame::Sealed`] — the [`GatewayWelcome`], sealed and sent
+///    only once the operator has confirmed too (or [`PairFrame::Reject`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum PairFrame {
@@ -122,6 +133,15 @@ mod tests {
     use super::*;
     use crate::kdf::derive_pair_keys;
     use crate::pake::Pake;
+
+    #[test]
+    fn device_confirm_round_trips() {
+        for accepted in [true, false] {
+            let c = DeviceConfirm { accepted };
+            let decoded: DeviceConfirm = decode(&encode(&c).unwrap()).unwrap();
+            assert_eq!(c, decoded);
+        }
+    }
 
     #[test]
     fn device_hello_round_trips() {

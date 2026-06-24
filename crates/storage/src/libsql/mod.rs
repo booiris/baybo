@@ -528,11 +528,14 @@ impl LibsqlPool {
                     ON devices(auth_token);
 
                 CREATE TABLE IF NOT EXISTS device_pairings (
-                    code        TEXT    PRIMARY KEY,
-                    user_id     TEXT    NOT NULL,
-                    label       TEXT    NOT NULL,
-                    created_at  INTEGER NOT NULL,
-                    expires_at  INTEGER NOT NULL
+                    code              TEXT    PRIMARY KEY,
+                    user_id           TEXT    NOT NULL,
+                    label             TEXT    NOT NULL,
+                    created_at        INTEGER NOT NULL,
+                    expires_at        INTEGER NOT NULL,
+                    confirm_code      TEXT,
+                    device_id         TEXT,
+                    operator_decision INTEGER
                 );",
             )
             .await
@@ -550,6 +553,9 @@ impl LibsqlPool {
             "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE cost_records ADD COLUMN reason TEXT",
             "ALTER TABLE sessions ADD COLUMN folder_id TEXT",
+            "ALTER TABLE device_pairings ADD COLUMN confirm_code TEXT",
+            "ALTER TABLE device_pairings ADD COLUMN device_id TEXT",
+            "ALTER TABLE device_pairings ADD COLUMN operator_decision INTEGER",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {

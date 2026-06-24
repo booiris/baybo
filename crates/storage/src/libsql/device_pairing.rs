@@ -14,7 +14,8 @@ impl LibsqlDevicePairingStore {
     }
 }
 
-const COLS: &str = "code, user_id, label, created_at, expires_at";
+const COLS: &str =
+    "code, user_id, label, created_at, expires_at, confirm_code, device_id, operator_decision";
 
 fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Internal(anyhow::anyhow!("libsql {ctx}: {e}"))
@@ -24,12 +25,18 @@ async fn fetch_row(rows: &mut libsql::Rows) -> Result<Option<DevicePairingSlot>>
     let Some(row) = rows.next().await.map_err(|e| col_err("row", e))? else {
         return Ok(None);
     };
+    let operator_decision: Option<i64> = row
+        .get(7)
+        .map_err(|e| col_err("get operator_decision", e))?;
     Ok(Some(DevicePairingSlot {
         code: row.get(0).map_err(|e| col_err("get code", e))?,
         user_id: row.get(1).map_err(|e| col_err("get user_id", e))?,
         label: row.get(2).map_err(|e| col_err("get label", e))?,
         created_at: row.get(3).map_err(|e| col_err("get created_at", e))?,
         expires_at: row.get(4).map_err(|e| col_err("get expires_at", e))?,
+        confirm_code: row.get(5).map_err(|e| col_err("get confirm_code", e))?,
+        device_id: row.get(6).map_err(|e| col_err("get device_id", e))?,
+        operator_decision: operator_decision.map(|v| v != 0),
     }))
 }
 
@@ -84,6 +91,32 @@ impl DevicePairingStore for LibsqlDevicePairingStore {
         Ok(affected > 0)
     }
 
+    async fn set_confirm(&self, code: &str, confirm_code: &str, device_id: &str) -> Result<()> {
+        let conn = self.pool.conn();
+        conn.execute(
+            "UPDATE device_pairings SET confirm_code = ?2, device_id = ?3 WHERE code = ?1",
+            libsql::params![
+                code.to_string(),
+                confirm_code.to_string(),
+                device_id.to_string()
+            ],
+        )
+        .await
+        .map_err(|e| col_err("set confirm", e))?;
+        Ok(())
+    }
+
+    async fn set_operator_decision(&self, code: &str, accepted: bool) -> Result<()> {
+        let conn = self.pool.conn();
+        conn.execute(
+            "UPDATE device_pairings SET operator_decision = ?2 WHERE code = ?1",
+            libsql::params![code.to_string(), i64::from(accepted)],
+        )
+        .await
+        .map_err(|e| col_err("set operator decision", e))?;
+        Ok(())
+    }
+
     async fn list_slots(&self) -> Result<Vec<DevicePairingSlot>> {
         let conn = self.pool.conn();
         let mut rows = conn
@@ -128,6 +161,9 @@ mod tests {
             label: "iPhone".into(),
             created_at: 100,
             expires_at: exp,
+            confirm_code: None,
+            device_id: None,
+            operator_decision: None,
         }
     }
 
@@ -152,6 +188,35 @@ mod tests {
         s.create_slot(&slot("DUP000", 1000)).await.unwrap();
         let err = s.create_slot(&slot("DUP000", 2000)).await.unwrap_err();
         assert!(matches!(err, StorageError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn confirm_then_operator_decision_round_trip() {
+        let s = store().await;
+        s.create_slot(&slot("CONF01", 1000)).await.unwrap();
+        // Fresh slot: no confirm challenge yet.
+        let got = s.get_slot("CONF01").await.unwrap().unwrap();
+        assert_eq!(got.confirm_code, None);
+        assert_eq!(got.operator_decision, None);
+
+        // Gateway publishes the challenge.
+        s.set_confirm("CONF01", "123456", "dev-1").await.unwrap();
+        let got = s.get_slot("CONF01").await.unwrap().unwrap();
+        assert_eq!(got.confirm_code.as_deref(), Some("123456"));
+        assert_eq!(got.device_id.as_deref(), Some("dev-1"));
+        assert_eq!(got.operator_decision, None);
+
+        // Operator declines, then (on a re-pair) approves — the value round-trips.
+        s.set_operator_decision("CONF01", false).await.unwrap();
+        assert_eq!(
+            s.get_slot("CONF01").await.unwrap().unwrap().operator_decision,
+            Some(false)
+        );
+        s.set_operator_decision("CONF01", true).await.unwrap();
+        assert_eq!(
+            s.get_slot("CONF01").await.unwrap().unwrap().operator_decision,
+            Some(true)
+        );
     }
 
     #[tokio::test]

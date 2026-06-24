@@ -252,19 +252,6 @@ impl DeviceStore for MemoryDeviceStore {
         ))
     }
 
-    async fn approve_by_code(&self, code: &str, now: i64) -> DeviceResult<Option<DeviceRow>> {
-        let mut g = self.rows.lock();
-        let Some(row) = g
-            .values_mut()
-            .find(|r| r.pairing_code.as_deref() == Some(code) && r.status == DeviceStatus::Pending)
-        else {
-            return Ok(None);
-        };
-        row.status = DeviceStatus::Approved;
-        row.approved_at = Some(now);
-        Ok(Some(row.clone()))
-    }
-
     async fn revoke(&self, user_id: &str, device_id: &str) -> DeviceResult<bool> {
         let mut g = self.rows.lock();
         let Some(row) = g.get_mut(&(user_id.to_string(), device_id.to_string())) else {
@@ -324,6 +311,21 @@ impl DevicePairingStore for MemoryDevicePairingStore {
 
     async fn delete_slot(&self, code: &str) -> SlotResult<bool> {
         Ok(self.slots.lock().remove(code).is_some())
+    }
+
+    async fn set_confirm(&self, code: &str, confirm_code: &str, device_id: &str) -> SlotResult<()> {
+        if let Some(slot) = self.slots.lock().get_mut(code) {
+            slot.confirm_code = Some(confirm_code.to_string());
+            slot.device_id = Some(device_id.to_string());
+        }
+        Ok(())
+    }
+
+    async fn set_operator_decision(&self, code: &str, accepted: bool) -> SlotResult<()> {
+        if let Some(slot) = self.slots.lock().get_mut(code) {
+            slot.operator_decision = Some(accepted);
+        }
+        Ok(())
     }
 
     async fn list_slots(&self) -> SlotResult<Vec<DevicePairingSlot>> {

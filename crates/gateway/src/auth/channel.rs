@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_device_token_is_rejected() {
+    async fn revoked_device_token_is_rejected() {
         use baybo_storage::test_support::MemoryDeviceStore;
         use std::sync::Arc;
 
@@ -535,11 +535,11 @@ mod tests {
                 device_id: "d1".into(),
                 label: "iPhone".into(),
                 device_pubkey: vec![0u8; 32],
-                auth_token: "pendtok".into(),
-                status: baybo_store::DeviceStatus::Pending,
+                auth_token: "revtok".into(),
+                status: baybo_store::DeviceStatus::Revoked,
                 pairing_code: Some("CODE12".into()),
                 created_at: 1,
-                approved_at: None,
+                approved_at: Some(1),
                 last_seen_at: None,
             })
             .await
@@ -549,8 +549,8 @@ mod tests {
 
         let mut req = empty_req();
         req.headers_mut()
-            .insert(CHANNEL_TOKEN_HEADER, "pendtok".parse().unwrap());
-        // An inert (un-approved) device token must 401.
+            .insert(CHANNEL_TOKEN_HEADER, "revtok".parse().unwrap());
+        // A revoked device token must 401.
         let err = check_channel_token(&req, &state).await.unwrap_err();
         assert_eq!(err, StatusCode::UNAUTHORIZED);
     }

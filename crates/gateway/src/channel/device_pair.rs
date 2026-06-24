@@ -1,19 +1,22 @@
-//! Token-free `/v1/device/pair` WebSocket: the SPAKE2 device-pairing handshake.
+//! Token-free `/v1/device/pair` WebSocket: the SPAKE2 device-pairing handshake
+//! with a Bluetooth-style mutual confirm.
 //!
 //! Pairing happens *before* any auth token exists, so this route carries no
 //! channel-token middleware — it is gated by the SPAKE2 code itself (a balanced
-//! PAKE allows one online guess per run; the operator's `baybo device approve`
-//! is the second gate). The 4-message handshake (see
+//! PAKE allows one online guess per run) and then by a two-sided confirm: the
+//! phone user and the operator each approve a confirmation code derived from K
+//! before any token activates. The handshake (see
 //! [`device_proto::pairing::PairFrame`]):
 //!
-//! 1. P → A `Hello { code, pake }`   — A claims the slot and runs SPAKE2.
-//! 2. A → P `PakeReply { pake }`     — both ends derive the master secret K.
-//! 3. P → A `Sealed(DeviceHello)`    — app's static key + push registration.
-//! 4. A → P `Sealed(GatewayWelcome)` — A's static key, routing, `auth_token`.
+//! 1. P → A `Hello { code, pake }` — A claims the slot and runs SPAKE2.
+//! 2. A → P `PakeReply { pake }` — both ends derive the master secret K + the confirmation code (HKDF of K).
+//! 3. P → A `Sealed(DeviceHello)` — app's static key + push registration.
+//! 4. P → A `Sealed(DeviceConfirm)` — the phone user's decision; A also waits for the operator's `y` on the live `device pair`.
+//! 5. A → P `Sealed(GatewayWelcome)` — A's static key, routing, active `auth_token`.
 //!
-//! On success a **pending** device row exists (its `auth_token` inert until
-//! the operator approves) and the per-device push key (HKDF of K) is stored in
-//! A's `SecretVault`. C never sees any of this — it only relays opaque blobs.
+//! On mutual confirm an **approved** device row exists (its `auth_token` active)
+//! and the per-device push key (HKDF of K) is stored in A's `SecretVault`. C
+//! never sees any of this — it only relays opaque blobs.
 
 use std::time::Duration;
 
@@ -22,8 +25,8 @@ use axum::extract::State;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use device_proto::kdf::derive_pair_keys;
-use device_proto::pairing::{self, DeviceHello, GatewayWelcome, PairFrame};
+use device_proto::kdf::{derive_confirm_code, derive_pair_keys};
+use device_proto::pairing::{self, DeviceConfirm, DeviceHello, GatewayWelcome, PairFrame};
 use device_proto::pake::Pake;
 
 use super::state::WsChannelState;
@@ -31,6 +34,13 @@ use crate::device::load_or_create_static_keypair;
 
 /// Per-step receive timeout — a stalled peer must not pin a connection.
 const PAIR_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the confirm step waits on a human (the phone user's tap and the
+/// operator's `y`) — longer than a protocol step since people are deciding.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Poll cadence for the operator's confirm decision on the shared slot.
+const CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(400);
 
 pub(crate) fn routes() -> Router<WsChannelState> {
     Router::new().route("/device/pair", get(handler))
@@ -51,7 +61,7 @@ async fn run_pairing(mut socket: WebSocket, state: WsChannelState) {
 
 async fn drive(socket: &mut WebSocket, state: &WsChannelState) -> Result<(), String> {
     // 1. Hello — the pairing code + the app's SPAKE2 message.
-    let PairFrame::Hello { code, pake } = recv(socket).await? else {
+    let PairFrame::Hello { code, pake } = recv(socket, PAIR_STEP_TIMEOUT).await? else {
         return Err("expected Hello frame".into());
     };
 
@@ -70,13 +80,39 @@ async fn drive(socket: &mut WebSocket, state: &WsChannelState) -> Result<(), Str
     send(socket, &PairFrame::PakeReply { pake: gw_pake }).await?;
 
     // 4. Sealed DeviceHello — app static key + push registration.
-    let PairFrame::Sealed { nonce, ciphertext } = recv(socket).await? else {
+    let PairFrame::Sealed { nonce, ciphertext } = recv(socket, PAIR_STEP_TIMEOUT).await? else {
         return Err("expected sealed DeviceHello".into());
     };
     let hello: DeviceHello = pairing::open_msg(&keys.channel_key, &nonce, &ciphertext)
         .map_err(|e| format!("open DeviceHello: {e}"))?;
 
-    // 5. Finalize: write a pending device row + consume the slot.
+    // 5. Mutual confirm. Publish the confirmation code (derived from K) onto the
+    //    slot so the operator's live `device pair` shows it, then require BOTH
+    //    the phone user and the operator to approve before any token activates.
+    let confirm_code = derive_confirm_code(&k).map_err(|e| format!("confirm code: {e}"))?;
+    state
+        .device_pairing
+        .publish_confirm(&slot.code, &confirm_code, &hello.device_id)
+        .await
+        .map_err(|e| format!("publish confirm: {e}"))?;
+
+    // 5a. The phone user's decision, sealed under the channel key.
+    let PairFrame::Sealed { nonce, ciphertext } = recv(socket, CONFIRM_TIMEOUT).await? else {
+        return Err("expected sealed DeviceConfirm".into());
+    };
+    let confirm: DeviceConfirm = pairing::open_msg(&keys.channel_key, &nonce, &ciphertext)
+        .map_err(|e| format!("open DeviceConfirm: {e}"))?;
+    if !confirm.accepted {
+        return Err("the device declined pairing".into());
+    }
+
+    // 5b. The operator's decision, polled from the shared slot (their live
+    //     `device pair` writes it). Abandoned slots age out via the TTL.
+    if !wait_operator_decision(state, &slot.code).await? {
+        return Err("the operator declined pairing".into());
+    }
+
+    // 6. Finalize: write an approved device row + consume the slot.
     let row = state
         .device_pairing
         .complete(&slot, &hello.device_id, hello.static_pubkey.to_vec())
@@ -145,13 +181,34 @@ async fn drive(socket: &mut WebSocket, state: &WsChannelState) -> Result<(), Str
     tracing::info!(
         device = %super::short_hash(&hello.device_id),
         user = %super::short_hash(&slot.user_id),
-        "device paired (pending operator approval)",
+        "device paired",
     );
     Ok(())
 }
 
-async fn recv(socket: &mut WebSocket) -> Result<PairFrame, String> {
-    let next = tokio::time::timeout(PAIR_STEP_TIMEOUT, socket.recv())
+/// Poll the shared slot for the operator's confirm decision (their live
+/// `device pair` writes it) until it is set or the confirm window elapses.
+async fn wait_operator_decision(state: &WsChannelState, code: &str) -> Result<bool, String> {
+    let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
+    loop {
+        let slot = state
+            .device_pairing
+            .claim_slot(code)
+            .await
+            .map_err(|e| format!("poll operator decision: {e}"))?
+            .ok_or_else(|| "pairing slot expired before the operator decided".to_string())?;
+        if let Some(decision) = slot.operator_decision {
+            return Ok(decision);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("timed out waiting for the operator to confirm".into());
+        }
+        tokio::time::sleep(CONFIRM_POLL_INTERVAL).await;
+    }
+}
+
+async fn recv(socket: &mut WebSocket, timeout: Duration) -> Result<PairFrame, String> {
+    let next = tokio::time::timeout(timeout, socket.recv())
         .await
         .map_err(|_| "timed out waiting for pairing frame".to_string())?;
     let msg = next
@@ -216,20 +273,21 @@ mod tests {
     }
 
     /// The full SPAKE2 handshake over a real WebSocket: an app-side client
-    /// drives it end to end and a pending device row + stored push key result.
+    /// drives it end to end, both ends confirm, and an approved device row +
+    /// stored push key result.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn full_pairing_handshake_lands_pending_device() {
+    async fn full_pairing_handshake_lands_approved_device() {
         let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
         let state = WsChannelState::from_deps(&tg.deps);
         let device_store = tg.deps.stores.device.clone();
         let vault = tg.deps.secret_vault.clone();
+        let device_pairing = state.device_pairing.clone();
 
         // Operator mints a slot (the `baybo device pair` step).
-        let code = state
-            .device_pairing
-            .mint("user-1", "Test iPhone")
-            .await
-            .unwrap();
+        let code = device_pairing.mint("user-1", "Test iPhone").await.unwrap();
+        // Operator confirms in their live session (their CLI writes this). Set
+        // up front so the gateway's poll finds it without a timing race.
+        device_pairing.set_operator_decision(&code, true).await.unwrap();
 
         // Serve just the token-free pairing route on an ephemeral port.
         let app = Router::new().nest("/v1", routes().with_state(state));
@@ -269,6 +327,11 @@ mod tests {
         let (nonce, ciphertext) = pairing::seal_msg(&keys.channel_key, &hello).unwrap();
         send_pf(&mut ws, &PairFrame::Sealed { nonce, ciphertext }).await;
 
+        // 3b: sealed DeviceConfirm — the phone user accepts the shown code.
+        let confirm = DeviceConfirm { accepted: true };
+        let (nonce, ciphertext) = pairing::seal_msg(&keys.channel_key, &confirm).unwrap();
+        send_pf(&mut ws, &PairFrame::Sealed { nonce, ciphertext }).await;
+
         // 4: sealed GatewayWelcome.
         let PairFrame::Sealed { nonce, ciphertext } = recv_pf(&mut ws).await else {
             panic!("expected sealed GatewayWelcome");
@@ -279,14 +342,14 @@ mod tests {
         assert!(!welcome.auth_token.is_empty());
         assert_eq!(welcome.static_pubkey.len(), 32);
 
-        // A pending device row landed with the app's static key + the issued
-        // (inert) token, and the per-device push key (HKDF of K) is stored.
+        // An approved device row landed with the app's static key + the active
+        // token, and the per-device push key (HKDF of K) is stored.
         let row = device_store
             .get("user-1", "dev-xyz")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.status, DeviceStatus::Pending);
+        assert_eq!(row.status, DeviceStatus::Approved);
         assert_eq!(row.auth_token, welcome.auth_token);
         assert_eq!(row.device_pubkey, device_static.public().to_vec());
         let pk = vault
@@ -296,8 +359,8 @@ mod tests {
             .unwrap();
         assert_eq!(pk.as_bytes(), keys.push_key.as_slice());
 
-        // Slot consumed: the durable device row carries the code as the
-        // approval handle now (slot deletion is covered by the service tests).
+        // The durable device row retains the code it paired under (slot deletion
+        // is covered by the service tests).
         assert_eq!(row.pairing_code.as_deref(), Some(code.as_str()));
         server.abort();
     }

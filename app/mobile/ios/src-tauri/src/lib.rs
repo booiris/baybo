@@ -10,13 +10,31 @@ mod keychain;
 mod pairing;
 mod push_register;
 
-use pairing::PairedSummary;
+use pairing::{PairChallenge, PairedSummary, PairingSessions};
+use tauri::State;
 
-/// Scan-to-connect: dial the gateway and run the SPAKE2 pairing handshake.
-/// Returns the operator-pending summary the UI renders.
+/// Scan-to-connect, phase 1: dial the gateway, run SPAKE2 + send `DeviceHello`,
+/// and return the Bluetooth-style confirmation code the UI shows the user to
+/// compare against the operator's terminal.
 #[tauri::command]
-async fn pair(endpoint: String, code: String, label: String) -> Result<PairedSummary, String> {
-    pairing::run_pairing(&endpoint, &code, &label).await
+async fn pair_begin(
+    sessions: State<'_, PairingSessions>,
+    endpoint: String,
+    code: String,
+    label: String,
+) -> Result<PairChallenge, String> {
+    pairing::pair_begin(&sessions, &endpoint, &code, &label).await
+}
+
+/// Phase 2: send the user's decision. On accept — and once the operator also
+/// confirms on their terminal — pairing finalizes and the UI renders the summary.
+#[tauri::command]
+async fn pair_confirm(
+    sessions: State<'_, PairingSessions>,
+    device_id: String,
+    accepted: bool,
+) -> Result<PairedSummary, String> {
+    pairing::pair_confirm(&sessions, &device_id, accepted).await
 }
 
 /// Debug-only: seed a known push key into the shared App Group keychain so the
@@ -66,13 +84,14 @@ pub fn run() {
     #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
     let result = builder
+        .manage(PairingSessions::default())
         .setup(|_app| {
             // Request provisional notification auth + remote-notification
             // registration once the app is up (main thread). No-op off iOS.
             push_register::register();
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![pair])
+        .invoke_handler(tauri::generate_handler![pair_begin, pair_confirm])
         .run(tauri::generate_context!());
     if let Err(e) = result {
         eprintln!("baybo: fatal error while running the app: {e}");

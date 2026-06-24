@@ -7,12 +7,16 @@
 //! slot up by code to authorize the SPAKE2 handshake and learn the owning
 //! `user_id` / `label`.
 //!
-//! A slot carries no key material — it only authorizes a handshake. When the
-//! handshake completes the gateway writes a durable [`crate::device::DeviceRow`]
-//! (retaining the code as the approval handle) and deletes the slot. Unconsumed
-//! slots age out via [`DevicePairingStore::purge_expired`]. This mirrors
-//! [`crate::channel_pairing::ChannelPairingStore`] but is single-use and keyed
-//! solely by `code`.
+//! A slot carries no key material — it only authorizes a handshake and then
+//! brokers the live mutual-confirm. When SPAKE2 + `DeviceHello` complete the
+//! gateway records the confirmation code + device id on the slot
+//! ([`set_confirm`](DevicePairingStore::set_confirm)); the operator's live
+//! `baybo device pair` polls that, shows the code, and writes its decision
+//! ([`set_operator_decision`](DevicePairingStore::set_operator_decision)); the
+//! gateway then writes a durable [`crate::device::DeviceRow`] and deletes the
+//! slot. Unconsumed slots age out via [`DevicePairingStore::purge_expired`].
+//! This mirrors [`crate::channel_pairing::ChannelPairingStore`] but is
+//! single-use and keyed solely by `code`.
 
 use async_trait::async_trait;
 
@@ -30,6 +34,17 @@ pub struct DevicePairingSlot {
     pub created_at: i64,
     /// Unix seconds; the slot is dead once `now >= expires_at`.
     pub expires_at: i64,
+    /// The human-comparable confirmation code both ends display, set by the
+    /// gateway once SPAKE2 + `DeviceHello` complete. `None` until then. Derived
+    /// from the SPAKE2 secret — not itself secret.
+    pub confirm_code: Option<String>,
+    /// The app-generated device id of the phone in the live handshake, recorded
+    /// alongside `confirm_code` so the operator's `device pair` can name it.
+    pub device_id: Option<String>,
+    /// The operator's confirm decision: `Some(true)` approve, `Some(false)`
+    /// decline, `None` undecided. Written by `baybo device pair`; the gateway
+    /// polls it before sealing the welcome.
+    pub operator_decision: Option<bool>,
 }
 
 impl DevicePairingSlot {
@@ -55,6 +70,16 @@ pub trait DevicePairingStore: Send + Sync {
     /// clients that scanned the same live code race here, and only the one that
     /// gets `true` may finalize a device — so one code mints at most one device.
     async fn delete_slot(&self, code: &str) -> Result<bool>;
+
+    /// Publish the confirm challenge: the gateway, after SPAKE2 + `DeviceHello`,
+    /// records the confirmation code + the live device id so the operator's
+    /// `baybo device pair` can display them. No-op if the slot is gone.
+    async fn set_confirm(&self, code: &str, confirm_code: &str, device_id: &str) -> Result<()>;
+
+    /// Record the operator's confirm decision (written by `baybo device pair`).
+    /// The gateway polls [`get_slot`](Self::get_slot) for it before sealing the
+    /// welcome. No-op if the slot is gone.
+    async fn set_operator_decision(&self, code: &str, accepted: bool) -> Result<()>;
 
     /// List all slots, newest `created_at` first (CLI visibility).
     async fn list_slots(&self) -> Result<Vec<DevicePairingSlot>>;

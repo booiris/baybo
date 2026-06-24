@@ -6,13 +6,13 @@
 //! so a single phone that pairs with home + work gateways lands two rows in
 //! two gateways' tables.
 //!
-//! Lifecycle: a row is written `Pending` when SPAKE2 pairing completes
-//! (carrying the device's static pubkey + an inert `auth_token`), activated by
-//! `baybo device approve <code>`, and flipped to `Revoked` on revoke. Per the
-//! project rule, **revoke never deletes the row** — it keeps the audit trail
-//! and stops the `auth_token` UNIQUE slot from being silently reused. The APNs
-//! token does not live here (it lives in the remote-host push store); A only
-//! needs `device_id` to address a push.
+//! Lifecycle: a row is written `Approved` the moment the phone user and the
+//! operator both confirm the pairing (carrying the device's static pubkey + an
+//! active `auth_token`), and flipped to `Revoked` on revoke. Per the project
+//! rule, **revoke never deletes the row** — it keeps the audit trail and stops
+//! the `auth_token` UNIQUE slot from being silently reused. The APNs token does
+//! not live here (it lives in the remote-host push store); A only needs
+//! `device_id` to address a push.
 //!
 //! Business logic (SPAKE2, code minting, TTL) lives in `baybo-pairing`; this
 //! module is only the trait + row shape, keeping `baybo-storage` the single
@@ -24,13 +24,13 @@ use crate::StorageError;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
-/// Lifecycle state of a device row.
+/// Lifecycle state of a device row. A row exists only once both ends confirmed
+/// the pairing, so there is no inert/pending state — it is `Approved` from
+/// creation until `Revoked`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceStatus {
-    /// Paired but not yet operator-approved — the `auth_token` is inert.
-    Pending,
-    /// Operator-approved — the `auth_token` authenticates the scoped device
-    /// surface (`/v1/chat/*` + channel-ws).
+    /// Active — the `auth_token` authenticates the scoped device surface
+    /// (`/v1/chat/*` + channel-ws).
     Approved,
     /// Revoked — the row (and its `auth_token` slot) is retained for audit but
     /// the token no longer authenticates anything.
@@ -40,7 +40,6 @@ pub enum DeviceStatus {
 impl DeviceStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
-            DeviceStatus::Pending => "pending",
             DeviceStatus::Approved => "approved",
             DeviceStatus::Revoked => "revoked",
         }
@@ -48,7 +47,6 @@ impl DeviceStatus {
 
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
-            "pending" => Some(Self::Pending),
             "approved" => Some(Self::Approved),
             "revoked" => Some(Self::Revoked),
             _ => None,
@@ -67,15 +65,16 @@ pub struct DeviceRow {
     pub label: String,
     /// The device's X25519 static public key, exchanged at pairing (32 bytes).
     pub device_pubkey: Vec<u8>,
-    /// 256-bit hex bearer for the scoped REST/WS surface. Inert until approved.
+    /// 256-bit hex bearer for the scoped REST/WS surface. Active from creation
+    /// (the row only exists once both ends confirmed).
     pub auth_token: String,
     pub status: DeviceStatus,
-    /// The retained SPAKE2 code, used as the operator approval handle
-    /// (`baybo device approve <code>`). `None` once consumed/cleared.
+    /// The SPAKE2 code this device paired under, retained for the operator's
+    /// device list / audit. `None` if cleared.
     pub pairing_code: Option<String>,
     /// Unix seconds.
     pub created_at: i64,
-    /// Unix seconds; set when the operator approves.
+    /// Unix seconds; set at pairing-confirm time (when the row is created).
     pub approved_at: Option<i64>,
     /// Unix seconds; bumped on device activity.
     pub last_seen_at: Option<i64>,
@@ -84,7 +83,7 @@ pub struct DeviceRow {
 /// Persistence contract for device-registry rows.
 #[async_trait]
 pub trait DeviceStore: Send + Sync {
-    /// Insert a freshly-paired (`Pending`) device row. Errors with
+    /// Insert a freshly-paired (`Approved`) device row. Errors with
     /// [`StorageError::Conflict`] if the `(user_id, device_id)` or the
     /// `auth_token` already exists.
     async fn create(&self, row: &DeviceRow) -> Result<()>;
@@ -93,8 +92,8 @@ pub trait DeviceStore: Send + Sync {
     async fn get(&self, user_id: &str, device_id: &str) -> Result<Option<DeviceRow>>;
 
     /// Resolve an **approved** device by its bearer token — the gateway auth
-    /// path. Pending and revoked rows never match, so the security-critical
-    /// status filter lives in one place (the SQL), not at every call site.
+    /// path. Revoked rows never match, so the security-critical status filter
+    /// lives in one place (the SQL), not at every call site.
     async fn lookup_approved_by_auth_token(&self, auth_token: &str) -> Result<Option<DeviceRow>>;
 
     /// List all rows, optionally filtered by status. Newest `created_at` first.
@@ -108,11 +107,6 @@ pub trait DeviceStore: Send + Sync {
         user_id: &str,
         status: Option<DeviceStatus>,
     ) -> Result<Vec<DeviceRow>>;
-
-    /// Flip a `Pending` row identified by `pairing_code` to `Approved`,
-    /// stamping `approved_at = now`. Returns the updated row, or `None` if the
-    /// code is unknown or the row is not pending.
-    async fn approve_by_code(&self, code: &str, now: i64) -> Result<Option<DeviceRow>>;
 
     /// Flip a row to `Revoked` (keeping the row + token slot). Returns `true`
     /// if a row changed, `false` if it was unknown or already revoked.

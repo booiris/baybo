@@ -108,9 +108,8 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: PairCmd,
     },
-    /// Manage iOS-companion device pairings: `pair <label>` (mint a QR
-    /// pairing code), `approve <code>`, `list` (pending/approved), and
-    /// `revoke <user> <device>`.
+    /// Manage iOS-companion device pairings: `pair <label>` (interactive
+    /// scan + mutual confirm), `list`, and `revoke <user> <device>`.
     Device {
         #[command(subcommand)]
         cmd: DeviceCmd,
@@ -537,8 +536,9 @@ pub enum TrustLevelArg {
 
 #[derive(Debug, Subcommand)]
 pub enum DeviceCmd {
-    /// Mint a pairing code + slot for a new device. The code is rendered as
-    /// a QR the iOS app scans to start SPAKE2; it expires in 15 minutes.
+    /// Pair a new device: mint a code for the iOS app to scan, then confirm a
+    /// Bluetooth-style code on both the phone and this terminal. Interactive —
+    /// it stays live until both sides confirm (or it times out).
     Pair {
         /// Device label for the operator's list ("Booiris iPhone").
         label: String,
@@ -548,17 +548,10 @@ pub enum DeviceCmd {
         #[arg(long)]
         user: Option<String>,
     },
-    /// Approve a pending device by its pairing code, activating its (until
-    /// now inert) auth token.
-    Approve {
-        /// Pairing code from `baybo device pair`.
-        code: String,
-    },
     /// List registered devices. With no flag, shows every row; pass
-    /// `--pending` or `--approved` to restrict.
+    /// `--approved` to show only active devices.
     List {
-        #[arg(long, conflicts_with = "approved")]
-        pending: bool,
+        /// Show only active (approved) devices.
         #[arg(long)]
         approved: bool,
     },

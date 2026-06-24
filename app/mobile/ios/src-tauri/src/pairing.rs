@@ -1,21 +1,52 @@
-//! The `pair` command's transport: dial the gateway's `/v1/device/pair` WS and
-//! drive the 4-message SPAKE2 handshake through `baybo_mobile_core::PairingClient`.
+//! The pairing command's transport: dial the gateway's `/v1/device/pair` WS and
+//! drive the SPAKE2 + mutual-confirm handshake through
+//! `baybo_mobile_core::PairingClient`.
+//!
+//! The handshake pauses for a human decision, so it is split across two Tauri
+//! commands: [`pair_begin`] runs up to the confirmation step and returns the
+//! Bluetooth-style code for the UI to show; [`pair_confirm`] sends the user's
+//! decision and finishes. The in-flight session (live WS + client) is parked in
+//! [`PairingSessions`] between the two, keyed by the device id.
 //!
 //! The crypto + state machine live in the host-tested core; this file is just
 //! the WebSocket pump (msgpack `PairFrame`s as binary frames) + the bits the
 //! shell owns: generating the device's Noise keypair and a device id.
 
+use std::collections::HashMap;
+
+use baybo_mobile_core::{PairedGateway, PairingClient, PairingRequest};
 use device_proto::noise::StaticKeypair;
 use device_proto::pairing::{self, ApnsEnv, PairFrame};
-use baybo_mobile_core::{PairedGateway, PairingClient, PairingRequest};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
+use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-/// What the UI renders after a successful (operator-pending) pairing. The
-/// secrets (`auth_token`, `push_key`, the Noise static secret) are persisted by
-/// the shell, never returned to the webview.
+/// In-flight pairing sessions, parked between `pair_begin` and `pair_confirm`
+/// (keyed by device id). The map lock is held only to insert/remove — the WS
+/// I/O runs on the owned session, never under the lock.
+#[derive(Default)]
+pub struct PairingSessions(Mutex<HashMap<String, PairSession>>);
+
+struct PairSession {
+    ws: Ws,
+    client: PairingClient,
+    device_id: String,
+}
+
+/// What `pair_begin` returns: the confirmation code to show the user + the
+/// device id the UI passes back to `pair_confirm`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairChallenge {
+    pub device_id: String,
+    pub confirm_code: String,
+}
+
+/// What the UI renders after a successful pairing. The secrets (`auth_token`,
+/// `push_key`, the Noise static secret) are persisted by the shell, never
+/// returned to the webview.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairedSummary {
@@ -23,7 +54,6 @@ pub struct PairedSummary {
     pub relay_node_id: String,
     pub direct_candidates: Vec<String>,
     pub pairing_code: String,
-    pub pending_approval: bool,
 }
 
 impl From<&PairedGateway> for PairedSummary {
@@ -33,18 +63,19 @@ impl From<&PairedGateway> for PairedSummary {
             relay_node_id: p.relay_node_id.clone(),
             direct_candidates: p.direct_candidates.clone(),
             pairing_code: p.pairing_code.clone(),
-            // The token is inert until the operator runs `baybo device approve`.
-            pending_approval: true,
         }
     }
 }
 
-/// Run the full pairing handshake against `endpoint` (`ws://` or `wss://`).
-pub async fn run_pairing(
+/// Phase 1: dial `endpoint`, run SPAKE2 + send the sealed `DeviceHello`, and
+/// return the confirmation code for the user to compare against the operator's
+/// terminal. The live session is parked for [`pair_confirm`].
+pub async fn pair_begin(
+    sessions: &PairingSessions,
     endpoint: &str,
     code: &str,
     label: &str,
-) -> Result<PairedSummary, String> {
+) -> Result<PairChallenge, String> {
     let url = format!("{}/v1/device/pair", endpoint.trim_end_matches('/'));
     let (mut ws, _) = connect_async(&url)
         .await
@@ -75,17 +106,59 @@ pub async fn run_pairing(
     let sealed = client.on_pake_reply(&pake).map_err(|e| e.to_string())?;
     send(&mut ws, &sealed).await?;
 
-    let PairFrame::Sealed { nonce, ciphertext } = recv(&mut ws).await? else {
+    let confirm_code = client
+        .confirm_code()
+        .ok_or("confirmation code unavailable")?
+        .to_string();
+
+    sessions.0.lock().await.insert(
+        device_id.clone(),
+        PairSession {
+            ws,
+            client,
+            device_id: device_id.clone(),
+        },
+    );
+
+    Ok(PairChallenge {
+        device_id,
+        confirm_code,
+    })
+}
+
+/// Phase 2: send the user's decision. On accept (and once the operator also
+/// confirms) the gateway returns the sealed welcome and pairing finalizes; on
+/// decline the gateway aborts and this returns an error.
+pub async fn pair_confirm(
+    sessions: &PairingSessions,
+    device_id: &str,
+    accepted: bool,
+) -> Result<PairedSummary, String> {
+    let mut session = sessions
+        .0
+        .lock()
+        .await
+        .remove(device_id)
+        .ok_or("no pending pairing session for this device")?;
+
+    let confirm = session.client.confirm(accepted).map_err(|e| e.to_string())?;
+    send(&mut session.ws, &confirm).await?;
+    if !accepted {
+        return Err("pairing cancelled".into());
+    }
+
+    let PairFrame::Sealed { nonce, ciphertext } = recv(&mut session.ws).await? else {
         return Err("expected sealed GatewayWelcome".into());
     };
-    let paired = client
+    let paired = session
+        .client
         .on_welcome(&nonce, &ciphertext)
         .map_err(|e| e.to_string())?;
 
     // Persist the push key to the shared App Group keychain so the NSE can
     // decrypt lock-screen previews (account `baybo.push-key.<device_id>`, since
     // the gateway stamps `bid = device_id` into every push payload).
-    crate::keychain::store_push_key(&device_id, &paired.push_key)
+    crate::keychain::store_push_key(&session.device_id, &paired.push_key)
         .map_err(|e| format!("persist push key: {e}"))?;
 
     // TODO(persist): also store `paired` (auth_token, gateway static key,
@@ -93,9 +166,8 @@ pub async fn run_pairing(
     Ok(PairedSummary::from(&paired))
 }
 
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn send(ws: &mut Ws, frame: &PairFrame) -> Result<(), String> {
     let bytes = pairing::encode(frame).map_err(|e| format!("encode: {e}"))?;

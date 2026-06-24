@@ -29,7 +29,7 @@ pub const PLAINTEXT: &[u8] = br#"{"title":"Baybo","body":"The agent finished rep
 /// `ChaCha20-Poly1305(KEY, NONCE, PLAINTEXT, aad=∅)` = `ciphertext || tag`,
 /// hex-encoded. Pinned so the NSE's CryptoKit decrypt is validated against an
 /// exact byte sequence.
-pub const CIPHERTEXT_HEX: &str = "77890c36398aa78f9a2db2618e9bdfd7bf3cbcdb3a485a81e0b0be911005a66218a070e3c0a08ce2a3a8d5cf7821143f23aa2d162b71a68f69fd2b8d48cff9e1cc8670a8738b";
+pub const CIPHERTEXT_HEX: &str = "77890c36398aa78f9a2db175859892d9b17cb1d027134299968cb3d45103a46902f436ecc7a796f9aea9919d6f34082a33ad245f272e1680e50d5ab76a47bcd8968f87f6de8098";
 
 /// Decode [`CIPHERTEXT_HEX`] into bytes (`ciphertext || tag`).
 pub fn ciphertext_bytes() -> Vec<u8> {

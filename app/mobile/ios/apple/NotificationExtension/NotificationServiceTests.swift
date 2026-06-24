@@ -16,9 +16,9 @@ final class NotificationServiceTests: XCTestCase {
     static let nonce = Data((0xa0...0xab).map { UInt8($0) })
     // device_proto::fixtures::CIPHERTEXT_HEX  (ciphertext || tag)
     static let ciphertextHex =
-        "77890c36398aa78f9a2db2618e9bdfd7bf3cbcdb3a485a81e0b0be911005a662" +
-        "18a070e3c0a08ce2a3a8d5cf7821143f23aa2d162b71a68f69fd2b8d48cff9e1" +
-        "cc8670a8738b"
+        "77890c36398aa78f9a2db175859892d9b17cb1d027134299968cb3d45103a469" +
+        "02f436ecc7a796f9aea9919d6f34082a33ad245f272e1680e50d5ab76a47bcd8" +
+        "968f87f6de8098"
 
     func testDecryptsThePinnedFixture() throws {
         let ct = try XCTUnwrap(Data(hexString: Self.ciphertextHex))

@@ -35,7 +35,7 @@ crate — its `/notify` + `/register` payloads are a JSON contract, so the
   `GatewayWelcome` / `ApnsEnv`), and `fixtures` (the pinned cross-language AEAD
   vector).
 - `crates/gateway` — A-side: the `/v1/device/pair` route (`channel/device_pair.rs`),
-  the device store + operator approval, and the push dispatcher (`push/mod.rs`).
+  the device store + mutual-confirm orchestration, and the push dispatcher (`push/mod.rs`).
 - `crates/pairing` — the device pairing service.
 - `remote-host/crates/push` — C-side APNs: HTTP/2 sender (`apns_http.rs`), ES256
   provider tokens from the `.p8` (`jwt.rs`), the `/notify` + `/register` routes
@@ -57,15 +57,20 @@ relay rendezvous):
 
 ```
 P → A   Hello { code, pake }                 # SPAKE2 start, keyed by the QR code
-A → P   PakeReply { pake }
+A → P   PakeReply { pake }                   # both ends now derive K + the confirmation code
 P → A   Sealed( DeviceHello )                # device_id, label, Noise static pubkey, apns_token, env
-A → P   Sealed( GatewayWelcome )             # user_id, auth_token (inert until approved), gateway static pubkey, relay node, direct candidates
+P → A   Sealed( DeviceConfirm )              # phone user's decision after comparing the confirmation code
+A → P   Sealed( GatewayWelcome )             # sent only once the operator confirms too: user_id, active auth_token, gateway static pubkey, relay node, direct candidates
 ```
 
 Both sides derive the same keys from the SPAKE2 secret via HKDF: a `channel_key`
-(seals the two `DeviceHello`/`GatewayWelcome` messages) and a 32-byte `push_key`
-(the per-device preview key). The `auth_token` is inert until the operator runs
-`baybo device approve`.
+(seals the K-channel messages), a 32-byte `push_key` (the per-device preview
+key), and a short human-comparable **confirmation code** (Bluetooth-style numeric
+comparison). Pairing is a live, two-sided confirm: `baybo device pair` stays open,
+shows the code, and waits for the operator's `y`; the app shows the same code and
+waits for the user's tap. The gateway seals `GatewayWelcome` (with an **active**
+`auth_token`) only after both confirm — there is no separate `device approve`
+step. The operator's decision crosses to the gateway via the shared pairing slot.
 
 **Push preview** (A encrypts → C relays blind → P's NSE decrypts):
 
@@ -98,7 +103,7 @@ device_id, apns_token, env}` to C, so the phone never holds a C credential.
 | # | Scope | Status |
 |---|---|---|
 | **M0** | Protocol + crypto (`wire`, `device-proto`): SPAKE2, Noise, AEAD, KDF, pinned fixture | ✅ done, host-tested |
-| **M1** | Gateway pairing (A): `/v1/device/pair`, device store, operator approval | ✅ done |
+| **M1** | Gateway pairing (A): `/v1/device/pair`, device store, mutual confirm | ✅ done |
 | **M2** | Remote host (C): push (HTTP/2 APNs, ES256 `.p8` JWT, `/notify`, `/register`) + blind relay | ✅ done |
 | **M3** | Tauri iOS app + React UI + NSE Xcode target | ✅ done — `Baybo.app` builds, NSE `.appex` embedded, installs + launches on the iOS 26 simulator |
 | **M3.5** | Push-key keychain persistence + provisional notification auth (the NSE keystone) | ✅ implemented + verified to the signing boundary (see below) |

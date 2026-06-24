@@ -6,14 +6,17 @@
 //! [`device_proto`], so the app and the gateway agree by construction.
 //!
 //! Flow: [`PairingClient::start`] → send `Hello` → [`on_pake_reply`] → send the
-//! sealed `DeviceHello` → [`on_welcome`] → [`PairedGateway`].
+//! sealed `DeviceHello` → show [`confirm_code`], [`confirm`] → send the sealed
+//! `DeviceConfirm` → [`on_welcome`] → [`PairedGateway`].
 //!
 //! [`on_pake_reply`]: PairingClient::on_pake_reply
+//! [`confirm_code`]: PairingClient::confirm_code
+//! [`confirm`]: PairingClient::confirm
 //! [`on_welcome`]: PairingClient::on_welcome
 
 use device_proto::aead::KEY_LEN;
-use device_proto::kdf::{PairKeys, derive_pair_keys};
-use device_proto::pairing::{self, ApnsEnv, DeviceHello, GatewayWelcome, PairFrame};
+use device_proto::kdf::{PairKeys, derive_confirm_code, derive_pair_keys};
+use device_proto::pairing::{self, ApnsEnv, DeviceConfirm, DeviceHello, GatewayWelcome, PairFrame};
 use device_proto::pake::Pake;
 
 use crate::error::MobileError;
@@ -35,12 +38,13 @@ pub struct PairingRequest {
     pub apns_env: ApnsEnv,
 }
 
-/// The result of a completed (still operator-pending) pairing — everything the
-/// app persists to talk to this gateway.
+/// The result of a completed pairing — everything the app persists to talk to
+/// this gateway. Only produced once both sides confirmed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairedGateway {
     pub user_id: String,
-    /// Bearer token for the scoped REST/WS surface (inert until approved).
+    /// Bearer token for the scoped REST/WS surface. Active — the gateway only
+    /// seals the welcome after the phone user and the operator both confirmed.
     pub auth_token: String,
     /// The gateway's Noise static public key (authenticates every later session).
     pub gateway_static_pubkey: [u8; KEY_LEN],
@@ -49,7 +53,7 @@ pub struct PairedGateway {
     pub push_key: [u8; KEY_LEN],
     pub relay_node_id: String,
     pub direct_candidates: Vec<String>,
-    /// The retained code (the operator's approval handle).
+    /// The code this device paired under (retained for audit).
     pub pairing_code: String,
 }
 
@@ -58,6 +62,8 @@ pub struct PairingClient {
     req: PairingRequest,
     pake: Option<Pake>,
     keys: Option<PairKeys>,
+    /// The confirmation code to show the user, derived from K in `on_pake_reply`.
+    confirm_code: Option<String>,
 }
 
 impl PairingClient {
@@ -73,13 +79,14 @@ impl PairingClient {
                 req,
                 pake: Some(pake),
                 keys: None,
+                confirm_code: None,
             },
             hello,
         )
     }
 
-    /// On the gateway's `PakeReply`: derive the shared keys and return the
-    /// sealed [`DeviceHello`] to send.
+    /// On the gateway's `PakeReply`: derive the shared keys + the confirmation
+    /// code and return the sealed [`DeviceHello`] to send.
     pub fn on_pake_reply(&mut self, gateway_pake: &[u8]) -> Result<PairFrame, MobileError> {
         let pake = self
             .pake
@@ -87,6 +94,7 @@ impl PairingClient {
             .ok_or(MobileError::State("pake already consumed"))?;
         let k = pake.finish(gateway_pake)?;
         let keys = derive_pair_keys(&k)?;
+        let confirm_code = derive_confirm_code(&k)?;
         let hello = DeviceHello {
             device_id: self.req.device_id.clone(),
             label: self.req.label.clone(),
@@ -96,6 +104,26 @@ impl PairingClient {
         };
         let (nonce, ciphertext) = pairing::seal_msg(&keys.channel_key, &hello)?;
         self.keys = Some(keys);
+        self.confirm_code = Some(confirm_code);
+        Ok(PairFrame::Sealed { nonce, ciphertext })
+    }
+
+    /// The Bluetooth-style confirmation code to show the user (available after
+    /// [`on_pake_reply`](Self::on_pake_reply)). The operator sees the same
+    /// number on their terminal; the user pairs only if they match.
+    pub fn confirm_code(&self) -> Option<&str> {
+        self.confirm_code.as_deref()
+    }
+
+    /// The user's pairing decision after comparing the confirmation code.
+    /// Returns the sealed [`DeviceConfirm`] frame to send; on `false` the
+    /// gateway aborts the handshake.
+    pub fn confirm(&self, accepted: bool) -> Result<PairFrame, MobileError> {
+        let keys = self
+            .keys
+            .as_ref()
+            .ok_or(MobileError::State("keys not derived yet"))?;
+        let (nonce, ciphertext) = pairing::seal_msg(&keys.channel_key, &DeviceConfirm { accepted })?;
         Ok(PairFrame::Sealed { nonce, ciphertext })
     }
 
@@ -150,6 +178,7 @@ mod tests {
         let (gw_pake_state, gw_pake) = Pake::start_gateway(&code);
         let gw_k = gw_pake_state.finish(&app_pake).unwrap();
         let gw_keys = derive_pair_keys(&gw_k).unwrap();
+        let gw_confirm = derive_confirm_code(&gw_k).unwrap();
 
         // client processes PakeReply → sealed DeviceHello
         let PairFrame::Sealed { nonce, ciphertext } =
@@ -161,6 +190,17 @@ mod tests {
             pairing::open_msg(&gw_keys.channel_key, &nonce, &ciphertext).unwrap();
         assert_eq!(device_hello.device_id, "dev-xyz");
         assert_eq!(device_hello.static_pubkey, [4u8; KEY_LEN]);
+
+        // both ends derived the same confirmation code (numeric comparison)
+        assert_eq!(client.confirm_code(), Some(gw_confirm.as_str()));
+
+        // user accepts → client seals DeviceConfirm; gateway opens it
+        let PairFrame::Sealed { nonce: cn, ciphertext: cc } = client.confirm(true).unwrap() else {
+            panic!("expected sealed DeviceConfirm");
+        };
+        let device_confirm: DeviceConfirm =
+            pairing::open_msg(&gw_keys.channel_key, &cn, &cc).unwrap();
+        assert!(device_confirm.accepted);
 
         // gateway seals GatewayWelcome (with the issued token + its static key)
         let welcome = GatewayWelcome {

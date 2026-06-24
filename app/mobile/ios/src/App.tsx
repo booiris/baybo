@@ -1,13 +1,19 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-/// Mirror of `PairedSummary` returned by the `pair` command (src-tauri).
+/// Mirror of `PairChallenge` returned by `pair_begin` (src-tauri): the
+/// confirmation code to compare + the device id to pass back to `pair_confirm`.
+type PairChallenge = {
+  deviceId: string;
+  confirmCode: string;
+};
+
+/// Mirror of `PairedSummary` returned by `pair_confirm` (src-tauri).
 type PairedSummary = {
   userId: string;
   relayNodeId: string;
   directCandidates: string[];
   pairingCode: string;
-  pendingApproval: boolean;
 };
 
 /// Parse an `baybo://pair?h=<endpoint>&c=<code>` QR payload, or fall back to
@@ -32,6 +38,7 @@ export default function App() {
   const [label, setLabel] = useState("My iPhone");
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [challenge, setChallenge] = useState<PairChallenge | null>(null);
   const [paired, setPaired] = useState<PairedSummary | null>(null);
 
   async function scan() {
@@ -48,15 +55,47 @@ export default function App() {
     }
   }
 
-  async function pair() {
+  // Phase 1: connect + SPAKE2 → get the confirmation code to show the user.
+  async function pairBegin() {
     setBusy(true);
-    setStatus("Pairing…");
+    setStatus("Connecting…");
     try {
-      const summary = await invoke<PairedSummary>("pair", { endpoint, code, label });
-      setPaired(summary);
+      const c = await invoke<PairChallenge>("pair_begin", { endpoint, code, label });
+      setChallenge(c);
       setStatus(null);
     } catch (e) {
       setStatus(`Pairing failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Phase 2: send the user's decision; on accept the gateway finalizes once the
+  // operator confirms too.
+  async function confirmPair(accepted: boolean) {
+    if (!challenge) return;
+    setBusy(true);
+    setStatus(accepted ? "Confirming…" : "Cancelling…");
+    try {
+      if (accepted) {
+        const summary = await invoke<PairedSummary>("pair_confirm", {
+          deviceId: challenge.deviceId,
+          accepted: true,
+        });
+        setPaired(summary);
+        setChallenge(null);
+        setStatus(null);
+      } else {
+        // The decline path intentionally returns an error on the Rust side.
+        await invoke("pair_confirm", { deviceId: challenge.deviceId, accepted: false }).catch(
+          () => {},
+        );
+        setChallenge(null);
+        setStatus("Pairing cancelled.");
+      }
+    } catch (e) {
+      setStatus(`Pairing failed: ${e}`);
+      setChallenge(null);
     } finally {
       setBusy(false);
     }
@@ -66,11 +105,7 @@ export default function App() {
     return (
       <main className="container">
         <h1>Connected</h1>
-        <p className="muted">
-          {paired.pendingApproval
-            ? "Waiting for the operator to approve this device. Your token is inert until then."
-            : "Approved and ready."}
-        </p>
+        <p className="muted">Paired and ready.</p>
         <dl className="kv">
           <dt>User</dt>
           <dd>{paired.userId}</dd>
@@ -82,6 +117,28 @@ export default function App() {
           <dd>{paired.directCandidates.length ? paired.directCandidates.join(", ") : "—"}</dd>
         </dl>
         <button onClick={() => setPaired(null)}>Pair another</button>
+      </main>
+    );
+  }
+
+  if (challenge) {
+    return (
+      <main className="container">
+        <h1>Confirm pairing</h1>
+        <p className="muted">
+          Check this code matches the one shown on the computer running{" "}
+          <code>baybo device pair</code>, then pair on both.
+        </p>
+        <div className="confirm-code">{challenge.confirmCode}</div>
+        <div className="row">
+          <button onClick={() => confirmPair(false)} disabled={busy}>
+            Cancel
+          </button>
+          <button onClick={() => confirmPair(true)} disabled={busy}>
+            Pair
+          </button>
+        </div>
+        {status && <p className="status">{status}</p>}
       </main>
     );
   }
@@ -106,7 +163,7 @@ export default function App() {
 
       <div className="row">
         <button onClick={scan} disabled={busy}>Scan QR</button>
-        <button onClick={pair} disabled={busy || !code || !endpoint}>Pair</button>
+        <button onClick={pairBegin} disabled={busy || !code || !endpoint}>Pair</button>
       </div>
 
       {status && <p className="status">{status}</p>}

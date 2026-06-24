@@ -12,18 +12,6 @@ impl LibsqlDeviceStore {
     pub fn new(pool: LibsqlPool) -> Self {
         Self { pool }
     }
-
-    async fn get_by_code(&self, code: &str) -> Result<Option<DeviceRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                &format!("SELECT {COLS} FROM devices WHERE pairing_code = ?1"),
-                libsql::params![code.to_string()],
-            )
-            .await
-            .map_err(|e| col_err("query by code", e))?;
-        fetch_row(&mut rows).await
-    }
 }
 
 const COLS: &str = "user_id, device_id, label, device_pubkey, auth_token, status, \
@@ -180,22 +168,6 @@ impl DeviceStore for LibsqlDeviceStore {
         collect(&mut rows).await
     }
 
-    async fn approve_by_code(&self, code: &str, now: i64) -> Result<Option<DeviceRow>> {
-        let conn = self.pool.conn();
-        let affected = conn
-            .execute(
-                "UPDATE devices SET status = 'approved', approved_at = ?2
-                 WHERE pairing_code = ?1 AND status = 'pending'",
-                libsql::params![code.to_string(), now],
-            )
-            .await
-            .map_err(|e| col_err("approve", e))?;
-        if affected == 0 {
-            return Ok(None);
-        }
-        self.get_by_code(code).await
-    }
-
     async fn revoke(&self, user_id: &str, device_id: &str) -> Result<bool> {
         let conn = self.pool.conn();
         let affected = conn
@@ -225,17 +197,17 @@ impl DeviceStore for LibsqlDeviceStore {
 mod tests {
     use super::*;
 
-    fn pending_row(user: &str, device: &str, token: &str, code: &str) -> DeviceRow {
+    fn device_row(user: &str, device: &str, token: &str, code: &str) -> DeviceRow {
         DeviceRow {
             user_id: user.into(),
             device_id: device.into(),
             label: "iPhone".into(),
             device_pubkey: vec![7u8; 32],
             auth_token: token.into(),
-            status: DeviceStatus::Pending,
+            status: DeviceStatus::Approved,
             pairing_code: Some(code.into()),
             created_at: 100,
-            approved_at: None,
+            approved_at: Some(100),
             last_seen_at: None,
         }
     }
@@ -247,75 +219,59 @@ mod tests {
     #[tokio::test]
     async fn create_then_get_round_trips_blob() {
         let s = store().await;
-        s.create(&pending_row("u1", "d1", "tok1", "ABC123"))
+        s.create(&device_row("u1", "d1", "tok1", "ABC123"))
             .await
             .unwrap();
         let got = s.get("u1", "d1").await.unwrap().unwrap();
         assert_eq!(got.device_id, "d1");
         assert_eq!(got.device_pubkey, vec![7u8; 32]);
-        assert_eq!(got.status, DeviceStatus::Pending);
+        assert_eq!(got.status, DeviceStatus::Approved);
         assert_eq!(got.pairing_code.as_deref(), Some("ABC123"));
     }
 
     #[tokio::test]
     async fn duplicate_auth_token_conflicts() {
         let s = store().await;
-        s.create(&pending_row("u1", "d1", "shared", "C1"))
+        s.create(&device_row("u1", "d1", "shared", "C1"))
             .await
             .unwrap();
         let err = s
-            .create(&pending_row("u2", "d2", "shared", "C2"))
+            .create(&device_row("u2", "d2", "shared", "C2"))
             .await
             .unwrap_err();
         assert!(matches!(err, StorageError::Conflict(_)));
     }
 
     #[tokio::test]
-    async fn pending_token_does_not_authenticate_until_approved() {
+    async fn approved_token_authenticates_until_revoked() {
         let s = store().await;
-        s.create(&pending_row("u1", "d1", "tok1", "CODE12"))
+        s.create(&device_row("u1", "d1", "tok1", "CODE12"))
             .await
             .unwrap();
-        // Inert while pending.
-        assert!(
-            s.lookup_approved_by_auth_token("tok1")
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        let approved = s.approve_by_code("CODE12", 200).await.unwrap().unwrap();
-        assert_eq!(approved.status, DeviceStatus::Approved);
-        assert_eq!(approved.approved_at, Some(200));
-
-        // Now it resolves.
+        // A freshly-paired row exists only post-confirm, so it authenticates now.
         let resolved = s
             .lookup_approved_by_auth_token("tok1")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(resolved.device_id, "d1");
-    }
 
-    #[tokio::test]
-    async fn approve_unknown_or_nonpending_code_is_none() {
-        let s = store().await;
-        assert!(s.approve_by_code("NOPE", 1).await.unwrap().is_none());
-        s.create(&pending_row("u1", "d1", "t", "CODE99"))
-            .await
-            .unwrap();
-        s.approve_by_code("CODE99", 200).await.unwrap();
-        // Second approve on the now-approved code is a no-op.
-        assert!(s.approve_by_code("CODE99", 300).await.unwrap().is_none());
+        // Revoking kills the token.
+        assert!(s.revoke("u1", "d1").await.unwrap());
+        assert!(
+            s.lookup_approved_by_auth_token("tok1")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn revoke_keeps_row_but_kills_auth() {
         let s = store().await;
-        s.create(&pending_row("u1", "d1", "tok1", "CODE12"))
+        s.create(&device_row("u1", "d1", "tok1", "CODE12"))
             .await
             .unwrap();
-        s.approve_by_code("CODE12", 200).await.unwrap();
         assert!(s.revoke("u1", "d1").await.unwrap());
 
         // Row survives (audit), token no longer authenticates.
@@ -336,27 +292,26 @@ mod tests {
     #[tokio::test]
     async fn list_and_list_for_user_filter_by_status() {
         let s = store().await;
-        s.create(&pending_row("u1", "d1", "t1", "C1"))
+        s.create(&device_row("u1", "d1", "t1", "C1"))
             .await
             .unwrap();
-        s.create(&pending_row("u1", "d2", "t2", "C2"))
+        s.create(&device_row("u1", "d2", "t2", "C2"))
             .await
             .unwrap();
-        s.create(&pending_row("u2", "d3", "t3", "C3"))
+        s.create(&device_row("u2", "d3", "t3", "C3"))
             .await
             .unwrap();
-        s.approve_by_code("C1", 200).await.unwrap();
+        s.revoke("u1", "d2").await.unwrap();
 
         let approved = s.list(Some(DeviceStatus::Approved)).await.unwrap();
-        assert_eq!(approved.len(), 1);
-        assert_eq!(approved[0].device_id, "d1");
+        assert_eq!(approved.len(), 2);
 
-        let u1_pending = s
-            .list_for_user("u1", Some(DeviceStatus::Pending))
+        let u1_revoked = s
+            .list_for_user("u1", Some(DeviceStatus::Revoked))
             .await
             .unwrap();
-        assert_eq!(u1_pending.len(), 1);
-        assert_eq!(u1_pending[0].device_id, "d2");
+        assert_eq!(u1_revoked.len(), 1);
+        assert_eq!(u1_revoked[0].device_id, "d2");
 
         assert_eq!(s.list(None).await.unwrap().len(), 3);
         assert_eq!(s.list_for_user("u1", None).await.unwrap().len(), 2);
@@ -365,7 +320,7 @@ mod tests {
     #[tokio::test]
     async fn touch_last_seen_updates() {
         let s = store().await;
-        s.create(&pending_row("u1", "d1", "t1", "C1"))
+        s.create(&device_row("u1", "d1", "t1", "C1"))
             .await
             .unwrap();
         s.touch_last_seen("u1", "d1", 555).await.unwrap();

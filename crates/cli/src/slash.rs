@@ -6,8 +6,8 @@ use baybo_model::ContentBlock;
 use clap::{CommandFactory, Parser};
 
 use crate::cli::{
-    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, DeviceCmd, ExternalAgentCmd, JobCmd,
-    LlmCmd, LogCmd, McpCmd, PairCmd, SecretCmd, SessionCmd, SkillsCmd,
+    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, ExternalAgentCmd, JobCmd, LlmCmd,
+    LogCmd, McpCmd, PairCmd, SecretCmd, SessionCmd, SkillsCmd,
 };
 use crate::context::{CommandContext, Invocation};
 use crate::dispatch;
@@ -108,7 +108,7 @@ impl SlashHandler for CliSlashHandler {
             // this is the cosmetic mirror so the menu stays coherent.
             if matches!(
                 name,
-                "help" | "completion" | "setup" | "tui" | "gateway" | "memory"
+                "help" | "completion" | "setup" | "tui" | "gateway" | "memory" | "device"
             ) {
                 continue;
             }
@@ -313,12 +313,12 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
         Commands::Pair { cmd } => match cmd {
             PairCmd::List { .. } | PairCmd::Approve { .. } | PairCmd::Revoke { .. } => Ok(()),
         },
-        Commands::Device { cmd } => match cmd {
-            DeviceCmd::Pair { .. }
-            | DeviceCmd::Approve { .. }
-            | DeviceCmd::List { .. }
-            | DeviceCmd::Revoke { .. } => Ok(()),
-        },
+        // `device` is operator/terminal-only: `pair` is an interactive,
+        // live mutual-confirm flow; the rest manage trusted devices. CLI
+        // commands are not exposed to slash unless explicitly admitted.
+        Commands::Device { .. } => {
+            Err("`device` commands are terminal-only; run them from a shell")
+        }
         Commands::Llm {
             cmd: LlmCmd::Status | LlmCmd::Probe { .. } | LlmCmd::LiveModel { .. },
         } => Ok(()),
