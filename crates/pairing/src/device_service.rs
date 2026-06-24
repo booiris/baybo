@@ -78,15 +78,20 @@ impl DevicePairingService {
     }
 
     /// Publish the confirm challenge: record the confirmation code + the live
-    /// device id on the slot so the operator's `baybo device pair` can display
+    /// device id + the resolved label (the device's reported name, or the
+    /// operator's override) so the operator's `baybo device pair` can display
     /// them. Called by the gateway once SPAKE2 + `DeviceHello` complete.
     pub async fn publish_confirm(
         &self,
         code: &str,
         confirm_code: &str,
         device_id: &str,
+        label: &str,
     ) -> Result<(), DevicePairingError> {
-        Ok(self.slots.set_confirm(code, confirm_code, device_id).await?)
+        Ok(self
+            .slots
+            .set_confirm(code, confirm_code, device_id, label)
+            .await?)
     }
 
     /// Record the operator's confirm decision (written by `baybo device pair`).
@@ -100,13 +105,16 @@ impl DevicePairingService {
     }
 
     /// Finalize a confirmed handshake: write an **approved** device row (with a
-    /// freshly minted, active `auth_token`) and consume the slot. The gateway
-    /// calls this only once both the phone user and the operator confirmed.
+    /// freshly minted, active `auth_token`) and consume the slot. `label` is the
+    /// resolved device name (the device's reported label, or the operator's
+    /// override). The gateway calls this only once both the phone user and the
+    /// operator confirmed.
     pub async fn complete(
         &self,
         slot: &DevicePairingSlot,
         device_id: &str,
         device_pubkey: Vec<u8>,
+        label: &str,
     ) -> Result<DeviceRow, DevicePairingError> {
         // Atomically consume the single-use slot up front: two clients that
         // scanned the same live code race here, and the loser gets `false` and
@@ -119,7 +127,7 @@ impl DevicePairingService {
         let row = DeviceRow {
             user_id: slot.user_id.clone(),
             device_id: device_id.to_string(),
-            label: slot.label.clone(),
+            label: label.to_string(),
             device_pubkey,
             auth_token: mint_auth_token(),
             status: DeviceStatus::Approved,
@@ -208,11 +216,15 @@ mod tests {
         let slot = svc.claim_slot(&code).await.unwrap().unwrap();
         assert_eq!(slot.user_id, "user-1");
 
-        // Gateway publishes the confirm challenge; both ends would now show it.
-        svc.publish_confirm(&code, "123456", "dev-abc").await.unwrap();
+        // Gateway publishes the confirm challenge (with the device's reported
+        // name); both ends would now show it.
+        svc.publish_confirm(&code, "123456", "dev-abc", "Booiris iPhone")
+            .await
+            .unwrap();
         let slot = svc.claim_slot(&code).await.unwrap().unwrap();
         assert_eq!(slot.confirm_code.as_deref(), Some("123456"));
         assert_eq!(slot.device_id.as_deref(), Some("dev-abc"));
+        assert_eq!(slot.label, "Booiris iPhone");
 
         // Operator approves in the live session.
         svc.set_operator_decision(&code, true).await.unwrap();
@@ -222,8 +234,12 @@ mod tests {
         );
 
         // Finalize → an active (approved) row, token live from creation.
-        let row = svc.complete(&slot, "dev-abc", vec![3u8; 32]).await.unwrap();
+        let row = svc
+            .complete(&slot, "dev-abc", vec![3u8; 32], "Booiris iPhone")
+            .await
+            .unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
+        assert_eq!(row.label, "Booiris iPhone");
         assert_eq!(row.approved_at, Some(row.created_at));
         assert_eq!(row.device_pubkey, vec![3u8; 32]);
         assert_eq!(
@@ -249,9 +265,11 @@ mod tests {
         let slot = svc.claim_slot(&code).await.unwrap().unwrap();
         // The first finalize atomically consumes the slot; the second is refused,
         // so the code can't mint a second approvable device.
-        svc.complete(&slot, "dev-1", vec![1u8; 32]).await.unwrap();
+        svc.complete(&slot, "dev-1", vec![1u8; 32], "iPhone")
+            .await
+            .unwrap();
         assert!(matches!(
-            svc.complete(&slot, "dev-2", vec![2u8; 32]).await,
+            svc.complete(&slot, "dev-2", vec![2u8; 32], "iPhone").await,
             Err(DevicePairingError::SlotConsumed),
         ));
         let all = svc.list(None).await.unwrap();
@@ -275,7 +293,10 @@ mod tests {
         let svc = service();
         let code = svc.mint("u", "phone").await.unwrap();
         let slot = svc.claim_slot(&code).await.unwrap().unwrap();
-        let row = svc.complete(&slot, "d1", vec![1u8; 32]).await.unwrap();
+        let row = svc
+            .complete(&slot, "d1", vec![1u8; 32], "phone")
+            .await
+            .unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
         assert!(svc.revoke(&row.user_id, "d1").await.unwrap());
         // Revoked devices don't show under the Approved filter.

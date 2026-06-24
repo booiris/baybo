@@ -91,14 +91,21 @@ impl DevicePairingStore for LibsqlDevicePairingStore {
         Ok(affected > 0)
     }
 
-    async fn set_confirm(&self, code: &str, confirm_code: &str, device_id: &str) -> Result<()> {
+    async fn set_confirm(
+        &self,
+        code: &str,
+        confirm_code: &str,
+        device_id: &str,
+        label: &str,
+    ) -> Result<()> {
         let conn = self.pool.conn();
         conn.execute(
-            "UPDATE device_pairings SET confirm_code = ?2, device_id = ?3 WHERE code = ?1",
+            "UPDATE device_pairings SET confirm_code = ?2, device_id = ?3, label = ?4 WHERE code = ?1",
             libsql::params![
                 code.to_string(),
                 confirm_code.to_string(),
-                device_id.to_string()
+                device_id.to_string(),
+                label.to_string(),
             ],
         )
         .await
@@ -199,11 +206,14 @@ mod tests {
         assert_eq!(got.confirm_code, None);
         assert_eq!(got.operator_decision, None);
 
-        // Gateway publishes the challenge.
-        s.set_confirm("CONF01", "123456", "dev-1").await.unwrap();
+        // Gateway publishes the challenge (with the device's reported label).
+        s.set_confirm("CONF01", "123456", "dev-1", "Booiris iPhone")
+            .await
+            .unwrap();
         let got = s.get_slot("CONF01").await.unwrap().unwrap();
         assert_eq!(got.confirm_code.as_deref(), Some("123456"));
         assert_eq!(got.device_id.as_deref(), Some("dev-1"));
+        assert_eq!(got.label, "Booiris iPhone");
         assert_eq!(got.operator_decision, None);
 
         // Operator declines, then (on a re-pair) approves — the value round-trips.

@@ -72,9 +72,17 @@ pub trait DevicePairingStore: Send + Sync {
     async fn delete_slot(&self, code: &str) -> Result<bool>;
 
     /// Publish the confirm challenge: the gateway, after SPAKE2 + `DeviceHello`,
-    /// records the confirmation code + the live device id so the operator's
-    /// `baybo device pair` can display them. No-op if the slot is gone.
-    async fn set_confirm(&self, code: &str, confirm_code: &str, device_id: &str) -> Result<()>;
+    /// records the confirmation code + the live device id + the resolved device
+    /// label so the operator's `baybo device pair` can display them. The label
+    /// is the device's self-reported name (or the operator's override). No-op if
+    /// the slot is gone.
+    async fn set_confirm(
+        &self,
+        code: &str,
+        confirm_code: &str,
+        device_id: &str,
+        label: &str,
+    ) -> Result<()>;
 
     /// Record the operator's confirm decision (written by `baybo device pair`).
     /// The gateway polls [`get_slot`](Self::get_slot) for it before sealing the

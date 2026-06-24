@@ -313,10 +313,17 @@ impl DevicePairingStore for MemoryDevicePairingStore {
         Ok(self.slots.lock().remove(code).is_some())
     }
 
-    async fn set_confirm(&self, code: &str, confirm_code: &str, device_id: &str) -> SlotResult<()> {
+    async fn set_confirm(
+        &self,
+        code: &str,
+        confirm_code: &str,
+        device_id: &str,
+        label: &str,
+    ) -> SlotResult<()> {
         if let Some(slot) = self.slots.lock().get_mut(code) {
             slot.confirm_code = Some(confirm_code.to_string());
             slot.device_id = Some(device_id.to_string());
+            slot.label = label.to_string();
         }
         Ok(())
     }

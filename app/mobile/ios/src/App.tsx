@@ -33,7 +33,7 @@ function parseScan(text: string): { endpoint?: string; code: string } {
 }
 
 export default function App() {
-  const [endpoint, setEndpoint] = useState("ws://127.0.0.1:8889");
+  const [endpoint, setEndpoint] = useState("wss://proxy.baybo.space:7777");
   const [code, setCode] = useState("");
   const [label, setLabel] = useState("My iPhone");
   const [status, setStatus] = useState<string | null>(null);

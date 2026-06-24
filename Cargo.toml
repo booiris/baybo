@@ -165,6 +165,9 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = [
     "handshake",
 ] }
 rmp-serde = "1"
+# Terminal QR rendering for `device pair`; default-features off drops the heavy
+# `image`/`svg` renderers — we only use the unicode (Dense1x2) renderer.
+qrcode = { version = "0.14", default-features = false }
 ts-rs = { version = "11", features = ["serde-compat", "no-serde-warnings"] }
 # Sidecar embedding: zstd decompresses each esbuild-produced JS bundle
 # at runtime. Bundles themselves are produced by `pnpm bundle` in

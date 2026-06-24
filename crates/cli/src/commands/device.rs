@@ -31,6 +31,9 @@ const OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const SCAN_WAIT: Duration = Duration::from_secs(300);
 /// How long to wait for the gateway to finalize once the operator confirmed.
 const OUTCOME_WAIT: Duration = Duration::from_secs(125);
+/// Built-in default endpoint embedded in the pairing QR when the operator has
+/// not configured a reachable `gateway.direct.advertise` address.
+const DEFAULT_GATEWAY_ENDPOINT: &str = "wss://proxy.baybo.space:7777";
 
 pub async fn handle(ctx: &CommandContext, cmd: DeviceCmd) -> Result<CommandOutput> {
     match cmd {
@@ -63,32 +66,50 @@ fn operator_user_id() -> String {
         .unwrap_or_else(|_| "baybo-cli".to_string())
 }
 
-async fn pair(ctx: &CommandContext, label: String, user: Option<String>) -> Result<CommandOutput> {
+async fn pair(
+    ctx: &CommandContext,
+    label: Option<String>,
+    user: Option<String>,
+) -> Result<CommandOutput> {
     let svc = require_service(ctx)?;
     let user = user.unwrap_or_else(operator_user_id);
+    // The label is optional: an empty slot label tells the gateway to use the
+    // name the device reports in its DeviceHello during the handshake.
+    let operator_label = label.as_deref().unwrap_or("");
     let code = svc
-        .mint(&user, &label)
+        .mint(&user, operator_label)
         .await
         .map_err(|e| CliError::Manager(format!("mint device pairing: {e}")))?;
 
-    eprintln!("Pairing \"{label}\".");
-    eprintln!("Scan this code in the Baybo iOS app:\n\n    {code}\n");
+    let endpoint = pairing_endpoint(ctx);
+    let payload = format!("baybo://pair?h={endpoint}&c={code}");
+    eprintln!("Pairing a new device.\n");
+    if let Some(qr) = render_pairing_qr(&payload) {
+        eprintln!("{qr}");
+    }
+    eprintln!("Scan in the Baybo app — or enter manually:");
+    eprintln!("    endpoint: {endpoint}");
+    eprintln!("    code:     {code}\n");
     eprintln!("Waiting for the device to scan…");
 
     // 1. Wait for the phone to scan + reach the confirm step: the gateway
-    //    publishes the confirmation code onto the slot once it has K.
+    //    publishes the confirmation code + the device's name onto the slot.
     let Some(slot) = wait_for_confirm(svc, &code, SCAN_WAIT).await? else {
         return Ok(CommandOutput::structured(
-            format!("No device scanned the code for \"{label}\" in time; it has expired."),
+            "No device scanned the code in time; it has expired.".to_string(),
             &json!({ "action": "timeout", "code": code, "stage": "scan" }),
         ));
     };
     let device_id = slot.device_id.unwrap_or_default();
     let confirm_code = slot.confirm_code.unwrap_or_default();
+    // Resolved during the handshake: the device's reported name (or the
+    // operator's override if one was passed).
+    let device_label = slot.label;
 
     // 2. Operator confirms the code matches the phone (Bluetooth-style numeric
     //    comparison). `confirm` requires a terminal, so this is shell-only.
     eprintln!("\nA device wants to pair:");
+    eprintln!("    name:              {device_label}");
     eprintln!("    device:            {device_id}");
     eprintln!("    confirmation code: {confirm_code}");
     let accepted = prompt::confirm("Does this match the code on the phone? Pair this device?")?;
@@ -97,7 +118,7 @@ async fn pair(ctx: &CommandContext, label: String, user: Option<String>) -> Resu
         .map_err(|e| CliError::Manager(format!("record pairing decision: {e}")))?;
     if !accepted {
         return Ok(CommandOutput::structured(
-            format!("Declined pairing for \"{label}\"."),
+            format!("Declined pairing for \"{device_label}\"."),
             &json!({ "action": "declined", "code": code, "device_id": device_id }),
         ));
     }
@@ -106,18 +127,18 @@ async fn pair(ctx: &CommandContext, label: String, user: Option<String>) -> Resu
     eprintln!("Confirming…");
     if wait_for_paired(svc, &user, &device_id, OUTCOME_WAIT).await? {
         Ok(CommandOutput::structured(
-            format!("Paired \"{label}\" ({user}:{device_id})."),
+            format!("Paired \"{device_label}\" ({user}:{device_id})."),
             &json!({
                 "action": "paired",
                 "user_id": user,
                 "device_id": device_id,
-                "label": label,
+                "label": device_label,
             }),
         ))
     } else {
         Ok(CommandOutput::structured(
             format!(
-                "Pairing for \"{label}\" did not complete (the device may have declined or timed out)."
+                "Pairing for \"{device_label}\" did not complete (the device may have declined or timed out)."
             ),
             &json!({ "action": "incomplete", "code": code, "device_id": device_id }),
         ))
@@ -171,6 +192,34 @@ async fn wait_for_paired(
         }
         tokio::time::sleep(OUTCOME_POLL_INTERVAL).await;
     }
+}
+
+/// The endpoint to embed in the pairing QR: the operator's first advertised
+/// direct address when direct reachability is configured, else the built-in
+/// default proxy.
+fn pairing_endpoint(ctx: &CommandContext) -> String {
+    let direct = &ctx.config.gateway.direct;
+    if direct.enabled
+        && let Some(first) = direct.advertise.first()
+    {
+        return first.clone();
+    }
+    DEFAULT_GATEWAY_ENDPOINT.to_string()
+}
+
+/// Render `payload` as a QR for the terminal (unicode half-blocks, inverted so
+/// it scans on a dark background). `None` if the payload won't fit a QR.
+fn render_pairing_qr(payload: &str) -> Option<String> {
+    use qrcode::QrCode;
+    use qrcode::render::unicode;
+    let code = QrCode::new(payload).ok()?;
+    Some(
+        code.render::<unicode::Dense1x2>()
+            .dark_color(unicode::Dense1x2::Light)
+            .light_color(unicode::Dense1x2::Dark)
+            .quiet_zone(true)
+            .build(),
+    )
 }
 
 async fn list(ctx: &CommandContext, approved: bool) -> Result<CommandOutput> {
@@ -253,5 +302,21 @@ fn status_str(row: &DeviceRow) -> &'static str {
     match row.status {
         DeviceStatus::Approved => "APPROVED",
         DeviceStatus::Revoked => "REVOKED",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_a_scannable_qr() {
+        let qr = render_pairing_qr("baybo://pair?h=wss://proxy.baybo.space:7777&c=5PRX2B")
+            .expect("the short pairing payload fits a QR");
+        assert!(qr.lines().count() > 8, "multi-line QR matrix");
+        assert!(
+            qr.contains('█') || qr.contains('▀') || qr.contains('▄'),
+            "rendered with half-block glyphs"
+        );
     }
 }

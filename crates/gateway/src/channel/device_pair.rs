@@ -89,10 +89,17 @@ async fn drive(socket: &mut WebSocket, state: &WsChannelState) -> Result<(), Str
     // 5. Mutual confirm. Publish the confirmation code (derived from K) onto the
     //    slot so the operator's live `device pair` shows it, then require BOTH
     //    the phone user and the operator to approve before any token activates.
+    // Resolve the device label: the operator's `device pair <label>` override if
+    // they passed one, else the name the device reports in `DeviceHello`.
+    let device_label = if slot.label.is_empty() {
+        hello.label.as_str()
+    } else {
+        slot.label.as_str()
+    };
     let confirm_code = derive_confirm_code(&k).map_err(|e| format!("confirm code: {e}"))?;
     state
         .device_pairing
-        .publish_confirm(&slot.code, &confirm_code, &hello.device_id)
+        .publish_confirm(&slot.code, &confirm_code, &hello.device_id, device_label)
         .await
         .map_err(|e| format!("publish confirm: {e}"))?;
 
@@ -115,7 +122,12 @@ async fn drive(socket: &mut WebSocket, state: &WsChannelState) -> Result<(), Str
     // 6. Finalize: write an approved device row + consume the slot.
     let row = state
         .device_pairing
-        .complete(&slot, &hello.device_id, hello.static_pubkey.to_vec())
+        .complete(
+            &slot,
+            &hello.device_id,
+            hello.static_pubkey.to_vec(),
+            device_label,
+        )
         .await
         .map_err(|e| format!("complete pairing: {e}"))?;
 
@@ -283,8 +295,9 @@ mod tests {
         let vault = tg.deps.secret_vault.clone();
         let device_pairing = state.device_pairing.clone();
 
-        // Operator mints a slot (the `baybo device pair` step).
-        let code = device_pairing.mint("user-1", "Test iPhone").await.unwrap();
+        // Operator mints a slot with no label (the bare `baybo device pair`):
+        // the device's reported name should flow through instead.
+        let code = device_pairing.mint("user-1", "").await.unwrap();
         // Operator confirms in their live session (their CLI writes this). Set
         // up front so the gateway's poll finds it without a timing race.
         device_pairing.set_operator_decision(&code, true).await.unwrap();
@@ -350,6 +363,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
+        assert_eq!(
+            row.label, "Test iPhone",
+            "no operator label → the device's reported name is used"
+        );
         assert_eq!(row.auth_token, welcome.auth_token);
         assert_eq!(row.device_pubkey, device_static.public().to_vec());
         let pk = vault
