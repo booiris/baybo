@@ -18,7 +18,7 @@ use baybo_mobile_core::{PairedGateway, PairingClient, PairingRequest};
 use device_proto::noise::StaticKeypair;
 use device_proto::pairing::{self, ApnsEnv, PairFrame};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -33,6 +33,24 @@ struct PairSession {
     ws: Ws,
     client: PairingClient,
     device_id: String,
+    /// The app's Noise static identity, carried from `pair_begin` so
+    /// `pair_confirm` can persist its secret for content sessions.
+    keypair: StaticKeypair,
+}
+
+/// The durable record persisted after pairing — everything the app needs to
+/// reconnect and open a content session after a relaunch. Serialized into the
+/// App Group keychain (`keychain::store_paired_record`).
+#[derive(Debug, Serialize, Deserialize)]
+struct PairedRecord {
+    user_id: String,
+    device_id: String,
+    auth_token: String,
+    gateway_static_pubkey: [u8; 32],
+    direct_candidates: Vec<String>,
+    relay_node_id: String,
+    /// The app's long-term Noise static secret (its content-session identity).
+    noise_secret: [u8; 32],
 }
 
 /// What `pair_begin` returns: the confirmation code to show the user + the
@@ -123,6 +141,7 @@ pub async fn pair_begin(
             ws,
             client,
             device_id: device_id.clone(),
+            keypair,
         },
     );
 
@@ -167,9 +186,32 @@ pub async fn pair_confirm(
     crate::keychain::store_push_key(&session.device_id, &paired.push_key)
         .map_err(|e| format!("persist push key: {e}"))?;
 
-    // TODO(persist): also store `paired` (auth_token, gateway static key,
-    // relay/direct candidates) + the Noise static secret for content sessions.
+    // Persist the content-session record (auth token, gateway static key,
+    // routing candidates, and the app's Noise secret) so the app can reconnect
+    // and open a content session after a relaunch.
+    let record = PairedRecord {
+        user_id: paired.user_id.clone(),
+        device_id: session.device_id.clone(),
+        auth_token: paired.auth_token.clone(),
+        gateway_static_pubkey: paired.gateway_static_pubkey,
+        direct_candidates: paired.direct_candidates.clone(),
+        relay_node_id: paired.relay_node_id.clone(),
+        noise_secret: session.keypair.secret(),
+    };
+    let bytes =
+        serde_json::to_vec(&record).map_err(|e| format!("encode paired record: {e}"))?;
+    crate::keychain::store_paired_record(&bytes)
+        .map_err(|e| format!("persist paired record: {e}"))?;
+
     Ok(PairedSummary::from(&paired))
+}
+
+/// The owning user of the persisted pairing, if the app is already paired
+/// (so a relaunch can skip straight to "connected" instead of the scan form).
+pub fn paired_user() -> Option<String> {
+    let bytes = crate::keychain::read_paired_record().ok().flatten()?;
+    let record: PairedRecord = serde_json::from_slice(&bytes).ok()?;
+    Some(record.user_id)
 }
 
 type Ws =

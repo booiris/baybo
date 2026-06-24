@@ -38,6 +38,13 @@ async fn pair_confirm(
     pairing::pair_confirm(&sessions, &device_id, accepted).await
 }
 
+/// The owning user of a persisted pairing, if the app is already paired — so a
+/// relaunch can show "connected" instead of the pairing form.
+#[tauri::command]
+fn paired_user() -> Option<String> {
+    pairing::paired_user()
+}
+
 /// Debug-only: seed a known push key into the shared App Group keychain so the
 /// NSE decrypt path can be exercised with `xcrun simctl push` without a live
 /// gateway pairing. Reads `BAYBO_SEED_PUSH_KEY` as `<bid>:<64-hex-key>` (absent
@@ -92,7 +99,7 @@ pub fn run() {
             push_register::register();
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![pair_begin, pair_confirm])
+        .invoke_handler(tauri::generate_handler![pair_begin, pair_confirm, paired_user])
         .run(tauri::generate_context!());
     if let Err(e) = result {
         eprintln!("baybo: fatal error while running the app: {e}");

@@ -54,29 +54,29 @@ mod imp {
         unsafe { CFString::wrap_under_get_rule(r) }.as_CFType()
     }
 
-    pub(super) fn store_push_key(bid: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
-        let account = CFString::new(&format!("{ACCOUNT_PREFIX}{bid}")).as_CFType();
+    /// Upsert an opaque blob into the shared App Group keychain under `account`.
+    pub(super) fn store_blob(account: &str, bytes: &[u8]) -> Result<(), String> {
+        let account = CFString::new(account).as_CFType();
         let group = CFString::new(ACCESS_GROUP).as_CFType();
-        let data = CFData::from_buffer(&key[..]).as_CFType();
+        let data = CFData::from_buffer(bytes).as_CFType();
 
         // SAFETY: the kSec* statics are valid CFStringRefs from the linked
         // Security framework; the dictionaries outlive each Sec* call.
         unsafe {
-            let generic_pw = constant(kSecClassGenericPassword);
             let identity = vec![
-                (constant(kSecClass), generic_pw.clone()),
+                (constant(kSecClass), constant(kSecClassGenericPassword)),
                 (constant(kSecAttrAccount), account.clone()),
                 (constant(kSecAttrAccessGroup), group.clone()),
             ];
-            // Upsert: a re-pair re-derives the same key; delete-then-add avoids
-            // an errSecDuplicateItem.
+            // Upsert: delete-then-add avoids an errSecDuplicateItem on re-pair.
             let query = CFDictionary::from_CFType_pairs(&identity);
             SecItemDelete(query.as_concrete_TypeRef());
 
             let mut attrs = identity;
             attrs.push((constant(kSecValueData), data));
-            // `AfterFirstUnlock` so the NSE can read it on the lock screen (after
-            // the first unlock since boot), matching the preview's threat model.
+            // `AfterFirstUnlock` so the NSE can read the push key on the lock
+            // screen (after the first unlock since boot); the paired record
+            // rides the same class.
             attrs.push((
                 constant(kSecAttrAccessible),
                 constant(kSecAttrAccessibleAfterFirstUnlock),
@@ -91,14 +91,11 @@ mod imp {
         }
     }
 
-    /// Read the push key back from the shared keychain — the same lookup the
-    /// NSE's `PushKeyStore` does. Used by the debug self-check to prove the
-    /// access-group round-trip works on-device. `Ok(None)` = not found.
-    #[cfg(debug_assertions)]
-    pub(super) fn read_push_key(bid: &str) -> Result<Option<[u8; KEY_LEN]>, String> {
-        let account = CFString::new(&format!("{ACCOUNT_PREFIX}{bid}")).as_CFType();
+    /// Read an opaque blob back. `Ok(None)` = not found.
+    pub(super) fn read_blob(account: &str) -> Result<Option<Vec<u8>>, String> {
+        let account = CFString::new(account).as_CFType();
         let group = CFString::new(ACCESS_GROUP).as_CFType();
-        // SAFETY: as in `store_push_key` — valid constants, dictionary outlives
+        // SAFETY: as in `store_blob` — valid constants, the dictionary outlives
         // the call, and the returned CFData is owned (create rule).
         unsafe {
             let query = CFDictionary::from_CFType_pairs(&[
@@ -114,10 +111,25 @@ mod imp {
                 return Ok(None);
             }
             let data = CFData::wrap_under_create_rule(out as CFDataRef);
-            data.bytes()
+            Ok(Some(data.bytes().to_vec()))
+        }
+    }
+
+    pub(super) fn store_push_key(bid: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
+        store_blob(&format!("{ACCOUNT_PREFIX}{bid}"), &key[..])
+    }
+
+    /// Read the push key back — the same lookup the NSE's `PushKeyStore` does.
+    /// Used by the debug self-check to prove the access-group round-trip.
+    #[cfg(debug_assertions)]
+    pub(super) fn read_push_key(bid: &str) -> Result<Option<[u8; KEY_LEN]>, String> {
+        match read_blob(&format!("{ACCOUNT_PREFIX}{bid}"))? {
+            Some(b) => b
+                .as_slice()
                 .try_into()
                 .map(Some)
-                .map_err(|_| "stored push key has the wrong length".to_string())
+                .map_err(|_| "stored push key has the wrong length".to_string()),
+            None => Ok(None),
         }
     }
 }
@@ -128,6 +140,12 @@ mod imp {
     pub(super) fn store_push_key(_bid: &str, _key: &[u8; KEY_LEN]) -> Result<(), String> {
         Ok(())
     }
+    pub(super) fn store_blob(_account: &str, _bytes: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+    pub(super) fn read_blob(_account: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
 }
 
 /// Write the device's push key to the shared App Group keychain at account
@@ -135,6 +153,21 @@ mod imp {
 /// push payload, so the NSE can look the key back up.
 pub fn store_push_key(bid: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
     imp::store_push_key(bid, key)
+}
+
+/// Account holding the serialized paired-gateway record — the content-session
+/// material (auth token, gateway static key, routing candidates, and the app's
+/// Noise static secret) the app needs to reconnect after a relaunch.
+const PAIRED_RECORD_ACCOUNT: &str = "baybo.paired-gateway";
+
+/// Persist the paired-gateway record (an opaque serialized blob).
+pub fn store_paired_record(bytes: &[u8]) -> Result<(), String> {
+    imp::store_blob(PAIRED_RECORD_ACCOUNT, bytes)
+}
+
+/// Read the persisted paired-gateway record. `Ok(None)` = not paired yet.
+pub fn read_paired_record() -> Result<Option<Vec<u8>>, String> {
+    imp::read_blob(PAIRED_RECORD_ACCOUNT)
 }
 
 /// Debug self-check: read the key back (the same lookup the NSE does) to prove

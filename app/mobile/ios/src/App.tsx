@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 /// Mirror of `PairChallenge` returned by `pair_begin` (src-tauri): the
@@ -43,6 +43,14 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [challenge, setChallenge] = useState<PairChallenge | null>(null);
   const [paired, setPaired] = useState<PairedSummary | null>(null);
+  // On launch, a persisted pairing means we can skip straight to "connected".
+  const [rememberedUser, setRememberedUser] = useState<string | null>(null);
+
+  useEffect(() => {
+    invoke<string | null>("paired_user")
+      .then((u) => setRememberedUser(u))
+      .catch(() => {});
+  }, []);
 
   async function scan() {
     setStatus("Opening scanner…");
@@ -143,6 +151,18 @@ export default function App() {
           </button>
         </div>
         {status && <p className="status">{status}</p>}
+      </main>
+    );
+  }
+
+  if (rememberedUser) {
+    return (
+      <main className="container">
+        <h1>Connected</h1>
+        <p className="muted">
+          Paired as {rememberedUser} (remembered from a previous session).
+        </p>
+        <button onClick={() => setRememberedUser(null)}>Pair another device</button>
       </main>
     );
   }
