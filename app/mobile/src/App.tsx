@@ -157,7 +157,7 @@ function ChatView({ onClose }: { onClose: () => void }) {
 }
 
 export default function App() {
-  const [endpoint, setEndpoint] = useState("wss://proxy.baybo.space:7777");
+  const [endpoint, setEndpoint] = useState("wss://proxy.baybo.space");
   const [relay, setRelay] = useState(true);
   const [code, setCode] = useState("");
   const [label, setLabel] = useState("My iPhone");

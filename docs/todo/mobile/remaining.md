@@ -10,7 +10,7 @@ the overall design and the A (gateway) / C (remote-host) / P (phone) roles.
   the operator confirm a code derived from the SPAKE2 secret; no separate
   `device approve` step; device rows are `Approved` from creation). `device pair`
   is interactive, label is optional (the device reports its own name), renders a
-  terminal QR, default endpoint `wss://proxy.baybo.space:7777`.
+  terminal QR, default endpoint `wss://proxy.baybo.space`.
 - **Relay pairing (C+A+P)**: `remote-host-relay` binary hosts the blind
   rendezvous (`/pair/host/{code}` admission-gated by `x-instance-key`,
   `/pair/join/{code}` for the app). The gateway's `channel/relay_pair.rs` host
@@ -107,8 +107,8 @@ for host and `aarch64-apple-ios-sim`; real end-to-end delivery still needs #4
 
 ## Deploying what's built (relay pairing)
 
-1. Deploy `remote-host-relay` behind the `proxy.baybo.space:7777` TLS terminator:
+1. Deploy `remote-host-relay` behind the `proxy.baybo.space` TLS terminator:
    `RELAY_INSTANCE_KEYS=<gateway instance_key>` (comma-separated), optional
    `RELAY_BIND_ADDR` (default `0.0.0.0:8444`).
 2. Gateway `baybo.json`:
-   `"relay": { "enabled": true, "url": "wss://proxy.baybo.space:7777", "instance_key": "<same key>" }`.
+   `"relay": { "enabled": true, "url": "wss://proxy.baybo.space", "instance_key": "<same key>" }`.

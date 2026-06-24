@@ -33,7 +33,7 @@ const SCAN_WAIT: Duration = Duration::from_secs(300);
 const OUTCOME_WAIT: Duration = Duration::from_secs(125);
 /// Built-in default endpoint embedded in the pairing QR when the operator has
 /// not configured a reachable `gateway.direct.advertise` address.
-const DEFAULT_GATEWAY_ENDPOINT: &str = "wss://proxy.baybo.space:7777";
+const DEFAULT_GATEWAY_ENDPOINT: &str = "wss://proxy.baybo.space";
 
 pub async fn handle(ctx: &CommandContext, cmd: DeviceCmd) -> Result<CommandOutput> {
     match cmd {
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn renders_a_scannable_qr() {
-        let qr = render_pairing_qr("baybo://pair?h=wss://proxy.baybo.space:7777&c=5PRX2B")
+        let qr = render_pairing_qr("baybo://pair?h=wss://proxy.baybo.space&c=5PRX2B")
             .expect("the short pairing payload fits a QR");
         assert!(qr.lines().count() > 8, "multi-line QR matrix");
         assert!(

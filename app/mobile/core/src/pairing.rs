@@ -219,7 +219,7 @@ mod tests {
         let welcome = GatewayWelcome {
             static_pubkey: [9u8; KEY_LEN],
             relay_node_id: "node-1".into(),
-            relay_url: "wss://proxy.baybo.space:7777".into(),
+            relay_url: "wss://proxy.baybo.space".into(),
             direct_candidates: vec!["wss://baybo.lan:8889".into()],
             user_id: "user-1".into(),
             pairing_code: code.clone(),

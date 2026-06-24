@@ -54,7 +54,7 @@ pub struct GatewayConfig {
 pub struct RelayConfig {
     /// When false, the gateway hosts no relay pairing legs (direct dial only).
     pub enabled: bool,
-    /// The relay's base WS URL, e.g. `wss://proxy.baybo.space:7777`.
+    /// The relay's base WS URL, e.g. `wss://proxy.baybo.space`.
     pub url: String,
     /// The gateway's admission key — a `RELAY_INSTANCE_KEYS` entry on the relay.
     /// Typically the same key as [`PushConfig::instance_key`].

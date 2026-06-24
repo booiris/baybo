@@ -57,7 +57,7 @@ volumes:
 
 With a terminator in front you can drop the `ports:` host-publishes on `push`/`relay` (Caddy reaches them over the compose network) — or keep them bound to `127.0.0.1` only.
 
-If you already run a terminator (e.g. `proxy.baybo.space:7777`), just forward it to the container ports (`:7777 → relay:8444`, and a route to `push:8443`).
+If you already run a terminator (e.g. `proxy.baybo.space`), forward it to the container ports — the relay routes (`/pair/*`, `/content/*`, `/control`) → `relay:8444`, and `/notify` + `/register` → `push:8443`.
 
 ## Gateway wiring (`baybo.json`)
 

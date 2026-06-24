@@ -33,7 +33,7 @@ const HOST_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Config for hosting pairing legs on the relay.
 #[derive(Debug, Clone)]
 pub(crate) struct RelayPairConfig {
-    /// Base WS URL of the relay (e.g. `wss://proxy.baybo.space:7777`).
+    /// Base WS URL of the relay (e.g. `wss://proxy.baybo.space`).
     pub relay_url: String,
     /// The gateway's admission key (a `RELAY_INSTANCE_KEYS` entry on the relay).
     pub instance_key: String,

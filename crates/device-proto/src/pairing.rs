@@ -57,7 +57,7 @@ pub struct GatewayWelcome {
     /// relay (the gateway's stable `relay_node_id`). P never holds A's
     /// `instance_key`. Empty when the gateway has no relay configured.
     pub relay_node_id: String,
-    /// Base WS URL of the blind relay (C), e.g. `wss://proxy.baybo.space:7777`.
+    /// Base WS URL of the blind relay (C), e.g. `wss://proxy.baybo.space`.
     /// The app dials `{relay_url}/content/join/{relay_node_id}` to reach a NAT'd
     /// gateway when every direct candidate fails. Empty when relay is off; it is
     /// carried here (not derived from the pairing endpoint) so a device that
@@ -169,7 +169,7 @@ mod tests {
         let welcome = GatewayWelcome {
             static_pubkey: [9u8; KEY_LEN],
             relay_node_id: "node-xyz".into(),
-            relay_url: "wss://proxy.baybo.space:7777".into(),
+            relay_url: "wss://proxy.baybo.space".into(),
             direct_candidates: vec!["wss://baybo.lan:8889".into()],
             user_id: "user-1".into(),
             pairing_code: "WORMHOLE-7-foo-bar".into(),
