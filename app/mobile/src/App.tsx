@@ -210,10 +210,16 @@ export default function App() {
       setCode(parsed.code);
       setRelay(parsed.relay);
       if (parsed.endpoint) setEndpoint(parsed.endpoint);
-      // Confirmation beat: lands on the app background (camera is already gone)
-      // and gives the success animation time to play before the form shows.
+      // Success: buzz, then a green dot pops at the reticle centre and the scan
+      // panel slides off to the left to reveal the form underneath.
+      try {
+        const { notificationFeedback } = await import("@tauri-apps/plugin-haptics");
+        await notificationFeedback("success");
+      } catch {
+        // haptics unavailable (e.g. desktop) — non-fatal
+      }
       setScanPhase("success");
-      await new Promise((resolve) => setTimeout(resolve, 650));
+      await new Promise((resolve) => setTimeout(resolve, 700));
       setStatus("Scanned. Review and pair.");
     } catch (e) {
       setStatus(scanCancelled.current ? null : `Scan failed: ${e}`);
@@ -277,43 +283,6 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }
-
-  if (scanPhase === "scanning") {
-    return (
-      <div className="scan-overlay">
-        <svg
-          className="scan-reticle"
-          viewBox="0 0 100 100"
-          fill="none"
-          stroke="#fff"
-          strokeWidth="8"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <path d="M8 24 L8 22 Q8 8 22 8 L24 8" />
-          <path d="M92 24 L92 22 Q92 8 78 8 L76 8" />
-          <path d="M8 76 L8 78 Q8 92 22 92 L24 92" />
-          <path d="M92 76 L92 78 Q92 92 78 92 L76 92" />
-        </svg>
-        <button className="scan-cancel" onClick={cancelScan}>
-          Cancel
-        </button>
-      </div>
-    );
-  }
-
-  if (scanPhase === "success") {
-    return (
-      <div className="scan-success">
-        <span className="ring" />
-        <span className="dot">
-          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M5 13 l4 4 L19 7" />
-          </svg>
-        </span>
-      </div>
-    );
   }
 
   if (chatting) {
@@ -381,33 +350,63 @@ export default function App() {
   }
 
   return (
-    <main className="container">
-      <h1>Baybo</h1>
-      <p className="muted">Scan the pairing code shown by <code>baybo device pair</code>.</p>
+    <>
+      <main className="container">
+        <h1>Baybo</h1>
+        <p className="muted">Scan the pairing code shown by <code>baybo device pair</code>.</p>
 
-      <label>
-        Gateway endpoint
-        <input value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="ws://host:port" />
-      </label>
-      <label>
-        Pairing code
-        <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="WORMHOLE-7-…" />
-      </label>
-      <label>
-        Device label
-        <input value={label} onChange={(e) => setLabel(e.target.value)} />
-      </label>
-      <label className="checkbox">
-        <input type="checkbox" checked={relay} onChange={(e) => setRelay(e.target.checked)} />
-        Connect via relay (proxy)
-      </label>
+        <label>
+          Gateway endpoint
+          <input value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="ws://host:port" />
+        </label>
+        <label>
+          Pairing code
+          <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="WORMHOLE-7-…" />
+        </label>
+        <label>
+          Device label
+          <input value={label} onChange={(e) => setLabel(e.target.value)} />
+        </label>
+        <label className="checkbox">
+          <input type="checkbox" checked={relay} onChange={(e) => setRelay(e.target.checked)} />
+          Connect via relay (proxy)
+        </label>
 
-      <div className="row">
-        <button onClick={scan} disabled={busy}>Scan QR</button>
-        <button onClick={pairBegin} disabled={busy || !code || !endpoint}>Pair</button>
-      </div>
+        <div className="row">
+          <button onClick={scan} disabled={busy}>Scan QR</button>
+          <button onClick={pairBegin} disabled={busy || !code || !endpoint}>Pair</button>
+        </div>
 
-      {status && <p className="status">{status}</p>}
-    </main>
+        {status && <p className="status">{status}</p>}
+      </main>
+
+      {scanPhase === "scanning" && (
+        <div className="scan-overlay">
+          <svg
+            className="scan-reticle"
+            viewBox="0 0 100 100"
+            fill="none"
+            stroke="#fff"
+            strokeWidth="8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M8 24 L8 22 Q8 8 22 8 L24 8" />
+            <path d="M92 24 L92 22 Q92 8 78 8 L76 8" />
+            <path d="M8 76 L8 78 Q8 92 22 92 L24 92" />
+            <path d="M92 76 L92 78 Q92 92 78 92 L76 92" />
+          </svg>
+          <button className="scan-cancel" onClick={cancelScan}>
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {scanPhase === "success" && (
+        <div className="scan-panel">
+          <span className="scan-dot" />
+        </div>
+      )}
+    </>
   );
 }

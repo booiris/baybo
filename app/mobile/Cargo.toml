@@ -36,6 +36,7 @@ futures-util = "0.3"
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-barcode-scanner = "2"
+tauri-plugin-haptics = "2"
 # iOS-only: writing the push key to the shared App Group keychain (SecItemAdd).
 core-foundation = "0.10"
 core-foundation-sys = "0.8"

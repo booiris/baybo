@@ -122,9 +122,12 @@ pub fn run() {
     debug_seed_push_key();
 
     let builder = tauri::Builder::default();
-    // The barcode/camera plugin is mobile-only (the QR scan-to-connect path).
+    // The barcode/camera + haptics plugins are mobile-only (the QR
+    // scan-to-connect path and the scan-success buzz).
     #[cfg(mobile)]
-    let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
+    let builder = builder
+        .plugin(tauri_plugin_barcode_scanner::init())
+        .plugin(tauri_plugin_haptics::init());
     let result = builder
         .manage(PairingSessions::default())
         .manage(ContentSessions::default())

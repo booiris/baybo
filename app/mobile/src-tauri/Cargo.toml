@@ -25,9 +25,11 @@ futures-util = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
 tokio-tungstenite = { workspace = true }
 
-# The camera/barcode plugin only exists on mobile; on desktop the crate is empty.
+# The camera/barcode + haptics plugins only exist on mobile; on desktop the
+# crates are empty.
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 tauri-plugin-barcode-scanner = { workspace = true }
+tauri-plugin-haptics = { workspace = true }
 
 # The App Group keychain write (push-key persistence for the NSE) is iOS-only,
 # as is push registration (notification auth + remote-notification token).
