@@ -109,7 +109,7 @@ html.scanning #root {
    bends and the line ends are both rounded). stroke-width is in viewBox units;
    non-scaling-stroke keeps it a constant on-screen thickness at any size. */
 .scan-reticle {
-  width: min(68vw, 270px);
+  width: min(80vw, 330px);
   aspect-ratio: 1;
   filter: drop-shadow(0 0 4px rgba(0, 0, 0, 0.5));
 }

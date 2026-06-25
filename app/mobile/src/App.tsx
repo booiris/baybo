@@ -285,10 +285,10 @@ export default function App() {
           strokeLinecap="round"
           strokeLinejoin="round"
         >
-          <path d="M8 36 L8 22 Q8 8 22 8 L36 8" />
-          <path d="M92 36 L92 22 Q92 8 78 8 L64 8" />
-          <path d="M8 64 L8 78 Q8 92 22 92 L36 92" />
-          <path d="M92 64 L92 78 Q92 92 78 92 L64 92" />
+          <path d="M8 28 L8 22 Q8 8 22 8 L28 8" />
+          <path d="M92 28 L92 22 Q92 8 78 8 L72 8" />
+          <path d="M8 72 L8 78 Q8 92 22 92 L28 92" />
+          <path d="M92 72 L92 78 Q92 92 78 92 L72 92" />
         </svg>
         <button className="scan-cancel" onClick={cancelScan}>
           Cancel
