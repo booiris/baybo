@@ -66,6 +66,47 @@ fn operator_user_id() -> String {
         .unwrap_or_else(|_| "baybo-cli".to_string())
 }
 
+/// Owns the spawned self-hosting relay task and stops it on drop (every
+/// operator-flow exit path), unless [`finish`](Self::finish) drained it first.
+struct StopHosting(Option<tokio::task::JoinHandle<()>>);
+
+impl StopHosting {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// Wait briefly for the handshake to finish (it sends the sealed
+    /// `GatewayWelcome` just after the approved row `wait_for_paired` observes),
+    /// so a successful pair isn't cut off before the app receives it.
+    async fn finish(mut self) {
+        if let Some(h) = self.0.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+        }
+    }
+}
+
+impl Drop for StopHosting {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
+}
+
+/// Percent-encode an instance key for the QR query so `new URL(...).searchParams`
+/// round-trips it (keys are usually base64url/hex, but a `+`/`=`/space would
+/// otherwise break parsing).
+fn qr_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 async fn pair(
     ctx: &CommandContext,
     label: Option<String>,
@@ -82,10 +123,28 @@ async fn pair(
         .map_err(|e| CliError::Manager(format!("mint device pairing: {e}")))?;
 
     let (endpoint, relay) = pairing_endpoint(ctx);
-    let payload = if relay {
-        format!("baybo://pair?h={endpoint}&c={code}&relay=1")
+    // On the relay path the operator supplies the relay admission key; it's baked
+    // into the QR so the app presents it on its join leg (the relay admits both
+    // sides). `guest` is the public trial key. Direct pairing carries no key.
+    let instance_key = if relay {
+        // `guest` is the trial key for the built-in public proxy; only surface it
+        // (hint + default) when that's the endpoint. Any other relay must supply
+        // its own admission key.
+        let (label, default_key) = if endpoint == DEFAULT_GATEWAY_ENDPOINT {
+            ("Relay instance key (enter `guest` to try it out)", "guest")
+        } else {
+            ("Relay instance key", "")
+        };
+        Some(prompt::prompt_with_default(label, default_key)?)
     } else {
-        format!("baybo://pair?h={endpoint}&c={code}")
+        None
+    };
+    let payload = match instance_key.as_deref() {
+        Some(key) => {
+            let k = qr_encode(key);
+            format!("baybo://pair?h={endpoint}&c={code}&k={k}&relay=1")
+        }
+        None => format!("baybo://pair?h={endpoint}&c={code}"),
     };
     eprintln!("Pairing a new device.\n");
     if let Some(qr) = render_pairing_qr(&payload) {
@@ -98,6 +157,39 @@ async fn pair(
         eprintln!("endpoint: {endpoint}\ncode:     {code}\n");
     }
     eprintln!("Waiting for the device to scan…");
+
+    // Self-contained relay hosting: open our `/pair/host/{code}` leg on the relay
+    // and run the SPAKE2 handshake here, so pairing works with no `baybo gateway
+    // start` daemon. Runs concurrently with the operator flow below (they sync
+    // through the shared slot); the guard stops it on every exit path.
+    let host = match instance_key.as_deref() {
+        Some(key) => {
+            let secret_vault = ctx
+                .secret_vault
+                .clone()
+                .ok_or_else(|| CliError::Config("device pairing needs the secret vault".into()))?;
+            let deps = baybo_gateway::PairingHostDeps {
+                device_pairing: Arc::clone(svc),
+                secret_vault,
+                relay_url: endpoint.clone(),
+                device_direct_candidates: if ctx.config.gateway.direct.enabled {
+                    ctx.config.gateway.direct.advertise.clone()
+                } else {
+                    Vec::new()
+                },
+                apns_registrar: None,
+            };
+            let (relay_url, key, code) = (endpoint.clone(), key.to_string(), code.clone());
+            Some(StopHosting::new(tokio::spawn(async move {
+                if let Err(e) =
+                    baybo_gateway::host_pairing_leg(&deps, &relay_url, &key, &code).await
+                {
+                    tracing::debug!(error = %e, "device pair: relay host ended");
+                }
+            })))
+        }
+        None => None,
+    };
 
     // 1. Wait for the phone to scan + reach the confirm step: the gateway
     //    publishes the confirmation code + the device's name onto the slot.
@@ -119,7 +211,10 @@ async fn pair(
     eprintln!("    name:              {device_label}");
     eprintln!("    device:            {device_id}");
     eprintln!("    confirmation code: {confirm_code}");
-    let accepted = prompt::confirm("Does this match the code on the phone? Pair this device?")?;
+    let accepted = prompt::confirm_with_default(
+        "Does this match the code on the phone? Pair this device?",
+        true,
+    )?;
     svc.set_operator_decision(&code, accepted)
         .await
         .map_err(|e| CliError::Manager(format!("record pairing decision: {e}")))?;
@@ -132,7 +227,16 @@ async fn pair(
 
     // 3. Wait for the gateway to finalize (it requires the phone's confirm too).
     eprintln!("Confirming…");
-    if wait_for_paired(svc, &user, &device_id, OUTCOME_WAIT).await? {
+    let paired = wait_for_paired(svc, &user, &device_id, OUTCOME_WAIT).await?;
+    // Stop our self-hosted relay leg: on success let it finish sending the sealed
+    // GatewayWelcome (it goes out right after the approved row `wait_for_paired`
+    // just observed); otherwise drop the guard to abort the still-running task.
+    match (host, paired) {
+        (Some(h), true) => h.finish().await,
+        (Some(h), false) => drop(h),
+        (None, _) => {}
+    }
+    if paired {
         Ok(CommandOutput::structured(
             format!("Paired \"{device_label}\" ({user}:{device_id})."),
             &json!({
@@ -167,8 +271,8 @@ async fn wait_for_confirm(
             .map_err(|e| CliError::Manager(format!("poll pairing slot: {e}")))?
         {
             Some(slot) if slot.confirm_code.is_some() => return Ok(Some(slot)),
-            Some(_) => {}             // scanned but not yet at the confirm step
-            None => return Ok(None),  // expired or consumed
+            Some(_) => {}            // scanned but not yet at the confirm step
+            None => return Ok(None), // expired or consumed
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(None);

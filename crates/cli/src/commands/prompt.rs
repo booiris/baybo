@@ -24,10 +24,16 @@ pub(crate) fn prompt_line<R: BufRead, W: Write>(
     Ok(buf.trim().to_string())
 }
 
-/// `[y/N]` confirmation prompt over stdin/stderr. Returns `true`
-/// only on an explicit yes; everything else (including empty input)
-/// is `false`.
+/// `[y/N]` confirmation prompt over stdin/stderr. Returns `true` only on an
+/// explicit yes; everything else (including empty input) is `false`.
 pub(crate) fn confirm(question: &str) -> Result<bool> {
+    confirm_with_default(question, false)
+}
+
+/// Like [`confirm`], but `default` decides an empty line (enter) and which side
+/// the `[Y/n]` / `[y/N]` hint capitalises. Explicit `y`/`yes` → `true`,
+/// `n`/`no` → `false`, anything else → `default`.
+pub(crate) fn confirm_with_default(question: &str, default: bool) -> Result<bool> {
     let stdin = io::stdin();
     let stderr = io::stderr();
     if !stdin.is_terminal() || !stderr.is_terminal() {
@@ -37,12 +43,14 @@ pub(crate) fn confirm(question: &str) -> Result<bool> {
     }
     let mut reader = stdin.lock();
     let mut writer = stderr.lock();
-    let label = format!("{question} [y/N]: ");
+    let hint = if default { "[Y/n]" } else { "[y/N]" };
+    let label = format!("{question} {hint}: ");
     let ans = prompt_line(&mut reader, &mut writer, &label)?;
-    Ok(matches!(
-        ans.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+    Ok(match ans.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => default,
+    })
 }
 
 /// Like `prompt_line` but substitutes `default` when the user
