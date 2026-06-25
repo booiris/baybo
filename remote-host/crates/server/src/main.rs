@@ -10,7 +10,10 @@ use std::process::ExitCode;
 use axum::Router;
 use remote_host_push::serve::{PushConfig, build_router as push_router};
 use remote_host_relay::serve::{RelayConfig, build_router as relay_router};
-use remote_host_serve::TlsPaths;
+
+mod serve;
+
+use serve::TlsPaths;
 
 /// Listener address when `BIND_ADDR` is unset. Map it to the host `:443` (e.g.
 /// in docker) for a port-less wss/https URL.
@@ -55,6 +58,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "remote-host: listening on {bind_addr} ({scheme}) — roles: {}",
         roles.join(" + "),
     );
-    remote_host_serve::serve(&bind_addr, tls, app).await?;
+    serve::serve(&bind_addr, tls, app).await?;
     Ok(())
 }

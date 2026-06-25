@@ -1158,9 +1158,11 @@ name = "remote-host"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "axum-server",
  "remote-host-push",
  "remote-host-relay",
- "remote-host-serve",
+ "rustls",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -1205,17 +1207,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.24.0",
  "tracing",
-]
-
-[[package]]
-name = "remote-host-serve"
-version = "0.1.0"
-dependencies = [
- "axum",
- "axum-server",
- "rustls",
- "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]

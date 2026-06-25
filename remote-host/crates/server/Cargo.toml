@@ -10,6 +10,9 @@ path = "src/main.rs"
 [dependencies]
 tokio = { workspace = true }
 axum = { workspace = true }
+# In-process TLS termination (the `serve` module).
+axum-server = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
 remote-host-push = { workspace = true }
 remote-host-relay = { workspace = true }
-remote-host-serve = { workspace = true }

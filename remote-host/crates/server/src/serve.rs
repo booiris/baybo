@@ -1,7 +1,7 @@
-//! Serve an axum [`Router`] over plain HTTP or rustls TLS — shared by the relay
-//! and push binaries so each can terminate TLS in-process (wss/https) without a
-//! separate reverse proxy. TLS is opt-in: pass `None` to serve plaintext (the
-//! behind-a-terminator deployment), or a cert/key pair to serve TLS directly.
+//! Serve the assembled [`Router`] over plain HTTP/ws or rustls TLS (wss/https) —
+//! in-process TLS termination so the service can be exposed directly, with no
+//! reverse proxy. TLS is opt-in: pass `None` to serve plaintext, or a cert/key
+//! pair to serve TLS.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -11,9 +11,9 @@ use thiserror::Error;
 
 /// PEM certificate + private-key paths for in-process TLS.
 #[derive(Debug, Clone)]
-pub struct TlsPaths {
-    pub cert: PathBuf,
-    pub key: PathBuf,
+pub(crate) struct TlsPaths {
+    cert: PathBuf,
+    key: PathBuf,
 }
 
 impl TlsPaths {
@@ -21,7 +21,7 @@ impl TlsPaths {
     /// set (serve plaintext `ws`), `Some` if both are (serve `wss`), an error if
     /// only one is (a half-configured TLS setup). An unset *or empty* value
     /// counts as "not set", so a compose file can leave the vars blank.
-    pub fn from_env(cert_var: &str, key_var: &str) -> Result<Option<Self>, String> {
+    pub(crate) fn from_env(cert_var: &str, key_var: &str) -> Result<Option<Self>, String> {
         let cert = std::env::var(cert_var).ok().filter(|s| !s.is_empty());
         let key = std::env::var(key_var).ok().filter(|s| !s.is_empty());
         match (cert, key) {
@@ -36,7 +36,7 @@ impl TlsPaths {
 }
 
 #[derive(Debug, Error)]
-pub enum ServeError {
+pub(crate) enum ServeError {
     #[error("invalid bind address {addr}: {reason}")]
     BindAddr { addr: String, reason: String },
     #[error("load TLS cert/key: {0}")]
@@ -47,7 +47,7 @@ pub enum ServeError {
 
 /// Bind `bind_addr` and serve `router` — over rustls when `tls` is `Some`, else
 /// plaintext. Runs until the process is signalled.
-pub async fn serve(
+pub(crate) async fn serve(
     bind_addr: &str,
     tls: Option<TlsPaths>,
     router: Router,
