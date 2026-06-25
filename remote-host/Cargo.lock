@@ -1409,6 +1409,7 @@ dependencies = [
  "parking_lot",
  "remote-host-admission",
  "remote-host-protocol",
+ "remote-host-ratelimit",
  "reqwest",
  "serde",
  "serde_json",
@@ -1419,6 +1420,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "remote-host-ratelimit"
+version = "0.1.0"
+
+[[package]]
 name = "remote-host-relay"
 version = "0.1.0"
 dependencies = [
@@ -1427,6 +1432,7 @@ dependencies = [
  "parking_lot",
  "remote-host-admission",
  "remote-host-protocol",
+ "remote-host-ratelimit",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

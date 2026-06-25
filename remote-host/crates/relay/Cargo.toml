@@ -23,7 +23,9 @@ serde_json = { workspace = true }
 remote-host-admission = { workspace = true }
 # The shared wire contract: route paths, x-instance-key, ControlHello/Signal.
 remote-host-protocol = { workspace = true }
+# The token-bucket primitive backing the per-instance bandwidth throttle.
+remote-host-ratelimit = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tokio-tungstenite = { workspace = true }

@@ -61,10 +61,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => registry,
     };
     let conns = Arc::new(registry);
+    // Per-gateway content-bandwidth throttle (fixed rate; see RELAY_BYTES_PER_SEC).
+    let bandwidth = Arc::new(remote_host_relay::BandwidthRegistry::new());
     let admission = {
         let conns = conns.clone();
+        let bandwidth = bandwidth.clone();
         admission_db::open(&db_path, poll, move |revoked| {
+            // A revoked key loses its live connections and its bandwidth bucket.
             conns.kick(&revoked);
+            bandwidth.forget(&revoked);
         })
         .await?
     };
@@ -85,7 +90,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Relay is always on.
-    app = app.merge(relay_router(admission.clone(), conns.clone()));
+    app = app.merge(relay_router(
+        admission.clone(),
+        conns.clone(),
+        bandwidth.clone(),
+    ));
     roles.push("relay");
 
     // TODO(dashboard): wire in `remote-host-dashboard` here — a blind,
@@ -98,7 +107,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into());
     let tls = TlsPaths::from_env("TLS_CERT", "TLS_KEY")?;
-    let scheme = if tls.is_some() { "https/wss" } else { "http/ws" };
+    let scheme = if tls.is_some() {
+        "https/wss"
+    } else {
+        "http/ws"
+    };
     eprintln!(
         "remote-host: listening on {bind_addr} ({scheme}) — roles: {}",
         roles.join(" + "),

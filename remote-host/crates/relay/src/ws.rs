@@ -3,42 +3,73 @@
 //! Each side of a relayed connection (the phone, and the gateway A) opens a
 //! WebSocket to C keyed by the `relay_node_id`; [`pump_ws`] joins it to a
 //! [`RelayLeg`] and shuttles binary frames in both directions, **blind** —
-//! bytes are copied, never inspected (the payload is Noise-inside-TLS). The
-//! pump is the single `on_upgrade` task driving a `select!` over the split
-//! halves, so there's no detached writer task to starve.
+//! bytes are copied, never inspected (the payload is Noise-inside-TLS).
+//!
+//! The two directions are **independent** futures driven concurrently by one
+//! `select!` (no detached, unbounded writer task). They are split rather than
+//! folded into a single `loop { select! }` because the inbound direction may
+//! `await` a bandwidth throttle: in a single-loop design that sleep would sit on
+//! the only task and stall *outbound* delivery on the same socket — a tiny
+//! back-channel frame could freeze a large reverse stream, since both legs share
+//! one (aggregate) bucket. As separate futures, a throttle sleep parks only the
+//! inbound future; `select!` keeps polling outbound, so pacing one direction
+//! never blocks the other. Whichever direction ends first tears down the socket
+//! (and signals the partner) by dropping both halves.
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 
+use crate::bandwidth::BandwidthLimiter;
 use crate::broker::RelayLeg;
 
 /// Pump one WebSocket against its matched [`RelayLeg`] until either side closes:
 /// binary frames the client sends go to the partner leg; frames from the
 /// partner go back to the client. Non-binary control frames (ping/pong/text)
 /// are ignored — the relay only carries opaque binary.
-pub async fn pump_ws(socket: WebSocket, mut leg: RelayLeg) {
+///
+/// `limiter` (present for content legs, `None` for pairing) throttles bytes
+/// **read from this socket** to the gateway's configured rate: the pump reserves
+/// the frame's bytes and sleeps off any debt before forwarding, so an unread
+/// socket backpressures its sender over TCP. Both legs of a session share one
+/// limiter, so the cap is the gateway's aggregate.
+pub async fn pump_ws(socket: WebSocket, leg: RelayLeg, limiter: Option<BandwidthLimiter>) {
     let (mut sink, mut source) = socket.split();
-    loop {
-        tokio::select! {
-            inbound = source.next() => match inbound {
-                Some(Ok(Message::Binary(b))) => {
-                    if leg.to_peer.send(b.to_vec()).await.is_err() {
+    let RelayLeg {
+        to_peer,
+        mut from_peer,
+    } = leg;
+
+    // Inbound: this socket → partner leg (throttled). A throttle sleep parks only
+    // this future, not the outbound one below.
+    let inbound = async move {
+        while let Some(msg) = source.next().await {
+            match msg {
+                Ok(Message::Binary(b)) => {
+                    if let Some(limiter) = &limiter {
+                        limiter.throttle(b.len()).await;
+                    }
+                    if to_peer.send(b.to_vec()).await.is_err() {
                         break; // partner leg gone
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(_)) => {}
-                Some(Err(_)) => break,
-            },
-            outbound = leg.from_peer.recv() => match outbound {
-                Some(bytes) => {
-                    if sink.send(Message::Binary(bytes.into())).await.is_err() {
-                        break; // client socket gone
-                    }
-                }
-                None => break, // partner leg closed
-            },
+                Ok(Message::Close(_)) | Err(_) => break,
+                Ok(_) => {} // ping/pong/text: not relayed
+            }
         }
+    };
+
+    // Outbound: partner leg → this socket.
+    let outbound = async move {
+        while let Some(bytes) = from_peer.recv().await {
+            if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                break; // client socket gone
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = inbound => {}
+        _ = outbound => {}
     }
 }
 
@@ -64,7 +95,7 @@ mod tests {
         State(broker): State<Arc<RelayBroker>>,
     ) -> impl IntoResponse {
         let leg = broker.join(&key);
-        ws.on_upgrade(move |socket| pump_ws(socket, leg))
+        ws.on_upgrade(move |socket| pump_ws(socket, leg, None))
     }
 
     async fn connect(port: u16, key: &str) -> WebSocketStream<TcpStream> {

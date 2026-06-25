@@ -22,6 +22,8 @@ reqwest = { workspace = true }
 remote-host-admission = { workspace = true }
 # The shared wire contract: route paths + NotifyRequest/RegisterRequest/ApnsEnv.
 remote-host-protocol = { workspace = true }
+# The token-bucket primitive backing the per-(instance,device) /notify frequency control.
+remote-host-ratelimit = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

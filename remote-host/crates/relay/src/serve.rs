@@ -32,6 +32,7 @@ use remote_host_protocol::relay::{
     CONTENT_HOST, CONTENT_JOIN, CONTROL, INSTANCE_KEY_HEADER, PAIR_HOST, PAIR_JOIN,
 };
 
+use crate::bandwidth::BandwidthRegistry;
 use crate::broker::RelayBroker;
 use crate::conns::ConnectionRegistry;
 use crate::control::{ControlHello, ControlRegistry};
@@ -42,6 +43,22 @@ use crate::ws::pump_ws;
 /// connection trips it — releasing the stale registry slot promptly.
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Cap on a single relayed WebSocket message. Content frames are chunked Noise
+/// messages (≤ ~64 KiB each) and pairing/control frames are far smaller, so this
+/// never truncates legitimate traffic. It bounds per-frame memory and keeps the
+/// bandwidth throttle fine-grained: a frame is read whole before it is throttled,
+/// so without this cap axum's 64 MiB default would let one (buggy or hostile)
+/// frame balloon memory and stall the pump for tens of seconds. An oversized
+/// frame trips a WS protocol error and closes the leg instead.
+const MAX_RELAY_FRAME_BYTES: usize = 128 * 1024;
+
+/// Apply the relay's per-message size cap to a WS upgrade (every relay route
+/// carries only small opaque frames).
+fn capped(ws: WebSocketUpgrade) -> WebSocketUpgrade {
+    ws.max_message_size(MAX_RELAY_FRAME_BYTES)
+        .max_frame_size(MAX_RELAY_FRAME_BYTES)
+}
+
 #[derive(Clone)]
 struct RelayState {
     broker: Arc<RelayBroker>,
@@ -51,6 +68,9 @@ struct RelayState {
     /// Live admission-gated connections keyed by instance key, so an admission
     /// hot-reload can drop the connections of a revoked key.
     conns: Arc<ConnectionRegistry>,
+    /// Per-instance content-bandwidth buckets; content legs throttle against the
+    /// owning gateway's bucket (pairing legs are tiny and unthrottled).
+    bandwidth: Arc<BandwidthRegistry>,
     /// Monotonic source of per-data-leg `relay_key`s. Uniqueness (not secrecy)
     /// is all that's needed: the content-host route is admission-gated, so a
     /// guessed key can't be hosted by anyone but the real gateway.
@@ -59,13 +79,19 @@ struct RelayState {
 
 /// Assemble the relay router. `admission` is the shared, hot-reloaded allow-list
 /// of admitted gateway instance keys; `conns` tracks live connections so a
-/// revoke (an admission reload that dropped a key) can kick them.
-pub fn build_router(admission: Arc<dyn Admission>, conns: Arc<ConnectionRegistry>) -> Router {
+/// revoke (an admission reload that dropped a key) can kick them; `bandwidth`
+/// throttles each gateway's aggregate content throughput.
+pub fn build_router(
+    admission: Arc<dyn Admission>,
+    conns: Arc<ConnectionRegistry>,
+    bandwidth: Arc<BandwidthRegistry>,
+) -> Router {
     let state = RelayState {
         broker: Arc::new(RelayBroker::new()),
         admitted: admission,
         control: Arc::new(ControlRegistry::new()),
         conns,
+        bandwidth,
         seq: Arc::new(AtomicU64::new(0)),
     };
     Router::new()
@@ -86,17 +112,25 @@ async fn host_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let Some(key) = headers.get(INSTANCE_KEY_HEADER).and_then(|v| v.to_str().ok()) else {
+    let Some(key) = headers
+        .get(INSTANCE_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+    else {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     };
     if !state.admitted.is_admitted(key) {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
     // Cap how many connections one instance key may hold (control + legs).
-    let Some((guard, kick)) =
-        state.conns.register(key, state.admitted.max_conns(key).map(|c| c as usize))
+    let Some((guard, kick)) = state
+        .conns
+        .register(key, state.admitted.max_conns(key).map(|c| c as usize))
     else {
-        return (StatusCode::TOO_MANY_REQUESTS, "instance connection limit reached").into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "instance connection limit reached",
+        )
+            .into_response();
     };
     // Close the TOCTOU window: if the key was revoked between the admission check
     // above and registering, a concurrent kick may have already passed us by, and
@@ -107,10 +141,11 @@ async fn host_handler(
     }
     let leg = state.broker.join(&code);
     let broker = Arc::clone(&state.broker);
-    ws.on_upgrade(move |socket| async move {
+    capped(ws).on_upgrade(move |socket| async move {
         let _guard = guard;
         tokio::select! {
-            _ = pump_ws(socket, leg) => {}
+            // Pairing frames are tiny SPAKE2 blobs — not bandwidth-throttled.
+            _ = pump_ws(socket, leg, None) => {}
             // The gateway's instance key was revoked mid-connection.
             _ = kick => {}
         }
@@ -127,7 +162,7 @@ async fn join_handler(
     ws: WebSocketUpgrade,
 ) -> Response {
     match state.broker.try_match(&code) {
-        Some(leg) => ws.on_upgrade(move |socket| pump_ws(socket, leg)),
+        Some(leg) => capped(ws).on_upgrade(move |socket| pump_ws(socket, leg, None)),
         None => (StatusCode::NOT_FOUND, "no pairing host for this code").into_response(),
     }
 }
@@ -138,7 +173,7 @@ async fn join_handler(
 /// leg") over it. Admission rides the hello (not a header) so the same dial both
 /// authenticates and identifies the gateway.
 async fn control_handler(State(state): State<RelayState>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| run_control(socket, state))
+    capped(ws).on_upgrade(move |socket| run_control(socket, state))
 }
 
 async fn run_control(mut socket: WebSocket, state: RelayState) {
@@ -165,7 +200,9 @@ async fn run_control(mut socket: WebSocket, state: RelayState) {
     if !state.admitted.is_admitted(&hello.instance_key) {
         return;
     }
-    let mut rx = state.control.register(&hello.relay_node_id);
+    let mut rx = state
+        .control
+        .register(&hello.relay_node_id, &hello.instance_key);
     // `register` replaces any prior slot (reconnect wins); if our slot is
     // superseded, `rx` closes and we must NOT unregister the new owner.
     let mut superseded = false;
@@ -222,13 +259,18 @@ async fn content_join_handler(
     ws: WebSocketUpgrade,
 ) -> Response {
     let relay_key = format!("dl-{}", state.seq.fetch_add(1, Ordering::Relaxed));
-    if !state.control.signal_open(&relay_node_id, &relay_key).await {
+    // Signaling resolves the owning gateway's instance key, so this anonymous
+    // phone leg meters against the same bandwidth bucket as the gateway's leg.
+    let Some(instance_key) = state.control.signal_open(&relay_node_id, &relay_key).await else {
         return (StatusCode::NOT_FOUND, "gateway not connected").into_response();
-    }
+    };
+    let limiter = state
+        .bandwidth
+        .limiter_for(&instance_key, state.admitted.max_bps(&instance_key));
     let leg = state.broker.join(&relay_key);
     let broker = Arc::clone(&state.broker);
-    ws.on_upgrade(move |socket| async move {
-        pump_ws(socket, leg).await;
+    capped(ws).on_upgrade(move |socket| async move {
+        pump_ws(socket, leg, Some(limiter)).await;
         broker.cancel(&relay_key);
     })
 }
@@ -243,17 +285,25 @@ async fn content_host_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let Some(key) = headers.get(INSTANCE_KEY_HEADER).and_then(|v| v.to_str().ok()) else {
+    let Some(key) = headers
+        .get(INSTANCE_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+    else {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     };
     if !state.admitted.is_admitted(key) {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
     // Cap how many connections one instance key may hold (control + legs).
-    let Some((guard, kick)) =
-        state.conns.register(key, state.admitted.max_conns(key).map(|c| c as usize))
+    let Some((guard, kick)) = state
+        .conns
+        .register(key, state.admitted.max_conns(key).map(|c| c as usize))
     else {
-        return (StatusCode::TOO_MANY_REQUESTS, "instance connection limit reached").into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "instance connection limit reached",
+        )
+            .into_response();
     };
     // Close the TOCTOU window: if the key was revoked between the admission check
     // above and registering, a concurrent kick may have already passed us by, and
@@ -262,12 +312,15 @@ async fn content_host_handler(
     if !state.admitted.is_admitted(key) {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
+    let limiter = state
+        .bandwidth
+        .limiter_for(key, state.admitted.max_bps(key));
     let leg = state.broker.join(&relay_key);
     let broker = Arc::clone(&state.broker);
-    ws.on_upgrade(move |socket| async move {
+    capped(ws).on_upgrade(move |socket| async move {
         let _guard = guard;
         tokio::select! {
-            _ = pump_ws(socket, leg) => {}
+            _ = pump_ws(socket, leg, Some(limiter)) => {}
             // The gateway's instance key was revoked mid-session.
             _ = kick => {}
         }
@@ -286,12 +339,16 @@ mod tests {
     use tokio_tungstenite::{WebSocketStream, client_async};
 
     async fn serve() -> u16 {
-        let admission = Arc::new(remote_host_admission::InMemoryAdmission::with_keys(["inst-A"]));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let admission = Arc::new(remote_host_admission::InMemoryAdmission::with_keys([
+            "inst-A",
+        ]));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = build_router(admission, Arc::new(ConnectionRegistry::new()));
+        let app = build_router(
+            admission,
+            Arc::new(ConnectionRegistry::new()),
+            Arc::new(BandwidthRegistry::new()),
+        );
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -330,6 +387,34 @@ mod tests {
         assert_eq!(recv_bin(&mut app).await, b"a->p");
         app.send(Message::Binary(b"p->a".to_vec())).await.unwrap();
         assert_eq!(recv_bin(&mut host).await, b"p->a");
+    }
+
+    /// A frame past the per-message cap trips a WS protocol error: the server
+    /// closes the leg instead of buffering the whole oversized frame (which would
+    /// balloon memory and stall the throttle).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_frame_closes_the_leg() {
+        let port = serve().await;
+        // Hold the host leg so the app's join matches; it's torn down at the end.
+        let host = connect_host(port, "BIG", Some("inst-A")).await;
+        let mut app = connect_join(port, "BIG").await.expect("host is parked");
+
+        // One byte over the cap. The client write may flush locally; the server
+        // rejects it on read and tears the connection down.
+        let huge = vec![0u8; MAX_RELAY_FRAME_BYTES + 1];
+        let _ = app.send(Message::Binary(huge)).await;
+
+        // The app's leg closes (Close frame or EOF/error), and the host never
+        // receives the oversized payload.
+        let closed = loop {
+            match app.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break true,
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                Some(Ok(_)) => break false,
+            }
+        };
+        assert!(closed, "server closes the leg on an oversized frame");
+        drop(host);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -481,12 +566,13 @@ mod tests {
     async fn revoking_a_key_drops_its_live_control_connection() {
         use std::collections::HashSet;
 
-        let admission =
-            Arc::new(remote_host_admission::InMemoryAdmission::with_keys(["inst-A"]));
+        let admission = Arc::new(remote_host_admission::InMemoryAdmission::with_keys([
+            "inst-A",
+        ]));
         let conns = Arc::new(ConnectionRegistry::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = build_router(admission, conns.clone());
+        let app = build_router(admission, conns.clone(), Arc::new(BandwidthRegistry::new()));
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -519,7 +605,10 @@ mod tests {
                 Some(Ok(other)) => panic!("unexpected frame after revoke: {other:?}"),
             }
         };
-        assert!(closed, "control connection closed after its key was revoked");
+        assert!(
+            closed,
+            "control connection closed after its key was revoked"
+        );
     }
 
     async fn recv_bin(ws: &mut WebSocketStream<TcpStream>) -> Vec<u8> {

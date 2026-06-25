@@ -12,7 +12,9 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 
-use crate::notify::{NotifyOutcome, NotifyRequest, NotifyService, RegisterOutcome, RegisterRequest};
+use crate::notify::{
+    NotifyOutcome, NotifyRequest, NotifyService, RegisterOutcome, RegisterRequest,
+};
 
 /// Shared state for the push HTTP server.
 #[derive(Clone)]
@@ -44,6 +46,7 @@ async fn notify(State(state): State<PushState>, Json(req): Json<NotifyRequest>) 
         // A pruned token is still a successful "we handled it" from A's view.
         NotifyOutcome::Delivered | NotifyOutcome::Pruned => StatusCode::OK,
         NotifyOutcome::Unadmitted => StatusCode::UNAUTHORIZED,
+        NotifyOutcome::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         NotifyOutcome::UnknownDevice => StatusCode::NOT_FOUND,
         NotifyOutcome::Failed(_) => StatusCode::BAD_GATEWAY,
     }
@@ -166,6 +169,33 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         assert_eq!(
             post_notify(body("inst-A", "ghost")).await,
             StatusCode::NOT_FOUND,
+        );
+    }
+
+    #[tokio::test]
+    async fn over_rate_returns_429() {
+        // One shared router (cloned per request) keeps the limiter state across the
+        // whole burst; the push past it maps to 429.
+        let app = app();
+        let post = || {
+            Request::builder()
+                .method("POST")
+                .uri("/notify")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&body("inst-A", "dev-1")).unwrap(),
+                ))
+                .unwrap()
+        };
+        for _ in 0..crate::ratelimit::NOTIFY_BURST as usize {
+            assert_eq!(
+                app.clone().oneshot(post()).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            app.clone().oneshot(post()).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS,
         );
     }
 }

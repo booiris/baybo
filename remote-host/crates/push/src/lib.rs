@@ -17,16 +17,18 @@ pub mod error;
 pub mod http;
 pub mod jwt;
 pub mod notify;
+pub mod ratelimit;
 pub mod serve;
 pub mod store;
 
 pub use apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender};
 pub use apns_http::HttpApnsSender;
-pub use serve::{PushConfig, build_router};
 pub use error::PushError;
 pub use http::{PushState, router};
 pub use jwt::ApnsProviderToken;
 pub use notify::{NotifyOutcome, NotifyRequest, NotifyService, RegisterOutcome, RegisterRequest};
+pub use ratelimit::NotifyRateLimiter;
+pub use serve::{PushConfig, build_router};
 pub use store::{
     Admission, DeviceRegistration, DeviceTokenStore, InMemoryAdmission, InMemoryDeviceTokenStore,
 };

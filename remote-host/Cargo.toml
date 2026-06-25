@@ -9,7 +9,7 @@
 # See docs/mobile-remote-host.md and docs/todo/mobile/phase1.md.
 [workspace]
 resolver = "2"
-members = ["crates/push", "crates/relay", "crates/dashboard", "crates/server", "crates/admission", "crates/protocol"]
+members = ["crates/push", "crates/relay", "crates/dashboard", "crates/server", "crates/admission", "crates/protocol", "crates/ratelimit"]
 
 [workspace.package]
 version = "0.1.0"
@@ -36,6 +36,9 @@ remote-host-admission = { path = "crates/admission" }
 # The shared wire contract (routes + serde types) the gateway + app also depend
 # on. Pure serde, no transport/baybo deps.
 remote-host-protocol = { path = "crates/protocol" }
+# The token-bucket primitive shared by the push frequency control + relay
+# bandwidth throttle. Pure std, no deps.
+remote-host-ratelimit = { path = "crates/ratelimit" }
 # Admission allow-list is a libsql/SQLite table, hot-reloaded by polling (it may
 # be updated out of band). `core` = embedded SQLite, no remote/replication.
 libsql = { version = "0.9", default-features = false, features = ["core"] }

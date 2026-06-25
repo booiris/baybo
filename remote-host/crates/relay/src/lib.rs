@@ -12,13 +12,15 @@
 //! pairing rendezvous with admission so only an admitted gateway can occupy a
 //! code.
 
+pub mod bandwidth;
 pub mod broker;
-pub mod control;
 pub mod conns;
+pub mod control;
 pub mod error;
 pub mod serve;
 pub mod ws;
 
+pub use bandwidth::{BandwidthLimiter, BandwidthRegistry};
 pub use broker::{RelayBroker, RelayLeg};
 pub use conns::ConnectionRegistry;
 pub use control::{ControlRegistry, ControlSignal};

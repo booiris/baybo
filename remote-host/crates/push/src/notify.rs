@@ -15,6 +15,7 @@ use serde_json::json;
 use crate::apns::{ApnsOutcome, ApnsRequest, ApnsSender};
 use crate::error::PushError;
 use crate::jwt::ApnsProviderToken;
+use crate::ratelimit::NotifyRateLimiter;
 use crate::store::{Admission, DeviceRegistration, DeviceTokenStore};
 
 /// The `/notify` + `/register` request bodies live in the shared protocol crate,
@@ -36,6 +37,9 @@ pub enum NotifyOutcome {
     Delivered,
     /// `instance_key` is not admitted.
     Unadmitted,
+    /// `(instance_key, device_id)` is pushing faster than its allowed rate; the
+    /// gateway should back off and retry (`429`).
+    RateLimited,
     /// No APNs binding for `device_id`.
     UnknownDevice,
     /// APNs rejected the token (`400`/`410`) → the binding was pruned.
@@ -51,6 +55,9 @@ pub struct NotifyService {
     store: Arc<dyn DeviceTokenStore>,
     sender: Arc<dyn ApnsSender>,
     signer: Arc<ApnsProviderToken>,
+    /// Per-`(instance_key, device_id)` frequency control, checked before any APNs
+    /// work so a flood is cheap to refuse.
+    rate: NotifyRateLimiter,
     /// The last signed provider JWT and its `iat`, reused across requests until
     /// it ages past the refresh window (APNs accepts a token for up to an hour).
     cached_jwt: Mutex<Option<(String, u64)>>,
@@ -71,6 +78,7 @@ impl NotifyService {
             store,
             sender,
             signer,
+            rate: NotifyRateLimiter::new(),
             cached_jwt: Mutex::new(None),
             topic: topic.into(),
         }
@@ -113,9 +121,18 @@ impl NotifyService {
         if !self.admission.is_admitted(&req.instance_key) {
             return NotifyOutcome::Unadmitted;
         }
+        // Resolve the device BEFORE the rate check: an unknown `device_id` is
+        // refused here without minting a bucket, so the bucket map is bounded by
+        // the registered-device set (the store) rather than by attacker-supplied
+        // `device_id`s — a `/notify` flood of fresh ids can't grow it. There's no
+        // egress to bound for an unknown device anyway.
         let Some(reg) = self.store.get(&req.instance_key, &req.device_id) else {
             return NotifyOutcome::UnknownDevice;
         };
+        // Frequency control gates before signing / egress.
+        if !self.rate.check(&req.instance_key, &req.device_id) {
+            return NotifyOutcome::RateLimited;
+        }
         let jwt = match self.provider_jwt(now) {
             Ok(j) => j,
             Err(e) => return NotifyOutcome::Failed(e.to_string()),
@@ -224,7 +241,10 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     #[test]
     fn register_binds_token_when_admitted_else_rejects() {
         let store = Arc::new(InMemoryDeviceTokenStore::new());
-        let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), Arc::clone(&store));
+        let svc = service(
+            Arc::new(MockApns::new(ApnsOutcome::Delivered)),
+            Arc::clone(&store),
+        );
 
         assert_eq!(
             svc.register(RegisterRequest {
@@ -263,6 +283,31 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         assert_eq!(
             svc.notify(req("bad-instance", "dev-1"), 1000).await,
             NotifyOutcome::Unadmitted,
+        );
+    }
+
+    #[tokio::test]
+    async fn over_rate_returns_rate_limited_before_touching_apns() {
+        let store = Arc::new(InMemoryDeviceTokenStore::new());
+        store.register(
+            "inst-A",
+            "dev-1",
+            DeviceRegistration {
+                apns_token: "tok".into(),
+                env: ApnsEnv::Sandbox,
+            },
+        );
+        let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), store);
+        // The whole burst delivers; the next push over it is rate-limited.
+        for _ in 0..crate::ratelimit::NOTIFY_BURST as usize {
+            assert_eq!(
+                svc.notify(req("inst-A", "dev-1"), 1000).await,
+                NotifyOutcome::Delivered,
+            );
+        }
+        assert_eq!(
+            svc.notify(req("inst-A", "dev-1"), 1000).await,
+            NotifyOutcome::RateLimited,
         );
     }
 
@@ -321,7 +366,10 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
                 env: ApnsEnv::Production,
             },
         );
-        let svc = service(Arc::new(MockApns::new(ApnsOutcome::BadDeviceToken)), Arc::clone(&store));
+        let svc = service(
+            Arc::new(MockApns::new(ApnsOutcome::BadDeviceToken)),
+            Arc::clone(&store),
+        );
         assert_eq!(
             svc.notify(req("inst-A", "dev-1"), 1000).await,
             NotifyOutcome::Pruned,
@@ -372,7 +420,10 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             svc.notify(req("inst-A", "dev-1"), 1000).await,
             NotifyOutcome::Failed("503".into()),
         );
-        assert!(store.get("inst-A", "dev-1").is_some(), "transient error must not prune");
+        assert!(
+            store.get("inst-A", "dev-1").is_some(),
+            "transient error must not prune"
+        );
     }
 
     #[tokio::test]
@@ -396,8 +447,11 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let jwt2 = sender.last.lock().clone().unwrap().provider_jwt;
         assert_eq!(jwt1, jwt2, "token reused within the refresh window");
         // Past the window it is re-signed (new `iat`).
-        svc.notify(req("inst-A", "dev-1"), 1000 + crate::jwt::TOKEN_REFRESH_SECS + 1)
-            .await;
+        svc.notify(
+            req("inst-A", "dev-1"),
+            1000 + crate::jwt::TOKEN_REFRESH_SECS + 1,
+        )
+        .await;
         let jwt3 = sender.last.lock().clone().unwrap().provider_jwt;
         assert_ne!(jwt1, jwt3, "token re-signed past the refresh window");
     }

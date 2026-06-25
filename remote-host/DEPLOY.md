@@ -89,7 +89,7 @@ sqlite3 ./data/admission.db \
 # revoke:
 sqlite3 ./data/admission.db "DELETE FROM admitted_instances WHERE instance_key='<key>';"
 # list:
-sqlite3 ./data/admission.db "SELECT instance_key, label, max_conns FROM admitted_instances;"
+sqlite3 ./data/admission.db "SELECT instance_key, label, max_conns, max_bps FROM admitted_instances;"
 ```
 
 The `admitted_instances` table is created on first start; an empty table admits no one (fail-closed). The same list gates both roles.
@@ -102,6 +102,15 @@ The `admitted_instances` table is created on first start; an empty table admits 
 sqlite3 ./data/admission.db \
   "UPDATE admitted_instances SET max_conns = 200 WHERE instance_key='<key>';"
 ```
+
+**Per-gateway relay bandwidth.** Content sessions (the bandwidth-heavy traffic) are throttled per gateway: the relay only authenticates the gateway (the phone-side leg is anonymous), so the cap is keyed by `instance_key` and aggregates **both directions across all of that gateway's content legs**. The default rate is a fixed **1 MiB/s**, overridable per gateway by the row's `max_bps` column in bytes/sec (NULL → the default), hot-reloaded with the table. Enforcement is *throttle, not drop* — a gateway over its rate is paced via TCP backpressure, nothing is lost. (Pairing legs are tiny SPAKE2 blobs and are not throttled.) Raise it for a gateway serving many concurrent sessions or large attachments:
+
+```bash
+sqlite3 ./data/admission.db \
+  "UPDATE admitted_instances SET max_bps = 4194304 WHERE instance_key='<key>';"
+```
+
+**Push frequency control.** `POST /notify` is rate-limited per `(instance_key, device_id)` so a buggy or abusive gateway can't hammer APNs or spam a phone. Over the limit it returns `429` (the gateway backs off and retries). The limit is a fixed **60 pushes/min sustained, burst 20** per device; only admitted, registered devices are metered. Hardcoded, not configurable.
 
 ## Gateway wiring (`baybo.json`)
 
