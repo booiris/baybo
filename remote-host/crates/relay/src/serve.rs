@@ -92,9 +92,10 @@ async fn host_handler(
     if !state.admitted.is_admitted(key) {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
-    let leg = state.broker.join(&code);
-    let broker = Arc::clone(&state.broker);
-    let (guard, kick) = state.conns.register(key);
+    // Cap how many connections one instance key may hold (control + legs).
+    let Some((guard, kick)) = state.conns.register(key) else {
+        return (StatusCode::TOO_MANY_REQUESTS, "instance connection limit reached").into_response();
+    };
     // Close the TOCTOU window: if the key was revoked between the admission check
     // above and registering, a concurrent kick may have already passed us by, and
     // future polls won't re-target an already-removed key — so re-check and abort
@@ -102,6 +103,8 @@ async fn host_handler(
     if !state.admitted.is_admitted(key) {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
+    let leg = state.broker.join(&code);
+    let broker = Arc::clone(&state.broker);
     ws.on_upgrade(move |socket| async move {
         let _guard = guard;
         tokio::select! {
@@ -152,7 +155,9 @@ async fn run_control(mut socket: WebSocket, state: RelayState) {
         return;
     }
     tracing::info!(node = %hello.relay_node_id, "control: gateway connected");
-    let (_kick_guard, mut kick) = state.conns.register(&hello.instance_key);
+    // The control connection is exempt from the per-key cap (essential, ~one per
+    // gateway) so a gateway at its leg limit can still (re)establish control.
+    let (_kick_guard, mut kick) = state.conns.register_unchecked(&hello.instance_key);
     // Close the TOCTOU window (see the host handlers): a concurrent revoke's kick
     // may have run between the admission check and registering.
     if !state.admitted.is_admitted(&hello.instance_key) {
@@ -242,9 +247,10 @@ async fn content_host_handler(
     if !state.admitted.is_admitted(key) {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
-    let leg = state.broker.join(&relay_key);
-    let broker = Arc::clone(&state.broker);
-    let (guard, kick) = state.conns.register(key);
+    // Cap how many connections one instance key may hold (control + legs).
+    let Some((guard, kick)) = state.conns.register(key) else {
+        return (StatusCode::TOO_MANY_REQUESTS, "instance connection limit reached").into_response();
+    };
     // Close the TOCTOU window: if the key was revoked between the admission check
     // above and registering, a concurrent kick may have already passed us by, and
     // future polls won't re-target an already-removed key — so re-check and abort
@@ -252,6 +258,8 @@ async fn content_host_handler(
     if !state.admitted.is_admitted(key) {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
+    let leg = state.broker.join(&relay_key);
+    let broker = Arc::clone(&state.broker);
     ws.on_upgrade(move |socket| async move {
         let _guard = guard;
         tokio::select! {

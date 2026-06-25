@@ -16,24 +16,74 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
+/// Default cap on simultaneous relay connections one admitted instance key may
+/// hold (control + pairing/content host legs). Bounds a buggy or abusive gateway
+/// from exhausting C, while staying generous for a real gateway (one control
+/// connection plus a leg per active pairing/content session). Override per
+/// deployment with `MAX_CONNS_PER_INSTANCE`.
+pub const DEFAULT_MAX_CONNS_PER_KEY: usize = 64;
+
 /// Registry of live connections' kick channels, keyed by instance key. Cheap
 /// per-connection registration; the only bulk op is [`kick`](Self::kick) on a
-/// poll that removed keys.
-#[derive(Default)]
+/// poll that removed keys. Also caps how many connections one key may hold.
 pub struct ConnectionRegistry {
     conns: Mutex<HashMap<String, HashMap<u64, oneshot::Sender<()>>>>,
     next_id: AtomicU64,
+    /// Per-key cap enforced by [`register`](Self::register). The control channel
+    /// ([`register_unchecked`](Self::register_unchecked)) is exempt so a gateway
+    /// at its leg limit can always (re)establish control.
+    max_per_key: usize,
+}
+
+impl Default for ConnectionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConnectionRegistry {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            conns: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            max_per_key: DEFAULT_MAX_CONNS_PER_KEY,
+        }
     }
 
-    /// Register a live connection for `instance_key`. Await the returned receiver
-    /// in the connection's loop — it resolves when the key is revoked. Hold the
-    /// [`ConnGuard`] for the connection's lifetime; dropping it deregisters.
+    /// Override the per-key connection cap (operator-tunable). Clamped to ≥ 1.
+    pub fn with_max_per_key(mut self, max: usize) -> Self {
+        self.max_per_key = max.max(1);
+        self
+    }
+
+    /// Register a live connection for `instance_key`, enforcing the per-key cap.
+    /// Returns `None` if the key already holds `max_per_key` connections — the
+    /// caller must refuse the new one. Await the returned receiver in the
+    /// connection's loop (it resolves on revoke); hold the [`ConnGuard`] for the
+    /// connection's lifetime (dropping it deregisters).
     pub(crate) fn register(
+        self: &Arc<Self>,
+        instance_key: &str,
+    ) -> Option<(ConnGuard, oneshot::Receiver<()>)> {
+        let mut conns = self.conns.lock();
+        let entry = conns.entry(instance_key.to_string()).or_default();
+        if entry.len() >= self.max_per_key {
+            // `or_default` only inserts an empty map for a brand-new key, which is
+            // never at the cap; an at-cap key already existed, so nothing leaks.
+            drop(conns);
+            tracing::warn!(max = self.max_per_key, "relay: instance key at its connection cap; refusing");
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        entry.insert(id, tx);
+        Some((self.guard(instance_key, id), rx))
+    }
+
+    /// Register the gateway's control connection — exempt from the cap so a
+    /// gateway already at its leg limit can still (re)establish control. Counted
+    /// and kickable like any other connection.
+    pub(crate) fn register_unchecked(
         self: &Arc<Self>,
         instance_key: &str,
     ) -> (ConnGuard, oneshot::Receiver<()>) {
@@ -44,12 +94,15 @@ impl ConnectionRegistry {
             .entry(instance_key.to_string())
             .or_default()
             .insert(id, tx);
-        let guard = ConnGuard {
+        (self.guard(instance_key, id), rx)
+    }
+
+    fn guard(self: &Arc<Self>, instance_key: &str, id: u64) -> ConnGuard {
+        ConnGuard {
             registry: Arc::clone(self),
             key: instance_key.to_string(),
             id,
-        };
-        (guard, rx)
+        }
     }
 
     /// Drop every live connection whose instance key is in `revoked` (called on
@@ -111,8 +164,8 @@ mod tests {
     #[tokio::test]
     async fn kick_fires_the_receiver_and_counts_only_revoked() {
         let reg = Arc::new(ConnectionRegistry::new());
-        let (_g_a, rx_a) = reg.register("inst-A");
-        let (_g_b, mut rx_b) = reg.register("inst-B");
+        let (_g_a, rx_a) = reg.register("inst-A").unwrap();
+        let (_g_b, mut rx_b) = reg.register("inst-B").unwrap();
 
         let kicked = reg.kick(&HashSet::from(["inst-A".to_string()]));
         assert_eq!(kicked, 1, "only inst-A is revoked");
@@ -124,9 +177,34 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_guard_deregisters() {
         let reg = Arc::new(ConnectionRegistry::new());
-        let (guard, _rx) = reg.register("inst-A");
+        let (guard, _rx) = reg.register("inst-A").unwrap();
         drop(guard);
         // Nothing left to kick: the connection deregistered itself.
         assert_eq!(reg.kick(&HashSet::from(["inst-A".to_string()])), 0);
+    }
+
+    #[test]
+    fn register_enforces_the_per_key_cap_and_frees_on_drop() {
+        let reg = Arc::new(ConnectionRegistry::new().with_max_per_key(2));
+        let a = reg.register("k").expect("1st is under the cap");
+        let _b = reg.register("k").expect("2nd is under the cap");
+        assert!(reg.register("k").is_none(), "3rd exceeds the cap and is refused");
+        assert!(reg.register("other").is_some(), "the cap is per-key");
+        drop(a);
+        assert!(reg.register("k").is_some(), "a freed slot is reusable");
+    }
+
+    #[tokio::test]
+    async fn control_connection_is_exempt_from_the_cap() {
+        let reg = Arc::new(ConnectionRegistry::new().with_max_per_key(1));
+        let _leg = reg.register("k").expect("under the cap");
+        assert!(reg.register("k").is_none(), "a second leg exceeds the cap");
+        // The control channel registers even at the cap, and is still kickable.
+        let _ctrl = reg.register_unchecked("k");
+        assert_eq!(
+            reg.kick(&HashSet::from(["k".to_string()])),
+            2,
+            "both the leg and the control connection drop on revoke"
+        );
     }
 }

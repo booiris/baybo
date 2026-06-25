@@ -33,6 +33,9 @@ services:
       BIND_ADDR: 0.0.0.0:${PORT:-7777}
       # gateway admission allow-list — a SQLite table on the /data volume
       ADMISSION_DB_PATH: /data/admission.db
+      ADMISSION_POLL_SECS: ${ADMISSION_POLL_SECS:-30}
+      # cap on simultaneous relay connections one admitted gateway may hold
+      MAX_CONNS_PER_INSTANCE: ${MAX_CONNS_PER_INSTANCE:-64}
       # push — enabled automatically when APNS_P8_HOST_PATH is set in .env
       APNS_P8_PATH: ${APNS_P8_HOST_PATH:+/run/secrets/apns_p8}
       APNS_KEY_ID: ${APNS_KEY_ID:-}

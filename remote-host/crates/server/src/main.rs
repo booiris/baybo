@@ -50,8 +50,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(DEFAULT_POLL_SECS),
     );
     // Track live relay connections so an admission reload that drops a key can
-    // kick that gateway's connections, not just refuse new ones.
-    let conns = Arc::new(remote_host_relay::ConnectionRegistry::new());
+    // kick that gateway's connections, not just refuse new ones — and cap how many
+    // connections one instance key may hold (override with MAX_CONNS_PER_INSTANCE).
+    let registry = remote_host_relay::ConnectionRegistry::new();
+    let registry = match std::env::var("MAX_CONNS_PER_INSTANCE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        Some(max) => registry.with_max_per_key(max),
+        None => registry,
+    };
+    let conns = Arc::new(registry);
     let admission = {
         let conns = conns.clone();
         admission_db::open(&db_path, poll, move |revoked| {

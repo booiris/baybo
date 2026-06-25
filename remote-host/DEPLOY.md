@@ -96,6 +96,8 @@ The `admitted_instances` table is created on first start; an empty table admits 
 
 **Revoking is enforced on live connections, not just new ones.** On each poll, any key that was dropped from the table has its live relay connections (the gateway's control channel + any in-flight pairing/content legs) closed within the poll interval — so a revoked gateway is disconnected, not left running until it happens to drop. (The push role is per-request, so a revoked key simply gets `401` on its next `/notify`.)
 
+**Per-gateway connection cap.** A single admitted `instance_key` may hold at most `MAX_CONNS_PER_INSTANCE` simultaneous relay connections (default **64**) — bounding a buggy or abusive gateway from exhausting C. Pairing/content host legs over the cap are refused with `429`; the gateway's one control channel is exempt, so a gateway at its limit can always reconnect control. Raise it for a gateway serving many concurrent device sessions.
+
 ## Gateway wiring (`baybo.json`)
 
 The gateway holds **no** `.p8` — it only knows the C base URL + its admission key:
