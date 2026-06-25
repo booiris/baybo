@@ -17,12 +17,12 @@ cert. (`remote-host-dashboard` is a library, not a service.)
 ```bash
 cd remote-host
 cp .env.example .env
-$EDITOR .env                      # fill APNS_* + *_INSTANCE_KEYS, point APNS_P8_HOST_PATH at your .p8
+$EDITOR .env                      # (optional) fill the APNs section to enable push
 docker compose up -d --build
 docker compose logs -f            # "remote-host: listening on 0.0.0.0:7777 (http/ws) — roles: push + relay"
 ```
 
-`docker compose` fails fast with a clear message if any required `.env` var is unset.
+`.env` is all optional — a bare config runs **relay only** (push needs the APNs section). Then **admit your gateways in the DB** (below) so they can connect.
 
 Cross-arch (e.g. building on an Apple-Silicon Mac for an x86_64 host):
 ```bash
@@ -78,21 +78,37 @@ With a terminator on the same host you can bind the service's `ports:` to
 `127.0.0.1` only (or drop the host-publish — Caddy reaches it over the compose
 network).
 
+## Admission (which gateways may connect)
+
+The allow-list of gateway `instance_key`s is a **SQLite table**, not env. The runtime polls it (every `ADMISSION_POLL_SECS`, default 30s), so you add/remove gateways **without a restart**. The DB is bind-mounted (`./data/admission.db` by default), so you edit it from the host:
+
+```bash
+# admit a gateway (the instance_key from its baybo.json):
+sqlite3 ./data/admission.db \
+  "INSERT INTO admitted_instances(instance_key, label) VALUES('<key>', 'my gateway');"
+# revoke:
+sqlite3 ./data/admission.db "DELETE FROM admitted_instances WHERE instance_key='<key>';"
+# list:
+sqlite3 ./data/admission.db "SELECT instance_key, label FROM admitted_instances;"
+```
+
+The `admitted_instances` table is created on first start; an empty table admits no one (fail-closed). The same list gates both roles.
+
 ## Gateway wiring (`baybo.json`)
 
 The gateway holds **no** `.p8` — it only knows the C base URL + its admission key:
 
 ```jsonc
-"push":  { "enabled": true, "gateway_url": "https://c.example.com", "instance_key": "<PUSH_INSTANCE_KEYS value>" },
-"relay": { "enabled": true, "url": "wss://c.example.com",            "instance_key": "<RELAY_INSTANCE_KEYS value>" }
+"push":  { "enabled": true, "gateway_url": "https://c.example.com", "instance_key": "<admitted key>" },
+"relay": { "enabled": true, "url": "wss://c.example.com",            "instance_key": "<admitted key>" }
 ```
 
-Both URLs resolve to the one `remote-host` listener (the disjoint paths route to the right role). `push.instance_key` / `relay.instance_key` must appear in the corresponding `*_INSTANCE_KEYS` allow-list in `.env`.
+Both URLs resolve to the one `remote-host` listener (the disjoint paths route to the right role). The `instance_key` must be admitted in the `admitted_instances` table (see **Admission** above) — one key serves both roles.
 
 ## Notes
 
 - **Relay-only / `.p8` isolation.** Leave the APNs section of `.env` blank and only the relay runs — no `.p8` on that host. Fill it in to add push. The `.p8` lives solely where you configure it.
-- **State is in-memory.** A restart drops device-token registrations and admission state; devices re-register on their next pairing/heartbeat, and the gateway re-registers an approved device before its first push. No volumes needed (the only mounts are the read-only `.p8` and, when TLS is configured, the cert/key).
+- **State.** The admission allow-list is the SQLite table, persisted on the `./data` volume (survives restart). Device-token registrations are in-memory — dropped on restart, but devices re-register on their next pairing/heartbeat and the gateway re-registers an approved device before its first push.
 - **APNs environment.** Push targets sandbox vs production **per device registration** (the token's env), so one deployment serves both — no env switch here. A debug-built app registers a sandbox token.
 - **Logs** go to stderr (the relay has no `tracing` subscriber wired, so only the `eprintln!` startup/error lines are guaranteed).
 - **Secrets.** `.env` and `*.p8` are gitignored. The `.p8` is mounted read-only as a Docker secret at `/run/secrets/apns_p8`; it never enters an image layer.

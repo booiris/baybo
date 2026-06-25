@@ -16,3 +16,6 @@ rustls = { workspace = true }
 thiserror = { workspace = true }
 remote-host-push = { workspace = true }
 remote-host-relay = { workspace = true }
+remote-host-admission = { workspace = true }
+# The admission allow-list table (hot-reloaded by the admission_db poller).
+libsql = { workspace = true }

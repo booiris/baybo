@@ -17,7 +17,6 @@
 //!
 //! [`try_match`]: RelayBroker::try_match
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -28,10 +27,10 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use remote_host_admission::Admission;
 
 use crate::broker::RelayBroker;
 use crate::control::{ControlHello, ControlRegistry};
-use crate::error::RelayError;
 use crate::ws::pump_ws;
 
 /// Header the gateway presents to host a rendezvous (its admission key). The app
@@ -43,36 +42,10 @@ pub const INSTANCE_KEY_HEADER: &str = "x-instance-key";
 /// connection trips it — releasing the stale registry slot promptly.
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Router config for the relay role.
-#[derive(Debug, Clone)]
-pub struct RelayConfig {
-    /// Admitted gateway instance keys (the host-leg allow-list).
-    pub instance_keys: Vec<String>,
-}
-
-impl RelayConfig {
-    /// Load from the environment. Required: `RELAY_INSTANCE_KEYS`
-    /// (comma-separated).
-    pub fn from_env() -> Result<Self, RelayError> {
-        let instance_keys: Vec<String> = std::env::var("RELAY_INSTANCE_KEYS")
-            .map_err(|_| RelayError::Config("missing env RELAY_INSTANCE_KEYS".into()))?
-            .split(',')
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if instance_keys.is_empty() {
-            return Err(RelayError::Config(
-                "RELAY_INSTANCE_KEYS must list at least one admitted gateway key".into(),
-            ));
-        }
-        Ok(Self { instance_keys })
-    }
-}
-
 #[derive(Clone)]
 struct RelayState {
     broker: Arc<RelayBroker>,
-    admitted: Arc<HashSet<String>>,
+    admitted: Arc<dyn Admission>,
     /// Live gateway control connections, keyed by `relay_node_id`.
     control: Arc<ControlRegistry>,
     /// Monotonic source of per-data-leg `relay_key`s. Uniqueness (not secrecy)
@@ -81,11 +54,12 @@ struct RelayState {
     seq: Arc<AtomicU64>,
 }
 
-/// Assemble the relay router from config.
-pub fn build_router(config: &RelayConfig) -> Router {
+/// Assemble the relay router. `admission` is the shared, hot-reloaded allow-list
+/// of admitted gateway instance keys.
+pub fn build_router(admission: Arc<dyn Admission>) -> Router {
     let state = RelayState {
         broker: Arc::new(RelayBroker::new()),
-        admitted: Arc::new(config.instance_keys.iter().cloned().collect()),
+        admitted: admission,
         control: Arc::new(ControlRegistry::new()),
         seq: Arc::new(AtomicU64::new(0)),
     };
@@ -110,7 +84,7 @@ async fn host_handler(
     let admitted = headers
         .get(INSTANCE_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|k| state.admitted.contains(k));
+        .is_some_and(|k| state.admitted.is_admitted(k));
     if !admitted {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
@@ -156,7 +130,7 @@ async fn run_control(mut socket: WebSocket, state: RelayState) {
         },
         _ => return,
     };
-    if !state.admitted.contains(&hello.instance_key) {
+    if !state.admitted.is_admitted(&hello.instance_key) {
         tracing::warn!("control: instance key not admitted; closing");
         return;
     }
@@ -237,7 +211,7 @@ async fn content_host_handler(
     let admitted = headers
         .get(INSTANCE_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|k| state.admitted.contains(k));
+        .is_some_and(|k| state.admitted.is_admitted(k));
     if !admitted {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
@@ -260,14 +234,12 @@ mod tests {
     use tokio_tungstenite::{WebSocketStream, client_async};
 
     async fn serve() -> u16 {
-        let config = RelayConfig {
-            instance_keys: vec!["inst-A".into()],
-        };
+        let admission = Arc::new(remote_host_admission::InMemoryAdmission::with_keys(["inst-A"]));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = build_router(&config);
+        let app = build_router(admission);
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });

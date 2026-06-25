@@ -18,6 +18,8 @@ parking_lot = { workspace = true }
 axum = { workspace = true }
 # Real APNs egress: reqwest negotiates HTTP/2 over TLS (ALPN), as APNs requires.
 reqwest = { workspace = true }
+# The shared admission trait (the live allow-list is wired by the server binary).
+remote-host-admission = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

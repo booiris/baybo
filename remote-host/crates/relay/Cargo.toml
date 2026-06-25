@@ -19,6 +19,8 @@ futures = { workspace = true }
 # JSON over the control WS (the gateway's `relay/mod.rs` agrees on this shape).
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The shared admission trait (relay checks the live allow-list).
+remote-host-admission = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

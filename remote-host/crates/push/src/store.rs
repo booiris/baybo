@@ -7,7 +7,7 @@
 //! for a durable backend without touching the `/notify` logic.
 
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::apns::ApnsEnv;
 
@@ -78,47 +78,9 @@ impl DeviceTokenStore for InMemoryDeviceTokenStore {
     }
 }
 
-/// "Auth" on the push role = per-instance admission only (machine-to-machine,
-/// the Bitwarden installation-id model). Never device auth, never plaintext.
-pub trait Admission: Send + Sync {
-    fn is_admitted(&self, instance_key: &str) -> bool;
-}
-
-/// In-memory admission allow-list of valid per-instance keys.
-#[derive(Default)]
-pub struct InMemoryAdmission {
-    keys: Mutex<HashSet<String>>,
-}
-
-impl InMemoryAdmission {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_keys<I, S>(keys: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            keys: Mutex::new(keys.into_iter().map(Into::into).collect()),
-        }
-    }
-
-    pub fn admit(&self, instance_key: impl Into<String>) {
-        self.keys.lock().insert(instance_key.into());
-    }
-
-    pub fn revoke(&self, instance_key: &str) {
-        self.keys.lock().remove(instance_key);
-    }
-}
-
-impl Admission for InMemoryAdmission {
-    fn is_admitted(&self, instance_key: &str) -> bool {
-        self.keys.lock().contains(instance_key)
-    }
-}
+/// Per-instance admission (the gateway allow-list) lives in the shared crate, so
+/// the relay and push roles check the same live, hot-reloaded list.
+pub use remote_host_admission::{Admission, InMemoryAdmission};
 
 #[cfg(test)]
 mod tests {
@@ -142,16 +104,5 @@ mod tests {
         assert!(s.get("inst-2", "dev-1").is_none());
         s.unbind("inst-1", "dev-1");
         assert!(s.get("inst-1", "dev-1").is_none());
-    }
-
-    #[test]
-    fn admission_allow_list() {
-        let a = InMemoryAdmission::with_keys(["inst-A"]);
-        assert!(a.is_admitted("inst-A"));
-        assert!(!a.is_admitted("inst-B"));
-        a.admit("inst-B");
-        assert!(a.is_admitted("inst-B"));
-        a.revoke("inst-A");
-        assert!(!a.is_admitted("inst-A"));
     }
 }

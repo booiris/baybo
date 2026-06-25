@@ -2,15 +2,18 @@
 //! roles on a single listener, distinguished by their disjoint route paths
 //! (`/notify` + `/register` vs `/pair`, `/content`, `/control`). The **relay is
 //! always on**; **push turns on automatically when an APNs `.p8` is configured**
-//! (`APNS_P8_PATH` is set). Bind + TLS are configured here (`BIND_ADDR`, and
-//! optional `TLS_CERT` + `TLS_KEY` to serve wss/https directly).
+//! (`APNS_P8_PATH` is set). The gateway admission allow-list is a SQLite (libsql)
+//! table polled for external edits (`admission_db`). Bind + TLS are configured
+//! here (`BIND_ADDR`, and optional `TLS_CERT` + `TLS_KEY` to serve wss/https).
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use axum::Router;
 use remote_host_push::serve::{PushConfig, build_router as push_router};
-use remote_host_relay::serve::{RelayConfig, build_router as relay_router};
+use remote_host_relay::serve::build_router as relay_router;
 
+mod admission_db;
 mod serve;
 
 use serve::TlsPaths;
@@ -18,6 +21,11 @@ use serve::TlsPaths;
 /// Listener address when `BIND_ADDR` is unset. Map it to the host `:443` (e.g.
 /// in docker) for a port-less wss/https URL.
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:7777";
+/// Admission-table location when `ADMISSION_DB_PATH` is unset (a mounted volume
+/// in docker so an external admin can edit it).
+const DEFAULT_DB_PATH: &str = "/data/admission.db";
+/// How often to re-read the admission table when `ADMISSION_POLL_SECS` is unset.
+const DEFAULT_POLL_SECS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -31,6 +39,17 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // The gateway admission allow-list: a SQLite table, hot-reloaded by polling
+    // for external edits. Shared by both roles.
+    let db_path = std::env::var("ADMISSION_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.into());
+    let poll = Duration::from_secs(
+        std::env::var("ADMISSION_POLL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_POLL_SECS),
+    );
+    let admission = admission_db::open(&db_path, poll).await?;
+
     let mut app = Router::new();
     let mut roles: Vec<&str> = Vec::new();
 
@@ -42,13 +61,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let (config, p8_path) = PushConfig::from_env()?;
         let p8_pem = std::fs::read(&p8_path)
             .map_err(|e| format!("read .p8 at {}: {e}", p8_path.display()))?;
-        app = app.merge(push_router(&config, &p8_pem)?);
+        app = app.merge(push_router(&config, &p8_pem, admission.clone())?);
         roles.push("push");
     }
 
-    // Relay is always on (it needs RELAY_INSTANCE_KEYS, validated in from_env).
-    let relay = RelayConfig::from_env()?;
-    app = app.merge(relay_router(&relay));
+    // Relay is always on.
+    app = app.merge(relay_router(admission.clone()));
     roles.push("relay");
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into());

@@ -3,9 +3,12 @@
 # (APNS_P8_HOST_PATH in .env). Their route paths are disjoint (/notify +
 # /register vs /pair, /content, /control).
 #
+# Admitted gateways live in a SQLite table (./data/admission.db by default),
+# hot-reloaded by polling — add/remove keys out of band (see DEPLOY.md), no
+# restart needed.
+#
 # Serves plain ws/http by default. Set TLS_CERT_HOST_PATH + TLS_KEY_HOST_PATH in
-# .env and it serves wss/https instead (one cert covers both roles); set PORT=443
-# for port-less URLs.
+# .env and it serves wss/https instead; set PORT=443 for port-less URLs.
 #
 # One-click:
 #   cp .env.example .env && $EDITOR .env
@@ -28,20 +31,22 @@ services:
       # The listen port, host + container the same (default 7777). The container
       # runs as root, so a privileged PORT like 443 binds fine.
       BIND_ADDR: 0.0.0.0:${PORT:-7777}
-      # relay (always on)
-      RELAY_INSTANCE_KEYS: ${RELAY_INSTANCE_KEYS:?set RELAY_INSTANCE_KEYS in .env}
+      # gateway admission allow-list — a SQLite table on the /data volume
+      ADMISSION_DB_PATH: /data/admission.db
       # push — enabled automatically when APNS_P8_HOST_PATH is set in .env
       APNS_P8_PATH: ${APNS_P8_HOST_PATH:+/run/secrets/apns_p8}
       APNS_KEY_ID: ${APNS_KEY_ID:-}
       APNS_TEAM_ID: ${APNS_TEAM_ID:-}
       APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:-}
-      PUSH_INSTANCE_KEYS: ${PUSH_INSTANCE_KEYS:-}
       # TLS — set only when a cert is configured (-> wss/https), else blank (-> ws/http)
       TLS_CERT: ${TLS_CERT_HOST_PATH:+/run/tls/cert.pem}
       TLS_KEY: ${TLS_KEY_HOST_PATH:+/run/tls/key.pem}
     secrets:
       - apns_p8
     volumes:
+      # The admission DB — bind-mounted so you can edit it from the host
+      # (sqlite3 ./data/admission.db ...).
+      - ${ADMISSION_DIR:-./data}:/data
       - ${TLS_CERT_HOST_PATH:-/dev/null}:/run/tls/cert.pem:ro
       - ${TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/key.pem:ro
     ports:
