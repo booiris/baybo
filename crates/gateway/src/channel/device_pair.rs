@@ -18,6 +18,7 @@
 //! and the per-device push key (HKDF of K) is stored in A's `SecretVault`. C
 //! never sees any of this — it only relays opaque blobs.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -29,8 +30,30 @@ use device_proto::kdf::{derive_confirm_code, derive_pair_keys};
 use device_proto::pairing::{self, DeviceConfirm, DeviceHello, GatewayWelcome, PairFrame};
 use device_proto::pake::Pake;
 
+use baybo_pairing::DevicePairingService;
+use baybo_security::SecretVault;
+
 use super::state::WsChannelState;
 use crate::device::load_or_create_static_keypair;
+
+/// The slice of gateway state the pairing handshake ([`drive`]) needs. Carried
+/// explicitly — rather than the whole [`WsChannelState`] — so the handshake can
+/// run from the daemon's relay-pair manager, the direct `/v1/device/pair` route,
+/// or a self-contained `baybo device pair` that builds this from CLI deps without
+/// a full gateway. Field names mirror [`WsChannelState`] so [`drive`] reads them
+/// unchanged.
+#[derive(Clone)]
+pub struct PairingHostDeps {
+    pub device_pairing: Arc<DevicePairingService>,
+    pub secret_vault: Arc<SecretVault>,
+    /// Base WS URL of the relay (advertised in `GatewayWelcome.relay_url`, and
+    /// gating the `relay_node_id`); empty = no relay fallback advertised.
+    pub relay_url: String,
+    /// Direct-reachability endpoints for `GatewayWelcome.direct_candidates`.
+    pub device_direct_candidates: Vec<String>,
+    /// Best-effort APNs registrar; `None` when push isn't configured.
+    pub apns_registrar: Option<Arc<dyn crate::push::ApnsRegistrar>>,
+}
 
 /// Per-step receive timeout — a stalled peer must not pin a connection.
 const PAIR_STEP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,7 +74,7 @@ async fn handler(State(state): State<WsChannelState>, ws: WebSocketUpgrade) -> i
 }
 
 async fn run_pairing(mut socket: WebSocket, state: WsChannelState) {
-    if let Err(reason) = drive(&mut socket, &state).await {
+    if let Err(reason) = drive(&mut socket, &state.pairing_host_deps()).await {
         tracing::debug!(reason = %reason, "device pairing handshake aborted");
         // Best-effort reject so a well-behaved peer stops waiting; the socket
         // then closes on drop.
@@ -61,7 +84,7 @@ async fn run_pairing(mut socket: WebSocket, state: WsChannelState) {
 
 pub(crate) async fn drive<T: PairTransport + ?Sized>(
     transport: &mut T,
-    state: &WsChannelState,
+    state: &PairingHostDeps,
 ) -> Result<(), String> {
     // 1. Hello — the pairing code + the app's SPAKE2 message.
     let PairFrame::Hello { code, pake } = transport.recv_frame(PAIR_STEP_TIMEOUT).await? else {
@@ -218,7 +241,7 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
 
 /// Poll the shared slot for the operator's confirm decision (their live
 /// `device pair` writes it) until it is set or the confirm window elapses.
-async fn wait_operator_decision(state: &WsChannelState, code: &str) -> Result<bool, String> {
+async fn wait_operator_decision(state: &PairingHostDeps, code: &str) -> Result<bool, String> {
     let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
     loop {
         let slot = state

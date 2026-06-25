@@ -69,10 +69,10 @@ async fn run_once(
     let pump = tokio::spawn({
         let hello = ControlHello {
             relay_node_id: relay_node_id.to_owned(),
-            instance_key: config.instance_key.clone(),
         };
         let control_url = control_url.to_owned();
-        async move { connect_control(&control_url, &hello, tx).await }
+        let instance_key = config.instance_key.clone();
+        async move { connect_control(&control_url, &instance_key, &hello, tx).await }
     });
 
     while let Some(ControlSignal::OpenDataLeg { relay_key }) = rx.recv().await {

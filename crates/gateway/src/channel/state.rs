@@ -125,6 +125,20 @@ pub struct WsChannelState {
 }
 
 impl WsChannelState {
+    /// The subset of state the device-pairing handshake needs (see
+    /// [`super::device_pair::PairingHostDeps`]). Lets the daemon's relay-pair
+    /// manager and the direct route share the handshake with a self-contained
+    /// `baybo device pair` that has no full `WsChannelState`.
+    pub(crate) fn pairing_host_deps(&self) -> super::device_pair::PairingHostDeps {
+        super::device_pair::PairingHostDeps {
+            device_pairing: Arc::clone(&self.device_pairing),
+            secret_vault: Arc::clone(&self.secret_vault),
+            relay_url: self.relay_url.clone(),
+            device_direct_candidates: self.device_direct_candidates.clone(),
+            apns_registrar: self.apns_registrar.clone(),
+        }
+    }
+
     /// Build the WS channel state from the shared [`GatewayDeps`].
     /// Used by both the loopback channel listener and the admin
     /// listener (which co-hosts `/v1/channel-ws` so the browser-side

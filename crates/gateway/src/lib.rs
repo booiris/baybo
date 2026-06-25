@@ -40,6 +40,10 @@ pub use crate::auth::{
     TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY, TokenHandle, constant_time_eq, generate_token,
 };
 pub use crate::channel::{ChannelControlError, ChannelControlRegistry};
+// Self-contained relay pairing for `baybo device pair`: host a `/pair/host`
+// leg + run the SPAKE2 handshake without a running gateway daemon.
+pub use crate::channel::device_pair::PairingHostDeps;
+pub use crate::channel::relay_pair::host_pairing_leg;
 pub use crate::channel_listener::ChannelServer;
 pub use crate::config::RuntimeGatewayConfig;
 pub use crate::error::{GatewayError, Result};

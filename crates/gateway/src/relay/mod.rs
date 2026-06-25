@@ -112,12 +112,21 @@ where
 /// closes or errors so the caller can reconnect.
 pub async fn connect_control(
     url: &str,
+    instance_key: &str,
     hello: &ControlHello,
     signals: mpsc::Sender<ControlSignal>,
 ) -> Result<(), ControlError> {
-    let request = url
+    let mut request = url
         .into_client_request()
         .map_err(|e| ControlError::Codec(format!("bad url: {e}")))?;
+    // Admission rides the dial header now (the relay's shared pre-layer), so the
+    // hello carries only the relay_node_id.
+    let value = instance_key
+        .parse()
+        .map_err(|e| ControlError::Codec(format!("bad instance key header: {e}")))?;
+    request
+        .headers_mut()
+        .insert(remote_host_protocol::relay::INSTANCE_KEY_HEADER, value);
     let (ws, _) = connect_async(request).await?;
     pump_control(ws, hello, signals).await
 }
@@ -244,7 +253,6 @@ mod tests {
         let url = format!("ws://127.0.0.1:{port}/control");
         let hello = ControlHello {
             relay_node_id: "node-1".into(),
-            instance_key: "inst-A".into(),
         };
         let (tx, mut rx) = mpsc::channel(4);
         let client =
@@ -267,7 +275,6 @@ mod tests {
             *mock.received_hello.lock(),
             Some(ControlHello {
                 relay_node_id: "node-1".into(),
-                instance_key: "inst-A".into(),
             }),
         );
 
