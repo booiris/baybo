@@ -131,3 +131,55 @@ html.scanning #root {
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
 }
+
+/* Scan-success beat: a green dot pops in with a checkmark + an expanding ring,
+   on the app background so the hand-off to the form is seamless (no flash). */
+.scan-success {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+}
+@media (prefers-color-scheme: dark) {
+  .scan-success { background: #1a1a1a; }
+}
+.scan-success .dot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: #34c759;
+  animation: scan-pop 0.35s cubic-bezier(0.2, 0.7, 0.2, 1.4) both;
+}
+.scan-success .dot svg {
+  width: 38px;
+  height: 38px;
+}
+.scan-success .dot path {
+  stroke-dasharray: 22;
+  stroke-dashoffset: 22;
+  animation: scan-check 0.3s 0.18s ease-out forwards;
+}
+.scan-success .ring {
+  position: absolute;
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  border: 3px solid #34c759;
+  animation: scan-ring 0.65s ease-out both;
+}
+@keyframes scan-pop {
+  from { transform: scale(0); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+@keyframes scan-check {
+  to { stroke-dashoffset: 0; }
+}
+@keyframes scan-ring {
+  from { transform: scale(1); opacity: 0.6; }
+  to { transform: scale(2.6); opacity: 0; }
+}

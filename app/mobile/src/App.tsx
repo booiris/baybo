@@ -169,10 +169,12 @@ export default function App() {
   const [rememberedUser, setRememberedUser] = useState<string | null>(null);
   // Whether the chat view is open (a live content session).
   const [chatting, setChatting] = useState(false);
-  // While the QR scanner is open the page is made transparent so the native
-  // camera feed (drawn behind the webview by the windowed barcode scanner)
-  // shows through; `scanCancelled` suppresses the error toast on a user cancel.
-  const [scanning, setScanning] = useState(false);
+  // QR scan flow. "scanning" makes the page transparent so the native camera
+  // (drawn behind the webview) shows through; "success" plays a brief
+  // confirmation beat on the app background, covering the camera teardown so the
+  // hand-off to the form doesn't flash. `scanCancelled` suppresses the error
+  // toast on a user cancel.
+  const [scanPhase, setScanPhase] = useState<"idle" | "scanning" | "success">("idle");
   const scanCancelled = useRef(false);
 
   useEffect(() => {
@@ -182,9 +184,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    document.documentElement.classList.toggle("scanning", scanning);
+    document.documentElement.classList.toggle("scanning", scanPhase === "scanning");
     return () => document.documentElement.classList.remove("scanning");
-  }, [scanning]);
+  }, [scanPhase]);
 
   async function scan() {
     scanCancelled.current = false;
@@ -202,17 +204,21 @@ export default function App() {
       // Go transparent only once permission is granted, right before the camera
       // opens behind the webview.
       setStatus(null);
-      setScanning(true);
+      setScanPhase("scanning");
       const res = await bs.scan({ windowed: true, formats: [bs.Format.QRCode] });
       const parsed = parseScan(res.content);
       setCode(parsed.code);
       setRelay(parsed.relay);
       if (parsed.endpoint) setEndpoint(parsed.endpoint);
+      // Confirmation beat: lands on the app background (camera is already gone)
+      // and gives the success animation time to play before the form shows.
+      setScanPhase("success");
+      await new Promise((resolve) => setTimeout(resolve, 650));
       setStatus("Scanned. Review and pair.");
     } catch (e) {
       setStatus(scanCancelled.current ? null : `Scan failed: ${e}`);
     } finally {
-      setScanning(false);
+      setScanPhase("idle");
     }
   }
 
@@ -224,7 +230,7 @@ export default function App() {
     } catch {
       // already stopped
     }
-    setScanning(false);
+    setScanPhase("idle");
   }
 
   // Phase 1: connect + SPAKE2 → get the confirmation code to show the user.
@@ -273,7 +279,7 @@ export default function App() {
     }
   }
 
-  if (scanning) {
+  if (scanPhase === "scanning") {
     return (
       <div className="scan-overlay">
         <svg
@@ -293,6 +299,19 @@ export default function App() {
         <button className="scan-cancel" onClick={cancelScan}>
           Cancel
         </button>
+      </div>
+    );
+  }
+
+  if (scanPhase === "success") {
+    return (
+      <div className="scan-success">
+        <span className="ring" />
+        <span className="dot">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M5 13 l4 4 L19 7" />
+          </svg>
+        </span>
       </div>
     );
   }
