@@ -86,6 +86,10 @@ tokio-tungstenite = { workspace = true, features = [
     "connect",
     "rustls-tls-webpki-roots",
 ] }
+# Pin the process-wide rustls CryptoProvider before the relay wss client dials
+# (see GatewayServer::new) — the graph has both aws-lc-rs + ring, so rustls can't
+# auto-select and connect_async would panic.
+rustls = { workspace = true }
 libc = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

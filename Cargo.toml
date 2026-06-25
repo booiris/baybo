@@ -141,6 +141,12 @@ serenity = { version = "0.12", features = ["client", "gateway", "model"] }
 tower = { version = "0.5", features = ["util"] }
 url = "2"
 reqwest = { version = "0.13", features = ["json", "socks"] }
+# Direct handle on rustls so the gateway can pin the process-wide CryptoProvider
+# before its relay `wss://` client dials. The graph enables BOTH aws-lc-rs and
+# ring (via reqwest/hyper-rustls), so rustls can't auto-select one and
+# connect_async would panic; we install aws-lc-rs explicitly. default-features
+# off — the rest of the graph already unions in std/tls12/ring.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 dom_smoothie = "0.17"
 htmd = "0.5"
 bytes = "1"

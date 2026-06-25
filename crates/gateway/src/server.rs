@@ -255,6 +255,12 @@ impl GatewayServer {
         // once here (the admin server is always created); a no-op when the
         // `relay` block is disabled.
         if let Some(relay) = deps.runtime_config.relay.clone() {
+            // The relay managers below dial `wss://` via tokio-tungstenite, which
+            // builds its ClientConfig from rustls's process-default CryptoProvider.
+            // Our graph enables both aws-lc-rs and ring, so rustls can't auto-select
+            // one and connect_async would panic — install aws-lc-rs explicitly
+            // before the first dial (idempotent; Err = already installed).
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             crate::channel::relay_pair::spawn(
                 WsChannelState::from_deps(&deps),
                 crate::channel::relay_pair::RelayPairConfig {
