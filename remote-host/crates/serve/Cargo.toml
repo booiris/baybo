@@ -1,0 +1,14 @@
+[package]
+name = "remote-host-serve"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+axum = { workspace = true }
+axum-server = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }

@@ -28,9 +28,27 @@ Cross-arch (e.g. building on an Apple-Silicon Mac for an x86_64 host):
 docker buildx build --platform linux/amd64 -t remote-host:latest --load .
 ```
 
-## TLS termination
+## TLS
 
-The relay must be reachable by phones as `wss://`, and the gateway reaches push as `https://`. The push and relay route paths are disjoint, so a single domain can front both. Example **Caddy** (auto-HTTPS via Let's Encrypt) — add as a third service and drop in this `Caddyfile`:
+The relay must be reachable by phones as `wss://`, and the gateway reaches push as `https://`. Two ways to get there:
+
+### Option A — direct TLS in-process (no proxy)
+
+Both binaries terminate TLS themselves with rustls. Provide a PEM cert + key and run with the TLS overlay:
+
+```bash
+# in .env:
+#   TLS_CERT_HOST_PATH=/etc/letsencrypt/live/c.example.com/fullchain.pem
+#   TLS_KEY_HOST_PATH=/etc/letsencrypt/live/c.example.com/privkey.pem
+#   RELAY_PORT=443        # optional — for a port-less wss://host URL
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+```
+
+The relay then serves `wss` (startup log shows `wss/https`) and push serves `https`. One cert for the host covers both. TLS is opt-in per binary via `RELAY_TLS_CERT`/`RELAY_TLS_KEY` and `PUSH_TLS_CERT`/`PUSH_TLS_KEY` (set both of a pair or neither). You renew the cert out of band (e.g. certbot) and restart.
+
+### Option B — front with a TLS terminator
+
+Leave TLS off (plaintext) and put Caddy / nginx / a cloud LB / Cloudflare in front. The push and relay route paths are disjoint, so one domain fronts both. Example **Caddy** (auto-HTTPS) — add as a third service with this `Caddyfile`:
 
 ```caddyfile
 c.example.com {
@@ -55,9 +73,7 @@ volumes:
   caddy_data:
 ```
 
-With a terminator in front you can drop the `ports:` host-publishes on `push`/`relay` (Caddy reaches them over the compose network) — or keep them bound to `127.0.0.1` only.
-
-If you already run a terminator (e.g. `proxy.baybo.space`), forward it to the container ports — the relay routes (`/pair/*`, `/content/*`, `/control`) → `relay:8444`, and `/notify` + `/register` → `push:8443`.
+With a terminator in front you can drop the `ports:` host-publishes on `push`/`relay` (it reaches them over the compose network), or bind them to `127.0.0.1` only. If you already run a terminator (e.g. `proxy.baybo.space`), just forward it to the container ports.
 
 ## Gateway wiring (`baybo.json`)
 

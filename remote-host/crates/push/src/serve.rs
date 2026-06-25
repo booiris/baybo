@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
+use remote_host_serve::TlsPaths;
 
 use crate::apns_http::HttpApnsSender;
 use crate::error::PushError;
@@ -34,12 +35,15 @@ pub struct PushConfig {
     pub topic: String,
     /// The admitted gateway instance keys (the admission allow-list).
     pub instance_keys: Vec<String>,
+    /// When set, terminate TLS in-process (serve `https`); else plaintext.
+    pub tls: Option<TlsPaths>,
 }
 
 impl PushConfig {
     /// Load the config + `.p8` path from the environment. Required:
     /// `APNS_P8_PATH`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID`,
-    /// `PUSH_INSTANCE_KEYS` (comma-separated). Optional: `PUSH_BIND_ADDR`.
+    /// `PUSH_INSTANCE_KEYS` (comma-separated). Optional: `PUSH_BIND_ADDR`, and
+    /// `PUSH_TLS_CERT` + `PUSH_TLS_KEY` (both or neither) to serve `https`.
     pub fn from_env() -> Result<(Self, PathBuf), PushError> {
         fn req(key: &str) -> Result<String, PushError> {
             std::env::var(key).map_err(|_| PushError::Config(format!("missing env {key}")))
@@ -55,12 +59,14 @@ impl PushConfig {
                 "PUSH_INSTANCE_KEYS must list at least one admitted gateway key".into(),
             ));
         }
+        let tls = TlsPaths::from_env("PUSH_TLS_CERT", "PUSH_TLS_KEY").map_err(PushError::Config)?;
         let config = PushConfig {
             bind_addr: std::env::var("PUSH_BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into()),
             key_id: req("APNS_KEY_ID")?,
             team_id: req("APNS_TEAM_ID")?,
             topic: req("APNS_BUNDLE_ID")?,
             instance_keys,
+            tls,
         };
         Ok((config, p8_path))
     }
@@ -106,6 +112,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             team_id: "TEAM456".into(),
             topic: "com.baybo.app".into(),
             instance_keys: vec!["inst-A".into()],
+            tls: None,
         }
     }
 

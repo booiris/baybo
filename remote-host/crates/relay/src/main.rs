@@ -23,12 +23,12 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = RelayConfig::from_env()?;
     let router = build_router(&config);
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    let scheme = if config.tls.is_some() { "wss/https" } else { "ws/http" };
     eprintln!(
-        "remote-host-relay: listening on {} ({} admitted gateways)",
+        "remote-host-relay: listening on {} ({scheme}, {} admitted gateways)",
         config.bind_addr,
         config.instance_keys.len(),
     );
-    axum::serve(listener, router).await?;
+    remote_host_serve::serve(&config.bind_addr, config.tls, router).await?;
     Ok(())
 }

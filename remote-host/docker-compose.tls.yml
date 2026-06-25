@@ -1,0 +1,26 @@
+# Direct in-process TLS (wss/https) — no reverse proxy needed. Overlay on top of
+# the base compose:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+#
+# Provide a PEM cert + key (e.g. Let's Encrypt fullchain.pem + privkey.pem) via
+# .env: TLS_CERT_HOST_PATH and TLS_KEY_HOST_PATH. One cert for the host serves
+# both ports (relay wss + push https). The relay then serves wss on its port and
+# push serves https; map RELAY_PORT=443 for a port-less wss://host URL.
+
+services:
+  push:
+    environment:
+      PUSH_TLS_CERT: /run/tls/cert.pem
+      PUSH_TLS_KEY: /run/tls/key.pem
+    volumes:
+      - ${TLS_CERT_HOST_PATH:?set TLS_CERT_HOST_PATH in .env}:/run/tls/cert.pem:ro
+      - ${TLS_KEY_HOST_PATH:?set TLS_KEY_HOST_PATH in .env}:/run/tls/key.pem:ro
+
+  relay:
+    environment:
+      RELAY_TLS_CERT: /run/tls/cert.pem
+      RELAY_TLS_KEY: /run/tls/key.pem
+    volumes:
+      - ${TLS_CERT_HOST_PATH:?set TLS_CERT_HOST_PATH in .env}:/run/tls/cert.pem:ro
+      - ${TLS_KEY_HOST_PATH:?set TLS_KEY_HOST_PATH in .env}:/run/tls/key.pem:ro

@@ -22,6 +22,8 @@ parking_lot = { workspace = true }
 axum = { workspace = true }
 # Real APNs egress: reqwest negotiates HTTP/2 over TLS (ALPN), as APNs requires.
 reqwest = { workspace = true }
+# Serve plain http or https (in-process rustls) based on the optional TLS env.
+remote-host-serve = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

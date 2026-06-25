@@ -25,11 +25,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("read .p8 at {}: {e}", p8_path.display()))?;
     let router = build_router(&config, &p8_pem)?;
 
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    let scheme = if config.tls.is_some() { "https" } else { "http" };
     eprintln!(
-        "remote-host-push: listening on {} (topic {})",
+        "remote-host-push: listening on {} ({scheme}, topic {})",
         config.bind_addr, config.topic,
     );
-    axum::serve(listener, router).await?;
+    remote_host_serve::serve(&config.bind_addr, config.tls, router).await?;
     Ok(())
 }

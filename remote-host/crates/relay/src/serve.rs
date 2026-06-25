@@ -29,6 +29,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
+use remote_host_serve::TlsPaths;
+
 use crate::broker::RelayBroker;
 use crate::control::{ControlHello, ControlRegistry};
 use crate::error::RelayError;
@@ -54,11 +56,14 @@ pub struct RelayConfig {
     pub bind_addr: String,
     /// Admitted gateway instance keys (the host-leg allow-list).
     pub instance_keys: Vec<String>,
+    /// When set, terminate TLS in-process (serve `wss`); else plaintext `ws`.
+    pub tls: Option<TlsPaths>,
 }
 
 impl RelayConfig {
     /// Load from the environment. Required: `RELAY_INSTANCE_KEYS`
-    /// (comma-separated). Optional: `RELAY_BIND_ADDR`.
+    /// (comma-separated). Optional: `RELAY_BIND_ADDR`, and `RELAY_TLS_CERT` +
+    /// `RELAY_TLS_KEY` (both or neither) to serve `wss` directly.
     pub fn from_env() -> Result<Self, RelayError> {
         let instance_keys: Vec<String> = std::env::var("RELAY_INSTANCE_KEYS")
             .map_err(|_| RelayError::Config("missing env RELAY_INSTANCE_KEYS".into()))?
@@ -71,10 +76,12 @@ impl RelayConfig {
                 "RELAY_INSTANCE_KEYS must list at least one admitted gateway key".into(),
             ));
         }
+        let tls = TlsPaths::from_env("RELAY_TLS_CERT", "RELAY_TLS_KEY").map_err(RelayError::Config)?;
         Ok(Self {
             bind_addr: std::env::var("RELAY_BIND_ADDR")
                 .unwrap_or_else(|_| DEFAULT_BIND_ADDR.into()),
             instance_keys,
+            tls,
         })
     }
 }
@@ -273,6 +280,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: "127.0.0.1:0".into(),
             instance_keys: vec!["inst-A".into()],
+            tls: None,
         };
         let listener = tokio::net::TcpListener::bind(&config.bind_addr)
             .await
