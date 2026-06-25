@@ -89,14 +89,19 @@ sqlite3 ./data/admission.db \
 # revoke:
 sqlite3 ./data/admission.db "DELETE FROM admitted_instances WHERE instance_key='<key>';"
 # list:
-sqlite3 ./data/admission.db "SELECT instance_key, label FROM admitted_instances;"
+sqlite3 ./data/admission.db "SELECT instance_key, label, max_conns FROM admitted_instances;"
 ```
 
 The `admitted_instances` table is created on first start; an empty table admits no one (fail-closed). The same list gates both roles.
 
 **Revoking is enforced on live connections, not just new ones.** On each poll, any key that was dropped from the table has its live relay connections (the gateway's control channel + any in-flight pairing/content legs) closed within the poll interval — so a revoked gateway is disconnected, not left running until it happens to drop. (The push role is per-request, so a revoked key simply gets `401` on its next `/notify`.)
 
-**Per-gateway connection cap.** A single admitted `instance_key` may hold at most `MAX_CONNS_PER_INSTANCE` simultaneous relay connections (default **64**) — bounding a buggy or abusive gateway from exhausting C. Pairing/content host legs over the cap are refused with `429`; the gateway's one control channel is exempt, so a gateway at its limit can always reconnect control. Raise it for a gateway serving many concurrent device sessions.
+**Per-gateway connection cap.** Each admitted gateway may hold a bounded number of simultaneous relay connections, so a buggy or abusive one can't exhaust C. The limit is the row's `max_conns` column (NULL → the server default `MAX_CONNS_PER_INSTANCE`, **64**), hot-reloaded with the rest of the table. Pairing/content host legs over the cap are refused with `429`; the gateway's one control channel is exempt, so a gateway at its limit can always reconnect control. Raise it per gateway for one serving many concurrent device sessions:
+
+```bash
+sqlite3 ./data/admission.db \
+  "UPDATE admitted_instances SET max_conns = 200 WHERE instance_key='<key>';"
+```
 
 ## Gateway wiring (`baybo.json`)
 

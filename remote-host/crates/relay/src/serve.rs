@@ -93,7 +93,9 @@ async fn host_handler(
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
     // Cap how many connections one instance key may hold (control + legs).
-    let Some((guard, kick)) = state.conns.register(key) else {
+    let Some((guard, kick)) =
+        state.conns.register(key, state.admitted.max_conns(key).map(|c| c as usize))
+    else {
         return (StatusCode::TOO_MANY_REQUESTS, "instance connection limit reached").into_response();
     };
     // Close the TOCTOU window: if the key was revoked between the admission check
@@ -248,7 +250,9 @@ async fn content_host_handler(
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
     // Cap how many connections one instance key may hold (control + legs).
-    let Some((guard, kick)) = state.conns.register(key) else {
+    let Some((guard, kick)) =
+        state.conns.register(key, state.admitted.max_conns(key).map(|c| c as usize))
+    else {
         return (StatusCode::TOO_MANY_REQUESTS, "instance connection limit reached").into_response();
     };
     // Close the TOCTOU window: if the key was revoked between the admission check

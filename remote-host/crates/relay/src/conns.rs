@@ -16,11 +16,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
-/// Default cap on simultaneous relay connections one admitted instance key may
-/// hold (control + pairing/content host legs). Bounds a buggy or abusive gateway
-/// from exhausting C, while staying generous for a real gateway (one control
-/// connection plus a leg per active pairing/content session). Override per
-/// deployment with `MAX_CONNS_PER_INSTANCE`.
+/// Fallback cap on simultaneous relay connections one admitted instance key may
+/// hold (control + pairing/content host legs) when the key sets no cap of its
+/// own. Bounds a buggy or abusive gateway from exhausting C, while staying
+/// generous for a real gateway (one control connection plus a leg per active
+/// pairing/content session). Override the fallback with `MAX_CONNS_PER_INSTANCE`;
+/// override per-key via the `max_conns` column in the admission table.
 pub const DEFAULT_MAX_CONNS_PER_KEY: usize = 64;
 
 /// Registry of live connections' kick channels, keyed by instance key. Cheap
@@ -29,9 +30,9 @@ pub const DEFAULT_MAX_CONNS_PER_KEY: usize = 64;
 pub struct ConnectionRegistry {
     conns: Mutex<HashMap<String, HashMap<u64, oneshot::Sender<()>>>>,
     next_id: AtomicU64,
-    /// Per-key cap enforced by [`register`](Self::register). The control channel
-    /// ([`register_unchecked`](Self::register_unchecked)) is exempt so a gateway
-    /// at its leg limit can always (re)establish control.
+    /// Fallback per-key cap for [`register`](Self::register) when a key passes no
+    /// override. The control channel ([`register_unchecked`](Self::register_unchecked))
+    /// is exempt so a gateway at its leg limit can always (re)establish control.
     max_per_key: usize,
 }
 
@@ -50,28 +51,32 @@ impl ConnectionRegistry {
         }
     }
 
-    /// Override the per-key connection cap (operator-tunable). Clamped to ≥ 1.
+    /// Override the fallback per-key cap (operator-tunable; the default for keys
+    /// with no `max_conns` of their own). Clamped to ≥ 1.
     pub fn with_max_per_key(mut self, max: usize) -> Self {
         self.max_per_key = max.max(1);
         self
     }
 
-    /// Register a live connection for `instance_key`, enforcing the per-key cap.
-    /// Returns `None` if the key already holds `max_per_key` connections — the
-    /// caller must refuse the new one. Await the returned receiver in the
-    /// connection's loop (it resolves on revoke); hold the [`ConnGuard`] for the
-    /// connection's lifetime (dropping it deregisters).
+    /// Register a live connection for `instance_key`, enforcing its connection
+    /// cap: `max_override` (the key's per-key cap from admission) if set, else the
+    /// registry's fallback default. Returns `None` if the key is already at the
+    /// cap — the caller must refuse the new one. Await the returned receiver in
+    /// the connection's loop (it resolves on revoke); hold the [`ConnGuard`] for
+    /// the connection's lifetime (dropping it deregisters).
     pub(crate) fn register(
         self: &Arc<Self>,
         instance_key: &str,
+        max_override: Option<usize>,
     ) -> Option<(ConnGuard, oneshot::Receiver<()>)> {
+        let cap = max_override.unwrap_or(self.max_per_key);
         let mut conns = self.conns.lock();
         let entry = conns.entry(instance_key.to_string()).or_default();
-        if entry.len() >= self.max_per_key {
+        if entry.len() >= cap {
             // `or_default` only inserts an empty map for a brand-new key, which is
             // never at the cap; an at-cap key already existed, so nothing leaks.
             drop(conns);
-            tracing::warn!(max = self.max_per_key, "relay: instance key at its connection cap; refusing");
+            tracing::warn!(cap, "relay: instance key at its connection cap; refusing");
             return None;
         }
         let (tx, rx) = oneshot::channel();
@@ -164,8 +169,8 @@ mod tests {
     #[tokio::test]
     async fn kick_fires_the_receiver_and_counts_only_revoked() {
         let reg = Arc::new(ConnectionRegistry::new());
-        let (_g_a, rx_a) = reg.register("inst-A").unwrap();
-        let (_g_b, mut rx_b) = reg.register("inst-B").unwrap();
+        let (_g_a, rx_a) = reg.register("inst-A", None).unwrap();
+        let (_g_b, mut rx_b) = reg.register("inst-B", None).unwrap();
 
         let kicked = reg.kick(&HashSet::from(["inst-A".to_string()]));
         assert_eq!(kicked, 1, "only inst-A is revoked");
@@ -177,7 +182,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_guard_deregisters() {
         let reg = Arc::new(ConnectionRegistry::new());
-        let (guard, _rx) = reg.register("inst-A").unwrap();
+        let (guard, _rx) = reg.register("inst-A", None).unwrap();
         drop(guard);
         // Nothing left to kick: the connection deregistered itself.
         assert_eq!(reg.kick(&HashSet::from(["inst-A".to_string()])), 0);
@@ -186,19 +191,29 @@ mod tests {
     #[test]
     fn register_enforces_the_per_key_cap_and_frees_on_drop() {
         let reg = Arc::new(ConnectionRegistry::new().with_max_per_key(2));
-        let a = reg.register("k").expect("1st is under the cap");
-        let _b = reg.register("k").expect("2nd is under the cap");
-        assert!(reg.register("k").is_none(), "3rd exceeds the cap and is refused");
-        assert!(reg.register("other").is_some(), "the cap is per-key");
+        let a = reg.register("k", None).expect("1st is under the cap");
+        let _b = reg.register("k", None).expect("2nd is under the cap");
+        assert!(reg.register("k", None).is_none(), "3rd exceeds the cap and is refused");
+        assert!(reg.register("other", None).is_some(), "the cap is per-key");
         drop(a);
-        assert!(reg.register("k").is_some(), "a freed slot is reusable");
+        assert!(reg.register("k", None).is_some(), "a freed slot is reusable");
+    }
+
+    #[test]
+    fn per_key_override_beats_the_fallback_default() {
+        // Fallback default is 1, but this key carries its own cap of 3.
+        let reg = Arc::new(ConnectionRegistry::new().with_max_per_key(1));
+        let _a = reg.register("k", Some(3)).expect("1st under the override");
+        let _b = reg.register("k", Some(3)).expect("2nd under the override");
+        let _c = reg.register("k", Some(3)).expect("3rd under the override");
+        assert!(reg.register("k", Some(3)).is_none(), "4th exceeds the override");
     }
 
     #[tokio::test]
     async fn control_connection_is_exempt_from_the_cap() {
         let reg = Arc::new(ConnectionRegistry::new().with_max_per_key(1));
-        let _leg = reg.register("k").expect("under the cap");
-        assert!(reg.register("k").is_none(), "a second leg exceeds the cap");
+        let _leg = reg.register("k", None).expect("under the cap");
+        assert!(reg.register("k", None).is_none(), "a second leg exceeds the cap");
         // The control channel registers even at the cap, and is still kickable.
         let _ctrl = reg.register_unchecked("k");
         assert_eq!(

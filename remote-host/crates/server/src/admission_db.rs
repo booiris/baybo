@@ -3,7 +3,7 @@
 //! process writes it), so the runtime re-reads it on an interval rather than
 //! reacting to in-process writes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,10 +11,12 @@ use libsql::Builder;
 use remote_host_admission::InMemoryAdmission;
 
 /// Source-of-truth table: one row per admitted gateway instance key. `label` +
-/// `created_at` are for whoever administers it; only `instance_key` is read.
+/// `created_at` are for whoever administers it; `max_conns` is the key's optional
+/// per-key connection cap (NULL → the server's `MAX_CONNS_PER_INSTANCE` default).
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS admitted_instances (\
     instance_key TEXT PRIMARY KEY, \
     label TEXT, \
+    max_conns INTEGER, \
     created_at TEXT NOT NULL DEFAULT (datetime('now')))";
 
 /// Open the libsql DB at `path`, ensure the table, load the allow-list, and
@@ -33,6 +35,11 @@ where
     let db = Builder::new_local(path).build().await?;
     let conn = db.connect()?;
     conn.execute(SCHEMA, ()).await?;
+    // Migrate a table created before the per-key cap column existed. The ALTER
+    // errors harmlessly ("duplicate column") once it's present; ignore that.
+    let _ = conn
+        .execute("ALTER TABLE admitted_instances ADD COLUMN max_conns INTEGER", ())
+        .await;
 
     let admission = Arc::new(InMemoryAdmission::new());
     // Initial load: nothing was admitted before, so nothing to revoke.
@@ -61,13 +68,17 @@ where
     Ok(admission)
 }
 
-async fn load(conn: &libsql::Connection) -> Result<HashSet<String>, libsql::Error> {
+async fn load(conn: &libsql::Connection) -> Result<HashMap<String, Option<u32>>, libsql::Error> {
     let mut rows = conn
-        .query("SELECT instance_key FROM admitted_instances", ())
+        .query("SELECT instance_key, max_conns FROM admitted_instances", ())
         .await?;
-    let mut keys = HashSet::new();
+    let mut keys = HashMap::new();
     while let Some(row) = rows.next().await? {
-        keys.insert(row.get::<String>(0)?);
+        let key = row.get::<String>(0)?;
+        // Nullable INTEGER -> per-key cap override; NULL or out-of-range -> None
+        // (the caller's default applies).
+        let cap = row.get::<Option<i64>>(1)?.and_then(|v| u32::try_from(v).ok());
+        keys.insert(key, cap);
     }
     Ok(keys)
 }
