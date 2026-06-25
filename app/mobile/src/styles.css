@@ -136,8 +136,9 @@ html.scanning .container {
   -webkit-backdrop-filter: blur(10px);
 }
 
-/* Scan success: a green dot pops at the reticle centre, then the whole panel
-   slides off to the left to reveal the form underneath. */
+/* Scan success: a green dot pops at the reticle centre on a panel the same
+   colour as the form, which then fades out to reveal the form — a gentle
+   cross-fade rather than an abrupt camera->app wipe. */
 .scan-panel {
   position: fixed;
   inset: 0;
@@ -145,8 +146,11 @@ html.scanning .container {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #000;
-  animation: scan-slide-out 0.66s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  background: #fff;
+  animation: scan-settle 0.6s ease-out forwards;
+}
+@media (prefers-color-scheme: dark) {
+  .scan-panel { background: #1a1a1a; }
 }
 .scan-panel .scan-dot {
   width: 60px;
@@ -159,7 +163,7 @@ html.scanning .container {
   from { transform: scale(0); opacity: 0; }
   to { transform: scale(1); opacity: 1; }
 }
-@keyframes scan-slide-out {
-  0%, 42% { transform: translateX(0); }
-  100% { transform: translateX(-100%); }
+@keyframes scan-settle {
+  0%, 45% { opacity: 1; }
+  100% { opacity: 0; }
 }

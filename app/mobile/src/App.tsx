@@ -210,8 +210,8 @@ export default function App() {
       setCode(parsed.code);
       setRelay(parsed.relay);
       if (parsed.endpoint) setEndpoint(parsed.endpoint);
-      // Success: buzz, then a green dot pops at the reticle centre and the scan
-      // panel slides off to the left to reveal the form underneath.
+      // Success: buzz, pop a green dot at the reticle centre, then briefly hold
+      // and cross-fade to the form (same background, so no abrupt wipe).
       try {
         const { notificationFeedback } = await import("@tauri-apps/plugin-haptics");
         await notificationFeedback("success");
@@ -219,7 +219,7 @@ export default function App() {
         // haptics unavailable (e.g. desktop) — non-fatal
       }
       setScanPhase("success");
-      await new Promise((resolve) => setTimeout(resolve, 700));
+      await new Promise((resolve) => setTimeout(resolve, 650));
       setStatus("Scanned. Review and pair.");
     } catch (e) {
       setStatus(scanCancelled.current ? null : `Scan failed: ${e}`);
