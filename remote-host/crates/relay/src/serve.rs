@@ -33,6 +33,7 @@ use remote_host_protocol::relay::{
 };
 
 use crate::broker::RelayBroker;
+use crate::conns::ConnectionRegistry;
 use crate::control::{ControlHello, ControlRegistry};
 use crate::ws::pump_ws;
 
@@ -47,6 +48,9 @@ struct RelayState {
     admitted: Arc<dyn Admission>,
     /// Live gateway control connections, keyed by `relay_node_id`.
     control: Arc<ControlRegistry>,
+    /// Live admission-gated connections keyed by instance key, so an admission
+    /// hot-reload can drop the connections of a revoked key.
+    conns: Arc<ConnectionRegistry>,
     /// Monotonic source of per-data-leg `relay_key`s. Uniqueness (not secrecy)
     /// is all that's needed: the content-host route is admission-gated, so a
     /// guessed key can't be hosted by anyone but the real gateway.
@@ -54,12 +58,14 @@ struct RelayState {
 }
 
 /// Assemble the relay router. `admission` is the shared, hot-reloaded allow-list
-/// of admitted gateway instance keys.
-pub fn build_router(admission: Arc<dyn Admission>) -> Router {
+/// of admitted gateway instance keys; `conns` tracks live connections so a
+/// revoke (an admission reload that dropped a key) can kick them.
+pub fn build_router(admission: Arc<dyn Admission>, conns: Arc<ConnectionRegistry>) -> Router {
     let state = RelayState {
         broker: Arc::new(RelayBroker::new()),
         admitted: admission,
         control: Arc::new(ControlRegistry::new()),
+        conns,
         seq: Arc::new(AtomicU64::new(0)),
     };
     Router::new()
@@ -80,17 +86,29 @@ async fn host_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let admitted = headers
-        .get(INSTANCE_KEY_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|k| state.admitted.is_admitted(k));
-    if !admitted {
+    let Some(key) = headers.get(INSTANCE_KEY_HEADER).and_then(|v| v.to_str().ok()) else {
+        return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
+    };
+    if !state.admitted.is_admitted(key) {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
     let leg = state.broker.join(&code);
     let broker = Arc::clone(&state.broker);
+    let (guard, kick) = state.conns.register(key);
+    // Close the TOCTOU window: if the key was revoked between the admission check
+    // above and registering, a concurrent kick may have already passed us by, and
+    // future polls won't re-target an already-removed key — so re-check and abort
+    // rather than linger un-kicked. (`guard` drops here, deregistering.)
+    if !state.admitted.is_admitted(key) {
+        return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
+    }
     ws.on_upgrade(move |socket| async move {
-        pump_ws(socket, leg).await;
+        let _guard = guard;
+        tokio::select! {
+            _ = pump_ws(socket, leg) => {}
+            // The gateway's instance key was revoked mid-connection.
+            _ = kick => {}
+        }
         // If the app never matched (the host disconnected first), drop the
         // still-parked leg so a stale code can't linger.
         broker.cancel(&code);
@@ -134,12 +152,23 @@ async fn run_control(mut socket: WebSocket, state: RelayState) {
         return;
     }
     tracing::info!(node = %hello.relay_node_id, "control: gateway connected");
+    let (_kick_guard, mut kick) = state.conns.register(&hello.instance_key);
+    // Close the TOCTOU window (see the host handlers): a concurrent revoke's kick
+    // may have run between the admission check and registering.
+    if !state.admitted.is_admitted(&hello.instance_key) {
+        return;
+    }
     let mut rx = state.control.register(&hello.relay_node_id);
     // `register` replaces any prior slot (reconnect wins); if our slot is
     // superseded, `rx` closes and we must NOT unregister the new owner.
     let mut superseded = false;
     loop {
         tokio::select! {
+            // The gateway's instance key was revoked (admission hot-reload).
+            _ = &mut kick => {
+                tracing::info!(node = %hello.relay_node_id, "control: instance key revoked; closing");
+                break;
+            }
             sig = rx.recv() => match sig {
                 Some(signal) => {
                     let json = match serde_json::to_vec(&signal) {
@@ -207,17 +236,29 @@ async fn content_host_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let admitted = headers
-        .get(INSTANCE_KEY_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|k| state.admitted.is_admitted(k));
-    if !admitted {
+    let Some(key) = headers.get(INSTANCE_KEY_HEADER).and_then(|v| v.to_str().ok()) else {
+        return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
+    };
+    if !state.admitted.is_admitted(key) {
         return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
     }
     let leg = state.broker.join(&relay_key);
     let broker = Arc::clone(&state.broker);
+    let (guard, kick) = state.conns.register(key);
+    // Close the TOCTOU window: if the key was revoked between the admission check
+    // above and registering, a concurrent kick may have already passed us by, and
+    // future polls won't re-target an already-removed key — so re-check and abort
+    // rather than linger un-kicked. (`guard` drops here, deregistering.)
+    if !state.admitted.is_admitted(key) {
+        return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
+    }
     ws.on_upgrade(move |socket| async move {
-        pump_ws(socket, leg).await;
+        let _guard = guard;
+        tokio::select! {
+            _ = pump_ws(socket, leg) => {}
+            // The gateway's instance key was revoked mid-session.
+            _ = kick => {}
+        }
         broker.cancel(&relay_key);
     })
 }
@@ -238,7 +279,7 @@ mod tests {
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = build_router(admission);
+        let app = build_router(admission, Arc::new(ConnectionRegistry::new()));
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -419,6 +460,54 @@ mod tests {
             Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::NOT_FOUND),
             other => panic!("expected 404, got {other:?}"),
         }
+    }
+
+    /// Revoking an admitted gateway's instance key (an admission reload that
+    /// dropped it) kicks its already-live control connection, not just future
+    /// dials.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoking_a_key_drops_its_live_control_connection() {
+        use std::collections::HashSet;
+
+        let admission =
+            Arc::new(remote_host_admission::InMemoryAdmission::with_keys(["inst-A"]));
+        let conns = Arc::new(ConnectionRegistry::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = build_router(admission, conns.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut control = connect_control(port).await;
+        let hello = serde_json::json!({ "relay_node_id": "node-1", "instance_key": "inst-A" });
+        control
+            .send(Message::Binary(serde_json::to_vec(&hello).unwrap()))
+            .await
+            .unwrap();
+
+        // Registration is async (the server reads the hello, then registers), so
+        // poll the kick until it finds the live connection and drops it.
+        let revoked = HashSet::from(["inst-A".to_string()]);
+        let mut kicked = 0;
+        for _ in 0..40 {
+            kicked = conns.kick(&revoked);
+            if kicked > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(kicked, 1, "the live control connection was kicked");
+
+        // The server closed it: the client sees a Close frame or EOF.
+        let closed = loop {
+            match control.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break true,
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                Some(Ok(other)) => panic!("unexpected frame after revoke: {other:?}"),
+            }
+        };
+        assert!(closed, "control connection closed after its key was revoked");
     }
 
     async fn recv_bin(ws: &mut WebSocketStream<TcpStream>) -> Vec<u8> {

@@ -94,6 +94,8 @@ sqlite3 ./data/admission.db "SELECT instance_key, label FROM admitted_instances;
 
 The `admitted_instances` table is created on first start; an empty table admits no one (fail-closed). The same list gates both roles.
 
+**Revoking is enforced on live connections, not just new ones.** On each poll, any key that was dropped from the table has its live relay connections (the gateway's control channel + any in-flight pairing/content legs) closed within the poll interval — so a revoked gateway is disconnected, not left running until it happens to drop. (The push role is per-request, so a revoked key simply gets `401` on its next `/notify`.)
+
 ## Gateway wiring (`baybo.json`)
 
 The gateway holds **no** `.p8` — it only knows the C base URL + its admission key:

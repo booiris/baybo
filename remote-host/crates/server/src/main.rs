@@ -7,6 +7,7 @@
 //! here (`BIND_ADDR`, and optional `TLS_CERT` + `TLS_KEY` to serve wss/https).
 
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -48,7 +49,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_POLL_SECS),
     );
-    let admission = admission_db::open(&db_path, poll).await?;
+    // Track live relay connections so an admission reload that drops a key can
+    // kick that gateway's connections, not just refuse new ones.
+    let conns = Arc::new(remote_host_relay::ConnectionRegistry::new());
+    let admission = {
+        let conns = conns.clone();
+        admission_db::open(&db_path, poll, move |revoked| {
+            conns.kick(&revoked);
+        })
+        .await?
+    };
 
     let mut app = Router::new();
     let mut roles: Vec<&str> = Vec::new();
@@ -66,7 +76,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Relay is always on.
-    app = app.merge(relay_router(admission.clone()));
+    app = app.merge(relay_router(admission.clone(), conns.clone()));
     roles.push("relay");
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into());

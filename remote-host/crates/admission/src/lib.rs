@@ -47,9 +47,14 @@ impl InMemoryAdmission {
         self.keys.write().remove(instance_key);
     }
 
-    /// Replace the entire allow-list — the poll refresh.
-    pub fn replace_all(&self, keys: HashSet<String>) {
-        *self.keys.write() = keys;
+    /// Replace the entire allow-list — the poll refresh. Returns the keys that
+    /// were admitted before but are absent from `keys` (revoked), so the caller
+    /// can drop their live connections.
+    pub fn replace_all(&self, keys: HashSet<String>) -> HashSet<String> {
+        let mut guard = self.keys.write();
+        let revoked = guard.difference(&keys).cloned().collect();
+        *guard = keys;
+        revoked
     }
 }
 
@@ -75,10 +80,13 @@ mod tests {
     }
 
     #[test]
-    fn replace_all_swaps_the_whole_set() {
-        let a = InMemoryAdmission::with_keys(["old"]);
-        a.replace_all(HashSet::from(["new".to_string()]));
+    fn replace_all_swaps_the_whole_set_and_reports_revoked() {
+        let a = InMemoryAdmission::with_keys(["old", "kept"]);
+        let revoked = a.replace_all(HashSet::from(["kept".to_string(), "new".to_string()]));
         assert!(a.is_admitted("new"));
+        assert!(a.is_admitted("kept"));
         assert!(!a.is_admitted("old"));
+        // Only `old` lost admission; `kept` stayed and `new` was added.
+        assert_eq!(revoked, HashSet::from(["old".to_string()]));
     }
 }

@@ -14,10 +14,12 @@
 
 pub mod broker;
 pub mod control;
+pub mod conns;
 pub mod error;
 pub mod serve;
 pub mod ws;
 
 pub use broker::{RelayBroker, RelayLeg};
+pub use conns::ConnectionRegistry;
 pub use control::{ControlRegistry, ControlSignal};
 pub use ws::pump_ws;

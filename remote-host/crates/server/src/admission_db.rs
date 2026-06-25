@@ -18,18 +18,25 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS admitted_instances (\
     created_at TEXT NOT NULL DEFAULT (datetime('now')))";
 
 /// Open the libsql DB at `path`, ensure the table, load the allow-list, and
-/// spawn a task that re-reads it every `poll` to pick up external edits. Returns
-/// the live admission handle shared by both roles.
-pub(crate) async fn open(
+/// spawn a task that re-reads it every `poll` to pick up external edits. On each
+/// reload, `on_revoke` is called with the keys that just lost admission so their
+/// live connections can be dropped. Returns the live admission handle shared by
+/// both roles.
+pub(crate) async fn open<F>(
     path: &str,
     poll: Duration,
-) -> Result<Arc<InMemoryAdmission>, Box<dyn std::error::Error>> {
+    on_revoke: F,
+) -> Result<Arc<InMemoryAdmission>, Box<dyn std::error::Error>>
+where
+    F: Fn(HashSet<String>) + Send + 'static,
+{
     let db = Builder::new_local(path).build().await?;
     let conn = db.connect()?;
     conn.execute(SCHEMA, ()).await?;
 
     let admission = Arc::new(InMemoryAdmission::new());
-    admission.replace_all(load(&conn).await?);
+    // Initial load: nothing was admitted before, so nothing to revoke.
+    let _ = admission.replace_all(load(&conn).await?);
 
     let admission_poll = admission.clone();
     tokio::spawn(async move {
@@ -39,7 +46,13 @@ pub(crate) async fn open(
         loop {
             tick.tick().await;
             match load(&conn).await {
-                Ok(keys) => admission_poll.replace_all(keys),
+                Ok(keys) => {
+                    let revoked = admission_poll.replace_all(keys);
+                    // Drop the live connections of any key that just lost admission.
+                    if !revoked.is_empty() {
+                        on_revoke(revoked);
+                    }
+                }
                 Err(e) => eprintln!("remote-host: admission poll failed: {e}"),
             }
         }
