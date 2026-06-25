@@ -27,8 +27,9 @@ async fn pair_begin(
     code: String,
     label: String,
     relay: bool,
+    instance_key: Option<String>,
 ) -> Result<PairChallenge, String> {
-    pairing::pair_begin(&sessions, &endpoint, &code, &label, relay).await
+    pairing::pair_begin(&sessions, &endpoint, &code, &label, relay, instance_key).await
 }
 
 /// Phase 2: send the user's decision. On accept — and once the operator also

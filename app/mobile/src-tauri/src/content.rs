@@ -133,20 +133,36 @@ async fn dial_direct(
 }
 
 /// Dial the blind relay's content-join leg for the gateway's `relay_node_id`
-/// (fallback when no direct candidate connected). No token: the relay leg is
-/// unauthenticated and the gateway authenticates this device purely by matching
-/// the Noise IK initiator's static against an approved device row.
+/// (fallback when no direct candidate connected). The relay now admits this leg
+/// by the instance key (symmetric with the gateway's host leg); end-to-end, the
+/// gateway still authenticates this device by matching the Noise IK initiator's
+/// static against an approved device row.
 async fn dial_relay(
     node_id: &str,
     record: &PairedRecord,
     local: &StaticKeypair,
 ) -> Result<Established, String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
     if record.relay_url.is_empty() {
         return Err("no relay url for this pairing".into());
     }
     let base = record.relay_url.trim_end_matches('/');
     let url = remote_host_protocol::relay::content_join_url(base, node_id);
-    let (ws, _) = connect_async(&url)
+    // Present the admission key the QR carried at pairing — the relay admits the
+    // phone leg too now.
+    let mut req = url
+        .into_client_request()
+        .map_err(|e| format!("bad relay url {base}: {e}"))?;
+    if !record.instance_key.is_empty() {
+        let value = record
+            .instance_key
+            .parse()
+            .map_err(|e| format!("bad instance key header: {e}"))?;
+        req.headers_mut()
+            .insert(remote_host_protocol::relay::INSTANCE_KEY_HEADER, value);
+    }
+    let (ws, _) = connect_async(req)
         .await
         .map_err(|e| format!("relay connect {base}: {e}"))?;
     handshake_over(ws, record, local).await

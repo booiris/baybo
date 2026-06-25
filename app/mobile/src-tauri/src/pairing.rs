@@ -36,6 +36,9 @@ struct PairSession {
     /// The app's Noise static identity, carried from `pair_begin` so
     /// `pair_confirm` can persist its secret for content sessions.
     keypair: StaticKeypair,
+    /// The relay admission key from the QR (empty on the direct path), carried so
+    /// `pair_confirm` can persist it for the relay content-join leg.
+    instance_key: String,
 }
 
 /// The durable record persisted after pairing — everything the app needs to
@@ -53,6 +56,11 @@ pub(crate) struct PairedRecord {
     /// a relay content leg when every direct candidate fails.
     #[serde(default)]
     pub(crate) relay_url: String,
+    /// The relay admission key (the QR's `k`) this device presents on the relay
+    /// content-join leg; empty when paired directly. Symmetric with the gateway's
+    /// host-side key.
+    #[serde(default)]
+    pub(crate) instance_key: String,
     /// The app's long-term Noise static identity (its content-session identity):
     /// the secret drives the IK initiator; the public half completes the keypair
     /// `device-proto` expects (snow re-derives it from the secret regardless).
@@ -86,6 +94,7 @@ pub async fn pair_begin(
     code: &str,
     label: &str,
     relay: bool,
+    instance_key: Option<String>,
 ) -> Result<PairChallenge, String> {
     let base = endpoint.trim_end_matches('/');
     // Relay: join the rendezvous keyed by the code (`/pair/join/{code}`); the
@@ -95,7 +104,7 @@ pub async fn pair_begin(
     } else {
         format!("{base}/v1/device/pair")
     };
-    let mut ws = connect_pair(&url, relay).await?;
+    let mut ws = connect_pair(&url, relay, instance_key.as_deref()).await?;
 
     // The app's long-term Noise identity. TODO(persist): the secret belongs in
     // the keychain so content sessions reuse it across launches.
@@ -141,6 +150,7 @@ pub async fn pair_begin(
             client,
             device_id: device_id.clone(),
             keypair,
+            instance_key: instance_key.unwrap_or_default(),
         },
     );
 
@@ -199,6 +209,7 @@ pub async fn pair_confirm(
         direct_candidates: paired.direct_candidates.clone(),
         relay_node_id: paired.relay_node_id.clone(),
         relay_url: paired.relay_url.clone(),
+        instance_key: session.instance_key.clone(),
         noise_secret: session.keypair.secret(),
         noise_public: session.keypair.public(),
     };
@@ -220,11 +231,29 @@ type Ws =
 
 /// Dial the pairing WS. On the relay path the gateway's host leg may not be
 /// parked the instant the app scans, so retry briefly on connect failure.
-async fn connect_pair(url: &str, relay: bool) -> Result<Ws, String> {
+async fn connect_pair(url: &str, relay: bool, instance_key: Option<&str>) -> Result<Ws, String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
     let attempts = if relay { 30 } else { 1 };
     let mut last = String::new();
     for i in 0..attempts {
-        match connect_async(url).await {
+        // A Request is consumed by `connect_async` and isn't cheaply cloneable,
+        // so rebuild it each attempt. On the relay path the app presents the QR's
+        // admission key as `x-instance-key`, matching the gateway's host leg.
+        let mut req = match url.into_client_request() {
+            Ok(r) => r,
+            Err(e) => return Err(format!("bad pairing url {url}: {e}")),
+        };
+        if let Some(key) = instance_key {
+            match key.parse() {
+                Ok(v) => {
+                    req.headers_mut()
+                        .insert(remote_host_protocol::relay::INSTANCE_KEY_HEADER, v);
+                }
+                Err(e) => return Err(format!("bad instance key header: {e}")),
+            }
+        }
+        match connect_async(req).await {
             Ok((ws, _)) => return Ok(ws),
             Err(e) => {
                 last = format!("connect {url}: {e}");

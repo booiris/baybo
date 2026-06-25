@@ -6,17 +6,24 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import type { PairChallenge } from "./generated/PairChallenge";
 import type { PairedSummary } from "./generated/PairedSummary";
 
-/// Parse a `baybo://pair?h=<endpoint>&c=<code>&relay=1` QR payload, or fall back
-/// to treating the whole scanned string as the bare code. `relay=1` means join
-/// the proxy rendezvous; otherwise dial the gateway directly.
-function parseScan(text: string): { endpoint?: string; code: string; relay: boolean } {
+/// Parse a `baybo://pair?h=<endpoint>&c=<code>&k=<instance-key>&relay=1` QR
+/// payload, or fall back to treating the whole scanned string as the bare code.
+/// `relay=1` means join the proxy rendezvous (presenting `k` as the relay
+/// admission key); otherwise dial the gateway directly.
+function parseScan(text: string): {
+  endpoint?: string;
+  code: string;
+  relay: boolean;
+  instanceKey?: string;
+} {
   try {
     const url = new URL(text);
     if (url.protocol === "baybo:") {
       const h = url.searchParams.get("h") ?? undefined;
       const c = url.searchParams.get("c");
+      const k = url.searchParams.get("k") ?? undefined;
       const relay = url.searchParams.get("relay") === "1";
-      if (c) return { endpoint: h, code: c, relay };
+      if (c) return { endpoint: h, code: c, relay, instanceKey: k };
     }
   } catch {
     /* not a URL — treat as a bare code */
@@ -264,6 +271,7 @@ export default function App() {
         endpoint: parsed.endpoint ?? DEFAULT_ENDPOINT,
         code: parsed.code,
         relay: parsed.relay,
+        instanceKey: parsed.instanceKey,
       });
     } catch (e) {
       setStatus(scanCancelled.current ? null : `Scan failed: ${e}`);
@@ -285,7 +293,12 @@ export default function App() {
 
   // Phase 1: connect + SPAKE2 → get the confirmation code to show the user.
   // Called straight off a successful scan with the QR's endpoint/code/relay.
-  async function pairBegin(opts: { endpoint: string; code: string; relay: boolean }) {
+  async function pairBegin(opts: {
+    endpoint: string;
+    code: string;
+    relay: boolean;
+    instanceKey?: string;
+  }) {
     setBusy(true);
     setStatus("Connecting…");
     try {
@@ -294,6 +307,7 @@ export default function App() {
         code: opts.code,
         label: DEVICE_LABEL,
         relay: opts.relay,
+        instanceKey: opts.instanceKey,
       });
       setChallenge(c);
       setStatus(null);
