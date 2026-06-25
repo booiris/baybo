@@ -276,9 +276,15 @@ export default function App() {
   if (scanning) {
     return (
       <div className="scan-overlay">
-        <p>Point the camera at the pairing QR code</p>
-        <div className="scan-frame" />
-        <button onClick={cancelScan}>Cancel</button>
+        <div className="scan-reticle">
+          <span className="corner tl" />
+          <span className="corner tr" />
+          <span className="corner bl" />
+          <span className="corner br" />
+        </div>
+        <button className="scan-cancel" onClick={cancelScan}>
+          Cancel
+        </button>
       </div>
     );
   }
