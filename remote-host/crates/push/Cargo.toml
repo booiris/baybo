@@ -20,6 +20,8 @@ axum = { workspace = true }
 reqwest = { workspace = true }
 # The shared admission trait (the live allow-list is wired by the server binary).
 remote-host-admission = { workspace = true }
+# The shared wire contract: route paths + NotifyRequest/RegisterRequest/ApnsEnv.
+remote-host-protocol = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

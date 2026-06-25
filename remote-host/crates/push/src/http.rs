@@ -23,8 +23,8 @@ pub struct PushState {
 /// Build the push router (`POST /notify`, `POST /register`).
 pub fn router(state: PushState) -> Router {
     Router::new()
-        .route("/notify", post(notify))
-        .route("/register", post(register))
+        .route(remote_host_protocol::push::NOTIFY, post(notify))
+        .route(remote_host_protocol::push::REGISTER, post(register))
         .with_state(state)
 }
 

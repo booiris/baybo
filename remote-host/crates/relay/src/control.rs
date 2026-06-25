@@ -13,31 +13,15 @@
 use std::collections::HashMap;
 
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 /// Bounded backlog of control signals toward one gateway.
 const CONTROL_CHANNEL_CAP: usize = 32;
 
-/// First frame the gateway (A) sends on the control WS: its `relay_node_id`
-/// (routing key) + its admission `instance_key`. Mirrors the gateway-side
-/// `ControlClientHello`; decoded from the binary JSON A sends.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ControlHello {
-    pub relay_node_id: String,
-    pub instance_key: String,
-}
-
-/// A control-plane signal C sends to a registered gateway. Serialized to the
-/// exact JSON the gateway's `ControlServerMsg` decodes (`{"t":"open_data_leg",
-/// "relay_key":"…"}`), so the two halves agree byte-for-byte.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "t", rename_all = "snake_case")]
-pub enum ControlSignal {
-    /// Open a data leg under `relay_key` and join the relay — a phone is
-    /// waiting there to reach you.
-    OpenDataLeg { relay_key: String },
-}
+/// The control-plane wire types ([`ControlHello`] in, [`ControlSignal`] out)
+/// live in the shared protocol crate, so the gateway encodes/decodes the exact
+/// same definitions.
+pub use remote_host_protocol::relay::{ControlHello, ControlSignal};
 
 /// Registry of gateways' live control connections, keyed by `relay_node_id`.
 #[derive(Default)]

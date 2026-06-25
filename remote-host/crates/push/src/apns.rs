@@ -8,26 +8,18 @@
 //! mock. This component never decrypts `enc` — it stays blind.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
-/// Which APNs environment a device token is bound to. A sandbox token is
-/// rejected by the production host and vice versa, so it is tracked per device
-/// (the #1 APNs footgun) and never guessed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApnsEnv {
-    Sandbox,
-    Production,
-}
+/// The APNs environment ([`ApnsEnv`]) is the shared wire type (the `env` of a
+/// register request), re-exported so the rest of the push crate refers to it as
+/// `crate::apns::ApnsEnv`.
+pub use remote_host_protocol::push::ApnsEnv;
 
-impl ApnsEnv {
-    /// The APNs API host for this environment (the same `.p8` serves both —
-    /// only the host differs).
-    pub fn host(self) -> &'static str {
-        match self {
-            ApnsEnv::Sandbox => "api.sandbox.push.apple.com",
-            ApnsEnv::Production => "api.push.apple.com",
-        }
+/// The APNs API host for `env` (the same `.p8` serves both — only the host
+/// differs). A free fn since [`ApnsEnv`] is the shared wire type.
+pub fn host(env: ApnsEnv) -> &'static str {
+    match env {
+        ApnsEnv::Sandbox => "api.sandbox.push.apple.com",
+        ApnsEnv::Production => "api.push.apple.com",
     }
 }
 
@@ -77,7 +69,7 @@ mod tests {
 
     #[test]
     fn env_hosts_are_distinct() {
-        assert_eq!(ApnsEnv::Sandbox.host(), "api.sandbox.push.apple.com");
-        assert_eq!(ApnsEnv::Production.host(), "api.push.apple.com");
+        assert_eq!(host(ApnsEnv::Sandbox), "api.sandbox.push.apple.com");
+        assert_eq!(host(ApnsEnv::Production), "api.push.apple.com");
     }
 }

@@ -21,6 +21,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # The shared admission trait (relay checks the live allow-list).
 remote-host-admission = { workspace = true }
+# The shared wire contract: route paths, x-instance-key, ControlHello/Signal.
+remote-host-protocol = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

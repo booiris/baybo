@@ -28,14 +28,13 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use remote_host_admission::Admission;
+use remote_host_protocol::relay::{
+    CONTENT_HOST, CONTENT_JOIN, CONTROL, INSTANCE_KEY_HEADER, PAIR_HOST, PAIR_JOIN,
+};
 
 use crate::broker::RelayBroker;
 use crate::control::{ControlHello, ControlRegistry};
 use crate::ws::pump_ws;
-
-/// Header the gateway presents to host a rendezvous (its admission key). The app
-/// side carries no credential.
-pub const INSTANCE_KEY_HEADER: &str = "x-instance-key";
 
 /// Drop a gateway control connection that has gone silent for this long. The
 /// gateway keepalive-Pings well inside it (every 30s), so only a half-open
@@ -64,13 +63,13 @@ pub fn build_router(admission: Arc<dyn Admission>) -> Router {
         seq: Arc::new(AtomicU64::new(0)),
     };
     Router::new()
-        .route("/pair/host/{code}", get(host_handler))
-        .route("/pair/join/{code}", get(join_handler))
+        .route(PAIR_HOST, get(host_handler))
+        .route(PAIR_JOIN, get(join_handler))
         // Content relay (phase 2): the gateway holds a control connection; a
         // phone names the gateway by relay_node_id and C splices a data leg.
-        .route("/control", get(control_handler))
-        .route("/content/join/{relay_node_id}", get(content_join_handler))
-        .route("/content/host/{relay_key}", get(content_host_handler))
+        .route(CONTROL, get(control_handler))
+        .route(CONTENT_JOIN, get(content_join_handler))
+        .route(CONTENT_HOST, get(content_host_handler))
         .with_state(state)
 }
 

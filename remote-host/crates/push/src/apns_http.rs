@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 
-use crate::apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender};
+use crate::apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender, host};
 
 /// reqwest-backed APNs sender. One shared client (its connection pool keeps the
 /// HTTP/2 connection to APNs warm across pushes).
@@ -32,7 +32,7 @@ impl Default for HttpApnsSender {
 
 /// The APNs request URL for an env + device token.
 fn apns_url(env: ApnsEnv, device_token: &str) -> String {
-    format!("https://{}/3/device/{}", env.host(), device_token)
+    format!("https://{}/3/device/{}", host(env), device_token)
 }
 
 /// Map an APNs HTTP response to a normalized [`ApnsOutcome`]. APNs returns `200`

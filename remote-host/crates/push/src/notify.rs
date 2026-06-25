@@ -10,40 +10,17 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender};
+use crate::apns::{ApnsOutcome, ApnsRequest, ApnsSender};
 use crate::error::PushError;
 use crate::jwt::ApnsProviderToken;
 use crate::store::{Admission, DeviceRegistration, DeviceTokenStore};
 
-/// The body a gateway POSTs to `/notify`. `enc`/`n` are the opaque base64 AEAD
-/// ciphertext+tag and nonce, already encrypted by A with the device's push key
-/// — copied verbatim, never decrypted here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotifyRequest {
-    pub instance_key: String,
-    pub device_id: String,
-    pub collapse_id: String,
-    pub kid: u32,
-    /// Per-binding device id; the NSE selects the push key by this.
-    pub bid: String,
-    pub enc: String,
-    pub n: String,
-}
-
-/// The body a gateway POSTs to `/register` to bind (or rebind) a device's APNs
-/// token. Gateway-mediated: A registers on the device's behalf so the app never
-/// holds a C credential; `env` is tracked per device (a sandbox token is
-/// rejected by the production host and vice versa).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterRequest {
-    pub instance_key: String,
-    pub device_id: String,
-    pub apns_token: String,
-    pub env: ApnsEnv,
-}
+/// The `/notify` + `/register` request bodies live in the shared protocol crate,
+/// so the gateway POSTs the exact same shapes (re-exported here for the rest of
+/// the push crate).
+pub use remote_host_protocol::push::{NotifyRequest, RegisterRequest};
 
 /// Result of processing one `/register`.
 #[derive(Debug, Clone, PartialEq, Eq)]

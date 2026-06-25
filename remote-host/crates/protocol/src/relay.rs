@@ -19,7 +19,7 @@ pub const CONTENT_HOST: &str = "/content/host/{relay_key}";
 /// First binary-JSON frame on [`CONTROL`] (gateway → C): the gateway names
 /// itself by `relay_node_id` and authenticates with `instance_key`.
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlHello {
     pub relay_node_id: String,
     pub instance_key: String,
@@ -28,7 +28,7 @@ pub struct ControlHello {
 /// C → gateway signal, pushed over [`CONTROL`] as binary-JSON
 /// (`{"t":"open_data_leg","relay_key":"…"}`).
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ControlSignal {
     /// Tell the gateway to open a content data leg under `relay_key`.

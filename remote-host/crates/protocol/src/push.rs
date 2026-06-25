@@ -21,7 +21,7 @@ pub enum ApnsEnv {
 /// for one pushable turn. `enc`/`n` are opaque base64 (copied verbatim into the
 /// APNs payload); C never decrypts them.
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotifyRequest {
     pub instance_key: String,
     pub device_id: String,
@@ -35,7 +35,7 @@ pub struct NotifyRequest {
 /// JSON body of `POST /register` — bind/rebind a device's APNs token
 /// (gateway-mediated, so the app never holds a C credential).
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterRequest {
     pub instance_key: String,
     pub device_id: String,
