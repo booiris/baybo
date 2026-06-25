@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
-use remote_host_serve::TlsPaths;
 
 use crate::apns_http::HttpApnsSender;
 use crate::error::PushError;
@@ -17,16 +16,9 @@ use crate::jwt::ApnsProviderToken;
 use crate::notify::NotifyService;
 use crate::store::{InMemoryAdmission, InMemoryDeviceTokenStore};
 
-/// Default listener when `PUSH_BIND_ADDR` is unset. The push role is the only
-/// component holding the `.p8`, so it's typically deployed behind a TLS
-/// terminator on its own host.
-pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8443";
-
-/// Runtime config for the push role.
+/// Router config for the push role.
 #[derive(Debug, Clone)]
 pub struct PushConfig {
-    /// `host:port` to bind the HTTP listener on.
-    pub bind_addr: String,
     /// APNs auth-key id (the `.p8`'s Key ID).
     pub key_id: String,
     /// Apple Developer Team ID (the provider-token `iss`).
@@ -35,15 +27,12 @@ pub struct PushConfig {
     pub topic: String,
     /// The admitted gateway instance keys (the admission allow-list).
     pub instance_keys: Vec<String>,
-    /// When set, terminate TLS in-process (serve `https`); else plaintext.
-    pub tls: Option<TlsPaths>,
 }
 
 impl PushConfig {
     /// Load the config + `.p8` path from the environment. Required:
     /// `APNS_P8_PATH`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID`,
-    /// `PUSH_INSTANCE_KEYS` (comma-separated). Optional: `PUSH_BIND_ADDR`, and
-    /// `PUSH_TLS_CERT` + `PUSH_TLS_KEY` (both or neither) to serve `https`.
+    /// `PUSH_INSTANCE_KEYS` (comma-separated).
     pub fn from_env() -> Result<(Self, PathBuf), PushError> {
         fn req(key: &str) -> Result<String, PushError> {
             std::env::var(key).map_err(|_| PushError::Config(format!("missing env {key}")))
@@ -59,14 +48,11 @@ impl PushConfig {
                 "PUSH_INSTANCE_KEYS must list at least one admitted gateway key".into(),
             ));
         }
-        let tls = TlsPaths::from_env("PUSH_TLS_CERT", "PUSH_TLS_KEY").map_err(PushError::Config)?;
         let config = PushConfig {
-            bind_addr: std::env::var("PUSH_BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into()),
             key_id: req("APNS_KEY_ID")?,
             team_id: req("APNS_TEAM_ID")?,
             topic: req("APNS_BUNDLE_ID")?,
             instance_keys,
-            tls,
         };
         Ok((config, p8_path))
     }
@@ -107,12 +93,10 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
 
     fn config() -> PushConfig {
         PushConfig {
-            bind_addr: DEFAULT_BIND_ADDR.into(),
             key_id: "KEY123".into(),
             team_id: "TEAM456".into(),
             topic: "com.baybo.app".into(),
             instance_keys: vec!["inst-A".into()],
-            tls: None,
         }
     }
 

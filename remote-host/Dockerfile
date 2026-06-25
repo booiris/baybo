@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1
 #
-# remote-host "C" role binaries: remote-host-push (APNs sender) and
-# remote-host-relay (blind pairing/content rendezvous). remote-host is a
-# self-contained Cargo workspace (the repo root excludes it and it has no
-# path-deps reaching outside this directory), so the build context is just
-# remote-host/ — no repo-root crates are pulled in.
+# The unified remote-host "C" binary — serves the push (APNs sender) and/or
+# relay (blind pairing/content rendezvous) roles on one listener, selected at
+# runtime by PUSH_ENABLE / RELAY_ENABLE. remote-host is a self-contained Cargo
+# workspace (the repo root excludes it and it has no path-deps reaching outside
+# this directory), so the build context is just remote-host/.
 
 FROM rust:1.94.1-bookworm AS builder
 # rustls' crypto provider (aws-lc-rs) and ring (via jsonwebtoken) compile C +
@@ -20,17 +20,15 @@ COPY crates ./crates
 # are not part of the image layer.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --locked --bins \
+    cargo build --release --locked --bin remote-host \
     && mkdir -p /out \
-    && cp target/release/remote-host-push target/release/remote-host-relay /out/
+    && cp target/release/remote-host /out/
 
 FROM debian:bookworm-slim AS runtime
 # rustls validates TLS against the OS trust store (no roots are bundled), so
 # APNs egress needs ca-certificates at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /out/remote-host-push /usr/local/bin/remote-host-push
-COPY --from=builder /out/remote-host-relay /usr/local/bin/remote-host-relay
-# Each compose service selects its binary via `command:`; this default lets the
-# image also run standalone.
-CMD ["remote-host-relay"]
+COPY --from=builder /out/remote-host /usr/local/bin/remote-host
+# Roles are selected via PUSH_ENABLE / RELAY_ENABLE in the environment.
+CMD ["remote-host"]

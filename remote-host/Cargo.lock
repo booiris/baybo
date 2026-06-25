@@ -1154,6 +1154,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "remote-host"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "remote-host-push",
+ "remote-host-relay",
+ "remote-host-serve",
+ "tokio",
+]
+
+[[package]]
 name = "remote-host-dashboard"
 version = "0.1.0"
 dependencies = [
@@ -1172,7 +1183,6 @@ dependencies = [
  "axum",
  "jsonwebtoken",
  "parking_lot",
- "remote-host-serve",
  "reqwest",
  "serde",
  "serde_json",
@@ -1189,7 +1199,6 @@ dependencies = [
  "axum",
  "futures",
  "parking_lot",
- "remote-host-serve",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

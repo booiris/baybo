@@ -9,7 +9,7 @@
 # See docs/mobile-remote-host.md and docs/todo/mobile/phase1.md.
 [workspace]
 resolver = "2"
-members = ["crates/push", "crates/relay", "crates/dashboard", "crates/serve"]
+members = ["crates/push", "crates/relay", "crates/dashboard", "crates/serve", "crates/server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -31,6 +31,8 @@ axum = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = "0.23"
 remote-host-serve = { path = "crates/serve" }
+remote-host-push = { path = "crates/push" }
+remote-host-relay = { path = "crates/relay" }
 futures = "0.3"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 reqwest = { version = "0.13", features = ["json"] }

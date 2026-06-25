@@ -1,47 +1,42 @@
-# remote-host "C" role: push (APNs sender) + relay (blind rendezvous).
+# remote-host "C" role — one service serving push (APNs) + relay (rendezvous) on
+# a single listener, selected by PUSH_ENABLE / RELAY_ENABLE (their route paths
+# are disjoint: /notify + /register vs /pair, /content, /control).
 #
 # One-click:
 #   cp .env.example .env && $EDITOR .env      # fill APNS_* + *_INSTANCE_KEYS
 #   docker compose up -d --build
 #
-# Both binaries serve PLAIN http/ws and are meant to sit behind your TLS
-# terminator (e.g. proxy.baybo.space). See DEPLOY.md for TLS + gateway wiring.
+# Serves plain http/ws by default (front with a TLS terminator). For direct
+# wss/https on one port with no proxy, add the TLS overlay — see
+# docker-compose.tls.yml and DEPLOY.md.
+#
+# To isolate the .p8-holding push role on its own host, run one instance with
+# only RELAY_ENABLE=1 and another (the push host) with only PUSH_ENABLE=1.
 
 secrets:
-  # The APNs auth key never enters the image or env — it is mounted read-only at
-  # /run/secrets/apns_p8 from the host path you set in .env.
   apns_p8:
     file: ${APNS_P8_HOST_PATH:?set APNS_P8_HOST_PATH in .env to your AuthKey_*.p8}
 
 services:
-  push:
+  remote-host:
     build:
       context: .
       dockerfile: Dockerfile
     image: remote-host:latest
-    command: ["remote-host-push"]
     restart: unless-stopped
     environment:
+      PUSH_ENABLE: "1"
+      RELAY_ENABLE: "1"
+      BIND_ADDR: 0.0.0.0:8443
+      # push role (APNs)
       APNS_P8_PATH: /run/secrets/apns_p8
       APNS_KEY_ID: ${APNS_KEY_ID:?set APNS_KEY_ID in .env}
       APNS_TEAM_ID: ${APNS_TEAM_ID:?set APNS_TEAM_ID in .env}
       APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:?set APNS_BUNDLE_ID in .env}
       PUSH_INSTANCE_KEYS: ${PUSH_INSTANCE_KEYS:?set PUSH_INSTANCE_KEYS in .env}
-      PUSH_BIND_ADDR: 0.0.0.0:8443
+      # relay role
+      RELAY_INSTANCE_KEYS: ${RELAY_INSTANCE_KEYS:?set RELAY_INSTANCE_KEYS in .env}
     secrets:
       - apns_p8
     ports:
-      - "${PUSH_PORT:-8443}:8443"
-
-  relay:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: remote-host:latest
-    command: ["remote-host-relay"]
-    restart: unless-stopped
-    environment:
-      RELAY_INSTANCE_KEYS: ${RELAY_INSTANCE_KEYS:?set RELAY_INSTANCE_KEYS in .env}
-      RELAY_BIND_ADDR: 0.0.0.0:8444
-    ports:
-      - "${RELAY_PORT:-8444}:8444"
+      - "${PORT:-8443}:8443"
