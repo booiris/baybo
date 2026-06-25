@@ -27,7 +27,7 @@ services:
     environment:
       PUSH_ENABLE: "1"
       RELAY_ENABLE: "1"
-      BIND_ADDR: 0.0.0.0:8443
+      BIND_ADDR: 0.0.0.0:7777
       # push role (APNs)
       APNS_P8_PATH: /run/secrets/apns_p8
       APNS_KEY_ID: ${APNS_KEY_ID:?set APNS_KEY_ID in .env}
@@ -47,4 +47,4 @@ services:
       - ${TLS_CERT_HOST_PATH:-/dev/null}:/run/tls/cert.pem:ro
       - ${TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/key.pem:ro
     ports:
-      - "${PORT:-8443}:8443"
+      - "${PORT:-7777}:7777"

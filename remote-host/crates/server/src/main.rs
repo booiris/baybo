@@ -16,7 +16,7 @@ use remote_host_serve::TlsPaths;
 
 /// Listener address when `BIND_ADDR` is unset. Map it to the host `:443` (e.g.
 /// in docker) for a port-less wss/https URL.
-const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8443";
+const DEFAULT_BIND_ADDR: &str = "0.0.0.0:7777";
 
 #[tokio::main]
 async fn main() -> ExitCode {
