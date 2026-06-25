@@ -17,11 +17,11 @@ pub const CONTENT_JOIN: &str = "/content/join/{relay_node_id}";
 pub const CONTENT_HOST: &str = "/content/host/{relay_key}";
 
 /// First binary-JSON frame on [`CONTROL`] (gateway → C): the gateway names
-/// itself by `relay_node_id` and authenticates with `instance_key`.
+/// itself by `relay_node_id`. Admission rides the `x-instance-key` header on the
+/// dial (the shared pre-layer), like every other route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlHello {
     pub relay_node_id: String,
-    pub instance_key: String,
 }
 
 /// C → gateway signal, pushed over [`CONTROL`] as binary-JSON
@@ -47,7 +47,10 @@ pub fn control_url(base: &str) -> String {
 }
 /// `{base}/content/join/{relay_node_id}` — the app's content join leg.
 pub fn content_join_url(base: &str, relay_node_id: &str) -> String {
-    crate::join(base, &CONTENT_JOIN.replace("{relay_node_id}", relay_node_id))
+    crate::join(
+        base,
+        &CONTENT_JOIN.replace("{relay_node_id}", relay_node_id),
+    )
 }
 /// `{base}/content/host/{relay_key}` — the gateway's content data leg.
 pub fn content_host_url(base: &str, relay_key: &str) -> String {

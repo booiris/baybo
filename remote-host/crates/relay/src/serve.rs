@@ -6,14 +6,15 @@
 //! - `GET /pair/host/{code}` — the **gateway** side. Authenticated by the
 //!   gateway's admission key ([`INSTANCE_KEY_HEADER`]); on success it parks a
 //!   leg under `code` and waits for the app.
-//! - `GET /pair/join/{code}` — the **app** side. No credential (the app only
-//!   has the scanned code). It [`try_match`]es an already-hosted code and is
-//!   refused if no admitted gateway is hosting it.
+//! - `GET /pair/join/{code}` — the **app** side. Also gated by an admitted
+//!   instance key ([`INSTANCE_KEY_HEADER`], the one the QR carries), so only
+//!   key-holders can use the relay's pairing rendezvous. It [`try_match`]es an
+//!   already-hosted code and is refused if no admitted gateway is hosting it.
 //!
-//! That asymmetry is the broker's admission: only an admitted gateway can
-//! occupy a code, so an unauthenticated peer can pair with a waiting host but
-//! can neither squat codes nor flood the broker with parked legs. C stays blind
-//! — it copies opaque SPAKE2 frames and never sees the code's secret.
+//! Both legs must present an admitted key, but only the gateway's host leg parks
+//! and counts against the per-instance connection cap; the ephemeral app leg
+//! does not. The pairing secret stays the SPAKE2 `code` — C copies opaque frames
+//! and never sees it.
 //!
 //! [`try_match`]: RelayBroker::try_match
 
@@ -23,8 +24,9 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Extension, Path, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use remote_host_admission::Admission;
@@ -94,6 +96,9 @@ pub fn build_router(
         bandwidth,
         seq: Arc::new(AtomicU64::new(0)),
     };
+    // Every route admits via the shared `x-instance-key` pre-layer — including
+    // `/control`, whose key now rides the dial header too (its hello carries only
+    // the relay_node_id).
     Router::new()
         .route(PAIR_HOST, get(host_handler))
         .route(PAIR_JOIN, get(join_handler))
@@ -102,29 +107,60 @@ pub fn build_router(
         .route(CONTROL, get(control_handler))
         .route(CONTENT_JOIN, get(content_join_handler))
         .route(CONTENT_HOST, get(content_host_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admitted,
+        ))
         .with_state(state)
 }
 
-/// Gateway side: authenticate the instance key, then park a leg under `code`.
-async fn host_handler(
-    Path(code): Path<String>,
+/// `401 Unauthorized` for a missing or unadmitted instance key.
+fn unadmitted() -> Response {
+    (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response()
+}
+
+/// The admitted instance key for a request, stashed by [`require_admitted`] so
+/// the handlers that meter on it (the connection cap / bandwidth bucket) can read
+/// it back as an `Extension`.
+#[derive(Clone)]
+struct AdmittedKey(String);
+
+/// Admission pre-layer for the header-gated routes: `401` unless `x-instance-key`
+/// is present and admitted, then stash the validated key as an [`AdmittedKey`]
+/// extension. `/control` admits via its WS hello frame, so it is not behind this
+/// layer.
+async fn require_admitted(
     State(state): State<RelayState>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
+    mut req: Request,
+    next: Next,
 ) -> Response {
-    let Some(key) = headers
+    let Some(key) = req
+        .headers()
         .get(INSTANCE_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
     else {
-        return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
+        return unadmitted();
     };
     if !state.admitted.is_admitted(key) {
-        return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
+        return unadmitted();
     }
+    let key = key.to_owned();
+    req.extensions_mut().insert(AdmittedKey(key));
+    next.run(req).await
+}
+
+/// Gateway side: the admission pre-layer authenticates the instance key, then we
+/// park a leg under `code`.
+async fn host_handler(
+    Path(code): Path<String>,
+    State(state): State<RelayState>,
+    Extension(AdmittedKey(key)): Extension<AdmittedKey>,
+    ws: WebSocketUpgrade,
+) -> Response {
     // Cap how many connections one instance key may hold (control + legs).
     let Some((guard, kick)) = state
         .conns
-        .register(key, state.admitted.max_conns(key).map(|c| c as usize))
+        .register(&key, state.admitted.max_conns(&key).map(|c| c as usize))
     else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -136,8 +172,8 @@ async fn host_handler(
     // above and registering, a concurrent kick may have already passed us by, and
     // future polls won't re-target an already-removed key — so re-check and abort
     // rather than linger un-kicked. (`guard` drops here, deregistering.)
-    if !state.admitted.is_admitted(key) {
-        return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
+    if !state.admitted.is_admitted(&key) {
+        return unadmitted();
     }
     let leg = state.broker.join(&code);
     let broker = Arc::clone(&state.broker);
@@ -155,7 +191,10 @@ async fn host_handler(
     })
 }
 
-/// App side: match an already-hosted code; never park.
+/// App side: match an already-hosted code; never park. Symmetric admission — the
+/// pre-layer requires the app to present an admitted key too (the one the QR
+/// carries). The phone leg is ephemeral, so — unlike the host leg — it is not
+/// registered against the gateway's per-instance connection cap.
 async fn join_handler(
     Path(code): Path<String>,
     State(state): State<RelayState>,
@@ -167,16 +206,19 @@ async fn join_handler(
     }
 }
 
-/// Gateway control connection. The gateway dials this and holds it open; the
-/// first frame is a JSON [`ControlHello`] (admission key + `relay_node_id`).
-/// After admission, C pushes `ControlSignal`s ("a phone arrived, open a data
-/// leg") over it. Admission rides the hello (not a header) so the same dial both
-/// authenticates and identifies the gateway.
-async fn control_handler(State(state): State<RelayState>, ws: WebSocketUpgrade) -> Response {
-    capped(ws).on_upgrade(move |socket| run_control(socket, state))
+/// Gateway control connection. The admission pre-layer authenticates the
+/// `x-instance-key` header; the gateway then holds the WS open, naming itself
+/// with a [`ControlHello`] (`relay_node_id`). C pushes `ControlSignal`s ("a phone
+/// arrived, open a data leg") over it.
+async fn control_handler(
+    State(state): State<RelayState>,
+    Extension(AdmittedKey(key)): Extension<AdmittedKey>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    capped(ws).on_upgrade(move |socket| run_control(socket, state, key))
 }
 
-async fn run_control(mut socket: WebSocket, state: RelayState) {
+async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
     let hello = match socket.recv().await {
         Some(Ok(AxumMessage::Binary(b))) => match serde_json::from_slice::<ControlHello>(&b) {
             Ok(h) => h,
@@ -187,22 +229,16 @@ async fn run_control(mut socket: WebSocket, state: RelayState) {
         },
         _ => return,
     };
-    if !state.admitted.is_admitted(&hello.instance_key) {
-        tracing::warn!("control: instance key not admitted; closing");
-        return;
-    }
     tracing::info!(node = %hello.relay_node_id, "control: gateway connected");
     // The control connection is exempt from the per-key cap (essential, ~one per
     // gateway) so a gateway at its leg limit can still (re)establish control.
-    let (_kick_guard, mut kick) = state.conns.register_unchecked(&hello.instance_key);
-    // Close the TOCTOU window (see the host handlers): a concurrent revoke's kick
-    // may have run between the admission check and registering.
-    if !state.admitted.is_admitted(&hello.instance_key) {
+    let (_kick_guard, mut kick) = state.conns.register_unchecked(&key);
+    // Close the TOCTOU window (see the host handlers): the pre-layer admitted the
+    // key, but a concurrent revoke's kick may have run before we registered.
+    if !state.admitted.is_admitted(&key) {
         return;
     }
-    let mut rx = state
-        .control
-        .register(&hello.relay_node_id, &hello.instance_key);
+    let mut rx = state.control.register(&hello.relay_node_id, &key);
     // `register` replaces any prior slot (reconnect wins); if our slot is
     // superseded, `rx` closes and we must NOT unregister the new owner.
     let mut superseded = false;
@@ -259,8 +295,9 @@ async fn content_join_handler(
     ws: WebSocketUpgrade,
 ) -> Response {
     let relay_key = format!("dl-{}", state.seq.fetch_add(1, Ordering::Relaxed));
-    // Signaling resolves the owning gateway's instance key, so this anonymous
-    // phone leg meters against the same bandwidth bucket as the gateway's leg.
+    // The phone leg is admitted by the pre-layer like every other route, but
+    // metering keys on the *gateway's* instance key (resolved by signaling) so
+    // both legs of a content session share one bandwidth bucket.
     let Some(instance_key) = state.control.signal_open(&relay_node_id, &relay_key).await else {
         return (StatusCode::NOT_FOUND, "gateway not connected").into_response();
     };
@@ -282,22 +319,13 @@ async fn content_join_handler(
 async fn content_host_handler(
     Path(relay_key): Path<String>,
     State(state): State<RelayState>,
-    headers: HeaderMap,
+    Extension(AdmittedKey(key)): Extension<AdmittedKey>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let Some(key) = headers
-        .get(INSTANCE_KEY_HEADER)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
-    };
-    if !state.admitted.is_admitted(key) {
-        return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
-    }
     // Cap how many connections one instance key may hold (control + legs).
     let Some((guard, kick)) = state
         .conns
-        .register(key, state.admitted.max_conns(key).map(|c| c as usize))
+        .register(&key, state.admitted.max_conns(&key).map(|c| c as usize))
     else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -309,12 +337,12 @@ async fn content_host_handler(
     // above and registering, a concurrent kick may have already passed us by, and
     // future polls won't re-target an already-removed key — so re-check and abort
     // rather than linger un-kicked. (`guard` drops here, deregistering.)
-    if !state.admitted.is_admitted(key) {
-        return (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response();
+    if !state.admitted.is_admitted(&key) {
+        return unadmitted();
     }
     let limiter = state
         .bandwidth
-        .limiter_for(key, state.admitted.max_bps(key));
+        .limiter_for(&key, state.admitted.max_bps(&key));
     let leg = state.broker.join(&relay_key);
     let broker = Arc::clone(&state.broker);
     capped(ws).on_upgrade(move |socket| async move {
@@ -367,11 +395,19 @@ mod tests {
         client_async(req, stream).await.unwrap().0
     }
 
-    async fn connect_join(port: u16, code: &str) -> Result<WebSocketStream<TcpStream>, WsError> {
+    async fn connect_join(
+        port: u16,
+        code: &str,
+        key: Option<&str>,
+    ) -> Result<WebSocketStream<TcpStream>, WsError> {
         let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let req = format!("ws://127.0.0.1:{port}/pair/join/{code}")
+        let mut req = format!("ws://127.0.0.1:{port}/pair/join/{code}")
             .into_client_request()
             .unwrap();
+        if let Some(k) = key {
+            req.headers_mut()
+                .insert(INSTANCE_KEY_HEADER, k.parse().unwrap());
+        }
         Ok(client_async(req, stream).await?.0)
     }
 
@@ -381,7 +417,9 @@ mod tests {
         // The host parks synchronously inside the handler before its 101, so by
         // the time `connect_host` returns the leg is already waiting to match.
         let mut host = connect_host(port, "CODE1", Some("inst-A")).await;
-        let mut app = connect_join(port, "CODE1").await.expect("host is parked");
+        let mut app = connect_join(port, "CODE1", Some("inst-A"))
+            .await
+            .expect("host is parked");
 
         host.send(Message::Binary(b"a->p".to_vec())).await.unwrap();
         assert_eq!(recv_bin(&mut app).await, b"a->p");
@@ -397,7 +435,9 @@ mod tests {
         let port = serve().await;
         // Hold the host leg so the app's join matches; it's torn down at the end.
         let host = connect_host(port, "BIG", Some("inst-A")).await;
-        let mut app = connect_join(port, "BIG").await.expect("host is parked");
+        let mut app = connect_join(port, "BIG", Some("inst-A"))
+            .await
+            .expect("host is parked");
 
         // One byte over the cap. The client write may flush locally; the server
         // rejects it on read and tears the connection down.
@@ -434,28 +474,52 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn join_without_host_is_refused() {
         let port = serve().await;
-        match connect_join(port, "NOHOST").await {
+        match connect_join(port, "NOHOST", Some("inst-A")).await {
             Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::NOT_FOUND),
             other => panic!("expected 404, got {other:?}"),
         }
     }
 
-    async fn connect_control(port: u16) -> WebSocketStream<TcpStream> {
+    /// Symmetric admission: the app's join leg also needs an admitted key — a
+    /// keyless join is 401'd even when a gateway is hosting the code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_without_an_admitted_key_is_rejected() {
+        let port = serve().await;
+        let _host = connect_host(port, "CODEK", Some("inst-A")).await;
+        match connect_join(port, "CODEK", None).await {
+            Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::UNAUTHORIZED),
+            other => panic!("expected 401, got {other:?}"),
+        }
+    }
+
+    async fn connect_control(
+        port: u16,
+        key: Option<&str>,
+    ) -> Result<WebSocketStream<TcpStream>, WsError> {
         let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let req = format!("ws://127.0.0.1:{port}/control")
+        let mut req = format!("ws://127.0.0.1:{port}/control")
             .into_client_request()
             .unwrap();
-        client_async(req, stream).await.unwrap().0
+        if let Some(k) = key {
+            req.headers_mut()
+                .insert(INSTANCE_KEY_HEADER, k.parse().unwrap());
+        }
+        Ok(client_async(req, stream).await?.0)
     }
 
     async fn connect_content_join(
         port: u16,
         node: &str,
+        key: Option<&str>,
     ) -> Result<WebSocketStream<TcpStream>, WsError> {
         let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let req = format!("ws://127.0.0.1:{port}/content/join/{node}")
+        let mut req = format!("ws://127.0.0.1:{port}/content/join/{node}")
             .into_client_request()
             .unwrap();
+        if let Some(k) = key {
+            req.headers_mut()
+                .insert(INSTANCE_KEY_HEADER, k.parse().unwrap());
+        }
         Ok(client_async(req, stream).await?.0)
     }
 
@@ -491,8 +555,8 @@ mod tests {
         let port = serve().await;
 
         // Gateway holds its control connection (admitted) under node-1.
-        let mut control = connect_control(port).await;
-        let hello = serde_json::json!({ "relay_node_id": "node-1", "instance_key": "inst-A" });
+        let mut control = connect_control(port, Some("inst-A")).await.unwrap();
+        let hello = serde_json::json!({ "relay_node_id": "node-1" });
         control
             .send(Message::Binary(serde_json::to_vec(&hello).unwrap()))
             .await
@@ -502,7 +566,7 @@ mod tests {
         // briefly until C admits the join (the gateway is registered).
         let mut app = None;
         for _ in 0..40 {
-            match connect_content_join(port, "node-1").await {
+            match connect_content_join(port, "node-1", Some("inst-A")).await {
                 Ok(ws) => {
                     app = Some(ws);
                     break;
@@ -535,25 +599,34 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn content_join_without_a_connected_gateway_is_refused() {
         let port = serve().await;
-        match connect_content_join(port, "ghost-node").await {
+        match connect_content_join(port, "ghost-node", Some("inst-A")).await {
             Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::NOT_FOUND),
             other => panic!("expected 404, got {other:?}"),
         }
     }
 
-    /// An unadmitted gateway control hello is dropped (the WS closes), so it can
-    /// never receive signals or be named by a phone.
+    /// Symmetric admission on content too: a keyless content-join is 401'd
+    /// (before any gateway signaling).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unadmitted_control_hello_is_dropped() {
+    async fn content_join_without_an_admitted_key_is_rejected() {
         let port = serve().await;
-        let mut control = connect_control(port).await;
-        let hello = serde_json::json!({ "relay_node_id": "node-x", "instance_key": "bogus" });
-        control
-            .send(Message::Binary(serde_json::to_vec(&hello).unwrap()))
-            .await
-            .unwrap();
-        // A phone naming node-x is refused — the bogus gateway never registered.
-        match connect_content_join(port, "node-x").await {
+        match connect_content_join(port, "node-1", None).await {
+            Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::UNAUTHORIZED),
+            other => panic!("expected 401, got {other:?}"),
+        }
+    }
+
+    /// An unadmitted key is refused at the control dial itself (the pre-layer
+    /// 401s), so the gateway never registers and a phone naming it is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unadmitted_control_dial_is_rejected() {
+        let port = serve().await;
+        match connect_control(port, Some("bogus")).await {
+            Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::UNAUTHORIZED),
+            other => panic!("expected 401, got {other:?}"),
+        }
+        // No gateway registered for node-x, so a phone naming it is refused.
+        match connect_content_join(port, "node-x", Some("inst-A")).await {
             Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::NOT_FOUND),
             other => panic!("expected 404, got {other:?}"),
         }
@@ -577,8 +650,8 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut control = connect_control(port).await;
-        let hello = serde_json::json!({ "relay_node_id": "node-1", "instance_key": "inst-A" });
+        let mut control = connect_control(port, Some("inst-A")).await.unwrap();
+        let hello = serde_json::json!({ "relay_node_id": "node-1" });
         control
             .send(Message::Binary(serde_json::to_vec(&hello).unwrap()))
             .await
