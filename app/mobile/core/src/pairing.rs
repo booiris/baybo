@@ -52,9 +52,9 @@ pub struct PairedGateway {
     /// shared Keychain for the NSE.
     pub push_key: [u8; KEY_LEN],
     pub relay_node_id: String,
-    /// Base WS URL of the blind relay (C); the app dials
-    /// `{relay_url}/content/join/{relay_node_id}` to reach a NAT'd gateway when
-    /// every direct candidate fails. Empty when relay is off.
+    /// Base WS URL of the blind relay (C); the app dials the relay's content-join
+    /// route (`remote_host_protocol::relay::content_join_url`) to reach a NAT'd
+    /// gateway when every direct candidate fails. Empty when relay is off.
     pub relay_url: String,
     pub direct_candidates: Vec<String>,
     /// The code this device paired under (retained for audit).
