@@ -6,12 +6,20 @@ edition.workspace = true
 [lib]
 doctest = false
 
+[features]
+# ts-rs codegen for the IPC DTOs (PairChallenge/PairedSummary), emitted to the
+# webview's src/generated/. Off by default so iOS/release builds skip ts-rs.
+ts-export = ["dep:ts-rs"]
+
 [dependencies]
 wire = { workspace = true }
 device-proto = { workspace = true }
 baybo-model = { workspace = true }
 thiserror = { workspace = true }
 snow = { workspace = true }
+serde = { workspace = true }
+# Optional: only compiled for the `ts-export` feature (the IPC-DTO codegen).
+ts-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

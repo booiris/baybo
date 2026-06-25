@@ -19,7 +19,7 @@ pub mod pairing;
 pub use connect::{ConnectError, Endpoint, connect_first, connection_plan, endpoints};
 pub use content::{ContentHandshake, ContentSession, subscribe_frame, user_text_frame};
 pub use error::MobileError;
-pub use pairing::{PairedGateway, PairingClient, PairingRequest};
+pub use pairing::{PairChallenge, PairedGateway, PairedSummary, PairingClient, PairingRequest};
 
 // Re-export the wire `Frame` so the shell renders threads against the same type
 // the gateway emits.

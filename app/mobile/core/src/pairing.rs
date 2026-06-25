@@ -18,6 +18,7 @@ use device_proto::aead::KEY_LEN;
 use device_proto::kdf::{PairKeys, derive_confirm_code, derive_pair_keys};
 use device_proto::pairing::{self, ApnsEnv, DeviceConfirm, DeviceHello, GatewayWelcome, PairFrame};
 use device_proto::pake::Pake;
+use serde::Serialize;
 
 use crate::error::MobileError;
 
@@ -59,6 +60,42 @@ pub struct PairedGateway {
     pub direct_candidates: Vec<String>,
     /// The code this device paired under (retained for audit).
     pub pairing_code: String,
+}
+
+/// What `pair_begin` returns (a Tauri IPC DTO): the confirmation code to show
+/// the user + the device id the UI passes back to `pair_confirm`.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../src/generated/"))]
+#[serde(rename_all = "camelCase")]
+pub struct PairChallenge {
+    pub device_id: String,
+    pub confirm_code: String,
+}
+
+/// What the UI renders after a successful pairing (a Tauri IPC DTO). The secrets
+/// (`auth_token`, `push_key`, the Noise static secret) are persisted by the
+/// shell, never returned to the webview.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../src/generated/"))]
+#[serde(rename_all = "camelCase")]
+pub struct PairedSummary {
+    pub user_id: String,
+    pub relay_node_id: String,
+    pub direct_candidates: Vec<String>,
+    pub pairing_code: String,
+}
+
+impl From<&PairedGateway> for PairedSummary {
+    fn from(p: &PairedGateway) -> Self {
+        Self {
+            user_id: p.user_id.clone(),
+            relay_node_id: p.relay_node_id.clone(),
+            direct_candidates: p.direct_candidates.clone(),
+            pairing_code: p.pairing_code.clone(),
+        }
+    }
 }
 
 /// App-side pairing state machine.

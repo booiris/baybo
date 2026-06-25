@@ -1,20 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
-
-/// Mirror of `PairChallenge` returned by `pair_begin` (src-tauri): the
-/// confirmation code to compare + the device id to pass back to `pair_confirm`.
-type PairChallenge = {
-  deviceId: string;
-  confirmCode: string;
-};
-
-/// Mirror of `PairedSummary` returned by `pair_confirm` (src-tauri).
-type PairedSummary = {
-  userId: string;
-  relayNodeId: string;
-  directCandidates: string[];
-  pairingCode: string;
-};
+// PairChallenge / PairedSummary are generated from the src-tauri IPC structs by
+// ts-rs (cargo test -p baybo-mobile-app --features ts-export); the bindings are
+// regenerated + drift-checked by scripts/check-ts-bindings.sh.
+import type { PairChallenge } from "./generated/PairChallenge";
+import type { PairedSummary } from "./generated/PairedSummary";
 
 /// Parse a `baybo://pair?h=<endpoint>&c=<code>&relay=1` QR payload, or fall back
 /// to treating the whole scanned string as the bare code. `relay=1` means join

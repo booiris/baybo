@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use baybo_mobile_core::{PairedGateway, PairingClient, PairingRequest};
+use baybo_mobile_core::{PairingClient, PairingRequest};
 use device_proto::noise::StaticKeypair;
 use device_proto::pairing::{self, ApnsEnv, PairFrame};
 use futures_util::{SinkExt, StreamExt};
@@ -71,37 +71,11 @@ pub(crate) fn load_paired_record() -> Result<Option<PairedRecord>, String> {
         .map_err(|e| format!("decode paired record: {e}"))
 }
 
-/// What `pair_begin` returns: the confirmation code to show the user + the
-/// device id the UI passes back to `pair_confirm`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PairChallenge {
-    pub device_id: String,
-    pub confirm_code: String,
-}
-
-/// What the UI renders after a successful pairing. The secrets (`auth_token`,
-/// `push_key`, the Noise static secret) are persisted by the shell, never
-/// returned to the webview.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PairedSummary {
-    pub user_id: String,
-    pub relay_node_id: String,
-    pub direct_candidates: Vec<String>,
-    pub pairing_code: String,
-}
-
-impl From<&PairedGateway> for PairedSummary {
-    fn from(p: &PairedGateway) -> Self {
-        Self {
-            user_id: p.user_id.clone(),
-            relay_node_id: p.relay_node_id.clone(),
-            direct_candidates: p.direct_candidates.clone(),
-            pairing_code: p.pairing_code.clone(),
-        }
-    }
-}
+/// The IPC DTOs ([`PairChallenge`] / [`PairedSummary`]) live in
+/// baybo-mobile-core beside [`PairedGateway`], where ts-rs generates their TS
+/// (core's `ts-export` feature). Re-exported so the commands + lib.rs keep
+/// referring to them as `pairing::*`.
+pub use baybo_mobile_core::{PairChallenge, PairedSummary};
 
 /// Phase 1: dial `endpoint`, run SPAKE2 + send the sealed `DeviceHello`, and
 /// return the confirmation code for the user to compare against the operator's
