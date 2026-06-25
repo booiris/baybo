@@ -1,21 +1,21 @@
-# remote-host "C" role — one service serving push (APNs) + relay (rendezvous) on
-# a single listener, selected by PUSH_ENABLE / RELAY_ENABLE (their route paths
-# are disjoint: /notify + /register vs /pair, /content, /control).
+# remote-host "C" role — one service, one listener. The relay is always on; the
+# push role turns on automatically when you configure an APNs .p8
+# (APNS_P8_HOST_PATH in .env). Their route paths are disjoint (/notify +
+# /register vs /pair, /content, /control).
 #
 # Serves plain ws/http by default. Set TLS_CERT_HOST_PATH + TLS_KEY_HOST_PATH in
 # .env and it serves wss/https instead (one cert covers both roles); set PORT=443
 # for port-less URLs.
 #
 # One-click:
-#   cp .env.example .env && $EDITOR .env      # fill APNS_* + *_INSTANCE_KEYS
+#   cp .env.example .env && $EDITOR .env
 #   docker compose up -d --build
-#
-# To isolate the .p8-holding push role on its own host, run one instance with
-# only RELAY_ENABLE=1 and another (the push host) with only PUSH_ENABLE=1.
 
 secrets:
+  # The .p8 — falls back to a /dev/null placeholder when unset (push stays off,
+  # so it's never read). Mounted read-only; never enters an image layer.
   apns_p8:
-    file: ${APNS_P8_HOST_PATH:?set APNS_P8_HOST_PATH in .env to your AuthKey_*.p8}
+    file: ${APNS_P8_HOST_PATH:-/dev/null}
 
 services:
   remote-host:
@@ -25,25 +25,21 @@ services:
     image: remote-host:latest
     restart: unless-stopped
     environment:
-      PUSH_ENABLE: "1"
-      RELAY_ENABLE: "1"
       BIND_ADDR: 0.0.0.0:7777
-      # push role (APNs)
-      APNS_P8_PATH: /run/secrets/apns_p8
-      APNS_KEY_ID: ${APNS_KEY_ID:?set APNS_KEY_ID in .env}
-      APNS_TEAM_ID: ${APNS_TEAM_ID:?set APNS_TEAM_ID in .env}
-      APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:?set APNS_BUNDLE_ID in .env}
-      PUSH_INSTANCE_KEYS: ${PUSH_INSTANCE_KEYS:?set PUSH_INSTANCE_KEYS in .env}
-      # relay role
+      # relay (always on)
       RELAY_INSTANCE_KEYS: ${RELAY_INSTANCE_KEYS:?set RELAY_INSTANCE_KEYS in .env}
-      # TLS: set only when a cert is configured (-> wss/https), else blank (-> ws/http)
+      # push — enabled automatically when APNS_P8_HOST_PATH is set in .env
+      APNS_P8_PATH: ${APNS_P8_HOST_PATH:+/run/secrets/apns_p8}
+      APNS_KEY_ID: ${APNS_KEY_ID:-}
+      APNS_TEAM_ID: ${APNS_TEAM_ID:-}
+      APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:-}
+      PUSH_INSTANCE_KEYS: ${PUSH_INSTANCE_KEYS:-}
+      # TLS — set only when a cert is configured (-> wss/https), else blank (-> ws/http)
       TLS_CERT: ${TLS_CERT_HOST_PATH:+/run/tls/cert.pem}
       TLS_KEY: ${TLS_KEY_HOST_PATH:+/run/tls/key.pem}
     secrets:
       - apns_p8
     volumes:
-      # Mount the cert+key when configured; otherwise a harmless /dev/null
-      # placeholder (TLS_CERT/TLS_KEY stay blank, so the binary never reads it).
       - ${TLS_CERT_HOST_PATH:-/dev/null}:/run/tls/cert.pem:ro
       - ${TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/key.pem:ro
     ports:

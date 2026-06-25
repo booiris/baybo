@@ -1,17 +1,16 @@
 # Deploying remote-host (the "C" role) with Docker Compose
 
 `remote-host` is the operator-run **C** role: a single binary serving two roles
-on one listener, each enabled by an env flag and reached by disjoint route paths.
+on one listener, reached by disjoint route paths.
 
-| Role | Enable | Routes | What it does |
-|------|--------|--------|--------------|
-| **push** | `PUSH_ENABLE=1` | `POST /notify`, `POST /register` | Holds the APNs `.p8`; signs ES256 JWTs and POSTs the blind encrypted preview to Apple. |
-| **relay** | `RELAY_ENABLE=1` | `/pair/host/{code}`, `/pair/join/{code}`, `/control`, `/content/join/{node}`, `/content/host/{key}` | Blind WebSocket rendezvous for pairing + content (NAT'd gateways). Stateless. |
+| Role | When it runs | Routes | What it does |
+|------|--------------|--------|--------------|
+| **relay** | always on | `/pair/host/{code}`, `/pair/join/{code}`, `/control`, `/content/join/{node}`, `/content/host/{key}` | Blind WebSocket rendezvous for pairing + content (NAT'd gateways). Stateless. |
+| **push** | auto, when an APNs `.p8` is configured (`APNS_P8_HOST_PATH`) | `POST /notify`, `POST /register` | Holds the APNs `.p8`; signs ES256 JWTs and POSTs the blind encrypted preview to Apple. |
 
-Enable both to share one port, or just one for an isolated deployment (e.g. the
-`.p8`-holding push role on its own host). It serves **plain `ws/http`** by
-default, or **`wss/https`** when you configure a cert. (`remote-host-dashboard`
-is a library, not a service.)
+So a bare config runs relay only; fill the APNs section in `.env` to add push.
+It serves **plain `ws/http`** by default, or **`wss/https`** when you configure a
+cert. (`remote-host-dashboard` is a library, not a service.)
 
 ## Quick start
 
@@ -92,7 +91,7 @@ Both URLs resolve to the one `remote-host` listener (the disjoint paths route to
 
 ## Notes
 
-- **Isolation.** To keep the `.p8`-holding push role off the relay host, run two instances: one with `RELAY_ENABLE=1` (no APNs env) and one — on a separate host — with `PUSH_ENABLE=1`. The unified binary with a single flag is exactly the old standalone role.
+- **Relay-only / `.p8` isolation.** Leave the APNs section of `.env` blank and only the relay runs — no `.p8` on that host. Fill it in to add push. The `.p8` lives solely where you configure it.
 - **State is in-memory.** A restart drops device-token registrations and admission state; devices re-register on their next pairing/heartbeat, and the gateway re-registers an approved device before its first push. No volumes needed (the only mounts are the read-only `.p8` and, when TLS is configured, the cert/key).
 - **APNs environment.** Push targets sandbox vs production **per device registration** (the token's env), so one deployment serves both — no env switch here. A debug-built app registers a sandbox token.
 - **Logs** go to stderr (the relay has no `tracing` subscriber wired, so only the `eprintln!` startup/error lines are guaranteed).

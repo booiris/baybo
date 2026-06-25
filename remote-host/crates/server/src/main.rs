@@ -1,11 +1,9 @@
-//! The unified remote-host ("C") binary: serve the push and/or relay roles on a
-//! single listener, selected by `PUSH_ENABLE` / `RELAY_ENABLE` and distinguished
-//! by their disjoint route paths (`/notify` + `/register` vs `/pair`, `/content`,
-//! `/control`). Enable one role for an isolated deployment (e.g. the
-//! `.p8`-holding push role on its own host), or both to share a port.
-//!
-//! Bind + TLS are configured once here (`BIND_ADDR`, and optional `TLS_CERT` +
-//! `TLS_KEY` to serve wss/https directly); each role contributes only its router.
+//! The unified remote-host ("C") binary: serve the relay and (optionally) push
+//! roles on a single listener, distinguished by their disjoint route paths
+//! (`/notify` + `/register` vs `/pair`, `/content`, `/control`). The **relay is
+//! always on**; **push turns on automatically when an APNs `.p8` is configured**
+//! (`APNS_P8_PATH` is set). Bind + TLS are configured here (`BIND_ADDR`, and
+//! optional `TLS_CERT` + `TLS_KEY` to serve wss/https directly).
 
 use std::process::ExitCode;
 
@@ -29,35 +27,26 @@ async fn main() -> ExitCode {
     }
 }
 
-/// A truthy env flag (`1` / `true` / `yes` / `on`, case-insensitive).
-fn enabled(var: &str) -> bool {
-    std::env::var(var)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let push_on = enabled("PUSH_ENABLE");
-    let relay_on = enabled("RELAY_ENABLE");
-    if !push_on && !relay_on {
-        return Err("enable at least one role: set PUSH_ENABLE=1 and/or RELAY_ENABLE=1".into());
-    }
-
     let mut app = Router::new();
     let mut roles: Vec<&str> = Vec::new();
 
-    if push_on {
+    // Push turns on only when an APNs .p8 is configured.
+    let p8_configured = std::env::var("APNS_P8_PATH")
+        .ok()
+        .is_some_and(|p| !p.is_empty());
+    if p8_configured {
         let (config, p8_path) = PushConfig::from_env()?;
         let p8_pem = std::fs::read(&p8_path)
             .map_err(|e| format!("read .p8 at {}: {e}", p8_path.display()))?;
         app = app.merge(push_router(&config, &p8_pem)?);
         roles.push("push");
     }
-    if relay_on {
-        let config = RelayConfig::from_env()?;
-        app = app.merge(relay_router(&config));
-        roles.push("relay");
-    }
+
+    // Relay is always on (it needs RELAY_INSTANCE_KEYS, validated in from_env).
+    let relay = RelayConfig::from_env()?;
+    app = app.merge(relay_router(&relay));
+    roles.push("relay");
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into());
     let tls = TlsPaths::from_env("TLS_CERT", "TLS_KEY")?;
