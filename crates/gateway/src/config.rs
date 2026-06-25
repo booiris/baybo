@@ -34,12 +34,11 @@ impl RuntimeGatewayConfig {
                 addr: format!("{}:{}", config.bind_address, config.port),
                 reason: format!("invalid socket address: {e}"),
             })?;
-        let relay = (config.relay.enabled && !config.relay.url.is_empty()).then(|| {
-            RelayPairRuntime {
+        let relay =
+            (config.relay.enabled && !config.relay.url.is_empty()).then(|| RelayPairRuntime {
                 url: config.relay.url.clone(),
                 instance_key: config.relay.instance_key.clone(),
-            }
-        });
+            });
         Ok(Self {
             admin_bind: addr,
             cors_allowed_origins: config.cors_allowed_origins.clone(),

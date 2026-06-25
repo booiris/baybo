@@ -73,7 +73,9 @@ use remote_host_protocol::push::{NotifyRequest, RegisterRequest};
 fn to_wire_env(env: device_proto::pairing::ApnsEnv) -> remote_host_protocol::push::ApnsEnv {
     match env {
         device_proto::pairing::ApnsEnv::Sandbox => remote_host_protocol::push::ApnsEnv::Sandbox,
-        device_proto::pairing::ApnsEnv::Production => remote_host_protocol::push::ApnsEnv::Production,
+        device_proto::pairing::ApnsEnv::Production => {
+            remote_host_protocol::push::ApnsEnv::Production
+        }
     }
 }
 
@@ -144,7 +146,11 @@ impl HttpApnsRegistrar {
     /// `client` should be the workspace's proxy-aware client
     /// ([`baybo_security::http::client`]) — `/register` POSTs to the remote
     /// host (C), a non-loopback egress target subject to the egress proxy.
-    pub fn new(gateway_url: &str, instance_key: impl Into<String>, client: reqwest::Client) -> Self {
+    pub fn new(
+        gateway_url: &str,
+        instance_key: impl Into<String>,
+        client: reqwest::Client,
+    ) -> Self {
         Self {
             client,
             register_url: remote_host_protocol::push::register_url(gateway_url),

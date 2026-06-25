@@ -124,12 +124,22 @@ mod tests {
     #[test]
     fn confirm_code_is_stable_padded_and_secret_dependent() {
         let code = derive_confirm_code(b"shared spake2 master secret").unwrap();
-        assert_eq!(code.len(), CONFIRM_CODE_DIGITS as usize, "zero-padded width");
+        assert_eq!(
+            code.len(),
+            CONFIRM_CODE_DIGITS as usize,
+            "zero-padded width"
+        );
         assert!(code.chars().all(|c| c.is_ascii_digit()));
         // Both ends derive the same code from the same K...
-        assert_eq!(code, derive_confirm_code(b"shared spake2 master secret").unwrap());
+        assert_eq!(
+            code,
+            derive_confirm_code(b"shared spake2 master secret").unwrap()
+        );
         // ...and a different K (e.g. a MITM with a different secret) almost
         // certainly shows a different number.
-        assert_ne!(code, derive_confirm_code(b"different master secret").unwrap());
+        assert_ne!(
+            code,
+            derive_confirm_code(b"different master secret").unwrap()
+        );
     }
 }

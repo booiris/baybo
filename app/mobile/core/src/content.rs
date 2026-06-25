@@ -16,8 +16,8 @@
 
 use baybo_model::{ChannelType, SessionId};
 use device_proto::noise::{FrameReassembler, NOISE_MAX_MESSAGE, StaticKeypair, write_chunked};
-use wire::{Frame, Message, MessageRole, decode, encode};
 use snow::{HandshakeState, TransportState};
+use wire::{Frame, Message, MessageRole, decode, encode};
 
 use crate::error::MobileError;
 
@@ -197,7 +197,10 @@ mod tests {
             ordinal: None,
         });
         let sealed = session.seal(&big).unwrap();
-        assert!(sealed.len() > 1, "a 200 KB frame spans several Noise messages");
+        assert!(
+            sealed.len() > 1,
+            "a 200 KB frame spans several Noise messages"
+        );
         assert_eq!(drain(&mut gw_reasm, &mut gw_t, &sealed), vec![big]);
     }
 

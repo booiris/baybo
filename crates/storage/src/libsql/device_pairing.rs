@@ -219,12 +219,20 @@ mod tests {
         // Operator declines, then (on a re-pair) approves — the value round-trips.
         s.set_operator_decision("CONF01", false).await.unwrap();
         assert_eq!(
-            s.get_slot("CONF01").await.unwrap().unwrap().operator_decision,
+            s.get_slot("CONF01")
+                .await
+                .unwrap()
+                .unwrap()
+                .operator_decision,
             Some(false)
         );
         s.set_operator_decision("CONF01", true).await.unwrap();
         assert_eq!(
-            s.get_slot("CONF01").await.unwrap().unwrap().operator_decision,
+            s.get_slot("CONF01")
+                .await
+                .unwrap()
+                .unwrap()
+                .operator_decision,
             Some(true)
         );
     }

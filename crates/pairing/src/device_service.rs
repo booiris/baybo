@@ -235,7 +235,11 @@ mod tests {
         // Operator approves in the live session.
         svc.set_operator_decision(&code, true).await.unwrap();
         assert_eq!(
-            svc.claim_slot(&code).await.unwrap().unwrap().operator_decision,
+            svc.claim_slot(&code)
+                .await
+                .unwrap()
+                .unwrap()
+                .operator_decision,
             Some(true)
         );
 

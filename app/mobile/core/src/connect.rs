@@ -108,7 +108,9 @@ mod tests {
             vec![
                 Endpoint::Direct("wss://baybo.lan".into()),
                 Endpoint::Direct("wss://baybo.ts".into()),
-                Endpoint::Relay { node_id: "node-1".into() },
+                Endpoint::Relay {
+                    node_id: "node-1".into()
+                },
             ],
         );
     }

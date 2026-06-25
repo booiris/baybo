@@ -176,7 +176,10 @@ mod tests {
         assert_eq!(kicked, 1, "only inst-A is revoked");
         // inst-A's receiver resolved (sender dropped); inst-B's is untouched.
         assert!(rx_a.await.is_err(), "kicked receiver resolves");
-        assert!(rx_b.try_recv().is_err(), "inst-B still pending (not resolved)");
+        assert!(
+            rx_b.try_recv().is_err(),
+            "inst-B still pending (not resolved)"
+        );
     }
 
     #[tokio::test]
@@ -193,10 +196,16 @@ mod tests {
         let reg = Arc::new(ConnectionRegistry::new().with_max_per_key(2));
         let a = reg.register("k", None).expect("1st is under the cap");
         let _b = reg.register("k", None).expect("2nd is under the cap");
-        assert!(reg.register("k", None).is_none(), "3rd exceeds the cap and is refused");
+        assert!(
+            reg.register("k", None).is_none(),
+            "3rd exceeds the cap and is refused"
+        );
         assert!(reg.register("other", None).is_some(), "the cap is per-key");
         drop(a);
-        assert!(reg.register("k", None).is_some(), "a freed slot is reusable");
+        assert!(
+            reg.register("k", None).is_some(),
+            "a freed slot is reusable"
+        );
     }
 
     #[test]
@@ -206,14 +215,20 @@ mod tests {
         let _a = reg.register("k", Some(3)).expect("1st under the override");
         let _b = reg.register("k", Some(3)).expect("2nd under the override");
         let _c = reg.register("k", Some(3)).expect("3rd under the override");
-        assert!(reg.register("k", Some(3)).is_none(), "4th exceeds the override");
+        assert!(
+            reg.register("k", Some(3)).is_none(),
+            "4th exceeds the override"
+        );
     }
 
     #[tokio::test]
     async fn control_connection_is_exempt_from_the_cap() {
         let reg = Arc::new(ConnectionRegistry::new().with_max_per_key(1));
         let _leg = reg.register("k", None).expect("under the cap");
-        assert!(reg.register("k", None).is_none(), "a second leg exceeds the cap");
+        assert!(
+            reg.register("k", None).is_none(),
+            "a second leg exceeds the cap"
+        );
         // The control channel registers even at the cap, and is still kickable.
         let _ctrl = reg.register_unchecked("k");
         assert_eq!(

@@ -74,7 +74,12 @@ mod tests {
         };
         let app = router(Arc::new(Fixed(snap.clone())));
         let resp = app
-            .oneshot(Request::builder().uri("/status").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

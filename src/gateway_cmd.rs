@@ -470,7 +470,8 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         let push_cfg = &graph.config.gateway.push;
         // Proxy-aware client: /notify + /register POST to the remote host (C), a
         // non-loopback egress target subject to the operator's egress proxy.
-        let push_client = baybo_security::http::client(boot::proxy_settings(&graph.config).as_ref())?;
+        let push_client =
+            baybo_security::http::client(boot::proxy_settings(&graph.config).as_ref())?;
         let registrar: Arc<dyn baybo_gateway::push::ApnsRegistrar> =
             Arc::new(baybo_gateway::push::HttpApnsRegistrar::new(
                 &push_cfg.gateway_url,

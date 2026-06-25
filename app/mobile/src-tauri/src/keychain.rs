@@ -102,7 +102,10 @@ mod imp {
                 (constant(kSecClass), constant(kSecClassGenericPassword)),
                 (constant(kSecAttrAccount), account),
                 (constant(kSecAttrAccessGroup), group),
-                (constant(kSecReturnData), CFBoolean::true_value().as_CFType()),
+                (
+                    constant(kSecReturnData),
+                    CFBoolean::true_value().as_CFType(),
+                ),
                 (constant(kSecMatchLimit), constant(kSecMatchLimitOne)),
             ]);
             let mut out: CFTypeRef = std::ptr::null();

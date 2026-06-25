@@ -58,10 +58,7 @@ fn parse_error_body(body: &[u8]) -> (Option<String>, Option<u64>) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
         return (None, None);
     };
-    let reason = v
-        .get("reason")
-        .and_then(|r| r.as_str())
-        .map(str::to_owned);
+    let reason = v.get("reason").and_then(|r| r.as_str()).map(str::to_owned);
     let timestamp_ms = v.get("timestamp").and_then(serde_json::Value::as_u64);
     (reason, timestamp_ms)
 }

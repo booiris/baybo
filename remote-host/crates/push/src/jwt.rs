@@ -141,8 +141,17 @@ c3d3e3f3g3h3i3j3k3l3m3n3o3p3q3r3s3t3u3v3w3x3y3z3A3B3C3D3E3F3G3==
 
     #[test]
     fn refresh_window() {
-        assert!(!ApnsProviderToken::needs_refresh(1000, 1000 + TOKEN_REFRESH_SECS - 1));
-        assert!(ApnsProviderToken::needs_refresh(1000, 1000 + TOKEN_REFRESH_SECS));
-        assert!(ApnsProviderToken::needs_refresh(1000, 1000 + TOKEN_MAX_AGE_SECS));
+        assert!(!ApnsProviderToken::needs_refresh(
+            1000,
+            1000 + TOKEN_REFRESH_SECS - 1
+        ));
+        assert!(ApnsProviderToken::needs_refresh(
+            1000,
+            1000 + TOKEN_REFRESH_SECS
+        ));
+        assert!(ApnsProviderToken::needs_refresh(
+            1000,
+            1000 + TOKEN_MAX_AGE_SECS
+        ));
     }
 }
