@@ -9,7 +9,6 @@ pub const REGISTER: &str = "/register";
 /// Which APNs environment a device token is bound to (the `env` of
 /// [`RegisterRequest`]). A sandbox token is rejected by the production host and
 /// vice versa, so it is tracked per device.
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApnsEnv {
@@ -20,7 +19,6 @@ pub enum ApnsEnv {
 /// JSON body of `POST /notify` — the gateway's blind, operator-encrypted preview
 /// for one pushable turn. `enc`/`n` are opaque base64 (copied verbatim into the
 /// APNs payload); C never decrypts them.
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotifyRequest {
     pub instance_key: String,
@@ -34,7 +32,6 @@ pub struct NotifyRequest {
 
 /// JSON body of `POST /register` — bind/rebind a device's APNs token
 /// (gateway-mediated, so the app never holds a C credential).
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterRequest {
     pub instance_key: String,

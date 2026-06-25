@@ -6,11 +6,5 @@ edition.workspace = true
 [lib]
 doctest = false
 
-[features]
-# Emit ts-rs-generated TypeScript for the wire types (off by default so release
-# builds don't compile ts-rs).
-ts-export = ["dep:ts-rs"]
-
 [dependencies]
 serde = { workspace = true }
-ts-rs = { workspace = true, optional = true }

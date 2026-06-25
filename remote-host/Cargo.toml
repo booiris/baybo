@@ -34,9 +34,8 @@ remote-host-push = { path = "crates/push" }
 remote-host-relay = { path = "crates/relay" }
 remote-host-admission = { path = "crates/admission" }
 # The shared wire contract (routes + serde types) the gateway + app also depend
-# on. Pure serde; ts-rs only for the optional TypeScript export.
+# on. Pure serde, no transport/baybo deps.
 remote-host-protocol = { path = "crates/protocol" }
-ts-rs = { version = "11", features = ["serde-compat", "no-serde-warnings"] }
 # Admission allow-list is a libsql/SQLite table, hot-reloaded by polling (it may
 # be updated out of band). `core` = embedded SQLite, no remote/replication.
 libsql = { version = "0.9", default-features = false, features = ["core"] }
