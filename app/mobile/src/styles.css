@@ -105,23 +105,17 @@ html.scanning #root {
   justify-content: center;
   pointer-events: none;
 }
-/* iOS-style viewfinder: four rounded corner brackets, no solid frame. */
+/* iOS-style viewfinder: four thick, fully-rounded corner brackets (SVG so the
+   bends and the line ends are both rounded). stroke-width is in viewBox units;
+   non-scaling-stroke keeps it a constant on-screen thickness at any size. */
 .scan-reticle {
-  position: relative;
-  width: min(66vw, 260px);
+  width: min(68vw, 270px);
   aspect-ratio: 1;
+  filter: drop-shadow(0 0 4px rgba(0, 0, 0, 0.5));
 }
-.scan-reticle .corner {
-  position: absolute;
-  width: 2.75rem;
-  height: 2.75rem;
-  border: 5px solid #fff;
-  filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.45));
+.scan-reticle path {
+  vector-effect: non-scaling-stroke;
 }
-.scan-reticle .tl { top: 0; left: 0; border-right: 0; border-bottom: 0; border-top-left-radius: 1rem; }
-.scan-reticle .tr { top: 0; right: 0; border-left: 0; border-bottom: 0; border-top-right-radius: 1rem; }
-.scan-reticle .bl { bottom: 0; left: 0; border-right: 0; border-top: 0; border-bottom-left-radius: 1rem; }
-.scan-reticle .br { bottom: 0; right: 0; border-left: 0; border-top: 0; border-bottom-right-radius: 1rem; }
 .scan-cancel {
   position: absolute;
   right: calc(env(safe-area-inset-right, 0px) + 1.5rem);

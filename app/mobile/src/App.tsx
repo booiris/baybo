@@ -276,12 +276,20 @@ export default function App() {
   if (scanning) {
     return (
       <div className="scan-overlay">
-        <div className="scan-reticle">
-          <span className="corner tl" />
-          <span className="corner tr" />
-          <span className="corner bl" />
-          <span className="corner br" />
-        </div>
+        <svg
+          className="scan-reticle"
+          viewBox="0 0 100 100"
+          fill="none"
+          stroke="#fff"
+          strokeWidth="8"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M8 36 L8 22 Q8 8 22 8 L36 8" />
+          <path d="M92 36 L92 22 Q92 8 78 8 L64 8" />
+          <path d="M8 64 L8 78 Q8 92 22 92 L36 92" />
+          <path d="M92 64 L92 78 Q92 92 78 92 L64 92" />
+        </svg>
         <button className="scan-cancel" onClick={cancelScan}>
           Cancel
         </button>
