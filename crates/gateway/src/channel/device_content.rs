@@ -32,6 +32,7 @@ use axum::routing::get;
 use baybo_channels::wire::{self, Frame};
 use baybo_model::ChannelType;
 use device_proto::aead::KEY_LEN;
+use device_proto::noise::{FrameReassembler, NOISE_MAX_MESSAGE, write_chunked};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -47,11 +48,6 @@ use super::state::WsChannelState;
 use crate::auth::{AuthedClient, constant_time_eq};
 use crate::device::load_or_create_static_keypair;
 
-/// snow's per-message ceiling; a Noise transport message (handshake or
-/// post-handshake frame) cannot exceed this. Matches `baybo-mobile-core`.
-const MAX_NOISE_MSG: usize = 65535;
-/// ChaCha20-Poly1305 auth tag length added to every sealed transport message.
-const NOISE_TAG_LEN: usize = 16;
 /// How long the responder waits for the initiator's first handshake message
 /// after the WS upgrade — a stalled peer must not pin a connection.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -156,7 +152,7 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
         .ik_responder()
         .map_err(|e| format!("build ik responder: {e}"))?;
     let msg1 = recv_handshake(&mut source, HANDSHAKE_TIMEOUT).await?;
-    let mut buf = vec![0u8; MAX_NOISE_MSG];
+    let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
     handshake
         .read_message(&msg1, &mut buf)
         .map_err(|e| format!("read handshake msg1: {e}"))?;
@@ -236,6 +232,8 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
         NoiseFrameSource {
             source,
             transport: Arc::clone(&transport),
+            reassembler: FrameReassembler::new(),
+            pending: std::collections::VecDeque::new(),
         },
         state,
         &channel_type,
@@ -353,30 +351,22 @@ impl<S: BinarySink> FrameSink for NoiseFrameSink<S> {
                 return Ok(());
             }
         };
-        // A single frame larger than the Noise per-message ceiling can't be
-        // sealed; skip it rather than tear down an otherwise-healthy session.
-        if plaintext.len() > MAX_NOISE_MSG - NOISE_TAG_LEN {
-            tracing::warn!(
-                len = plaintext.len(),
-                "content frame exceeds the Noise message ceiling; dropping",
-            );
-            return Ok(());
-        }
-        let ciphertext = {
-            let mut buf = vec![0u8; plaintext.len() + NOISE_TAG_LEN];
+        // Chunk past the Noise per-message ceiling: a large frame seals into
+        // several transport messages the peer reassembles in order.
+        let messages = {
             let mut transport = self.transport.lock();
-            match transport.write_message(&plaintext, &mut buf) {
-                Ok(n) => {
-                    buf.truncate(n);
-                    buf
-                }
+            match write_chunked(&mut transport, &plaintext) {
+                Ok(m) => m,
                 Err(e) => {
                     tracing::warn!(error = %e, "noise encrypt failed; pump exiting");
                     return Err(());
                 }
             }
         };
-        self.inner.send_bytes(ciphertext).await
+        for message in messages {
+            self.inner.send_bytes(message).await?;
+        }
+        Ok(())
     }
 
     async fn close(&mut self) {
@@ -388,42 +378,36 @@ impl<S: BinarySink> FrameSink for NoiseFrameSink<S> {
 pub(crate) struct NoiseFrameSource<R: BinarySource> {
     source: R,
     transport: Arc<Mutex<TransportState>>,
+    reassembler: FrameReassembler,
+    /// Frames reassembled from inbound messages but not yet handed out (the
+    /// `FrameSource` returns them one at a time).
+    pending: std::collections::VecDeque<Frame>,
 }
 
 #[async_trait::async_trait]
 impl<R: BinarySource> FrameSource for NoiseFrameSource<R> {
     async fn next_frame(&mut self) -> Option<Frame> {
         loop {
-            let bytes = self.source.next_bytes().await?;
-            // A Noise transport message can't exceed snow's ceiling, and
-            // `read_message` would reject an oversized one anyway — bail before
-            // allocating a buffer sized to an attacker-chosen frame.
-            if bytes.len() > MAX_NOISE_MSG {
-                tracing::warn!(
-                    len = bytes.len(),
-                    "content frame exceeds the Noise ceiling; closing"
-                );
-                return None;
+            if let Some(frame) = self.pending.pop_front() {
+                return Some(frame);
             }
-            // Plaintext is never longer than the ciphertext.
-            let mut buf = vec![0u8; bytes.len()];
-            let plaintext_len = {
+            let bytes = self.source.next_bytes().await?;
+            let reassembled = {
                 let mut transport = self.transport.lock();
-                match transport.read_message(&bytes, &mut buf) {
-                    Ok(n) => n,
+                match self.reassembler.read(&mut transport, &bytes) {
+                    Ok(frames) => frames,
                     Err(e) => {
-                        // A decrypt failure means the stream desynced —
-                        // unrecoverable for Noise, so tear the session down.
+                        // A decrypt failure / desync is unrecoverable for Noise,
+                        // so tear the session down.
                         tracing::warn!(error = %e, "noise decrypt failed; tearing down");
                         return None;
                     }
                 }
             };
-            match wire::decode(&buf[..plaintext_len]) {
-                Ok(frame) => return Some(frame),
-                Err(e) => {
-                    tracing::warn!(error = %e, "decode content frame failed");
-                    continue;
+            for frame_bytes in reassembled {
+                match wire::decode(&frame_bytes) {
+                    Ok(frame) => self.pending.push_back(frame),
+                    Err(e) => tracing::warn!(error = %e, "decode content frame failed"),
                 }
             }
         }
@@ -518,7 +502,7 @@ mod tests {
         gateway_pubkey: &[u8; KEY_LEN],
     ) -> Option<TransportState> {
         let mut hs: HandshakeState = device.ik_initiator(gateway_pubkey).unwrap();
-        let mut buf = vec![0u8; MAX_NOISE_MSG];
+        let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
         let n = hs.write_message(&[], &mut buf).unwrap();
         ws.send(WsMessage::Binary(buf[..n].to_vec())).await.unwrap();
         let msg2 = recv_bin(ws).await?;
@@ -528,16 +512,18 @@ mod tests {
 
     fn seal(transport: &mut TransportState, frame: &Frame) -> Vec<u8> {
         let plaintext = wire::encode(frame).unwrap();
-        let mut buf = vec![0u8; plaintext.len() + NOISE_TAG_LEN];
-        let n = transport.write_message(&plaintext, &mut buf).unwrap();
-        buf.truncate(n);
-        buf
+        let mut messages = write_chunked(transport, &plaintext).unwrap();
+        assert_eq!(messages.len(), 1, "test frames fit one chunk");
+        messages.remove(0)
     }
 
     fn open(transport: &mut TransportState, ciphertext: &[u8]) -> Frame {
-        let mut buf = vec![0u8; ciphertext.len()];
-        let n = transport.read_message(ciphertext, &mut buf).unwrap();
-        wire::decode(&buf[..n]).unwrap()
+        // The test frames are single-chunk, so a fresh reassembler per message
+        // yields exactly one frame (the Noise nonce lives in `transport`).
+        let mut reassembler = FrameReassembler::new();
+        let mut frames = reassembler.read(transport, ciphertext).unwrap();
+        assert_eq!(frames.len(), 1, "test frames fit one chunk");
+        wire::decode(&frames.remove(0)).unwrap()
     }
 
     /// Full content session: an approved device authenticates, completes the
@@ -705,7 +691,7 @@ mod tests {
 
         // The phone: IK initiator handshake, then Subscribe + a message.
         let mut hs: HandshakeState = device.ik_initiator(&gw_pub).unwrap();
-        let mut buf = vec![0u8; MAX_NOISE_MSG];
+        let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
         let n = hs.write_message(&[], &mut buf).unwrap();
         phone_tx.send(buf[..n].to_vec()).await.unwrap();
         let msg2 = phone_rx.recv().await.expect("gateway msg2");

@@ -35,4 +35,9 @@ pub enum ProtoError {
     /// wrong length.
     #[error("invalid key length: expected {expected}, got {got}")]
     KeyLen { expected: usize, got: usize },
+
+    /// A content frame's chunking length prefix exceeded the cap — a garbled or
+    /// hostile length, refused before allocating.
+    #[error("content frame too large: {len} bytes")]
+    FrameTooLarge { len: usize },
 }

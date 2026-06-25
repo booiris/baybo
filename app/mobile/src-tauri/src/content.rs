@@ -200,55 +200,64 @@ async fn pump(
     // Self-pull: subscribe to the session so the gateway replays the thread and
     // streams live agent output.
     match session.seal(&subscribe_frame(&session_id, None)) {
-        Ok(bytes) => {
-            if sink.send(Message::Binary(bytes)).await.is_err() {
-                return;
+        Ok(messages) => {
+            for bytes in messages {
+                if sink.send(Message::Binary(bytes)).await.is_err() {
+                    return;
+                }
             }
         }
         Err(_) => return,
     }
 
-    loop {
+    'session: loop {
         tokio::select! {
             inbound = stream.next() => match inbound {
                 Some(Ok(Message::Binary(bytes))) => {
-                    let frame = match session.open(&bytes) {
+                    // One Noise message may complete zero, one, or several frames.
+                    let frames = match session.open(&bytes) {
                         Ok(f) => f,
                         // A decrypt failure means the Noise stream desynced —
                         // unrecoverable, so end the session.
-                        Err(_) => break,
+                        Err(_) => break 'session,
                     };
-                    // Answer the gateway's keepalive itself rather than forward it.
-                    if matches!(frame, Frame::Ping) {
-                        if let Ok(b) = session.seal(&Frame::Pong) {
-                            let _ = sink.send(Message::Binary(b)).await;
+                    for frame in frames {
+                        // Answer the gateway's keepalive itself, don't forward it.
+                        if matches!(frame, Frame::Ping) {
+                            if let Ok(messages) = session.seal(&Frame::Pong) {
+                                for b in messages {
+                                    let _ = sink.send(Message::Binary(b)).await;
+                                }
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    if on_frame.send(frame).is_err() {
-                        // The webview dropped the channel (navigated away).
-                        break;
+                        if on_frame.send(frame).is_err() {
+                            // The webview dropped the channel (navigated away).
+                            break 'session;
+                        }
                     }
                 }
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Close(_))) | None => break 'session,
                 Some(Ok(_)) => {}
-                Some(Err(_)) => break,
+                Some(Err(_)) => break 'session,
             },
             cmd = outbound_rx.recv() => match cmd {
                 Some(OutboundCmd::Send { text, msg_id }) => {
                     let frame = user_text_frame(&session_id, &user_id, &text, &msg_id);
                     match session.seal(&frame) {
-                        Ok(bytes) => {
-                            if sink.send(Message::Binary(bytes)).await.is_err() {
-                                break;
+                        Ok(messages) => {
+                            for bytes in messages {
+                                if sink.send(Message::Binary(bytes)).await.is_err() {
+                                    break 'session;
+                                }
                             }
                         }
                         Err(_) => continue,
                     }
                 }
                 // Every sender dropped (handle replaced/torn down).
-                None => break,
+                None => break 'session,
             },
         }
     }

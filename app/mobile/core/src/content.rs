@@ -15,14 +15,11 @@
 //! the gateway is guaranteed by construction.
 
 use baybo_model::{ChannelType, SessionId};
-use device_proto::noise::StaticKeypair;
+use device_proto::noise::{FrameReassembler, NOISE_MAX_MESSAGE, StaticKeypair, write_chunked};
 use wire::{Frame, Message, MessageRole, decode, encode};
 use snow::{HandshakeState, TransportState};
 
 use crate::error::MobileError;
-
-/// snow's per-message ceiling; Noise frames cannot exceed this.
-const MAX_NOISE_MSG: usize = 65535;
 
 /// An in-progress Noise IK handshake (initiator = the app).
 pub struct ContentHandshake {
@@ -36,7 +33,7 @@ impl ContentHandshake {
         gateway_static: &[u8; 32],
     ) -> Result<(Self, Vec<u8>), MobileError> {
         let mut state = local.ik_initiator(gateway_static)?;
-        let mut buf = vec![0u8; MAX_NOISE_MSG];
+        let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
         let n = state.write_message(&[], &mut buf)?;
         buf.truncate(n);
         Ok((Self { state }, buf))
@@ -44,10 +41,11 @@ impl ContentHandshake {
 
     /// Process the gateway's handshake reply and finalize the session.
     pub fn finish(mut self, reply: &[u8]) -> Result<ContentSession, MobileError> {
-        let mut buf = vec![0u8; MAX_NOISE_MSG];
+        let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
         self.state.read_message(reply, &mut buf)?;
         Ok(ContentSession {
             transport: self.state.into_transport_mode()?,
+            reassembler: FrameReassembler::new(),
         })
     }
 }
@@ -56,26 +54,25 @@ impl ContentHandshake {
 /// ones, all inside Noise.
 pub struct ContentSession {
     transport: TransportState,
+    reassembler: FrameReassembler,
 }
 
 impl ContentSession {
-    /// Seal a `Frame` for transmission (e.g. a `Frame::Subscribe` catch-up
-    /// request). Returns the opaque ciphertext to send.
-    pub fn seal(&mut self, frame: &Frame) -> Result<Vec<u8>, MobileError> {
+    /// Seal a `Frame` into the Noise transport messages to send, chunked past the
+    /// per-message ceiling (usually one message; a large frame yields several).
+    pub fn seal(&mut self, frame: &Frame) -> Result<Vec<Vec<u8>>, MobileError> {
         let plaintext = encode(frame)?;
-        let mut buf = vec![0u8; plaintext.len() + 16];
-        let n = self.transport.write_message(&plaintext, &mut buf)?;
-        buf.truncate(n);
-        Ok(buf)
+        Ok(write_chunked(&mut self.transport, &plaintext)?)
     }
 
-    /// Open a received ciphertext into a `Frame` (e.g. a replayed
-    /// `Frame::Message`).
-    pub fn open(&mut self, ciphertext: &[u8]) -> Result<Frame, MobileError> {
-        let mut buf = vec![0u8; ciphertext.len()];
-        let n = self.transport.read_message(ciphertext, &mut buf)?;
-        buf.truncate(n);
-        Ok(decode(&buf)?)
+    /// Open one received Noise message, returning every `Frame` it completes
+    /// (none for a partial chunk, one, or several if the peer pipelined).
+    pub fn open(&mut self, message: &[u8]) -> Result<Vec<Frame>, MobileError> {
+        let mut frames = Vec::new();
+        for bytes in self.reassembler.read(&mut self.transport, message)? {
+            frames.push(decode(&bytes)?);
+        }
+        Ok(frames)
     }
 }
 
@@ -115,25 +112,43 @@ pub fn user_text_frame(
 mod tests {
     use super::*;
 
+    /// App-initiator + gateway-responder IK handshake; returns the app's session
+    /// and the gateway's raw transport (the test drives the gateway by hand).
+    fn established_pair() -> (ContentSession, TransportState) {
+        let app = StaticKeypair::generate().unwrap();
+        let gw = StaticKeypair::generate().unwrap();
+        let (handshake, msg1) = ContentHandshake::start(&app, &gw.public()).unwrap();
+        let mut gw_hs = gw.ik_responder().unwrap();
+        let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
+        gw_hs.read_message(&msg1, &mut buf).unwrap();
+        let n = gw_hs.write_message(&[], &mut buf).unwrap();
+        let session = handshake.finish(&buf[..n]).unwrap();
+        let gw_t = gw_hs.into_transport_mode().unwrap();
+        (session, gw_t)
+    }
+
+    /// Decrypt + reassemble every message the app sealed, returning the frames.
+    fn drain(
+        reasm: &mut FrameReassembler,
+        gw_t: &mut TransportState,
+        msgs: &[Vec<u8>],
+    ) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        for m in msgs {
+            for bytes in reasm.read(gw_t, m).unwrap() {
+                frames.push(decode(&bytes).unwrap());
+            }
+        }
+        frames
+    }
+
     /// The app's content session round-trips a self-pull against an in-process
     /// gateway (IK responder built from the same `device-proto`): the app
     /// subscribes, the gateway replays a `Frame::Message`, the app decodes it.
     #[test]
     fn self_pull_round_trips_over_noise() {
-        let app = StaticKeypair::generate().unwrap();
-        let gw = StaticKeypair::generate().unwrap();
-
-        // App (initiator) starts; gateway (responder) completes the IK handshake.
-        let (handshake, msg1) = ContentHandshake::start(&app, &gw.public()).unwrap();
-        let mut gw_hs = gw.ik_responder().unwrap();
-        let mut buf = [0u8; MAX_NOISE_MSG];
-        gw_hs.read_message(&msg1, &mut buf).unwrap();
-        let n = gw_hs.write_message(&[], &mut buf).unwrap();
-        let mut session = handshake.finish(&buf[..n]).unwrap();
-        let mut gw_t = gw_hs.into_transport_mode().unwrap();
-
-        // The gateway authenticated the app's static key.
-        // (Initiator's static is learned by the IK responder during msg1.)
+        let (mut session, mut gw_t) = established_pair();
+        let mut gw_reasm = FrameReassembler::new();
 
         // App → gateway: Subscribe for catch-up.
         let subscribe = Frame::Subscribe {
@@ -141,10 +156,7 @@ mod tests {
             since_ordinal: Some(41),
         };
         let sealed = session.seal(&subscribe).unwrap();
-        let mut gw_in = [0u8; MAX_NOISE_MSG];
-        let m = gw_t.read_message(&sealed, &mut gw_in).unwrap();
-        let got = decode(&gw_in[..m]).unwrap();
-        assert_eq!(got, subscribe);
+        assert_eq!(drain(&mut gw_reasm, &mut gw_t, &sealed), vec![subscribe]);
 
         // Gateway → app: a replayed assistant message; the app decodes it.
         let reply = Frame::Message(Message {
@@ -158,11 +170,35 @@ mod tests {
             role: MessageRole::Assistant,
             ordinal: Some(42),
         });
-        let reply_bytes = encode(&reply).unwrap();
-        let mut out = [0u8; MAX_NOISE_MSG];
-        let r = gw_t.write_message(&reply_bytes, &mut out).unwrap();
-        let decoded = session.open(&out[..r]).unwrap();
-        assert_eq!(decoded, reply);
+        let reply_msgs = write_chunked(&mut gw_t, &encode(&reply).unwrap()).unwrap();
+        let mut decoded = Vec::new();
+        for m in &reply_msgs {
+            decoded.extend(session.open(m).unwrap());
+        }
+        assert_eq!(decoded, vec![reply]);
+    }
+
+    /// A `Frame` far larger than the Noise per-message ceiling chunks on send and
+    /// reassembles intact — the case the old one-frame-per-message path dropped.
+    #[test]
+    fn content_frame_over_the_ceiling_chunks_and_reassembles() {
+        let (mut session, mut gw_t) = established_pair();
+        let mut gw_reasm = FrameReassembler::new();
+
+        let big = Frame::Message(Message {
+            content: "x".repeat(200_000),
+            session_id: SessionId::from("sess-1"),
+            user_id: "u1".into(),
+            channel_type: ChannelType::ios(),
+            bot_id: String::new(),
+            attachments: Vec::new(),
+            platform_msg_id: String::new(),
+            role: MessageRole::User,
+            ordinal: None,
+        });
+        let sealed = session.seal(&big).unwrap();
+        assert!(sealed.len() > 1, "a 200 KB frame spans several Noise messages");
+        assert_eq!(drain(&mut gw_reasm, &mut gw_t, &sealed), vec![big]);
     }
 
     #[test]
@@ -175,7 +211,7 @@ mod tests {
         // complete the handshake (IK authenticates the responder's static).
         let (_hs, msg1) = ContentHandshake::start(&app, &wrong.public()).unwrap();
         let mut gw_hs = real_gw.ik_responder().unwrap();
-        let mut buf = [0u8; MAX_NOISE_MSG];
+        let mut buf = [0u8; NOISE_MAX_MESSAGE];
         assert!(gw_hs.read_message(&msg1, &mut buf).is_err());
     }
 }
