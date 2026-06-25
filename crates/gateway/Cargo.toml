@@ -37,6 +37,7 @@ baybo-config = { workspace = true }
 baybo-cron = { workspace = true }
 baybo-cost = { workspace = true }
 device-proto = { workspace = true }
+remote-host-protocol = { workspace = true }
 baybo-job = { workspace = true }
 baybo-llm = { workspace = true }
 baybo-model = { workspace = true }

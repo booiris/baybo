@@ -22,11 +22,11 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+use remote_host_protocol::relay::INSTANCE_KEY_HEADER;
+
 use super::device_pair::{PairTransport, drive};
 use super::state::WsChannelState;
 
-/// Header carrying the gateway's admission key on the relay host leg.
-const INSTANCE_KEY_HEADER: &str = "x-instance-key";
 /// How often the manager scans for live slots that need a host leg.
 const HOST_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -113,11 +113,7 @@ async fn run(state: WsChannelState, config: RelayPairConfig) {
 /// handshake finishes, the app never shows (timeout), or the connection fails —
 /// the caller re-hosts on the next poll while the slot is still live.
 async fn host_one(state: &WsChannelState, config: &RelayPairConfig, code: &str) {
-    let url = format!(
-        "{}/pair/host/{}",
-        config.relay_url.trim_end_matches('/'),
-        code
-    );
+    let url = remote_host_protocol::relay::pair_host_url(&config.relay_url, code);
     let mut req = match url.into_client_request() {
         Ok(r) => r,
         Err(e) => {

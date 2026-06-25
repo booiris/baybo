@@ -51,6 +51,9 @@ baybo-model = { path = "crates/model" }
 baybo-channels = { path = "crates/channels" }
 wire = { path = "crates/wire" }
 device-proto = { path = "crates/device-proto" }
+# The remote-host (C) wire contract, path-depended across the workspace boundary
+# (like wire/device-proto) so the gateway uses C's route paths + types directly.
+remote-host-protocol = { path = "remote-host/crates/protocol" }
 baybo-llm = { path = "crates/llm" }
 baybo-tools = { path = "crates/tools" }
 baybo-workspace = { path = "crates/workspace", default-features = false }

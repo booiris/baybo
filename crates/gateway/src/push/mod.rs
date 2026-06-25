@@ -64,24 +64,24 @@ pub(crate) struct DeviceApnsRegistration {
     pub apns_env: device_proto::pairing::ApnsEnv,
 }
 
-/// The blind `/notify` body A POSTs to C. `enc`/`n` are base64 of the
-/// per-device AEAD output; C copies them verbatim into the APNs payload.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct NotifyBody {
-    pub instance_key: String,
-    pub device_id: String,
-    pub collapse_id: String,
-    pub kid: u32,
-    pub bid: String,
-    pub enc: String,
-    pub n: String,
+/// The `/notify` + `/register` request bodies are the shared protocol wire
+/// types, so A and C serialize/deserialize the exact same shapes.
+use remote_host_protocol::push::{NotifyRequest, RegisterRequest};
+
+/// Map the pairing-side [`device_proto::pairing::ApnsEnv`] onto the C-wire
+/// [`remote_host_protocol::push::ApnsEnv`] (same variants, distinct crates).
+fn to_wire_env(env: device_proto::pairing::ApnsEnv) -> remote_host_protocol::push::ApnsEnv {
+    match env {
+        device_proto::pairing::ApnsEnv::Sandbox => remote_host_protocol::push::ApnsEnv::Sandbox,
+        device_proto::pairing::ApnsEnv::Production => remote_host_protocol::push::ApnsEnv::Production,
+    }
 }
 
 /// Seam over the POST to C's `/notify`. The real impl uses reqwest; tests use a
 /// mock so the whole dispatch path is host-testable.
 #[async_trait::async_trait]
 pub trait NotifySink: Send + Sync {
-    async fn post(&self, body: &NotifyBody) -> Result<(), String>;
+    async fn post(&self, body: &NotifyRequest) -> Result<(), String>;
 }
 
 /// reqwest-backed sink POSTing to `<gateway_url>/notify`.
@@ -97,14 +97,14 @@ impl HttpNotifySink {
     pub fn new(gateway_url: &str, client: reqwest::Client) -> Self {
         Self {
             client,
-            notify_url: format!("{}/notify", gateway_url.trim_end_matches('/')),
+            notify_url: remote_host_protocol::push::notify_url(gateway_url),
         }
     }
 }
 
 #[async_trait::async_trait]
 impl NotifySink for HttpNotifySink {
-    async fn post(&self, body: &NotifyBody) -> Result<(), String> {
+    async fn post(&self, body: &NotifyRequest) -> Result<(), String> {
         let resp = self
             .client
             .post(&self.notify_url)
@@ -118,17 +118,6 @@ impl NotifySink for HttpNotifySink {
             Err(format!("notify status {}", resp.status()))
         }
     }
-}
-
-/// Body A POSTs to C's `/register` to bind a device's APNs token. Matches the
-/// remote-host push role's `RegisterRequest` JSON shape (agreed by contract; C
-/// is a separate workspace). `env` serializes to `"sandbox"`/`"production"`.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct RegisterBody {
-    instance_key: String,
-    device_id: String,
-    apns_token: String,
-    env: device_proto::pairing::ApnsEnv,
 }
 
 /// Seam over the POST to C's `/register`. The device-pair route calls it
@@ -158,7 +147,7 @@ impl HttpApnsRegistrar {
     pub fn new(gateway_url: &str, instance_key: impl Into<String>, client: reqwest::Client) -> Self {
         Self {
             client,
-            register_url: format!("{}/register", gateway_url.trim_end_matches('/')),
+            register_url: remote_host_protocol::push::register_url(gateway_url),
             instance_key: instance_key.into(),
         }
     }
@@ -172,11 +161,11 @@ impl ApnsRegistrar for HttpApnsRegistrar {
         apns_token: &str,
         env: device_proto::pairing::ApnsEnv,
     ) -> Result<(), String> {
-        let body = RegisterBody {
+        let body = RegisterRequest {
             instance_key: self.instance_key.clone(),
             device_id: device_id.to_string(),
             apns_token: apns_token.to_string(),
-            env,
+            env: to_wire_env(env),
         };
         let resp = self
             .client
@@ -448,11 +437,11 @@ fn build_notify_body(
     session_id: &SessionId,
     key: &[u8; aead::KEY_LEN],
     preview: &str,
-) -> Result<NotifyBody, String> {
+) -> Result<NotifyRequest, String> {
     let (nonce, ciphertext) =
         aead::seal(key, preview.as_bytes()).map_err(|e| format!("seal: {e}"))?;
     let b64 = base64::engine::general_purpose::STANDARD;
-    Ok(NotifyBody {
+    Ok(NotifyRequest {
         instance_key: instance_key.to_string(),
         device_id: device_id.to_string(),
         collapse_id: format!("{device_id}:{session_id}"),
@@ -613,11 +602,11 @@ mod tests {
 
     #[test]
     fn register_body_matches_remote_host_wire_shape() {
-        let body = RegisterBody {
+        let body = RegisterRequest {
             instance_key: "inst-A".into(),
             device_id: "dev-1".into(),
             apns_token: "tok".into(),
-            env: device_proto::pairing::ApnsEnv::Sandbox,
+            env: remote_host_protocol::push::ApnsEnv::Sandbox,
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["instance_key"], "inst-A");

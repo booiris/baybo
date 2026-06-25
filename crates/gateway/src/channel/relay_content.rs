@@ -3,7 +3,7 @@
 //! A NAT'd gateway can't be dialed, so for post-pairing chat it holds a
 //! persistent outbound **control connection** to C (`/control`). When a phone
 //! arrives at the relay for this gateway's `relay_node_id`, C pushes
-//! [`ControlServerMsg::OpenDataLeg`]; the gateway dials a data leg
+//! [`ControlSignal::OpenDataLeg`]; the gateway dials a data leg
 //! (`/content/host/{relay_key}`) and runs the Noise content responder over it —
 //! byte-identical to a direct `/v1/device/content` session, only the transport
 //! differs (it reuses [`super::device_content::run_content_over_relay`]).
@@ -19,13 +19,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use super::device_content::run_content_over_relay;
 use super::state::WsChannelState;
-use crate::relay::{
-    ControlClientHello, ControlServerMsg, connect_control, load_or_create_relay_node_id,
-};
+use remote_host_protocol::relay::INSTANCE_KEY_HEADER;
 
-/// Header carrying the gateway's admission key on a relay data leg (matches the
-/// relay's `INSTANCE_KEY_HEADER`).
-const INSTANCE_KEY_HEADER: &str = "x-instance-key";
+use crate::relay::{ControlHello, ControlSignal, connect_control, load_or_create_relay_node_id};
+
 /// Backoff between control-connection (re)dials.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
@@ -51,7 +48,7 @@ async fn run(state: WsChannelState, config: RelayContentConfig) {
             return;
         }
     };
-    let control_url = format!("{}/control", config.relay_url.trim_end_matches('/'));
+    let control_url = remote_host_protocol::relay::control_url(&config.relay_url);
     loop {
         if let Err(e) = run_once(&state, &config, &control_url, &relay_node_id).await {
             tracing::debug!(error = %e, "relay-content: control connection ended");
@@ -68,9 +65,9 @@ async fn run_once(
     control_url: &str,
     relay_node_id: &str,
 ) -> Result<(), String> {
-    let (tx, mut rx) = mpsc::channel::<ControlServerMsg>(32);
+    let (tx, mut rx) = mpsc::channel::<ControlSignal>(32);
     let pump = tokio::spawn({
-        let hello = ControlClientHello {
+        let hello = ControlHello {
             relay_node_id: relay_node_id.to_owned(),
             instance_key: config.instance_key.clone(),
         };
@@ -78,7 +75,7 @@ async fn run_once(
         async move { connect_control(&control_url, &hello, tx).await }
     });
 
-    while let Some(ControlServerMsg::OpenDataLeg { relay_key }) = rx.recv().await {
+    while let Some(ControlSignal::OpenDataLeg { relay_key }) = rx.recv().await {
         let state = state.clone();
         let config = config.clone();
         tokio::spawn(async move {
@@ -96,11 +93,7 @@ async fn run_once(
 
 /// Dial a content data leg for `relay_key` and run the Noise content responder.
 async fn open_data_leg(state: &WsChannelState, config: &RelayContentConfig, relay_key: &str) {
-    let url = format!(
-        "{}/content/host/{}",
-        config.relay_url.trim_end_matches('/'),
-        relay_key
-    );
+    let url = remote_host_protocol::relay::content_host_url(&config.relay_url, relay_key);
     let mut req = match url.into_client_request() {
         Ok(r) => r,
         Err(e) => {

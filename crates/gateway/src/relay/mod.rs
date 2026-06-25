@@ -2,8 +2,8 @@
 //!
 //! A NAT'd gateway can't be dialed by the remote host (C), so A instead holds a
 //! **persistent outbound control connection** to C. On open it sends a
-//! [`ControlClientHello`] (its `relay_node_id` + its per-instance admission
-//! key); thereafter C pushes [`ControlServerMsg`] signals — today only
+//! [`ControlHello`] (its `relay_node_id` + its per-instance admission
+//! key); thereafter C pushes [`ControlSignal`] signals — today only
 //! `OpenDataLeg`, meaning a phone is waiting at the relay and A should open a
 //! data leg to meet it.
 //!
@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use baybo_security::SecretVault;
 use futures::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc};
@@ -75,21 +74,9 @@ async fn read_relay_node_id(vault: &SecretVault) -> anyhow::Result<Option<String
     Ok((!id.is_empty()).then_some(id))
 }
 
-/// Sent once by A right after the control WS opens. Identifies the gateway by
-/// its C-assigned `relay_node_id` and authenticates with its admission key.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ControlClientHello {
-    pub relay_node_id: String,
-    pub instance_key: String,
-}
-
-/// A control-plane message C pushes to A. `OpenDataLeg` means a phone is parked
-/// at the relay under `relay_key`; A opens a data leg and joins to meet it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "t", rename_all = "snake_case")]
-pub enum ControlServerMsg {
-    OpenDataLeg { relay_key: String },
-}
+/// The control-plane wire types ([`ControlHello`] A sends, [`ControlSignal`] C
+/// pushes) live in the shared protocol crate, so A and C agree by construction.
+pub use remote_host_protocol::relay::{ControlHello, ControlSignal};
 
 #[derive(Debug, Error)]
 pub enum ControlError {
@@ -107,8 +94,8 @@ pub enum ControlError {
 pub async fn run_control_connection<S>(
     url: &str,
     stream: S,
-    hello: &ControlClientHello,
-    signals: mpsc::Sender<ControlServerMsg>,
+    hello: &ControlHello,
+    signals: mpsc::Sender<ControlSignal>,
 ) -> Result<(), ControlError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -125,8 +112,8 @@ where
 /// closes or errors so the caller can reconnect.
 pub async fn connect_control(
     url: &str,
-    hello: &ControlClientHello,
-    signals: mpsc::Sender<ControlServerMsg>,
+    hello: &ControlHello,
+    signals: mpsc::Sender<ControlSignal>,
 ) -> Result<(), ControlError> {
     let request = url
         .into_client_request()
@@ -142,8 +129,8 @@ pub async fn connect_control(
 /// logged and skipped (forward-compatible with future signal kinds).
 async fn pump_control<T>(
     mut ws: WebSocketStream<T>,
-    hello: &ControlClientHello,
-    signals: mpsc::Sender<ControlServerMsg>,
+    hello: &ControlHello,
+    signals: mpsc::Sender<ControlSignal>,
 ) -> Result<(), ControlError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -171,7 +158,7 @@ where
                 match msg? {
                     Message::Binary(b) => {
                         awaiting_pong = false;
-                        match serde_json::from_slice::<ControlServerMsg>(&b) {
+                        match serde_json::from_slice::<ControlSignal>(&b) {
                             Ok(sig) => {
                                 if signals.send(sig).await.is_err() {
                                     break; // the consumer dropped its receiver
@@ -214,7 +201,7 @@ mod tests {
     // The mock C records the hello it received and emits one OpenDataLeg.
     #[derive(Clone, Default)]
     struct MockC {
-        received_hello: Arc<Mutex<Option<ControlClientHello>>>,
+        received_hello: Arc<Mutex<Option<ControlHello>>>,
     }
 
     async fn mock_c_handler(
@@ -226,10 +213,10 @@ mod tests {
 
     async fn run_mock_c(mut socket: WebSocket, state: MockC) {
         if let Some(Ok(AxumMsg::Binary(b))) = socket.recv().await
-            && let Ok(hello) = serde_json::from_slice::<ControlClientHello>(&b)
+            && let Ok(hello) = serde_json::from_slice::<ControlHello>(&b)
         {
             *state.received_hello.lock() = Some(hello);
-            let sig = ControlServerMsg::OpenDataLeg {
+            let sig = ControlSignal::OpenDataLeg {
                 relay_key: "leg-xyz".into(),
             };
             let _ = socket
@@ -255,7 +242,7 @@ mod tests {
         // A dials the control WS (ws:// for the test; production wss:// adds TLS).
         let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let url = format!("ws://127.0.0.1:{port}/control");
-        let hello = ControlClientHello {
+        let hello = ControlHello {
             relay_node_id: "node-1".into(),
             instance_key: "inst-A".into(),
         };
@@ -270,7 +257,7 @@ mod tests {
             .expect("signal channel closed");
         assert_eq!(
             sig,
-            ControlServerMsg::OpenDataLeg {
+            ControlSignal::OpenDataLeg {
                 relay_key: "leg-xyz".into(),
             },
         );
@@ -278,7 +265,7 @@ mod tests {
         // C received A's hello (relay_node_id + instance key).
         assert_eq!(
             *mock.received_hello.lock(),
-            Some(ControlClientHello {
+            Some(ControlHello {
                 relay_node_id: "node-1".into(),
                 instance_key: "inst-A".into(),
             }),
@@ -290,7 +277,7 @@ mod tests {
 
     #[test]
     fn open_data_leg_wire_shape_is_stable() {
-        let sig = ControlServerMsg::OpenDataLeg {
+        let sig = ControlSignal::OpenDataLeg {
             relay_key: "k".into(),
         };
         let v: serde_json::Value = serde_json::to_value(&sig).unwrap();
