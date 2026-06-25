@@ -25,6 +25,10 @@ hex = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
 tokio-tungstenite = { workspace = true }
+# Selects + installs the rustls crypto provider for tokio-tungstenite's wss
+# dials (see run() in lib.rs); tokio-tungstenite itself pulls rustls with no
+# provider, so the first dial would otherwise panic.
+rustls = { workspace = true }
 
 # The camera/barcode + haptics plugins only exist on mobile; on desktop the
 # crates are empty.

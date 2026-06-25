@@ -38,6 +38,11 @@ snow = "0.9"
 tokio = { version = "1", features = ["rt", "macros"] }
 # The Tauri shell dials the gateway's /v1/device/pair WS (ws:// or wss://).
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# tokio-tungstenite pins rustls with default-features off, so NO crypto provider
+# is selected — the first wss dial would panic building its ClientConfig. Pull
+# rustls directly with exactly one provider (ring: light, and cross-compiles
+# cleanly for iOS device + simulator) and install it at startup (src-tauri run()).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = "0.3"
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }

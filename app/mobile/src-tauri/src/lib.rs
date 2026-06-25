@@ -116,8 +116,19 @@ fn debug_seed_push_key() {
     eprintln!("baybo(debug): keychain self-check: {result}");
 }
 
+/// Select the rustls crypto provider for the process. `tokio-tungstenite` pulls
+/// rustls with `default-features = false` (no provider), so the first `wss://`
+/// dial — pairing or content — would panic building its `ClientConfig`. Install
+/// `ring` once here, before any command can run, so every dial finds a provider.
+fn install_crypto_provider() {
+    // Err only if a provider is already installed — harmless, so ignore it.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_crypto_provider();
+
     #[cfg(all(debug_assertions, target_os = "ios"))]
     debug_seed_push_key();
 
