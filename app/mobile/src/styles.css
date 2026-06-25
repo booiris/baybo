@@ -25,7 +25,6 @@ body { margin: 0; }
 h1 { margin: 0.5rem 0 0; }
 .muted { color: #888; margin: 0 0 0.5rem; }
 
-label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.85rem; color: #888; }
 input {
   padding: 0.6rem 0.7rem;
   font-size: 1rem;
@@ -47,6 +46,15 @@ button {
 button:disabled { opacity: 0.5; }
 
 .status { color: #0a84ff; font-size: 0.9rem; }
+
+/* Debug-only readout of the last scanned QR (pairing code masked). */
+.scan-debug {
+  margin: 0.5rem 0 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  color: #888;
+  word-break: break-all;
+}
 
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.4rem 1rem; }
 .kv dt { color: #888; }
@@ -101,6 +109,16 @@ html.scanning #root {
 html.scanning .container {
   display: none;
 }
+/* Camera warm-up cover: held over the page (which stays opaque) until the feed
+   is up, so the reveal goes cover->camera rather than flashing a black frame.
+   Black so it reads as the camera viewport initialising, not an app screen. */
+.scan-warming {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  background: #000;
+}
+
 .scan-overlay {
   position: fixed;
   inset: 0;
@@ -137,8 +155,8 @@ html.scanning .container {
 }
 
 /* Scan success: a green dot pops at the reticle centre on a panel the same
-   colour as the form, which then fades out to reveal the form — a gentle
-   cross-fade rather than an abrupt camera->app wipe. */
+   colour as the app background, which then fades out as the handshake begins —
+   a gentle cross-fade rather than an abrupt camera->app wipe. */
 .scan-panel {
   position: fixed;
   inset: 0;

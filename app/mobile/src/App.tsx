@@ -39,6 +39,34 @@ type WireFrame =
 
 type ChatMsg = { id: string; role: "user" | "assistant" | "notice"; content: string };
 
+// Pairing defaults now that the manual form is gone: the QR carries the gateway
+// endpoint (`h=`) and the relay flag, so we only fall back to the public proxy
+// when a bare-code QR omits the endpoint, and report a fixed device label (the
+// operator's terminal shows its own name regardless).
+const DEFAULT_ENDPOINT = "wss://proxy.baybo.space";
+const DEVICE_LABEL = "My iPhone";
+
+// The windowed scanner draws the camera behind the webview and exposes no
+// "camera ready" signal, so going transparent up front would flash a black frame
+// while the feed warms up. Instead we hold an opaque cover over the page for one
+// AVCaptureSession startup, then reveal the camera + reticle together. This is a
+// timed approximation — a true ready gate would need a native event from the
+// plugin (it has none).
+const CAMERA_WARMUP_MS = 300;
+
+// True under `tauri ios dev` (Vite dev server) and `tauri ios build --debug`,
+// false in release. Gates the on-screen scan readout below — never shown in a
+// shipped build.
+const DEBUG = import.meta.env.DEV || import.meta.env.TAURI_ENV_DEBUG === "true";
+
+// Reveal only a short prefix + length of a secret, so the debug readout proves
+// what was scanned (and lets you cross-check the prefix against the terminal)
+// without printing the full pairing code on screen.
+function maskSecret(s: string): string {
+  if (s.length <= 4) return s.length ? "•".repeat(s.length) : "—";
+  return `${s.slice(0, 3)}…(${s.length})`;
+}
+
 /// The post-pairing chat: opens a Noise content session for a fresh session id,
 /// renders the agent's streamed reply, and sends user messages.
 function ChatView({ onClose }: { onClose: () => void }) {
@@ -147,10 +175,6 @@ function ChatView({ onClose }: { onClose: () => void }) {
 }
 
 export default function App() {
-  const [endpoint, setEndpoint] = useState("wss://proxy.baybo.space");
-  const [relay, setRelay] = useState(true);
-  const [code, setCode] = useState("");
-  const [label, setLabel] = useState("My iPhone");
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [challenge, setChallenge] = useState<PairChallenge | null>(null);
@@ -162,9 +186,14 @@ export default function App() {
   // QR scan flow. "scanning" makes the page transparent so the native camera
   // (drawn behind the webview) shows through; "success" plays a brief
   // confirmation beat on the app background, covering the camera teardown so the
-  // hand-off to the form doesn't flash. `scanCancelled` suppresses the error
-  // toast on a user cancel.
+  // jump straight into the handshake doesn't flash. `scanCancelled` suppresses
+  // the error toast on a user cancel.
   const [scanPhase, setScanPhase] = useState<"idle" | "scanning" | "success">("idle");
+  // Flips true once the camera has had a beat to warm up: drops the warm-up cover
+  // and mounts the reticle, revealing the already-transparent live feed.
+  const [cameraUp, setCameraUp] = useState(false);
+  // Debug-only readout of the last scanned QR (sensitive code masked).
+  const [scanInfo, setScanInfo] = useState<string | null>(null);
   const scanCancelled = useRef(false);
 
   useEffect(() => {
@@ -173,9 +202,26 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  // Stay transparent for the whole scan so the camera (drawn behind the webview)
+  // can show through. The warm-up cover below masks the not-yet-ready feed, so
+  // this never reveals a black frame — and because the reveal is just dropping
+  // that cover (a React element, in sync with paint) rather than toggling this
+  // class in an effect (which paints one frame late), there's no white flash.
   useEffect(() => {
     document.documentElement.classList.toggle("scanning", scanPhase === "scanning");
     return () => document.documentElement.classList.remove("scanning");
+  }, [scanPhase]);
+
+  // Drop the cover (and mount the reticle) one warm-up beat after scanning
+  // starts; the cleanup clears the pending timer and re-arms the cover the moment
+  // scanning ends — on a scanned code, a cancel, or unmount.
+  useEffect(() => {
+    if (scanPhase !== "scanning") {
+      setCameraUp(false);
+      return;
+    }
+    const t = setTimeout(() => setCameraUp(true), CAMERA_WARMUP_MS);
+    return () => clearTimeout(t);
   }, [scanPhase]);
 
   async function scan() {
@@ -197,11 +243,13 @@ export default function App() {
       setScanPhase("scanning");
       const res = await bs.scan({ windowed: true, formats: [bs.Format.QRCode] });
       const parsed = parseScan(res.content);
-      setCode(parsed.code);
-      setRelay(parsed.relay);
-      if (parsed.endpoint) setEndpoint(parsed.endpoint);
+      if (DEBUG) {
+        setScanInfo(
+          `QR · host=${parsed.endpoint ?? "(default)"} · relay=${parsed.relay} · code=${maskSecret(parsed.code)}`,
+        );
+      }
       // Success: buzz, pop a green dot at the reticle centre, then briefly hold
-      // and cross-fade to the form (same background, so no abrupt wipe).
+      // and cross-fade out (same background, so no abrupt wipe).
       try {
         const { notificationFeedback } = await import("@tauri-apps/plugin-haptics");
         await notificationFeedback("success");
@@ -210,7 +258,13 @@ export default function App() {
       }
       setScanPhase("success");
       await new Promise((resolve) => setTimeout(resolve, 650));
-      setStatus("Scanned. Review and pair.");
+      // Everything the handshake needs rides in on the QR — go straight into it
+      // instead of dropping the user back on a form to review and confirm.
+      await pairBegin({
+        endpoint: parsed.endpoint ?? DEFAULT_ENDPOINT,
+        code: parsed.code,
+        relay: parsed.relay,
+      });
     } catch (e) {
       setStatus(scanCancelled.current ? null : `Scan failed: ${e}`);
     } finally {
@@ -230,11 +284,17 @@ export default function App() {
   }
 
   // Phase 1: connect + SPAKE2 → get the confirmation code to show the user.
-  async function pairBegin() {
+  // Called straight off a successful scan with the QR's endpoint/code/relay.
+  async function pairBegin(opts: { endpoint: string; code: string; relay: boolean }) {
     setBusy(true);
     setStatus("Connecting…");
     try {
-      const c = await invoke<PairChallenge>("pair_begin", { endpoint, code, label, relay });
+      const c = await invoke<PairChallenge>("pair_begin", {
+        endpoint: opts.endpoint,
+        code: opts.code,
+        label: DEVICE_LABEL,
+        relay: opts.relay,
+      });
       setChallenge(c);
       setStatus(null);
     } catch (e) {
@@ -320,6 +380,7 @@ export default function App() {
           </button>
         </div>
         {status && <p className="status">{status}</p>}
+        {DEBUG && scanInfo && <p className="scan-debug">{scanInfo}</p>}
       </main>
     );
   }
@@ -345,32 +406,17 @@ export default function App() {
         <h1>Baybo</h1>
         <p className="muted">Scan the pairing code shown by <code>baybo device pair</code>.</p>
 
-        <label>
-          Gateway endpoint
-          <input value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="ws://host:port" />
-        </label>
-        <label>
-          Pairing code
-          <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="WORMHOLE-7-…" />
-        </label>
-        <label>
-          Device label
-          <input value={label} onChange={(e) => setLabel(e.target.value)} />
-        </label>
-        <label className="checkbox">
-          <input type="checkbox" checked={relay} onChange={(e) => setRelay(e.target.checked)} />
-          Connect via relay (proxy)
-        </label>
-
         <div className="row">
           <button onClick={scan} disabled={busy}>Scan QR</button>
-          <button onClick={pairBegin} disabled={busy || !code || !endpoint}>Pair</button>
         </div>
 
         {status && <p className="status">{status}</p>}
+        {DEBUG && scanInfo && <p className="scan-debug">{scanInfo}</p>}
       </main>
 
-      {scanPhase === "scanning" && (
+      {scanPhase === "scanning" && !cameraUp && <div className="scan-warming" />}
+
+      {scanPhase === "scanning" && cameraUp && (
         <div className="scan-overlay">
           <svg
             className="scan-reticle"
