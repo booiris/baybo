@@ -25,7 +25,9 @@ services:
     image: remote-host:latest
     restart: unless-stopped
     environment:
-      BIND_ADDR: 0.0.0.0:7777
+      # The listen port, host + container the same (default 7777). The container
+      # runs as root, so a privileged PORT like 443 binds fine.
+      BIND_ADDR: 0.0.0.0:${PORT:-7777}
       # relay (always on)
       RELAY_INSTANCE_KEYS: ${RELAY_INSTANCE_KEYS:?set RELAY_INSTANCE_KEYS in .env}
       # push — enabled automatically when APNS_P8_HOST_PATH is set in .env
@@ -43,4 +45,4 @@ services:
       - ${TLS_CERT_HOST_PATH:-/dev/null}:/run/tls/cert.pem:ro
       - ${TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/key.pem:ro
     ports:
-      - "${PORT:-7777}:7777"
+      - "${PORT:-7777}:${PORT:-7777}"
