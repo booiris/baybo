@@ -18,10 +18,13 @@ pub struct TlsPaths {
 
 impl TlsPaths {
     /// Read a cert+key path pair from the named env vars: `None` if neither is
-    /// set (serve plaintext), `Some` if both are, an error if only one is (a
-    /// half-configured TLS setup that would silently fall back to plaintext).
+    /// set (serve plaintext `ws`), `Some` if both are (serve `wss`), an error if
+    /// only one is (a half-configured TLS setup). An unset *or empty* value
+    /// counts as "not set", so a compose file can leave the vars blank.
     pub fn from_env(cert_var: &str, key_var: &str) -> Result<Option<Self>, String> {
-        match (std::env::var(cert_var).ok(), std::env::var(key_var).ok()) {
+        let cert = std::env::var(cert_var).ok().filter(|s| !s.is_empty());
+        let key = std::env::var(key_var).ok().filter(|s| !s.is_empty());
+        match (cert, key) {
             (Some(cert), Some(key)) => Ok(Some(Self {
                 cert: cert.into(),
                 key: key.into(),

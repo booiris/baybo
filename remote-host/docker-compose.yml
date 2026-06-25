@@ -2,13 +2,13 @@
 # a single listener, selected by PUSH_ENABLE / RELAY_ENABLE (their route paths
 # are disjoint: /notify + /register vs /pair, /content, /control).
 #
+# Serves plain ws/http by default. Set TLS_CERT_HOST_PATH + TLS_KEY_HOST_PATH in
+# .env and it serves wss/https instead (one cert covers both roles); set PORT=443
+# for port-less URLs.
+#
 # One-click:
 #   cp .env.example .env && $EDITOR .env      # fill APNS_* + *_INSTANCE_KEYS
 #   docker compose up -d --build
-#
-# Serves plain http/ws by default (front with a TLS terminator). For direct
-# wss/https on one port with no proxy, add the TLS overlay — see
-# docker-compose.tls.yml and DEPLOY.md.
 #
 # To isolate the .p8-holding push role on its own host, run one instance with
 # only RELAY_ENABLE=1 and another (the push host) with only PUSH_ENABLE=1.
@@ -36,7 +36,15 @@ services:
       PUSH_INSTANCE_KEYS: ${PUSH_INSTANCE_KEYS:?set PUSH_INSTANCE_KEYS in .env}
       # relay role
       RELAY_INSTANCE_KEYS: ${RELAY_INSTANCE_KEYS:?set RELAY_INSTANCE_KEYS in .env}
+      # TLS: set only when a cert is configured (-> wss/https), else blank (-> ws/http)
+      TLS_CERT: ${TLS_CERT_HOST_PATH:+/run/tls/cert.pem}
+      TLS_KEY: ${TLS_KEY_HOST_PATH:+/run/tls/key.pem}
     secrets:
       - apns_p8
+    volumes:
+      # Mount the cert+key when configured; otherwise a harmless /dev/null
+      # placeholder (TLS_CERT/TLS_KEY stay blank, so the binary never reads it).
+      - ${TLS_CERT_HOST_PATH:-/dev/null}:/run/tls/cert.pem:ro
+      - ${TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/key.pem:ro
     ports:
       - "${PORT:-8443}:8443"

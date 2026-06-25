@@ -33,29 +33,28 @@ docker buildx build --platform linux/amd64 -t remote-host:latest --load .
 ## TLS
 
 Phones reach the relay as `wss://` and the gateway reaches push as `https://` —
-both on the **same** host:port now (one listener). Two ways to terminate TLS:
-
-### Option A — direct TLS in-process (no proxy)
-
-The binary terminates TLS itself with rustls. Provide a PEM cert + key and run
-with the TLS overlay:
+both on the **same** host:port (one listener). It serves plain `ws/http` by
+default; set a cert and it serves `wss/https` automatically — same compose file,
+no overlay, no proxy:
 
 ```bash
 # in .env:
 #   TLS_CERT_HOST_PATH=/etc/letsencrypt/live/c.example.com/fullchain.pem
 #   TLS_KEY_HOST_PATH=/etc/letsencrypt/live/c.example.com/privkey.pem
 #   PORT=443        # optional — for port-less wss://host / https://host URLs
-docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+docker compose up -d --build
 ```
 
-The startup log then shows `https/wss`, and one cert covers both roles. TLS is
-on whenever `TLS_CERT` + `TLS_KEY` are both set (the overlay does this). Renew
-the cert out of band (e.g. certbot) and `docker compose restart`.
+The binary terminates TLS itself with rustls. The startup log shows `https/wss`
+once a cert is configured (`http/ws` otherwise), and one cert covers both roles.
+Leave the cert vars blank for plain `ws/http`. Renew the cert out of band (e.g.
+certbot) and `docker compose restart`.
 
-### Option B — front with a TLS terminator
+### Fronting with a terminator instead
 
-Leave TLS off (plaintext) and put Caddy / nginx / a cloud LB / Cloudflare in
-front. With one listener you don't need path-routing — just proxy the whole host:
+If you'd rather terminate TLS elsewhere — Caddy / nginx / a cloud LB / Cloudflare
+— leave the cert vars blank (plain `ws/http`) and proxy the whole host. With one
+listener you don't need path-routing:
 
 ```caddyfile
 c.example.com {
