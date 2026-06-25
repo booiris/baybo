@@ -117,7 +117,7 @@ pub async fn pair_begin(
     // Relay: join the rendezvous keyed by the code (`/pair/join/{code}`); the
     // gateway hosts the other leg. Direct: dial the gateway's pairing route.
     let url = if relay {
-        format!("{base}/pair/join/{code}")
+        remote_host_protocol::relay::pair_join_url(base, code)
     } else {
         format!("{base}/v1/device/pair")
     };

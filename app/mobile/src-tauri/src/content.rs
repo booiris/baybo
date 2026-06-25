@@ -145,7 +145,7 @@ async fn dial_relay(
         return Err("no relay url for this pairing".into());
     }
     let base = record.relay_url.trim_end_matches('/');
-    let url = format!("{base}/content/join/{node_id}");
+    let url = remote_host_protocol::relay::content_join_url(base, node_id);
     let (ws, _) = connect_async(&url)
         .await
         .map_err(|e| format!("relay connect {base}: {e}"))?;
