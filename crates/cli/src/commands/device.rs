@@ -37,13 +37,9 @@ const DEFAULT_GATEWAY_ENDPOINT: &str = "wss://proxy.baybo.space";
 
 pub async fn handle(ctx: &CommandContext, cmd: DeviceCmd) -> Result<CommandOutput> {
     match cmd {
-        DeviceCmd::Pair { user } => pair(ctx, user).await,
+        DeviceCmd::Pair => pair(ctx).await,
         DeviceCmd::List { approved } => list(ctx, approved).await,
-        DeviceCmd::Revoke {
-            user_id,
-            device_id,
-            yes,
-        } => revoke(ctx, user_id, device_id, yes).await,
+        DeviceCmd::Revoke { device_id, yes } => revoke(ctx, device_id, yes).await,
     }
 }
 
@@ -55,15 +51,6 @@ fn require_service(ctx: &CommandContext) -> Result<&Arc<DevicePairingService>> {
                 .into(),
         )
     })
-}
-
-/// The local operator's user id — the same `$USER`/`$USERNAME` derivation
-/// `prompt`/`tui` turns run as, so a device paired with no `--user` is owned by
-/// the identity whose completed turns should push to it.
-fn operator_user_id() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "baybo-cli".to_string())
 }
 
 /// Owns the spawned self-hosting relay task and stops it on drop (every
@@ -121,17 +108,16 @@ fn qr_encode(s: &str) -> String {
         .collect()
 }
 
-async fn pair(ctx: &CommandContext, user: Option<String>) -> Result<CommandOutput> {
+async fn pair(ctx: &CommandContext) -> Result<CommandOutput> {
     let svc = require_service(ctx)?;
-    let user = user.unwrap_or_else(operator_user_id);
 
-    // 1:1 binding: the gateway binds at most one device per user (one gateway =
-    // one user = one app). If one is already bound, get the operator's informed
-    // consent before minting — the actual replacement happens only if/when the
-    // new pairing completes (`complete` revokes the old row atomically), so a
-    // working binding is never dropped for a pairing that never finishes.
+    // 1:1 binding: the gateway binds at most one device (one gateway = one app).
+    // If one is already bound, get the operator's informed consent before
+    // minting — the actual replacement happens only if/when the new pairing
+    // completes (`complete` revokes the old row atomically), so a working binding
+    // is never dropped for a pairing that never finishes.
     let existing = svc
-        .current_device(&user)
+        .current_device()
         .await
         .map_err(|e| CliError::Manager(format!("look up current device: {e}")))?;
     if let Some(ref dev) = existing {
@@ -155,7 +141,7 @@ async fn pair(ctx: &CommandContext, user: Option<String>) -> Result<CommandOutpu
     // (the Noise PSK). The secret travels *only* in the QR below — never the
     // relay, never a log, never the durable row.
     let (rendezvous_id, secret) = svc
-        .mint(&user)
+        .mint()
         .await
         .map_err(|e| CliError::Manager(format!("mint device pairing: {e}")))?;
 
@@ -274,7 +260,7 @@ async fn pair(ctx: &CommandContext, user: Option<String>) -> Result<CommandOutpu
 
     // 3. Wait for the gateway to finalize (it requires the phone's confirm too).
     eprintln!("Confirming…");
-    let outcome = wait_for_paired(svc, &user, &device_id, &rendezvous_id, OUTCOME_WAIT).await?;
+    let outcome = wait_for_paired(svc, &device_id, &rendezvous_id, OUTCOME_WAIT).await?;
     // Stop our self-hosted relay leg: on success let it finish sending the sealed
     // GatewayWelcome (it goes out right after the approved row `wait_for_paired`
     // just observed); otherwise drop the guard to abort the still-running task.
@@ -291,10 +277,9 @@ async fn pair(ctx: &CommandContext, user: Option<String>) -> Result<CommandOutpu
                 .map(|d| format!(" Replaced device {}.", d.device_id))
                 .unwrap_or_default();
             Ok(CommandOutput::structured(
-                format!("Paired device {user}:{device_id}.{replaced_note}"),
+                format!("Paired device {device_id}.{replaced_note}"),
                 &json!({
                     "action": "paired",
-                    "user_id": user,
                     "device_id": device_id,
                     "replaced_device_id": existing.as_ref().map(|d| d.device_id.as_str()),
                 }),
@@ -452,7 +437,6 @@ enum PairOutcome {
 /// short-circuiting if the phone backs out in the meantime.
 async fn wait_for_paired(
     svc: &DevicePairingService,
-    user: &str,
     device_id: &str,
     rendezvous_id: &str,
     budget: Duration,
@@ -460,7 +444,7 @@ async fn wait_for_paired(
     let deadline = tokio::time::Instant::now() + budget;
     loop {
         if let Some(row) = svc
-            .device(user, device_id)
+            .device(device_id)
             .await
             .map_err(|e| CliError::Manager(format!("poll device row: {e}")))?
             && row.status == DeviceStatus::Approved
@@ -528,12 +512,11 @@ async fn list(ctx: &CommandContext, approved: bool) -> Result<CommandOutput> {
     let human = if rows.is_empty() {
         "(no devices)".to_string()
     } else {
-        let mut buf = String::from("STATUS\tUSER\tDEVICE\tRENDEZVOUS\tCREATED_AT\n");
+        let mut buf = String::from("STATUS\tDEVICE\tRENDEZVOUS\tCREATED_AT\n");
         for r in &rows {
             buf.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\n",
                 status_str(r),
-                r.user_id,
                 r.device_id,
                 r.rendezvous_id.as_deref().unwrap_or("-"),
                 r.created_at,
@@ -548,7 +531,6 @@ async fn list(ctx: &CommandContext, approved: bool) -> Result<CommandOutput> {
                 .iter()
                 .map(|r| json!({
                     "status": status_str(r),
-                    "user_id": r.user_id,
                     "device_id": r.device_id,
                     "rendezvous_id": r.rendezvous_id,
                     "created_at": r.created_at,
@@ -560,12 +542,7 @@ async fn list(ctx: &CommandContext, approved: bool) -> Result<CommandOutput> {
     ))
 }
 
-async fn revoke(
-    ctx: &CommandContext,
-    user_id: String,
-    device_id: String,
-    yes: bool,
-) -> Result<CommandOutput> {
+async fn revoke(ctx: &CommandContext, device_id: String, yes: bool) -> Result<CommandOutput> {
     if ctx.invocation == Invocation::Slash && !yes {
         return Err(CliError::Config(
             "pass --yes to revoke a device from a chat channel".into(),
@@ -573,20 +550,19 @@ async fn revoke(
     }
     let svc = require_service(ctx)?;
     let changed = svc
-        .revoke(&user_id, &device_id)
+        .revoke(&device_id)
         .await
         .map_err(|e| CliError::Manager(format!("revoke device: {e}")))?;
     let human = if changed {
-        format!("Revoked device {user_id}:{device_id} (row retained for audit).")
+        format!("Revoked device {device_id} (row retained for audit).")
     } else {
-        format!("No live device {user_id}:{device_id} to revoke.")
+        format!("No live device {device_id} to revoke.")
     };
     Ok(CommandOutput::structured(
         human,
         &json!({
             "action": "revoked",
             "changed": changed,
-            "user_id": user_id,
             "device_id": device_id,
         }),
     ))

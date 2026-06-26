@@ -242,7 +242,6 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     let welcome = GatewayWelcome {
         relay_node_id,
         relay_url,
-        user_id: slot.user_id.clone(),
         rendezvous_id: slot.rendezvous_id.clone(),
         auth_token: row.auth_token.clone(),
     };
@@ -255,7 +254,6 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
 
     tracing::info!(
         device = %super::short_hash(&hello.device_id),
-        user = %super::short_hash(&slot.user_id),
         "device paired",
     );
     Ok(())
@@ -452,7 +450,7 @@ mod tests {
         let device_store = tg.deps.stores.device.clone();
         let vault = tg.deps.secret_vault.clone();
 
-        let (rid, secret) = device_pairing.mint("user-1").await.unwrap();
+        let (rid, secret) = device_pairing.mint().await.unwrap();
         // Operator confirms in their live session, up front (no timing race).
         device_pairing
             .set_operator_decision(&rid, true)
@@ -495,18 +493,13 @@ mod tests {
             panic!("expected sealed GatewayWelcome");
         };
         let welcome: GatewayWelcome = pairing::decode(&app.read(&msg).unwrap()).unwrap();
-        assert_eq!(welcome.user_id, "user-1");
         assert!(!welcome.auth_token.is_empty());
         assert_eq!(welcome.rendezvous_id, rid);
         drive_task.await.unwrap().unwrap();
 
         // An approved device row landed pinning the app's in-band static + the
         // active token, and the per-device push key (HKDF of `h`) is stored.
-        let row = device_store
-            .get("user-1", "dev-xyz")
-            .await
-            .unwrap()
-            .unwrap();
+        let row = device_store.get("dev-xyz").await.unwrap().unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
         assert_eq!(row.auth_token, welcome.auth_token);
         // The gateway pinned A's *peer* static — i.e. the app's static key.
@@ -570,7 +563,7 @@ mod tests {
         let (server, mut client) = duplex();
         let drive_task = spawn_drive(server, deps);
 
-        let (rid, _real_secret) = device_pairing.mint("user-1").await.unwrap();
+        let (rid, _real_secret) = device_pairing.mint().await.unwrap();
         // The attacker uses the right rendezvous id but a guessed secret.
         let app_static = StaticKeypair::generate().unwrap();
         let prologue = build_prologue(&rid, "");
@@ -611,7 +604,7 @@ mod tests {
     ) {
         let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
         let (deps, device_pairing) = deps_from(&tg);
-        let (rid, secret) = device_pairing.mint("user-1").await.unwrap();
+        let (rid, secret) = device_pairing.mint().await.unwrap();
 
         let (server, mut client) = duplex();
         let drive_task = spawn_drive(server, deps);

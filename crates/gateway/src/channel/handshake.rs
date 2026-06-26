@@ -313,7 +313,6 @@ mod tests {
         let tokens = ChannelTokenTable::new();
         let frame = register("", ChannelType::IOS);
         let authed = AuthedClient::Device {
-            user_id: "u1".into(),
             device_id: "d1".into(),
         };
         let outcome = validate_register(frame, &authed, &tokens).unwrap();
@@ -325,7 +324,6 @@ mod tests {
         let tokens = ChannelTokenTable::new();
         let frame = register("", "telegram");
         let authed = AuthedClient::Device {
-            user_id: "u1".into(),
             device_id: "d1".into(),
         };
         let err = validate_register(frame, &authed, &tokens).unwrap_err();

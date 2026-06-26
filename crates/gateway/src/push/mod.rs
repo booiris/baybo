@@ -270,18 +270,22 @@ impl PushDispatcher {
 
     async fn dispatch_completed(&self, ev: &JobLifecycleEvent) -> usize {
         let start_cursor = self.start_cursors.lock().remove(&ev.job_id);
-        let Some(session) = self
+        // Skip a vanished session (nothing to preview), but otherwise fan out to
+        // every approved device — one gateway = one app, so there is no per-user
+        // scoping to apply.
+        if self
             .session_manager
             .get(&ev.session_id)
             .await
             .ok()
             .flatten()
-        else {
+            .is_none()
+        {
             return 0;
-        };
+        }
         let devices = self
             .device_store
-            .list_for_user(&session.user.id, Some(DeviceStatus::Approved))
+            .list(Some(DeviceStatus::Approved))
             .await
             .unwrap_or_default();
         if devices.is_empty() {

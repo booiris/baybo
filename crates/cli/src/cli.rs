@@ -109,7 +109,7 @@ pub enum Commands {
         cmd: PairCmd,
     },
     /// Manage iOS-companion device pairings: `pair` (interactive
-    /// scan + mutual confirm), `list`, and `revoke <user> <device>`.
+    /// scan + mutual confirm), `list`, and `revoke <device>`.
     Device {
         #[command(subcommand)]
         cmd: DeviceCmd,
@@ -539,13 +539,7 @@ pub enum DeviceCmd {
     /// Pair a new device: mint a code for the iOS app to scan, then confirm a
     /// Bluetooth-style code on both the phone and this terminal. Interactive —
     /// it stays live until both sides confirm (or it times out).
-    Pair {
-        /// Owning user id. Defaults to the local operator ($USER/$USERNAME) —
-        /// the same identity CLI/TUI turns run as, so the device matches the
-        /// sessions whose completed turns should push to it.
-        #[arg(long)]
-        user: Option<String>,
-    },
+    Pair,
     /// List registered devices. With no flag, shows every row; pass
     /// `--approved` to show only active devices.
     List {
@@ -556,8 +550,6 @@ pub enum DeviceCmd {
     /// Revoke a device. The row + token slot are retained for audit (the
     /// token simply stops authenticating).
     Revoke {
-        /// Owning user id.
-        user_id: String,
         /// Device id.
         device_id: String,
         /// Confirm the destructive action (required in slash mode).

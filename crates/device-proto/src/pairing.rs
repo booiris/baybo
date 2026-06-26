@@ -46,7 +46,7 @@ pub enum ApnsEnv {
 /// static itself is an XX handshake token, not a field here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceHello {
-    /// Client-generated, per-binding (one row per `(user_id, device_id)`).
+    /// Client-generated, per-binding (one row per `device_id`).
     pub device_id: String,
     /// APNs device token (gateway-mediated registration relays it to C).
     pub apns_token: String,
@@ -67,8 +67,6 @@ pub struct GatewayWelcome {
     /// NAT'd) gateway for content. Empty when relay is off.
     #[serde(default)]
     pub relay_url: String,
-    /// Owning principal on the gateway.
-    pub user_id: String,
     /// The **public** rendezvous id this device paired under, retained as an
     /// audit / device-list handle. Not secret (the relay saw it); the QR secret
     /// is never carried here.
@@ -154,7 +152,6 @@ mod tests {
         let welcome = GatewayWelcome {
             relay_node_id: "node-xyz".into(),
             relay_url: "wss://proxy.baybo.space".into(),
-            user_id: "user-1".into(),
             rendezvous_id: "11111111-2222-4333-8444-555555555555".into(),
             auth_token: "deadbeef".into(),
         };
@@ -237,7 +234,6 @@ mod tests {
         let welcome = GatewayWelcome {
             relay_node_id: "n1".into(),
             relay_url: String::new(),
-            user_id: "u1".into(),
             rendezvous_id: "rid".into(),
             auth_token: "tok".into(),
         };

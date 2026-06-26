@@ -61,7 +61,6 @@ struct PairControl {
 /// App Group keychain (`keychain::store_paired_record`).
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct PairedRecord {
-    pub(crate) user_id: String,
     pub(crate) device_id: String,
     pub(crate) auth_token: String,
     pub(crate) gateway_static_pubkey: [u8; 32],
@@ -352,7 +351,6 @@ async fn finish_pair(
     // routing candidates, and the app's Noise secret) so the app can reconnect
     // and open a content session after a relaunch.
     let record = PairedRecord {
-        user_id: paired.user_id.clone(),
         device_id: device_id.to_string(),
         auth_token: paired.auth_token.clone(),
         gateway_static_pubkey: paired.gateway_static_pubkey,
@@ -369,10 +367,10 @@ async fn finish_pair(
     Ok(PairedSummary::from(&paired))
 }
 
-/// The owning user of the persisted pairing, if the app is already paired
-/// (so a relaunch can skip straight to "connected" instead of the scan form).
-pub fn paired_user() -> Option<String> {
-    load_paired_record().ok().flatten().map(|r| r.user_id)
+/// The device id of the persisted pairing, if the app is already paired (so a
+/// relaunch can skip straight to "connected" instead of the scan form).
+pub fn paired_device() -> Option<String> {
+    load_paired_record().ok().flatten().map(|r| r.device_id)
 }
 
 /// Forget the current pairing (unpair): clear the persisted record and the

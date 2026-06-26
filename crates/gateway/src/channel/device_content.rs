@@ -96,7 +96,7 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
         .await
         .map_err(|e| format!("device lookup by pubkey: {e}"))?
         .ok_or_else(|| "no approved device for this static key".to_string())?;
-    let (user_id, device_id) = (row.user_id, row.device_id);
+    let device_id = row.device_id;
 
     let n = handshake
         .write_message(&[], &mut buf)
@@ -111,17 +111,12 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
 
     tracing::info!(
         device = %super::short_hash(&device_id),
-        user = %super::short_hash(&user_id),
         "device content session established",
     );
 
     // Best-effort liveness bump for the operator's device list.
     let now = chrono::Utc::now().timestamp();
-    if let Err(e) = state
-        .device_store
-        .touch_last_seen(&user_id, &device_id, now)
-        .await
-    {
+    if let Err(e) = state.device_store.touch_last_seen(&device_id, now).await {
         tracing::debug!(error = %e, "touch device last_seen failed");
     }
 
@@ -310,9 +305,8 @@ mod tests {
 
     const TEST_TOKEN: &str = "device-auth-token-fixed-0123456789abcdef";
 
-    fn device_row(user_id: &str, device_id: &str, pubkey: Vec<u8>) -> DeviceRow {
+    fn device_row(device_id: &str, pubkey: Vec<u8>) -> DeviceRow {
         DeviceRow {
-            user_id: user_id.into(),
             device_id: device_id.into(),
             device_pubkey: pubkey,
             auth_token: TEST_TOKEN.into(),
@@ -371,7 +365,7 @@ mod tests {
         tg.deps
             .stores
             .device
-            .create(&device_row("user-1", "ios-dev", device.public().to_vec()))
+            .create(&device_row("ios-dev", device.public().to_vec()))
             .await
             .expect("seed approved device row");
         crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::ios())

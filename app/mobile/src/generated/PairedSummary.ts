@@ -6,4 +6,4 @@
  * shell, never returned to the webview — and the QR secret is never carried at
  * all (only the public `rendezvous_id`).
  */
-export type PairedSummary = { userId: string, relayNodeId: string, rendezvousId: string, };
+export type PairedSummary = { relayNodeId: string, rendezvousId: string, };

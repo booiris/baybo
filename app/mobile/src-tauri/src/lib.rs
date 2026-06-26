@@ -54,11 +54,11 @@ async fn pair_confirm(
     pairing::pair_confirm(&sessions, &device_id, accepted).await
 }
 
-/// The owning user of a persisted pairing, if the app is already paired — so a
+/// The device id of a persisted pairing, if the app is already paired — so a
 /// relaunch can show "connected" instead of the pairing form.
 #[tauri::command]
-fn paired_user() -> Option<String> {
-    pairing::paired_user()
+fn paired_device() -> Option<String> {
+    pairing::paired_device()
 }
 
 /// Forget the current pairing (unpair): clear the keychain record + push key so
@@ -170,7 +170,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pair_begin,
             pair_confirm,
-            paired_user,
+            paired_device,
             forget_pairing,
             content_connect,
             content_send,

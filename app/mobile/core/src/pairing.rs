@@ -56,7 +56,6 @@ pub struct PairingRequest {
 /// this gateway. Only produced once both sides confirmed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairedGateway {
-    pub user_id: String,
     /// Bearer token for the scoped REST/WS surface. Active — the gateway only
     /// seals the welcome after the phone user and the operator both confirmed.
     pub auth_token: String,
@@ -95,7 +94,6 @@ pub struct PairChallenge {
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../src/generated/"))]
 #[serde(rename_all = "camelCase")]
 pub struct PairedSummary {
-    pub user_id: String,
     pub relay_node_id: String,
     pub rendezvous_id: String,
 }
@@ -103,7 +101,6 @@ pub struct PairedSummary {
 impl From<&PairedGateway> for PairedSummary {
     fn from(p: &PairedGateway) -> Self {
         Self {
-            user_id: p.user_id.clone(),
             relay_node_id: p.relay_node_id.clone(),
             rendezvous_id: p.rendezvous_id.clone(),
         }
@@ -214,7 +211,6 @@ impl PairingClient {
         let push_key = derive_push_key(transport.handshake_hash())?;
         let gateway_static_pubkey = *transport.remote_static();
         Ok(PairedGateway {
-            user_id: welcome.user_id,
             auth_token: welcome.auth_token,
             gateway_static_pubkey,
             push_key,
@@ -293,7 +289,6 @@ mod tests {
         let welcome = GatewayWelcome {
             relay_node_id: "node-1".into(),
             relay_url: "wss://proxy.baybo.space".into(),
-            user_id: "user-1".into(),
             rendezvous_id: RID.into(),
             auth_token: "issued-token".into(),
         };
@@ -301,7 +296,6 @@ mod tests {
 
         // client opens the welcome
         let paired = client.on_welcome(&wc).unwrap();
-        assert_eq!(paired.user_id, "user-1");
         assert_eq!(paired.auth_token, "issued-token");
         assert_eq!(paired.gateway_static_pubkey, gw_static.public());
         assert_eq!(paired.relay_node_id, "node-1");

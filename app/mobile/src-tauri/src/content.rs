@@ -66,12 +66,12 @@ pub async fn connect(
     let established = dial_relay(&record.relay_node_id, &record, &local).await?;
 
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-    let user_id = record.user_id.clone();
+    let device_id = record.device_id.clone();
     let task = tokio::spawn(pump(
         established.ws,
         established.session,
         session_id,
-        user_id,
+        device_id,
         on_frame,
         outbound_rx,
     ));
@@ -175,7 +175,7 @@ async fn pump(
     ws: Ws,
     mut session: ContentSession,
     session_id: String,
-    user_id: String,
+    device_id: String,
     on_frame: Channel<Frame>,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
 ) {
@@ -228,7 +228,7 @@ async fn pump(
             },
             cmd = outbound_rx.recv() => match cmd {
                 Some(OutboundCmd::Send { text, msg_id }) => {
-                    let frame = user_text_frame(&session_id, &user_id, &text, &msg_id);
+                    let frame = user_text_frame(&session_id, &device_id, &text, &msg_id);
                     match session.seal(&frame) {
                         Ok(messages) => {
                             for bytes in messages {

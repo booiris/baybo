@@ -190,7 +190,7 @@ export default function App() {
   const [challenge, setChallenge] = useState<PairChallenge | null>(null);
   const [paired, setPaired] = useState<PairedSummary | null>(null);
   // On launch, a persisted pairing means we can skip straight to "connected".
-  const [rememberedUser, setRememberedUser] = useState<string | null>(null);
+  const [rememberedDevice, setRememberedDevice] = useState<string | null>(null);
   // Whether the chat view is open (a live content session).
   const [chatting, setChatting] = useState(false);
   // QR scan flow. "scanning" makes the page transparent so the native camera
@@ -211,8 +211,8 @@ export default function App() {
   const [pendingAction, setPendingAction] = useState<null | "replace" | "forget">(null);
 
   useEffect(() => {
-    invoke<string | null>("paired_user")
-      .then((u) => setRememberedUser(u))
+    invoke<string | null>("paired_device")
+      .then((d) => setRememberedDevice(d))
       .catch(() => {});
   }, []);
 
@@ -381,7 +381,7 @@ export default function App() {
       setBusy(false);
       setPendingAction(null);
       setPaired(null);
-      setRememberedUser(null);
+      setRememberedDevice(null);
     }
   }
 
@@ -391,7 +391,7 @@ export default function App() {
   function startReplace() {
     setPendingAction(null);
     setPaired(null);
-    setRememberedUser(null);
+    setRememberedDevice(null);
   }
 
   // The actions on a "connected" screen (shared by the just-paired and the
@@ -454,8 +454,6 @@ export default function App() {
         <h1>Connected</h1>
         <p className="muted">Paired and ready.</p>
         <dl className="kv">
-          <dt>User</dt>
-          <dd>{paired.userId}</dd>
           <dt>Rendezvous</dt>
           <dd>{paired.rendezvousId}</dd>
           <dt>Relay node</dt>
@@ -490,12 +488,12 @@ export default function App() {
     );
   }
 
-  if (rememberedUser) {
+  if (rememberedDevice) {
     return (
       <main className="container">
         <h1>Connected</h1>
         <p className="muted">
-          Paired as {rememberedUser} (remembered from a previous session).
+          Paired (remembered from a previous session).
         </p>
         {connectedActions()}
         {status && <p className="status">{status}</p>}

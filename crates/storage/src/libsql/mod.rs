@@ -510,7 +510,6 @@ impl LibsqlPool {
                     ON channel_pairings(code);
 
                 CREATE TABLE IF NOT EXISTS devices (
-                    user_id       TEXT    NOT NULL,
                     device_id     TEXT    NOT NULL,
                     device_pubkey BLOB    NOT NULL,
                     auth_token    TEXT    NOT NULL,
@@ -519,34 +518,19 @@ impl LibsqlPool {
                     created_at    INTEGER NOT NULL,
                     approved_at   INTEGER,
                     last_seen_at  INTEGER,
-                    PRIMARY KEY (user_id, device_id)
+                    PRIMARY KEY (device_id)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_auth_token
                     ON devices(auth_token);
-                -- Reconcile any legacy multi-device rows to the 1:1 invariant
-                -- BEFORE building the partial index below: keep each user's
-                -- newest approved device, revoke the older approved ones. A DB
-                -- created before the one-app-per-gateway policy could hold two
-                -- approved rows for a user, which would make the unique index's
-                -- creation fail and brick startup (IF NOT EXISTS only skips an
-                -- existing index, not conflicting data). Idempotent — a no-op
-                -- once at most one approved row per user remains.
-                UPDATE devices SET status = 'revoked'
-                WHERE status = 'approved'
-                  AND rowid NOT IN (
-                      SELECT rowid FROM devices AS newest
-                      WHERE newest.user_id = devices.user_id
-                        AND newest.status = 'approved'
-                      ORDER BY created_at DESC, rowid DESC
-                      LIMIT 1
-                  );
-                -- One gateway = one user = one app: at most one Approved device
-                -- per user at a time. Re-pairing the same device refreshes its
-                -- row in place; a different device supersedes the prior binding
-                -- (see DeviceStore::create_replacing_approved), whose row goes
-                -- Revoked and drops out of this partial index.
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_one_approved_per_user
-                    ON devices(user_id) WHERE status = 'approved';",
+                -- One gateway = one app: at most one Approved device at a time.
+                -- A partial unique index on the (constant-valued) status column
+                -- of approved rows admits exactly one such row. Re-pairing the
+                -- same device refreshes its row in place; a different device
+                -- supersedes the prior binding (see
+                -- DeviceStore::create_replacing_approved), whose row goes Revoked
+                -- and drops out of this partial index.
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_one_approved
+                    ON devices(status) WHERE status = 'approved';",
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;

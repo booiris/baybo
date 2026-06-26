@@ -48,19 +48,18 @@ impl DevicePairingService {
         }
     }
 
-    /// Mint the one-time pairing slot for `user_id`. Returns the public
-    /// `rendezvous_id` (the relay routes on it; baked into the QR as `r=`) and
-    /// the high-entropy `secret` (the Noise PSK; baked into the QR as `s=` and
-    /// never transmitted over the relay). The secret is held only in the
-    /// in-memory slot from here on.
-    pub async fn mint(&self, user_id: &str) -> Result<(String, PairingSecret), DevicePairingError> {
+    /// Mint the one-time pairing slot. Returns the public `rendezvous_id` (the
+    /// relay routes on it; baked into the QR as `r=`) and the high-entropy
+    /// `secret` (the Noise PSK; baked into the QR as `s=` and never transmitted
+    /// over the relay). The secret is held only in the in-memory slot from here
+    /// on.
+    pub async fn mint(&self) -> Result<(String, PairingSecret), DevicePairingError> {
         let now = Utc::now().timestamp();
         let rendezvous_id = uuid::Uuid::new_v4().to_string();
         let secret = PairingSecret::generate();
         *self.slot.lock() = Some(DevicePairingSlot {
             rendezvous_id: rendezvous_id.clone(),
             secret: secret.clone(),
-            user_id: user_id.to_string(),
             created_at: now,
             expires_at: now.saturating_add(SLOT_TTL_SECONDS),
             confirm_code: None,
@@ -148,17 +147,14 @@ impl DevicePairingService {
         Ok(())
     }
 
-    /// The gateway's current bound device for `user_id`, if any — at most one
-    /// (one gateway = one user = one app). The operator's `baybo device pair`
-    /// queries this before minting a slot so it can warn that the new pairing
-    /// will replace the existing binding.
-    pub async fn current_device(
-        &self,
-        user_id: &str,
-    ) -> Result<Option<DeviceRow>, DevicePairingError> {
+    /// The gateway's current bound device, if any — at most one (one gateway =
+    /// one app). The operator's `baybo device pair` queries this before minting a
+    /// slot so it can warn that the new pairing will replace the existing
+    /// binding.
+    pub async fn current_device(&self) -> Result<Option<DeviceRow>, DevicePairingError> {
         Ok(self
             .devices
-            .list_for_user(user_id, Some(DeviceStatus::Approved))
+            .list(Some(DeviceStatus::Approved))
             .await?
             .into_iter()
             .next())
@@ -168,11 +164,11 @@ impl DevicePairingService {
     /// freshly minted, active `auth_token`) and consume the slot. Called only
     /// once both the phone user and the operator confirmed.
     ///
-    /// Enforces the 1:1 binding: any device the user already had bound is
-    /// atomically revoked as this one is written, so the gateway is never bound
-    /// to two devices at once. The replacement happens **here**, at finalize —
-    /// not when the operator first runs `device pair` — so a working binding is
-    /// kept live until the new pairing actually completes.
+    /// Enforces the 1:1 binding: any device already bound is atomically revoked
+    /// as this one is written, so the gateway is never bound to two devices at
+    /// once. The replacement happens **here**, at finalize — not when the
+    /// operator first runs `device pair` — so a working binding is kept live
+    /// until the new pairing actually completes.
     pub async fn complete(
         &self,
         slot: &DevicePairingSlot,
@@ -192,7 +188,6 @@ impl DevicePairingService {
         }
         let now = Utc::now().timestamp();
         let row = DeviceRow {
-            user_id: slot.user_id.clone(),
             device_id: device_id.to_string(),
             device_pubkey,
             auth_token: mint_auth_token(),
@@ -217,18 +212,14 @@ impl DevicePairingService {
 
     /// Revoke a device (keeps the row + token slot; the token stops
     /// authenticating). Returns whether a row changed.
-    pub async fn revoke(&self, user_id: &str, device_id: &str) -> Result<bool, DevicePairingError> {
-        Ok(self.devices.revoke(user_id, device_id).await?)
+    pub async fn revoke(&self, device_id: &str) -> Result<bool, DevicePairingError> {
+        Ok(self.devices.revoke(device_id).await?)
     }
 
     /// Fetch one device row by its natural key. The operator's live
     /// `device pair` polls this to report whether the pairing finalized.
-    pub async fn device(
-        &self,
-        user_id: &str,
-        device_id: &str,
-    ) -> Result<Option<DeviceRow>, DevicePairingError> {
-        Ok(self.devices.get(user_id, device_id).await?)
+    pub async fn device(&self, device_id: &str) -> Result<Option<DeviceRow>, DevicePairingError> {
+        Ok(self.devices.get(device_id).await?)
     }
 
     /// List device rows, optionally filtered by status (`baybo device list`).
@@ -258,11 +249,10 @@ mod tests {
     #[tokio::test]
     async fn mint_claim_confirm_complete_yields_approved() {
         let svc = service();
-        let (rid, secret) = svc.mint("user-1").await.unwrap();
+        let (rid, secret) = svc.mint().await.unwrap();
         assert!(!rid.is_empty(), "rendezvous id minted");
 
         let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
-        assert_eq!(slot.user_id, "user-1");
         // The slot holds the same secret the QR carries (the only copy on the
         // gateway side).
         assert_eq!(slot.secret.as_bytes(), secret.as_bytes());
@@ -310,7 +300,7 @@ mod tests {
     #[tokio::test]
     async fn one_rendezvous_mints_at_most_one_device() {
         let svc = service();
-        let (rid, _secret) = svc.mint("user-1").await.unwrap();
+        let (rid, _secret) = svc.mint().await.unwrap();
         // Two finalize attempts read the same live slot before either consumed it.
         let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
         // The first finalize consumes the slot; the second is refused, so the
@@ -328,8 +318,8 @@ mod tests {
     #[tokio::test]
     async fn mint_supersedes_any_prior_slot() {
         let svc = service();
-        let (a, _) = svc.mint("u").await.unwrap();
-        let (b, _) = svc.mint("u").await.unwrap();
+        let (a, _) = svc.mint().await.unwrap();
+        let (b, _) = svc.mint().await.unwrap();
         assert_ne!(a, b);
         // One in-flight pairing per service: the latest mint replaces the prior,
         // so only the newest rendezvous is claimable.
@@ -340,11 +330,11 @@ mod tests {
     #[tokio::test]
     async fn revoke_after_pair() {
         let svc = service();
-        let (rid, _) = svc.mint("u").await.unwrap();
+        let (rid, _) = svc.mint().await.unwrap();
         let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
         let row = svc.complete(&slot, "d1", vec![1u8; 32]).await.unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
-        assert!(svc.revoke(&row.user_id, "d1").await.unwrap());
+        assert!(svc.revoke("d1").await.unwrap());
         // Revoked devices don't show under the Approved filter.
         assert!(
             svc.list(Some(DeviceStatus::Approved))
@@ -357,17 +347,17 @@ mod tests {
     #[tokio::test]
     async fn second_pairing_replaces_the_first() {
         let svc = service();
-        // First device for the user.
-        let (r1, _) = svc.mint("u").await.unwrap();
+        // First device.
+        let (r1, _) = svc.mint().await.unwrap();
         let slot1 = svc.claim_slot(&r1).await.unwrap().unwrap();
         svc.complete(&slot1, "dev-a", vec![1u8; 32]).await.unwrap();
         assert_eq!(
-            svc.current_device("u").await.unwrap().unwrap().device_id,
+            svc.current_device().await.unwrap().unwrap().device_id,
             "dev-a"
         );
 
         // A second pairing supersedes it: one gateway = one app.
-        let (r2, _) = svc.mint("u").await.unwrap();
+        let (r2, _) = svc.mint().await.unwrap();
         let slot2 = svc.claim_slot(&r2).await.unwrap().unwrap();
         svc.complete(&slot2, "dev-b", vec![2u8; 32]).await.unwrap();
 
@@ -375,7 +365,7 @@ mod tests {
         assert_eq!(approved.len(), 1, "exactly one approved device");
         assert_eq!(approved[0].device_id, "dev-b", "the newest wins");
         assert_eq!(
-            svc.current_device("u").await.unwrap().unwrap().device_id,
+            svc.current_device().await.unwrap().unwrap().device_id,
             "dev-b"
         );
         // The superseded device is retained as revoked (audit), not deleted.
@@ -386,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn expired_slot_is_not_claimable() {
         let svc = service();
-        let (rid, _) = svc.mint("u").await.unwrap();
+        let (rid, _) = svc.mint().await.unwrap();
         // Backdate the slot well past its TTL; `claim_slot` filters it out.
         {
             let mut guard = svc.slot.lock();

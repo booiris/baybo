@@ -87,7 +87,6 @@ pub enum AuthedClient {
     /// (a `Subscribed` channel), and may not upload blobs (receive-only in
     /// phase 1).
     Device {
-        user_id: String,
         device_id: String,
     },
 }
@@ -276,7 +275,6 @@ async fn resolve_token(
         match device_store.lookup_approved_by_auth_token(token).await {
             Ok(Some(row)) => {
                 return Ok(Some(AuthedClient::Device {
-                    user_id: row.user_id,
                     device_id: row.device_id,
                 }));
             }
@@ -494,7 +492,6 @@ mod tests {
         let store = Arc::new(MemoryDeviceStore::new());
         store
             .create(&baybo_store::DeviceRow {
-                user_id: "u1".into(),
                 device_id: "d1".into(),
                 device_pubkey: vec![0u8; 32],
                 auth_token: "devtok".into(),
@@ -517,8 +514,7 @@ mod tests {
         let out = check_channel_token(&req, &state).await.unwrap();
         assert!(matches!(
             out,
-            Some(AuthedClient::Device { user_id, device_id })
-                if user_id == "u1" && device_id == "d1"
+            Some(AuthedClient::Device { device_id }) if device_id == "d1"
         ));
     }
 
@@ -530,7 +526,6 @@ mod tests {
         let store = Arc::new(MemoryDeviceStore::new());
         store
             .create(&baybo_store::DeviceRow {
-                user_id: "u1".into(),
                 device_id: "d1".into(),
                 device_pubkey: vec![0u8; 32],
                 auth_token: "revtok".into(),

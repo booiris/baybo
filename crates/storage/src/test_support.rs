@@ -183,10 +183,10 @@ fn split_id(blob_id: &str) -> BlobResult<(&str, &str)> {
 
 use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result as DeviceResult};
 
-/// In-memory [`DeviceStore`] keyed by `(user_id, device_id)`.
+/// In-memory [`DeviceStore`] keyed by `device_id`.
 #[derive(Default)]
 pub struct MemoryDeviceStore {
-    rows: Mutex<HashMap<(String, String), DeviceRow>>,
+    rows: Mutex<HashMap<String, DeviceRow>>,
 }
 
 impl MemoryDeviceStore {
@@ -199,47 +199,42 @@ impl MemoryDeviceStore {
 impl DeviceStore for MemoryDeviceStore {
     async fn create(&self, row: &DeviceRow) -> DeviceResult<()> {
         let mut g = self.rows.lock();
-        let key = (row.user_id.clone(), row.device_id.clone());
-        if g.contains_key(&key) || g.values().any(|r| r.auth_token == row.auth_token) {
+        if g.contains_key(&row.device_id) || g.values().any(|r| r.auth_token == row.auth_token) {
             return Err(StorageError::Conflict("device or auth_token exists".into()));
         }
-        // Mirror the partial unique index: at most one Approved row per user.
+        // Mirror the partial unique index: at most one Approved row.
         if row.status == DeviceStatus::Approved
-            && g.values()
-                .any(|r| r.user_id == row.user_id && r.status == DeviceStatus::Approved)
+            && g.values().any(|r| r.status == DeviceStatus::Approved)
         {
             return Err(StorageError::Conflict(
-                "user already has an approved device".into(),
+                "an approved device already exists".into(),
             ));
         }
-        g.insert(key, row.clone());
+        g.insert(row.device_id.clone(), row.clone());
         Ok(())
     }
 
     async fn create_replacing_approved(&self, row: &DeviceRow) -> DeviceResult<Vec<String>> {
         let mut g = self.rows.lock();
-        let key = (row.user_id.clone(), row.device_id.clone());
-        if g.contains_key(&key) || g.values().any(|r| r.auth_token == row.auth_token) {
-            return Err(StorageError::Conflict("device or auth_token exists".into()));
+        if g.values()
+            .any(|r| r.auth_token == row.auth_token && r.device_id != row.device_id)
+        {
+            return Err(StorageError::Conflict("auth_token exists".into()));
         }
         let replaced: Vec<String> = g
             .values_mut()
-            .filter(|r| r.user_id == row.user_id && r.status == DeviceStatus::Approved)
+            .filter(|r| r.status == DeviceStatus::Approved && r.device_id != row.device_id)
             .map(|r| {
                 r.status = DeviceStatus::Revoked;
                 r.device_id.clone()
             })
             .collect();
-        g.insert(key, row.clone());
+        g.insert(row.device_id.clone(), row.clone());
         Ok(replaced)
     }
 
-    async fn get(&self, user_id: &str, device_id: &str) -> DeviceResult<Option<DeviceRow>> {
-        Ok(self
-            .rows
-            .lock()
-            .get(&(user_id.to_string(), device_id.to_string()))
-            .cloned())
+    async fn get(&self, device_id: &str) -> DeviceResult<Option<DeviceRow>> {
+        Ok(self.rows.lock().get(device_id).cloned())
     }
 
     async fn lookup_approved_by_auth_token(
@@ -276,23 +271,9 @@ impl DeviceStore for MemoryDeviceStore {
         ))
     }
 
-    async fn list_for_user(
-        &self,
-        user_id: &str,
-        status: Option<DeviceStatus>,
-    ) -> DeviceResult<Vec<DeviceRow>> {
-        Ok(sorted_desc(
-            self.rows
-                .lock()
-                .values()
-                .filter(|r| r.user_id == user_id && status.is_none_or(|s| r.status == s))
-                .cloned(),
-        ))
-    }
-
-    async fn revoke(&self, user_id: &str, device_id: &str) -> DeviceResult<bool> {
+    async fn revoke(&self, device_id: &str) -> DeviceResult<bool> {
         let mut g = self.rows.lock();
-        let Some(row) = g.get_mut(&(user_id.to_string(), device_id.to_string())) else {
+        let Some(row) = g.get_mut(device_id) else {
             return Ok(false);
         };
         if row.status == DeviceStatus::Revoked {
@@ -302,12 +283,8 @@ impl DeviceStore for MemoryDeviceStore {
         Ok(true)
     }
 
-    async fn touch_last_seen(&self, user_id: &str, device_id: &str, now: i64) -> DeviceResult<()> {
-        if let Some(row) = self
-            .rows
-            .lock()
-            .get_mut(&(user_id.to_string(), device_id.to_string()))
-        {
+    async fn touch_last_seen(&self, device_id: &str, now: i64) -> DeviceResult<()> {
+        if let Some(row) = self.rows.lock().get_mut(device_id) {
             row.last_seen_at = Some(now);
         }
         Ok(())

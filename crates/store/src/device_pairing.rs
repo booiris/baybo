@@ -2,9 +2,9 @@
 //!
 //! A slot is the short-lived, in-process bookkeeping for one live
 //! `baybo device pair` run: it carries the public `rendezvous_id`, the QR
-//! `secret` (the Noise PSK), the owning `user_id`, the confirmation code both
-//! ends compare once the handshake completes, and each side's confirm
-//! decision. It is held in memory by
+//! `secret` (the Noise PSK), the confirmation code both ends compare once the
+//! handshake completes, and each side's confirm decision. It is held in memory
+//! by
 //! [`baybo_pairing::DevicePairingService`](../../baybo_pairing) for the lifetime
 //! of the command — pairing is driven entirely by that single interactive
 //! process (the operator's CLI hosts the relay leg *and* runs the handshake), so
@@ -35,7 +35,6 @@ pub struct DevicePairingSlot {
     /// The QR secret used as the Noise PSK. Credential material — see the module
     /// docs; never persisted or logged, zeroized on drop.
     pub secret: PairingSecret,
-    pub user_id: String,
     /// Unix seconds.
     pub created_at: i64,
     /// Unix seconds; the slot is dead once `now >= expires_at`.
