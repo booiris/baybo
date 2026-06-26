@@ -512,7 +512,6 @@ impl LibsqlPool {
                 CREATE TABLE IF NOT EXISTS devices (
                     user_id       TEXT    NOT NULL,
                     device_id     TEXT    NOT NULL,
-                    label         TEXT    NOT NULL,
                     device_pubkey BLOB    NOT NULL,
                     auth_token    TEXT    NOT NULL,
                     status        TEXT    NOT NULL,

@@ -496,7 +496,6 @@ mod tests {
             .create(&baybo_store::DeviceRow {
                 user_id: "u1".into(),
                 device_id: "d1".into(),
-                label: "iPhone".into(),
                 device_pubkey: vec![0u8; 32],
                 auth_token: "devtok".into(),
                 status: baybo_store::DeviceStatus::Approved,
@@ -533,7 +532,6 @@ mod tests {
             .create(&baybo_store::DeviceRow {
                 user_id: "u1".into(),
                 device_id: "d1".into(),
-                label: "iPhone".into(),
                 device_pubkey: vec![0u8; 32],
                 auth_token: "revtok".into(),
                 status: baybo_store::DeviceStatus::Revoked,

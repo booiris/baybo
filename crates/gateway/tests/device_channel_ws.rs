@@ -28,7 +28,6 @@ fn approved_device(token: &str) -> DeviceRow {
     DeviceRow {
         user_id: "dev-user".into(),
         device_id: "dev-1".into(),
-        label: "iPhone".into(),
         device_pubkey: vec![0u8; 32],
         auth_token: token.into(),
         status: DeviceStatus::Approved,

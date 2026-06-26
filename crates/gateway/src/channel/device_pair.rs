@@ -131,23 +131,11 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     //    live transcript, so it is not grindable or precomputable. Publish it
     //    onto the slot so the operator's live `device pair` shows it, then require
     //    BOTH the phone user and the operator to approve before any token activates.
-    // Resolve the device label: the operator's `device pair <label>` override if
-    // they passed one, else the name the device reports in `DeviceHello`.
-    let device_label = if slot.label.is_empty() {
-        hello.label.as_str()
-    } else {
-        slot.label.as_str()
-    };
     let confirm_code =
         derive_confirm_code(noise.handshake_hash()).map_err(|e| format!("confirm code: {e}"))?;
     state
         .device_pairing
-        .publish_confirm(
-            &slot.rendezvous_id,
-            &confirm_code,
-            &hello.device_id,
-            device_label,
-        )
+        .publish_confirm(&slot.rendezvous_id, &confirm_code, &hello.device_id)
         .await
         .map_err(|e| format!("publish confirm: {e}"))?;
 
@@ -207,7 +195,7 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     //    in-band) + consume the slot (zeroizing the secret it held).
     let row = state
         .device_pairing
-        .complete(&slot, &hello.device_id, app_static.to_vec(), device_label)
+        .complete(&slot, &hello.device_id, app_static.to_vec())
         .await
         .map_err(|e| format!("complete pairing: {e}"))?;
 
@@ -441,7 +429,6 @@ mod tests {
 
         let hello = DeviceHello {
             device_id: device_id.to_string(),
-            label: "Test iPhone".into(),
             apns_token: "apns-tok".into(),
             apns_env: ApnsEnv::Sandbox,
         };
@@ -465,9 +452,7 @@ mod tests {
         let device_store = tg.deps.stores.device.clone();
         let vault = tg.deps.secret_vault.clone();
 
-        // Operator mints a slot with no label (the bare `baybo device pair`): the
-        // device's reported name should flow through instead.
-        let (rid, secret) = device_pairing.mint("user-1", "").await.unwrap();
+        let (rid, secret) = device_pairing.mint("user-1").await.unwrap();
         // Operator confirms in their live session, up front (no timing race).
         device_pairing
             .set_operator_decision(&rid, true)
@@ -523,10 +508,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
-        assert_eq!(
-            row.label, "Test iPhone",
-            "no operator label → the device's reported name is used"
-        );
         assert_eq!(row.auth_token, welcome.auth_token);
         // The gateway pinned A's *peer* static — i.e. the app's static key.
         assert_eq!(row.device_pubkey.len(), 32);
@@ -589,7 +570,7 @@ mod tests {
         let (server, mut client) = duplex();
         let drive_task = spawn_drive(server, deps);
 
-        let (rid, _real_secret) = device_pairing.mint("user-1", "").await.unwrap();
+        let (rid, _real_secret) = device_pairing.mint("user-1").await.unwrap();
         // The attacker uses the right rendezvous id but a guessed secret.
         let app_static = StaticKeypair::generate().unwrap();
         let prologue = build_prologue(&rid, "");
@@ -630,7 +611,7 @@ mod tests {
     ) {
         let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
         let (deps, device_pairing) = deps_from(&tg);
-        let (rid, secret) = device_pairing.mint("user-1", "").await.unwrap();
+        let (rid, secret) = device_pairing.mint("user-1").await.unwrap();
 
         let (server, mut client) = duplex();
         let drive_task = spawn_drive(server, deps);

@@ -132,9 +132,9 @@ msg5 ◄─ PairFrame::Sealed(GatewayWelcome)          (transport msg, after ope
 - `Hello` carries `rendezvous_id` so the gateway can claim the in-flight slot by
   it (and it is bound into the prologue); on the relay route it is also the path
   param and MUST match.
-- `DeviceHello`'s non-static fields (`device_id`, `label`, `apns_token`,
-  `apns_env`) ride as the **msg3 payload** (authenticated by the app static). The
-  app static itself is now an XX handshake token, not a payload field.
+- `DeviceHello`'s non-static fields (`device_id`, `apns_token`, `apns_env`) ride
+  as the **msg3 payload** (authenticated by the app static). The app static
+  itself is now an XX handshake token, not a payload field.
 - `DeviceConfirm` / `GatewayWelcome` are **transport-mode** messages (snow's
   implicit nonce — drop the explicit `nonce` field from `PairFrame::Sealed`).
 - Optional nicety: the app can compute msg3 (hence `h` and the confirm code)

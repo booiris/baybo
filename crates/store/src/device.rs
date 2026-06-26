@@ -71,8 +71,6 @@ pub struct DeviceRow {
     /// *different* device supersedes the prior one, whose row is revoked (kept
     /// for audit), never reused.
     pub device_id: String,
-    /// Human label for the device list ("Booiris iPhone").
-    pub label: String,
     /// The device's X25519 static public key, exchanged at pairing (32 bytes).
     pub device_pubkey: Vec<u8>,
     /// 256-bit hex bearer for the scoped REST/WS surface. Active from creation

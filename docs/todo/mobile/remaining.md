@@ -9,8 +9,8 @@ the overall design and the A (gateway) / C (remote-host) / P (phone) roles.
 - **Pairing**: Bluetooth-style mutual-confirm handshake (both the phone user and
   the operator confirm a code derived from the Noise handshake hash `h`; no
   separate `device approve` step; device rows are `Approved` from creation).
-  `device pair` is interactive, label is optional (the device reports its own
-  name), renders a terminal QR, default endpoint `wss://proxy.baybo.space`. The
+  `device pair` is interactive, renders a terminal QR, default endpoint
+  `wss://proxy.baybo.space`. The
   former malicious-relay MITM is **closed** (TODO #6): the QR carries a public
   `rendezvous_id` (C's routing key) *and* a 256-bit `secret` used as the Noise
   **XXpsk0** PSK, which C never sees — so a hostile relay can't complete the

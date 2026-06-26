@@ -48,8 +48,6 @@ pub enum ApnsEnv {
 pub struct DeviceHello {
     /// Client-generated, per-binding (one row per `(user_id, device_id)`).
     pub device_id: String,
-    /// Human label for the device list ("Booiris iPhone").
-    pub label: String,
     /// APNs device token (gateway-mediated registration relays it to C).
     pub apns_token: String,
     /// Environment the token is bound to.
@@ -144,7 +142,6 @@ mod tests {
     fn device_hello_round_trips() {
         let hello = DeviceHello {
             device_id: "dev-123".into(),
-            label: "Booiris iPhone".into(),
             apns_token: "abc123".into(),
             apns_env: ApnsEnv::Sandbox,
         };
@@ -206,7 +203,6 @@ mod tests {
         // msg3 carries the DeviceHello body.
         let hello = DeviceHello {
             device_id: "dev-1".into(),
-            label: "iPhone".into(),
             apns_token: "tok".into(),
             apns_env: ApnsEnv::Production,
         };

@@ -121,7 +121,6 @@ pub async fn pair_begin(
     endpoint: &str,
     rendezvous_id: &str,
     secret: &str,
-    label: &str,
     instance_key: Option<String>,
     on_abort: Channel<PairAborted>,
 ) -> Result<PairChallenge, String> {
@@ -149,7 +148,6 @@ pub async fn pair_begin(
         // gateway's relay URL — it does, both being the QR `h=`.
         endpoint: endpoint.to_string(),
         device_id: device_id.clone(),
-        label: label.to_string(),
         // The app static rides the handshake as an XX token; the gateway learns
         // the public half in-band.
         static_secret: keypair.secret(),

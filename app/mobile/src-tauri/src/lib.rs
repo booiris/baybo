@@ -29,7 +29,6 @@ async fn pair_begin(
     endpoint: String,
     rendezvous_id: String,
     secret: String,
-    label: String,
     instance_key: Option<String>,
     on_abort: Channel<PairAborted>,
 ) -> Result<PairChallenge, String> {
@@ -38,7 +37,6 @@ async fn pair_begin(
         &endpoint,
         &rendezvous_id,
         &secret,
-        &label,
         instance_key,
         on_abort,
     )

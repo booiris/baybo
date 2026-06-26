@@ -53,10 +53,8 @@ type ChatMsg = { id: string; role: "user" | "assistant" | "notice"; content: str
 
 // Pairing defaults now that the manual form is gone: the QR carries the relay
 // endpoint (`h=`), so we only fall back to the public proxy when a bare-code QR
-// omits it, and report a fixed device label (the operator's terminal shows its
-// own name regardless).
+// omits it.
 const DEFAULT_ENDPOINT = "wss://proxy.baybo.space";
-const DEVICE_LABEL = "My iPhone";
 
 // The windowed scanner draws the camera behind the webview and exposes no
 // "camera ready" signal, so going transparent up front would flash a black frame
@@ -327,7 +325,6 @@ export default function App() {
         endpoint: opts.endpoint,
         rendezvousId: opts.rendezvousId,
         secret: opts.secret,
-        label: DEVICE_LABEL,
         instanceKey: opts.instanceKey,
         onAbort,
       });

@@ -14,15 +14,15 @@ impl LibsqlDeviceStore {
     }
 }
 
-const COLS: &str = "user_id, device_id, label, device_pubkey, auth_token, status, \
+const COLS: &str = "user_id, device_id, device_pubkey, auth_token, status, \
      rendezvous_id, created_at, approved_at, last_seen_at";
 
 /// Shared INSERT for a device row — reused by `create` and the transactional
 /// `create_replacing_approved` so the column list has one source of truth.
 const INSERT_DEVICE: &str = "INSERT INTO devices
-     (user_id, device_id, label, device_pubkey, auth_token, status,
+     (user_id, device_id, device_pubkey, auth_token, status,
       rendezvous_id, created_at, approved_at, last_seen_at)
- VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
 
 /// Re-pair tail appended to [`INSERT_DEVICE`], used only by
 /// [`LibsqlDeviceStore::create_replacing_approved`]. `device_id` is a stable,
@@ -33,7 +33,6 @@ const INSERT_DEVICE: &str = "INSERT INTO devices
 /// so it stays the device's first-seen time. Pairing a **different** device hits
 /// no conflict and inserts a fresh row as before.
 const REPAIR_UPSERT_TAIL: &str = " ON CONFLICT(user_id, device_id) DO UPDATE SET \
-     label = excluded.label, \
      device_pubkey = excluded.device_pubkey, \
      auth_token = excluded.auth_token, \
      status = excluded.status, \
@@ -60,14 +59,13 @@ fn insert_conflict_err(row: &DeviceRow, e: impl std::fmt::Display) -> StorageErr
     }
 }
 
-/// The ten positional params for [`INSERT_DEVICE`], in column order.
+/// The nine positional params for [`INSERT_DEVICE`], in column order.
 fn insert_params(row: &DeviceRow) -> Vec<libsql::Value> {
     use libsql::Value;
     let opt_int = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
     vec![
         Value::Text(row.user_id.clone()),
         Value::Text(row.device_id.clone()),
-        Value::Text(row.label.clone()),
         Value::Blob(row.device_pubkey.clone()),
         Value::Text(row.auth_token.clone()),
         Value::Text(row.status.as_str().to_string()),
@@ -82,20 +80,19 @@ async fn fetch_row(rows: &mut libsql::Rows) -> Result<Option<DeviceRow>> {
     let Some(row) = rows.next().await.map_err(|e| col_err("row", e))? else {
         return Ok(None);
     };
-    let status_s: String = row.get(5).map_err(|e| col_err("get status", e))?;
+    let status_s: String = row.get(4).map_err(|e| col_err("get status", e))?;
     let status = DeviceStatus::parse(&status_s)
         .ok_or_else(|| col_err("status", format!("unknown device status: {status_s}")))?;
     Ok(Some(DeviceRow {
         user_id: row.get(0).map_err(|e| col_err("get user_id", e))?,
         device_id: row.get(1).map_err(|e| col_err("get device_id", e))?,
-        label: row.get(2).map_err(|e| col_err("get label", e))?,
-        device_pubkey: row.get(3).map_err(|e| col_err("get device_pubkey", e))?,
-        auth_token: row.get(4).map_err(|e| col_err("get auth_token", e))?,
+        device_pubkey: row.get(2).map_err(|e| col_err("get device_pubkey", e))?,
+        auth_token: row.get(3).map_err(|e| col_err("get auth_token", e))?,
         status,
-        rendezvous_id: row.get(6).map_err(|e| col_err("get rendezvous_id", e))?,
-        created_at: row.get(7).map_err(|e| col_err("get created_at", e))?,
-        approved_at: row.get(8).map_err(|e| col_err("get approved_at", e))?,
-        last_seen_at: row.get(9).map_err(|e| col_err("get last_seen_at", e))?,
+        rendezvous_id: row.get(5).map_err(|e| col_err("get rendezvous_id", e))?,
+        created_at: row.get(6).map_err(|e| col_err("get created_at", e))?,
+        approved_at: row.get(7).map_err(|e| col_err("get approved_at", e))?,
+        last_seen_at: row.get(8).map_err(|e| col_err("get last_seen_at", e))?,
     }))
 }
 
@@ -302,7 +299,6 @@ mod tests {
         DeviceRow {
             user_id: user.into(),
             device_id: device.into(),
-            label: "iPhone".into(),
             device_pubkey: vec![7u8; 32],
             auth_token: token.into(),
             status: DeviceStatus::Approved,

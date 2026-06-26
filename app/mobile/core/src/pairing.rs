@@ -43,8 +43,6 @@ pub struct PairingRequest {
     pub endpoint: String,
     /// Client-generated, per-pairing device id.
     pub device_id: String,
-    /// Human label ("Booiris iPhone").
-    pub label: String,
     /// The app's long-term Noise static **secret**. It rides the handshake as an
     /// XX token (the gateway learns the public half in-band); it never leaves the
     /// keystore otherwise.
@@ -151,7 +149,6 @@ impl PairingClient {
         let msg1 = handshake.write_handshake(&[])?;
         let hello = DeviceHello {
             device_id: req.device_id,
-            label: req.label,
             apns_token: req.apns_token,
             apns_env: req.apns_env,
         };
@@ -251,7 +248,6 @@ mod tests {
             secret: secret.clone(),
             endpoint: ENDPOINT.into(),
             device_id: "dev-xyz".into(),
-            label: "Test iPhone".into(),
             static_secret: app_static.secret(),
             apns_token: "apns-tok".into(),
             apns_env: ApnsEnv::Sandbox,
@@ -325,7 +321,6 @@ mod tests {
             secret: PairingSecret::generate(),
             endpoint: ENDPOINT.into(),
             device_id: "d".into(),
-            label: "l".into(),
             static_secret: app_static.secret(),
             apns_token: "t".into(),
             apns_env: ApnsEnv::Sandbox,

@@ -314,7 +314,6 @@ mod tests {
         DeviceRow {
             user_id: user_id.into(),
             device_id: device_id.into(),
-            label: "Test iPhone".into(),
             device_pubkey: pubkey,
             auth_token: TEST_TOKEN.into(),
             status: DeviceStatus::Approved,

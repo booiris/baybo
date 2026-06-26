@@ -53,11 +53,7 @@ impl DevicePairingService {
     /// the high-entropy `secret` (the Noise PSK; baked into the QR as `s=` and
     /// never transmitted over the relay). The secret is held only in the
     /// in-memory slot from here on.
-    pub async fn mint(
-        &self,
-        user_id: &str,
-        label: &str,
-    ) -> Result<(String, PairingSecret), DevicePairingError> {
+    pub async fn mint(&self, user_id: &str) -> Result<(String, PairingSecret), DevicePairingError> {
         let now = Utc::now().timestamp();
         let rendezvous_id = uuid::Uuid::new_v4().to_string();
         let secret = PairingSecret::generate();
@@ -65,7 +61,6 @@ impl DevicePairingService {
             rendezvous_id: rendezvous_id.clone(),
             secret: secret.clone(),
             user_id: user_id.to_string(),
-            label: label.to_string(),
             created_at: now,
             expires_at: now.saturating_add(SLOT_TTL_SECONDS),
             confirm_code: None,
@@ -93,16 +88,14 @@ impl DevicePairingService {
     }
 
     /// Publish the confirm challenge: record the confirmation code + the live
-    /// device id + the resolved label (the device's reported name, or the
-    /// operator's override) so the operator's `baybo device pair` can display
-    /// them. Called once the handshake + `DeviceHello` complete. No-op if the
-    /// slot is gone or its rendezvous id no longer matches.
+    /// device id so the operator's `baybo device pair` can display them. Called
+    /// once the handshake + `DeviceHello` complete. No-op if the slot is gone or
+    /// its rendezvous id no longer matches.
     pub async fn publish_confirm(
         &self,
         rendezvous_id: &str,
         confirm_code: &str,
         device_id: &str,
-        label: &str,
     ) -> Result<(), DevicePairingError> {
         if let Some(slot) = self
             .slot
@@ -112,7 +105,6 @@ impl DevicePairingService {
         {
             slot.confirm_code = Some(confirm_code.to_string());
             slot.device_id = Some(device_id.to_string());
-            slot.label = label.to_string();
         }
         Ok(())
     }
@@ -173,9 +165,8 @@ impl DevicePairingService {
     }
 
     /// Finalize a confirmed handshake: write an **approved** device row (with a
-    /// freshly minted, active `auth_token`) and consume the slot. `label` is the
-    /// resolved device name (the device's reported label, or the operator's
-    /// override). Called only once both the phone user and the operator confirmed.
+    /// freshly minted, active `auth_token`) and consume the slot. Called only
+    /// once both the phone user and the operator confirmed.
     ///
     /// Enforces the 1:1 binding: any device the user already had bound is
     /// atomically revoked as this one is written, so the gateway is never bound
@@ -187,7 +178,6 @@ impl DevicePairingService {
         slot: &DevicePairingSlot,
         device_id: &str,
         device_pubkey: Vec<u8>,
-        label: &str,
     ) -> Result<DeviceRow, DevicePairingError> {
         // Consume the single-use slot up front: a second finalize for the same
         // rendezvous (a retrying leg) gets `SlotConsumed` and is refused, so one
@@ -204,7 +194,6 @@ impl DevicePairingService {
         let row = DeviceRow {
             user_id: slot.user_id.clone(),
             device_id: device_id.to_string(),
-            label: label.to_string(),
             device_pubkey,
             auth_token: mint_auth_token(),
             status: DeviceStatus::Approved,
@@ -269,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn mint_claim_confirm_complete_yields_approved() {
         let svc = service();
-        let (rid, secret) = svc.mint("user-1", "Booiris iPhone").await.unwrap();
+        let (rid, secret) = svc.mint("user-1").await.unwrap();
         assert!(!rid.is_empty(), "rendezvous id minted");
 
         let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
@@ -278,15 +267,13 @@ mod tests {
         // gateway side).
         assert_eq!(slot.secret.as_bytes(), secret.as_bytes());
 
-        // Publish the confirm challenge (with the device's reported name); both
-        // ends would now show it.
-        svc.publish_confirm(&rid, "123456", "dev-abc", "Booiris iPhone")
+        // Publish the confirm challenge; both ends would now show it.
+        svc.publish_confirm(&rid, "123456", "dev-abc")
             .await
             .unwrap();
         let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
         assert_eq!(slot.confirm_code.as_deref(), Some("123456"));
         assert_eq!(slot.device_id.as_deref(), Some("dev-abc"));
-        assert_eq!(slot.label, "Booiris iPhone");
 
         // Operator approves in the live session.
         svc.set_operator_decision(&rid, true).await.unwrap();
@@ -300,12 +287,8 @@ mod tests {
         );
 
         // Finalize → an active (approved) row, token live from creation.
-        let row = svc
-            .complete(&slot, "dev-abc", vec![3u8; 32], "Booiris iPhone")
-            .await
-            .unwrap();
+        let row = svc.complete(&slot, "dev-abc", vec![3u8; 32]).await.unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
-        assert_eq!(row.label, "Booiris iPhone");
         assert_eq!(row.approved_at, Some(row.created_at));
         assert_eq!(row.device_pubkey, vec![3u8; 32]);
         assert_eq!(
@@ -327,16 +310,14 @@ mod tests {
     #[tokio::test]
     async fn one_rendezvous_mints_at_most_one_device() {
         let svc = service();
-        let (rid, _secret) = svc.mint("user-1", "Phone").await.unwrap();
+        let (rid, _secret) = svc.mint("user-1").await.unwrap();
         // Two finalize attempts read the same live slot before either consumed it.
         let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
         // The first finalize consumes the slot; the second is refused, so the
         // rendezvous can't mint a second approvable device.
-        svc.complete(&slot, "dev-1", vec![1u8; 32], "iPhone")
-            .await
-            .unwrap();
+        svc.complete(&slot, "dev-1", vec![1u8; 32]).await.unwrap();
         assert!(matches!(
-            svc.complete(&slot, "dev-2", vec![2u8; 32], "iPhone").await,
+            svc.complete(&slot, "dev-2", vec![2u8; 32]).await,
             Err(DevicePairingError::SlotConsumed),
         ));
         let all = svc.list(None).await.unwrap();
@@ -347,8 +328,8 @@ mod tests {
     #[tokio::test]
     async fn mint_supersedes_any_prior_slot() {
         let svc = service();
-        let (a, _) = svc.mint("u", "A").await.unwrap();
-        let (b, _) = svc.mint("u", "B").await.unwrap();
+        let (a, _) = svc.mint("u").await.unwrap();
+        let (b, _) = svc.mint("u").await.unwrap();
         assert_ne!(a, b);
         // One in-flight pairing per service: the latest mint replaces the prior,
         // so only the newest rendezvous is claimable.
@@ -359,12 +340,9 @@ mod tests {
     #[tokio::test]
     async fn revoke_after_pair() {
         let svc = service();
-        let (rid, _) = svc.mint("u", "phone").await.unwrap();
+        let (rid, _) = svc.mint("u").await.unwrap();
         let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
-        let row = svc
-            .complete(&slot, "d1", vec![1u8; 32], "phone")
-            .await
-            .unwrap();
+        let row = svc.complete(&slot, "d1", vec![1u8; 32]).await.unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
         assert!(svc.revoke(&row.user_id, "d1").await.unwrap());
         // Revoked devices don't show under the Approved filter.
@@ -380,22 +358,18 @@ mod tests {
     async fn second_pairing_replaces_the_first() {
         let svc = service();
         // First device for the user.
-        let (r1, _) = svc.mint("u", "Phone A").await.unwrap();
+        let (r1, _) = svc.mint("u").await.unwrap();
         let slot1 = svc.claim_slot(&r1).await.unwrap().unwrap();
-        svc.complete(&slot1, "dev-a", vec![1u8; 32], "Phone A")
-            .await
-            .unwrap();
+        svc.complete(&slot1, "dev-a", vec![1u8; 32]).await.unwrap();
         assert_eq!(
             svc.current_device("u").await.unwrap().unwrap().device_id,
             "dev-a"
         );
 
         // A second pairing supersedes it: one gateway = one app.
-        let (r2, _) = svc.mint("u", "Phone B").await.unwrap();
+        let (r2, _) = svc.mint("u").await.unwrap();
         let slot2 = svc.claim_slot(&r2).await.unwrap().unwrap();
-        svc.complete(&slot2, "dev-b", vec![2u8; 32], "Phone B")
-            .await
-            .unwrap();
+        svc.complete(&slot2, "dev-b", vec![2u8; 32]).await.unwrap();
 
         let approved = svc.list(Some(DeviceStatus::Approved)).await.unwrap();
         assert_eq!(approved.len(), 1, "exactly one approved device");
@@ -412,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn expired_slot_is_not_claimable() {
         let svc = service();
-        let (rid, _) = svc.mint("u", "phone").await.unwrap();
+        let (rid, _) = svc.mint("u").await.unwrap();
         // Backdate the slot well past its TTL; `claim_slot` filters it out.
         {
             let mut guard = svc.slot.lock();

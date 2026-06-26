@@ -108,7 +108,7 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: PairCmd,
     },
-    /// Manage iOS-companion device pairings: `pair <label>` (interactive
+    /// Manage iOS-companion device pairings: `pair` (interactive
     /// scan + mutual confirm), `list`, and `revoke <user> <device>`.
     Device {
         #[command(subcommand)]
@@ -540,9 +540,6 @@ pub enum DeviceCmd {
     /// Bluetooth-style code on both the phone and this terminal. Interactive —
     /// it stays live until both sides confirm (or it times out).
     Pair {
-        /// Device label for the operator's list. Optional — defaults to the
-        /// name the device reports during pairing ("Booiris iPhone").
-        label: Option<String>,
         /// Owning user id. Defaults to the local operator ($USER/$USERNAME) —
         /// the same identity CLI/TUI turns run as, so the device matches the
         /// sessions whose completed turns should push to it.

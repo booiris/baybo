@@ -37,7 +37,7 @@ const DEFAULT_GATEWAY_ENDPOINT: &str = "wss://proxy.baybo.space";
 
 pub async fn handle(ctx: &CommandContext, cmd: DeviceCmd) -> Result<CommandOutput> {
     match cmd {
-        DeviceCmd::Pair { label, user } => pair(ctx, label, user).await,
+        DeviceCmd::Pair { user } => pair(ctx, user).await,
         DeviceCmd::List { approved } => list(ctx, approved).await,
         DeviceCmd::Revoke {
             user_id,
@@ -121,11 +121,7 @@ fn qr_encode(s: &str) -> String {
         .collect()
 }
 
-async fn pair(
-    ctx: &CommandContext,
-    label: Option<String>,
-    user: Option<String>,
-) -> Result<CommandOutput> {
+async fn pair(ctx: &CommandContext, user: Option<String>) -> Result<CommandOutput> {
     let svc = require_service(ctx)?;
     let user = user.unwrap_or_else(operator_user_id);
 
@@ -140,29 +136,26 @@ async fn pair(
         .map_err(|e| CliError::Manager(format!("look up current device: {e}")))?;
     if let Some(ref dev) = existing {
         eprintln!(
-            "This gateway is already paired with \"{}\" ({}).",
-            dev.label, dev.device_id
+            "This gateway is already paired with device {}.",
+            dev.device_id
         );
         if !prompt::confirm_with_default(
             "Pairing a new device will replace it once the new pairing completes. Continue?",
             false,
         )? {
             return Ok(CommandOutput::structured(
-                format!("Kept the existing pairing with \"{}\".", dev.label),
+                format!("Kept the existing pairing with device {}.", dev.device_id),
                 &json!({ "action": "kept_existing", "device_id": dev.device_id }),
             ));
         }
     }
 
-    // The label is optional: an empty slot label tells the gateway to use the
-    // name the device reports in its DeviceHello during the handshake.
-    let operator_label = label.as_deref().unwrap_or("");
     // The mint returns two values with opposite handling: the public
     // `rendezvous_id` (the relay routes on it) and the high-entropy `secret`
     // (the Noise PSK). The secret travels *only* in the QR below — never the
     // relay, never a log, never the durable row.
     let (rendezvous_id, secret) = svc
-        .mint(&user, operator_label)
+        .mint(&user)
         .await
         .map_err(|e| CliError::Manager(format!("mint device pairing: {e}")))?;
 
@@ -229,7 +222,7 @@ async fn pair(
     };
 
     // 1. Wait for the phone to scan + reach the confirm step: the gateway
-    //    publishes the confirmation code + the device's name onto the slot.
+    //    publishes the confirmation code onto the slot.
     let Some(slot) = wait_for_confirm(svc, &rendezvous_id, SCAN_WAIT).await? else {
         return Ok(CommandOutput::structured(
             "No device scanned the code in time; it has expired.".to_string(),
@@ -238,9 +231,6 @@ async fn pair(
     };
     let device_id = slot.device_id.unwrap_or_default();
     let confirm_code = slot.confirm_code.unwrap_or_default();
-    // Resolved during the handshake: the device's reported name (or the
-    // operator's override if one was passed).
-    let device_label = slot.label;
 
     // 2. Operator confirms the code matches the phone (Bluetooth-style numeric
     //    comparison). `confirm` requires a terminal, so this is shell-only. The
@@ -248,7 +238,6 @@ async fn pair(
     //    operator is still deciding, bail out instead of holding the prompt for a
     //    device that's already gone.
     eprintln!("\nA device wants to pair:");
-    eprintln!("    name:              {device_label}");
     eprintln!("    device:            {device_id}");
     eprintln!("    confirmation code: {confirm_code}");
     let accepted = match confirm_or_device_gone(
@@ -262,7 +251,7 @@ async fn pair(
         ConfirmOutcome::Decided(accepted) => accepted,
         ConfirmOutcome::DeviceGone => {
             return Ok(CommandOutput::structured(
-                format!("\"{device_label}\" cancelled pairing on the phone (or it expired)."),
+                format!("Device {device_id} cancelled pairing on the phone (or it expired)."),
                 &json!({ "action": "device_cancelled", "rendezvous_id": rendezvous_id, "device_id": device_id }),
             ));
         }
@@ -278,7 +267,7 @@ async fn pair(
         // and the app would see a reset connection instead of "operator declined".
         host.finish().await;
         return Ok(CommandOutput::structured(
-            format!("Declined pairing for \"{device_label}\"."),
+            format!("Declined pairing for device {device_id}."),
             &json!({ "action": "declined", "rendezvous_id": rendezvous_id, "device_id": device_id }),
         ));
     }
@@ -299,25 +288,24 @@ async fn pair(
             // atomically as the new row was written).
             let replaced_note = existing
                 .as_ref()
-                .map(|d| format!(" Replaced \"{}\".", d.label))
+                .map(|d| format!(" Replaced device {}.", d.device_id))
                 .unwrap_or_default();
             Ok(CommandOutput::structured(
-                format!("Paired \"{device_label}\" ({user}:{device_id}).{replaced_note}"),
+                format!("Paired device {user}:{device_id}.{replaced_note}"),
                 &json!({
                     "action": "paired",
                     "user_id": user,
                     "device_id": device_id,
-                    "label": device_label,
                     "replaced_device_id": existing.as_ref().map(|d| d.device_id.as_str()),
                 }),
             ))
         }
         PairOutcome::DeviceDeclined => Ok(CommandOutput::structured(
-            format!("\"{device_label}\" cancelled pairing on the phone."),
+            format!("Device {device_id} cancelled pairing on the phone."),
             &json!({ "action": "device_cancelled", "rendezvous_id": rendezvous_id, "device_id": device_id }),
         )),
         PairOutcome::TimedOut => Ok(CommandOutput::structured(
-            format!("Pairing for \"{device_label}\" did not complete (timed out)."),
+            format!("Pairing for device {device_id} did not complete (timed out)."),
             &json!({ "action": "incomplete", "rendezvous_id": rendezvous_id, "device_id": device_id }),
         )),
     }
@@ -540,14 +528,13 @@ async fn list(ctx: &CommandContext, approved: bool) -> Result<CommandOutput> {
     let human = if rows.is_empty() {
         "(no devices)".to_string()
     } else {
-        let mut buf = String::from("STATUS\tUSER\tDEVICE\tLABEL\tRENDEZVOUS\tCREATED_AT\n");
+        let mut buf = String::from("STATUS\tUSER\tDEVICE\tRENDEZVOUS\tCREATED_AT\n");
         for r in &rows {
             buf.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\n",
                 status_str(r),
                 r.user_id,
                 r.device_id,
-                r.label,
                 r.rendezvous_id.as_deref().unwrap_or("-"),
                 r.created_at,
             ));
@@ -563,7 +550,6 @@ async fn list(ctx: &CommandContext, approved: bool) -> Result<CommandOutput> {
                     "status": status_str(r),
                     "user_id": r.user_id,
                     "device_id": r.device_id,
-                    "label": r.label,
                     "rendezvous_id": r.rendezvous_id,
                     "created_at": r.created_at,
                     "approved_at": r.approved_at,
