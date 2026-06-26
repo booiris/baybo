@@ -187,11 +187,7 @@ async fn disable(ctx: &CommandContext) -> Result<CommandOutput> {
 
     let labels: Vec<&str> = enabled.iter().map(|k| k.display_name()).collect();
     let initial = vec![false; enabled.len()];
-    let picks = select_many(
-        "Select external agents to disable (space toggles, enter confirms):",
-        &labels,
-        &initial,
-    )?;
+    let picks = select_many("Select external agents to disable:", &labels, &initial)?;
     if picks.is_empty() {
         return Ok(CommandOutput {
             human: "nothing selected; no external agents were disabled".to_string(),
