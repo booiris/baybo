@@ -164,14 +164,11 @@ pub async fn host_pairing_leg(
             return Err(reason);
         }
 
-        if handshake_abort {
-            // A PSK-auth/handshake abort with a still-live slot means a
-            // leg-stealer (or a transient app glitch) failed the handshake.
-            // Re-park immediately — no backoff — so the real app's retry can match
-            // without delay, and log it so repeated griefing is observable.
-            tracing::warn!(reason = %reason, "device pair: relay leg handshake failed; re-parking");
-        } else {
-            // Hammering an unreachable relay is pointless — back off first.
+        // A PSK-auth/handshake abort with a still-live slot means a leg-stealer
+        // (or a transient app glitch) failed the handshake — re-park immediately,
+        // no backoff, so the real app's retry can match without delay. Anything
+        // else (an unreachable relay) is pointless to hammer, so back off first.
+        if !handshake_abort {
             tokio::time::sleep(REHOST_BACKOFF).await;
         }
     }
