@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use baybo_store::{ChannelPairingStore, DevicePairingStore};
+use baybo_store::ChannelPairingStore;
 use baybo_workspace::WorkspacePaths;
 
 use fs_sweep::{DirSweep, is_log_file, sweep_directory};
@@ -45,7 +45,6 @@ pub struct JanitorReport {
     pub log_files_removed: usize,
     pub sidecar_dirs_removed: usize,
     pub pairings_purged: u64,
-    pub device_pairings_purged: u64,
 }
 
 /// Live-set view consumed by the sidecar-cache sweep. `cache_root` is
@@ -63,7 +62,6 @@ pub struct Janitor {
     paths: WorkspacePaths,
     sidecar_cache: Option<SidecarCache>,
     pairings: Option<Arc<dyn ChannelPairingStore>>,
-    device_pairings: Option<Arc<dyn DevicePairingStore>>,
 }
 
 impl Janitor {
@@ -72,7 +70,6 @@ impl Janitor {
             paths,
             sidecar_cache: None,
             pairings: None,
-            device_pairings: None,
         }
     }
 
@@ -91,15 +88,6 @@ impl Janitor {
     #[must_use]
     pub fn with_pairing_store(mut self, pairings: Arc<dyn ChannelPairingStore>) -> Self {
         self.pairings = Some(pairings);
-        self
-    }
-
-    /// Wire the iOS-companion device-pairing slot store for the hourly
-    /// expired-code sweep. Without this call the device-pairing sweep doesn't
-    /// run, and stale pending pairing codes accumulate.
-    #[must_use]
-    pub fn with_device_pairing_store(mut self, store: Arc<dyn DevicePairingStore>) -> Self {
-        self.device_pairings = Some(store);
         self
     }
 
@@ -129,36 +117,14 @@ impl Janitor {
         if self.pairings.is_some() {
             report.pairings_purged += self.sweep_pairings_once(chrono::Utc::now()).await;
         }
-        if self.device_pairings.is_some() {
-            report.device_pairings_purged +=
-                self.sweep_device_pairings_once(chrono::Utc::now()).await;
-        }
 
         tracing::info!(
             log_files_removed = report.log_files_removed,
             pairings_purged = report.pairings_purged,
-            device_pairings_purged = report.device_pairings_purged,
             "janitor sweep complete",
         );
 
         report
-    }
-
-    /// Hourly device-pairing-slot sweep. Returns the number of slots
-    /// hard-deleted. Mirrors [`Self::sweep_pairings_once`]: a pending device
-    /// code expires in ~15 minutes, so an hourly cadence keeps un-consumed
-    /// slots from piling up between the 12-hour main sweeps.
-    pub async fn sweep_device_pairings_once(&self, now: chrono::DateTime<chrono::Utc>) -> u64 {
-        let Some(store) = self.device_pairings.as_ref() else {
-            return 0;
-        };
-        match store.purge_expired(now.timestamp()).await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(error = %e, "device-pairing sweep failed");
-                0
-            }
-        }
     }
 
     /// Hourly pairing sweep. Returns the number of rows hard-deleted.
@@ -217,7 +183,6 @@ impl Janitor {
                 }
                 _ = pairing_interval.tick() => {
                     let _ = self.sweep_pairings_once(chrono::Utc::now()).await;
-                    let _ = self.sweep_device_pairings_once(chrono::Utc::now()).await;
                 }
                 _ = &mut shutdown => {
                     tracing::info!("janitor shutting down");
@@ -388,49 +353,6 @@ mod tests {
         let paths = workspace_paths(tmp.path());
         let report = Janitor::new(paths).sweep_once().await;
         assert_eq!(report.log_files_removed, 0);
-    }
-
-    #[tokio::test]
-    async fn device_pairing_sweep_purges_only_expired_slots() {
-        use baybo_storage::test_support::MemoryDevicePairingStore;
-        use baybo_store::device_pairing::DevicePairingSlot;
-
-        let store = Arc::new(MemoryDevicePairingStore::new());
-        let slot = |code: &str, exp: i64| DevicePairingSlot {
-            code: code.into(),
-            user_id: "u".into(),
-            label: "iPhone".into(),
-            created_at: 100,
-            expires_at: exp,
-            confirm_code: None,
-            device_id: None,
-            operator_decision: None,
-            device_decision: None,
-        };
-        store.create_slot(&slot("FRESH1", 10_000)).await.unwrap();
-        store.create_slot(&slot("STALE1", 200)).await.unwrap();
-
-        let tmp = TempDir::new().unwrap();
-        let janitor =
-            Janitor::new(workspace_paths(tmp.path())).with_device_pairing_store(store.clone());
-
-        // now = 300: past STALE1 (exp 200), before FRESH1 (exp 10_000).
-        let now = chrono::DateTime::from_timestamp(300, 0).unwrap();
-        assert_eq!(janitor.sweep_device_pairings_once(now).await, 1);
-        assert!(store.get_slot("STALE1").await.unwrap().is_none());
-        assert!(store.get_slot("FRESH1").await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn device_pairing_sweep_is_noop_when_unwired() {
-        let tmp = TempDir::new().unwrap();
-        let now = chrono::Utc::now();
-        assert_eq!(
-            Janitor::new(workspace_paths(tmp.path()))
-                .sweep_device_pairings_once(now)
-                .await,
-            0,
-        );
     }
 
     #[tokio::test]

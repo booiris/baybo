@@ -182,7 +182,6 @@ fn split_id(blob_id: &str) -> BlobResult<(&str, &str)> {
 // ---------------------------------------------------------------------------
 
 use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result as DeviceResult};
-use baybo_store::device_pairing::{DevicePairingSlot, DevicePairingStore, Result as SlotResult};
 
 /// In-memory [`DeviceStore`] keyed by `(user_id, device_id)`.
 #[derive(Default)]
@@ -292,78 +291,4 @@ fn sorted_desc(rows: impl Iterator<Item = DeviceRow>) -> Vec<DeviceRow> {
     let mut v: Vec<DeviceRow> = rows.collect();
     v.sort_by_key(|r| std::cmp::Reverse(r.created_at));
     v
-}
-
-/// In-memory [`DevicePairingStore`] keyed by `code`.
-#[derive(Default)]
-pub struct MemoryDevicePairingStore {
-    slots: Mutex<HashMap<String, DevicePairingSlot>>,
-}
-
-impl MemoryDevicePairingStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-#[async_trait]
-impl DevicePairingStore for MemoryDevicePairingStore {
-    async fn create_slot(&self, slot: &DevicePairingSlot) -> SlotResult<()> {
-        let mut g = self.slots.lock();
-        if g.contains_key(&slot.code) {
-            return Err(StorageError::Conflict(format!("code {} exists", slot.code)));
-        }
-        g.insert(slot.code.clone(), slot.clone());
-        Ok(())
-    }
-
-    async fn get_slot(&self, code: &str) -> SlotResult<Option<DevicePairingSlot>> {
-        Ok(self.slots.lock().get(code).cloned())
-    }
-
-    async fn delete_slot(&self, code: &str) -> SlotResult<bool> {
-        Ok(self.slots.lock().remove(code).is_some())
-    }
-
-    async fn set_confirm(
-        &self,
-        code: &str,
-        confirm_code: &str,
-        device_id: &str,
-        label: &str,
-    ) -> SlotResult<()> {
-        if let Some(slot) = self.slots.lock().get_mut(code) {
-            slot.confirm_code = Some(confirm_code.to_string());
-            slot.device_id = Some(device_id.to_string());
-            slot.label = label.to_string();
-        }
-        Ok(())
-    }
-
-    async fn set_operator_decision(&self, code: &str, accepted: bool) -> SlotResult<()> {
-        if let Some(slot) = self.slots.lock().get_mut(code) {
-            slot.operator_decision = Some(accepted);
-        }
-        Ok(())
-    }
-
-    async fn set_device_decision(&self, code: &str, accepted: bool) -> SlotResult<()> {
-        if let Some(slot) = self.slots.lock().get_mut(code) {
-            slot.device_decision = Some(accepted);
-        }
-        Ok(())
-    }
-
-    async fn list_slots(&self) -> SlotResult<Vec<DevicePairingSlot>> {
-        let mut v: Vec<DevicePairingSlot> = self.slots.lock().values().cloned().collect();
-        v.sort_by_key(|s| std::cmp::Reverse(s.created_at));
-        Ok(v)
-    }
-
-    async fn purge_expired(&self, now: i64) -> SlotResult<u64> {
-        let mut g = self.slots.lock();
-        let before = g.len();
-        g.retain(|_, s| !s.is_expired(now));
-        Ok((before - g.len()) as u64)
-    }
 }

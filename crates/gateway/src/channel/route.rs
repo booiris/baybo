@@ -47,10 +47,6 @@ pub fn routes() -> Router<WsChannelState> {
     Router::new()
         .route("/channel-ws", get(ws_handler))
         .merge(super::blobs::routes())
-        // The paired-device content session (Noise-wrapped) is also channel-auth
-        // gated: the middleware resolves the device token to `AuthedClient::Device`
-        // before the upgrade, then the Noise IK handshake authenticates the static.
-        .merge(super::device_content::routes())
 }
 
 async fn ws_handler(

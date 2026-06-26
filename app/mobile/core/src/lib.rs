@@ -11,12 +11,10 @@
 //! This first slice is the app side of the pairing handshake ([`pairing`]); the
 //! Noise content session + `Frame::Subscribe` self-pull layer follow.
 
-pub mod connect;
 pub mod content;
 pub mod error;
 pub mod pairing;
 
-pub use connect::{ConnectError, Endpoint, connect_first, connection_plan, endpoints};
 pub use content::{ContentHandshake, ContentSession, subscribe_frame, user_text_frame};
 pub use error::MobileError;
 pub use pairing::{

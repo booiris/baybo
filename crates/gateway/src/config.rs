@@ -13,15 +13,15 @@ pub struct RuntimeGatewayConfig {
     pub admin_bind: SocketAddr,
     pub cors_allowed_origins: Vec<String>,
     pub shutdown_grace: Duration,
-    /// Resolved relay-pairing config — `Some` only when the `relay` block is
-    /// enabled with a non-empty URL. Drives the relay-pairing host manager.
-    pub relay: Option<RelayPairRuntime>,
+    /// Resolved relay config — `Some` only when the `relay` block is enabled with
+    /// a non-empty URL. Drives the relay content control connection.
+    pub relay: Option<RelayRuntime>,
 }
 
-/// The bits the relay-pairing host manager needs (resolved from the `relay`
-/// block once at startup).
+/// The bits the relay content control connection needs (resolved from the
+/// `relay` block once at startup).
 #[derive(Debug, Clone)]
-pub struct RelayPairRuntime {
+pub struct RelayRuntime {
     pub url: String,
     pub instance_key: String,
 }
@@ -34,11 +34,10 @@ impl RuntimeGatewayConfig {
                 addr: format!("{}:{}", config.bind_address, config.port),
                 reason: format!("invalid socket address: {e}"),
             })?;
-        let relay =
-            (config.relay.enabled && !config.relay.url.is_empty()).then(|| RelayPairRuntime {
-                url: config.relay.url.clone(),
-                instance_key: config.relay.instance_key.clone(),
-            });
+        let relay = (config.relay.enabled && !config.relay.url.is_empty()).then(|| RelayRuntime {
+            url: config.relay.url.clone(),
+            instance_key: config.relay.instance_key.clone(),
+        });
         Ok(Self {
             admin_bind: addr,
             cors_allowed_origins: config.cors_allowed_origins.clone(),

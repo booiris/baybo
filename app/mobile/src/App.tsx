@@ -7,14 +7,13 @@ import type { PairAborted } from "./generated/PairAborted";
 import type { PairChallenge } from "./generated/PairChallenge";
 import type { PairedSummary } from "./generated/PairedSummary";
 
-/// Parse a `baybo://pair?h=<endpoint>&c=<code>&k=<instance-key>&relay=1` QR
-/// payload, or fall back to treating the whole scanned string as the bare code.
-/// `relay=1` means join the proxy rendezvous (presenting `k` as the relay
-/// admission key); otherwise dial the gateway directly.
+/// Parse a `baybo://pair?h=<relay>&c=<code>&k=<instance-key>` QR payload, or fall
+/// back to treating the whole scanned string as the bare code. Pairing is
+/// relay-only: the app joins the proxy rendezvous (`/pair/join/<code>`) presenting
+/// `k` as the relay admission key.
 function parseScan(text: string): {
   endpoint?: string;
   code: string;
-  relay: boolean;
   instanceKey?: string;
 } {
   try {
@@ -23,13 +22,12 @@ function parseScan(text: string): {
       const h = url.searchParams.get("h") ?? undefined;
       const c = url.searchParams.get("c");
       const k = url.searchParams.get("k") ?? undefined;
-      const relay = url.searchParams.get("relay") === "1";
-      if (c) return { endpoint: h, code: c, relay, instanceKey: k };
+      if (c) return { endpoint: h, code: c, instanceKey: k };
     }
   } catch {
     /* not a URL — treat as a bare code */
   }
-  return { code: text.trim(), relay: false };
+  return { code: text.trim() };
 }
 
 /// A decrypted wire `Frame` as it arrives over the Tauri content channel.
@@ -47,10 +45,10 @@ type WireFrame =
 
 type ChatMsg = { id: string; role: "user" | "assistant" | "notice"; content: string };
 
-// Pairing defaults now that the manual form is gone: the QR carries the gateway
-// endpoint (`h=`) and the relay flag, so we only fall back to the public proxy
-// when a bare-code QR omits the endpoint, and report a fixed device label (the
-// operator's terminal shows its own name regardless).
+// Pairing defaults now that the manual form is gone: the QR carries the relay
+// endpoint (`h=`), so we only fall back to the public proxy when a bare-code QR
+// omits it, and report a fixed device label (the operator's terminal shows its
+// own name regardless).
 const DEFAULT_ENDPOINT = "wss://proxy.baybo.space";
 const DEVICE_LABEL = "My iPhone";
 
@@ -253,7 +251,7 @@ export default function App() {
       const parsed = parseScan(res.content);
       if (DEBUG) {
         setScanInfo(
-          `QR · host=${parsed.endpoint ?? "(default)"} · relay=${parsed.relay} · code=${maskSecret(parsed.code)}`,
+          `QR · host=${parsed.endpoint ?? "(default)"} · code=${maskSecret(parsed.code)}`,
         );
       }
       // Success: buzz, pop a green dot at the reticle centre, then briefly hold
@@ -271,7 +269,6 @@ export default function App() {
       await pairBegin({
         endpoint: parsed.endpoint ?? DEFAULT_ENDPOINT,
         code: parsed.code,
-        relay: parsed.relay,
         instanceKey: parsed.instanceKey,
       });
     } catch (e) {
@@ -293,11 +290,10 @@ export default function App() {
   }
 
   // Phase 1: connect + SPAKE2 → get the confirmation code to show the user.
-  // Called straight off a successful scan with the QR's endpoint/code/relay.
+  // Called straight off a successful scan with the QR's endpoint/code.
   async function pairBegin(opts: {
     endpoint: string;
     code: string;
-    relay: boolean;
     instanceKey?: string;
   }) {
     setBusy(true);
@@ -315,7 +311,6 @@ export default function App() {
         endpoint: opts.endpoint,
         code: opts.code,
         label: DEVICE_LABEL,
-        relay: opts.relay,
         instanceKey: opts.instanceKey,
         onAbort,
       });
@@ -375,8 +370,6 @@ export default function App() {
           <dd>{paired.pairingCode}</dd>
           <dt>Relay node</dt>
           <dd>{paired.relayNodeId || "—"}</dd>
-          <dt>Direct candidates</dt>
-          <dd>{paired.directCandidates.length ? paired.directCandidates.join(", ") : "—"}</dd>
         </dl>
         <div className="row">
           <button onClick={() => setChatting(true)}>Open chat</button>

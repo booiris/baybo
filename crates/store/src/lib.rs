@@ -32,7 +32,7 @@ pub use channel_session::ChannelSessionStore;
 pub use cost::CostStore;
 pub use cron::CronStore;
 pub use device::{DeviceRow, DeviceStatus, DeviceStore};
-pub use device_pairing::{DevicePairingSlot, DevicePairingStore};
+pub use device_pairing::DevicePairingSlot;
 pub use error::StorageError;
 pub use job::{JobRow, JobStore, JobTransitionRow};
 pub use secret::SecretStore;

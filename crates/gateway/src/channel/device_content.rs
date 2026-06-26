@@ -1,17 +1,17 @@
-//! Token-authenticated `/v1/device/content` WebSocket: the gateway side of a
-//! paired device's **content session**.
+//! The gateway side of a paired device's **content session** (chat), run over the
+//! relay's content data leg.
 //!
-//! Pairing (`device_pair`) leaves the device holding A's static Noise key and an
-//! `auth_token`; A holds the device's static key in the device row. This route
-//! is where the device cashes that in to actually chat:
+//! Pairing (`device_pair`) leaves the device holding A's static Noise key; A holds
+//! the device's static key in the device row. A NAT'd gateway can't be dialed, so
+//! the device reaches it through C's blind relay: C splices the phone's
+//! `/content/join/{node_id}` leg to the gateway's outbound `/content/host/{key}`
+//! data leg (see [`super::relay_content`]), and the gateway runs a **Noise IK
+//! responder** over it:
 //!
-//! 1. The channel-auth middleware resolves the device's `auth_token` to
-//!    [`AuthedClient::Device`] (an *approved* device row) before the upgrade.
-//! 2. A runs a **Noise IK responder** handshake (its static key from
-//!    [`load_or_create_static_keypair`]) and verifies the initiator's static
-//!    equals the device row's `device_pubkey` — so a leaked token alone can't
-//!    open the session, and C (a relay) can't MITM it.
-//! 3. After transport mode, every WS binary frame is Noise-decrypted into a
+//! 1. A reads the initiator's first handshake message (its static key) and
+//!    authenticates the device by matching that static to an *approved* device
+//!    row — no token rides the relay leg, and C (a relay) can't MITM it.
+//! 2. After transport mode, every WS binary frame is Noise-decrypted into a
 //!    [`wire::Frame`], fed into the *same* channel frame loop the TUI / web chat
 //!    use ([`super::route::run_inbound_loop`]), and every reply is
 //!    Noise-encrypted on the way out.
@@ -24,14 +24,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
-use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Extension, State};
-use axum::response::IntoResponse;
-use axum::routing::get;
 use baybo_channels::wire::{self, Frame};
 use baybo_model::ChannelType;
-use device_proto::aead::KEY_LEN;
 use device_proto::noise::{FrameReassembler, NOISE_MAX_MESSAGE, write_chunked};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -43,60 +37,13 @@ use tokio_tungstenite::tungstenite::Message as TungMessage;
 type RelayWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-use super::adapter::{FrameSink, FrameSource, Sidecar, WsSink};
+use super::adapter::{FrameSink, FrameSource, Sidecar};
 use super::state::WsChannelState;
-use crate::auth::{AuthedClient, constant_time_eq};
 use crate::device::load_or_create_static_keypair;
 
 /// How long the responder waits for the initiator's first handshake message
 /// after the WS upgrade — a stalled peer must not pin a connection.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
-pub(crate) fn routes() -> Router<WsChannelState> {
-    Router::new().route("/device/content", get(handler))
-}
-
-async fn handler(
-    State(state): State<WsChannelState>,
-    Extension(authed): Extension<AuthedClient>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| run_content(socket, state, authed))
-}
-
-async fn run_content(socket: WebSocket, state: WsChannelState, authed: AuthedClient) {
-    let AuthedClient::Device { user_id, device_id } = authed else {
-        // Channel auth resolves any valid channel token here, but only a paired
-        // device may open a content session — everyone else is rejected.
-        tracing::warn!("non-device client on /v1/device/content; closing");
-        return;
-    };
-    // The auth middleware already confirmed the row is *approved* by resolving
-    // the token; pin the IK initiator's static to *this* device's pubkey so a
-    // valid token can't be paired with a different device's key.
-    let row = match state.device_store.get(&user_id, &device_id).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            tracing::warn!("device row vanished after auth; closing");
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "device lookup failed; closing");
-            return;
-        }
-    };
-    let (sink, source) = socket.split();
-    let auth = DeviceAuth::Pinned {
-        device_pubkey: row.device_pubkey,
-        user_id,
-        device_id,
-    };
-    if let Err(reason) =
-        run_content_session(AxumBinSink(sink), AxumBinSource(source), &state, auth).await
-    {
-        tracing::debug!(reason = %reason, "device content session aborted");
-    }
-}
 
 /// Run the content responder over an outbound **relay** data leg (the gateway
 /// dialed C's `/content/host/{relay_key}` after a control-plane signal). No
@@ -105,41 +52,20 @@ async fn run_content(socket: WebSocket, state: WsChannelState, authed: AuthedCli
 /// approved device row.
 pub(crate) async fn run_content_over_relay(ws: RelayWs, state: &WsChannelState) {
     let (sink, source) = ws.split();
-    if let Err(reason) = run_content_session(
-        TungBinSink(sink),
-        TungBinSource(source),
-        state,
-        DeviceAuth::AnyApproved,
-    )
-    .await
+    if let Err(reason) = run_content_session(TungBinSink(sink), TungBinSource(source), state).await
     {
         tracing::debug!(reason = %reason, "relay content session aborted");
     }
 }
 
-/// How the responder authenticates the Noise IK initiator's static key.
-enum DeviceAuth {
-    /// Direct path: the WS was already device-token-authed; the initiator's
-    /// static must equal exactly this device's pubkey.
-    Pinned {
-        device_pubkey: Vec<u8>,
-        user_id: String,
-        device_id: String,
-    },
-    /// Relay path: no prior auth; accept any *approved* device whose pubkey
-    /// matches the initiator's static (resolved by key).
-    AnyApproved,
-}
-
-/// The transport-agnostic content responder: run the Noise IK responder
-/// handshake (authenticating the device per `auth`), then Noise-wrap the shared
-/// channel frame loop over `sink`/`source`. Used by both the direct axum WS and
+/// The content responder: run the Noise IK responder handshake (authenticating
+/// the device by matching the initiator's static key to an approved device row),
+/// then Noise-wrap the shared channel frame loop over `sink`/`source`. Runs over
 /// the outbound relay data leg.
 async fn run_content_session<Si: BinarySink, So: BinarySource>(
     mut sink: Si,
     mut source: So,
     state: &WsChannelState,
-    auth: DeviceAuth,
 ) -> Result<(), String> {
     let gateway_static = load_or_create_static_keypair(&state.secret_vault)
         .await
@@ -161,27 +87,16 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
         .ok_or_else(|| "initiator sent no static key".to_string())?
         .to_vec();
 
-    let (user_id, device_id) = match auth {
-        DeviceAuth::Pinned {
-            device_pubkey,
-            user_id,
-            device_id,
-        } => {
-            if remote_static.len() != KEY_LEN || !constant_time_eq(&remote_static, &device_pubkey) {
-                return Err("initiator static key does not match the paired device".into());
-            }
-            (user_id, device_id)
-        }
-        DeviceAuth::AnyApproved => {
-            let row = state
-                .device_store
-                .lookup_approved_by_pubkey(&remote_static)
-                .await
-                .map_err(|e| format!("device lookup by pubkey: {e}"))?
-                .ok_or_else(|| "no approved device for this static key".to_string())?;
-            (row.user_id, row.device_id)
-        }
-    };
+    // No prior channel-auth ran (the gateway dialed the relay data leg blind), so
+    // authenticate the device purely by matching the Noise IK initiator's static
+    // key to an approved device row.
+    let row = state
+        .device_store
+        .lookup_approved_by_pubkey(&remote_static)
+        .await
+        .map_err(|e| format!("device lookup by pubkey: {e}"))?
+        .ok_or_else(|| "no approved device for this static key".to_string())?;
+    let (user_id, device_id) = (row.user_id, row.device_id);
 
     let n = handshake
         .write_message(&[], &mut buf)
@@ -258,10 +173,9 @@ async fn recv_handshake<So: BinarySource>(
         .ok_or_else(|| "peer closed during handshake".to_string())
 }
 
-/// A binary-message duplex the content responder runs over: the direct axum WS
-/// ([`AxumBinSink`]/[`AxumBinSource`]) or an outbound relay data leg
-/// ([`TungBinSink`]/[`TungBinSource`]). Only opaque binary frames cross it (Noise
-/// ciphertext); ping/pong are skipped, anything else ends the stream.
+/// A binary-message duplex the content responder runs over: the outbound relay
+/// data leg ([`TungBinSink`]/[`TungBinSource`]). Only opaque binary frames cross
+/// it (Noise ciphertext); ping/pong are skipped, anything else ends the stream.
 #[async_trait::async_trait]
 pub(crate) trait BinarySink: Send + 'static {
     /// Send one binary message. `Err(())` means the wire is gone.
@@ -275,37 +189,7 @@ pub(crate) trait BinarySource: Send {
     async fn next_bytes(&mut self) -> Option<Vec<u8>>;
 }
 
-/// Direct path: the axum WebSocket's split halves.
-struct AxumBinSink(WsSink);
-struct AxumBinSource(SplitStream<WebSocket>);
-
-#[async_trait::async_trait]
-impl BinarySink for AxumBinSink {
-    async fn send_bytes(&mut self, bytes: Vec<u8>) -> Result<(), ()> {
-        self.0
-            .send(AxumWsMessage::Binary(bytes.into()))
-            .await
-            .map_err(|e| tracing::debug!(error = %e, "content ws sink error"))
-    }
-    async fn close(&mut self) {
-        let _ = self.0.close().await;
-    }
-}
-
-#[async_trait::async_trait]
-impl BinarySource for AxumBinSource {
-    async fn next_bytes(&mut self) -> Option<Vec<u8>> {
-        loop {
-            match self.0.next().await {
-                Some(Ok(AxumWsMessage::Binary(b))) => return Some(b.into()),
-                Some(Ok(AxumWsMessage::Ping(_) | AxumWsMessage::Pong(_))) => continue,
-                Some(Ok(_)) | Some(Err(_)) | None => return None,
-            }
-        }
-    }
-}
-
-/// Relay path: the outbound `tokio-tungstenite` data leg's split halves.
+/// The outbound `tokio-tungstenite` relay data leg's split halves.
 struct TungBinSink(SplitSink<RelayWs, TungMessage>);
 struct TungBinSource(SplitStream<RelayWs>);
 
@@ -417,21 +301,12 @@ impl<R: BinarySource> FrameSource for NoiseFrameSource<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{ChannelAuthState, attach_channel_auth};
     use crate::test_support::build_test_deps;
     use baybo_channels::RouterInbound;
     use baybo_channels::wire::{Message as WireMessage, MessageRole};
     use baybo_store::{DeviceRow, DeviceStatus};
     use device_proto::noise::StaticKeypair;
-    use futures::{SinkExt, StreamExt};
     use snow::HandshakeState;
-    use tokio::net::TcpStream;
-    use tokio_tungstenite::WebSocketStream;
-    use tokio_tungstenite::client_async;
-    use tokio_tungstenite::tungstenite::Message as WsMessage;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-
-    type Client = WebSocketStream<TcpStream>;
 
     const TEST_TOKEN: &str = "device-auth-token-fixed-0123456789abcdef";
 
@@ -450,66 +325,6 @@ mod tests {
         }
     }
 
-    /// Serve the content route (behind channel auth with device-store lookup) on
-    /// an ephemeral port, returning the port + the gateway's static pubkey.
-    async fn serve(tg: &crate::test_support::TestGateway) -> (u16, [u8; KEY_LEN]) {
-        crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::ios())
-            .expect("install ios channel");
-        // Persist (and read) A's static key so the client can target it.
-        let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
-            .await
-            .expect("gateway static key");
-        let state = WsChannelState::from_deps(&tg.deps);
-        let auth_state = ChannelAuthState::new(tg.deps.channel_tokens.clone())
-            .with_device_store(tg.deps.stores.device.clone());
-        let app = Router::new().nest(
-            "/v1",
-            attach_channel_auth(routes().with_state(state), auth_state),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app.into_make_service()).await;
-        });
-        (port, gw_static.public())
-    }
-
-    async fn connect(port: u16, token: &str) -> Client {
-        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let req = format!("ws://127.0.0.1:{port}/v1/device/content?token={token}")
-            .into_client_request()
-            .unwrap();
-        client_async(req, stream).await.unwrap().0
-    }
-
-    async fn recv_bin(ws: &mut Client) -> Option<Vec<u8>> {
-        loop {
-            match ws.next().await {
-                Some(Ok(WsMessage::Binary(b))) => return Some(b.to_vec()),
-                Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
-                Some(Ok(WsMessage::Close(_))) | None => return None,
-                Some(Ok(_)) => continue,
-                Some(Err(_)) => return None,
-            }
-        }
-    }
-
-    /// Drive the IK initiator side (mirror of `baybo-mobile-core`'s
-    /// `ContentHandshake`) over a live socket; returns the device transport.
-    async fn client_handshake(
-        ws: &mut Client,
-        device: &StaticKeypair,
-        gateway_pubkey: &[u8; KEY_LEN],
-    ) -> Option<TransportState> {
-        let mut hs: HandshakeState = device.ik_initiator(gateway_pubkey).unwrap();
-        let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
-        let n = hs.write_message(&[], &mut buf).unwrap();
-        ws.send(WsMessage::Binary(buf[..n].to_vec())).await.unwrap();
-        let msg2 = recv_bin(ws).await?;
-        hs.read_message(&msg2, &mut buf).ok()?;
-        hs.into_transport_mode().ok()
-    }
-
     fn seal(transport: &mut TransportState, frame: &Frame) -> Vec<u8> {
         let plaintext = wire::encode(frame).unwrap();
         let mut messages = write_chunked(transport, &plaintext).unwrap();
@@ -524,112 +339,6 @@ mod tests {
         let mut frames = reassembler.read(transport, ciphertext).unwrap();
         assert_eq!(frames.len(), 1, "test frames fit one chunk");
         wire::decode(&frames.remove(0)).unwrap()
-    }
-
-    /// Full content session: an approved device authenticates, completes the
-    /// Noise IK handshake, subscribes, and sends a message — which reaches the
-    /// router intake *and* is echoed back to the device over Noise.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn device_subscribes_sends_and_self_pulls_over_noise() {
-        let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-        let device = StaticKeypair::generate().unwrap();
-        tg.deps
-            .stores
-            .device
-            .create(&device_row("user-1", "ios-dev", device.public().to_vec()))
-            .await
-            .expect("seed approved device row");
-
-        let (port, gw_pubkey) = serve(&tg).await;
-        let mut incoming_rx = tg.incoming_rx;
-
-        let mut ws = connect(port, TEST_TOKEN).await;
-        let mut transport = client_handshake(&mut ws, &device, &gw_pubkey)
-            .await
-            .expect("noise handshake completes");
-
-        // Subscribe, then send a user message on that session.
-        let sealed = seal(
-            &mut transport,
-            &Frame::Subscribe {
-                session_id: "sess-1".into(),
-                since_ordinal: None,
-            },
-        );
-        ws.send(WsMessage::Binary(sealed)).await.unwrap();
-
-        let msg = Frame::Message(WireMessage {
-            content: "hi from the phone".into(),
-            session_id: "sess-1".into(),
-            user_id: "user-1".into(),
-            channel_type: ChannelType::ios(),
-            bot_id: String::new(),
-            attachments: Vec::new(),
-            platform_msg_id: "m1".into(),
-            role: MessageRole::User,
-            ordinal: None,
-        });
-        let sealed = seal(&mut transport, &msg);
-        ws.send(WsMessage::Binary(sealed)).await.unwrap();
-
-        // The gateway routed the decrypted inbound message to the agent intake.
-        let inbound = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
-            .await
-            .expect("router intake within timeout")
-            .expect("router intake item");
-        match inbound {
-            RouterInbound::One(incoming) => {
-                assert_eq!(incoming.message.content.len(), 1);
-                assert_eq!(incoming.message.session_id.as_str(), "sess-1");
-            }
-            other => panic!("expected RouterInbound::One, got {other:?}"),
-        }
-
-        // …and the user-echo of that message comes back to the device, proving
-        // the outbound Noise path through the real Sidecar pump. Skip the
-        // post-Subscribe snapshot frames until the echoed Message lands.
-        let mut saw_echo = false;
-        for _ in 0..8 {
-            let Some(bytes) = recv_bin(&mut ws).await else {
-                break;
-            };
-            if let Frame::Message(m) = open(&mut transport, &bytes) {
-                assert_eq!(m.content, "hi from the phone");
-                assert!(matches!(m.role, MessageRole::User));
-                saw_echo = true;
-                break;
-            }
-        }
-        assert!(saw_echo, "device never received the Noise-wrapped echo");
-    }
-
-    /// An initiator whose static key isn't the paired device's is rejected at
-    /// the handshake — the gateway closes before transport mode, so the client
-    /// never gets a usable session. Guards the IK static-key binding.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn wrong_device_static_key_is_rejected() {
-        let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-        let paired = StaticKeypair::generate().unwrap();
-        let imposter = StaticKeypair::generate().unwrap();
-        // The row binds the *paired* device's pubkey; the client below presents
-        // the imposter key under the same (valid) auth token.
-        tg.deps
-            .stores
-            .device
-            .create(&device_row("user-1", "ios-dev", paired.public().to_vec()))
-            .await
-            .expect("seed approved device row");
-
-        let (port, gw_pubkey) = serve(&tg).await;
-        let mut ws = connect(port, TEST_TOKEN).await;
-        // The imposter completes its half of the IK math locally, but the
-        // gateway aborts after msg1 (static mismatch), so no msg2 arrives.
-        assert!(
-            client_handshake(&mut ws, &imposter, &gw_pubkey)
-                .await
-                .is_none(),
-            "handshake must not complete for a non-paired static key",
-        );
     }
 
     // In-memory binary legs standing in for a spliced relay data leg, so the
@@ -652,11 +361,10 @@ mod tests {
         }
     }
 
-    /// The relay content path: no channel-auth ran, so the responder resolves
-    /// the device by *looking up* the IK initiator's static key (the
-    /// `DeviceAuth::AnyApproved` branch), then routes + echoes a message over
-    /// the generic binary transport. Mirrors the direct test with the auth path
-    /// swapped and in-memory legs instead of a WS.
+    /// The content path: no channel-auth ran (the gateway dialed the relay data
+    /// leg blind), so the responder resolves the device by *looking up* the IK
+    /// initiator's static key, then routes + echoes a message over the generic
+    /// binary transport (in-memory legs stand in for a spliced relay data leg).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn relay_path_resolves_device_by_pubkey_and_round_trips() {
         let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
@@ -680,13 +388,7 @@ mod tests {
         let (gw_tx, mut phone_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16); // gateway -> phone
         let (phone_tx, gw_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16); // phone -> gateway
         tokio::spawn(async move {
-            let _ = run_content_session(
-                ChanSink(gw_tx),
-                ChanSource(gw_rx),
-                &state,
-                DeviceAuth::AnyApproved,
-            )
-            .await;
+            let _ = run_content_session(ChanSink(gw_tx), ChanSource(gw_rx), &state).await;
         });
 
         // The phone: IK initiator handshake, then Subscribe + a message.
@@ -748,6 +450,37 @@ mod tests {
         assert!(
             saw_echo,
             "phone never received the echo over the relay legs"
+        );
+    }
+
+    /// A static key with no approved device row is rejected at the handshake: the
+    /// responder errors before transport mode, so the initiator never gets msg2.
+    /// Guards the IK static-key binding — the relay path's only authentication.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_static_key_is_rejected() {
+        let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+        // No device row seeded → the lookup-by-pubkey finds nothing.
+        let device = StaticKeypair::generate().unwrap();
+        let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
+            .await
+            .expect("gateway static key");
+        let gw_pub = gw_static.public();
+        let state = WsChannelState::from_deps(&tg.deps);
+
+        let (gw_tx, mut phone_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (phone_tx, gw_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        tokio::spawn(async move {
+            let _ = run_content_session(ChanSink(gw_tx), ChanSource(gw_rx), &state).await;
+        });
+
+        // msg1 carries the (unknown) static; the gateway aborts, so msg2 never comes.
+        let mut hs: HandshakeState = device.ik_initiator(&gw_pub).unwrap();
+        let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
+        let n = hs.write_message(&[], &mut buf).unwrap();
+        phone_tx.send(buf[..n].to_vec()).await.unwrap();
+        assert!(
+            phone_rx.recv().await.is_none(),
+            "gateway must not send msg2 for an unknown static key",
         );
     }
 }

@@ -57,16 +57,11 @@ pub struct GatewayWelcome {
     /// relay (the gateway's stable `relay_node_id`). P never holds A's
     /// `instance_key`. Empty when the gateway has no relay configured.
     pub relay_node_id: String,
-    /// Base WS URL of the blind relay (C), e.g. `wss://proxy.baybo.space`.
-    /// The app dials `{relay_url}/content/join/{relay_node_id}` to reach a NAT'd
-    /// gateway when every direct candidate fails. Empty when relay is off; it is
-    /// carried here (not derived from the pairing endpoint) so a device that
-    /// paired *directly* still learns where C is.
+    /// Base WS URL of the blind relay (C), e.g. `wss://proxy.baybo.space`. The app
+    /// dials `{relay_url}/content/join/{relay_node_id}` to reach the (possibly
+    /// NAT'd) gateway for content. Empty when relay is off.
     #[serde(default)]
     pub relay_url: String,
-    /// Direct-reachability candidates (LAN / Tailscale / reverse proxy) the
-    /// app tries before falling back to the relay.
-    pub direct_candidates: Vec<String>,
     /// Owning principal on the gateway.
     pub user_id: String,
     /// The SPAKE2 code this device paired under, retained for audit / the
@@ -87,7 +82,7 @@ pub struct DeviceConfirm {
     pub accepted: bool,
 }
 
-/// On-wire envelope for the device-pairing handshake over the `/v1/device/pair`
+/// On-wire envelope for the device-pairing handshake over the relay pairing
 /// WebSocket (each variant is one binary frame, MessagePack-encoded):
 ///
 /// 1. P → A [`PairFrame::Hello`] — the pairing code + the app's SPAKE2 message.
@@ -170,7 +165,6 @@ mod tests {
             static_pubkey: [9u8; KEY_LEN],
             relay_node_id: "node-xyz".into(),
             relay_url: "wss://proxy.baybo.space".into(),
-            direct_candidates: vec!["wss://baybo.lan:8889".into()],
             user_id: "user-1".into(),
             pairing_code: "WORMHOLE-7-foo-bar".into(),
             auth_token: "deadbeef".into(),
@@ -229,7 +223,6 @@ mod tests {
             static_pubkey: [2u8; KEY_LEN],
             relay_node_id: "n1".into(),
             relay_url: String::new(),
-            direct_candidates: vec![],
             user_id: "u1".into(),
             pairing_code: "code-shared".into(),
             auth_token: "tok".into(),

@@ -1,5 +1,5 @@
-//! The content-session command: dial the gateway's `/v1/device/content` WS,
-//! run the Noise IK handshake, and pump `Frame`s between the webview and the
+//! The content-session command: dial the gateway over the relay's content-join
+//! leg, run the Noise IK handshake, and pump `Frame`s between the webview and the
 //! gateway over the established E2E channel.
 //!
 //! The crypto + frame codec live in the host-tested core
@@ -9,12 +9,12 @@
 //! [`Channel`] for the UI, and seals outbound user messages it receives over an
 //! mpsc from [`content_send`](crate::content_send).
 //!
-//! One session at a time (phase 1): opening a new one aborts the previous task.
-//! Relay content is phase 2 — a `Relay` endpoint in the plan is skipped for now.
+//! One session at a time: opening a new one aborts the previous task. Content is
+//! relay-only — the app reaches the (possibly NAT'd) gateway through C's blind
+//! content-join leg.
 
 use baybo_mobile_core::{
-    ConnectError, ContentHandshake, ContentSession, Endpoint, Frame, connect_first, endpoints,
-    subscribe_frame, user_text_frame,
+    ContentHandshake, ContentSession, Frame, subscribe_frame, user_text_frame,
 };
 use device_proto::noise::StaticKeypair;
 use futures_util::{SinkExt, StreamExt};
@@ -51,8 +51,8 @@ struct Established {
 }
 
 /// Open a content session for `session_id`, streaming decrypted gateway frames
-/// to `on_frame`. Tries each direct candidate (relay is phase 2) until one
-/// connects + completes the Noise handshake, then spawns the pump task.
+/// to `on_frame`. Dials the gateway over the relay's content-join leg, completes
+/// the Noise handshake, then spawns the pump task.
 pub async fn connect(
     sessions: &ContentSessions,
     session_id: String,
@@ -60,24 +60,10 @@ pub async fn connect(
 ) -> Result<(), String> {
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
-    let plan = endpoints(&record.direct_candidates, &record.relay_node_id);
-
-    let record_ref = &record;
-    let local_ref = &local;
-    let established = connect_first(&plan, |ep| async move {
-        match ep {
-            Endpoint::Direct(base) => dial_direct(&base, record_ref, local_ref).await,
-            Endpoint::Relay { node_id } => dial_relay(&node_id, record_ref, local_ref).await,
-        }
-    })
-    .await;
-    let established = match established {
-        Ok(e) => e,
-        Err(ConnectError::NoEndpoints) => {
-            return Err("no reachable gateway endpoints; re-pair".into());
-        }
-        Err(ConnectError::AllFailed(e)) => return Err(format!("could not reach the gateway: {e}")),
-    };
+    if record.relay_node_id.is_empty() {
+        return Err("paired gateway has no relay route; re-pair".into());
+    }
+    let established = dial_relay(&record.relay_node_id, &record, &local).await?;
 
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
     let user_id = record.user_id.clone();
@@ -115,28 +101,10 @@ pub async fn disconnect(sessions: &ContentSessions) {
     }
 }
 
-/// Dial one direct candidate and run the Noise IK initiator handshake.
-async fn dial_direct(
-    base: &str,
-    record: &PairedRecord,
-    local: &StaticKeypair,
-) -> Result<Established, String> {
-    let base = base.trim_end_matches('/');
-    // The auth token rides the `?token=` query so the channel-auth middleware
-    // resolves it to the device identity before the upgrade; the Noise IK
-    // handshake then authenticates the static key end-to-end.
-    let url = format!("{base}/v1/device/content?token={}", record.auth_token);
-    let (ws, _) = connect_async(&url)
-        .await
-        .map_err(|e| format!("connect {base}: {e}"))?;
-    handshake_over(ws, record, local).await
-}
-
-/// Dial the blind relay's content-join leg for the gateway's `relay_node_id`
-/// (fallback when no direct candidate connected). The relay now admits this leg
-/// by the instance key (symmetric with the gateway's host leg); end-to-end, the
-/// gateway still authenticates this device by matching the Noise IK initiator's
-/// static against an approved device row.
+/// Dial the blind relay's content-join leg for the gateway's `relay_node_id`.
+/// The relay admits this leg by the instance key (symmetric with the gateway's
+/// host leg); end-to-end, the gateway authenticates this device by matching the
+/// Noise IK initiator's static against an approved device row.
 async fn dial_relay(
     node_id: &str,
     record: &PairedRecord,

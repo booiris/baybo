@@ -5,7 +5,6 @@ mod channel_session;
 mod cost;
 mod cron;
 mod device;
-mod device_pairing;
 mod job;
 mod secret;
 mod session;
@@ -23,7 +22,6 @@ pub use channel_session::LibsqlChannelSessionStore;
 pub use cost::LibsqlCostStore;
 pub use cron::LibsqlCronStore;
 pub use device::LibsqlDeviceStore;
-pub use device_pairing::LibsqlDevicePairingStore;
 pub use job::LibsqlJobStore;
 pub use secret::LibsqlSecretStore;
 pub use session::LibsqlSessionStore;
@@ -525,19 +523,7 @@ impl LibsqlPool {
                     PRIMARY KEY (user_id, device_id)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_auth_token
-                    ON devices(auth_token);
-
-                CREATE TABLE IF NOT EXISTS device_pairings (
-                    code              TEXT    PRIMARY KEY,
-                    user_id           TEXT    NOT NULL,
-                    label             TEXT    NOT NULL,
-                    created_at        INTEGER NOT NULL,
-                    expires_at        INTEGER NOT NULL,
-                    confirm_code      TEXT,
-                    device_id         TEXT,
-                    operator_decision INTEGER,
-                    device_decision   INTEGER
-                );",
+                    ON devices(auth_token);",
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;
@@ -554,10 +540,6 @@ impl LibsqlPool {
             "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE cost_records ADD COLUMN reason TEXT",
             "ALTER TABLE sessions ADD COLUMN folder_id TEXT",
-            "ALTER TABLE device_pairings ADD COLUMN confirm_code TEXT",
-            "ALTER TABLE device_pairings ADD COLUMN device_id TEXT",
-            "ALTER TABLE device_pairings ADD COLUMN operator_decision INTEGER",
-            "ALTER TABLE device_pairings ADD COLUMN device_decision INTEGER",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {

@@ -39,7 +39,7 @@ pub(crate) type WsSink = SplitSink<WebSocket, AxumWsMessage>;
 
 /// Outbound transport for a channel connection: MessagePack-encode a [`Frame`]
 /// and write it to the wire. The raw `/v1/channel-ws` path sends the bytes
-/// directly ([`WsFrameSink`]); the `/v1/device/content` path Noise-wraps them
+/// directly ([`WsFrameSink`]); the relay device-content path Noise-wraps them
 /// (`device_content::NoiseFrameSink`). Keeping the encode + write behind this
 /// seam lets the shared [`pump_loop`] stay transport-agnostic.
 #[async_trait::async_trait]

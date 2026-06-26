@@ -677,7 +677,6 @@ name = "baybo-janitor"
 version = "0.1.0"
 dependencies = [
  "baybo-model",
- "baybo-storage",
  "baybo-store",
  "baybo-workspace",
  "chrono",
@@ -788,6 +787,7 @@ dependencies = [
  "baybo-store",
  "chrono",
  "hex",
+ "parking_lot",
  "rand 0.10.1",
  "thiserror 2.0.18",
  "tokio",

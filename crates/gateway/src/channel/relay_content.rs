@@ -4,9 +4,8 @@
 //! persistent outbound **control connection** to C (`/control`). When a phone
 //! arrives at the relay for this gateway's `relay_node_id`, C pushes
 //! [`ControlSignal::OpenDataLeg`]; the gateway dials a data leg
-//! (`/content/host/{relay_key}`) and runs the Noise content responder over it —
-//! byte-identical to a direct `/v1/device/content` session, only the transport
-//! differs (it reuses [`super::device_content::run_content_over_relay`]).
+//! (`/content/host/{relay_key}`) and runs the Noise content responder over it
+//! (see [`super::device_content::run_content_over_relay`]).
 //!
 //! The connection is held for the process's life and re-dialed with a fixed
 //! backoff after any drop, so a phone can always reach a live gateway via C.

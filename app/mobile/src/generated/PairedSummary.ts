@@ -5,4 +5,4 @@
  * (`auth_token`, `push_key`, the Noise static secret) are persisted by the
  * shell, never returned to the webview.
  */
-export type PairedSummary = { userId: string, relayNodeId: string, directCandidates: Array<string>, pairingCode: string, };
+export type PairedSummary = { userId: string, relayNodeId: string, pairingCode: string, };

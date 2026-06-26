@@ -1,9 +1,9 @@
 //! The app (P) side of the SPAKE2 device-pairing handshake.
 //!
 //! A transport-agnostic state machine: the Tauri shell pumps
-//! [`PairFrame`]s over the `/v1/device/pair` WebSocket (direct or via C's
-//! rendezvous) and feeds them through these methods. The crypto is entirely
-//! [`device_proto`], so the app and the gateway agree by construction.
+//! [`PairFrame`]s over the relay pairing WebSocket (C's `/pair/join` rendezvous)
+//! and feeds them through these methods. The crypto is entirely [`device_proto`],
+//! so the app and the gateway agree by construction.
 //!
 //! Flow: [`PairingClient::start`] → send `Hello` → [`on_pake_reply`] → send the
 //! sealed `DeviceHello` → show [`confirm_code`], [`confirm`] → send the sealed
@@ -54,10 +54,9 @@ pub struct PairedGateway {
     pub push_key: [u8; KEY_LEN],
     pub relay_node_id: String,
     /// Base WS URL of the blind relay (C); the app dials the relay's content-join
-    /// route (`remote_host_protocol::relay::content_join_url`) to reach a NAT'd
-    /// gateway when every direct candidate fails. Empty when relay is off.
+    /// route (`remote_host_protocol::relay::content_join_url`) to reach the
+    /// (possibly NAT'd) gateway for content. Empty when relay is off.
     pub relay_url: String,
-    pub direct_candidates: Vec<String>,
     /// The code this device paired under (retained for audit).
     pub pairing_code: String,
 }
@@ -83,7 +82,6 @@ pub struct PairChallenge {
 pub struct PairedSummary {
     pub user_id: String,
     pub relay_node_id: String,
-    pub direct_candidates: Vec<String>,
     pub pairing_code: String,
 }
 
@@ -92,7 +90,6 @@ impl From<&PairedGateway> for PairedSummary {
         Self {
             user_id: p.user_id.clone(),
             relay_node_id: p.relay_node_id.clone(),
-            direct_candidates: p.direct_candidates.clone(),
             pairing_code: p.pairing_code.clone(),
         }
     }
@@ -202,7 +199,6 @@ impl PairingClient {
             push_key: keys.push_key,
             relay_node_id: welcome.relay_node_id,
             relay_url: welcome.relay_url,
-            direct_candidates: welcome.direct_candidates,
             pairing_code: welcome.pairing_code,
         })
     }
@@ -272,7 +268,6 @@ mod tests {
             static_pubkey: [9u8; KEY_LEN],
             relay_node_id: "node-1".into(),
             relay_url: "wss://proxy.baybo.space".into(),
-            direct_candidates: vec!["wss://baybo.lan:8889".into()],
             user_id: "user-1".into(),
             pairing_code: code.clone(),
             auth_token: "issued-token".into(),
@@ -285,10 +280,6 @@ mod tests {
         assert_eq!(paired.auth_token, "issued-token");
         assert_eq!(paired.gateway_static_pubkey, [9u8; KEY_LEN]);
         assert_eq!(paired.relay_node_id, "node-1");
-        assert_eq!(
-            paired.direct_candidates,
-            vec!["wss://baybo.lan:8889".to_string()]
-        );
         // Both ends derived the same push key from the SPAKE2 secret.
         assert_eq!(paired.push_key, gw_keys.push_key);
     }

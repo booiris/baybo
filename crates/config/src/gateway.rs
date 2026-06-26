@@ -34,43 +34,27 @@ pub struct GatewayConfig {
     /// Seconds the process waits for graceful shutdown before the
     /// force-exit watchdog kicks in.
     pub shutdown_grace_secs: u64,
-    /// Direct-reachability advertisement for paired iOS devices. The app
-    /// tries these endpoints before falling back to the operator relay, so
-    /// the common "phone + server on the same network" case stays off the
-    /// relay. Handed to the device inside the SPAKE2 K-channel at pairing
-    /// (`GatewayWelcome.direct_candidates`).
-    pub direct: DirectConfig,
     /// Blind remote-host push: when enabled, A POSTs an operator-encrypted
     /// lock-screen preview to the remote host (C) on every real user turn.
     pub push: PushConfig,
-    /// Relay-pairing: when enabled, A hosts pairing legs on the operator's relay
-    /// (C) so a phone behind a different network can pair via the proxy QR.
+    /// Relay (C): when enabled, the gateway holds an outbound control link so a
+    /// NAT'd gateway stays reachable for post-pairing content, and
+    /// `baybo device pair` hosts its pairing legs on this same relay.
     pub relay: RelayConfig,
 }
 
-/// A-side relay-pairing config (the `relay` block in `baybo.json`).
+/// A-side relay config (the `relay` block in `baybo.json`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct RelayConfig {
-    /// When false, the gateway hosts no relay pairing legs (direct dial only).
+    /// When false, the gateway opens no relay control connection (it is then
+    /// reachable only via its direct candidates).
     pub enabled: bool,
     /// The relay's base WS URL, e.g. `wss://proxy.baybo.space`.
     pub url: String,
     /// The gateway's admission key — a `RELAY_INSTANCE_KEYS` entry on the relay.
     /// Typically the same key as [`PushConfig::instance_key`].
     pub instance_key: String,
-}
-
-/// A-side direct-reachability config (the `direct` block in `baybo.json`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default)]
-pub struct DirectConfig {
-    /// When false, no direct candidates are advertised — pairing devices fall
-    /// straight to the relay.
-    pub enabled: bool,
-    /// Endpoints A is reachable at directly (LAN / Tailscale / reverse proxy),
-    /// e.g. `["wss://baybo.lan:8889", "wss://baybo.tailnet.ts.net:8889"]`.
-    pub advertise: Vec<String>,
 }
 
 /// A-side push config (the `push` block in `baybo.json`). A holds only the
@@ -95,7 +79,6 @@ impl Default for GatewayConfig {
             port: 8888,
             cors_allowed_origins: Vec::new(),
             shutdown_grace_secs: 30,
-            direct: DirectConfig::default(),
             push: PushConfig::default(),
             relay: RelayConfig::default(),
         }

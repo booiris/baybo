@@ -12,6 +12,7 @@ baybo-store = { workspace = true }
 
 chrono = { workspace = true }
 hex = { workspace = true }
+parking_lot = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

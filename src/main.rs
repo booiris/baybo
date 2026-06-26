@@ -262,7 +262,6 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Ok((vault, stores)) = runtime::build_bot_registry_deps(&config).await {
         let device_service = std::sync::Arc::new(baybo_pairing::DevicePairingService::new(
-            stores.device_pairing.clone(),
             stores.device.clone(),
         ));
         builder = builder

@@ -8,11 +8,8 @@ pub enum DevicePairingError {
     #[error("storage: {0}")]
     Storage(#[from] baybo_store::StorageError),
 
-    #[error("code: {0}")]
-    Code(#[from] crate::code::CodeError),
-
-    /// The single-use pairing slot was already consumed — a concurrent
-    /// handshake for the same code won the race.
+    /// The single-use pairing slot was already consumed — a second finalize for
+    /// the same code is refused.
     #[error("pairing slot already consumed")]
     SlotConsumed,
 }

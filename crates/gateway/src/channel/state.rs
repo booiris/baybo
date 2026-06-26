@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use baybo_agent::SessionManager;
 use baybo_channels::{ChannelRegistry, RouterInbound};
-use baybo_pairing::{DevicePairingService, PairingService};
+use baybo_pairing::PairingService;
 use baybo_security::SecretVault;
 use baybo_store::{BlobStore, ChannelBotStore, DeviceStore, TaskStore};
 
@@ -79,28 +79,10 @@ pub struct WsChannelState {
     /// triples get a short code back via [`baybo_channels::wire::Frame::Notice`]
     /// and their message is dropped. See `docs/modules/pairing.md`.
     pub pairing: Arc<PairingService>,
-    /// iOS-companion device pairing: mints/claims SPAKE2 slots and finalizes a
-    /// completed handshake into a pending device row. Drives the token-free
-    /// `/v1/device/pair` WS route (A's static Noise key is loaded lazily from
-    /// `secret_vault` per handshake).
-    pub device_pairing: Arc<DevicePairingService>,
-    /// Persisted device registry. The `/v1/device/content` route re-fetches the
-    /// authenticated device's row to verify the Noise IK initiator's static key
-    /// equals the `device_pubkey` exchanged at pairing.
+    /// Persisted device registry. The content session looks a device up by the
+    /// Noise IK initiator's static key, matching it against an approved row's
+    /// `device_pubkey` from pairing.
     pub device_store: Arc<dyn DeviceStore>,
-    /// Base WS URL of the blind relay (C), or empty when relay is disabled.
-    /// Advertised to the app in `GatewayWelcome.relay_url` so a device that
-    /// paired directly can still fall back to the relay; non-empty also gates
-    /// whether pairing hands out a `relay_node_id`.
-    pub relay_url: String,
-    /// Direct-reachability endpoints handed to a pairing device inside the
-    /// SPAKE2 K-channel (`GatewayWelcome.direct_candidates`). Empty when
-    /// `gateway.direct.enabled` is false.
-    pub device_direct_candidates: Vec<String>,
-    /// Gateway-mediated APNs registrar: on a successful pairing, A relays the
-    /// device's APNs token to the remote host (C). `None` when push isn't
-    /// configured, so the device-pair route simply skips registration.
-    pub apns_registrar: Option<Arc<dyn crate::push::ApnsRegistrar>>,
     /// Backing store for non-text media. Sidecars upload via
     /// `POST /v1/blobs`, the agent emits replies that reference blobs
     /// the gateway already has, and `GET /v1/blobs/{id}` lets sidecars
@@ -125,20 +107,6 @@ pub struct WsChannelState {
 }
 
 impl WsChannelState {
-    /// The subset of state the device-pairing handshake needs (see
-    /// [`super::device_pair::PairingHostDeps`]). Lets the daemon's relay-pair
-    /// manager and the direct route share the handshake with a self-contained
-    /// `baybo device pair` that has no full `WsChannelState`.
-    pub(crate) fn pairing_host_deps(&self) -> super::device_pair::PairingHostDeps {
-        super::device_pair::PairingHostDeps {
-            device_pairing: Arc::clone(&self.device_pairing),
-            secret_vault: Arc::clone(&self.secret_vault),
-            relay_url: self.relay_url.clone(),
-            device_direct_candidates: self.device_direct_candidates.clone(),
-            apns_registrar: self.apns_registrar.clone(),
-        }
-    }
-
     /// Build the WS channel state from the shared [`GatewayDeps`].
     /// Used by both the loopback channel listener and the admin
     /// listener (which co-hosts `/v1/channel-ws` so the browser-side
@@ -150,42 +118,6 @@ impl WsChannelState {
             deps.stores.channel_session.clone(),
         ));
         let pairing = Arc::new(PairingService::new(deps.stores.channel_pairing.clone()));
-        let device_pairing = Arc::new(DevicePairingService::new(
-            deps.stores.device_pairing.clone(),
-            deps.stores.device.clone(),
-        ));
-        let direct = &deps.config.gateway.direct;
-        let device_direct_candidates = if direct.enabled {
-            direct.advertise.clone()
-        } else {
-            Vec::new()
-        };
-        let push = &deps.config.gateway.push;
-        // Proxy-aware client (the egress proxy applies to the C `/register`
-        // POST). `from_deps` is infallible, so a malformed proxy degrades to
-        // None — the same misconfig fails loudly when the dispatcher is built.
-        let apns_registrar: Option<Arc<dyn crate::push::ApnsRegistrar>> =
-            if push.enabled && !push.gateway_url.is_empty() {
-                let proxy =
-                    deps.config
-                        .proxy
-                        .as_ref()
-                        .map(|p| baybo_security::http::ProxySettings {
-                            url: p.url.clone(),
-                            no_proxy: p.no_proxy.clone(),
-                        });
-                baybo_security::http::client(proxy.as_ref())
-                    .ok()
-                    .map(|client| {
-                        Arc::new(crate::push::HttpApnsRegistrar::new(
-                            &push.gateway_url,
-                            push.instance_key.clone(),
-                            client,
-                        )) as Arc<dyn crate::push::ApnsRegistrar>
-                    })
-            } else {
-                None
-            };
         Self {
             registry: Arc::clone(&deps.channel_registry),
             incoming_tx: deps.incoming_tx.clone(),
@@ -200,16 +132,7 @@ impl WsChannelState {
             secret_vault: Arc::clone(&deps.secret_vault),
             bot_reconciler: Arc::clone(&deps.bot_reconciler),
             pairing,
-            device_pairing,
             device_store: deps.stores.device.clone(),
-            relay_url: deps
-                .runtime_config
-                .relay
-                .as_ref()
-                .map(|r| r.url.clone())
-                .unwrap_or_default(),
-            device_direct_candidates,
-            apns_registrar,
             blob_store: deps.stores.blob.clone(),
             task_store: deps.stores.task.clone(),
             job_lifecycle: Arc::clone(&deps.job_lifecycle),

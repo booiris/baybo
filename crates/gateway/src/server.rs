@@ -250,26 +250,15 @@ impl GatewayServer {
     pub fn new(deps: GatewayDeps) -> Self {
         let bind = deps.runtime_config.admin_bind;
         let shutdown_grace = deps.runtime_config.shutdown_grace;
-        // Relay-pairing host manager: host pairing legs on the operator's relay
-        // so phones behind another network can pair via the proxy QR. Started
-        // once here (the admin server is always created); a no-op when the
-        // `relay` block is disabled.
+        // Content control connection: hold an outbound A->C link so a phone can
+        // reach this (possibly NAT'd) gateway for chat via the relay. A no-op when
+        // the `relay` block is disabled.
         if let Some(relay) = deps.runtime_config.relay.clone() {
-            // The relay managers below dial `wss://` via tokio-tungstenite, which
-            // builds its ClientConfig from rustls's process-default CryptoProvider.
-            // Our graph enables both aws-lc-rs and ring, so rustls can't auto-select
-            // one and connect_async would panic — install aws-lc-rs explicitly
-            // before the first dial (idempotent; Err = already installed).
+            // tokio-tungstenite dials `wss://` using rustls's process-default
+            // CryptoProvider; our graph enables both aws-lc-rs and ring, so install
+            // aws-lc-rs explicitly before the first dial or connect_async panics
+            // (idempotent; Err = already installed).
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-            crate::channel::relay_pair::spawn(
-                WsChannelState::from_deps(&deps),
-                crate::channel::relay_pair::RelayPairConfig {
-                    relay_url: relay.url.clone(),
-                    instance_key: relay.instance_key.clone(),
-                },
-            );
-            // Content control connection: hold an outbound A->C link so a phone
-            // can reach this (possibly NAT'd) gateway for chat via the relay.
             crate::channel::relay_content::spawn(
                 WsChannelState::from_deps(&deps),
                 crate::channel::relay_content::RelayContentConfig {
@@ -368,16 +357,10 @@ fn build_channel_v1_subrouter(
     // TraceLayer goes *inside* the auth middleware so it sees the
     // URI AFTER `require_channel_auth` has stripped `?token=…`.
     let inner: Router<()> = crate::channel::routes()
-        .with_state(state.clone())
-        .layer(TraceLayer::new_for_http());
-    let v1_authed = channel_auth::attach(inner, auth_state);
-    // The device-pairing handshake is **token-free** — pairing precedes any
-    // auth token, and the SPAKE2 code is the gate — so it is mounted OUTSIDE
-    // `channel_auth::attach`.
-    let pair: Router<()> = crate::channel::device_pair::routes()
         .with_state(state)
         .layer(TraceLayer::new_for_http());
-    Router::new().nest("/v1", v1_authed.merge(pair))
+    let v1_authed = channel_auth::attach(inner, auth_state);
+    Router::new().nest("/v1", v1_authed)
 }
 
 /// Build the router served on the channel TCP listener. Called by

@@ -1,6 +1,6 @@
 //! `baybo device` subcommand family — the operator surface for the iOS
 //! companion's device pairing (orthogonal to `baybo pair`, which gates channel
-//! senders). See [`mobile-remote-host`](../../../docs/mobile-remote-host.md).
+//! senders).
 //!
 //! `pair` is a live, terminal-only flow: it mints a code, waits for the phone to
 //! scan and reach the confirm step, shows the Bluetooth-style confirmation code,
@@ -31,8 +31,8 @@ const OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const SCAN_WAIT: Duration = Duration::from_secs(300);
 /// How long to wait for the gateway to finalize once the operator confirmed.
 const OUTCOME_WAIT: Duration = Duration::from_secs(125);
-/// Built-in default endpoint embedded in the pairing QR when the operator has
-/// not configured a reachable `gateway.direct.advertise` address.
+/// Built-in public relay embedded in the pairing QR when the operator has not
+/// configured their own `gateway.relay`.
 const DEFAULT_GATEWAY_ENDPOINT: &str = "wss://proxy.baybo.space";
 
 pub async fn handle(ctx: &CommandContext, cmd: DeviceCmd) -> Result<CommandOutput> {
@@ -88,9 +88,7 @@ impl StopHosting {
     /// terminal outcome (the slot is gone, or a side declined), so the task
     /// completing *while the operator is still deciding* is a direct "the phone
     /// gave up" signal — no slot round-trip. Borrows the handle (doesn't consume
-    /// it), so `finish`/`drop` still work afterward. Never resolves when there is
-    /// no self-hosted leg (the direct path), so the caller falls back to the slot
-    /// poll there.
+    /// it), so `finish`/`drop` still work afterward.
     async fn ended(&mut self) {
         match self.0.as_mut() {
             Some(h) => {
@@ -138,30 +136,19 @@ async fn pair(
         .await
         .map_err(|e| CliError::Manager(format!("mint device pairing: {e}")))?;
 
-    let (endpoint, relay) = pairing_endpoint(ctx);
-    // On the relay path the operator supplies the relay admission key; it's baked
-    // into the QR so the app presents it on its join leg (the relay admits both
-    // sides). `guest` is the public trial key. Direct pairing carries no key.
-    let instance_key = if relay {
-        // `guest` is the trial key for the built-in public proxy; only surface it
-        // (hint + default) when that's the endpoint. Any other relay must supply
-        // its own admission key.
-        let (label, default_key) = if endpoint == DEFAULT_GATEWAY_ENDPOINT {
-            ("Relay instance key (enter `guest` to try it out)", "guest")
-        } else {
-            ("Relay instance key", "")
-        };
-        Some(prompt::prompt_with_default(label, default_key)?)
+    // Pairing always runs through the relay: the operator supplies its admission
+    // key, baked into the QR so the app presents it on its join leg (the relay
+    // admits both sides).
+    let (endpoint, default_key) = relay_endpoint(ctx);
+    let key_label = if endpoint == DEFAULT_GATEWAY_ENDPOINT {
+        // `guest` is the trial key for the built-in public proxy.
+        "Relay instance key (enter `guest` to try it out)"
     } else {
-        None
+        "Relay instance key"
     };
-    let payload = match instance_key.as_deref() {
-        Some(key) => {
-            let k = qr_encode(key);
-            format!("baybo://pair?h={endpoint}&c={code}&k={k}&relay=1")
-        }
-        None => format!("baybo://pair?h={endpoint}&c={code}"),
-    };
+    let instance_key = prompt::prompt_with_default(key_label, &default_key)?;
+    let k = qr_encode(&instance_key);
+    let payload = format!("baybo://pair?h={endpoint}&c={code}&k={k}");
     eprintln!("Pairing a new device.\n");
     if let Some(qr) = render_pairing_qr(&payload) {
         // Blank line after as well: the surrounding blank lines stand in for the
@@ -175,36 +162,25 @@ async fn pair(
     eprintln!("Waiting for the device to scan…");
 
     // Self-contained relay hosting: open our `/pair/host/{code}` leg on the relay
-    // and run the SPAKE2 handshake here, so pairing works with no `baybo gateway
-    // start` daemon. Runs concurrently with the operator flow below (they sync
-    // through the shared slot); the guard stops it on every exit path.
-    let mut host = match instance_key.as_deref() {
-        Some(key) => {
-            let secret_vault = ctx
-                .secret_vault
-                .clone()
-                .ok_or_else(|| CliError::Config("device pairing needs the secret vault".into()))?;
-            let deps = baybo_gateway::PairingHostDeps {
-                device_pairing: Arc::clone(svc),
-                secret_vault,
-                relay_url: endpoint.clone(),
-                device_direct_candidates: if ctx.config.gateway.direct.enabled {
-                    ctx.config.gateway.direct.advertise.clone()
-                } else {
-                    Vec::new()
-                },
-                apns_registrar: None,
-            };
-            let (relay_url, key, code) = (endpoint.clone(), key.to_string(), code.clone());
-            Some(StopHosting::new(tokio::spawn(async move {
-                if let Err(e) =
-                    baybo_gateway::host_pairing_leg(&deps, &relay_url, &key, &code).await
-                {
-                    tracing::debug!(error = %e, "device pair: relay host ended");
-                }
-            })))
-        }
-        None => None,
+    // and run the SPAKE2 handshake here — pairing needs no `baybo gateway start`
+    // daemon. Runs concurrently with the operator flow below (they sync through
+    // the in-process slot); the guard stops it on every exit path.
+    let secret_vault = ctx
+        .secret_vault
+        .clone()
+        .ok_or_else(|| CliError::Config("device pairing needs the secret vault".into()))?;
+    let deps = baybo_gateway::PairingHostDeps {
+        device_pairing: Arc::clone(svc),
+        secret_vault,
+        relay_url: endpoint.clone(),
+    };
+    let mut host = {
+        let (relay_url, key, code) = (endpoint.clone(), instance_key.clone(), code.clone());
+        StopHosting::new(tokio::spawn(async move {
+            if let Err(e) = baybo_gateway::host_pairing_leg(&deps, &relay_url, &key, &code).await {
+                tracing::debug!(error = %e, "device pair: relay host ended");
+            }
+        }))
     };
 
     // 1. Wait for the phone to scan + reach the confirm step: the gateway
@@ -234,7 +210,7 @@ async fn pair(
         svc,
         &code,
         "Does this match the code on the phone? Pair this device?",
-        host.as_mut(),
+        &mut host,
     )
     .await?
     {
@@ -251,14 +227,11 @@ async fn pair(
         .map_err(|e| CliError::Manager(format!("record pairing decision: {e}")))?;
     if !accepted {
         // Let the self-hosted relay leg deliver the `Reject` to the phone before
-        // we exit: the gateway side polls the decision we just wrote, rejects, and
-        // the host loop then stops (it sees the decline), so this returns
+        // we exit: the host's drive() polls the decision we just wrote, rejects,
+        // and the host loop then stops (it sees the decline), so this returns
         // promptly. Without it, dropping the guard would abort the leg mid-flight
         // and the app would see a reset connection instead of "operator declined".
-        // No-op on the direct path — a running daemon serves + rejects.
-        if let Some(h) = host {
-            h.finish().await;
-        }
+        host.finish().await;
         return Ok(CommandOutput::structured(
             format!("Declined pairing for \"{device_label}\"."),
             &json!({ "action": "declined", "code": code, "device_id": device_id }),
@@ -271,10 +244,9 @@ async fn pair(
     // Stop our self-hosted relay leg: on success let it finish sending the sealed
     // GatewayWelcome (it goes out right after the approved row `wait_for_paired`
     // just observed); otherwise drop the guard to abort the still-running task.
-    match (host, &outcome) {
-        (Some(h), PairOutcome::Paired) => h.finish().await,
-        (Some(h), _) => drop(h),
-        (None, _) => {}
+    match &outcome {
+        PairOutcome::Paired => host.finish().await,
+        _ => drop(host),
     }
     match outcome {
         PairOutcome::Paired => Ok(CommandOutput::structured(
@@ -315,13 +287,13 @@ enum ConfirmOutcome {
 ///   stdin would keep the tokio runtime from shutting down and hang process exit
 ///   after we bail; a detached thread is just terminated at exit);
 /// - the self-hosted relay leg's task ending (a direct phone-gave-up signal);
-/// - a slot poll for the phone-side `device_decision` (the fallback that also
-///   covers the direct path, where there is no self-hosted leg to watch).
+/// - a slot poll for the phone-side `device_decision` (a belt-and-braces fallback
+///   that also catches an expired/consumed slot).
 async fn confirm_or_device_gone(
     svc: &DevicePairingService,
     code: &str,
     question: &str,
-    host: Option<&mut StopHosting>,
+    host: &mut StopHosting,
 ) -> Result<ConfirmOutcome> {
     use std::io::{BufRead, IsTerminal, Write};
 
@@ -360,12 +332,7 @@ async fn confirm_or_device_gone(
         let _ = tx.send(decision);
     });
     tokio::pin!(rx);
-    let host_ended = async move {
-        match host {
-            Some(h) => h.ended().await,
-            None => std::future::pending::<()>().await,
-        }
-    };
+    let host_ended = host.ended();
     tokio::pin!(host_ended);
     loop {
         tokio::select! {
@@ -471,18 +438,16 @@ async fn wait_for_paired(
     }
 }
 
-/// The endpoint to embed in the pairing QR, and whether it is the relay (so the
-/// app joins via `/pair/join/<code>` on the proxy instead of dialing the gateway
-/// directly at `/v1/device/pair`). Prefers a configured direct address; else
-/// falls back to the built-in default proxy (relay).
-fn pairing_endpoint(ctx: &CommandContext) -> (String, bool) {
-    let direct = &ctx.config.gateway.direct;
-    if direct.enabled
-        && let Some(first) = direct.advertise.first()
-    {
-        return (first.clone(), false);
+/// The relay endpoint to embed in the pairing QR (the app joins via
+/// `/pair/join/<code>` on it), plus the default admission key to offer at the
+/// prompt. Prefers the operator's configured `gateway.relay`; else the built-in
+/// public proxy (whose trial key is `guest`).
+fn relay_endpoint(ctx: &CommandContext) -> (String, String) {
+    let relay = &ctx.config.gateway.relay;
+    if relay.enabled && !relay.url.is_empty() {
+        return (relay.url.clone(), relay.instance_key.clone());
     }
-    (DEFAULT_GATEWAY_ENDPOINT.to_string(), true)
+    (DEFAULT_GATEWAY_ENDPOINT.to_string(), "guest".to_string())
 }
 
 /// Render `payload` as a QR for the terminal (unicode half-blocks). `None` if

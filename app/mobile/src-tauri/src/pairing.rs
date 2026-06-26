@@ -57,15 +57,13 @@ pub(crate) struct PairedRecord {
     pub(crate) device_id: String,
     pub(crate) auth_token: String,
     pub(crate) gateway_static_pubkey: [u8; 32],
-    pub(crate) direct_candidates: Vec<String>,
     pub(crate) relay_node_id: String,
     /// Base WS URL of the blind relay (C); empty when relay is off. Used to dial
-    /// a relay content leg when every direct candidate fails.
+    /// the relay content leg.
     #[serde(default)]
     pub(crate) relay_url: String,
     /// The relay admission key (the QR's `k`) this device presents on the relay
-    /// content-join leg; empty when paired directly. Symmetric with the gateway's
-    /// host-side key.
+    /// content-join leg. Symmetric with the gateway's host-side key.
     #[serde(default)]
     pub(crate) instance_key: String,
     /// The app's long-term Noise static identity (its content-session identity):
@@ -102,19 +100,15 @@ pub async fn pair_begin(
     endpoint: &str,
     code: &str,
     label: &str,
-    relay: bool,
     instance_key: Option<String>,
     on_abort: Channel<PairAborted>,
 ) -> Result<PairChallenge, String> {
     let base = endpoint.trim_end_matches('/');
-    // Relay: join the rendezvous keyed by the code (`/pair/join/{code}`); the
-    // gateway hosts the other leg. Direct: dial the gateway's pairing route.
-    let url = if relay {
-        remote_host_protocol::relay::pair_join_url(base, code)
-    } else {
-        format!("{base}/v1/device/pair")
-    };
-    let mut ws = connect_pair(&url, relay, instance_key.as_deref()).await?;
+    // Pairing is relay-only: join the rendezvous keyed by the code
+    // (`/pair/join/{code}`); the operator's `baybo device pair` hosts the other
+    // leg on the relay.
+    let url = remote_host_protocol::relay::pair_join_url(base, code);
+    let mut ws = connect_pair(&url, instance_key.as_deref()).await?;
 
     // The app's long-term Noise identity. TODO(persist): the secret belongs in
     // the keychain so content sessions reuse it across launches.
@@ -332,7 +326,6 @@ async fn finish_pair(
         device_id: device_id.to_string(),
         auth_token: paired.auth_token.clone(),
         gateway_static_pubkey: paired.gateway_static_pubkey,
-        direct_candidates: paired.direct_candidates.clone(),
         relay_node_id: paired.relay_node_id.clone(),
         relay_url: paired.relay_url.clone(),
         instance_key: instance_key.to_string(),
@@ -355,12 +348,12 @@ pub fn paired_user() -> Option<String> {
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Dial the pairing WS. On the relay path the gateway's host leg may not be
-/// parked the instant the app scans, so retry briefly on connect failure.
-async fn connect_pair(url: &str, relay: bool, instance_key: Option<&str>) -> Result<Ws, String> {
+/// Dial the relay pairing WS. The operator's host leg may not be parked the
+/// instant the app scans, so retry briefly on connect failure.
+async fn connect_pair(url: &str, instance_key: Option<&str>) -> Result<Ws, String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let attempts = if relay { 30 } else { 1 };
+    let attempts = 30;
     let mut last = String::new();
     for i in 0..attempts {
         // A Request is consumed by `connect_async` and isn't cheaply cloneable,
