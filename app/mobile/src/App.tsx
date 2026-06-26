@@ -207,6 +207,10 @@ export default function App() {
   // Debug-only readout of the last scanned QR (sensitive code masked).
   const [scanInfo, setScanInfo] = useState<string | null>(null);
   const scanCancelled = useRef(false);
+  // One app binds one gateway, so re-pairing or unpairing is an explicit,
+  // confirmed action. `null` = showing the normal connected actions; otherwise
+  // the in-progress confirm for replacing or forgetting the current gateway.
+  const [pendingAction, setPendingAction] = useState<null | "replace" | "forget">(null);
 
   useEffect(() => {
     invoke<string | null>("paired_user")
@@ -367,6 +371,82 @@ export default function App() {
     }
   }
 
+  // Unpair: clear the keychain record + push key, then drop back to the scan
+  // screen fully unpaired.
+  async function forgetPairing() {
+    setBusy(true);
+    try {
+      await invoke("forget_pairing");
+      setStatus(null);
+    } catch (e) {
+      setStatus(`Couldn't forget the pairing: ${e}`);
+    } finally {
+      setBusy(false);
+      setPendingAction(null);
+      setPaired(null);
+      setRememberedUser(null);
+    }
+  }
+
+  // Re-pair: go to the scan screen to bind a different gateway. The current
+  // pairing stays in the keychain until the new one finishes (replace-on-
+  // success), so backing out of the scan leaves the existing binding intact.
+  function startReplace() {
+    setPendingAction(null);
+    setPaired(null);
+    setRememberedUser(null);
+  }
+
+  // The actions on a "connected" screen (shared by the just-paired and the
+  // remembered-on-launch views). One app binds one gateway, so the only ways
+  // forward are: open the chat, replace this gateway, or forget it.
+  function connectedActions() {
+    if (pendingAction === "forget") {
+      return (
+        <div className="confirm-inline">
+          <p className="muted">
+            Forget this gateway? Notifications and chat stop until you pair again.
+          </p>
+          <div className="row">
+            <button onClick={() => setPendingAction(null)} disabled={busy}>
+              Cancel
+            </button>
+            <button className="danger" onClick={forgetPairing} disabled={busy}>
+              Forget
+            </button>
+          </div>
+        </div>
+      );
+    }
+    if (pendingAction === "replace") {
+      return (
+        <div className="confirm-inline">
+          <p className="muted">
+            Replace this pairing? You'll scan a new gateway; the current one stays
+            until the new pairing finishes.
+          </p>
+          <div className="row">
+            <button onClick={() => setPendingAction(null)} disabled={busy}>
+              Cancel
+            </button>
+            <button onClick={startReplace} disabled={busy}>
+              Replace
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div className="row">
+        <button onClick={() => setChatting(true)}>Open chat</button>
+        <button onClick={() => setPendingAction("replace")}>Replace pairing</button>
+        <button className="danger" onClick={() => setPendingAction("forget")}>
+          Forget
+        </button>
+      </div>
+    );
+  }
+
   if (chatting) {
     return <ChatView onClose={() => setChatting(false)} />;
   }
@@ -384,10 +464,8 @@ export default function App() {
           <dt>Relay node</dt>
           <dd>{paired.relayNodeId || "—"}</dd>
         </dl>
-        <div className="row">
-          <button onClick={() => setChatting(true)}>Open chat</button>
-          <button onClick={() => setPaired(null)}>Pair another</button>
-        </div>
+        {connectedActions()}
+        {status && <p className="status">{status}</p>}
       </main>
     );
   }
@@ -422,10 +500,8 @@ export default function App() {
         <p className="muted">
           Paired as {rememberedUser} (remembered from a previous session).
         </p>
-        <div className="row">
-          <button onClick={() => setChatting(true)}>Open chat</button>
-          <button onClick={() => setRememberedUser(null)}>Pair another device</button>
-        </div>
+        {connectedActions()}
+        {status && <p className="status">{status}</p>}
       </main>
     );
   }

@@ -156,10 +156,32 @@ impl DevicePairingService {
         Ok(())
     }
 
+    /// The gateway's current bound device for `user_id`, if any — at most one
+    /// (one gateway = one user = one app). The operator's `baybo device pair`
+    /// queries this before minting a slot so it can warn that the new pairing
+    /// will replace the existing binding.
+    pub async fn current_device(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<DeviceRow>, DevicePairingError> {
+        Ok(self
+            .devices
+            .list_for_user(user_id, Some(DeviceStatus::Approved))
+            .await?
+            .into_iter()
+            .next())
+    }
+
     /// Finalize a confirmed handshake: write an **approved** device row (with a
     /// freshly minted, active `auth_token`) and consume the slot. `label` is the
     /// resolved device name (the device's reported label, or the operator's
     /// override). Called only once both the phone user and the operator confirmed.
+    ///
+    /// Enforces the 1:1 binding: any device the user already had bound is
+    /// atomically revoked as this one is written, so the gateway is never bound
+    /// to two devices at once. The replacement happens **here**, at finalize —
+    /// not when the operator first runs `device pair` — so a working binding is
+    /// kept live until the new pairing actually completes.
     pub async fn complete(
         &self,
         slot: &DevicePairingSlot,
@@ -193,7 +215,14 @@ impl DevicePairingService {
             approved_at: Some(now),
             last_seen_at: None,
         };
-        self.devices.create(&row).await?;
+        let replaced = self.devices.create_replacing_approved(&row).await?;
+        if !replaced.is_empty() {
+            tracing::info!(
+                new_device = %device_id,
+                replaced = ?replaced,
+                "device pairing superseded the prior binding (one gateway = one app)",
+            );
+        }
         Ok(row)
     }
 
@@ -345,6 +374,39 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn second_pairing_replaces_the_first() {
+        let svc = service();
+        // First device for the user.
+        let (r1, _) = svc.mint("u", "Phone A").await.unwrap();
+        let slot1 = svc.claim_slot(&r1).await.unwrap().unwrap();
+        svc.complete(&slot1, "dev-a", vec![1u8; 32], "Phone A")
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.current_device("u").await.unwrap().unwrap().device_id,
+            "dev-a"
+        );
+
+        // A second pairing supersedes it: one gateway = one app.
+        let (r2, _) = svc.mint("u", "Phone B").await.unwrap();
+        let slot2 = svc.claim_slot(&r2).await.unwrap().unwrap();
+        svc.complete(&slot2, "dev-b", vec![2u8; 32], "Phone B")
+            .await
+            .unwrap();
+
+        let approved = svc.list(Some(DeviceStatus::Approved)).await.unwrap();
+        assert_eq!(approved.len(), 1, "exactly one approved device");
+        assert_eq!(approved[0].device_id, "dev-b", "the newest wins");
+        assert_eq!(
+            svc.current_device("u").await.unwrap().unwrap().device_id,
+            "dev-b"
+        );
+        // The superseded device is retained as revoked (audit), not deleted.
+        let all = svc.list(None).await.unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     #[tokio::test]

@@ -128,6 +128,32 @@ async fn pair(
 ) -> Result<CommandOutput> {
     let svc = require_service(ctx)?;
     let user = user.unwrap_or_else(operator_user_id);
+
+    // 1:1 binding: the gateway binds at most one device per user (one gateway =
+    // one user = one app). If one is already bound, get the operator's informed
+    // consent before minting — the actual replacement happens only if/when the
+    // new pairing completes (`complete` revokes the old row atomically), so a
+    // working binding is never dropped for a pairing that never finishes.
+    let existing = svc
+        .current_device(&user)
+        .await
+        .map_err(|e| CliError::Manager(format!("look up current device: {e}")))?;
+    if let Some(ref dev) = existing {
+        eprintln!(
+            "This gateway is already paired with \"{}\" ({}).",
+            dev.label, dev.device_id
+        );
+        if !prompt::confirm_with_default(
+            "Pairing a new device will replace it once the new pairing completes. Continue?",
+            false,
+        )? {
+            return Ok(CommandOutput::structured(
+                format!("Kept the existing pairing with \"{}\".", dev.label),
+                &json!({ "action": "kept_existing", "device_id": dev.device_id }),
+            ));
+        }
+    }
+
     // The label is optional: an empty slot label tells the gateway to use the
     // name the device reports in its DeviceHello during the handshake.
     let operator_label = label.as_deref().unwrap_or("");
@@ -268,15 +294,24 @@ async fn pair(
         _ => drop(host),
     }
     match outcome {
-        PairOutcome::Paired => Ok(CommandOutput::structured(
-            format!("Paired \"{device_label}\" ({user}:{device_id})."),
-            &json!({
-                "action": "paired",
-                "user_id": user,
-                "device_id": device_id,
-                "label": device_label,
-            }),
-        )),
+        PairOutcome::Paired => {
+            // Tell the operator what was superseded (the old binding was revoked
+            // atomically as the new row was written).
+            let replaced_note = existing
+                .as_ref()
+                .map(|d| format!(" Replaced \"{}\".", d.label))
+                .unwrap_or_default();
+            Ok(CommandOutput::structured(
+                format!("Paired \"{device_label}\" ({user}:{device_id}).{replaced_note}"),
+                &json!({
+                    "action": "paired",
+                    "user_id": user,
+                    "device_id": device_id,
+                    "label": device_label,
+                    "replaced_device_id": existing.as_ref().map(|d| d.device_id.as_str()),
+                }),
+            ))
+        }
         PairOutcome::DeviceDeclined => Ok(CommandOutput::structured(
             format!("\"{device_label}\" cancelled pairing on the phone."),
             &json!({ "action": "device_cancelled", "rendezvous_id": rendezvous_id, "device_id": device_id }),

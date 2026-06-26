@@ -203,8 +203,35 @@ impl DeviceStore for MemoryDeviceStore {
         if g.contains_key(&key) || g.values().any(|r| r.auth_token == row.auth_token) {
             return Err(StorageError::Conflict("device or auth_token exists".into()));
         }
+        // Mirror the partial unique index: at most one Approved row per user.
+        if row.status == DeviceStatus::Approved
+            && g.values()
+                .any(|r| r.user_id == row.user_id && r.status == DeviceStatus::Approved)
+        {
+            return Err(StorageError::Conflict(
+                "user already has an approved device".into(),
+            ));
+        }
         g.insert(key, row.clone());
         Ok(())
+    }
+
+    async fn create_replacing_approved(&self, row: &DeviceRow) -> DeviceResult<Vec<String>> {
+        let mut g = self.rows.lock();
+        let key = (row.user_id.clone(), row.device_id.clone());
+        if g.contains_key(&key) || g.values().any(|r| r.auth_token == row.auth_token) {
+            return Err(StorageError::Conflict("device or auth_token exists".into()));
+        }
+        let replaced: Vec<String> = g
+            .values_mut()
+            .filter(|r| r.user_id == row.user_id && r.status == DeviceStatus::Approved)
+            .map(|r| {
+                r.status = DeviceStatus::Revoked;
+                r.device_id.clone()
+            })
+            .collect();
+        g.insert(key, row.clone());
+        Ok(replaced)
     }
 
     async fn get(&self, user_id: &str, device_id: &str) -> DeviceResult<Option<DeviceRow>> {

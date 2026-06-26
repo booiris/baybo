@@ -44,6 +44,8 @@ mod imp {
     }
 
     const ERR_SEC_SUCCESS: OSStatus = 0;
+    /// `errSecItemNotFound` — a delete of an absent item is a benign no-op.
+    const ERR_SEC_ITEM_NOT_FOUND: OSStatus = -25300;
     /// MUST match `PushKeyStore.accessGroup` / `.accountPrefix` in the NSE.
     const ACCESS_GROUP: &str = "group.com.baybo.app";
     const ACCOUNT_PREFIX: &str = "baybo.push-key.";
@@ -118,8 +120,35 @@ mod imp {
         }
     }
 
+    /// Delete an item from the shared App Group keychain. A missing item
+    /// (`errSecItemNotFound`) is treated as success — the unpair path is
+    /// idempotent.
+    pub(super) fn delete_blob(account: &str) -> Result<(), String> {
+        let account = CFString::new(account).as_CFType();
+        let group = CFString::new(ACCESS_GROUP).as_CFType();
+        // SAFETY: as in `store_blob` — valid constants, the dictionary outlives
+        // the call.
+        unsafe {
+            let query = CFDictionary::from_CFType_pairs(&[
+                (constant(kSecClass), constant(kSecClassGenericPassword)),
+                (constant(kSecAttrAccount), account),
+                (constant(kSecAttrAccessGroup), group),
+            ]);
+            let status = SecItemDelete(query.as_concrete_TypeRef());
+            if status == ERR_SEC_SUCCESS || status == ERR_SEC_ITEM_NOT_FOUND {
+                Ok(())
+            } else {
+                Err(format!("SecItemDelete failed (OSStatus {status})"))
+            }
+        }
+    }
+
     pub(super) fn store_push_key(bid: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
         store_blob(&format!("{ACCOUNT_PREFIX}{bid}"), &key[..])
+    }
+
+    pub(super) fn delete_push_key(bid: &str) -> Result<(), String> {
+        delete_blob(&format!("{ACCOUNT_PREFIX}{bid}"))
     }
 
     /// Read the push key back — the same lookup the NSE's `PushKeyStore` does.
@@ -149,6 +178,12 @@ mod imp {
     pub(super) fn read_blob(_account: &str) -> Result<Option<Vec<u8>>, String> {
         Ok(None)
     }
+    pub(super) fn delete_blob(_account: &str) -> Result<(), String> {
+        Ok(())
+    }
+    pub(super) fn delete_push_key(_bid: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Write the device's push key to the shared App Group keychain at account
@@ -171,6 +206,18 @@ pub fn store_paired_record(bytes: &[u8]) -> Result<(), String> {
 /// Read the persisted paired-gateway record. `Ok(None)` = not paired yet.
 pub fn read_paired_record() -> Result<Option<Vec<u8>>, String> {
     imp::read_blob(PAIRED_RECORD_ACCOUNT)
+}
+
+/// Delete the persisted paired-gateway record (the unpair / "forget" action).
+/// Idempotent — succeeds even if nothing was stored.
+pub fn delete_paired_record() -> Result<(), String> {
+    imp::delete_blob(PAIRED_RECORD_ACCOUNT)
+}
+
+/// Delete a device's push key from the shared keychain (the write side is
+/// [`store_push_key`]). Called on unpair so a stale per-device key can't linger.
+pub fn delete_push_key(bid: &str) -> Result<(), String> {
+    imp::delete_push_key(bid)
 }
 
 /// Debug self-check: read the key back (the same lookup the NSE does) to prove

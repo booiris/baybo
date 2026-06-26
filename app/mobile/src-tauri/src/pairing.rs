@@ -362,6 +362,19 @@ pub fn paired_user() -> Option<String> {
     load_paired_record().ok().flatten().map(|r| r.user_id)
 }
 
+/// Forget the current pairing (unpair): clear the persisted record and the
+/// device's push key from the shared keychain, returning the app to the
+/// unpaired state. One app binds one gateway, so there is exactly one record to
+/// drop. Idempotent — succeeds even if nothing was stored.
+pub fn forget_pairing() -> Result<(), String> {
+    // Read the record first to learn the device_id, so its push key
+    // (`baybo.push-key.<device_id>`) is cleared too; a missing record is fine.
+    if let Some(record) = load_paired_record()? {
+        crate::keychain::delete_push_key(&record.device_id)?;
+    }
+    crate::keychain::delete_paired_record()
+}
+
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 

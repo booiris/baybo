@@ -63,6 +63,13 @@ fn paired_user() -> Option<String> {
     pairing::paired_user()
 }
 
+/// Forget the current pairing (unpair): clear the keychain record + push key so
+/// the app returns to the scan screen. One app binds one gateway.
+#[tauri::command]
+fn forget_pairing() -> Result<(), String> {
+    pairing::forget_pairing()
+}
+
 /// Open the E2E content session for `sessionId`: connect to the paired gateway,
 /// run the Noise handshake, subscribe, and stream decrypted frames to the
 /// webview over `onFrame`.
@@ -166,6 +173,7 @@ pub fn run() {
             pair_begin,
             pair_confirm,
             paired_user,
+            forget_pairing,
             content_connect,
             content_send,
             content_disconnect

@@ -17,8 +17,48 @@ impl LibsqlDeviceStore {
 const COLS: &str = "user_id, device_id, label, device_pubkey, auth_token, status, \
      rendezvous_id, created_at, approved_at, last_seen_at";
 
+/// Shared INSERT for a device row — reused by `create` and the transactional
+/// `create_replacing_approved` so the column list has one source of truth.
+const INSERT_DEVICE: &str = "INSERT INTO devices
+     (user_id, device_id, label, device_pubkey, auth_token, status,
+      rendezvous_id, created_at, approved_at, last_seen_at)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+
 fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Internal(anyhow::anyhow!("libsql {ctx}: {e}"))
+}
+
+/// Map a libsql INSERT error to a [`StorageError::Conflict`] when it tripped a
+/// uniqueness constraint (duplicate `(user_id, device_id)` or `auth_token`),
+/// else a generic internal error.
+fn insert_conflict_err(row: &DeviceRow, e: impl std::fmt::Display) -> StorageError {
+    let msg = e.to_string();
+    if msg.contains("constraint") || msg.contains("UNIQUE") {
+        StorageError::Conflict(format!(
+            "device ({}, {}) or its auth_token already exists",
+            row.user_id, row.device_id
+        ))
+    } else {
+        col_err("insert device", e)
+    }
+}
+
+/// The ten positional params for [`INSERT_DEVICE`], in column order.
+fn insert_params(row: &DeviceRow) -> Vec<libsql::Value> {
+    use libsql::Value;
+    let opt_int = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
+    vec![
+        Value::Text(row.user_id.clone()),
+        Value::Text(row.device_id.clone()),
+        Value::Text(row.label.clone()),
+        Value::Blob(row.device_pubkey.clone()),
+        Value::Text(row.auth_token.clone()),
+        Value::Text(row.status.as_str().to_string()),
+        row.rendezvous_id.clone().map_or(Value::Null, Value::Text),
+        Value::Integer(row.created_at),
+        opt_int(row.approved_at),
+        opt_int(row.last_seen_at),
+    ]
 }
 
 async fn fetch_row(rows: &mut libsql::Rows) -> Result<Option<DeviceRow>> {
@@ -54,37 +94,55 @@ async fn collect(rows: &mut libsql::Rows) -> Result<Vec<DeviceRow>> {
 impl DeviceStore for LibsqlDeviceStore {
     async fn create(&self, row: &DeviceRow) -> Result<()> {
         let conn = self.pool.conn();
-        conn.execute(
-            "INSERT INTO devices
-                 (user_id, device_id, label, device_pubkey, auth_token, status,
-                  rendezvous_id, created_at, approved_at, last_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            libsql::params![
-                row.user_id.clone(),
-                row.device_id.clone(),
-                row.label.clone(),
-                row.device_pubkey.clone(),
-                row.auth_token.clone(),
-                row.status.as_str().to_string(),
-                row.rendezvous_id.clone(),
-                row.created_at,
-                row.approved_at,
-                row.last_seen_at,
-            ],
+        conn.execute(INSERT_DEVICE, insert_params(row))
+            .await
+            .map_err(|e| insert_conflict_err(row, e))?;
+        Ok(())
+    }
+
+    async fn create_replacing_approved(&self, row: &DeviceRow) -> Result<Vec<String>> {
+        let conn = self.pool.conn();
+        // BEGIN IMMEDIATE takes the write lock up front so the revoke + insert
+        // commit as a unit — no window where the user has zero or two approved
+        // devices, and the partial unique index can never trip.
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|e| col_err("begin replace tx", e))?;
+
+        // The devices we're about to supersede, captured for the operator's
+        // "replaced X" report before they're flipped to revoked.
+        let mut rows = tx
+            .query(
+                "SELECT device_id FROM devices WHERE user_id = ?1 AND status = 'approved'",
+                libsql::params![row.user_id.clone()],
+            )
+            .await
+            .map_err(|e| col_err("query approved", e))?;
+        let mut replaced = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|e| col_err("row", e))? {
+            replaced.push(
+                r.get::<String>(0)
+                    .map_err(|e| col_err("get device_id", e))?,
+            );
+        }
+        drop(rows);
+
+        tx.execute(
+            "UPDATE devices SET status = 'revoked' WHERE user_id = ?1 AND status = 'approved'",
+            libsql::params![row.user_id.clone()],
         )
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("constraint") || msg.contains("UNIQUE") {
-                StorageError::Conflict(format!(
-                    "device ({}, {}) or its auth_token already exists",
-                    row.user_id, row.device_id
-                ))
-            } else {
-                col_err("insert device", e)
-            }
-        })?;
-        Ok(())
+        .map_err(|e| col_err("revoke prior approved", e))?;
+
+        tx.execute(INSERT_DEVICE, insert_params(row))
+            .await
+            .map_err(|e| insert_conflict_err(row, e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| col_err("commit replace tx", e))?;
+        Ok(replaced)
     }
 
     async fn get(&self, user_id: &str, device_id: &str) -> Result<Option<DeviceRow>> {
@@ -340,10 +398,14 @@ mod tests {
     async fn list_and_list_for_user_filter_by_status() {
         let s = store().await;
         s.create(&device_row("u1", "d1", "t1", "C1")).await.unwrap();
-        s.create(&device_row("u1", "d2", "t2", "C2")).await.unwrap();
+        // Replacing keeps the one-approved-per-user invariant: d1 → revoked,
+        // d2 → approved. (A bare second `create` for u1 would trip the index.)
+        s.create_replacing_approved(&device_row("u1", "d2", "t2", "C2"))
+            .await
+            .unwrap();
         s.create(&device_row("u2", "d3", "t3", "C3")).await.unwrap();
-        s.revoke("u1", "d2").await.unwrap();
 
+        // Approved across users: u1's current device (d2) + u2's (d3).
         let approved = s.list(Some(DeviceStatus::Approved)).await.unwrap();
         assert_eq!(approved.len(), 2);
 
@@ -352,10 +414,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(u1_revoked.len(), 1);
-        assert_eq!(u1_revoked[0].device_id, "d2");
+        assert_eq!(u1_revoked[0].device_id, "d1");
 
         assert_eq!(s.list(None).await.unwrap().len(), 3);
         assert_eq!(s.list_for_user("u1", None).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_replacing_approved_supersedes_prior_device() {
+        let s = store().await;
+        // First pairing: nothing to replace.
+        let replaced = s
+            .create_replacing_approved(&device_row("u1", "d1", "tok1", "C1"))
+            .await
+            .unwrap();
+        assert!(replaced.is_empty(), "first pairing replaces nothing");
+
+        // Second pairing for the same user supersedes the first.
+        let replaced = s
+            .create_replacing_approved(&device_row("u1", "d2", "tok2", "C2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            replaced,
+            vec!["d1".to_string()],
+            "reports the superseded id"
+        );
+
+        // Exactly one approved device remains, and it's the new one.
+        let approved = s.list(Some(DeviceStatus::Approved)).await.unwrap();
+        assert_eq!(approved.len(), 1, "one approved device per user (1:1)");
+        assert_eq!(approved[0].device_id, "d2");
+        // The old row survives as revoked (audit), token no longer authenticates.
+        assert_eq!(
+            s.get("u1", "d1").await.unwrap().unwrap().status,
+            DeviceStatus::Revoked
+        );
+        assert!(
+            s.lookup_approved_by_auth_token("tok1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.lookup_approved_by_auth_token("tok2")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_approved_per_user_index_blocks_a_second_approved_insert() {
+        let s = store().await;
+        s.create(&device_row("u1", "d1", "tok1", "C1"))
+            .await
+            .unwrap();
+        // A bare `create` of a second approved row for the same user trips the
+        // partial unique index — the backstop behind `create_replacing_approved`.
+        let err = s
+            .create(&device_row("u1", "d2", "tok2", "C2"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Conflict(_)));
     }
 
     #[tokio::test]

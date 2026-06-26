@@ -1,18 +1,23 @@
 //! Persistence contract for the iOS-companion **device registry**.
 //!
 //! Distinct from the in-memory channel token table: device credentials must
-//! survive a gateway restart, so they live in libsql. One row per
-//! `(user_id, device_id)` binding — `device_id` is per-pairing (multi-gateway),
-//! so a single phone that pairs with home + work gateways lands two rows in
-//! two gateways' tables.
+//! survive a gateway restart, so they live in libsql. The gateway binds to at
+//! most **one** device per user — one gateway = one user = one app. Rows are
+//! keyed by `(user_id, device_id)` with `device_id` minted fresh per pairing,
+//! but at most one row per `user_id` is ever `Approved` at a time: re-pairing
+//! supersedes the prior binding rather than accumulating a second live device.
+//! The invariant is held transactionally by
+//! [`DeviceStore::create_replacing_approved`] and backstopped by the
+//! `idx_devices_one_approved_per_user` partial unique index.
 //!
 //! Lifecycle: a row is written `Approved` the moment the phone user and the
 //! operator both confirm the pairing (carrying the device's static pubkey + an
-//! active `auth_token`), and flipped to `Revoked` on revoke. Per the project
-//! rule, **revoke never deletes the row** — it keeps the audit trail and stops
-//! the `auth_token` UNIQUE slot from being silently reused. The APNs token does
-//! not live here (it lives in the remote-host push store); A only needs
-//! `device_id` to address a push.
+//! active `auth_token`), and flipped to `Revoked` on revoke — or when a newer
+//! pairing replaces it. Per the project rule, **revoke never deletes the row**
+//! — it keeps the audit trail (so a superseded device stays visible in
+//! `device list`) and stops the `auth_token` UNIQUE slot from being silently
+//! reused. The APNs token does not live here (it lives in the remote-host push
+//! store); A only needs `device_id` to address a push.
 //!
 //! Business logic (the XXpsk0 handshake, rendezvous/secret minting, TTL) lives
 //! in `baybo-pairing`; this module is only the trait + row shape, keeping
@@ -59,7 +64,9 @@ impl DeviceStatus {
 #[derive(Debug, Clone)]
 pub struct DeviceRow {
     pub user_id: String,
-    /// Client-generated, per-pairing (multi-gateway).
+    /// Client-generated, minted fresh per pairing — so re-pairing the same
+    /// phone writes a new row rather than colliding on the natural key; the
+    /// superseded row is revoked (kept for audit), never reused.
     pub device_id: String,
     /// Human label for the device list ("Booiris iPhone").
     pub label: String,
@@ -86,8 +93,22 @@ pub struct DeviceRow {
 pub trait DeviceStore: Send + Sync {
     /// Insert a freshly-paired (`Approved`) device row. Errors with
     /// [`StorageError::Conflict`] if the `(user_id, device_id)` or the
-    /// `auth_token` already exists.
+    /// `auth_token` already exists. Does **not** enforce the one-approved-
+    /// per-user invariant on its own — the pairing path uses
+    /// [`create_replacing_approved`](Self::create_replacing_approved); plain
+    /// `create` is the bare insert primitive (tests, fixtures).
     async fn create(&self, row: &DeviceRow) -> Result<()>;
+
+    /// Atomically supersede the user's current binding with a freshly-paired
+    /// device: in one transaction, revoke every still-`Approved` row for
+    /// `row.user_id`, then insert `row` (itself `Approved`). Returns the
+    /// `device_id`s revoked in the process (empty on a first pairing) so the
+    /// caller can report what was replaced. This is the write path that holds
+    /// the **one approved device per user** (1:1 gateway↔app) invariant; the
+    /// `idx_devices_one_approved_per_user` partial unique index is its backstop.
+    /// Errors with [`StorageError::Conflict`] if `row`'s `(user_id, device_id)`
+    /// or `auth_token` already exists.
+    async fn create_replacing_approved(&self, row: &DeviceRow) -> Result<Vec<String>>;
 
     /// Fetch one row by its natural key.
     async fn get(&self, user_id: &str, device_id: &str) -> Result<Option<DeviceRow>>;

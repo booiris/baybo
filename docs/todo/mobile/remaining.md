@@ -136,9 +136,12 @@ for host and `aarch64-apple-ios-sim`; real end-to-end delivery still needs #4
   gateway are separate Cargo workspaces); each side is unit/integration-tested,
   but the spliced path is only proven on deployment. A harness that boots
   `remote-host` + a test gateway + a mock app would close this.
-- **Multi-gateway persist**: the `PairedRecord` is stored under one fixed account
-  (`baybo.paired-gateway`); pairing with a second gateway overwrites it. Key by
-  device id + a "current" pointer if multi-gateway is needed (a product call).
+- **Multi-gateway persist** — resolved by the **1:1 binding policy** (see
+  [§7](#7-one-gateway--one-app-11-binding--done)): one app binds exactly one gateway,
+  so the single fixed `PairedRecord` account is the design, not a limitation. The
+  silent overwrite is gone — re-pairing is an explicit *Replace* (kept until the
+  new pairing finishes) and there's an explicit *Forget* unpair. Multi-gateway is
+  intentionally not supported.
 - **Dashboard not wired in** — `remote-host-dashboard` (a blind, metadata-only
   status router: counts of admitted instances / device tokens / connected
   gateways / pending legs, never content) compiles as a workspace member but
@@ -182,9 +185,68 @@ dep are deleted. What landed:
 
 Pairing is **relay-only** (no direct/LAN pairing route); the prologue binds
 `endpoint`, which is what prevents cross-relay binding. Out of scope (unchanged):
-one-app-per-gateway policy; `NKpsk0`/gateway-static-in-QR; dropping the shared
-`guest` admission key (the PSK already defeats MITM, and the re-park + join
-rate-limit cover the residual griefing).
+`NKpsk0`/gateway-static-in-QR; dropping the shared `guest` admission key (the PSK
+already defeats MITM, and the re-park + join rate-limit cover the residual
+griefing). (The former "one-app-per-gateway policy" out-of-scope item is now
+**done** — see [§7](#7-one-gateway--one-app-11-binding--done).)
+
+---
+
+### 7. One gateway ↔ one app (1:1 binding) ✅ done
+
+The companion is a **1:1** relationship: a gateway binds **one** device, and the
+app binds **one** gateway. Concretely the gateway is single-user (one gateway =
+one user), and that user has at most one live device, so the whole chain is
+*gateway ↔ user ↔ app*. Re-pairing **replaces** the old binding (newest wins),
+always behind an explicit confirm — never a silent clobber.
+
+**Gateway (A) side — at most one Approved device per user:**
+
+- **DB backstop**: a partial unique index
+  `idx_devices_one_approved_per_user ON devices(user_id) WHERE status='approved'`
+  (`crates/storage/src/libsql/mod.rs`) makes a second live device structurally
+  impossible. Revoked rows drop out of the partial index, so the audit trail of
+  superseded devices is unbounded as before. The schema init runs an **idempotent
+  reconciliation** right before building the index — keep each user's newest
+  approved device, revoke older ones — so a DB that predates the policy (≥2
+  approved rows for a user) converges to the invariant instead of failing index
+  creation and bricking startup.
+- **Atomic replace at finalize**: `DeviceStore::create_replacing_approved`
+  (`crates/store/src/device.rs`, libsql impl in `.../libsql/device.rs`) revokes
+  every still-approved row for the user and inserts the new one **in one
+  `BEGIN IMMEDIATE` transaction** — no window with zero or two approved devices.
+  `DevicePairingService::complete` calls it (not bare `create`), so the swap
+  happens **only when the new pairing actually finalizes** (after both confirms).
+  A new pairing that the phone or operator abandons leaves the existing binding
+  untouched and live. The superseded `device_id`s are returned for the operator's
+  "Replaced X" line and logged.
+- **Operator consent up front**: `baybo device pair` calls
+  `DevicePairingService::current_device(user)` before minting the slot; if a
+  device is already bound it prints it and asks *"Pairing a new device will
+  replace it once the new pairing completes. Continue?"* (defaults to **no**, per
+  the fail-closed posture). Declining keeps the current pairing and never even
+  shows a QR. On success the result reports what was replaced.
+
+**App (P) side — one stored gateway, explicit replace + forget:**
+
+- The `PairedRecord` already lives under one fixed keychain account
+  (`baybo.paired-gateway`), so the app structurally holds one gateway. What
+  changed is the UX: the old *Pair another* button silently overwrote it.
+- **Replace** (re-pair): a confirm gate ("Replace this pairing? … the current one
+  stays until the new pairing finishes") then drops to the scanner. The keychain
+  record is overwritten **on success** (delete-then-add), so cancelling the scan
+  leaves the existing binding intact — symmetric with the gateway's
+  replace-at-finalize.
+- **Forget** (unpair): a new `forget_pairing` Tauri command
+  (`app/mobile/src-tauri/src/pairing.rs`) deletes the `PairedRecord` **and** the
+  device's push key (`keychain::delete_paired_record` / `delete_push_key`) and
+  returns to the scan screen, fully unpaired. Idempotent (`errSecItemNotFound`
+  is a no-op). This is the explicit unbind affordance the connected screen now
+  shows alongside *Open chat* and *Replace pairing*.
+
+**Note — pushes already targeted the single device**: the dispatcher fans over
+`list_for_user(user, Approved)`; with the invariant that's a one-element loop,
+so no change was needed there (kept as a loop, harmless and forward-compatible).
 
 ---
 

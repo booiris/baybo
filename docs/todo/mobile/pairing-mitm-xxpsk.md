@@ -273,9 +273,12 @@ honest model (C sees only the public rendezvous id).
 
 ## Out of scope (separate calls)
 
-- **One-app-per-gateway** (`temp/x`): a policy gate on the device count, orthogonal
-  to the crypto here — the scheme supports N devices (each its own static + push
-  key).
+- ~~**One-app-per-gateway**~~ — **now done** (a policy gate on the device count,
+  orthogonal to the crypto here). The binding is 1:1: one gateway = one user =
+  one app, replace-with-confirm. See
+  [`remaining.md` §7](remaining.md#7-one-gateway--one-app-11-binding--done). The
+  crypto scheme is unchanged (each device still has its own static + push key);
+  the policy just caps the live count at one per user.
 - **NKpsk0 / gateway-static-in-QR**: a possible future out-of-band gateway pin;
   not needed to close the MITM.
 

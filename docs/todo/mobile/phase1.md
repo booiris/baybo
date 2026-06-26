@@ -26,6 +26,17 @@ C is a **separate Cargo workspace** that deliberately depends on no `baybo-*`
 crate — its `/notify` + `/register` payloads are a JSON contract, so the
 `.p8`-holding push role stays isolatable.
 
+**Binding is 1:1.** One gateway (A) binds one device (P), and one app binds one
+gateway — the gateway is single-user, so the chain is *gateway ↔ user ↔ app*.
+A↔P is the only durable binding; C is a shared, blind relay and is **not**
+bound 1:1 (one C fronts many gateways, admitted by `instance_key`). Re-pairing
+**replaces** the prior binding (newest wins) behind an explicit confirm on both
+ends; there is an explicit unpair (*Forget*). The mechanism — the
+`idx_devices_one_approved_per_user` partial index, the atomic
+`create_replacing_approved` swap at finalize, and the app's single keychain
+record + Replace/Forget UX — is specified in
+[`remaining.md` §7](remaining.md#7-one-gateway--one-app-11-binding--done).
+
 ## Crates
 
 - `crates/wire` — the `Frame` / `Message` WS wire types (shared with the web channel).
