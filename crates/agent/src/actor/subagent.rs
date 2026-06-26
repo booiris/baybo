@@ -335,6 +335,7 @@ mod tests {
             &job_id,
             JobOutput::Message {
                 content: vec![ContentBlock::Text("done".into())],
+                ordinal: None,
             },
         )
         .await

@@ -1130,7 +1130,14 @@ async fn run_external_agent_job(
             let content = result.final_content.clone().unwrap_or_default();
             let _ = job_ctx
                 .lifecycle
-                .complete(&job.id, JobOutput::Message { content })
+                .complete(
+                    &job.id,
+                    // Subagent (Spawned) output — not a user turn, never pushed.
+                    JobOutput::Message {
+                        content,
+                        ordinal: None,
+                    },
+                )
                 .await;
         }
         SubagentExitStatus::Failed { reason } => {

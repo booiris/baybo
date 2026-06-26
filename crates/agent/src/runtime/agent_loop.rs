@@ -710,6 +710,10 @@ impl AgentLoop {
                     .await?;
                 let output = JobOutput::Message {
                     content: outgoing.content.clone(),
+                    // The reply's persisted ordinal (captured from the store
+                    // append) rides the Completed event so push reads exactly
+                    // this row without a read-after-write poll.
+                    ordinal: outgoing.ordinal,
                 };
                 let pending_with_id = pending.map(|p| (job_id, p));
                 Ok((output, (outgoing, pending_with_id)))
@@ -2476,6 +2480,8 @@ impl AgentLoop {
                 };
                 let output = JobOutput::Message {
                     content: vec![ContentBlock::Text(text.clone())],
+                    // `/compact` is a Maintenance job — never pushed.
+                    ordinal: None,
                 };
                 Ok((output, text))
             },

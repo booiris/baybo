@@ -444,6 +444,7 @@ mod tests {
     fn dummy_output() -> JobOutput {
         JobOutput::Message {
             content: vec![ContentBlock::Text("ok".into())],
+            ordinal: None,
         }
     }
 

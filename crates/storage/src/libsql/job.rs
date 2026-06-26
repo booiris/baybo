@@ -310,6 +310,7 @@ mod tests {
         completed
             .complete(baybo_job::JobOutput::Message {
                 content: vec![ContentBlock::Text("ok".into())],
+                ordinal: None,
             })
             .unwrap();
         create(&store, &completed).await;
@@ -349,6 +350,7 @@ mod tests {
         a_done
             .complete(baybo_job::JobOutput::Message {
                 content: vec![ContentBlock::Text("ok".into())],
+                ordinal: None,
             })
             .unwrap();
         create(&store, &a_done).await;

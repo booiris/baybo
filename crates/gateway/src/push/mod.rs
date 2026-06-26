@@ -9,18 +9,23 @@
 //! host (C). A encrypts, C relays blind, the iOS NSE decrypts — so the preview
 //! is real on the lock screen while C and Apple see only ciphertext.
 //!
+//! The reply's persisted ordinal rides the `Completed` event
+//! ([`JobPhase::Completed { reply_ordinal }`](baybo_job::JobPhase)); the
+//! dispatcher reads exactly that row (no read-after-write poll). A completion
+//! with no ordinal — a non-message output, or a reply whose store write failed
+//! — has no durable row to preview, so it is **not pushed** at all.
+//!
 //! Modeled on `spawn_turn_state_projector`: subscribe synchronously, then a
 //! `select!` loop over the bus with `Lagged`/`Closed` handling (push is
 //! best-effort, so a lag just drops that buzz).
 
 use std::sync::Arc;
 
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::collections::HashSet;
 
 use base64::Engine;
 use baybo_job::{JobInputKind, JobLifecycle, JobLifecycleEvent, JobPhase, JobShape};
-use baybo_model::{ContentBlock, JobId, Role, SessionId};
+use baybo_model::{ContentBlock, Role, SessionId};
 use baybo_security::SecretVault;
 use baybo_session::SessionManager;
 use baybo_store::{DeviceStatus, DeviceStore, SessionStore};
@@ -37,11 +42,10 @@ const PREVIEW_MAX_CHARS: usize = 200;
 /// `kid` epoch — always 0 in phase 1 (the field exists so rotation needs no
 /// payload change).
 const PHASE1_KID: u32 = 0;
-/// Read-after-write: how many times to re-check for a fresh assistant row
-/// before falling back to the generic placeholder.
-const PREVIEW_READ_RETRIES: u32 = 5;
-/// Backoff between read-after-write re-checks.
-const PREVIEW_READ_BACKOFF: Duration = Duration::from_millis(100);
+/// How many active rows to pull from the reply's ordinal when building the
+/// preview — 1 is enough (the reply sits exactly at `reply_ordinal`); a small
+/// margin tolerates an interleaved row without a second round-trip.
+const PREVIEW_READ_LIMIT: usize = 4;
 
 /// Secret-vault name for a device's per-device push key. The single source of
 /// truth shared by the write site (the device-pair route) and the read site
@@ -199,10 +203,6 @@ pub struct PushDispatcher {
     /// pairing, self-healing a transient pairing-time `/register` failure.
     apns_registrar: Option<Arc<dyn ApnsRegistrar>>,
     instance_key: String,
-    /// `job_id → session ordinal at turn start`, captured on the `Started`
-    /// edge so the completed-turn preview can wait for a row newer than this
-    /// (the read-after-write gate). Dropped on any terminal edge.
-    start_cursors: Mutex<HashMap<JobId, i64>>,
     /// device_ids re-registered with C this run (so we retry at most once per
     /// device per dispatcher lifetime).
     registered: Mutex<HashSet<String>>,
@@ -226,7 +226,6 @@ impl PushDispatcher {
             sink,
             apns_registrar,
             instance_key: instance_key.into(),
-            start_cursors: Mutex::new(HashMap::new()),
             registered: Mutex::new(HashSet::new()),
         }
     }
@@ -235,38 +234,30 @@ impl PushDispatcher {
     /// completed real user turn. The `shape == Turn` gate is what excludes
     /// `/compact`.
     pub fn should_dispatch(ev: &JobLifecycleEvent) -> bool {
-        ev.phase == JobPhase::Completed
+        matches!(ev.phase, JobPhase::Completed { .. })
             && ev.shape == JobShape::Turn
             && ev.kind == JobInputKind::UserChat
     }
 
-    /// Process one lifecycle event: track the turn's start cursor (for
-    /// read-after-write) and dispatch on the completed edge.
+    /// Dispatch on the completed edge of a real user turn. The reply's ordinal
+    /// rides the event, so there's no per-job cursor to track on other edges.
     pub async fn handle_event(&self, ev: &JobLifecycleEvent) {
-        // Only real user turns are relevant at all.
-        if ev.shape != JobShape::Turn || ev.kind != JobInputKind::UserChat {
-            return;
-        }
-        match ev.phase {
-            JobPhase::Started => {
-                let cursor = self
-                    .session_store
-                    .latest_session_ordinal(&ev.session_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
-                self.start_cursors.lock().insert(ev.job_id, cursor);
-            }
-            JobPhase::Completed => self.dispatch_completed(ev).await,
-            JobPhase::Failed | JobPhase::Cancelled => {
-                self.start_cursors.lock().remove(&ev.job_id);
-            }
+        if Self::should_dispatch(ev) {
+            self.dispatch_completed(ev).await;
         }
     }
 
     async fn dispatch_completed(&self, ev: &JobLifecycleEvent) {
-        let start_cursor = self.start_cursors.lock().remove(&ev.job_id);
+        // `handle_event` only calls this on a Completed edge; the reply ordinal
+        // rides that variant. No ordinal → no durable reply row to preview
+        // (a Structured completion, or a failed reply write) → don't push at all.
+        let JobPhase::Completed {
+            reply_ordinal: Some(reply_ordinal),
+        } = &ev.phase
+        else {
+            return;
+        };
+        let reply_ordinal = *reply_ordinal;
         // Skip a vanished session (nothing to preview), but otherwise fan out to
         // every approved device — one gateway = one app, so there is no per-user
         // scoping to apply.
@@ -288,7 +279,7 @@ impl PushDispatcher {
         if devices.is_empty() {
             return;
         }
-        let preview = self.build_preview(&ev.session_id, start_cursor).await;
+        let preview = self.build_preview(&ev.session_id, reply_ordinal).await;
         for d in devices {
             if let Err(e) = self
                 .dispatch_to_device(&d.device_id, &ev.session_id, &preview)
@@ -363,43 +354,34 @@ impl PushDispatcher {
             .map_err(|_| "push key wrong length".to_string())
     }
 
-    /// Build the preview JSON from the session's last assistant message, gated
-    /// on **read-after-write**: the `Completed` lifecycle event can fire before
-    /// the assistant message row is durable, so a naive read could encrypt the
-    /// *previous* turn's reply. We re-check (bounded) until a session row newer
-    /// than the turn's start cursor has landed, then take the last assistant
-    /// text; on expiry we send the generic placeholder, **never** stale text.
-    async fn build_preview(&self, session_id: &SessionId, start_cursor: Option<i64>) -> String {
-        for attempt in 0..PREVIEW_READ_RETRIES {
-            let latest = self
-                .session_store
-                .latest_session_ordinal(session_id)
+    /// Build the preview JSON from the turn's reply row, read directly at the
+    /// `reply_ordinal` the `Completed` event carried (the no-ordinal case is
+    /// dropped upstream in `dispatch_completed`, so it never reaches here). No
+    /// read-after-write poll: the reply is appended (awaited) before the event
+    /// publishes, and the store is a single shared connection, so the row is
+    /// already visible here. A missing/non-assistant/text-less row (e.g. a
+    /// tool-only reply) yields the generic placeholder — **never** a stale
+    /// previous reply.
+    async fn build_preview(&self, session_id: &SessionId, reply_ordinal: i64) -> String {
+        preview_json(
+            self.reply_text_at(session_id, reply_ordinal)
                 .await
-                .ok()
-                .flatten();
-            if landed(latest, start_cursor)
-                && let Some(text) = self.last_assistant_text(session_id).await
-            {
-                return preview_json(Some(&text));
-            }
-            if attempt + 1 < PREVIEW_READ_RETRIES {
-                tokio::time::sleep(PREVIEW_READ_BACKOFF).await;
-            }
-        }
-        preview_json(None)
+                .as_deref(),
+        )
     }
 
-    async fn last_assistant_text(&self, session_id: &SessionId) -> Option<String> {
-        let messages = self
+    /// The assistant text of the reply row at `ordinal`. Pulls the short slice
+    /// at/after that ordinal and returns the matching row's first text block.
+    async fn reply_text_at(&self, session_id: &SessionId, ordinal: i64) -> Option<String> {
+        let rows = self
             .session_store
-            .load_active_session_messages(session_id)
+            .load_active_session_messages_since(session_id, ordinal - 1, PREVIEW_READ_LIMIT)
             .await
             .ok()?;
-        messages
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::Assistant)
-            .and_then(|m| {
+        rows.into_iter()
+            .find(|(ord, _)| *ord == ordinal)
+            .filter(|(_, m)| m.role == Role::Assistant)
+            .and_then(|(_, m)| {
                 m.content.iter().find_map(|cb| match cb {
                     ContentBlock::Text(t) => Some(t.clone()),
                     _ => None,
@@ -408,22 +390,9 @@ impl PushDispatcher {
     }
 }
 
-/// Read-after-write decision: has a session row strictly newer than the turn's
-/// start cursor landed? With no start cursor (the dispatcher missed the
-/// `Started` edge — e.g. it booted mid-turn, or the bus lagged the start event)
-/// we cannot prove the latest row belongs to *this* turn, so we hold the
-/// placeholder rather than risk encrypting the previous turn's reply — the
-/// stale-preview leak `build_preview` promises never to produce.
-fn landed(latest: Option<i64>, start_cursor: Option<i64>) -> bool {
-    match (latest, start_cursor) {
-        (Some(l), Some(s)) => l > s,
-        _ => false,
-    }
-}
-
 /// The preview JSON the NSE rewrites into `title`/`body`. `None` text yields the
-/// generic placeholder (used when the read-after-write gate never sees a fresh
-/// reply), so a stale previous-turn reply is never encrypted.
+/// generic placeholder (used when the reply row can't be read), so a stale
+/// previous-turn reply is never encrypted.
 fn preview_json(text: Option<&str>) -> String {
     let body = match text {
         Some(t) => t.chars().take(PREVIEW_MAX_CHARS).collect::<String>(),
@@ -508,13 +477,17 @@ mod tests {
     fn dispatches_only_completed_user_turns() {
         // The one buzzing case.
         assert!(PushDispatcher::should_dispatch(&event(
-            JobPhase::Completed,
+            JobPhase::Completed {
+                reply_ordinal: None
+            },
             JobShape::Turn,
             JobInputKind::UserChat,
         )));
         // `/compact` — UserChat input but Maintenance shape — must NOT buzz.
         assert!(!PushDispatcher::should_dispatch(&event(
-            JobPhase::Completed,
+            JobPhase::Completed {
+                reply_ordinal: None
+            },
             JobShape::Maintenance,
             JobInputKind::UserChat,
         )));
@@ -531,7 +504,9 @@ mod tests {
             JobInputKind::SubagentNotification,
         ] {
             assert!(!PushDispatcher::should_dispatch(&event(
-                JobPhase::Completed,
+                JobPhase::Completed {
+                    reply_ordinal: None
+                },
                 JobShape::Turn,
                 kind,
             )));
@@ -563,21 +538,6 @@ mod tests {
         let ct = b64.decode(&body.enc).unwrap();
         let plaintext = aead::open(&key, &nonce, &ct).unwrap();
         assert_eq!(plaintext, preview.as_bytes());
-    }
-
-    #[test]
-    fn read_after_write_gate_waits_for_a_newer_row() {
-        assert!(landed(Some(5), Some(4)), "a newer row landed → go");
-        assert!(
-            !landed(Some(4), Some(4)),
-            "no new row since turn start → wait"
-        );
-        assert!(!landed(Some(3), Some(4)), "stale latest → wait");
-        assert!(
-            !landed(Some(9), None),
-            "no start cursor → hold the placeholder (never a stale preview)"
-        );
-        assert!(!landed(None, Some(4)), "empty session → wait");
     }
 
     #[test]
