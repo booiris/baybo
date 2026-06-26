@@ -14,9 +14,9 @@
 //! not live here (it lives in the remote-host push store); A only needs
 //! `device_id` to address a push.
 //!
-//! Business logic (SPAKE2, code minting, TTL) lives in `baybo-pairing`; this
-//! module is only the trait + row shape, keeping `baybo-storage` the single
-//! owner of every libsql adapter.
+//! Business logic (the XXpsk0 handshake, rendezvous/secret minting, TTL) lives
+//! in `baybo-pairing`; this module is only the trait + row shape, keeping
+//! `baybo-storage` the single owner of every libsql adapter.
 
 use async_trait::async_trait;
 
@@ -69,9 +69,10 @@ pub struct DeviceRow {
     /// (the row only exists once both ends confirmed).
     pub auth_token: String,
     pub status: DeviceStatus,
-    /// The SPAKE2 code this device paired under, retained for the operator's
-    /// device list / audit. `None` if cleared.
-    pub pairing_code: Option<String>,
+    /// The **public** rendezvous id this device paired under, retained for the
+    /// operator's device list / audit. Never the QR secret (that stays in the
+    /// in-memory slot and is zeroized on consume). `None` if cleared.
+    pub rendezvous_id: Option<String>,
     /// Unix seconds.
     pub created_at: i64,
     /// Unix seconds; set at pairing-confirm time (when the row is created).

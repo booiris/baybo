@@ -32,7 +32,7 @@ fn approved_device(token: &str) -> DeviceRow {
         device_pubkey: vec![0u8; 32],
         auth_token: token.into(),
         status: DeviceStatus::Approved,
-        pairing_code: Some("CODE12".into()),
+        rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
         created_at: 1,
         approved_at: Some(2),
         last_seen_at: None,

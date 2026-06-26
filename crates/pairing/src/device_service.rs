@@ -3,25 +3,25 @@
 //! Orthogonal to [`crate::PairingService`] (which gates channel *senders*);
 //! this binds a *device* to a *gateway* and bootstraps an E2E key. Pairing is
 //! driven entirely by one interactive `baybo device pair` process: it mints a
-//! code, hosts the relay leg, runs the SPAKE2 handshake, brokers the live mutual
-//! confirm, and finalizes into a durable (approved) device row. That run pairs
-//! exactly one device, so the in-flight **slot** is a single in-memory value here
-//! (no durable table, no cross-process store) — the only persisted artefact is
-//! the approved [`DeviceRow`]. The SPAKE2 + Noise + AEAD math lives in
-//! `device-proto`; the WS transport lives in the gateway.
+//! rendezvous id + secret, hosts the relay leg, runs the XXpsk0 handshake,
+//! brokers the live mutual confirm, and finalizes into a durable (approved)
+//! device row. That run pairs exactly one device, so the in-flight **slot** is a
+//! single in-memory value here (no durable table, no cross-process store) — the
+//! only persisted artefact is the approved [`DeviceRow`]. The Noise + AEAD math
+//! lives in `device-proto`; the WS transport lives in the gateway.
 
 use std::sync::Arc;
 
 use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore};
 use baybo_store::device_pairing::DevicePairingSlot;
 use chrono::Utc;
+use device_proto::psk_pair::PairingSecret;
 use parking_lot::Mutex;
 use rand::RngExt;
 
-use crate::code::generate_code;
 use crate::error::DevicePairingError;
 
-/// How long a minted pairing code stays valid. 15 minutes — long enough to walk
+/// How long a minted pairing slot stays valid. 15 minutes — long enough to walk
 /// to the phone and scan, short enough that a stale slot doesn't linger. With no
 /// background sweeper the slot simply ages out of [`claim_slot`] and dies with
 /// the process.
@@ -33,8 +33,9 @@ const AUTH_TOKEN_BYTES: usize = 32;
 /// Owns the live (in-memory) pairing slot and the durable device registry.
 pub struct DevicePairingService {
     /// The single in-flight pairing slot. One `baybo device pair` run mints one
-    /// code and pairs one device, so there is at most one at a time; a fresh
-    /// `mint` supersedes any prior slot. Never persisted.
+    /// rendezvous id + secret and pairs one device, so there is at most one at a
+    /// time; a fresh `mint` supersedes any prior slot. Never persisted — and it
+    /// is the *only* place the QR secret lives (zeroized on drop).
     slot: Mutex<Option<DevicePairingSlot>>,
     devices: Arc<dyn DeviceStore>,
 }
@@ -47,14 +48,22 @@ impl DevicePairingService {
         }
     }
 
-    /// Mint the one-time pairing slot for `user_id`. Returns the short code to
-    /// render in the QR (`baybo device pair`). The slot authorizes the SPAKE2
-    /// handshake; it carries no key material.
-    pub async fn mint(&self, user_id: &str, label: &str) -> Result<String, DevicePairingError> {
+    /// Mint the one-time pairing slot for `user_id`. Returns the public
+    /// `rendezvous_id` (the relay routes on it; baked into the QR as `r=`) and
+    /// the high-entropy `secret` (the Noise PSK; baked into the QR as `s=` and
+    /// never transmitted over the relay). The secret is held only in the
+    /// in-memory slot from here on.
+    pub async fn mint(
+        &self,
+        user_id: &str,
+        label: &str,
+    ) -> Result<(String, PairingSecret), DevicePairingError> {
         let now = Utc::now().timestamp();
-        let code = generate_code();
+        let rendezvous_id = uuid::Uuid::new_v4().to_string();
+        let secret = PairingSecret::generate();
         *self.slot.lock() = Some(DevicePairingSlot {
-            code: code.clone(),
+            rendezvous_id: rendezvous_id.clone(),
+            secret: secret.clone(),
             user_id: user_id.to_string(),
             label: label.to_string(),
             created_at: now,
@@ -64,38 +73,43 @@ impl DevicePairingService {
             operator_decision: None,
             device_decision: None,
         });
-        Ok(code)
+        Ok((rendezvous_id, secret))
     }
 
-    /// Look up the **live** (non-expired) slot if its code matches. The handshake
-    /// calls this before running SPAKE2 — `None` means an unknown or expired code,
-    /// which the handshake must refuse.
+    /// Look up the **live** (non-expired) slot if its rendezvous id matches. The
+    /// handshake calls this before running XXpsk0 — `None` means an unknown or
+    /// expired rendezvous, which the handshake must refuse.
     pub async fn claim_slot(
         &self,
-        code: &str,
+        rendezvous_id: &str,
     ) -> Result<Option<DevicePairingSlot>, DevicePairingError> {
         let now = Utc::now().timestamp();
         Ok(self
             .slot
             .lock()
             .as_ref()
-            .filter(|s| s.code == code && !s.is_expired(now))
+            .filter(|s| s.rendezvous_id == rendezvous_id && !s.is_expired(now))
             .cloned())
     }
 
     /// Publish the confirm challenge: record the confirmation code + the live
     /// device id + the resolved label (the device's reported name, or the
     /// operator's override) so the operator's `baybo device pair` can display
-    /// them. Called once SPAKE2 + `DeviceHello` complete. No-op if the slot is
-    /// gone or its code no longer matches.
+    /// them. Called once the handshake + `DeviceHello` complete. No-op if the
+    /// slot is gone or its rendezvous id no longer matches.
     pub async fn publish_confirm(
         &self,
-        code: &str,
+        rendezvous_id: &str,
         confirm_code: &str,
         device_id: &str,
         label: &str,
     ) -> Result<(), DevicePairingError> {
-        if let Some(slot) = self.slot.lock().as_mut().filter(|s| s.code == code) {
+        if let Some(slot) = self
+            .slot
+            .lock()
+            .as_mut()
+            .filter(|s| s.rendezvous_id == rendezvous_id)
+        {
             slot.confirm_code = Some(confirm_code.to_string());
             slot.device_id = Some(device_id.to_string());
             slot.label = label.to_string();
@@ -105,13 +119,18 @@ impl DevicePairingService {
 
     /// Record the operator's confirm decision (written by `baybo device pair`).
     /// The handshake observes it before sealing the welcome. No-op if the slot is
-    /// gone or its code no longer matches.
+    /// gone or its rendezvous id no longer matches.
     pub async fn set_operator_decision(
         &self,
-        code: &str,
+        rendezvous_id: &str,
         accepted: bool,
     ) -> Result<(), DevicePairingError> {
-        if let Some(slot) = self.slot.lock().as_mut().filter(|s| s.code == code) {
+        if let Some(slot) = self
+            .slot
+            .lock()
+            .as_mut()
+            .filter(|s| s.rendezvous_id == rendezvous_id)
+        {
             slot.operator_decision = Some(accepted);
         }
         Ok(())
@@ -120,13 +139,18 @@ impl DevicePairingService {
     /// Record the phone-side outcome (set when the phone declines or drops during
     /// the confirm step). The operator's live `baybo device pair` polls it so it
     /// stops waiting the moment the phone backs out. No-op if the slot is gone or
-    /// its code no longer matches.
+    /// its rendezvous id no longer matches.
     pub async fn set_device_decision(
         &self,
-        code: &str,
+        rendezvous_id: &str,
         accepted: bool,
     ) -> Result<(), DevicePairingError> {
-        if let Some(slot) = self.slot.lock().as_mut().filter(|s| s.code == code) {
+        if let Some(slot) = self
+            .slot
+            .lock()
+            .as_mut()
+            .filter(|s| s.rendezvous_id == rendezvous_id)
+        {
             slot.device_decision = Some(accepted);
         }
         Ok(())
@@ -144,12 +168,13 @@ impl DevicePairingService {
         label: &str,
     ) -> Result<DeviceRow, DevicePairingError> {
         // Consume the single-use slot up front: a second finalize for the same
-        // code (a retrying leg) gets `SlotConsumed` and is refused, so one code
-        // mints at most one device row.
+        // rendezvous (a retrying leg) gets `SlotConsumed` and is refused, so one
+        // rendezvous mints at most one device row. Dropping the slot here also
+        // zeroizes the QR secret it held.
         {
             let mut guard = self.slot.lock();
             match guard.as_ref() {
-                Some(s) if s.code == slot.code => *guard = None,
+                Some(s) if s.rendezvous_id == slot.rendezvous_id => *guard = None,
                 _ => return Err(DevicePairingError::SlotConsumed),
             }
         }
@@ -161,7 +186,9 @@ impl DevicePairingService {
             device_pubkey,
             auth_token: mint_auth_token(),
             status: DeviceStatus::Approved,
-            pairing_code: Some(slot.code.clone()),
+            // Only the public rendezvous id lands in the durable row — never the
+            // secret.
+            rendezvous_id: Some(slot.rendezvous_id.clone()),
             created_at: now,
             approved_at: Some(now),
             last_seen_at: None,
@@ -213,26 +240,29 @@ mod tests {
     #[tokio::test]
     async fn mint_claim_confirm_complete_yields_approved() {
         let svc = service();
-        let code = svc.mint("user-1", "Booiris iPhone").await.unwrap();
-        assert_eq!(code.len(), crate::CODE_LEN);
+        let (rid, secret) = svc.mint("user-1", "Booiris iPhone").await.unwrap();
+        assert!(!rid.is_empty(), "rendezvous id minted");
 
-        let slot = svc.claim_slot(&code).await.unwrap().unwrap();
+        let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
         assert_eq!(slot.user_id, "user-1");
+        // The slot holds the same secret the QR carries (the only copy on the
+        // gateway side).
+        assert_eq!(slot.secret.as_bytes(), secret.as_bytes());
 
         // Publish the confirm challenge (with the device's reported name); both
         // ends would now show it.
-        svc.publish_confirm(&code, "123456", "dev-abc", "Booiris iPhone")
+        svc.publish_confirm(&rid, "123456", "dev-abc", "Booiris iPhone")
             .await
             .unwrap();
-        let slot = svc.claim_slot(&code).await.unwrap().unwrap();
+        let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
         assert_eq!(slot.confirm_code.as_deref(), Some("123456"));
         assert_eq!(slot.device_id.as_deref(), Some("dev-abc"));
         assert_eq!(slot.label, "Booiris iPhone");
 
         // Operator approves in the live session.
-        svc.set_operator_decision(&code, true).await.unwrap();
+        svc.set_operator_decision(&rid, true).await.unwrap();
         assert_eq!(
-            svc.claim_slot(&code)
+            svc.claim_slot(&rid)
                 .await
                 .unwrap()
                 .unwrap()
@@ -254,10 +284,11 @@ mod tests {
             AUTH_TOKEN_BYTES * 2,
             "hex of 32 bytes"
         );
-        assert_eq!(row.pairing_code.as_deref(), Some(code.as_str()));
+        // Only the public rendezvous id is retained on the durable row.
+        assert_eq!(row.rendezvous_id.as_deref(), Some(rid.as_str()));
 
         // Slot is consumed — can't be claimed again.
-        assert!(svc.claim_slot(&code).await.unwrap().is_none());
+        assert!(svc.claim_slot(&rid).await.unwrap().is_none());
 
         let listed = svc.list(Some(DeviceStatus::Approved)).await.unwrap();
         assert_eq!(listed.len(), 1);
@@ -265,13 +296,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_code_mints_at_most_one_device() {
+    async fn one_rendezvous_mints_at_most_one_device() {
         let svc = service();
-        let code = svc.mint("user-1", "Phone").await.unwrap();
+        let (rid, _secret) = svc.mint("user-1", "Phone").await.unwrap();
         // Two finalize attempts read the same live slot before either consumed it.
-        let slot = svc.claim_slot(&code).await.unwrap().unwrap();
+        let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
         // The first finalize consumes the slot; the second is refused, so the
-        // code can't mint a second approvable device.
+        // rendezvous can't mint a second approvable device.
         svc.complete(&slot, "dev-1", vec![1u8; 32], "iPhone")
             .await
             .unwrap();
@@ -280,18 +311,18 @@ mod tests {
             Err(DevicePairingError::SlotConsumed),
         ));
         let all = svc.list(None).await.unwrap();
-        assert_eq!(all.len(), 1, "exactly one device row from one code");
+        assert_eq!(all.len(), 1, "exactly one device row from one rendezvous");
         assert_eq!(all[0].device_id, "dev-1");
     }
 
     #[tokio::test]
     async fn mint_supersedes_any_prior_slot() {
         let svc = service();
-        let a = svc.mint("u", "A").await.unwrap();
-        let b = svc.mint("u", "B").await.unwrap();
+        let (a, _) = svc.mint("u", "A").await.unwrap();
+        let (b, _) = svc.mint("u", "B").await.unwrap();
         assert_ne!(a, b);
         // One in-flight pairing per service: the latest mint replaces the prior,
-        // so only the newest code is claimable.
+        // so only the newest rendezvous is claimable.
         assert!(svc.claim_slot(&a).await.unwrap().is_none());
         assert!(svc.claim_slot(&b).await.unwrap().is_some());
     }
@@ -299,8 +330,8 @@ mod tests {
     #[tokio::test]
     async fn revoke_after_pair() {
         let svc = service();
-        let code = svc.mint("u", "phone").await.unwrap();
-        let slot = svc.claim_slot(&code).await.unwrap().unwrap();
+        let (rid, _) = svc.mint("u", "phone").await.unwrap();
+        let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
         let row = svc
             .complete(&slot, "d1", vec![1u8; 32], "phone")
             .await
@@ -319,12 +350,12 @@ mod tests {
     #[tokio::test]
     async fn expired_slot_is_not_claimable() {
         let svc = service();
-        let code = svc.mint("u", "phone").await.unwrap();
+        let (rid, _) = svc.mint("u", "phone").await.unwrap();
         // Backdate the slot well past its TTL; `claim_slot` filters it out.
         {
             let mut guard = svc.slot.lock();
             guard.as_mut().unwrap().expires_at = Utc::now().timestamp() - 1;
         }
-        assert!(svc.claim_slot(&code).await.unwrap().is_none());
+        assert!(svc.claim_slot(&rid).await.unwrap().is_none());
     }
 }

@@ -1,26 +1,29 @@
 //! The relay service: the blind pairing-rendezvous server (C).
 //!
-//! Two asymmetric routes ride the same [`RelayBroker`], keyed by the SPAKE2
-//! pairing `code`:
+//! Two asymmetric routes ride the same [`RelayBroker`], keyed by the **public
+//! `rendezvous_id`** (a UUID):
 //!
-//! - `GET /pair/host/{code}` — the **gateway** side. Authenticated by the
-//!   gateway's admission key ([`INSTANCE_KEY_HEADER`]); on success it parks a
-//!   leg under `code` and waits for the app.
-//! - `GET /pair/join/{code}` — the **app** side. Also gated by an admitted
-//!   instance key ([`INSTANCE_KEY_HEADER`], the one the QR carries), so only
-//!   key-holders can use the relay's pairing rendezvous. It [`try_match`]es an
-//!   already-hosted code and is refused if no admitted gateway is hosting it.
+//! - `GET /pair/host/{rendezvous_id}` — the **gateway** side. Authenticated by
+//!   the gateway's admission key ([`INSTANCE_KEY_HEADER`]); on success it parks a
+//!   leg under `rendezvous_id` and waits for the app.
+//! - `GET /pair/join/{rendezvous_id}` — the **app** side. Also gated by an
+//!   admitted instance key ([`INSTANCE_KEY_HEADER`], the one the QR carries), so
+//!   only key-holders can use the relay's pairing rendezvous. It [`try_match`]es
+//!   an already-hosted rendezvous and is refused if no admitted gateway hosts it.
 //!
 //! Both legs must present an admitted key, but only the gateway's host leg parks
 //! and counts against the per-instance connection cap; the ephemeral app leg
-//! does not. The pairing secret stays the SPAKE2 `code` — C copies opaque frames
-//! and never sees it.
+//! does not. C sees only the public `rendezvous_id` and copies opaque Noise
+//! frames blind — the QR **secret** (the pairing handshake's PSK) never reaches
+//! C, so a hostile relay cannot complete the handshake with either side (MITM is
+//! reduced to denial-of-service).
 //!
 //! [`try_match`]: RelayBroker::try_match
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
@@ -61,6 +64,58 @@ fn capped(ws: WebSocketUpgrade) -> WebSocketUpgrade {
         .max_frame_size(MAX_RELAY_FRAME_BYTES)
 }
 
+/// `/pair/join` attempts allowed per rendezvous id within [`JOIN_WINDOW`].
+/// Generous enough for the app's own connect-retry loop (≈30 attempts at 500ms
+/// while it waits for the host leg to park), tight enough that a griefer who
+/// learned the public rendezvous id can't flood it with leg-stealing joins.
+const JOIN_MAX_PER_WINDOW: usize = 30;
+/// Fixed window for the `/pair/join` rate limit.
+const JOIN_WINDOW: Duration = Duration::from_secs(10);
+/// Soft cap on tracked rendezvous ids before stale windows are pruned — bounds
+/// memory against an attacker spraying distinct ids.
+const JOIN_LIMITER_MAX_KEYS: usize = 4096;
+
+/// A fixed-window count for one rendezvous id.
+struct JoinWindow {
+    count: usize,
+    started: Instant,
+}
+
+/// Per-rendezvous-id rate limiter for `/pair/join`. Availability hardening only:
+/// the PSK already defeats a hostile relay's MITM, but the *public* rendezvous id
+/// lets any holder of it (or the shared admission key) grief pairing by stealing
+/// the parked host leg, so we throttle joins per id.
+#[derive(Default)]
+struct JoinRateLimiter {
+    windows: parking_lot::Mutex<HashMap<String, JoinWindow>>,
+}
+
+impl JoinRateLimiter {
+    /// Record a join attempt for `rendezvous_id`; `false` if it is over the limit.
+    fn allow(&self, rendezvous_id: &str) -> bool {
+        let now = Instant::now();
+        let mut windows = self.windows.lock();
+        if windows.len() >= JOIN_LIMITER_MAX_KEYS {
+            windows.retain(|_, w| now.duration_since(w.started) < JOIN_WINDOW);
+        }
+        let window = windows
+            .entry(rendezvous_id.to_string())
+            .or_insert(JoinWindow {
+                count: 0,
+                started: now,
+            });
+        if now.duration_since(window.started) >= JOIN_WINDOW {
+            window.count = 0;
+            window.started = now;
+        }
+        if window.count >= JOIN_MAX_PER_WINDOW {
+            return false;
+        }
+        window.count += 1;
+        true
+    }
+}
+
 #[derive(Clone)]
 struct RelayState {
     broker: Arc<RelayBroker>,
@@ -77,6 +132,8 @@ struct RelayState {
     /// is all that's needed: the content-host route is admission-gated, so a
     /// guessed key can't be hosted by anyone but the real gateway.
     seq: Arc<AtomicU64>,
+    /// Per-rendezvous `/pair/join` throttle (anti-grief; see [`JoinRateLimiter`]).
+    join_limiter: Arc<JoinRateLimiter>,
 }
 
 /// Assemble the relay router. `admission` is the shared, hot-reloaded allow-list
@@ -95,6 +152,7 @@ pub fn build_router(
         conns,
         bandwidth,
         seq: Arc::new(AtomicU64::new(0)),
+        join_limiter: Arc::new(JoinRateLimiter::default()),
     };
     // Every route admits via the shared `x-instance-key` pre-layer — including
     // `/control`, whose key now rides the dial header too (its hello carries only
@@ -150,9 +208,9 @@ async fn require_admitted(
 }
 
 /// Gateway side: the admission pre-layer authenticates the instance key, then we
-/// park a leg under `code`.
+/// park a leg under `rendezvous_id`.
 async fn host_handler(
-    Path(code): Path<String>,
+    Path(rendezvous_id): Path<String>,
     State(state): State<RelayState>,
     Extension(AdmittedKey(key)): Extension<AdmittedKey>,
     ws: WebSocketUpgrade,
@@ -175,19 +233,19 @@ async fn host_handler(
     if !state.admitted.is_admitted(&key) {
         return unadmitted();
     }
-    let leg = state.broker.join(&code);
+    let leg = state.broker.join(&rendezvous_id);
     let broker = Arc::clone(&state.broker);
     capped(ws).on_upgrade(move |socket| async move {
         let _guard = guard;
         tokio::select! {
-            // Pairing frames are tiny SPAKE2 blobs — not bandwidth-throttled.
+            // Pairing frames are tiny opaque Noise blobs — not bandwidth-throttled.
             _ = pump_ws(socket, leg, None) => {}
             // The gateway's instance key was revoked mid-connection.
             _ = kick => {}
         }
         // If the app never matched (the host disconnected first), drop the
-        // still-parked leg so a stale code can't linger.
-        broker.cancel(&code);
+        // still-parked leg so a stale rendezvous can't linger.
+        broker.cancel(&rendezvous_id);
     })
 }
 
@@ -196,13 +254,25 @@ async fn host_handler(
 /// carries). The phone leg is ephemeral, so — unlike the host leg — it is not
 /// registered against the gateway's per-instance connection cap.
 async fn join_handler(
-    Path(code): Path<String>,
+    Path(rendezvous_id): Path<String>,
     State(state): State<RelayState>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    match state.broker.try_match(&code) {
+    // The rendezvous id is public (the relay routes on it), so anyone who learns
+    // it — including a non-relay holder of the shared admission key — could
+    // repeatedly steal the gateway's parked host leg and fail the PSK handshake
+    // to grief pairing. Rate-limit joins per rendezvous id so a griefer can't
+    // hammer one rendezvous. (Availability only; the PSK already blocks MITM.)
+    if !state.join_limiter.allow(&rendezvous_id) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many pairing join attempts for this rendezvous",
+        )
+            .into_response();
+    }
+    match state.broker.try_match(&rendezvous_id) {
         Some(leg) => capped(ws).on_upgrade(move |socket| pump_ws(socket, leg, None)),
-        None => (StatusCode::NOT_FOUND, "no pairing host for this code").into_response(),
+        None => (StatusCode::NOT_FOUND, "no pairing host for this rendezvous").into_response(),
     }
 }
 
@@ -480,8 +550,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn join_rate_limiter_throttles_one_rendezvous_then_resets() {
+        let limiter = JoinRateLimiter::default();
+        // The first JOIN_MAX_PER_WINDOW attempts pass; the next is throttled.
+        for i in 0..JOIN_MAX_PER_WINDOW {
+            assert!(limiter.allow("rid-1"), "attempt {i} within the limit");
+        }
+        assert!(!limiter.allow("rid-1"), "over the limit is throttled");
+        // A different rendezvous id has its own independent budget.
+        assert!(limiter.allow("rid-2"), "distinct rendezvous unaffected");
+        // Forcing the window start into the past resets the count.
+        {
+            let mut w = limiter.windows.lock();
+            if let Some(win) = w.get_mut("rid-1") {
+                win.started = Instant::now() - JOIN_WINDOW - Duration::from_secs(1);
+            }
+        }
+        assert!(limiter.allow("rid-1"), "a fresh window admits again");
+    }
+
     /// Symmetric admission: the app's join leg also needs an admitted key — a
-    /// keyless join is 401'd even when a gateway is hosting the code.
+    /// keyless join is 401'd even when a gateway is hosting the rendezvous.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn join_without_an_admitted_key_is_rejected() {
         let port = serve().await;

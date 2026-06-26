@@ -131,7 +131,11 @@ async fn pair(
     // The label is optional: an empty slot label tells the gateway to use the
     // name the device reports in its DeviceHello during the handshake.
     let operator_label = label.as_deref().unwrap_or("");
-    let code = svc
+    // The mint returns two values with opposite handling: the public
+    // `rendezvous_id` (the relay routes on it) and the high-entropy `secret`
+    // (the Noise PSK). The secret travels *only* in the QR below — never the
+    // relay, never a log, never the durable row.
+    let (rendezvous_id, secret) = svc
         .mint(&user, operator_label)
         .await
         .map_err(|e| CliError::Manager(format!("mint device pairing: {e}")))?;
@@ -148,23 +152,34 @@ async fn pair(
     };
     let instance_key = prompt::prompt_with_default(key_label, &default_key)?;
     let k = qr_encode(&instance_key);
-    let payload = format!("baybo://pair?h={endpoint}&c={code}&k={k}");
+    // `s=` is the 256-bit secret, hex-encoded; it is bearer credential material.
+    // The whole payload is rendered as a QR only — never echoed to the terminal
+    // or any log.
+    let s = hex::encode(secret.as_bytes());
+    let payload = format!("baybo://pair?h={endpoint}&r={rendezvous_id}&s={s}&k={k}");
     eprintln!("Pairing a new device.\n");
-    if let Some(qr) = render_pairing_qr(&payload) {
-        // Blank line after as well: the surrounding blank lines stand in for the
-        // (dropped) quiet zone so the matrix still scans against the terminal bg.
-        eprintln!("{qr}\n");
-    } else {
-        // QR couldn't render (shouldn't happen for this short payload) — fall
-        // back to the raw code so the operator can still pair manually.
-        eprintln!("endpoint: {endpoint}\ncode:     {code}\n");
-    }
+    let Some(qr) = render_pairing_qr(&payload) else {
+        // The payload carries a one-time secret, so we must NEVER fall back to a
+        // shortened/typeable form of it (a short secret is offline-crackable by a
+        // hostile relay) or write it to disk. If the QR can't render, bail and ask
+        // the operator to retry in a larger terminal.
+        return Err(CliError::Io(
+            "couldn't render the pairing QR in this terminal — widen the window and re-run \
+             `baybo device pair`"
+                .into(),
+        ));
+    };
+    // Blank line after as well: the surrounding blank lines stand in for the
+    // (dropped) quiet zone so the matrix still scans against the terminal bg.
+    eprintln!("{qr}\n");
     eprintln!("Waiting for the device to scan…");
 
-    // Self-contained relay hosting: open our `/pair/host/{code}` leg on the relay
-    // and run the SPAKE2 handshake here — pairing needs no `baybo gateway start`
-    // daemon. Runs concurrently with the operator flow below (they sync through
-    // the in-process slot); the guard stops it on every exit path.
+    // Self-contained relay hosting: open our `/pair/host/{rendezvous_id}` leg on
+    // the relay and run the XXpsk0 handshake here — pairing needs no
+    // `baybo gateway start` daemon. Runs concurrently with the operator flow
+    // below (they sync through the in-process slot); the guard stops it on every
+    // exit path. The relay endpoint is bound into the handshake prologue, so the
+    // QR `h=` (which equals `endpoint`) and the gateway's `relay_url` agree.
     let secret_vault = ctx
         .secret_vault
         .clone()
@@ -175,9 +190,13 @@ async fn pair(
         relay_url: endpoint.clone(),
     };
     let mut host = {
-        let (relay_url, key, code) = (endpoint.clone(), instance_key.clone(), code.clone());
+        let (relay_url, key, rid) = (
+            endpoint.clone(),
+            instance_key.clone(),
+            rendezvous_id.clone(),
+        );
         StopHosting::new(tokio::spawn(async move {
-            if let Err(e) = baybo_gateway::host_pairing_leg(&deps, &relay_url, &key, &code).await {
+            if let Err(e) = baybo_gateway::host_pairing_leg(&deps, &relay_url, &key, &rid).await {
                 tracing::debug!(error = %e, "device pair: relay host ended");
             }
         }))
@@ -185,10 +204,10 @@ async fn pair(
 
     // 1. Wait for the phone to scan + reach the confirm step: the gateway
     //    publishes the confirmation code + the device's name onto the slot.
-    let Some(slot) = wait_for_confirm(svc, &code, SCAN_WAIT).await? else {
+    let Some(slot) = wait_for_confirm(svc, &rendezvous_id, SCAN_WAIT).await? else {
         return Ok(CommandOutput::structured(
             "No device scanned the code in time; it has expired.".to_string(),
-            &json!({ "action": "timeout", "code": code, "stage": "scan" }),
+            &json!({ "action": "timeout", "rendezvous_id": rendezvous_id, "stage": "scan" }),
         ));
     };
     let device_id = slot.device_id.unwrap_or_default();
@@ -208,7 +227,7 @@ async fn pair(
     eprintln!("    confirmation code: {confirm_code}");
     let accepted = match confirm_or_device_gone(
         svc,
-        &code,
+        &rendezvous_id,
         "Does this match the code on the phone? Pair this device?",
         &mut host,
     )
@@ -217,12 +236,12 @@ async fn pair(
         ConfirmOutcome::Decided(accepted) => accepted,
         ConfirmOutcome::DeviceGone => {
             return Ok(CommandOutput::structured(
-                format!("\"{device_label}\" cancelled pairing on the phone (or the code expired)."),
-                &json!({ "action": "device_cancelled", "code": code, "device_id": device_id }),
+                format!("\"{device_label}\" cancelled pairing on the phone (or it expired)."),
+                &json!({ "action": "device_cancelled", "rendezvous_id": rendezvous_id, "device_id": device_id }),
             ));
         }
     };
-    svc.set_operator_decision(&code, accepted)
+    svc.set_operator_decision(&rendezvous_id, accepted)
         .await
         .map_err(|e| CliError::Manager(format!("record pairing decision: {e}")))?;
     if !accepted {
@@ -234,13 +253,13 @@ async fn pair(
         host.finish().await;
         return Ok(CommandOutput::structured(
             format!("Declined pairing for \"{device_label}\"."),
-            &json!({ "action": "declined", "code": code, "device_id": device_id }),
+            &json!({ "action": "declined", "rendezvous_id": rendezvous_id, "device_id": device_id }),
         ));
     }
 
     // 3. Wait for the gateway to finalize (it requires the phone's confirm too).
     eprintln!("Confirming…");
-    let outcome = wait_for_paired(svc, &user, &device_id, &code, OUTCOME_WAIT).await?;
+    let outcome = wait_for_paired(svc, &user, &device_id, &rendezvous_id, OUTCOME_WAIT).await?;
     // Stop our self-hosted relay leg: on success let it finish sending the sealed
     // GatewayWelcome (it goes out right after the approved row `wait_for_paired`
     // just observed); otherwise drop the guard to abort the still-running task.
@@ -260,11 +279,11 @@ async fn pair(
         )),
         PairOutcome::DeviceDeclined => Ok(CommandOutput::structured(
             format!("\"{device_label}\" cancelled pairing on the phone."),
-            &json!({ "action": "device_cancelled", "code": code, "device_id": device_id }),
+            &json!({ "action": "device_cancelled", "rendezvous_id": rendezvous_id, "device_id": device_id }),
         )),
         PairOutcome::TimedOut => Ok(CommandOutput::structured(
             format!("Pairing for \"{device_label}\" did not complete (timed out)."),
-            &json!({ "action": "incomplete", "code": code, "device_id": device_id }),
+            &json!({ "action": "incomplete", "rendezvous_id": rendezvous_id, "device_id": device_id }),
         )),
     }
 }
@@ -278,8 +297,12 @@ enum ConfirmOutcome {
 }
 
 /// Ask the operator to confirm, but bail out early if the phone declines or
-/// drops first — so the operator isn't left holding a `[Y/n]` prompt for a
-/// device that has already gone away.
+/// drops first — so the operator isn't left holding a prompt for a device that
+/// has already gone away.
+///
+/// The prompt **defaults to no** (`[y/N]`): pairing authorizes a device against
+/// a possibly-hostile relay, so an absent-minded Enter must not pair, and the
+/// confirm is the backstop if the QR secret ever leaks (shoulder-surf / forward).
 ///
 /// Three concurrent signals decide the outcome:
 /// - the operator's answer (a blocking stdin read on a **detached OS thread** —
@@ -291,7 +314,7 @@ enum ConfirmOutcome {
 ///   that also catches an expired/consumed slot).
 async fn confirm_or_device_gone(
     svc: &DevicePairingService,
-    code: &str,
+    rendezvous_id: &str,
     question: &str,
     host: &mut StopHosting,
 ) -> Result<ConfirmOutcome> {
@@ -303,14 +326,14 @@ async fn confirm_or_device_gone(
             "interactive confirmation requires a terminal".into(),
         ));
     }
-    // Write the `[Y/n]` prompt ourselves and release the stderr lock immediately.
+    // Write the `[y/N]` prompt ourselves and release the stderr lock immediately.
     // The blocking read then runs on a detached thread holding *only* the stdin
     // lock, so if we bail (DeviceGone) our `eprintln!` below can't deadlock on a
     // stderr lock the reader is still holding. (`prompt::confirm_with_default`
     // holds stderr across the read, which would hang our bail-out.)
     {
         let mut err = std::io::stderr().lock();
-        write!(err, "{question} [Y/n]: ")
+        write!(err, "{question} [y/N]: ")
             .and_then(|()| err.flush())
             .map_err(|e| CliError::Io(format!("write confirm prompt: {e}")))?;
     }
@@ -323,10 +346,11 @@ async fn confirm_or_device_gone(
         let mut line = String::new();
         let decision = match std::io::stdin().lock().read_line(&mut line) {
             Ok(0) | Err(_) => None,
-            // `[Y/n]`: anything but an explicit no (incl. an empty line) is yes.
-            Ok(_) => Some(!matches!(
+            // `[y/N]`: only an explicit yes pairs; anything else (incl. an empty
+            // line) declines. Fail closed — see the doc comment.
+            Ok(_) => Some(matches!(
                 line.trim().to_ascii_lowercase().as_str(),
-                "n" | "no"
+                "y" | "yes"
             )),
         };
         let _ = tx.send(decision);
@@ -349,7 +373,7 @@ async fn confirm_or_device_gone(
             }
             _ = tokio::time::sleep(OUTCOME_POLL_INTERVAL) => {
                 let gone = match svc
-                    .claim_slot(code)
+                    .claim_slot(rendezvous_id)
                     .await
                     .map_err(|e| CliError::Manager(format!("poll pairing slot: {e}")))?
                 {
@@ -357,8 +381,8 @@ async fn confirm_or_device_gone(
                     None => true, // expired / consumed
                 };
                 if gone {
-                    // End the dangling `[Y/n]` prompt line so the caller's message
-                    // starts fresh, then bail (the stdin read is abandoned).
+                    // End the dangling prompt line so the caller's message starts
+                    // fresh, then bail (the stdin read is abandoned).
                     eprintln!();
                     return Ok(ConfirmOutcome::DeviceGone);
                 }
@@ -371,13 +395,13 @@ async fn confirm_or_device_gone(
 /// scanned and reached the confirm step), the slot is gone, or `budget` elapses.
 async fn wait_for_confirm(
     svc: &DevicePairingService,
-    code: &str,
+    rendezvous_id: &str,
     budget: Duration,
 ) -> Result<Option<DevicePairingSlot>> {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
         match svc
-            .claim_slot(code)
+            .claim_slot(rendezvous_id)
             .await
             .map_err(|e| CliError::Manager(format!("poll pairing slot: {e}")))?
         {
@@ -407,7 +431,7 @@ async fn wait_for_paired(
     svc: &DevicePairingService,
     user: &str,
     device_id: &str,
-    code: &str,
+    rendezvous_id: &str,
     budget: Duration,
 ) -> Result<PairOutcome> {
     let deadline = tokio::time::Instant::now() + budget;
@@ -424,7 +448,7 @@ async fn wait_for_paired(
         // is benign (the row check above is authoritative); only an explicit
         // device-side decline short-circuits the wait.
         if let Some(slot) = svc
-            .claim_slot(code)
+            .claim_slot(rendezvous_id)
             .await
             .map_err(|e| CliError::Manager(format!("poll pairing slot: {e}")))?
             && slot.device_decision == Some(false)
@@ -481,7 +505,7 @@ async fn list(ctx: &CommandContext, approved: bool) -> Result<CommandOutput> {
     let human = if rows.is_empty() {
         "(no devices)".to_string()
     } else {
-        let mut buf = String::from("STATUS\tUSER\tDEVICE\tLABEL\tCODE\tCREATED_AT\n");
+        let mut buf = String::from("STATUS\tUSER\tDEVICE\tLABEL\tRENDEZVOUS\tCREATED_AT\n");
         for r in &rows {
             buf.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -489,7 +513,7 @@ async fn list(ctx: &CommandContext, approved: bool) -> Result<CommandOutput> {
                 r.user_id,
                 r.device_id,
                 r.label,
-                r.pairing_code.as_deref().unwrap_or("-"),
+                r.rendezvous_id.as_deref().unwrap_or("-"),
                 r.created_at,
             ));
         }
@@ -505,7 +529,7 @@ async fn list(ctx: &CommandContext, approved: bool) -> Result<CommandOutput> {
                     "user_id": r.user_id,
                     "device_id": r.device_id,
                     "label": r.label,
-                    "pairing_code": r.pairing_code,
+                    "rendezvous_id": r.rendezvous_id,
                     "created_at": r.created_at,
                     "approved_at": r.approved_at,
                     "last_seen_at": r.last_seen_at,
@@ -560,8 +584,13 @@ mod tests {
 
     #[test]
     fn renders_a_scannable_qr() {
-        let qr = render_pairing_qr("baybo://pair?h=wss://proxy.baybo.space&c=5PRX2B")
-            .expect("the short pairing payload fits a QR");
+        // A realistic payload: relay endpoint, a UUID rendezvous id, a 64-hex
+        // (256-bit) secret, and the admission key.
+        let payload = format!(
+            "baybo://pair?h=wss://proxy.baybo.space&r=11111111-2222-4333-8444-555555555555&s={}&k=guest",
+            "ab".repeat(32),
+        );
+        let qr = render_pairing_qr(&payload).expect("the pairing payload fits a QR");
         assert!(qr.lines().count() > 8, "multi-line QR matrix");
         assert!(
             qr.contains('█') || qr.contains('▀') || qr.contains('▄'),

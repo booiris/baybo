@@ -10,8 +10,12 @@ pub const INSTANCE_KEY_HEADER: &str = "x-instance-key";
 
 /// Route templates (axum-style `{param}` tokens). The server registers these
 /// directly; clients build a concrete URL via the helpers below.
-pub const PAIR_HOST: &str = "/pair/host/{code}";
-pub const PAIR_JOIN: &str = "/pair/join/{code}";
+///
+/// The pairing routes key on the **public `rendezvous_id`** (a UUID) — the only
+/// pairing value C ever sees. It routes nothing secret: the QR secret (the Noise
+/// PSK) never reaches C, so C cannot complete the handshake with either side.
+pub const PAIR_HOST: &str = "/pair/host/{rendezvous_id}";
+pub const PAIR_JOIN: &str = "/pair/join/{rendezvous_id}";
 pub const CONTROL: &str = "/control";
 pub const CONTENT_JOIN: &str = "/content/join/{relay_node_id}";
 pub const CONTENT_HOST: &str = "/content/host/{relay_key}";
@@ -33,13 +37,13 @@ pub enum ControlSignal {
     OpenDataLeg { relay_key: String },
 }
 
-/// `{base}/pair/host/{code}` — the gateway's SPAKE2 host leg.
-pub fn pair_host_url(base: &str, code: &str) -> String {
-    crate::join(base, &PAIR_HOST.replace("{code}", code))
+/// `{base}/pair/host/{rendezvous_id}` — the gateway's pairing host leg.
+pub fn pair_host_url(base: &str, rendezvous_id: &str) -> String {
+    crate::join(base, &PAIR_HOST.replace("{rendezvous_id}", rendezvous_id))
 }
-/// `{base}/pair/join/{code}` — the app's SPAKE2 join leg.
-pub fn pair_join_url(base: &str, code: &str) -> String {
-    crate::join(base, &PAIR_JOIN.replace("{code}", code))
+/// `{base}/pair/join/{rendezvous_id}` — the app's pairing join leg.
+pub fn pair_join_url(base: &str, rendezvous_id: &str) -> String {
+    crate::join(base, &PAIR_JOIN.replace("{rendezvous_id}", rendezvous_id))
 }
 /// `{base}/control` — the gateway's persistent control connection.
 pub fn control_url(base: &str) -> String {

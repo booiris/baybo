@@ -7,27 +7,33 @@ import type { PairAborted } from "./generated/PairAborted";
 import type { PairChallenge } from "./generated/PairChallenge";
 import type { PairedSummary } from "./generated/PairedSummary";
 
-/// Parse a `baybo://pair?h=<relay>&c=<code>&k=<instance-key>` QR payload, or fall
-/// back to treating the whole scanned string as the bare code. Pairing is
-/// relay-only: the app joins the proxy rendezvous (`/pair/join/<code>`) presenting
+/// Parse a `baybo://pair?h=<relay>&r=<rendezvous-id>&s=<secret>&k=<instance-key>`
+/// QR payload. Both `r` (public rendezvous id) and `s` (the 256-bit secret, the
+/// Noise PSK) are required — there is no typeable fallback, because a short
+/// secret would be offline-crackable by a hostile relay. Pairing is relay-only:
+/// the app joins the proxy rendezvous (`/pair/join/<rendezvous-id>`) presenting
 /// `k` as the relay admission key.
 function parseScan(text: string): {
   endpoint?: string;
-  code: string;
+  rendezvousId: string;
+  secret: string;
   instanceKey?: string;
-} {
+} | null {
   try {
     const url = new URL(text);
     if (url.protocol === "baybo:") {
       const h = url.searchParams.get("h") ?? undefined;
-      const c = url.searchParams.get("c");
+      const r = url.searchParams.get("r");
+      const s = url.searchParams.get("s");
       const k = url.searchParams.get("k") ?? undefined;
-      if (c) return { endpoint: h, code: c, instanceKey: k };
+      if (r && s) return { endpoint: h, rendezvousId: r, secret: s, instanceKey: k };
     }
   } catch {
-    /* not a URL — treat as a bare code */
+    /* not a pairing URL */
   }
-  return { code: text.trim() };
+  // No bare-code fallback: a pairing QR must carry both the rendezvous id and
+  // the high-entropy secret.
+  return null;
 }
 
 /// A decrypted wire `Frame` as it arrives over the Tauri content channel.
@@ -249,9 +255,13 @@ export default function App() {
       setScanPhase("scanning");
       const res = await bs.scan({ windowed: true, formats: [bs.Format.QRCode] });
       const parsed = parseScan(res.content);
+      if (!parsed) {
+        setStatus("That QR isn't a Baybo pairing code. Scan the one shown by `baybo device pair`.");
+        return;
+      }
       if (DEBUG) {
         setScanInfo(
-          `QR · host=${parsed.endpoint ?? "(default)"} · code=${maskSecret(parsed.code)}`,
+          `QR · host=${parsed.endpoint ?? "(default)"} · secret=${maskSecret(parsed.secret)}`,
         );
       }
       // Success: buzz, pop a green dot at the reticle centre, then briefly hold
@@ -268,7 +278,8 @@ export default function App() {
       // instead of dropping the user back on a form to review and confirm.
       await pairBegin({
         endpoint: parsed.endpoint ?? DEFAULT_ENDPOINT,
-        code: parsed.code,
+        rendezvousId: parsed.rendezvousId,
+        secret: parsed.secret,
         instanceKey: parsed.instanceKey,
       });
     } catch (e) {
@@ -293,7 +304,8 @@ export default function App() {
   // Called straight off a successful scan with the QR's endpoint/code.
   async function pairBegin(opts: {
     endpoint: string;
-    code: string;
+    rendezvousId: string;
+    secret: string;
     instanceKey?: string;
   }) {
     setBusy(true);
@@ -309,7 +321,8 @@ export default function App() {
     try {
       const c = await invoke<PairChallenge>("pair_begin", {
         endpoint: opts.endpoint,
-        code: opts.code,
+        rendezvousId: opts.rendezvousId,
+        secret: opts.secret,
         label: DEVICE_LABEL,
         instanceKey: opts.instanceKey,
         onAbort,
@@ -366,8 +379,8 @@ export default function App() {
         <dl className="kv">
           <dt>User</dt>
           <dd>{paired.userId}</dd>
-          <dt>Pairing code</dt>
-          <dd>{paired.pairingCode}</dd>
+          <dt>Rendezvous</dt>
+          <dd>{paired.rendezvousId}</dd>
           <dt>Relay node</dt>
           <dd>{paired.relayNodeId || "—"}</dd>
         </dl>

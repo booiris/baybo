@@ -3,6 +3,7 @@
 /**
  * What the UI renders after a successful pairing (a Tauri IPC DTO). The secrets
  * (`auth_token`, `push_key`, the Noise static secret) are persisted by the
- * shell, never returned to the webview.
+ * shell, never returned to the webview — and the QR secret is never carried at
+ * all (only the public `rendezvous_id`).
  */
-export type PairedSummary = { userId: string, relayNodeId: string, pairingCode: string, };
+export type PairedSummary = { userId: string, relayNodeId: string, rendezvousId: string, };

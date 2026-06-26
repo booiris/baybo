@@ -115,12 +115,15 @@ hkdf = "0.12"
 aes-gcm = "0.10"
 rand = "0.10"
 # Device-pairing + E2E secure channel (device-proto, shared by the
-# gateway and the iOS companion's core). SPAKE2 over the rendezvous, Noise
-# for the session, ChaCha20-Poly1305 for the lock-screen-preview framing the
-# iOS NSE decrypts with CryptoKit. All cross-compile to aarch64-apple-ios.
+# gateway and the iOS companion's core). Noise XXpsk0 authenticates pairing
+# against a malicious relay (the QR secret is the PSK), Noise XX/IK secures the
+# post-pairing session, ChaCha20-Poly1305 frames the lock-screen-preview the iOS
+# NSE decrypts with CryptoKit. All cross-compile to aarch64-apple-ios.
 snow = "0.9"
-spake2 = "0.4"
 chacha20poly1305 = "0.10"
+# Zeroize the 32-byte pairing secret (the Noise PSK) on drop so it never
+# lingers in freed memory; cross-compiles to aarch64-apple-ios.
+zeroize = { version = "1", features = ["derive"] }
 # Local-only — never connects to a remote turso/libsql server, so we
 # drop default features (`replication`, `remote`, `sync`, `tls`) that
 # would pull in hyper-rustls + an old rustls/webpki tree.

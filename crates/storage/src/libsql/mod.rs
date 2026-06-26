@@ -516,7 +516,7 @@ impl LibsqlPool {
                     device_pubkey BLOB    NOT NULL,
                     auth_token    TEXT    NOT NULL,
                     status        TEXT    NOT NULL,
-                    pairing_code  TEXT,
+                    rendezvous_id TEXT,
                     created_at    INTEGER NOT NULL,
                     approved_at   INTEGER,
                     last_seen_at  INTEGER,

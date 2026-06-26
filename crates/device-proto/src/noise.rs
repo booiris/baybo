@@ -25,8 +25,9 @@ pub const NOISE_XX: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 pub const NOISE_IK: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 
 /// A long-term X25519 static identity. The gateway persists one in its
-/// `SecretVault`; the app persists one in its keystore. Only the public half
-/// crosses the wire (inside the SPAKE2 K-channel at pairing).
+/// `SecretVault`; the app persists one in its keystore. The public half is
+/// learned by the peer in-band, as an XX handshake token, during the
+/// [`crate::psk_pair`] pairing handshake.
 pub struct StaticKeypair {
     public: [u8; KEY_LEN],
     secret: [u8; KEY_LEN],
@@ -93,11 +94,11 @@ impl StaticKeypair {
 fn builder(pattern: &str) -> Result<Builder<'static>, ProtoError> {
     let params: NoiseParams = pattern
         .parse()
-        .map_err(|_| ProtoError::Pake(format!("bad noise pattern: {pattern}")))?;
+        .map_err(|_| ProtoError::Handshake(format!("bad noise pattern: {pattern}")))?;
     Ok(Builder::new(params))
 }
 
-fn to_key(bytes: &[u8]) -> Result<[u8; KEY_LEN], ProtoError> {
+pub(crate) fn to_key(bytes: &[u8]) -> Result<[u8; KEY_LEN], ProtoError> {
     bytes.try_into().map_err(|_| ProtoError::KeyLen {
         expected: KEY_LEN,
         got: bytes.len(),

@@ -9,6 +9,7 @@ doctest = false
 [dependencies]
 baybo-model = { workspace = true }
 baybo-store = { workspace = true }
+device-proto = { workspace = true }
 
 chrono = { workspace = true }
 hex = { workspace = true }
@@ -16,6 +17,7 @@ parking_lot = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 baybo-storage = { workspace = true, features = ["test-support"] }

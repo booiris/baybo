@@ -1,26 +1,34 @@
-//! Wire messages exchanged inside the SPAKE2 K-channel at pairing.
+//! Wire messages exchanged during the XXpsk0 device-pairing handshake.
 //!
-//! Once both ends derive the master secret and the channel key
-//! ([`crate::kdf`]), they swap exactly two AEAD-protected messages over the
-//! rendezvous:
+//! The handshake (see [`crate::psk_pair`]) runs over the relay rendezvous as a
+//! sequence of [`PairFrame`]s (each one binary frame, MessagePack-encoded):
 //!
-//! 1. [`DeviceHello`] (P → A): the app's long-term Noise static public key and
-//!    its push registration (`apns_token`, `apns_env`, the per-binding
-//!    `device_id`).
-//! 2. [`GatewayWelcome`] (A → P): the gateway's static public key plus the
-//!    routing the app needs to reach it later — the C-assigned
-//!    `relay_node_id`, direct-reachability candidates, the owning `user_id`,
-//!    and the retained pairing code (the operator approval handle).
+//! 1. P → A [`PairFrame::Hello`] — the public `rendezvous_id` + the app's first
+//!    Noise handshake message (`msg1`, `e`).
+//! 2. A → P [`PairFrame::HandshakeReply`] — the gateway's `msg2` (`e, ee, s,
+//!    es`); the app now holds the gateway's static (as an XX token, in `h`).
+//! 3. P → A [`PairFrame::HandshakeFinal`] — the app's `msg3` (`s, se`), whose
+//!    Noise payload is the [`DeviceHello`] body. Both ends are now in transport
+//!    mode and share the final handshake hash `h`.
+//! 4. P → A [`PairFrame::Sealed`] — the [`DeviceConfirm`] (the phone user's
+//!    decision), a Noise **transport** message (implicit nonce).
+//! 5. A → P [`PairFrame::Sealed`] — the [`GatewayWelcome`], a transport
+//!    message, sent only once the operator confirmed too (or
+//!    [`PairFrame::Reject`]).
+//!
+//! The statics are exchanged in-band as XX handshake tokens, so neither
+//! [`DeviceHello`] nor [`GatewayWelcome`] carries a `static_pubkey` field — each
+//! side reads the peer's authenticated static from the handshake itself
+//! ([`crate::psk_pair::PskTransport::remote_static`]). The relay sees only the
+//! public `rendezvous_id` and opaque Noise frames; lacking the PSK it can
+//! neither read nor forge any of this.
 //!
 //! These travel Rust↔Rust only (both ends link this crate), so MessagePack is
-//! the codec; only the [`crate::aead`] preview framing needs cross-language
-//! pinning. The channel key authenticates them — C relays opaque ciphertext
-//! and cannot read or forge a static key.
+//! the codec.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::aead::{self, KEY_LEN};
 use crate::error::ProtoError;
 
 /// Which APNs environment the app's device token is bound to. A sandbox token
@@ -33,26 +41,25 @@ pub enum ApnsEnv {
     Production,
 }
 
-/// App → gateway, inside the K-channel.
+/// App → gateway, as the Noise payload of the app's `msg3` (so it is
+/// authenticated by the app static that rides the same message). The app's
+/// static itself is an XX handshake token, not a field here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceHello {
     /// Client-generated, per-binding (one row per `(user_id, device_id)`).
     pub device_id: String,
     /// Human label for the device list ("Booiris iPhone").
     pub label: String,
-    /// The app's long-term Noise static public key.
-    pub static_pubkey: [u8; KEY_LEN],
     /// APNs device token (gateway-mediated registration relays it to C).
     pub apns_token: String,
     /// Environment the token is bound to.
     pub apns_env: ApnsEnv,
 }
 
-/// Gateway → app, inside the K-channel.
+/// Gateway → app, as a Noise transport message. The gateway's static is learned
+/// in-band as an XX token, so it is not a field here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayWelcome {
-    /// The gateway's long-term Noise static public key.
-    pub static_pubkey: [u8; KEY_LEN],
     /// Non-secret routing id the app uses to reach a NAT'd A via the blind
     /// relay (the gateway's stable `relay_node_id`). P never holds A's
     /// `instance_key`. Empty when the gateway has no relay configured.
@@ -64,42 +71,46 @@ pub struct GatewayWelcome {
     pub relay_url: String,
     /// Owning principal on the gateway.
     pub user_id: String,
-    /// The SPAKE2 code this device paired under, retained for audit / the
-    /// operator's device list (no longer an approval handle).
-    pub pairing_code: String,
+    /// The **public** rendezvous id this device paired under, retained as an
+    /// audit / device-list handle. Not secret (the relay saw it); the QR secret
+    /// is never carried here.
+    pub rendezvous_id: String,
     /// The device's bearer token for the scoped REST/WS surface. Active the
     /// moment this `GatewayWelcome` is sent — the gateway only seals it after
     /// both the phone user and the operator confirmed the pairing.
     pub auth_token: String,
 }
 
-/// App → gateway, inside the K-channel: the phone user's pairing decision after
-/// comparing the displayed confirmation code (see [`crate::kdf::derive_confirm_code`]).
-/// Sealed under the channel key so a blind relay can neither forge an acceptance
-/// nor flip a decline.
+/// App → gateway, as a Noise transport message: the phone user's pairing
+/// decision after comparing the displayed confirmation code (see
+/// [`crate::kdf::derive_confirm_code`]). Inside the authenticated Noise channel
+/// a blind relay can neither forge an acceptance nor flip a decline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceConfirm {
     pub accepted: bool,
 }
 
 /// On-wire envelope for the device-pairing handshake over the relay pairing
-/// WebSocket (each variant is one binary frame, MessagePack-encoded):
+/// WebSocket (each variant is one binary frame, MessagePack-encoded). See the
+/// module docs for the message sequence.
 ///
-/// 1. P → A [`PairFrame::Hello`] — the pairing code + the app's SPAKE2 message.
-/// 2. A → P [`PairFrame::PakeReply`] — A's SPAKE2 message (or
-///    [`PairFrame::Reject`] on a bad/expired code).
-/// 3. P → A [`PairFrame::Sealed`] — the [`DeviceHello`], AEAD-sealed under the
-///    derived channel key.
-/// 4. P → A [`PairFrame::Sealed`] — the [`DeviceConfirm`] (the phone user's
-///    decision after comparing the confirmation code on both screens).
-/// 5. A → P [`PairFrame::Sealed`] — the [`GatewayWelcome`], sealed and sent
-///    only once the operator has confirmed too (or [`PairFrame::Reject`]).
+/// `msg` payloads are opaque Noise bytes: handshake messages for
+/// [`Hello`](Self::Hello) / [`HandshakeReply`](Self::HandshakeReply) /
+/// [`HandshakeFinal`](Self::HandshakeFinal), and transport messages for
+/// [`Sealed`](Self::Sealed). [`Reject`](Self::Reject) is a plaintext abort.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum PairFrame {
-    Hello { code: String, pake: Vec<u8> },
-    PakeReply { pake: Vec<u8> },
-    Sealed { nonce: Vec<u8>, ciphertext: Vec<u8> },
+    /// P → A: the public rendezvous id (the gateway claims the in-flight slot by
+    /// it, and it is bound into the handshake prologue) plus the app's `msg1`.
+    Hello { rendezvous_id: String, msg: Vec<u8> },
+    /// A → P: the gateway's `msg2`.
+    HandshakeReply { msg: Vec<u8> },
+    /// P → A: the app's `msg3` (Noise payload = the `DeviceHello` body).
+    HandshakeFinal { msg: Vec<u8> },
+    /// A Noise transport message (`DeviceConfirm` up, `GatewayWelcome` down).
+    Sealed { msg: Vec<u8> },
+    /// Either side aborting the handshake, in the clear.
     Reject { reason: String },
 }
 
@@ -113,29 +124,12 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ProtoError> {
     rmp_serde::from_slice(bytes).map_err(|e| ProtoError::Codec(e.to_string()))
 }
 
-/// Encode `msg` and AEAD-seal it under the K-channel key. Returns
-/// `(nonce, ciphertext)` to relay through C.
-pub fn seal_msg<T: Serialize>(
-    channel_key: &[u8; KEY_LEN],
-    msg: &T,
-) -> Result<(Vec<u8>, Vec<u8>), ProtoError> {
-    aead::seal(channel_key, &encode(msg)?)
-}
-
-/// Open a sealed pairing message and decode it.
-pub fn open_msg<T: DeserializeOwned>(
-    channel_key: &[u8; KEY_LEN],
-    nonce: &[u8],
-    ciphertext: &[u8],
-) -> Result<T, ProtoError> {
-    decode(&aead::open(channel_key, nonce, ciphertext)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kdf::derive_pair_keys;
-    use crate::pake::Pake;
+    use crate::kdf::{derive_confirm_code, derive_push_key};
+    use crate::noise::StaticKeypair;
+    use crate::psk_pair::{PairingSecret, PskHandshake, build_prologue};
 
     #[test]
     fn device_confirm_round_trips() {
@@ -151,7 +145,6 @@ mod tests {
         let hello = DeviceHello {
             device_id: "dev-123".into(),
             label: "Booiris iPhone".into(),
-            static_pubkey: [5u8; KEY_LEN],
             apns_token: "abc123".into(),
             apns_env: ApnsEnv::Sandbox,
         };
@@ -162,11 +155,10 @@ mod tests {
     #[test]
     fn gateway_welcome_round_trips() {
         let welcome = GatewayWelcome {
-            static_pubkey: [9u8; KEY_LEN],
             relay_node_id: "node-xyz".into(),
             relay_url: "wss://proxy.baybo.space".into(),
             user_id: "user-1".into(),
-            pairing_code: "WORMHOLE-7-foo-bar".into(),
+            rendezvous_id: "11111111-2222-4333-8444-555555555555".into(),
             auth_token: "deadbeef".into(),
         };
         let decoded: GatewayWelcome = decode(&encode(&welcome).unwrap()).unwrap();
@@ -177,16 +169,14 @@ mod tests {
     fn pair_frames_round_trip() {
         for frame in [
             PairFrame::Hello {
-                code: "ABC123".into(),
-                pake: vec![1, 2, 3],
+                rendezvous_id: "rid".into(),
+                msg: vec![1, 2, 3],
             },
-            PairFrame::PakeReply { pake: vec![4, 5] },
-            PairFrame::Sealed {
-                nonce: vec![0; 12],
-                ciphertext: vec![9; 40],
-            },
+            PairFrame::HandshakeReply { msg: vec![4, 5] },
+            PairFrame::HandshakeFinal { msg: vec![6, 7] },
+            PairFrame::Sealed { msg: vec![9; 40] },
             PairFrame::Reject {
-                reason: "expired code".into(),
+                reason: "expired rendezvous".into(),
             },
         ] {
             let decoded: PairFrame = decode(&encode(&frame).unwrap()).unwrap();
@@ -194,56 +184,69 @@ mod tests {
         }
     }
 
-    /// End-to-end: SPAKE2 → channel key → sealed pairing exchange both ways,
-    /// exactly the phase-1 pairing wire path (minus the rendezvous relay).
+    /// End-to-end: the full XXpsk0 handshake + the sealed pairing exchange both
+    /// ways — exactly the pairing wire path (minus the rendezvous relay). Proves
+    /// both ends agree on the confirm code + push key and recover each message.
     #[test]
     fn sealed_exchange_over_pairing_channel() {
-        let (app, app_msg) = Pake::start_app("code-shared");
-        let (gw, gw_msg) = Pake::start_gateway("code-shared");
-        let app_k = app.finish(&gw_msg).unwrap();
-        let gw_k = gw.finish(&app_msg).unwrap();
-        let app_keys = derive_pair_keys(&app_k).unwrap();
-        let gw_keys = derive_pair_keys(&gw_k).unwrap();
-        assert_eq!(app_keys.channel_key, gw_keys.channel_key);
+        let secret = PairingSecret::generate();
+        let app_kp = StaticKeypair::generate().unwrap();
+        let gw_kp = StaticKeypair::generate().unwrap();
+        let prologue = build_prologue("rid", "wss://relay");
 
-        // P → A
+        let mut app = PskHandshake::start_initiator(&app_kp.secret(), &secret, &prologue).unwrap();
+        let mut gw = PskHandshake::start_responder(&gw_kp.secret(), &secret, &prologue).unwrap();
+
+        // msg1 / msg2.
+        let msg1 = app.write_handshake(&[]).unwrap();
+        gw.read_handshake(&msg1).unwrap();
+        let msg2 = gw.write_handshake(&[]).unwrap();
+        app.read_handshake(&msg2).unwrap();
+
+        // msg3 carries the DeviceHello body.
         let hello = DeviceHello {
             device_id: "dev-1".into(),
             label: "iPhone".into(),
-            static_pubkey: [1u8; KEY_LEN],
             apns_token: "tok".into(),
             apns_env: ApnsEnv::Production,
         };
-        let (n, ct) = seal_msg(&app_keys.channel_key, &hello).unwrap();
-        let got: DeviceHello = open_msg(&gw_keys.channel_key, &n, &ct).unwrap();
-        assert_eq!(got, hello);
+        let msg3 = app.write_handshake(&encode(&hello).unwrap()).unwrap();
+        let got_hello: DeviceHello = decode(&gw.read_handshake(&msg3).unwrap()).unwrap();
+        assert_eq!(got_hello, hello);
 
-        // A → P
+        let mut app_t = app.into_transport().unwrap();
+        let mut gw_t = gw.into_transport().unwrap();
+
+        // Channel binding agrees on both ends.
+        assert_eq!(app_t.handshake_hash(), gw_t.handshake_hash());
+        assert_eq!(
+            derive_confirm_code(app_t.handshake_hash()).unwrap(),
+            derive_confirm_code(gw_t.handshake_hash()).unwrap(),
+        );
+        assert_eq!(
+            derive_push_key(app_t.handshake_hash()).unwrap(),
+            derive_push_key(gw_t.handshake_hash()).unwrap(),
+        );
+        // Each side learned the other's real static in-band.
+        assert_eq!(app_t.remote_static(), &gw_kp.public());
+        assert_eq!(gw_t.remote_static(), &app_kp.public());
+
+        // P → A DeviceConfirm.
+        let confirm = encode(&DeviceConfirm { accepted: true }).unwrap();
+        let sealed = app_t.write(&confirm).unwrap();
+        let got: DeviceConfirm = decode(&gw_t.read(&sealed).unwrap()).unwrap();
+        assert!(got.accepted);
+
+        // A → P GatewayWelcome.
         let welcome = GatewayWelcome {
-            static_pubkey: [2u8; KEY_LEN],
             relay_node_id: "n1".into(),
             relay_url: String::new(),
             user_id: "u1".into(),
-            pairing_code: "code-shared".into(),
+            rendezvous_id: "rid".into(),
             auth_token: "tok".into(),
         };
-        let (n, ct) = seal_msg(&gw_keys.channel_key, &welcome).unwrap();
-        let got: GatewayWelcome = open_msg(&app_keys.channel_key, &n, &ct).unwrap();
+        let sealed = gw_t.write(&encode(&welcome).unwrap()).unwrap();
+        let got: GatewayWelcome = decode(&app_t.read(&sealed).unwrap()).unwrap();
         assert_eq!(got, welcome);
-    }
-
-    #[test]
-    fn wrong_channel_key_cannot_open() {
-        let keys = derive_pair_keys(b"master").unwrap();
-        let hello = DeviceHello {
-            device_id: "d".into(),
-            label: "l".into(),
-            static_pubkey: [0u8; KEY_LEN],
-            apns_token: "t".into(),
-            apns_env: ApnsEnv::Sandbox,
-        };
-        let (n, ct) = seal_msg(&keys.channel_key, &hello).unwrap();
-        let other = derive_pair_keys(b"different-master").unwrap();
-        assert!(open_msg::<DeviceHello>(&other.channel_key, &n, &ct).is_err());
     }
 }

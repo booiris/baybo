@@ -13,10 +13,11 @@ pub enum ProtoError {
     #[error("aead {stage} failed")]
     Aead { stage: &'static str },
 
-    /// SPAKE2 start/finish failed — almost always a code mismatch or a
-    /// corrupted/forged peer message.
-    #[error("pake: {0}")]
-    Pake(String),
+    /// A pairing-handshake setup error that isn't a `snow` error proper — a
+    /// bad Noise pattern string, or a malformed prologue/secret. The live
+    /// XXpsk0 failures (wrong PSK, tampered frame) surface as [`Self::Noise`].
+    #[error("handshake: {0}")]
+    Handshake(String),
 
     /// Underlying Noise handshake / transport error.
     #[error("noise: {0}")]

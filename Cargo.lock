@@ -472,6 +472,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "futures",
+ "hex",
  "libc",
  "parking_lot",
  "qrcode",
@@ -786,12 +787,14 @@ dependencies = [
  "baybo-storage",
  "baybo-store",
  "chrono",
+ "device-proto",
  "hex",
  "parking_lot",
  "rand 0.10.1",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -984,6 +987,7 @@ dependencies = [
  "baybo-model",
  "bytes",
  "chrono",
+ "device-proto",
  "futures",
  "serde",
  "thiserror 2.0.18",
@@ -1643,7 +1647,6 @@ dependencies = [
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
  "fiat-crypto",
- "rand_core 0.6.4",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -1799,12 +1802,13 @@ dependencies = [
  "chacha20poly1305",
  "hex",
  "hkdf",
+ "rand 0.10.1",
  "rmp-serde",
  "serde",
  "sha2",
  "snow",
- "spake2",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
@@ -4488,18 +4492,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spake2"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5482afe85a0b6ce956c945401598dbc527593c77ba51d0a87a586938b1b893a"
-dependencies = [
- "curve25519-dalek",
- "hkdf",
- "rand_core 0.6.4",
- "sha2",
-]
-
-[[package]]
 name = "sse-stream"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6285,6 +6277,20 @@ name = "zeroize"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "zerotrie"

@@ -1,20 +1,40 @@
 //! The in-flight device-pairing **slot** DTO.
 //!
 //! A slot is the short-lived, in-process bookkeeping for one live
-//! `baybo device pair` run: it carries the owning `user_id` / `label`, the
-//! confirmation code both ends compare once SPAKE2 completes, and each side's
-//! confirm decision. It is held in memory by
+//! `baybo device pair` run: it carries the public `rendezvous_id`, the QR
+//! `secret` (the Noise PSK), the owning `user_id` / `label`, the confirmation
+//! code both ends compare once the handshake completes, and each side's confirm
+//! decision. It is held in memory by
 //! [`baybo_pairing::DevicePairingService`](../../baybo_pairing) for the lifetime
 //! of the command — pairing is driven entirely by that single interactive
 //! process (the operator's CLI hosts the relay leg *and* runs the handshake), so
-//! the slot never needs to be durable or shared across processes. It carries no
-//! key material; the only durable artefact a pairing produces is the approved
-//! [`crate::device::DeviceRow`].
+//! the slot never needs to be durable or shared across processes.
+//!
+//! ## Two fields, opposite handling
+//!
+//! - `rendezvous_id` is **public**: the relay sees it (it routes on it), and it
+//!   is the only pairing identifier that ever lands in a durable row, a log, or
+//!   `device list`.
+//! - `secret` is a **credential**: the Noise PSK that authenticates the
+//!   handshake against a malicious relay. It travels *only* in the QR and lives
+//!   *only* here, in memory, for the run — never in a plaintext column, never in
+//!   the durable [`crate::device::DeviceRow`], never logged, and zeroized on
+//!   drop ([`device_proto::psk_pair::PairingSecret`]). Keeping it in this
+//!   in-memory single-use slot (rather than a durable encrypted vault) keeps it
+//!   out of every persisted store entirely — strictly stronger than the doc's
+//!   "vault it" sketch, and possible because mint + handshake share one process.
 
-/// One in-flight pairing slot. Keyed by `code` inside the service.
+use device_proto::psk_pair::PairingSecret;
+
+/// One in-flight pairing slot. Keyed by `rendezvous_id` inside the service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevicePairingSlot {
-    pub code: String,
+    /// The public rendezvous id (a UUID): the relay route param, the broker
+    /// key, and the slot lookup key. Not secret.
+    pub rendezvous_id: String,
+    /// The QR secret used as the Noise PSK. Credential material — see the module
+    /// docs; never persisted or logged, zeroized on drop.
+    pub secret: PairingSecret,
     pub user_id: String,
     pub label: String,
     /// Unix seconds.
@@ -22,8 +42,8 @@ pub struct DevicePairingSlot {
     /// Unix seconds; the slot is dead once `now >= expires_at`.
     pub expires_at: i64,
     /// The human-comparable confirmation code both ends display, set once the
-    /// SPAKE2 handshake and `DeviceHello` complete. `None` until then. Derived
-    /// from the SPAKE2 secret — not itself secret.
+    /// handshake completes and `DeviceHello` is read. `None` until then. Derived
+    /// from the Noise handshake hash `h` — not itself secret.
     pub confirm_code: Option<String>,
     /// The app-generated device id of the phone in the live handshake, recorded
     /// alongside `confirm_code` so the operator's `device pair` can name it.

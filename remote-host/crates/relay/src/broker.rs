@@ -3,14 +3,16 @@
 //! This is the single relay primitive the whole connectivity story rides on.
 //! Both uses key into the same broker:
 //!
-//! - **pairing rendezvous** — keyed by the SPAKE2 pairing code (the app and the
-//!   gateway each open a leg; the broker copies opaque PAKE blobs between them),
+//! - **pairing rendezvous** — keyed by the public `rendezvous_id` (the app and
+//!   the gateway each open a leg; the broker copies opaque Noise frames),
 //! - **content relay** — keyed by the C-assigned `relay_node_id` (the phone and
 //!   the NAT'd gateway each open a leg; the broker copies Noise frames).
 //!
-//! The broker NEVER inspects the bytes: pairing rides SPAKE2 (C learns neither
-//! the code nor the derived key) and content rides Noise inside TLS (C sees only
-//! ciphertext). It only matches a key to a partner and shuttles opaque frames.
+//! The broker NEVER inspects the bytes: pairing rides Noise `XXpsk0` (C sees only
+//! the public `rendezvous_id` and ciphertext — the QR secret that authenticates
+//! the handshake never reaches C, so C cannot complete it) and content rides
+//! Noise inside TLS (C sees only ciphertext). It only matches a key to a partner
+//! and shuttles opaque frames.
 //!
 //! The matching + piping core lives here over `mpsc` channels so it is fully
 //! host-testable; the production WebSocket transport is a thin adapter that
@@ -118,9 +120,9 @@ impl RelayBroker {
     /// Returns the second leg if a host is waiting, else `None`.
     ///
     /// This is the asymmetric half of the pairing rendezvous: only an admitted
-    /// gateway [`join`](Self::join)s (parks) a code; an unauthenticated app uses
-    /// `try_match`, so it can pair with a waiting host but can never occupy a
-    /// code or flood the broker with parked legs.
+    /// gateway [`join`](Self::join)s (parks) a rendezvous; an unauthenticated app
+    /// uses `try_match`, so it can pair with a waiting host but can never occupy a
+    /// rendezvous or flood the broker with parked legs.
     pub fn try_match(&self, key: &str) -> Option<RelayLeg> {
         self.pending.lock().remove(key).map(|half| RelayLeg {
             to_peer: half.to_first,

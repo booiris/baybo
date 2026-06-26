@@ -20,8 +20,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use baybo_mobile_core::{PairingClient, PairingRequest};
+use device_proto::aead::KEY_LEN;
 use device_proto::noise::StaticKeypair;
 use device_proto::pairing::{self, ApnsEnv, PairFrame};
+use device_proto::psk_pair::PairingSecret;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -33,6 +35,11 @@ use tokio_tungstenite::tungstenite::Message;
 /// `DeviceConfirm(false)` before dropping the socket — long enough for the relay
 /// round-trip, so the operator's side reliably learns we cancelled.
 const DECLINE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait for the gateway's `HandshakeReply` before giving up. Without
+/// it a malicious relay could keep the app pinned open indefinitely on the first
+/// reply (a `msg2` that never arrives).
+const HANDSHAKE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// In-flight pairing sessions, parked between `pair_begin` and `pair_confirm`
 /// (keyed by device id). The map lock is held only to insert/remove; the live WS
@@ -98,17 +105,22 @@ pub use baybo_mobile_core::{PairAborted, PairChallenge, PairedSummary};
 pub async fn pair_begin(
     sessions: &PairingSessions,
     endpoint: &str,
-    code: &str,
+    rendezvous_id: &str,
+    secret: &str,
     label: &str,
     instance_key: Option<String>,
     on_abort: Channel<PairAborted>,
 ) -> Result<PairChallenge, String> {
     let base = endpoint.trim_end_matches('/');
-    // Pairing is relay-only: join the rendezvous keyed by the code
-    // (`/pair/join/{code}`); the operator's `baybo device pair` hosts the other
-    // leg on the relay.
-    let url = remote_host_protocol::relay::pair_join_url(base, code);
+    // Pairing is relay-only: join the rendezvous keyed by the public rendezvous
+    // id (`/pair/join/{rendezvous_id}`); the operator's `baybo device pair` hosts
+    // the other leg on the relay.
+    let url = remote_host_protocol::relay::pair_join_url(base, rendezvous_id);
     let mut ws = connect_pair(&url, instance_key.as_deref()).await?;
+
+    // Decode the QR secret (the Noise PSK). It must be exactly 32 bytes — a
+    // short/typeable secret is forbidden (offline-crackable by the relay).
+    let secret = decode_secret(secret)?;
 
     // The app's long-term Noise identity. TODO(persist): the secret belongs in
     // the keychain so content sessions reuse it across launches.
@@ -116,10 +128,16 @@ pub async fn pair_begin(
     let device_id = format!("ios-{}", hex::encode(&keypair.public()[..8]));
 
     let req = PairingRequest {
-        code: code.to_string(),
+        rendezvous_id: rendezvous_id.to_string(),
+        secret,
+        // Bound into the handshake prologue (anti-cross-binding); must match the
+        // gateway's relay URL — it does, both being the QR `h=`.
+        endpoint: endpoint.to_string(),
         device_id: device_id.clone(),
         label: label.to_string(),
-        static_pubkey: keypair.public(),
+        // The app static rides the handshake as an XX token; the gateway learns
+        // the public half in-band.
+        static_secret: keypair.secret(),
         // Captured from `didRegisterForRemoteNotifications` (registration kicks
         // off at launch, so by pairing time the token is normally ready); empty
         // if it hasn't arrived yet, which the gateway re-registers out of band.
@@ -133,14 +151,15 @@ pub async fn pair_begin(
         },
     };
 
-    let (mut client, hello) = PairingClient::start(req);
+    let (mut client, hello) = PairingClient::start(req).map_err(|e| e.to_string())?;
     send(&mut ws, &hello).await?;
 
-    let PairFrame::PakeReply { pake } = recv(&mut ws).await? else {
-        return Err("expected PakeReply".into());
+    let PairFrame::HandshakeReply { msg } = recv_timeout(&mut ws, HANDSHAKE_REPLY_TIMEOUT).await?
+    else {
+        return Err("expected HandshakeReply".into());
     };
-    let sealed = client.on_pake_reply(&pake).map_err(|e| e.to_string())?;
-    send(&mut ws, &sealed).await?;
+    let final_frame = client.on_handshake_reply(&msg).map_err(|e| e.to_string())?;
+    send(&mut ws, &final_frame).await?;
 
     let confirm_code = client
         .confirm_code()
@@ -212,7 +231,7 @@ pub async fn pair_confirm(
 #[allow(clippy::too_many_arguments)]
 async fn run_pair_pump(
     mut ws: Ws,
-    client: PairingClient,
+    mut client: PairingClient,
     device_id: String,
     keypair: StaticKeypair,
     instance_key: String,
@@ -265,7 +284,7 @@ async fn run_pair_pump(
     // Phase B: the user decided — send it and finish (or tear down on decline).
     let outcome = finish_pair(
         &mut ws,
-        &client,
+        &mut client,
         &device_id,
         &keypair,
         &instance_key,
@@ -282,7 +301,7 @@ async fn run_pair_pump(
 /// the decline path as an error, as before).
 async fn finish_pair(
     ws: &mut Ws,
-    client: &PairingClient,
+    client: &mut PairingClient,
     device_id: &str,
     keypair: &StaticKeypair,
     instance_key: &str,
@@ -302,9 +321,7 @@ async fn finish_pair(
     }
 
     let paired = match recv(ws).await? {
-        PairFrame::Sealed { nonce, ciphertext } => client
-            .on_welcome(&nonce, &ciphertext)
-            .map_err(|e| e.to_string())?,
+        PairFrame::Sealed { msg } => client.on_welcome(&msg).map_err(|e| e.to_string())?,
         // The operator declined in the window between our accept and the welcome.
         PairFrame::Reject { reason } => {
             return Err(format!("the operator declined pairing: {reason}"));
@@ -404,4 +421,24 @@ async fn recv(ws: &mut Ws) -> Result<PairFrame, String> {
             Some(Err(e)) => return Err(format!("ws: {e}")),
         }
     }
+}
+
+/// [`recv`] with a deadline, so a stalled / hostile relay can't pin the app open
+/// waiting on a frame that never arrives.
+async fn recv_timeout(ws: &mut Ws, timeout: Duration) -> Result<PairFrame, String> {
+    match tokio::time::timeout(timeout, recv(ws)).await {
+        Ok(result) => result,
+        Err(_) => Err("timed out waiting for the gateway".into()),
+    }
+}
+
+/// Decode the QR's hex `s=` into the 32-byte Noise PSK. Rejects anything that
+/// isn't exactly [`KEY_LEN`] bytes — the load-bearing high-entropy invariant
+/// (a short secret would be offline-crackable by the relay).
+fn decode_secret(s: &str) -> Result<PairingSecret, String> {
+    let bytes = hex::decode(s.trim()).map_err(|_| "pairing secret is not valid hex".to_string())?;
+    let arr: [u8; KEY_LEN] = bytes
+        .try_into()
+        .map_err(|_| format!("pairing secret must be {KEY_LEN} bytes"))?;
+    Ok(PairingSecret::from_bytes(arr))
 }

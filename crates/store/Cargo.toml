@@ -8,6 +8,7 @@ doctest = false
 
 [dependencies]
 baybo-model = { workspace = true }
+device-proto = { workspace = true }
 chrono = { workspace = true }
 
 anyhow = { workspace = true }

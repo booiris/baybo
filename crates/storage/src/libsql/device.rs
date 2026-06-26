@@ -15,7 +15,7 @@ impl LibsqlDeviceStore {
 }
 
 const COLS: &str = "user_id, device_id, label, device_pubkey, auth_token, status, \
-     pairing_code, created_at, approved_at, last_seen_at";
+     rendezvous_id, created_at, approved_at, last_seen_at";
 
 fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Internal(anyhow::anyhow!("libsql {ctx}: {e}"))
@@ -35,7 +35,7 @@ async fn fetch_row(rows: &mut libsql::Rows) -> Result<Option<DeviceRow>> {
         device_pubkey: row.get(3).map_err(|e| col_err("get device_pubkey", e))?,
         auth_token: row.get(4).map_err(|e| col_err("get auth_token", e))?,
         status,
-        pairing_code: row.get(6).map_err(|e| col_err("get pairing_code", e))?,
+        rendezvous_id: row.get(6).map_err(|e| col_err("get rendezvous_id", e))?,
         created_at: row.get(7).map_err(|e| col_err("get created_at", e))?,
         approved_at: row.get(8).map_err(|e| col_err("get approved_at", e))?,
         last_seen_at: row.get(9).map_err(|e| col_err("get last_seen_at", e))?,
@@ -57,7 +57,7 @@ impl DeviceStore for LibsqlDeviceStore {
         conn.execute(
             "INSERT INTO devices
                  (user_id, device_id, label, device_pubkey, auth_token, status,
-                  pairing_code, created_at, approved_at, last_seen_at)
+                  rendezvous_id, created_at, approved_at, last_seen_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             libsql::params![
                 row.user_id.clone(),
@@ -66,7 +66,7 @@ impl DeviceStore for LibsqlDeviceStore {
                 row.device_pubkey.clone(),
                 row.auth_token.clone(),
                 row.status.as_str().to_string(),
-                row.pairing_code.clone(),
+                row.rendezvous_id.clone(),
                 row.created_at,
                 row.approved_at,
                 row.last_seen_at,
@@ -223,7 +223,7 @@ mod tests {
             device_pubkey: vec![7u8; 32],
             auth_token: token.into(),
             status: DeviceStatus::Approved,
-            pairing_code: Some(code.into()),
+            rendezvous_id: Some(code.into()),
             created_at: 100,
             approved_at: Some(100),
             last_seen_at: None,
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(got.device_id, "d1");
         assert_eq!(got.device_pubkey, vec![7u8; 32]);
         assert_eq!(got.status, DeviceStatus::Approved);
-        assert_eq!(got.pairing_code.as_deref(), Some("ABC123"));
+        assert_eq!(got.rendezvous_id.as_deref(), Some("ABC123"));
     }
 
     #[tokio::test]

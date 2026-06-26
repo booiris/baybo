@@ -318,7 +318,7 @@ mod tests {
             device_pubkey: pubkey,
             auth_token: TEST_TOKEN.into(),
             status: DeviceStatus::Approved,
-            pairing_code: Some("WORMHOLE-1".into()),
+            rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
             created_at: 0,
             approved_at: Some(0),
             last_seen_at: None,

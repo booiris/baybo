@@ -17,21 +17,32 @@ use pairing::{PairAborted, PairChallenge, PairedSummary, PairingSessions};
 use tauri::State;
 use tauri::ipc::Channel;
 
-/// Scan-to-connect, phase 1: dial the gateway, run SPAKE2 + send `DeviceHello`,
-/// and return the Bluetooth-style confirmation code the UI shows the user to
-/// compare against the operator's terminal. `on_abort` carries a gateway-side
-/// cancellation that lands before the user decides, so the UI can dismiss the
-/// confirm screen.
+/// Scan-to-connect, phase 1: dial the gateway, run the XXpsk0 handshake + send
+/// `DeviceHello`, and return the Bluetooth-style confirmation code the UI shows
+/// the user to compare against the operator's terminal. `rendezvous_id` + `secret`
+/// come from the QR (the secret is the Noise PSK). `on_abort` carries a
+/// gateway-side cancellation that lands before the user decides, so the UI can
+/// dismiss the confirm screen.
 #[tauri::command]
 async fn pair_begin(
     sessions: State<'_, PairingSessions>,
     endpoint: String,
-    code: String,
+    rendezvous_id: String,
+    secret: String,
     label: String,
     instance_key: Option<String>,
     on_abort: Channel<PairAborted>,
 ) -> Result<PairChallenge, String> {
-    pairing::pair_begin(&sessions, &endpoint, &code, &label, instance_key, on_abort).await
+    pairing::pair_begin(
+        &sessions,
+        &endpoint,
+        &rendezvous_id,
+        &secret,
+        &label,
+        instance_key,
+        on_abort,
+    )
+    .await
 }
 
 /// Phase 2: send the user's decision. On accept — and once the operator also

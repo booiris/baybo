@@ -1,15 +1,20 @@
 //! The relay **host leg** the operator's `baybo device pair` opens.
 //!
 //! Pairing always runs through the operator's relay (C): `baybo device pair`
-//! opens an authenticated host leg on the relay (`/pair/host/{code}`, gated by
-//! its admission key) and runs the SPAKE2 + mutual-confirm [`drive`] over it. The
-//! relay blindly pipes the app's `/pair/join/{code}` leg to ours, so the
-//! handshake is byte-identical to a local socket — only the transport differs.
-//! There is no daemon-served pairing path; the gateway daemon only serves
-//! *content* for already-paired devices (see [`super::relay_content`]).
+//! opens an authenticated host leg on the relay (`/pair/host/{rendezvous_id}`,
+//! gated by its admission key) and runs the XXpsk0 + mutual-confirm [`drive`]
+//! over it. The relay blindly pipes the app's `/pair/join/{rendezvous_id}` leg to
+//! ours, so the handshake is byte-identical to a local socket — only the
+//! transport differs. There is no daemon-served pairing path; the gateway daemon
+//! only serves *content* for already-paired devices (see [`super::relay_content`]).
 //!
-//! A host leg whose app never arrives times out and is re-opened, so a live code
-//! is continuously hosted until it pairs or the operator's command exits.
+//! A host leg whose app never arrives times out and is re-opened, so a live
+//! rendezvous is continuously hosted until it pairs or the operator's command
+//! exits. Because the rendezvous id is **public**, anyone who learns it (the
+//! relay, a QR photographer, any holder of the shared admission key) can join and
+//! fail the PSK handshake to grief pairing — so on a handshake abort (as opposed
+//! to a transport/connect error) we **re-park immediately**, with no backoff, so
+//! a leg-stealer can't impose latency on the real app's retry.
 
 use std::time::Duration;
 
@@ -57,53 +62,72 @@ impl PairTransport for RelayLegTransport {
     }
 }
 
-/// Open a single `/pair/host/{code}` leg authenticated by `instance_key` and run
-/// one pairing handshake over it. `Ok(())` on a completed handshake; `Err` on a
-/// bad URL/key, a failed connect, or an aborted handshake (the app never showed,
-/// declined, …) — on an abort the leg is best-effort `Reject`ed.
+/// How a single hosted leg ended — distinguishing a transport/connect failure
+/// (back off before retrying) from a handshake abort (re-park immediately so a
+/// PSK-failing leg-stealer can't delay the real app).
+enum LegEnd {
+    /// The handshake completed — pairing is done.
+    Done,
+    /// A bad URL/key or a failed connect, before the handshake. Back off.
+    Connect(String),
+    /// The leg matched and the handshake ran but aborted (PSK mismatch, a
+    /// decline, a timeout, …). It was best-effort `Reject`ed.
+    Handshake(String),
+}
+
+/// Open a single `/pair/host/{rendezvous_id}` leg authenticated by `instance_key`
+/// and run one pairing handshake over it.
 async fn host_leg_once(
     deps: &PairingHostDeps,
     relay_url: &str,
     instance_key: &str,
-    code: &str,
-) -> Result<(), String> {
-    let url = remote_host_protocol::relay::pair_host_url(relay_url, code);
-    let mut req = url
-        .into_client_request()
-        .map_err(|e| format!("bad relay url: {e}"))?;
-    let value = instance_key
-        .parse()
-        .map_err(|e| format!("bad instance key header: {e}"))?;
-    req.headers_mut().insert(INSTANCE_KEY_HEADER, value);
-    let (ws, _) = connect_async(req)
-        .await
-        .map_err(|e| format!("host leg connect failed: {e}"))?;
+    rendezvous_id: &str,
+) -> LegEnd {
+    let url = remote_host_protocol::relay::pair_host_url(relay_url, rendezvous_id);
+    let req = match url.into_client_request() {
+        Ok(mut req) => match instance_key.parse() {
+            Ok(value) => {
+                req.headers_mut().insert(INSTANCE_KEY_HEADER, value);
+                req
+            }
+            Err(e) => return LegEnd::Connect(format!("bad instance key header: {e}")),
+        },
+        Err(e) => return LegEnd::Connect(format!("bad relay url: {e}")),
+    };
+    let ws = match connect_async(req).await {
+        Ok((ws, _)) => ws,
+        Err(e) => return LegEnd::Connect(format!("host leg connect failed: {e}")),
+    };
     let mut transport = RelayLegTransport(ws);
-    if let Err(reason) = drive(&mut transport, deps).await {
-        let _ = transport
-            .send_frame(&PairFrame::Reject {
-                reason: reason.clone(),
-            })
-            .await;
-        return Err(reason);
+    match drive(&mut transport, deps).await {
+        Ok(()) => LegEnd::Done,
+        Err(reason) => {
+            let _ = transport
+                .send_frame(&PairFrame::Reject {
+                    reason: reason.clone(),
+                })
+                .await;
+            LegEnd::Handshake(reason)
+        }
     }
-    Ok(())
 }
 
-/// Backoff before re-opening a host leg whose app never arrived.
+/// Backoff before re-opening a host leg after a *connect/transport* failure (the
+/// relay may be momentarily unreachable). Handshake aborts do **not** back off —
+/// see [`host_pairing_leg`].
 const REHOST_BACKOFF: Duration = Duration::from_millis(500);
 
-/// Host `/pair/host/{code}` on `relay_url` with `instance_key` and run the pairing
-/// handshake, re-opening the leg while the slot stays live (the operator may not
-/// have shown the QR yet, or a leg may time out waiting for the app). Returns
-/// `Ok(())` once a handshake completes, or `Err` once the slot is gone (paired /
-/// aged out) or a side declined. Driven by `baybo device pair`; the caller aborts
-/// the task when its operator flow ends.
+/// Host `/pair/host/{rendezvous_id}` on `relay_url` with `instance_key` and run
+/// the pairing handshake, re-opening the leg while the slot stays live (the
+/// operator may not have shown the QR yet, or a leg may time out / be stolen).
+/// Returns `Ok(())` once a handshake completes, or `Err` once the slot is gone
+/// (paired / aged out) or a side declined. Driven by `baybo device pair`; the
+/// caller aborts the task when its operator flow ends.
 pub async fn host_pairing_leg(
     deps: &PairingHostDeps,
     relay_url: &str,
     instance_key: &str,
-    code: &str,
+    rendezvous_id: &str,
 ) -> Result<(), String> {
     // `baybo device pair` calls this from the CLI process — outside the gateway
     // server, which installs the provider in GatewayServer::new — and our graph
@@ -111,32 +135,44 @@ pub async fn host_pairing_leg(
     // connect_async panics. Idempotent: Err means one is already installed.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     loop {
-        match host_leg_once(deps, relay_url, instance_key, code).await {
-            Ok(()) => return Ok(()),
-            Err(reason) => {
-                // Stop re-hosting once there's a terminal outcome: the slot is
-                // gone (a successful pair consumed it, or it aged out) or either
-                // side has declined — re-opening a leg then would just strand a
-                // connection that immediately rejects, and (on a decline) we want
-                // this leg to finish *after* having delivered its `Reject`, so the
-                // caller can await it. Otherwise re-host so a late/retrying app
-                // still lands.
-                let done = match deps
-                    .device_pairing
-                    .claim_slot(code)
-                    .await
-                    .map_err(|e| format!("poll slot: {e}"))?
-                {
-                    None => true,
-                    Some(slot) => {
-                        slot.operator_decision == Some(false) || slot.device_decision == Some(false)
-                    }
-                };
-                if done {
-                    return Err(reason);
-                }
-                tokio::time::sleep(REHOST_BACKOFF).await;
+        // Keep whether this was a handshake abort (re-park now) or a connect
+        // failure (back off) alongside the reason, so there is one source of truth.
+        let (reason, handshake_abort) =
+            match host_leg_once(deps, relay_url, instance_key, rendezvous_id).await {
+                LegEnd::Done => return Ok(()),
+                LegEnd::Handshake(reason) => (reason, true),
+                LegEnd::Connect(reason) => (reason, false),
+            };
+
+        // Stop re-hosting once there's a terminal outcome: the slot is gone (a
+        // successful pair consumed it, or it aged out) or either side has declined
+        // — re-opening then would just strand a connection that immediately
+        // rejects, and (on a decline) we want this leg to finish *after* having
+        // delivered its `Reject`, so the caller can await it.
+        let terminal = match deps
+            .device_pairing
+            .claim_slot(rendezvous_id)
+            .await
+            .map_err(|e| format!("poll slot: {e}"))?
+        {
+            None => true,
+            Some(slot) => {
+                slot.operator_decision == Some(false) || slot.device_decision == Some(false)
             }
+        };
+        if terminal {
+            return Err(reason);
+        }
+
+        if handshake_abort {
+            // A PSK-auth/handshake abort with a still-live slot means a
+            // leg-stealer (or a transient app glitch) failed the handshake.
+            // Re-park immediately — no backoff — so the real app's retry can match
+            // without delay, and log it so repeated griefing is observable.
+            tracing::warn!(reason = %reason, "device pair: relay leg handshake failed; re-parking");
+        } else {
+            // Hammering an unreachable relay is pointless — back off first.
+            tokio::time::sleep(REHOST_BACKOFF).await;
         }
     }
 }

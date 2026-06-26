@@ -1,4 +1,4 @@
-//! The SPAKE2 device-pairing handshake ([`drive`]) with a Bluetooth-style mutual
+//! The XXpsk0 device-pairing handshake ([`drive`]) with a Bluetooth-style mutual
 //! confirm, plus the in-process [`PairingHostDeps`] it runs against.
 //!
 //! Pairing is driven entirely by one interactive `baybo device pair`: it hosts an
@@ -7,34 +7,40 @@
 //! serves *content* for already-paired devices.
 //!
 //! Pairing happens *before* any auth token exists, so it carries no channel-token
-//! middleware — it is gated by the SPAKE2 code itself (a balanced PAKE allows one
-//! online guess per run) and then by a two-sided confirm: the phone user and the
-//! operator each approve a confirmation code derived from K before any token
-//! activates. The handshake (see [`device_proto::pairing::PairFrame`]):
+//! middleware. Its security comes from the QR **secret**, carried out of band and
+//! used as the Noise **PSK**: the relay (**C**) sees only the public
+//! `rendezvous_id` and opaque Noise frames, so — lacking the PSK — it cannot
+//! complete the handshake with either side and is reduced from MITM to
+//! denial-of-service. On top of that, a two-sided confirm authorizes the pairing:
+//! the phone user and the operator each approve a confirmation code derived from
+//! the Noise handshake hash `h` before any token activates. The handshake (see
+//! [`device_proto::pairing::PairFrame`]):
 //!
-//! 1. P → A `Hello { code, pake }` — A claims the slot and runs SPAKE2.
-//! 2. A → P `PakeReply { pake }` — both ends derive the master secret K + the confirmation code (HKDF of K).
-//! 3. P → A `Sealed(DeviceHello)` — app's static key + push registration.
-//! 4. P → A `Sealed(DeviceConfirm)` — the phone user's decision; A also waits for the operator's `y` on the live `device pair`.
-//! 5. A → P `Sealed(GatewayWelcome)` — A's static key, routing, active `auth_token`.
+//! 1. P → A `Hello { rendezvous_id, msg }` — A claims the slot, loads the secret,
+//!    builds the XXpsk0 responder, and reads the app's `msg1`.
+//! 2. A → P `HandshakeReply { msg }` — A's `msg2` (its static rides as an XX token).
+//! 3. P → A `HandshakeFinal { msg }` — the app's `msg3`, whose Noise payload is
+//!    the `DeviceHello` body; both ends are now in transport mode and share `h`.
+//! 4. P → A `Sealed(DeviceConfirm)` — the phone user's decision; A also waits for
+//!    the operator's `y` on the live `device pair`.
+//! 5. A → P `Sealed(GatewayWelcome)` — routing + active `auth_token`.
 //!
-//! On mutual confirm an **approved** device row exists (its `auth_token` active)
-//! and the per-device push key (HKDF of K) is stored in A's `SecretVault`. C
-//! never sees any of this — it only relays opaque blobs.
+//! On mutual confirm an **approved** device row exists (its `auth_token` active,
+//! its `device_pubkey` the app static learned in-band) and the per-device push
+//! key (HKDF of `h`) is stored in A's `SecretVault`. C never sees any of this.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use device_proto::kdf::{derive_confirm_code, derive_pair_keys};
+use device_proto::kdf::{derive_confirm_code, derive_push_key};
 use device_proto::pairing::{self, DeviceConfirm, DeviceHello, GatewayWelcome, PairFrame};
-use device_proto::pake::Pake;
+use device_proto::psk_pair::{PskHandshake, PskTransport, build_prologue};
 
 use baybo_pairing::DevicePairingService;
 use baybo_security::SecretVault;
 
 use crate::device::load_or_create_static_keypair;
 
-/// The slice of gateway state the pairing handshake ([`drive`]) needs. Carried
 /// The dependencies the pairing handshake ([`drive`]) needs, built by the
 /// operator's `baybo device pair` from CLI deps. Carried explicitly so [`drive`]
 /// can run over the relay host leg (see [`super::relay_pair::host_pairing_leg`])
@@ -45,6 +51,9 @@ pub struct PairingHostDeps {
     pub secret_vault: Arc<SecretVault>,
     /// Base WS URL of the relay, advertised to the app in
     /// `GatewayWelcome.relay_url` and gating the `relay_node_id`; empty = no relay.
+    /// It is also bound into the handshake prologue, so the app's QR `h=` and this
+    /// value must agree (anti-cross-binding: the relay can't wire the app to a
+    /// gateway on a different endpoint).
     pub relay_url: String,
 }
 
@@ -62,38 +71,66 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     transport: &mut T,
     state: &PairingHostDeps,
 ) -> Result<(), String> {
-    // 1. Hello — the pairing code + the app's SPAKE2 message.
-    let PairFrame::Hello { code, pake } = transport.recv_frame(PAIR_STEP_TIMEOUT).await? else {
+    // 1. Hello — the public rendezvous id + the app's first handshake message.
+    let PairFrame::Hello { rendezvous_id, msg } = transport.recv_frame(PAIR_STEP_TIMEOUT).await?
+    else {
         return Err("expected Hello frame".into());
     };
 
-    // 2. Authorize against the live slot, then run SPAKE2 (gateway side).
+    // 2. Authorize against the live slot (which holds the QR secret), then build
+    //    the XXpsk0 responder. An unknown / expired rendezvous is refused before
+    //    any crypto runs; a wrong PSK fails the handshake below (fail closed).
     let slot = state
         .device_pairing
-        .claim_slot(&code)
+        .claim_slot(&rendezvous_id)
         .await
         .map_err(|e| format!("claim slot: {e}"))?
-        .ok_or_else(|| "unknown or expired pairing code".to_string())?;
-    let (pake_state, gw_pake) = Pake::start_gateway(&code);
-    let k = pake_state.finish(&pake).map_err(|e| format!("pake: {e}"))?;
-    let keys = derive_pair_keys(&k).map_err(|e| format!("kdf: {e}"))?;
+        .ok_or_else(|| "unknown or expired rendezvous id".to_string())?;
 
-    // 3. Hand the app our SPAKE2 message; it derives the same K.
+    // A's static Noise identity (loaded/created from the vault) — its secret is
+    // the responder's static, exchanged in-band as an XX token.
+    let static_key = load_or_create_static_keypair(&state.secret_vault)
+        .await
+        .map_err(|e| format!("static key: {e}"))?;
+
+    let prologue = build_prologue(&rendezvous_id, &state.relay_url);
+    let mut handshake =
+        PskHandshake::start_responder(&static_key.secret(), &slot.secret, &prologue)
+            .map_err(|e| format!("build responder: {e}"))?;
+    handshake
+        .read_handshake(&msg)
+        .map_err(|e| format!("read msg1: {e}"))?;
+
+    // 3. Hand the app our msg2; it learns A's static (as an XX token) from it.
+    let msg2 = handshake
+        .write_handshake(&[])
+        .map_err(|e| format!("write msg2: {e}"))?;
     transport
-        .send_frame(&PairFrame::PakeReply { pake: gw_pake })
+        .send_frame(&PairFrame::HandshakeReply { msg: msg2 })
         .await?;
 
-    // 4. Sealed DeviceHello — app static key + push registration.
-    let PairFrame::Sealed { nonce, ciphertext } = transport.recv_frame(PAIR_STEP_TIMEOUT).await?
-    else {
-        return Err("expected sealed DeviceHello".into());
+    // 4. msg3 — the app's static (XX token) + the DeviceHello body as the Noise
+    //    payload. A PSK mismatch / tampered frame aborts here.
+    let PairFrame::HandshakeFinal { msg } = transport.recv_frame(PAIR_STEP_TIMEOUT).await? else {
+        return Err("expected HandshakeFinal".into());
     };
-    let hello: DeviceHello = pairing::open_msg(&keys.channel_key, &nonce, &ciphertext)
-        .map_err(|e| format!("open DeviceHello: {e}"))?;
+    let hello_body = handshake
+        .read_handshake(&msg)
+        .map_err(|e| format!("read msg3: {e}"))?;
+    let mut noise = handshake
+        .into_transport()
+        .map_err(|e| format!("enter transport mode: {e}"))?;
+    let hello: DeviceHello =
+        pairing::decode(&hello_body).map_err(|e| format!("decode DeviceHello: {e}"))?;
+    // The app's authenticated static, learned in-band — the identity the durable
+    // row pins and the content channel later authenticates against.
+    let app_static = *noise.remote_static();
 
-    // 5. Mutual confirm. Publish the confirmation code (derived from K) onto the
-    //    slot so the operator's live `device pair` shows it, then require BOTH
-    //    the phone user and the operator to approve before any token activates.
+    // 5. Mutual confirm. The confirm code is the channel binding: HKDF of the
+    //    Noise handshake hash `h`, which commits to both statics and the whole
+    //    live transcript, so it is not grindable or precomputable. Publish it
+    //    onto the slot so the operator's live `device pair` shows it, then require
+    //    BOTH the phone user and the operator to approve before any token activates.
     // Resolve the device label: the operator's `device pair <label>` override if
     // they passed one, else the name the device reports in `DeviceHello`.
     let device_label = if slot.label.is_empty() {
@@ -101,10 +138,16 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     } else {
         slot.label.as_str()
     };
-    let confirm_code = derive_confirm_code(&k).map_err(|e| format!("confirm code: {e}"))?;
+    let confirm_code =
+        derive_confirm_code(noise.handshake_hash()).map_err(|e| format!("confirm code: {e}"))?;
     state
         .device_pairing
-        .publish_confirm(&slot.code, &confirm_code, &hello.device_id, device_label)
+        .publish_confirm(
+            &slot.rendezvous_id,
+            &confirm_code,
+            &hello.device_id,
+            device_label,
+        )
         .await
         .map_err(|e| format!("publish confirm: {e}"))?;
 
@@ -114,10 +157,7 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     //   it). Both must be "accept" — but the moment either side declines (or the
     //   phone drops) we abort so the *other* side isn't left hanging: the phone
     //   learns via the Reject `run_pairing`/`host_leg_once` sends on our `Err`, and
-    //   the operator learns via the `device_decision` we record on the slot. (The
-    //   old serial order — phone first, then operator — meant an operator decline
-    //   went unseen until the phone tapped, and a phone decline never reached the
-    //   operator at all.)
+    //   the operator learns via the `device_decision` we record on the slot.
     {
         let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
         let phone_confirm = transport.recv_frame(CONFIRM_TIMEOUT);
@@ -128,14 +168,14 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
             tokio::select! {
                 biased;
                 // The phone user's sealed DeviceConfirm — awaited only until it lands.
-                frame = &mut phone_confirm, if !phone_ok => match phone_decision(frame, &keys.channel_key) {
+                frame = &mut phone_confirm, if !phone_ok => match phone_decision(frame, &mut noise) {
                     PhoneDecision::Accepted => phone_ok = true,
                     PhoneDecision::Declined => {
-                        record_device_decline(state, &slot.code).await;
+                        record_device_decline(state, &slot.rendezvous_id).await;
                         return Err("the device declined pairing".into());
                     }
                     PhoneDecision::Aborted(reason) => {
-                        record_device_decline(state, &slot.code).await;
+                        record_device_decline(state, &slot.rendezvous_id).await;
                         return Err(reason);
                     }
                 },
@@ -143,7 +183,7 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
                 _ = tokio::time::sleep(CONFIRM_POLL_INTERVAL), if !operator_ok => {
                     let decision = state
                         .device_pairing
-                        .claim_slot(&slot.code)
+                        .claim_slot(&slot.rendezvous_id)
                         .await
                         .map_err(|e| format!("poll operator decision: {e}"))?
                         .ok_or_else(|| {
@@ -163,28 +203,26 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         }
     }
 
-    // 6. Finalize: write an approved device row + consume the slot.
+    // 6. Finalize: write an approved device row (pinning the app static learned
+    //    in-band) + consume the slot (zeroizing the secret it held).
     let row = state
         .device_pairing
-        .complete(
-            &slot,
-            &hello.device_id,
-            hello.static_pubkey.to_vec(),
-            device_label,
-        )
+        .complete(&slot, &hello.device_id, app_static.to_vec(), device_label)
         .await
         .map_err(|e| format!("complete pairing: {e}"))?;
 
-    // 6. Persist the per-device push key (HKDF of K) in A's vault, keyed by
-    //    device_id (the NSE selects it by `bid` at push time).
+    // 6a. Persist the per-device push key (HKDF of `h`) in A's vault, keyed by
+    //     device_id (the NSE selects it by `bid` at push time).
+    let push_key =
+        derive_push_key(noise.handshake_hash()).map_err(|e| format!("derive push key: {e}"))?;
     let push_key_name = crate::push::device_push_key_secret_name(&hello.device_id);
     state
         .secret_vault
-        .store_secret(&push_key_name, &keys.push_key)
+        .store_secret(&push_key_name, &push_key)
         .await
         .map_err(|e| format!("store push key: {e}"))?;
     // 6b. Persist the APNs registration material (token + env) in the vault so a
-    //     transient `/register` failure below is retriable — the push dispatcher
+    //     transient `/register` failure is retriable — the push dispatcher
     //     re-registers an approved device from this before its first push.
     let apns_reg = crate::push::DeviceApnsRegistration {
         apns_token: hello.apns_token.clone(),
@@ -200,19 +238,11 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         )
         .await
         .map_err(|e| format!("store apns registration: {e}"))?;
-    // The token persisted above is enough: the daemon's push dispatcher registers
-    // the device with the remote host (C) from that material before its first
-    // push. (Pairing runs in `baybo device pair`, which has no dispatcher.)
 
-    // 7. A's static Noise identity (lazily loaded/created from the vault).
-    let static_key = load_or_create_static_keypair(&state.secret_vault)
-        .await
-        .map_err(|e| format!("static key: {e}"))?;
-
-    // 8. Sealed GatewayWelcome — A's static key + the routing the app reaches it
-    //    by: direct candidates from config, and (when a relay is configured) the
-    //    gateway's stable relay_node_id + the relay's base URL so the app can
-    //    fall back to the blind relay when every direct candidate fails.
+    // 7. Sealed GatewayWelcome — the routing the app reaches A by (the gateway's
+    //    stable relay_node_id + the relay's base URL when a relay is configured)
+    //    + the active auth_token. A's static is not carried: the app already
+    //    learned it as an XX token during the handshake.
     let (relay_node_id, relay_url) = if state.relay_url.is_empty() {
         (String::new(), String::new())
     } else {
@@ -222,17 +252,17 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         (node_id, state.relay_url.clone())
     };
     let welcome = GatewayWelcome {
-        static_pubkey: static_key.public(),
         relay_node_id,
         relay_url,
         user_id: slot.user_id.clone(),
-        pairing_code: slot.code.clone(),
+        rendezvous_id: slot.rendezvous_id.clone(),
         auth_token: row.auth_token.clone(),
     };
-    let (nonce, ciphertext) =
-        pairing::seal_msg(&keys.channel_key, &welcome).map_err(|e| format!("seal welcome: {e}"))?;
+    let sealed = noise
+        .write(&pairing::encode(&welcome).map_err(|e| format!("encode welcome: {e}"))?)
+        .map_err(|e| format!("seal welcome: {e}"))?;
     transport
-        .send_frame(&PairFrame::Sealed { nonce, ciphertext })
+        .send_frame(&PairFrame::Sealed { msg: sealed })
         .await?;
 
     tracing::info!(
@@ -253,32 +283,37 @@ enum PhoneDecision {
     Aborted(String),
 }
 
-/// Open the phone's confirm frame and classify the decision. `frame` is the raw
-/// receive result, so a transport error (timeout / closed socket) maps to
-/// [`PhoneDecision::Aborted`] rather than being lost.
-fn phone_decision(
-    frame: Result<PairFrame, String>,
-    channel_key: &[u8; device_proto::aead::KEY_LEN],
-) -> PhoneDecision {
+/// Open the phone's confirm frame (a Noise transport message) and classify the
+/// decision. `frame` is the raw receive result, so a transport error (timeout /
+/// closed socket) maps to [`PhoneDecision::Aborted`] rather than being lost.
+fn phone_decision(frame: Result<PairFrame, String>, noise: &mut PskTransport) -> PhoneDecision {
     let frame = match frame {
         Ok(frame) => frame,
         Err(reason) => return PhoneDecision::Aborted(reason),
     };
-    let PairFrame::Sealed { nonce, ciphertext } = frame else {
+    let PairFrame::Sealed { msg } = frame else {
         return PhoneDecision::Aborted("expected sealed DeviceConfirm".into());
     };
-    match pairing::open_msg::<DeviceConfirm>(channel_key, &nonce, &ciphertext) {
+    let plaintext = match noise.read(&msg) {
+        Ok(pt) => pt,
+        Err(e) => return PhoneDecision::Aborted(format!("open DeviceConfirm: {e}")),
+    };
+    match pairing::decode::<DeviceConfirm>(&plaintext) {
         Ok(confirm) if confirm.accepted => PhoneDecision::Accepted,
         Ok(_) => PhoneDecision::Declined,
-        Err(e) => PhoneDecision::Aborted(format!("open DeviceConfirm: {e}")),
+        Err(e) => PhoneDecision::Aborted(format!("decode DeviceConfirm: {e}")),
     }
 }
 
 /// Best-effort: mark the slot so the operator's live `device pair` learns the
 /// phone backed out and stops waiting. A failure here only costs the operator a
 /// fall-through to their own timeout, so it must not mask the original abort.
-async fn record_device_decline(state: &PairingHostDeps, code: &str) {
-    if let Err(e) = state.device_pairing.set_device_decision(code, false).await {
+async fn record_device_decline(state: &PairingHostDeps, rendezvous_id: &str) {
+    if let Err(e) = state
+        .device_pairing
+        .set_device_decision(rendezvous_id, false)
+        .await
+    {
         tracing::debug!(error = %e, "device pair: failed to record device decline on slot");
     }
 }
@@ -297,9 +332,9 @@ mod tests {
     use super::*;
     use crate::test_support::{TestGateway, build_test_deps};
     use baybo_store::DeviceStatus;
-    use device_proto::kdf::PairKeys;
     use device_proto::noise::StaticKeypair;
     use device_proto::pairing::ApnsEnv;
+    use device_proto::psk_pair::PairingSecret;
     use tokio::task::JoinHandle;
 
     /// Per-step receive budget for the scripted app side.
@@ -374,9 +409,55 @@ mod tests {
         })
     }
 
-    /// The full SPAKE2 handshake over the in-memory transport: an app-side client
-    /// drives it end to end, both ends confirm, and an approved device row +
-    /// stored push key result.
+    /// The app-side XXpsk0 handshake: drive `Hello`/`HandshakeReply`/
+    /// `HandshakeFinal` over `client`, returning the transport (in transport
+    /// mode) so the test can exchange `DeviceConfirm` / `GatewayWelcome`.
+    /// `relay_url` must match the gateway's (the prologue binds it).
+    async fn app_handshake(
+        client: &mut ChanTransport,
+        rendezvous_id: &str,
+        secret: &PairingSecret,
+        relay_url: &str,
+        device_id: &str,
+    ) -> PskTransport {
+        let app_static = StaticKeypair::generate().unwrap();
+        let prologue = build_prologue(rendezvous_id, relay_url);
+        let mut hs =
+            PskHandshake::start_initiator(&app_static.secret(), secret, &prologue).unwrap();
+
+        let msg1 = hs.write_handshake(&[]).unwrap();
+        client
+            .send_frame(&PairFrame::Hello {
+                rendezvous_id: rendezvous_id.to_string(),
+                msg: msg1,
+            })
+            .await
+            .unwrap();
+
+        let PairFrame::HandshakeReply { msg } = client.recv_frame(STEP).await.unwrap() else {
+            panic!("expected HandshakeReply");
+        };
+        hs.read_handshake(&msg).unwrap();
+
+        let hello = DeviceHello {
+            device_id: device_id.to_string(),
+            label: "Test iPhone".into(),
+            apns_token: "apns-tok".into(),
+            apns_env: ApnsEnv::Sandbox,
+        };
+        let msg3 = hs
+            .write_handshake(&pairing::encode(&hello).unwrap())
+            .unwrap();
+        client
+            .send_frame(&PairFrame::HandshakeFinal { msg: msg3 })
+            .await
+            .unwrap();
+
+        hs.into_transport().unwrap()
+    }
+
+    /// The full handshake end to end, both ends confirm, and an approved device
+    /// row + stored push key result.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_pairing_handshake_lands_approved_device() {
         let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
@@ -386,68 +467,56 @@ mod tests {
 
         // Operator mints a slot with no label (the bare `baybo device pair`): the
         // device's reported name should flow through instead.
-        let code = device_pairing.mint("user-1", "").await.unwrap();
-        // Operator confirms in their live session. Set up front so the poll finds
-        // it without a timing race.
+        let (rid, secret) = device_pairing.mint("user-1", "").await.unwrap();
+        // Operator confirms in their live session, up front (no timing race).
         device_pairing
-            .set_operator_decision(&code, true)
+            .set_operator_decision(&rid, true)
             .await
             .unwrap();
 
         let (server, mut client) = duplex();
         let drive_task = spawn_drive(server, deps);
 
-        // 1–2: SPAKE2 (app side).
-        let (pake, app_msg) = Pake::start_app(&code);
-        client
-            .send_frame(&PairFrame::Hello {
-                code: code.clone(),
-                pake: app_msg,
-            })
-            .await
-            .unwrap();
-        let PairFrame::PakeReply { pake: gw_pake } = client.recv_frame(STEP).await.unwrap() else {
-            panic!("expected PakeReply");
-        };
-        let k = pake.finish(&gw_pake).unwrap();
-        let keys = derive_pair_keys(&k).unwrap();
+        let mut app = app_handshake(&mut client, &rid, &secret, "", "dev-xyz").await;
+        let app_static = *app.remote_static(); // A's static, learned in-band
+        let confirm_code = derive_confirm_code(app.handshake_hash()).unwrap();
 
-        // 3: sealed DeviceHello.
-        let device_static = StaticKeypair::generate().unwrap();
-        let hello = DeviceHello {
-            device_id: "dev-xyz".into(),
-            label: "Test iPhone".into(),
-            static_pubkey: device_static.public(),
-            apns_token: "apns-tok".into(),
-            apns_env: ApnsEnv::Sandbox,
-        };
-        let (nonce, ciphertext) = pairing::seal_msg(&keys.channel_key, &hello).unwrap();
-        client
-            .send_frame(&PairFrame::Sealed { nonce, ciphertext })
-            .await
-            .unwrap();
+        // The gateway publishes the confirm code onto the slot after it reads
+        // HandshakeFinal — poll until it lands, then assert it matches what the
+        // app derived from `h` (both ends derive the same channel binding).
+        let mut published = None;
+        for _ in 0..100 {
+            if let Some(slot) = device_pairing.claim_slot(&rid).await.unwrap()
+                && slot.confirm_code.is_some()
+            {
+                published = slot.confirm_code;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(published.as_deref(), Some(confirm_code.as_str()));
 
-        // 3b: sealed DeviceConfirm — the phone user accepts the shown code.
-        let confirm = DeviceConfirm { accepted: true };
-        let (nonce, ciphertext) = pairing::seal_msg(&keys.channel_key, &confirm).unwrap();
+        // Phone accepts → sealed DeviceConfirm.
+        let confirm = app
+            .write(&pairing::encode(&DeviceConfirm { accepted: true }).unwrap())
+            .unwrap();
         client
-            .send_frame(&PairFrame::Sealed { nonce, ciphertext })
+            .send_frame(&PairFrame::Sealed { msg: confirm })
             .await
             .unwrap();
 
-        // 4: sealed GatewayWelcome.
-        let PairFrame::Sealed { nonce, ciphertext } = client.recv_frame(STEP).await.unwrap() else {
+        // Sealed GatewayWelcome.
+        let PairFrame::Sealed { msg } = client.recv_frame(STEP).await.unwrap() else {
             panic!("expected sealed GatewayWelcome");
         };
-        let welcome: GatewayWelcome =
-            pairing::open_msg(&keys.channel_key, &nonce, &ciphertext).unwrap();
+        let welcome: GatewayWelcome = pairing::decode(&app.read(&msg).unwrap()).unwrap();
         assert_eq!(welcome.user_id, "user-1");
         assert!(!welcome.auth_token.is_empty());
-        assert_eq!(welcome.static_pubkey.len(), 32);
+        assert_eq!(welcome.rendezvous_id, rid);
         drive_task.await.unwrap().unwrap();
 
-        // An approved device row landed with the app's static key + the active
-        // token, and the per-device push key (HKDF of K) is stored.
+        // An approved device row landed pinning the app's in-band static + the
+        // active token, and the per-device push key (HKDF of `h`) is stored.
         let row = device_store
             .get("user-1", "dev-xyz")
             .await
@@ -459,34 +528,49 @@ mod tests {
             "no operator label → the device's reported name is used"
         );
         assert_eq!(row.auth_token, welcome.auth_token);
-        assert_eq!(row.device_pubkey, device_static.public().to_vec());
+        // The gateway pinned A's *peer* static — i.e. the app's static key.
+        assert_eq!(row.device_pubkey.len(), 32);
+        assert_ne!(
+            row.device_pubkey,
+            app_static.to_vec(),
+            "the row pins the app static, not the gateway's"
+        );
+        let push_key = derive_push_key(app.handshake_hash()).unwrap();
         let pk = vault
             .get_secret("device.dev-xyz.push_key")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(pk.as_bytes(), keys.push_key.as_slice());
+        assert_eq!(pk.as_bytes(), push_key.as_slice());
 
-        // The durable device row retains the code it paired under.
-        assert_eq!(row.pairing_code.as_deref(), Some(code.as_str()));
+        // The durable row retains the public rendezvous id it paired under.
+        assert_eq!(row.rendezvous_id.as_deref(), Some(rid.as_str()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pairing_with_bad_code_is_rejected() {
+    async fn pairing_with_unknown_rendezvous_is_rejected() {
         let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
         let (deps, _device_pairing) = deps_from(&tg);
         let (server, mut client) = duplex();
         let drive_task = spawn_drive(server, deps);
 
-        let (_pake, app_msg) = Pake::start_app("NEVER1");
+        // A never-minted rendezvous id → the handshake aborts before any crypto.
+        let app_static = StaticKeypair::generate().unwrap();
+        let prologue = build_prologue("ghost-rid", "");
+        let mut hs = PskHandshake::start_initiator(
+            &app_static.secret(),
+            &PairingSecret::generate(),
+            &prologue,
+        )
+        .unwrap();
+        let msg1 = hs.write_handshake(&[]).unwrap();
         client
             .send_frame(&PairFrame::Hello {
-                code: "NEVER1".into(),
-                pake: app_msg,
+                rendezvous_id: "ghost-rid".into(),
+                msg: msg1,
             })
             .await
             .unwrap();
-        // Never-minted code → the handshake aborts and the leg rejects.
         match client.recv_frame(STEP).await {
             Ok(PairFrame::Reject { .. }) => {}
             other => panic!("expected Reject, got {other:?}"),
@@ -494,71 +578,77 @@ mod tests {
         assert!(drive_task.await.unwrap().is_err());
     }
 
-    /// Drive a client through SPAKE2 + the sealed `DeviceHello` and stop just
-    /// before the mutual-confirm step. Returns the test gateway (kept alive for
-    /// its libsql tempdir), the client transport, the derived keys, the slot code,
-    /// the pairing service (to script the operator side / inspect the slot), and
-    /// the running `drive` task.
+    /// A relay that knows the public rendezvous id but not the QR secret cannot
+    /// complete the handshake — the PSK mismatch aborts it (MITM → DoS). The
+    /// gateway can't even open the app's `msg1` (its empty payload is AEAD-sealed
+    /// under a key derived from the PSK), so it rejects before `HandshakeReply`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrong_secret_is_rejected() {
+        let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+        let (deps, device_pairing) = deps_from(&tg);
+        let (server, mut client) = duplex();
+        let drive_task = spawn_drive(server, deps);
+
+        let (rid, _real_secret) = device_pairing.mint("user-1", "").await.unwrap();
+        // The attacker uses the right rendezvous id but a guessed secret.
+        let app_static = StaticKeypair::generate().unwrap();
+        let prologue = build_prologue(&rid, "");
+        let mut hs = PskHandshake::start_initiator(
+            &app_static.secret(),
+            &PairingSecret::generate(),
+            &prologue,
+        )
+        .unwrap();
+        let msg1 = hs.write_handshake(&[]).unwrap();
+        client
+            .send_frame(&PairFrame::Hello {
+                rendezvous_id: rid,
+                msg: msg1,
+            })
+            .await
+            .unwrap();
+        match client.recv_frame(STEP).await {
+            Ok(PairFrame::Reject { .. }) => {}
+            other => panic!("expected Reject on a wrong PSK, got {other:?}"),
+        }
+        assert!(
+            drive_task.await.unwrap().is_err(),
+            "a wrong PSK must abort pairing"
+        );
+    }
+
+    /// Drive the app through the handshake and stop just before the mutual-confirm
+    /// step. Returns the test gateway, the client transport + its noise session,
+    /// the rendezvous id, the pairing service, and the running `drive` task.
     async fn drive_to_confirm() -> (
         TestGateway,
         ChanTransport,
-        PairKeys,
+        PskTransport,
         String,
         Arc<DevicePairingService>,
         JoinHandle<Result<(), String>>,
     ) {
         let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
         let (deps, device_pairing) = deps_from(&tg);
-        let code = device_pairing.mint("user-1", "").await.unwrap();
+        let (rid, secret) = device_pairing.mint("user-1", "").await.unwrap();
 
         let (server, mut client) = duplex();
         let drive_task = spawn_drive(server, deps);
+        let app = app_handshake(&mut client, &rid, &secret, "", "dev-xyz").await;
 
-        let (pake, app_msg) = Pake::start_app(&code);
-        client
-            .send_frame(&PairFrame::Hello {
-                code: code.clone(),
-                pake: app_msg,
-            })
-            .await
-            .unwrap();
-        let PairFrame::PakeReply { pake: gw_pake } = client.recv_frame(STEP).await.unwrap() else {
-            panic!("expected PakeReply");
-        };
-        let k = pake.finish(&gw_pake).unwrap();
-        let keys = derive_pair_keys(&k).unwrap();
-
-        let device_static = StaticKeypair::generate().unwrap();
-        let hello = DeviceHello {
-            device_id: "dev-xyz".into(),
-            label: "Test iPhone".into(),
-            static_pubkey: device_static.public(),
-            apns_token: "apns-tok".into(),
-            apns_env: ApnsEnv::Sandbox,
-        };
-        let (nonce, ciphertext) = pairing::seal_msg(&keys.channel_key, &hello).unwrap();
-        client
-            .send_frame(&PairFrame::Sealed { nonce, ciphertext })
-            .await
-            .unwrap();
-
-        (tg, client, keys, code, device_pairing, drive_task)
+        (tg, client, app, rid, device_pairing, drive_task)
     }
 
     /// Direction ②: the operator declines while the phone is still on the confirm
-    /// screen (no `DeviceConfirm` sent yet). The handshake must notice the operator
-    /// decline *concurrently* and reject the phone promptly, rather than blocking
-    /// on a phone tap that may never come (the old serial order did).
+    /// screen. The handshake must notice the operator decline *concurrently* and
+    /// reject the phone promptly, rather than blocking on a phone tap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn operator_decline_before_phone_confirm_rejects_promptly() {
-        let (_tg, mut client, _keys, code, device_pairing, drive_task) = drive_to_confirm().await;
-        // Operator declines on their terminal; the phone has not tapped.
+        let (_tg, mut client, _app, rid, device_pairing, drive_task) = drive_to_confirm().await;
         device_pairing
-            .set_operator_decision(&code, false)
+            .set_operator_decision(&rid, false)
             .await
             .unwrap();
-        // The handshake aborts and rejects the phone without ever seeing a confirm
-        // (the `STEP` recv budget also asserts it doesn't block on the phone tap).
         match client.recv_frame(STEP).await {
             Ok(PairFrame::Reject { .. }) => {}
             other => panic!("expected prompt Reject, got {other:?}"),
@@ -568,26 +658,22 @@ mod tests {
 
     /// Direction ①: the phone user declines. The handshake aborts, rejects the
     /// phone, and records a device-side decline on the slot so the operator's
-    /// polling `device pair` learns the device backed out instead of waiting out
-    /// its own timeout.
+    /// polling `device pair` learns the device backed out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn phone_decline_records_device_decision_on_slot() {
-        let (_tg, mut client, keys, code, device_pairing, drive_task) = drive_to_confirm().await;
-        // The phone user taps Cancel.
-        let (nonce, ciphertext) =
-            pairing::seal_msg(&keys.channel_key, &DeviceConfirm { accepted: false }).unwrap();
+        let (_tg, mut client, mut app, rid, device_pairing, drive_task) = drive_to_confirm().await;
+        let confirm = app
+            .write(&pairing::encode(&DeviceConfirm { accepted: false }).unwrap())
+            .unwrap();
         client
-            .send_frame(&PairFrame::Sealed { nonce, ciphertext })
+            .send_frame(&PairFrame::Sealed { msg: confirm })
             .await
             .unwrap();
-        // The handshake rejects the phone …
         match client.recv_frame(STEP).await {
             Ok(PairFrame::Reject { .. }) => {}
             other => panic!("expected Reject, got {other:?}"),
         }
-        // … and the device-side decline is now visible to the operator's poll (the
-        // slot survives — only a successful pair consumes it).
-        let slot = device_pairing.claim_slot(&code).await.unwrap().unwrap();
+        let slot = device_pairing.claim_slot(&rid).await.unwrap().unwrap();
         assert_eq!(slot.device_decision, Some(false));
         assert_eq!(slot.operator_decision, None);
         assert!(drive_task.await.unwrap().is_err());

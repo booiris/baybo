@@ -7,16 +7,22 @@ the overall design and the A (gateway) / C (remote-host) / P (phone) roles.
 ## What already landed (for context)
 
 - **Pairing**: Bluetooth-style mutual-confirm handshake (both the phone user and
-  the operator confirm a code derived from the SPAKE2 secret; no separate
-  `device approve` step; device rows are `Approved` from creation). `device pair`
-  is interactive, label is optional (the device reports its own name), renders a
-  terminal QR, default endpoint `wss://proxy.baybo.space`.
+  the operator confirm a code derived from the Noise handshake hash `h`; no
+  separate `device approve` step; device rows are `Approved` from creation).
+  `device pair` is interactive, label is optional (the device reports its own
+  name), renders a terminal QR, default endpoint `wss://proxy.baybo.space`. The
+  former malicious-relay MITM is **closed** (TODO #6): the QR carries a public
+  `rendezvous_id` (C's routing key) *and* a 256-bit `secret` used as the Noise
+  **XXpsk0** PSK, which C never sees — so a hostile relay can't complete the
+  handshake (MITM → DoS).
 - **Relay pairing (C+A+P)**: the unified `remote-host` binary hosts the blind
-  rendezvous (`/pair/host/{code}` — the gateway presents its `x-instance-key`,
-  checked against the polled `admitted_instances` SQLite table; `/pair/join/{code}`
-  for the app). The gateway's `channel/relay_pair.rs` host manager parks a leg per
-  live slot; the app joins `/pair/join/<code>` when the QR carries `&relay=1`.
-  `drive()` is transport-generic (`PairTransport`).
+  rendezvous (`/pair/host/{rendezvous_id}` — the gateway presents its
+  `x-instance-key`, checked against the polled `admitted_instances` SQLite table;
+  `/pair/join/{rendezvous_id}` for the app). The gateway's `channel/relay_pair.rs`
+  host manager parks a leg per live slot (re-parking immediately on a PSK-auth
+  failure so a leg-stealer can't grief); the app joins
+  `/pair/join/<rendezvous_id>`. Pairing is relay-only. `drive()` is
+  transport-generic (`PairTransport`).
 - **Persist**: after pairing the app stores a `PairedRecord` (auth token,
   gateway static key, routing candidates, relay_node_id, Noise static secret) in
   the App Group keychain; `paired_user` + a React "remembered" view on launch.
@@ -141,6 +147,44 @@ for host and `aarch64-apple-ios-sim`; real end-to-end delivery still needs #4
   in `remote-host/crates/server/src/main.rs` (see the `TODO(dashboard)` there),
   likely behind a `DASHBOARD_ENABLE` env gate.
 - **PR #132** is closed; reopen or open a fresh PR when ready.
+
+### 6. Pairing malicious-relay MITM (SECURITY) ✅ done
+
+Closed per [`pairing-mitm-xxpsk.md`](pairing-mitm-xxpsk.md). The pairing value is
+split into a public `rendezvous_id` (the only thing C sees — the broker key, the
+`/pair/{host,join}/{rendezvous_id}` param, the slot/first-frame selector) and a
+256-bit CSPRNG `secret` carried **only** in the QR. Pairing now runs
+**`Noise_XXpsk0_25519_ChaChaPoly_SHA256`** (app = initiator, gateway = responder)
+with the secret as the PSK; SPAKE2 (`device-proto/src/pake.rs`) and the `spake2`
+dep are deleted. What landed:
+
+- **`device-proto`** (`psk_pair.rs`): the XXpsk0 state machine over `snow`
+  (`PskHandshake`/`PskTransport`), a 256-bit `PairingSecret` newtype (CSPRNG ctor
+  + `from_bytes` only — no string ctor, `Zeroize`/redacted `Debug`), and a
+  canonical versioned length-prefixed **prologue** binding
+  `version ‖ rendezvous_id ‖ endpoint ‖ role-labels` (anti-splice /
+  anti-cross-binding, role binding). `kdf.rs` derives the confirm code + push key
+  from the handshake hash `h` (binds both statics; not grindable). `PairFrame`
+  reshaped to `Hello{rendezvous_id,msg}` / `HandshakeReply` / `HandshakeFinal` /
+  `Sealed{msg}` / `Reject`; the statics ride as XX tokens (dropped from
+  `DeviceHello`/`GatewayWelcome`); transport msgs use snow's implicit nonce.
+- **Secret hygiene**: the secret lives only in the in-memory `DevicePairingSlot`
+  (zeroized on drop) — never a plaintext column, never the durable `DeviceRow`
+  (which stores `rendezvous_id`), never `device list`, `GatewayWelcome`,
+  `PairedSummary`, or a log. `device list`'s column + JSON key are `rendezvous_id`.
+- **Stage 3 relay rename** + honest doc comments (C sees only the public
+  rendezvous id) across `remote-host` protocol/serve/broker.
+- **Hardening**: re-park immediately on PSK-auth failure (no backoff) + a
+  per-rendezvous `/pair/join` rate limit + a warn metric on PSK failures; the
+  app times out the handshake reply; the typeable QR fallback is removed (a render
+  failure errors out asking for a wider terminal — never a shortened secret and
+  never written to disk); the operator confirm prompt defaults to **no**.
+
+Pairing is **relay-only** (no direct/LAN pairing route); the prologue binds
+`endpoint`, which is what prevents cross-relay binding. Out of scope (unchanged):
+one-app-per-gateway policy; `NKpsk0`/gateway-static-in-QR; dropping the shared
+`guest` admission key (the PSK already defeats MITM, and the re-park + join
+rate-limit cover the residual griefing).
 
 ---
 
