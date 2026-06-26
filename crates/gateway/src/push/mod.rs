@@ -240,13 +240,12 @@ impl PushDispatcher {
             && ev.kind == JobInputKind::UserChat
     }
 
-    /// Process one lifecycle event; returns how many devices were notified.
-    /// Tracks the turn's start cursor (for read-after-write) and dispatches on
-    /// the completed edge.
-    pub async fn handle_event(&self, ev: &JobLifecycleEvent) -> usize {
+    /// Process one lifecycle event: track the turn's start cursor (for
+    /// read-after-write) and dispatch on the completed edge.
+    pub async fn handle_event(&self, ev: &JobLifecycleEvent) {
         // Only real user turns are relevant at all.
         if ev.shape != JobShape::Turn || ev.kind != JobInputKind::UserChat {
-            return 0;
+            return;
         }
         match ev.phase {
             JobPhase::Started => {
@@ -258,17 +257,15 @@ impl PushDispatcher {
                     .flatten()
                     .unwrap_or(0);
                 self.start_cursors.lock().insert(ev.job_id, cursor);
-                0
             }
             JobPhase::Completed => self.dispatch_completed(ev).await,
             JobPhase::Failed | JobPhase::Cancelled => {
                 self.start_cursors.lock().remove(&ev.job_id);
-                0
             }
         }
     }
 
-    async fn dispatch_completed(&self, ev: &JobLifecycleEvent) -> usize {
+    async fn dispatch_completed(&self, ev: &JobLifecycleEvent) {
         let start_cursor = self.start_cursors.lock().remove(&ev.job_id);
         // Skip a vanished session (nothing to preview), but otherwise fan out to
         // every approved device — one gateway = one app, so there is no per-user
@@ -281,7 +278,7 @@ impl PushDispatcher {
             .flatten()
             .is_none()
         {
-            return 0;
+            return;
         }
         let devices = self
             .device_store
@@ -289,20 +286,17 @@ impl PushDispatcher {
             .await
             .unwrap_or_default();
         if devices.is_empty() {
-            return 0;
+            return;
         }
         let preview = self.build_preview(&ev.session_id, start_cursor).await;
-        let mut sent = 0;
         for d in devices {
-            match self
+            if let Err(e) = self
                 .dispatch_to_device(&d.device_id, &ev.session_id, &preview)
                 .await
             {
-                Ok(()) => sent += 1,
-                Err(e) => tracing::debug!(error = %e, "push: skipped a device"),
+                tracing::debug!(error = %e, "push: skipped a device");
             }
         }
-        sent
     }
 
     async fn dispatch_to_device(
@@ -481,7 +475,7 @@ where
                 _ = &mut shutdown => break,
                 recv = events.recv() => match recv {
                     Ok(ev) => {
-                        let _ = dispatcher.handle_event(&ev).await;
+                        dispatcher.handle_event(&ev).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::debug!(skipped = n, "push dispatcher lagged; buzz(es) dropped");
