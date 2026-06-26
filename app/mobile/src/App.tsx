@@ -3,6 +3,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 // PairChallenge / PairedSummary are generated from the src-tauri IPC structs by
 // ts-rs (cargo test -p baybo-mobile-app --features ts-export); the bindings are
 // regenerated + drift-checked by scripts/check-ts-bindings.sh.
+import type { PairAborted } from "./generated/PairAborted";
 import type { PairChallenge } from "./generated/PairChallenge";
 import type { PairedSummary } from "./generated/PairedSummary";
 
@@ -301,6 +302,14 @@ export default function App() {
   }) {
     setBusy(true);
     setStatus("Connecting…");
+    // The gateway can cancel pairing (the operator declined, or the link dropped)
+    // while we sit on the confirm screen. Listen for that so the screen dismisses
+    // itself instead of hanging until the user taps.
+    const onAbort = new Channel<PairAborted>();
+    onAbort.onmessage = (ev) => {
+      setChallenge(null);
+      setStatus(`Pairing cancelled: ${ev.reason}`);
+    };
     try {
       const c = await invoke<PairChallenge>("pair_begin", {
         endpoint: opts.endpoint,
@@ -308,6 +317,7 @@ export default function App() {
         label: DEVICE_LABEL,
         relay: opts.relay,
         instanceKey: opts.instanceKey,
+        onAbort,
       });
       setChallenge(c);
       setStatus(null);

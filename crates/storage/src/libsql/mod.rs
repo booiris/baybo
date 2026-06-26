@@ -535,7 +535,8 @@ impl LibsqlPool {
                     expires_at        INTEGER NOT NULL,
                     confirm_code      TEXT,
                     device_id         TEXT,
-                    operator_decision INTEGER
+                    operator_decision INTEGER,
+                    device_decision   INTEGER
                 );",
             )
             .await
@@ -556,6 +557,7 @@ impl LibsqlPool {
             "ALTER TABLE device_pairings ADD COLUMN confirm_code TEXT",
             "ALTER TABLE device_pairings ADD COLUMN device_id TEXT",
             "ALTER TABLE device_pairings ADD COLUMN operator_decision INTEGER",
+            "ALTER TABLE device_pairings ADD COLUMN device_decision INTEGER",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {

@@ -45,6 +45,17 @@ pub struct DevicePairingSlot {
     /// decline, `None` undecided. Written by `baybo device pair`; the gateway
     /// polls it before sealing the welcome.
     pub operator_decision: Option<bool>,
+    /// The phone-side outcome, written by the gateway when it abandons the
+    /// confirm step for a device-side reason — the phone user declined, or the
+    /// app dropped before deciding. `Some(false)` = the device will not pair;
+    /// `None` = still deciding. Symmetric with [`operator_decision`] but in the
+    /// other direction: it lets the operator's `baybo device pair` stop waiting
+    /// the instant the phone backs out, instead of sitting until its own
+    /// timeout. The gateway never records `Some(true)` here — a successful pair
+    /// is observed via the approved [`crate::device::DeviceRow`].
+    ///
+    /// [`operator_decision`]: Self::operator_decision
+    pub device_decision: Option<bool>,
 }
 
 impl DevicePairingSlot {
@@ -88,6 +99,12 @@ pub trait DevicePairingStore: Send + Sync {
     /// The gateway polls [`get_slot`](Self::get_slot) for it before sealing the
     /// welcome. No-op if the slot is gone.
     async fn set_operator_decision(&self, code: &str, accepted: bool) -> Result<()>;
+
+    /// Record the phone-side outcome (written by the gateway when the phone
+    /// declines or drops during the confirm step). The operator's `baybo device
+    /// pair` polls [`get_slot`](Self::get_slot) for it so it can stop waiting
+    /// the moment the phone backs out. No-op if the slot is gone.
+    async fn set_device_decision(&self, code: &str, accepted: bool) -> Result<()>;
 
     /// List all slots, newest `created_at` first (CLI visibility).
     async fn list_slots(&self) -> Result<Vec<DevicePairingSlot>>;

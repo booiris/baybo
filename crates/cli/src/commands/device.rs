@@ -83,6 +83,22 @@ impl StopHosting {
             let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
         }
     }
+
+    /// Await the hosted handshake task ending. The host loop only returns on a
+    /// terminal outcome (the slot is gone, or a side declined), so the task
+    /// completing *while the operator is still deciding* is a direct "the phone
+    /// gave up" signal — no slot round-trip. Borrows the handle (doesn't consume
+    /// it), so `finish`/`drop` still work afterward. Never resolves when there is
+    /// no self-hosted leg (the direct path), so the caller falls back to the slot
+    /// poll there.
+    async fn ended(&mut self) {
+        match self.0.as_mut() {
+            Some(h) => {
+                let _ = h.await;
+            }
+            None => std::future::pending().await,
+        }
+    }
 }
 
 impl Drop for StopHosting {
@@ -162,7 +178,7 @@ async fn pair(
     // and run the SPAKE2 handshake here, so pairing works with no `baybo gateway
     // start` daemon. Runs concurrently with the operator flow below (they sync
     // through the shared slot); the guard stops it on every exit path.
-    let host = match instance_key.as_deref() {
+    let mut host = match instance_key.as_deref() {
         Some(key) => {
             let secret_vault = ctx
                 .secret_vault
@@ -206,19 +222,43 @@ async fn pair(
     let device_label = slot.label;
 
     // 2. Operator confirms the code matches the phone (Bluetooth-style numeric
-    //    comparison). `confirm` requires a terminal, so this is shell-only.
+    //    comparison). `confirm` requires a terminal, so this is shell-only. The
+    //    prompt is interruptible: if the phone declines (or drops) while the
+    //    operator is still deciding, bail out instead of holding the prompt for a
+    //    device that's already gone.
     eprintln!("\nA device wants to pair:");
     eprintln!("    name:              {device_label}");
     eprintln!("    device:            {device_id}");
     eprintln!("    confirmation code: {confirm_code}");
-    let accepted = prompt::confirm_with_default(
+    let accepted = match confirm_or_device_gone(
+        svc,
+        &code,
         "Does this match the code on the phone? Pair this device?",
-        true,
-    )?;
+        host.as_mut(),
+    )
+    .await?
+    {
+        ConfirmOutcome::Decided(accepted) => accepted,
+        ConfirmOutcome::DeviceGone => {
+            return Ok(CommandOutput::structured(
+                format!("\"{device_label}\" cancelled pairing on the phone (or the code expired)."),
+                &json!({ "action": "device_cancelled", "code": code, "device_id": device_id }),
+            ));
+        }
+    };
     svc.set_operator_decision(&code, accepted)
         .await
         .map_err(|e| CliError::Manager(format!("record pairing decision: {e}")))?;
     if !accepted {
+        // Let the self-hosted relay leg deliver the `Reject` to the phone before
+        // we exit: the gateway side polls the decision we just wrote, rejects, and
+        // the host loop then stops (it sees the decline), so this returns
+        // promptly. Without it, dropping the guard would abort the leg mid-flight
+        // and the app would see a reset connection instead of "operator declined".
+        // No-op on the direct path — a running daemon serves + rejects.
+        if let Some(h) = host {
+            h.finish().await;
+        }
         return Ok(CommandOutput::structured(
             format!("Declined pairing for \"{device_label}\"."),
             &json!({ "action": "declined", "code": code, "device_id": device_id }),
@@ -227,17 +267,17 @@ async fn pair(
 
     // 3. Wait for the gateway to finalize (it requires the phone's confirm too).
     eprintln!("Confirming…");
-    let paired = wait_for_paired(svc, &user, &device_id, OUTCOME_WAIT).await?;
+    let outcome = wait_for_paired(svc, &user, &device_id, &code, OUTCOME_WAIT).await?;
     // Stop our self-hosted relay leg: on success let it finish sending the sealed
     // GatewayWelcome (it goes out right after the approved row `wait_for_paired`
     // just observed); otherwise drop the guard to abort the still-running task.
-    match (host, paired) {
-        (Some(h), true) => h.finish().await,
-        (Some(h), false) => drop(h),
+    match (host, &outcome) {
+        (Some(h), PairOutcome::Paired) => h.finish().await,
+        (Some(h), _) => drop(h),
         (None, _) => {}
     }
-    if paired {
-        Ok(CommandOutput::structured(
+    match outcome {
+        PairOutcome::Paired => Ok(CommandOutput::structured(
             format!("Paired \"{device_label}\" ({user}:{device_id})."),
             &json!({
                 "action": "paired",
@@ -245,14 +285,118 @@ async fn pair(
                 "device_id": device_id,
                 "label": device_label,
             }),
-        ))
-    } else {
-        Ok(CommandOutput::structured(
-            format!(
-                "Pairing for \"{device_label}\" did not complete (the device may have declined or timed out)."
-            ),
+        )),
+        PairOutcome::DeviceDeclined => Ok(CommandOutput::structured(
+            format!("\"{device_label}\" cancelled pairing on the phone."),
+            &json!({ "action": "device_cancelled", "code": code, "device_id": device_id }),
+        )),
+        PairOutcome::TimedOut => Ok(CommandOutput::structured(
+            format!("Pairing for \"{device_label}\" did not complete (timed out)."),
             &json!({ "action": "incomplete", "code": code, "device_id": device_id }),
-        ))
+        )),
+    }
+}
+
+/// Whether the operator decided at the prompt, or the phone backed out first.
+enum ConfirmOutcome {
+    Decided(bool),
+    /// The phone declined or dropped (or the slot expired) before the operator
+    /// answered — so there is nothing left to confirm.
+    DeviceGone,
+}
+
+/// Ask the operator to confirm, but bail out early if the phone declines or
+/// drops first — so the operator isn't left holding a `[Y/n]` prompt for a
+/// device that has already gone away.
+///
+/// Three concurrent signals decide the outcome:
+/// - the operator's answer (a blocking stdin read on a **detached OS thread** —
+///   not `spawn_blocking`, since an uncancellable blocking-pool thread stuck on
+///   stdin would keep the tokio runtime from shutting down and hang process exit
+///   after we bail; a detached thread is just terminated at exit);
+/// - the self-hosted relay leg's task ending (a direct phone-gave-up signal);
+/// - a slot poll for the phone-side `device_decision` (the fallback that also
+///   covers the direct path, where there is no self-hosted leg to watch).
+async fn confirm_or_device_gone(
+    svc: &DevicePairingService,
+    code: &str,
+    question: &str,
+    host: Option<&mut StopHosting>,
+) -> Result<ConfirmOutcome> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    // This confirm requires a terminal (the command is shell-only).
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Err(CliError::Config(
+            "interactive confirmation requires a terminal".into(),
+        ));
+    }
+    // Write the `[Y/n]` prompt ourselves and release the stderr lock immediately.
+    // The blocking read then runs on a detached thread holding *only* the stdin
+    // lock, so if we bail (DeviceGone) our `eprintln!` below can't deadlock on a
+    // stderr lock the reader is still holding. (`prompt::confirm_with_default`
+    // holds stderr across the read, which would hang our bail-out.)
+    {
+        let mut err = std::io::stderr().lock();
+        write!(err, "{question} [Y/n]: ")
+            .and_then(|()| err.flush())
+            .map_err(|e| CliError::Io(format!("write confirm prompt: {e}")))?;
+    }
+    // Detached OS thread, not `spawn_blocking`: a blocking stdin read can't be
+    // cancelled, and a tokio blocking-pool thread stuck on stdin would keep the
+    // runtime from shutting down — hanging exit after we bail. A detached thread
+    // is just terminated at process exit. Sends `None` on EOF / read error.
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<bool>>();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let decision = match std::io::stdin().lock().read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            // `[Y/n]`: anything but an explicit no (incl. an empty line) is yes.
+            Ok(_) => Some(!matches!(
+                line.trim().to_ascii_lowercase().as_str(),
+                "n" | "no"
+            )),
+        };
+        let _ = tx.send(decision);
+    });
+    tokio::pin!(rx);
+    let host_ended = async move {
+        match host {
+            Some(h) => h.ended().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(host_ended);
+    loop {
+        tokio::select! {
+            answered = &mut rx => {
+                // `None` (EOF / read error / sender dropped) → treat as decline.
+                let accepted = answered.ok().flatten().unwrap_or(false);
+                return Ok(ConfirmOutcome::Decided(accepted));
+            }
+            // The hosted handshake ended before the operator decided → the phone
+            // declined or dropped.
+            _ = &mut host_ended => {
+                eprintln!();
+                return Ok(ConfirmOutcome::DeviceGone);
+            }
+            _ = tokio::time::sleep(OUTCOME_POLL_INTERVAL) => {
+                let gone = match svc
+                    .claim_slot(code)
+                    .await
+                    .map_err(|e| CliError::Manager(format!("poll pairing slot: {e}")))?
+                {
+                    Some(slot) => slot.device_decision == Some(false),
+                    None => true, // expired / consumed
+                };
+                if gone {
+                    // End the dangling `[Y/n]` prompt line so the caller's message
+                    // starts fresh, then bail (the stdin read is abandoned).
+                    eprintln!();
+                    return Ok(ConfirmOutcome::DeviceGone);
+                }
+            }
+        }
     }
 }
 
@@ -281,13 +425,24 @@ async fn wait_for_confirm(
     }
 }
 
-/// Poll for the finalized (approved) device row after the operator confirmed.
+/// How waiting for the gateway to finalize ended, after the operator confirmed.
+enum PairOutcome {
+    Paired,
+    /// The phone declined or dropped *after* the operator approved — recorded on
+    /// the slot by the gateway, so we needn't sit until the timeout.
+    DeviceDeclined,
+    TimedOut,
+}
+
+/// Poll for the finalized (approved) device row after the operator confirmed,
+/// short-circuiting if the phone backs out in the meantime.
 async fn wait_for_paired(
     svc: &DevicePairingService,
     user: &str,
     device_id: &str,
+    code: &str,
     budget: Duration,
-) -> Result<bool> {
+) -> Result<PairOutcome> {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
         if let Some(row) = svc
@@ -296,10 +451,21 @@ async fn wait_for_paired(
             .map_err(|e| CliError::Manager(format!("poll device row: {e}")))?
             && row.status == DeviceStatus::Approved
         {
-            return Ok(true);
+            return Ok(PairOutcome::Paired);
+        }
+        // A successful pair deletes the slot and writes the row, so a *gone* slot
+        // is benign (the row check above is authoritative); only an explicit
+        // device-side decline short-circuits the wait.
+        if let Some(slot) = svc
+            .claim_slot(code)
+            .await
+            .map_err(|e| CliError::Manager(format!("poll pairing slot: {e}")))?
+            && slot.device_decision == Some(false)
+        {
+            return Ok(PairOutcome::DeviceDeclined);
         }
         if tokio::time::Instant::now() >= deadline {
-            return Ok(false);
+            return Ok(PairOutcome::TimedOut);
         }
         tokio::time::sleep(OUTCOME_POLL_INTERVAL).await;
     }

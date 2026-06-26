@@ -14,8 +14,8 @@ impl LibsqlDevicePairingStore {
     }
 }
 
-const COLS: &str =
-    "code, user_id, label, created_at, expires_at, confirm_code, device_id, operator_decision";
+const COLS: &str = "code, user_id, label, created_at, expires_at, confirm_code, device_id, \
+     operator_decision, device_decision";
 
 fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Internal(anyhow::anyhow!("libsql {ctx}: {e}"))
@@ -28,6 +28,7 @@ async fn fetch_row(rows: &mut libsql::Rows) -> Result<Option<DevicePairingSlot>>
     let operator_decision: Option<i64> = row
         .get(7)
         .map_err(|e| col_err("get operator_decision", e))?;
+    let device_decision: Option<i64> = row.get(8).map_err(|e| col_err("get device_decision", e))?;
     Ok(Some(DevicePairingSlot {
         code: row.get(0).map_err(|e| col_err("get code", e))?,
         user_id: row.get(1).map_err(|e| col_err("get user_id", e))?,
@@ -37,6 +38,7 @@ async fn fetch_row(rows: &mut libsql::Rows) -> Result<Option<DevicePairingSlot>>
         confirm_code: row.get(5).map_err(|e| col_err("get confirm_code", e))?,
         device_id: row.get(6).map_err(|e| col_err("get device_id", e))?,
         operator_decision: operator_decision.map(|v| v != 0),
+        device_decision: device_decision.map(|v| v != 0),
     }))
 }
 
@@ -124,6 +126,17 @@ impl DevicePairingStore for LibsqlDevicePairingStore {
         Ok(())
     }
 
+    async fn set_device_decision(&self, code: &str, accepted: bool) -> Result<()> {
+        let conn = self.pool.conn();
+        conn.execute(
+            "UPDATE device_pairings SET device_decision = ?2 WHERE code = ?1",
+            libsql::params![code.to_string(), i64::from(accepted)],
+        )
+        .await
+        .map_err(|e| col_err("set device decision", e))?;
+        Ok(())
+    }
+
     async fn list_slots(&self) -> Result<Vec<DevicePairingSlot>> {
         let conn = self.pool.conn();
         let mut rows = conn
@@ -171,6 +184,7 @@ mod tests {
             confirm_code: None,
             device_id: None,
             operator_decision: None,
+            device_decision: None,
         }
     }
 
@@ -235,6 +249,23 @@ mod tests {
                 .operator_decision,
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn device_decision_round_trips_independently() {
+        let s = store().await;
+        s.create_slot(&slot("DEVDEC", 1000)).await.unwrap();
+        // Fresh slot: no device-side decision yet.
+        assert_eq!(
+            s.get_slot("DEVDEC").await.unwrap().unwrap().device_decision,
+            None
+        );
+        // The gateway records the phone backing out; it round-trips and is
+        // independent of operator_decision.
+        s.set_device_decision("DEVDEC", false).await.unwrap();
+        let got = s.get_slot("DEVDEC").await.unwrap().unwrap();
+        assert_eq!(got.device_decision, Some(false));
+        assert_eq!(got.operator_decision, None);
     }
 
     #[tokio::test]

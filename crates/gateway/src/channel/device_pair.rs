@@ -132,21 +132,59 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         .await
         .map_err(|e| format!("publish confirm: {e}"))?;
 
-    // 5a. The phone user's decision, sealed under the channel key.
-    let PairFrame::Sealed { nonce, ciphertext } = transport.recv_frame(CONFIRM_TIMEOUT).await?
-    else {
-        return Err("expected sealed DeviceConfirm".into());
-    };
-    let confirm: DeviceConfirm = pairing::open_msg(&keys.channel_key, &nonce, &ciphertext)
-        .map_err(|e| format!("open DeviceConfirm: {e}"))?;
-    if !confirm.accepted {
-        return Err("the device declined pairing".into());
-    }
-
-    // 5b. The operator's decision, polled from the shared slot (their live
-    //     `device pair` writes it). Abandoned slots age out via the TTL.
-    if !wait_operator_decision(state, &slot.code).await? {
-        return Err("the operator declined pairing".into());
+    // 5a/5b. Mutual confirm, awaited *concurrently*: the phone user's decision
+    //   arrives as a sealed DeviceConfirm over the transport, while the operator's
+    //   decision is polled from the shared slot (their live `device pair` writes
+    //   it). Both must be "accept" — but the moment either side declines (or the
+    //   phone drops) we abort so the *other* side isn't left hanging: the phone
+    //   learns via the Reject `run_pairing`/`host_leg_once` sends on our `Err`, and
+    //   the operator learns via the `device_decision` we record on the slot. (The
+    //   old serial order — phone first, then operator — meant an operator decline
+    //   went unseen until the phone tapped, and a phone decline never reached the
+    //   operator at all.)
+    {
+        let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
+        let phone_confirm = transport.recv_frame(CONFIRM_TIMEOUT);
+        tokio::pin!(phone_confirm);
+        let mut phone_ok = false;
+        let mut operator_ok = false;
+        while !(phone_ok && operator_ok) {
+            tokio::select! {
+                biased;
+                // The phone user's sealed DeviceConfirm — awaited only until it lands.
+                frame = &mut phone_confirm, if !phone_ok => match phone_decision(frame, &keys.channel_key) {
+                    PhoneDecision::Accepted => phone_ok = true,
+                    PhoneDecision::Declined => {
+                        record_device_decline(state, &slot.code).await;
+                        return Err("the device declined pairing".into());
+                    }
+                    PhoneDecision::Aborted(reason) => {
+                        record_device_decline(state, &slot.code).await;
+                        return Err(reason);
+                    }
+                },
+                // The operator's decision on the shared slot.
+                _ = tokio::time::sleep(CONFIRM_POLL_INTERVAL), if !operator_ok => {
+                    let decision = state
+                        .device_pairing
+                        .claim_slot(&slot.code)
+                        .await
+                        .map_err(|e| format!("poll operator decision: {e}"))?
+                        .ok_or_else(|| {
+                            "pairing slot expired before the operator decided".to_string()
+                        })?
+                        .operator_decision;
+                    match decision {
+                        Some(true) => operator_ok = true,
+                        Some(false) => return Err("the operator declined pairing".into()),
+                        None if tokio::time::Instant::now() >= deadline => {
+                            return Err("timed out waiting for the operator to confirm".into());
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
     }
 
     // 6. Finalize: write an approved device row + consume the slot.
@@ -239,24 +277,43 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     Ok(())
 }
 
-/// Poll the shared slot for the operator's confirm decision (their live
-/// `device pair` writes it) until it is set or the confirm window elapses.
-async fn wait_operator_decision(state: &PairingHostDeps, code: &str) -> Result<bool, String> {
-    let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
-    loop {
-        let slot = state
-            .device_pairing
-            .claim_slot(code)
-            .await
-            .map_err(|e| format!("poll operator decision: {e}"))?
-            .ok_or_else(|| "pairing slot expired before the operator decided".to_string())?;
-        if let Some(decision) = slot.operator_decision {
-            return Ok(decision);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("timed out waiting for the operator to confirm".into());
-        }
-        tokio::time::sleep(CONFIRM_POLL_INTERVAL).await;
+/// Whether the phone user's sealed [`DeviceConfirm`] (or its absence) lets the
+/// handshake continue. Distinguishes an explicit decline from a transport-level
+/// abort (the app dropped, or a malformed/unexpected frame) so the caller can
+/// surface the right reason — though both record a device-side decline.
+enum PhoneDecision {
+    Accepted,
+    Declined,
+    Aborted(String),
+}
+
+/// Open the phone's confirm frame and classify the decision. `frame` is the raw
+/// receive result, so a transport error (timeout / closed socket) maps to
+/// [`PhoneDecision::Aborted`] rather than being lost.
+fn phone_decision(
+    frame: Result<PairFrame, String>,
+    channel_key: &[u8; device_proto::aead::KEY_LEN],
+) -> PhoneDecision {
+    let frame = match frame {
+        Ok(frame) => frame,
+        Err(reason) => return PhoneDecision::Aborted(reason),
+    };
+    let PairFrame::Sealed { nonce, ciphertext } = frame else {
+        return PhoneDecision::Aborted("expected sealed DeviceConfirm".into());
+    };
+    match pairing::open_msg::<DeviceConfirm>(channel_key, &nonce, &ciphertext) {
+        Ok(confirm) if confirm.accepted => PhoneDecision::Accepted,
+        Ok(_) => PhoneDecision::Declined,
+        Err(e) => PhoneDecision::Aborted(format!("open DeviceConfirm: {e}")),
+    }
+}
+
+/// Best-effort: mark the slot so the operator's live `device pair` learns the
+/// phone backed out and stops waiting. A failure here only costs the operator a
+/// fall-through to their own timeout, so it must not mask the original abort.
+async fn record_device_decline(state: &PairingHostDeps, code: &str) {
+    if let Err(e) = state.device_pairing.set_device_decision(code, false).await {
+        tracing::debug!(error = %e, "device pair: failed to record device decline on slot");
     }
 }
 
@@ -464,6 +521,103 @@ mod tests {
             PairFrame::Reject { .. } => {}
             other => panic!("expected Reject, got {other:?}"),
         }
+        server.abort();
+    }
+
+    /// Serve the token-free pairing route, drive a client through SPAKE2 + the
+    /// sealed `DeviceHello`, and stop just before the mutual-confirm step. Returns
+    /// the live socket, the derived keys, the slot code, the pairing service (to
+    /// script the operator side / inspect the slot), and the server task.
+    async fn drive_to_confirm() -> (
+        Client,
+        device_proto::kdf::PairKeys,
+        String,
+        Arc<DevicePairingService>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+        let state = WsChannelState::from_deps(&tg.deps);
+        let device_pairing = state.device_pairing.clone();
+        let code = device_pairing.mint("user-1", "").await.unwrap();
+
+        let app = Router::new().nest("/v1", routes().with_state(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+
+        let mut ws = connect(port).await;
+        let (pake, app_msg) = Pake::start_app(&code);
+        send_pf(
+            &mut ws,
+            &PairFrame::Hello {
+                code: code.clone(),
+                pake: app_msg,
+            },
+        )
+        .await;
+        let PairFrame::PakeReply { pake: gw_pake } = recv_pf(&mut ws).await else {
+            panic!("expected PakeReply");
+        };
+        let k = pake.finish(&gw_pake).unwrap();
+        let keys = derive_pair_keys(&k).unwrap();
+
+        let device_static = StaticKeypair::generate().unwrap();
+        let hello = DeviceHello {
+            device_id: "dev-xyz".into(),
+            label: "Test iPhone".into(),
+            static_pubkey: device_static.public(),
+            apns_token: "apns-tok".into(),
+            apns_env: ApnsEnv::Sandbox,
+        };
+        let (nonce, ciphertext) = pairing::seal_msg(&keys.channel_key, &hello).unwrap();
+        send_pf(&mut ws, &PairFrame::Sealed { nonce, ciphertext }).await;
+
+        (ws, keys, code, device_pairing, server)
+    }
+
+    /// Direction ②: the operator declines while the phone is still on the confirm
+    /// screen (no `DeviceConfirm` sent yet). The handshake must notice the
+    /// operator decline *concurrently* and reject the phone promptly, rather than
+    /// blocking on a phone tap that may never come (the old serial order did).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn operator_decline_before_phone_confirm_rejects_promptly() {
+        let (mut ws, _keys, code, device_pairing, server) = drive_to_confirm().await;
+        // Operator declines on their terminal; the phone has not tapped.
+        device_pairing
+            .set_operator_decision(&code, false)
+            .await
+            .unwrap();
+        // The gateway aborts and rejects the phone without ever seeing a confirm.
+        match recv_pf(&mut ws).await {
+            PairFrame::Reject { .. } => {}
+            other => panic!("expected Reject, got {other:?}"),
+        }
+        server.abort();
+    }
+
+    /// Direction ①: the phone user declines. The handshake aborts, rejects the
+    /// phone, and records a device-side decline on the slot so the operator's
+    /// polling `device pair` learns the device backed out instead of waiting out
+    /// its own timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn phone_decline_records_device_decision_on_slot() {
+        let (mut ws, keys, code, device_pairing, server) = drive_to_confirm().await;
+        // The phone user taps Cancel.
+        let (nonce, ciphertext) =
+            pairing::seal_msg(&keys.channel_key, &DeviceConfirm { accepted: false }).unwrap();
+        send_pf(&mut ws, &PairFrame::Sealed { nonce, ciphertext }).await;
+        // The gateway rejects the phone …
+        match recv_pf(&mut ws).await {
+            PairFrame::Reject { .. } => {}
+            other => panic!("expected Reject, got {other:?}"),
+        }
+        // … and the device-side decline is now visible to the operator's poll
+        // (the slot survives — only a successful pair consumes it).
+        let slot = device_pairing.claim_slot(&code).await.unwrap().unwrap();
+        assert_eq!(slot.device_decision, Some(false));
+        assert_eq!(slot.operator_decision, None);
         server.abort();
     }
 }

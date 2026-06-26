@@ -57,6 +57,7 @@ impl DevicePairingService {
             confirm_code: None,
             device_id: None,
             operator_decision: None,
+            device_decision: None,
         };
         self.slots.create_slot(&slot).await?;
         Ok(code)
@@ -102,6 +103,18 @@ impl DevicePairingService {
         accepted: bool,
     ) -> Result<(), DevicePairingError> {
         Ok(self.slots.set_operator_decision(code, accepted).await?)
+    }
+
+    /// Record the phone-side outcome on the slot (written by the gateway when
+    /// the phone declines or drops during the confirm step). The operator's live
+    /// `baybo device pair` polls it so it stops waiting the moment the phone
+    /// backs out.
+    pub async fn set_device_decision(
+        &self,
+        code: &str,
+        accepted: bool,
+    ) -> Result<(), DevicePairingError> {
+        Ok(self.slots.set_device_decision(code, accepted).await?)
     }
 
     /// Finalize a confirmed handshake: write an **approved** device row (with a

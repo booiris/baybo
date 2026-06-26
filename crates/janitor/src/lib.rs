@@ -405,6 +405,7 @@ mod tests {
             confirm_code: None,
             device_id: None,
             operator_decision: None,
+            device_decision: None,
         };
         store.create_slot(&slot("FRESH1", 10_000)).await.unwrap();
         store.create_slot(&slot("STALE1", 200)).await.unwrap();

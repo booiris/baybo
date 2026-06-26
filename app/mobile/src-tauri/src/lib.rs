@@ -13,13 +13,15 @@ mod push_register;
 
 use baybo_mobile_core::Frame;
 use content::ContentSessions;
-use pairing::{PairChallenge, PairedSummary, PairingSessions};
+use pairing::{PairAborted, PairChallenge, PairedSummary, PairingSessions};
 use tauri::State;
 use tauri::ipc::Channel;
 
 /// Scan-to-connect, phase 1: dial the gateway, run SPAKE2 + send `DeviceHello`,
 /// and return the Bluetooth-style confirmation code the UI shows the user to
-/// compare against the operator's terminal.
+/// compare against the operator's terminal. `on_abort` carries a gateway-side
+/// cancellation that lands before the user decides, so the UI can dismiss the
+/// confirm screen.
 #[tauri::command]
 async fn pair_begin(
     sessions: State<'_, PairingSessions>,
@@ -28,8 +30,18 @@ async fn pair_begin(
     label: String,
     relay: bool,
     instance_key: Option<String>,
+    on_abort: Channel<PairAborted>,
 ) -> Result<PairChallenge, String> {
-    pairing::pair_begin(&sessions, &endpoint, &code, &label, relay, instance_key).await
+    pairing::pair_begin(
+        &sessions,
+        &endpoint,
+        &code,
+        &label,
+        relay,
+        instance_key,
+        on_abort,
+    )
+    .await
 }
 
 /// Phase 2: send the user's decision. On accept — and once the operator also

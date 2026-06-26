@@ -347,6 +347,13 @@ impl DevicePairingStore for MemoryDevicePairingStore {
         Ok(())
     }
 
+    async fn set_device_decision(&self, code: &str, accepted: bool) -> SlotResult<()> {
+        if let Some(slot) = self.slots.lock().get_mut(code) {
+            slot.device_decision = Some(accepted);
+        }
+        Ok(())
+    }
+
     async fn list_slots(&self) -> SlotResult<Vec<DevicePairingSlot>> {
         let mut v: Vec<DevicePairingSlot> = self.slots.lock().values().cloned().collect();
         v.sort_by_key(|s| std::cmp::Reverse(s.created_at));

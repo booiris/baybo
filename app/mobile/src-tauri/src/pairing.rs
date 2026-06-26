@@ -5,40 +5,47 @@
 //! The handshake pauses for a human decision, so it is split across two Tauri
 //! commands: [`pair_begin`] runs up to the confirmation step and returns the
 //! Bluetooth-style code for the UI to show; [`pair_confirm`] sends the user's
-//! decision and finishes. The in-flight session (live WS + client) is parked in
-//! [`PairingSessions`] between the two, keyed by the device id.
+//! decision and finishes. Between the two, the live WS is owned by a background
+//! pump task ([`run_pair_pump`]) — keyed by device id in [`PairingSessions`] via
+//! a [`PairControl`] handle — so the app keeps *listening* while the confirm
+//! screen is up: if the gateway aborts (the operator declined, or the link
+//! dropped) before the user taps, the pump pushes a [`PairAborted`] over the
+//! `on_abort` channel and the UI dismisses the screen instead of hanging.
 //!
 //! The crypto + state machine live in the host-tested core; this file is just
 //! the WebSocket pump (msgpack `PairFrame`s as binary frames) + the bits the
 //! shell owns: generating the device's Noise keypair and a device id.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use baybo_mobile_core::{PairingClient, PairingRequest};
 use device_proto::noise::StaticKeypair;
 use device_proto::pairing::{self, ApnsEnv, PairFrame};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tauri::ipc::Channel;
+use tokio::sync::{Mutex, oneshot};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-/// In-flight pairing sessions, parked between `pair_begin` and `pair_confirm`
-/// (keyed by device id). The map lock is held only to insert/remove — the WS
-/// I/O runs on the owned session, never under the lock.
-#[derive(Default)]
-pub struct PairingSessions(Mutex<HashMap<String, PairSession>>);
+/// How long the decline path waits for the gateway to acknowledge our
+/// `DeviceConfirm(false)` before dropping the socket — long enough for the relay
+/// round-trip, so the operator's side reliably learns we cancelled.
+const DECLINE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-struct PairSession {
-    ws: Ws,
-    client: PairingClient,
-    device_id: String,
-    /// The app's Noise static identity, carried from `pair_begin` so
-    /// `pair_confirm` can persist its secret for content sessions.
-    keypair: StaticKeypair,
-    /// The relay admission key from the QR (empty on the direct path), carried so
-    /// `pair_confirm` can persist it for the relay content-join leg.
-    instance_key: String,
+/// In-flight pairing sessions, parked between `pair_begin` and `pair_confirm`
+/// (keyed by device id). The map lock is held only to insert/remove; the live WS
+/// is owned by the background [`run_pair_pump`] task, reached through this handle.
+#[derive(Default)]
+pub struct PairingSessions(Mutex<HashMap<String, PairControl>>);
+
+/// Control handle to a parked session's [`run_pair_pump`] task.
+struct PairControl {
+    /// Hands the user's Pair/Cancel decision to the pump.
+    decision_tx: oneshot::Sender<bool>,
+    /// Resolves with the pump's terminal outcome once the user has decided.
+    outcome_rx: oneshot::Receiver<Result<PairedSummary, String>>,
 }
 
 /// The durable record persisted after pairing — everything the app needs to
@@ -83,11 +90,13 @@ pub(crate) fn load_paired_record() -> Result<Option<PairedRecord>, String> {
 /// baybo-mobile-core beside [`PairedGateway`], where ts-rs generates their TS
 /// (core's `ts-export` feature). Re-exported so the commands + lib.rs keep
 /// referring to them as `pairing::*`.
-pub use baybo_mobile_core::{PairChallenge, PairedSummary};
+pub use baybo_mobile_core::{PairAborted, PairChallenge, PairedSummary};
 
 /// Phase 1: dial `endpoint`, run SPAKE2 + send the sealed `DeviceHello`, and
 /// return the confirmation code for the user to compare against the operator's
-/// terminal. The live session is parked for [`pair_confirm`].
+/// terminal. Hands the live session to a background [`run_pair_pump`] task that
+/// watches for a gateway abort (pushing [`PairAborted`] over `on_abort`) and
+/// finishes the handshake once the user decides via [`pair_confirm`].
 pub async fn pair_begin(
     sessions: &PairingSessions,
     endpoint: &str,
@@ -95,6 +104,7 @@ pub async fn pair_begin(
     label: &str,
     relay: bool,
     instance_key: Option<String>,
+    on_abort: Channel<PairAborted>,
 ) -> Result<PairChallenge, String> {
     let base = endpoint.trim_end_matches('/');
     // Relay: join the rendezvous keyed by the code (`/pair/join/{code}`); the
@@ -143,14 +153,27 @@ pub async fn pair_begin(
         .ok_or("confirmation code unavailable")?
         .to_string();
 
+    // Hand the live session to a background pump: it keeps reading the WS while
+    // the confirm screen is up (so a gateway abort cancels it), and finishes the
+    // handshake once `pair_confirm` relays the user's decision.
+    let (decision_tx, decision_rx) = oneshot::channel();
+    let (outcome_tx, outcome_rx) = oneshot::channel();
+    tokio::spawn(run_pair_pump(
+        ws,
+        client,
+        device_id.clone(),
+        keypair,
+        instance_key.unwrap_or_default(),
+        on_abort,
+        decision_rx,
+        outcome_tx,
+    ));
+
     sessions.0.lock().await.insert(
         device_id.clone(),
-        PairSession {
-            ws,
-            client,
-            device_id: device_id.clone(),
-            keypair,
-            instance_key: instance_key.unwrap_or_default(),
+        PairControl {
+            decision_tx,
+            outcome_rx,
         },
     );
 
@@ -160,42 +183,145 @@ pub async fn pair_begin(
     })
 }
 
-/// Phase 2: send the user's decision. On accept (and once the operator also
-/// confirms) the gateway returns the sealed welcome and pairing finalizes; on
-/// decline the gateway aborts and this returns an error.
+/// Phase 2: relay the user's decision to the pump task (which owns the live WS)
+/// and await its outcome. On accept (and once the operator also confirms) the
+/// gateway returns the sealed welcome and pairing finalizes; on decline — or if
+/// the gateway already aborted — this returns an error.
 pub async fn pair_confirm(
     sessions: &PairingSessions,
     device_id: &str,
     accepted: bool,
 ) -> Result<PairedSummary, String> {
-    let mut session = sessions
+    let control = sessions
         .0
         .lock()
         .await
         .remove(device_id)
         .ok_or("no pending pairing session for this device")?;
 
-    let confirm = session
-        .client
-        .confirm(accepted)
-        .map_err(|e| e.to_string())?;
-    send(&mut session.ws, &confirm).await?;
+    if control.decision_tx.send(accepted).is_err() {
+        // The pump already exited — the gateway aborted before the user tapped
+        // (the UI gets a `PairAborted` over the `on_abort` channel in that case).
+        return Err("pairing session already ended".into());
+    }
+    match control.outcome_rx.await {
+        Ok(result) => result,
+        Err(_) => Err("pairing session ended".into()),
+    }
+}
+
+/// Own the live WS between `pair_begin` and the user's decision. While the
+/// confirm screen is up it watches for a gateway `Reject` (or a dropped link) and
+/// pushes [`PairAborted`] so the UI can dismiss the screen; once the user decides
+/// (over `decision_rx`) it sends the sealed `DeviceConfirm` and finishes,
+/// reporting the result over `outcome_tx`.
+#[allow(clippy::too_many_arguments)]
+async fn run_pair_pump(
+    mut ws: Ws,
+    client: PairingClient,
+    device_id: String,
+    keypair: StaticKeypair,
+    instance_key: String,
+    on_abort: Channel<PairAborted>,
+    mut decision_rx: oneshot::Receiver<bool>,
+    outcome_tx: oneshot::Sender<Result<PairedSummary, String>>,
+) {
+    // Phase A: parked on the confirm screen. Wait for the user's decision, but
+    // keep reading the WS so a gateway abort cancels the screen rather than
+    // stranding it until the user taps.
+    let accepted = loop {
+        tokio::select! {
+            biased;
+            decided = &mut decision_rx => match decided {
+                Ok(accepted) => break accepted,
+                // Control dropped without a decision (shouldn't happen) — give up.
+                Err(_) => return,
+            },
+            inbound = ws.next() => match inbound {
+                Some(Ok(Message::Binary(bytes))) => match pairing::decode(&bytes) {
+                    // Operator declined (or the host aborted) before the user tapped.
+                    Ok(PairFrame::Reject { reason }) => {
+                        let _ = on_abort.send(PairAborted { reason });
+                        let _ = outcome_tx.send(Err("pairing was cancelled".into()));
+                        return;
+                    }
+                    // Any other frame here is unexpected this early; keep waiting.
+                    Ok(_) | Err(_) => continue,
+                },
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => {
+                    let _ = on_abort.send(PairAborted {
+                        reason: format!("connection error: {e}"),
+                    });
+                    let _ = outcome_tx.send(Err("pairing connection ended".into()));
+                    return;
+                }
+                None => {
+                    let _ = on_abort.send(PairAborted {
+                        reason: "connection closed".into(),
+                    });
+                    let _ = outcome_tx.send(Err("pairing connection closed".into()));
+                    return;
+                }
+            },
+        }
+    };
+
+    // Phase B: the user decided — send it and finish (or tear down on decline).
+    let outcome = finish_pair(
+        &mut ws,
+        &client,
+        &device_id,
+        &keypair,
+        &instance_key,
+        accepted,
+    )
+    .await;
+    let _ = outcome_tx.send(outcome);
+}
+
+/// Send the user's decision and complete the handshake. On accept this reads the
+/// sealed `GatewayWelcome` (or a late `Reject` if the operator declined in the
+/// window after we accepted), persists the push key + durable pairing record, and
+/// returns the summary; on decline it tells the gateway and errors (the UI treats
+/// the decline path as an error, as before).
+async fn finish_pair(
+    ws: &mut Ws,
+    client: &PairingClient,
+    device_id: &str,
+    keypair: &StaticKeypair,
+    instance_key: &str,
+    accepted: bool,
+) -> Result<PairedSummary, String> {
+    let confirm = client.confirm(accepted).map_err(|e| e.to_string())?;
+    send(ws, &confirm).await?;
     if !accepted {
+        // Wait for the gateway to acknowledge the decline (it replies with a
+        // Reject once it has processed our DeviceConfirm) before dropping the
+        // socket. On the relay path, closing immediately races the relay's
+        // forward of our DeviceConfirm — the gateway would never see it and the
+        // operator's `device pair` would never learn we cancelled. The ack proves
+        // the round-trip; the timeout bounds it if the gateway is already gone.
+        let _ = tokio::time::timeout(DECLINE_ACK_TIMEOUT, recv(ws)).await;
         return Err("pairing cancelled".into());
     }
 
-    let PairFrame::Sealed { nonce, ciphertext } = recv(&mut session.ws).await? else {
-        return Err("expected sealed GatewayWelcome".into());
+    let paired = match recv(ws).await? {
+        PairFrame::Sealed { nonce, ciphertext } => client
+            .on_welcome(&nonce, &ciphertext)
+            .map_err(|e| e.to_string())?,
+        // The operator declined in the window between our accept and the welcome.
+        PairFrame::Reject { reason } => {
+            return Err(format!("the operator declined pairing: {reason}"));
+        }
+        _ => return Err("expected sealed GatewayWelcome".into()),
     };
-    let paired = session
-        .client
-        .on_welcome(&nonce, &ciphertext)
-        .map_err(|e| e.to_string())?;
 
     // Persist the push key to the shared App Group keychain so the NSE can
     // decrypt lock-screen previews (account `baybo.push-key.<device_id>`, since
     // the gateway stamps `bid = device_id` into every push payload).
-    crate::keychain::store_push_key(&session.device_id, &paired.push_key)
+    crate::keychain::store_push_key(device_id, &paired.push_key)
         .map_err(|e| format!("persist push key: {e}"))?;
 
     // Persist the content-session record (auth token, gateway static key,
@@ -203,15 +329,15 @@ pub async fn pair_confirm(
     // and open a content session after a relaunch.
     let record = PairedRecord {
         user_id: paired.user_id.clone(),
-        device_id: session.device_id.clone(),
+        device_id: device_id.to_string(),
         auth_token: paired.auth_token.clone(),
         gateway_static_pubkey: paired.gateway_static_pubkey,
         direct_candidates: paired.direct_candidates.clone(),
         relay_node_id: paired.relay_node_id.clone(),
         relay_url: paired.relay_url.clone(),
-        instance_key: session.instance_key.clone(),
-        noise_secret: session.keypair.secret(),
-        noise_public: session.keypair.public(),
+        instance_key: instance_key.to_string(),
+        noise_secret: keypair.secret(),
+        noise_public: keypair.public(),
     };
     let bytes = serde_json::to_vec(&record).map_err(|e| format!("encode paired record: {e}"))?;
     crate::keychain::store_paired_record(&bytes)

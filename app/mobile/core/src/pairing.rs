@@ -98,6 +98,21 @@ impl From<&PairedGateway> for PairedSummary {
     }
 }
 
+/// Pushed to the UI (over a Tauri channel) when the gateway aborts pairing —
+/// the operator declined, or the connection dropped — *before* the phone user
+/// has tapped Pair/Cancel. Lets the confirm-code screen dismiss itself instead
+/// of hanging on a code the other side has already abandoned. A DTO, so it is
+/// generated into the webview's TS bindings by ts-rs.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../src/generated/"))]
+#[serde(rename_all = "camelCase")]
+pub struct PairAborted {
+    /// A short, human-readable reason (the gateway's reject text, or why the
+    /// connection ended). Shown to the user as context, not parsed.
+    pub reason: String,
+}
+
 /// App-side pairing state machine.
 pub struct PairingClient {
     req: PairingRequest,

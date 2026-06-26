@@ -183,15 +183,25 @@ pub async fn host_pairing_leg(
         match host_leg_once(deps, relay_url, instance_key, code).await {
             Ok(()) => return Ok(()),
             Err(reason) => {
-                // Stop once the slot is gone (consumed by a successful pair or
-                // aged out); else re-host so a late or retrying app still lands.
-                let live = deps
+                // Stop re-hosting once there's a terminal outcome: the slot is
+                // gone (a successful pair consumed it, or it aged out) or either
+                // side has declined — re-opening a leg then would just strand a
+                // connection that immediately rejects, and (on a decline) we want
+                // this leg to finish *after* having delivered its `Reject`, so the
+                // caller can await it. Otherwise re-host so a late/retrying app
+                // still lands.
+                let done = match deps
                     .device_pairing
                     .claim_slot(code)
                     .await
                     .map_err(|e| format!("poll slot: {e}"))?
-                    .is_some();
-                if !live {
+                {
+                    None => true,
+                    Some(slot) => {
+                        slot.operator_decision == Some(false) || slot.device_decision == Some(false)
+                    }
+                };
+                if done {
                     return Err(reason);
                 }
                 tokio::time::sleep(REHOST_BACKOFF).await;
