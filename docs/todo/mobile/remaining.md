@@ -243,6 +243,18 @@ always behind an explicit confirm — never a silent clobber.
   returns to the scan screen, fully unpaired. Idempotent (`errSecItemNotFound`
   is a no-op). This is the explicit unbind affordance the connected screen now
   shows alongside *Open chat* and *Replace pairing*.
+- **Stable `device_id`**: the app's long-term Noise static identity now lives
+  under its own keychain account (`baybo.device-identity`,
+  `keychain::store_device_identity` / `read_device_identity`) and is loaded at
+  `pair_begin` instead of being minted fresh each pairing, so the derived
+  `device_id` (`ios-<pubkey[..8]>`) is stable across re-pairings and launches.
+  It is deliberately **not** cleared by *Forget* (which only drops the
+  `PairedRecord` + push key), so re-pairing the same phone keeps the same id; a
+  full identity reset would mean also deleting `baybo.device-identity`. On the
+  gateway, `DeviceStore::create_replacing_approved` now **upserts** so the same
+  `device_id` refreshes its row in place rather than colliding on the
+  `(user_id, device_id)` primary key — a *different* device still supersedes the
+  prior binding (revoked, kept for audit).
 
 **Note — pushes already targeted the single device**: the dispatcher fans over
 `list_for_user(user, Approved)`; with the invariant that's a one-element loop,

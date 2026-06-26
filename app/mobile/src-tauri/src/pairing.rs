@@ -14,7 +14,8 @@
 //!
 //! The crypto + state machine live in the host-tested core; this file is just
 //! the WebSocket pump (msgpack `PairFrame`s as binary frames) + the bits the
-//! shell owns: generating the device's Noise keypair and a device id.
+//! shell owns: loading-or-minting the device's persistent Noise keypair (and the
+//! device id derived from it).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -91,6 +92,19 @@ pub(crate) fn load_paired_record() -> Result<Option<PairedRecord>, String> {
         .map_err(|e| format!("decode paired record: {e}"))
 }
 
+/// The app's long-term Noise static identity. Loaded from the keychain so the
+/// derived `device_id` is stable across re-pairings and launches; minted and
+/// persisted on first use. On a desktop dev build (no on-device keychain) the
+/// read is always empty, so each run mints an ephemeral key — fine off-device.
+fn load_or_create_device_identity() -> Result<StaticKeypair, String> {
+    if let Some((secret, public)) = crate::keychain::read_device_identity()? {
+        return Ok(StaticKeypair::from_parts(public, secret));
+    }
+    let keypair = StaticKeypair::generate().map_err(|e| e.to_string())?;
+    crate::keychain::store_device_identity(&keypair.secret(), &keypair.public())?;
+    Ok(keypair)
+}
+
 /// The IPC DTOs ([`PairChallenge`] / [`PairedSummary`]) live in
 /// baybo-mobile-core beside [`PairedGateway`], where ts-rs generates their TS
 /// (core's `ts-export` feature). Re-exported so the commands + lib.rs keep
@@ -122,9 +136,10 @@ pub async fn pair_begin(
     // short/typeable secret is forbidden (offline-crackable by the relay).
     let secret = decode_secret(secret)?;
 
-    // The app's long-term Noise identity. TODO(persist): the secret belongs in
-    // the keychain so content sessions reuse it across launches.
-    let keypair = StaticKeypair::generate().map_err(|e| e.to_string())?;
+    // The app's long-term Noise identity, loaded from (or minted into) the
+    // keychain so the derived device_id stays stable across re-pairings and
+    // launches, and content sessions reuse the same static across relaunches.
+    let keypair = load_or_create_device_identity()?;
     let device_id = format!("ios-{}", hex::encode(&keypair.public()[..8]));
 
     let req = PairingRequest {

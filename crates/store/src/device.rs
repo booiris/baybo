@@ -64,9 +64,12 @@ impl DeviceStatus {
 #[derive(Debug, Clone)]
 pub struct DeviceRow {
     pub user_id: String,
-    /// Client-generated, minted fresh per pairing — so re-pairing the same
-    /// phone writes a new row rather than colliding on the natural key; the
-    /// superseded row is revoked (kept for audit), never reused.
+    /// Client-generated and **stable per physical device**: the app keys it off
+    /// a keychain-pinned Noise static, so re-pairing the same phone yields the
+    /// same id. Re-pairing the same device updates its row in place
+    /// (`create_replacing_approved` upserts on the natural key); pairing a
+    /// *different* device supersedes the prior one, whose row is revoked (kept
+    /// for audit), never reused.
     pub device_id: String,
     /// Human label for the device list ("Booiris iPhone").
     pub label: String,
@@ -101,13 +104,17 @@ pub trait DeviceStore: Send + Sync {
 
     /// Atomically supersede the user's current binding with a freshly-paired
     /// device: in one transaction, revoke every still-`Approved` row for
-    /// `row.user_id`, then insert `row` (itself `Approved`). Returns the
-    /// `device_id`s revoked in the process (empty on a first pairing) so the
-    /// caller can report what was replaced. This is the write path that holds
-    /// the **one approved device per user** (1:1 gateway↔app) invariant; the
-    /// `idx_devices_one_approved_per_user` partial unique index is its backstop.
-    /// Errors with [`StorageError::Conflict`] if `row`'s `(user_id, device_id)`
-    /// or `auth_token` already exists.
+    /// `row.user_id`, then upsert `row` (itself `Approved`). Because `device_id`
+    /// is a stable per-device identity, re-pairing the **same** device refreshes
+    /// its row in place (new token/pubkey) instead of colliding on the natural
+    /// key; pairing a **different** device inserts a fresh row and leaves the
+    /// prior one revoked (kept for audit). Returns the `device_id`s of any
+    /// *other* bindings superseded — empty on a first pairing or a same-device
+    /// re-pair — so the caller can report what was replaced. This is the write
+    /// path that holds the **one approved device per user** (1:1 gateway↔app)
+    /// invariant; the `idx_devices_one_approved_per_user` partial unique index is
+    /// its backstop. Errors with [`StorageError::Conflict`] only on a genuine
+    /// `auth_token` collision.
     async fn create_replacing_approved(&self, row: &DeviceRow) -> Result<Vec<String>>;
 
     /// Fetch one row by its natural key.

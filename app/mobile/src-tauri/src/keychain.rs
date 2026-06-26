@@ -214,6 +214,41 @@ pub fn delete_paired_record() -> Result<(), String> {
     imp::delete_blob(PAIRED_RECORD_ACCOUNT)
 }
 
+/// Account holding the device's long-term Noise static identity, stored as the
+/// 32-byte secret followed by its 32-byte X25519 public (64 bytes). This is what
+/// makes the derived `device_id` (`ios-<public[..8]>`) stable across re-pairings
+/// and launches: pairing loads this key instead of minting a fresh one each
+/// time. Kept in its own account (not only inside the paired record) so it
+/// survives an unpair/"forget" and exists before the first pairing completes.
+const DEVICE_IDENTITY_ACCOUNT: &str = "baybo.device-identity";
+
+/// A persisted Noise static identity as `(secret, public)`, each `KEY_LEN` bytes.
+pub type DeviceIdentity = ([u8; KEY_LEN], [u8; KEY_LEN]);
+
+/// Persist the device's Noise static identity (`secret` ‖ `public`).
+pub fn store_device_identity(secret: &[u8; KEY_LEN], public: &[u8; KEY_LEN]) -> Result<(), String> {
+    let mut blob = Vec::with_capacity(KEY_LEN * 2);
+    blob.extend_from_slice(secret);
+    blob.extend_from_slice(public);
+    imp::store_blob(DEVICE_IDENTITY_ACCOUNT, &blob)
+}
+
+/// Read the persisted identity back as `(secret, public)`. `Ok(None)` = unset
+/// (first launch, or a desktop dev build with no on-device keychain).
+pub fn read_device_identity() -> Result<Option<DeviceIdentity>, String> {
+    let Some(blob) = imp::read_blob(DEVICE_IDENTITY_ACCOUNT)? else {
+        return Ok(None);
+    };
+    if blob.len() != KEY_LEN * 2 {
+        return Err("stored device identity has the wrong length".to_string());
+    }
+    let mut secret = [0u8; KEY_LEN];
+    let mut public = [0u8; KEY_LEN];
+    secret.copy_from_slice(&blob[..KEY_LEN]);
+    public.copy_from_slice(&blob[KEY_LEN..]);
+    Ok(Some((secret, public)))
+}
+
 /// Delete a device's push key from the shared keychain (the write side is
 /// [`store_push_key`]). Called on unpair so a stale per-device key can't linger.
 pub fn delete_push_key(bid: &str) -> Result<(), String> {

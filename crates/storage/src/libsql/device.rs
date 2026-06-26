@@ -24,6 +24,23 @@ const INSERT_DEVICE: &str = "INSERT INTO devices
       rendezvous_id, created_at, approved_at, last_seen_at)
  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
 
+/// Re-pair tail appended to [`INSERT_DEVICE`], used only by
+/// [`LibsqlDeviceStore::create_replacing_approved`]. `device_id` is a stable,
+/// client-persisted identity (the app keys it off a keychain-pinned Noise
+/// static), so re-pairing the **same** physical device collides on the
+/// `(user_id, device_id)` primary key. Upsert refreshes that row in place — new
+/// token / pubkey / status — instead of erroring; `created_at` is left untouched
+/// so it stays the device's first-seen time. Pairing a **different** device hits
+/// no conflict and inserts a fresh row as before.
+const REPAIR_UPSERT_TAIL: &str = " ON CONFLICT(user_id, device_id) DO UPDATE SET \
+     label = excluded.label, \
+     device_pubkey = excluded.device_pubkey, \
+     auth_token = excluded.auth_token, \
+     status = excluded.status, \
+     rendezvous_id = excluded.rendezvous_id, \
+     approved_at = excluded.approved_at, \
+     last_seen_at = excluded.last_seen_at";
+
 fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Internal(anyhow::anyhow!("libsql {ctx}: {e}"))
 }
@@ -102,7 +119,7 @@ impl DeviceStore for LibsqlDeviceStore {
 
     async fn create_replacing_approved(&self, row: &DeviceRow) -> Result<Vec<String>> {
         let conn = self.pool.conn();
-        // BEGIN IMMEDIATE takes the write lock up front so the revoke + insert
+        // BEGIN IMMEDIATE takes the write lock up front so the revoke + upsert
         // commit as a unit — no window where the user has zero or two approved
         // devices, and the partial unique index can never trip.
         let tx = conn
@@ -121,10 +138,15 @@ impl DeviceStore for LibsqlDeviceStore {
             .map_err(|e| col_err("query approved", e))?;
         let mut replaced = Vec::new();
         while let Some(r) = rows.next().await.map_err(|e| col_err("row", e))? {
-            replaced.push(
-                r.get::<String>(0)
-                    .map_err(|e| col_err("get device_id", e))?,
-            );
+            let id = r
+                .get::<String>(0)
+                .map_err(|e| col_err("get device_id", e))?;
+            // A same-device re-pair (stable device_id) refreshes its own row in
+            // place below; it didn't supersede a *different* binding, so don't
+            // report it as replaced.
+            if id != row.device_id {
+                replaced.push(id);
+            }
         }
         drop(rows);
 
@@ -135,9 +157,12 @@ impl DeviceStore for LibsqlDeviceStore {
         .await
         .map_err(|e| col_err("revoke prior approved", e))?;
 
-        tx.execute(INSERT_DEVICE, insert_params(row))
-            .await
-            .map_err(|e| insert_conflict_err(row, e))?;
+        tx.execute(
+            &format!("{INSERT_DEVICE}{REPAIR_UPSERT_TAIL}"),
+            insert_params(row),
+        )
+        .await
+        .map_err(|e| insert_conflict_err(row, e))?;
 
         tx.commit()
             .await
@@ -462,6 +487,50 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn create_replacing_approved_repairs_same_device_id_in_place() {
+        let s = store().await;
+        // First pairing of device d1.
+        s.create_replacing_approved(&device_row("u1", "d1", "tok1", "C1"))
+            .await
+            .unwrap();
+
+        // Re-pairing the SAME device (device_id is now a stable client identity)
+        // refreshes the row in place instead of colliding on (user_id, device_id).
+        let mut repair = device_row("u1", "d1", "tok2", "C2");
+        repair.created_at = 200; // a later first-seen value that must NOT overwrite
+        let replaced = s.create_replacing_approved(&repair).await.unwrap();
+        assert!(
+            replaced.is_empty(),
+            "a same-device re-pair supersedes no *other* binding"
+        );
+
+        // Exactly one approved row, still d1, with the refreshed token.
+        let approved = s.list(Some(DeviceStatus::Approved)).await.unwrap();
+        assert_eq!(approved.len(), 1, "no stray second row");
+        assert_eq!(approved[0].device_id, "d1");
+        assert_eq!(approved[0].auth_token, "tok2", "token refreshed in place");
+        assert_eq!(
+            approved[0].created_at, 100,
+            "created_at preserved as the device's first-seen time"
+        );
+        // The superseded token no longer authenticates; the new one does.
+        assert!(
+            s.lookup_approved_by_auth_token("tok1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.lookup_approved_by_auth_token("tok2")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Still a single row total for the user (in-place update, not append).
+        assert_eq!(s.list_for_user("u1", None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

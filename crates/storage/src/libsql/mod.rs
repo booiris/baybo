@@ -542,9 +542,10 @@ impl LibsqlPool {
                       LIMIT 1
                   );
                 -- One gateway = one user = one app: at most one Approved device
-                -- per user at a time. Re-pairing supersedes the prior binding
-                -- (see DeviceStore::create_replacing_approved); superseded rows
-                -- go Revoked and drop out of this partial index.
+                -- per user at a time. Re-pairing the same device refreshes its
+                -- row in place; a different device supersedes the prior binding
+                -- (see DeviceStore::create_replacing_approved), whose row goes
+                -- Revoked and drops out of this partial index.
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_one_approved_per_user
                     ON devices(user_id) WHERE status = 'approved';",
             )
