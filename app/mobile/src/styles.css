@@ -52,7 +52,7 @@ button.danger { background: #ff3b30; }
 
 .status { color: #0a84ff; font-size: 0.9rem; }
 
-/* Debug-only readout of the last scanned QR (pairing code masked). */
+/* Debug-only readout of the last scanned QR (secret masked). */
 .scan-debug {
   margin: 0.5rem 0 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;

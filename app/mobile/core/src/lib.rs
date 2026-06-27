@@ -1,15 +1,13 @@
-//! **baybo-mobile-core** — the FFI-free shared client core for the Baybo iOS
-//! companion (and a future Android app).
+//! **baybo-mobile-core** — the FFI-free shared client core for the Baybo mobile
+//! companion.
 //!
 //! It runs in the Tauri shell's `src-tauri` (reached from the webview via Tauri
 //! commands) and speaks the exact same protocol as the gateway by depending on
 //! the same crates — [`wire`] for the `Frame` wire types and
-//! [`device_proto`] for SPAKE2 / Noise / the AEAD framing. No FFI, no
+//! [`device_proto`] for XXpsk0 pairing, Noise content/blob legs, and the AEAD
+//! push-preview framing. No FFI, no
 //! Tauri, no platform APIs here, so it is fully host-unit-testable and
 //! cross-compiles to `aarch64-apple-ios` unchanged.
-//!
-//! This first slice is the app side of the pairing handshake ([`pairing`]); the
-//! Noise content session + `Frame::Subscribe` self-pull layer follow.
 
 pub mod blob;
 pub mod content;

@@ -1,10 +1,10 @@
 //! The Baybo iOS companion (Tauri shell).
 //!
 //! A thin native shell around the host-tested `baybo-mobile-core`: the webview
-//! drives phase-1's two features — scan-to-connect (the [`pair`] command) and
-//! remote notifications (handled out-of-process by the Notification Service
-//! Extension under `../apple`). The protocol/crypto live in the shared crates,
-//! so interop with the gateway is guaranteed by construction.
+//! drives scan-to-connect, chat, and attachments, while remote notifications are
+//! handled out-of-process by the Notification Service Extension under `../apple`.
+//! The protocol/crypto live in the shared crates, so interop with the gateway is
+//! guaranteed by construction.
 
 mod blob;
 mod content;
@@ -18,12 +18,12 @@ use pairing::{PairAborted, PairChallenge, PairedSummary, PairingSessions};
 use tauri::ipc::Channel;
 use tauri::{Emitter, State};
 
-/// Scan-to-connect, phase 1: dial the gateway, run the XXpsk0 handshake + send
-/// `DeviceHello`, and return the Bluetooth-style confirmation code the UI shows
-/// the user to compare against the operator's terminal. `rendezvous_id` + `secret`
-/// come from the QR (the secret is the Noise PSK). `on_abort` carries a
-/// gateway-side cancellation that lands before the user decides, so the UI can
-/// dismiss the confirm screen.
+/// Scan-to-connect: dial the gateway, run the XXpsk0 handshake through
+/// `DeviceHello`, and return the confirmation code the UI shows the user to
+/// compare against the operator's terminal. `rendezvous_id` + `secret` come from
+/// the QR (the secret is the Noise PSK). `on_abort` carries a gateway-side
+/// cancellation that lands before the user decides, so the UI can dismiss the
+/// confirm screen.
 #[tauri::command]
 async fn pair_begin(
     sessions: State<'_, PairingSessions>,

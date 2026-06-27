@@ -1,13 +1,9 @@
-//! Noise sessions for the post-pairing E2E channel.
+//! Noise IK sessions for the post-pairing E2E channel.
 //!
 //! After pairing each side holds the other's X25519 static public key. Every
-//! connection (direct or relayed through C) runs a Noise handshake whose
-//! static-key authentication blocks an active MITM — including by the operator
-//! — once the statics were authentically exchanged at pairing. We use:
-//!
-//! - **XX** for first contact (mutual static exchange in-band), and
-//! - **IK** for reconnects (the initiator already knows the responder's
-//!   static, so it is near-0-RTT).
+//! content/blob connection runs a Noise IK handshake whose static-key
+//! authentication blocks an active MITM — including by the operator — once the
+//! statics were authentically exchanged at pairing.
 //!
 //! C holds no static private key, so it can never impersonate either end. The
 //! `snow` crate provides the primitives; callers stay on these helpers rather
@@ -19,9 +15,9 @@ use snow::{Builder, HandshakeState};
 use crate::aead::KEY_LEN;
 use crate::error::ProtoError;
 
-/// Noise pattern for first contact (mutual static exchange).
+/// Plain XX pattern, retained for protocol tests and keypair generation.
 pub const NOISE_XX: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
-/// Noise pattern for reconnects (initiator knows responder's static).
+/// IK pattern for production post-pairing content/blob legs.
 pub const NOISE_IK: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 
 /// A long-term X25519 static identity. The gateway persists one in its
@@ -58,14 +54,14 @@ impl StaticKeypair {
         self.secret
     }
 
-    /// XX initiator (first contact).
+    /// XX initiator for protocol tests.
     pub fn xx_initiator(&self) -> Result<HandshakeState, ProtoError> {
         Ok(builder(NOISE_XX)?
             .local_private_key(&self.secret)
             .build_initiator()?)
     }
 
-    /// XX responder (first contact).
+    /// XX responder for protocol tests.
     pub fn xx_responder(&self) -> Result<HandshakeState, ProtoError> {
         Ok(builder(NOISE_XX)?
             .local_private_key(&self.secret)

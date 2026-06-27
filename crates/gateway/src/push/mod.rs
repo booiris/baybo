@@ -39,9 +39,9 @@ use tokio::task::JoinHandle;
 /// Max preview characters (kept well under the 4 KB APNs payload once
 /// encrypted + base64'd).
 const PREVIEW_MAX_CHARS: usize = 200;
-/// `kid` epoch — always 0 in phase 1 (the field exists so rotation needs no
+/// `kid` epoch — always 0 today (the field exists so rotation needs no
 /// payload change).
-const PHASE1_KID: u32 = 0;
+const PUSH_KEY_EPOCH: u32 = 0;
 /// How many active rows to pull from the reply's ordinal when building the
 /// preview — 1 is enough (the reply sits exactly at `reply_ordinal`); a small
 /// margin tolerates an interleaved row without a second round-trip.
@@ -126,7 +126,8 @@ impl NotifySink for HttpNotifySink {
 
 /// Seam over the POST to C's `/register`. The device-pair route calls it
 /// (best-effort, gateway-mediated) after a successful handshake so the app
-/// never holds a C credential. Real impl uses reqwest; tests use a mock.
+/// never holds APNs provider credentials. Real impl uses reqwest; tests use a
+/// mock.
 #[async_trait::async_trait]
 pub trait ApnsRegistrar: Send + Sync {
     async fn register_device(
@@ -435,7 +436,7 @@ fn build_notify_body(
         remote_api_key: remote_api_key.to_string(),
         device_id: device_id.to_string(),
         collapse_id: format!("{device_id}:{session_id}"),
-        kid: PHASE1_KID,
+        kid: PUSH_KEY_EPOCH,
         bid: device_id.to_string(),
         enc: b64.encode(&ciphertext),
         n: b64.encode(&nonce),

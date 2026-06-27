@@ -1,16 +1,16 @@
-//! **relay** — the blind byte-pipe + SPAKE2 rendezvous for `remote-host`.
+//! **relay** — the blind byte-pipe for `remote-host`.
 //!
 //! Solves "the phone can't reach the NAT'd gateway" and hosts pairing. Both the
-//! pairing rendezvous (keyed by the SPAKE2 code) and the content relay (keyed by
-//! the C-assigned `relay_node_id`) ride the same [`RelayBroker`] primitive:
-//! match two legs by key, copy opaque frames blind. Pairing runs SPAKE2 and
-//! content runs Noise inside TLS, so C sees neither the code nor any plaintext —
-//! it only shuttles ciphertext.
+//! pairing rendezvous (keyed by the public `rendezvous_id`) and the content relay
+//! (keyed by the C-assigned `relay_node_id`) ride the same [`RelayBroker`]
+//! primitive: match two legs by key, copy opaque frames blind. Pairing and
+//! content run Noise above the splice, so C sees only routing keys and
+//! ciphertext.
 //!
 //! The matching + piping core is the broker; [`serve`] layers the production
 //! WebSocket transport on top (the `remote-host-relay` binary), hosting the
 //! pairing rendezvous with admission so only an admitted gateway can occupy a
-//! code.
+//! rendezvous.
 
 pub mod bandwidth;
 pub mod broker;

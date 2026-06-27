@@ -7,10 +7,10 @@ user-facing features:
    mutual-confirm handshake establishes a device identity; both the phone user and
    the operator confirm a code derived from the handshake, and the gateway is then
    reachable for chat.
-2. **Remote notifications** — when an agent turn completes, the phone gets a push
-   whose lock-screen preview is **end-to-end encrypted**: the gateway encrypts, the
-   operator's remote host forwards ciphertext blind, and the phone decrypts locally
-   in a Notification Service Extension (NSE).
+2. **Remote notifications** — when a real user-chat turn completes successfully,
+   the phone gets a push whose lock-screen preview is **end-to-end encrypted**:
+   the gateway encrypts, the operator's remote host forwards ciphertext blind,
+   and the phone decrypts locally in a Notification Service Extension (NSE).
 
 The app is a **Tauri 2** shell (`app/mobile`) over a host-tested, FFI-free Rust
 core (`baybo-mobile-core`); the protocol + crypto live in shared crates so the
@@ -75,7 +75,7 @@ shared blind relay and is **not** bound 1:1.
 - `crates/device-proto` — the device protocol + crypto:
   - `psk_pair` — the pairing **XXpsk0** state machine over `snow` (`PskHandshake` /
     `PskTransport`), the `PairingSecret` newtype, and the canonical prologue
-    builder (see the security doc). SPAKE2 (`pake.rs`) is **deleted**.
+    builder (see the security doc).
   - `noise` — the post-pairing **Noise IK** content transport over `snow`, plus
     `write_chunked` / `FrameReassembler` (a length-prefixed plaintext stream that
     chunks a `Frame` past the Noise ~64 KiB per-message ceiling).
@@ -99,8 +99,9 @@ shared blind relay and is **not** bound 1:1.
     `crates/push` — APNs (HTTP/2 sender, ES256 `.p8` JWT, `/notify` + `/register`);
     `crates/server` — the single binary serving relay + push on one listener.
 - `app/mobile/core` (`baybo-mobile-core`) — P-side: `PairingClient`,
-  `ContentSession` (Noise self-pull), and the direct-first/relay-fallback connect
-  policy. No FFI, no platform APIs — host-unit-testable.
+  `ContentSession` (Noise self-pull), and the blob-leg client. No FFI, no
+  platform APIs — host-unit-testable; the Tauri shell owns relay WebSocket and
+  filesystem/keychain integration.
 - `app/mobile/src-tauri` — the Tauri shell: the `pair` / `forget_pairing`
   commands, push-key keychain persistence (`keychain.rs`), and push registration
   (`push_register.rs`).
@@ -144,8 +145,8 @@ first handshake message, authenticates the device by matching its static to an
 content leg**), then Noise-wraps the *same* channel frame loop the TUI / web chat
 use (`ChannelType::ios`, `Subscribe` + self-pull). Frames are chunked
 (`write_chunked` / `FrameReassembler`). The transport is generic
-(`BinarySink` / `BinarySource`), so the responder runs identically over a direct
-WS or an outbound relay leg.
+(`BinarySink` / `BinarySource`), so the responder can be tested in memory and
+runs in production over the outbound relay data leg.
 
 ### Push preview (A encrypts → C relays blind → P's NSE decrypts)
 
@@ -159,8 +160,9 @@ WS or an outbound relay leg.
 ```
 
 `mutable-content: 1` wakes the NSE; it reads the 32-byte `push_key` for `bid`
-from the **App Group keychain** (account `baybo.push-key.<bid>`, access group
-`group.com.baybo.app`), ChaCha20-Poly1305-opens `enc` with nonce `n`, and
+from the shared keychain access group (account `baybo.push-key.<bid>`, access
+group `group.com.baybo.app` in the app/NSE code), ChaCha20-Poly1305-opens `enc`
+with nonce `n`, and
 rewrites the visible `title`/`body`. On **any** failure it keeps the generic
 "New message" placeholder — a bad key / wrong nonce / tamper are
 indistinguishable. The Rust producer (`device_proto::aead`) and the Swift
@@ -169,8 +171,10 @@ consumer (CryptoKit `ChaChaPoly`) are pinned to one byte-exact vector in
 
 **Registration:** after a successful handshake the gateway
 (`HttpApnsRegistrar`, best-effort) POSTs `{remote_api_key, device_id, apns_token,
-env}` to C's `/register`, so the phone never holds a C credential. The device
-token is captured at launch by hooking the Tauri/wry-owned
+env}` to C's `/register`, so the phone never holds the APNs `.p8` or any push
+provider credential. It does persist the relay admission key from the QR and
+presents it on relay joins. The device token is captured at launch by hooking the
+Tauri/wry-owned
 `UIApplicationDelegate` (`push_register.rs`, `class_addMethod` on
 `didRegisterForRemoteNotificationsWithDeviceToken`) and threaded (hex) + the
 build's APNs env into `DeviceHello`.
@@ -216,16 +220,15 @@ C's blind relay, which only matches two legs by key and copies opaque frames
     enforcement is *throttle, not drop* (TCP backpressure paces the sender). Per-row
     overrides are in `DEPLOY.md`; the guest-tier defaults (and the per-server
     sub-cap) are consts in `remote-host/crates/admission/src/lib.rs`.
-  - a per-rendezvous `/pair/join` limiter, a parked-leg **TTL sweep** + a hard
+  - a per-rendezvous `/pair/join` limiter, parked-leg TTL cleanup + a hard
     `MAX_PENDING_LEGS` ceiling, and a per-client-IP upgrade limiter ahead of
     admission (`RELAY_PER_IP_LIMIT`, default on, socket-peer keyed; behind a proxy
     disable it or resolve the real client via
     `RELAY_CLIENT_IP_HEADERS=cf-connecting-ip` — see `DEPLOY.md`).
   - an admission reload that drops a key **kicks that key's live connections and
     forgets all its bandwidth buckets**, not just refusing future dials. Guest rows
-    may carry an `expires_at`; `gc_expired_guests` + the load-time filter drop
-    expired guests (the periodic sweep is unset this round, so guests created with
-    `expires_at = NULL` never expire yet).
+    may carry an `expires_at`; expired guests are filtered on load, and the durable
+    `gc_expired_guests` sweep is not mounted today.
 
 ## App lifecycle & persistence
 
@@ -236,32 +239,33 @@ and the content session reconnects (with catch-up) on every iOS foreground.
 `push_key` is persisted to the App Group keychain on a successful pair so the NSE
 can read it on-device.
 
+## Attachments
+
+Mobile attachments use dedicated relay blob legs rather than the chat leg. The
+blob path, token gate, bandwidth class, and upload quota are documented in
+[`mobile-blob-transfer.md`](mobile-blob-transfer.md).
+
 ## Status & open items
 
-Everything above is implemented and verified (cargo test/clippy on the root, iOS,
-and remote-host workspaces; tsc on the frontend; `simctl push` through the
-usernotifications pipeline; AEAD interop byte-exact). Real end-to-end APNs
-delivery is verified on a paid Apple Developer account + a real device (the
-simulator can't receive real APNs), and the App Group keychain / live NSE decrypt
-work on a provisioned, code-signed build (Xcode automatic signing — see the
-empirical boundary notes below).
+The pairing/content/push path, relay E2E tests, AEAD interop vector, and mobile
+UI are implemented in this branch. Real APNs delivery and App Group keychain
+reads require a provisioned, code-signed build; the simulator can exercise
+`simctl push` and the NSE path but cannot receive live APNs.
 
-**Open:** the `remote-host-dashboard` (a blind, metadata-only status router)
-compiles but **nothing mounts it** — it isn't in `remote-host/crates/server/Cargo.toml`,
-only a `TODO(dashboard)` in `main.rs`, with no real `MetadataProvider` impl and no
-`DASHBOARD_ENABLE` gate. Wiring it is a deliberate follow-up.
+**Open:** `remote-host-dashboard` is not mounted by the `remote-host` server.
 
 ### The signing boundary (empirical, iOS 26 simulator)
 
-The App Group keychain (and thus the live NSE decrypt + real APNs) is gated on a
-**provisioned, code-signed** build — an Apple boundary, not a code gap:
+The shared keychain access group (and thus the live NSE decrypt + real APNs) is
+gated on a **provisioned, code-signed** build — an Apple boundary, not a code
+gap:
 
 - An unsigned build's `SecItemAdd` returns `errSecMissingEntitlement (-34018)` —
   the code reaches the keychain; only the entitlement is unhonored.
 - `get-task-allow` is mandatory to launch any re-signed build.
-- The simulator rejects the App Group `group.com.baybo.app` unless it is
-  provisioned for the signing team; manual `codesign` (ad-hoc or Development)
-  cannot register an App Group.
+- The simulator rejects `group.com.baybo.app` unless the matching app/keychain
+  group entitlement is provisioned for the signing team; manual `codesign`
+  (ad-hoc or Development) cannot register that capability.
 
 The reliable path is **Xcode automatic signing** (set the team on both the app and
 the NSE target — a paid Apple Developer capability). `apple/verify-nse.sh`
@@ -271,11 +275,11 @@ replying."*
 
 ## Testing
 
-Each side is unit/integration-tested, and the spliced relay path is proven
-end-to-end **across the workspace boundary**: `remote-host-relay` /
+Each side is unit/integration-tested, and the spliced relay path is exercised
+end-to-end across the workspace boundary: `remote-host-relay` /
 `remote-host-admission` are path-depended as gateway dev-dependencies (like
 `remote-host-protocol`), and `crates/gateway/src/channel/relay_e2e.rs` boots a
-real `remote-host` relay in-process to drive both paths through it —
+real `remote-host` relay in-process to drive both paths through it:
 `real_relay_splices_gateway_responder_and_mock_app` (the real Noise IK content
 responder + a mock app) and `real_relay_pairs_gateway_and_mock_app` (the real
 XXpsk0 pairing entry + a mock app landing an approved row). The AEAD interop is
@@ -295,6 +299,8 @@ gateway auto-starts its relay control connection + push from that row.
 
 - [`mobile-pairing-security.md`](mobile-pairing-security.md) — the pairing threat
   model (hostile-relay MITM) and the XXpsk0 design.
+- [`mobile-blob-transfer.md`](mobile-blob-transfer.md) — dedicated relay blob
+  legs for mobile attachments.
 - [`pairing.md`](pairing.md) — the **channel**-pairing gate (a *different*
   subsystem for sidecar-routed inbound; do not conflate with device pairing).
 - [`gateway.md`](gateway.md) — the gateway crate that hosts the A-side routes,

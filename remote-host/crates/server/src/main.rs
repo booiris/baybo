@@ -125,13 +125,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     ));
     roles.push("relay");
 
-    // TODO(dashboard): wire in `remote-host-dashboard` here — a blind,
-    // metadata-only status router (counts of admitted keys / device tokens /
-    // connected gateways / pending relay legs, never content). It needs a
-    // `MetadataProvider` impl over the push `DeviceTokenStore` + the relay
-    // `ControlRegistry`/broker, then `app = app.merge(remote_host_dashboard::
-    // router(provider))`, likely behind a `DASHBOARD_ENABLE` env gate. The crate
-    // compiles as a workspace member today but nothing mounts it.
+    // Dashboard is intentionally not mounted in this slice.
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into());
     let tls = TlsPaths::from_env("TLS_CERT", "TLS_KEY")?;

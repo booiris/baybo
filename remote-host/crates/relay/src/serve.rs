@@ -428,10 +428,10 @@ async fn host_handler(
     })
 }
 
-/// App side: match an already-hosted code; never park. Symmetric admission — the
-/// pre-layer requires the app to present an admitted key too (the one the QR
-/// carries). The phone leg is ephemeral, so — unlike the host leg — it is not
-/// registered against the gateway's per-key connection cap.
+/// App side: match an already-hosted rendezvous; never park. Symmetric admission
+/// requires the app to present the admitted key the QR carries. The phone leg is
+/// ephemeral, so unlike the host leg it is not registered against the gateway's
+/// per-key connection cap.
 async fn join_handler(
     Path(rendezvous_id): Path<String>,
     State(state): State<RelayState>,

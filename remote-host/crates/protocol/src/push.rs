@@ -31,7 +31,7 @@ pub struct NotifyRequest {
 }
 
 /// JSON body of `POST /register` — bind/rebind a device's APNs token
-/// (gateway-mediated, so the app never holds a C credential).
+/// (gateway-mediated, so the app never holds APNs provider credentials).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterRequest {
     pub remote_api_key: String,

@@ -10,9 +10,9 @@
 //! Noise ciphertext.
 //!
 //! Transport-agnostic and host-testable: the Tauri shell pumps the opaque bytes
-//! over the direct or relayed WebSocket; the crypto is entirely
-//! [`device_proto`] + the `Frame` codec is [`wire`], so interop with
-//! the gateway is guaranteed by construction.
+//! over the relay WebSocket; the crypto is entirely [`device_proto`] and the
+//! `Frame` codec is [`wire`], so interop with the gateway is guaranteed by
+//! construction.
 
 use baybo_model::{ChannelType, SessionId};
 use device_proto::noise::{FrameReassembler, NOISE_MAX_MESSAGE, StaticKeypair, write_chunked};

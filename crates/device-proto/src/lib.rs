@@ -16,8 +16,8 @@
 //!   (`ciphertext || 16-byte Poly1305 tag`, fresh random 12-byte nonce, empty
 //!   AAD) matches Apple CryptoKit's `ChaChaPoly.SealedBox`, so the iOS
 //!   Notification Service Extension decrypts a preview natively with no Rust.
-//! - [`noise`] — the Noise (`snow`) IK/XX session both sides run for every
-//!   direct or relayed connection after pairing.
+//! - [`noise`] — the Noise (`snow`) IK session both sides run for post-pairing
+//!   content and blob legs.
 //! - [`pairing`] — the wire messages swapped during the pairing handshake
 //!   (the `DeviceHello` body, routing, push registration, confirm decision).
 //! - [`fixtures`] — pinned cross-language test vectors the iOS NSE's Swift

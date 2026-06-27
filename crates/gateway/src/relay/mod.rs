@@ -11,8 +11,7 @@
 //! This module is the **protocol-over-WebSocket core**: it runs over an
 //! already-connected stream, so it is host-testable against a mock C. The
 //! production wrapper supplies the TCP/TLS dial of `relay.base_url` and a
-//! reconnect loop; data-leg establishment + the blind byte-pipe ride on top
-//! (the relay path is operated but content prefers direct in phase 1).
+//! reconnect loop; data-leg establishment and the blind byte-pipe ride on top.
 
 use std::time::Duration;
 

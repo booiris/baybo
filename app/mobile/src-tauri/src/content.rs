@@ -239,8 +239,8 @@ async fn dial_relay(
     handshake_over(ws, record, local).await
 }
 
-/// Run the Noise IK initiator handshake over an established WS (direct or relay)
-/// and return the ready content session.
+/// Run the Noise IK initiator handshake over an established relay WS and return
+/// the ready content session.
 async fn handshake_over(
     mut ws: Ws,
     record: &PairedRecord,

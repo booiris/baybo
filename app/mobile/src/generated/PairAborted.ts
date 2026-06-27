@@ -7,7 +7,7 @@
  * of hanging on a code the other side has already abandoned. A DTO, so it is
  * generated into the webview's TS bindings by ts-rs.
  */
-export type PairAborted = { 
+export type PairAborted = {
 /**
  * A short, human-readable reason (the gateway's reject text, or why the
  * connection ended). Shown to the user as context, not parsed.

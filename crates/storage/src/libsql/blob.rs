@@ -673,11 +673,9 @@ mod tests {
 
     #[tokio::test]
     async fn id_without_token_or_with_wrong_token_is_not_found() {
-        // Pins the capability model the codex review flagged: holding
-        // the SHA-256 alone (or a wrong token) is not enough to read
-        // the blob. Every code path that surfaces bytes — `get`,
-        // `stat`, `open` — must reject a doctored id that strips or
-        // mutates the token suffix.
+        // Holding the SHA-256 alone (or a wrong token) is not enough to read the
+        // blob. Every byte-surfacing path must reject a doctored id that strips
+        // or mutates the token suffix.
         let (store, _dir) = build().await;
         let real = store.put(b"private", "text/plain", None).await.unwrap();
 

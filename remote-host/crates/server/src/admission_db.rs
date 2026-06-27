@@ -18,8 +18,6 @@ use remote_host_admission::{AdmissionEntry, InMemoryAdmission, Tier};
 /// `per_server_max_bps` are the key's optional limits (NULL → the guest default for
 /// guest rows, else the server's conservative role floor). `expires_at` is the
 /// guest-TTL wall clock (NULL → never expires).
-///
-/// Pre-release: redefined clean, no back-compat migration.
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS remote_api_keys (\
     remote_api_key TEXT PRIMARY KEY, \
     label TEXT, \
@@ -126,9 +124,8 @@ async fn load(conn: &libsql::Connection) -> Result<HashMap<String, AdmissionEntr
 /// returning the number removed. This is an **infra / admission** GC, NOT session
 /// data — the "never delete sessions" rule does not apply.
 ///
-/// Hook for the guest-TTL sweep: intentionally **not** invoked this round (no TTL
-/// is set, so guests are created with `expires_at = NULL` and never expire). Wire
-/// it to a periodic task once `GUEST_TTL` / `GUEST_SWEEP_INTERVAL` are chosen.
+/// Expired guests are already filtered on load; no durable periodic sweep is
+/// mounted today.
 #[allow(dead_code)]
 pub(crate) async fn gc_expired_guests(conn: &libsql::Connection) -> Result<u64, libsql::Error> {
     conn.execute(

@@ -4,8 +4,9 @@
 //!
 //! * **Admin** — TCP, bearer-token authenticated. Config / status /
 //!   jobs / cron / memory / traces / skills / tools / llm and a
-//!   read-only channel list. Surfaces the same data the CLI does; no
-//!   chat content flows through.
+//!   read-only channel list. Also co-hosts the channel-token web chat
+//!   routes (`/v1/channel-ws`, `/v1/blobs/*`) so browser clients can
+//!   reach them over the public bind.
 //! * **Channel** — loopback TCP (`127.0.0.1:<ephemeral>`),
 //!   vault-issued channel-token authenticated. Hosts a single
 //!   WebSocket endpoint (`/v1/channel-ws`) over which the bundled
@@ -41,7 +42,7 @@ pub use crate::auth::{
 };
 pub use crate::channel::{ChannelControlError, ChannelControlRegistry};
 // Self-contained relay pairing for `baybo device pair`: host a `/pair/host`
-// leg + run the SPAKE2 handshake without a running gateway daemon.
+// leg and run the XXpsk0 handshake without a running gateway daemon.
 pub use crate::channel::device_pair::PairingHostDeps;
 pub use crate::channel::relay_pair::host_pairing_leg;
 pub use crate::channel_listener::ChannelServer;

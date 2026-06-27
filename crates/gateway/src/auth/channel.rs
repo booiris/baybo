@@ -84,8 +84,8 @@ pub enum AuthedClient {
     /// [`ChannelTokenTable`]) — only `approved` rows match, so a pending or
     /// revoked device never authenticates. Scoped to the channel surface:
     /// registers on `/v1/channel-ws` only as [`ChannelType::IOS`]
-    /// (a `Subscribed` channel), and may not upload blobs (receive-only in
-    /// phase 1).
+    /// (a `Subscribed` channel). HTTP `/v1/blobs` upload is forbidden for device
+    /// tokens; mobile attachments upload over the E2E relay blob leg instead.
     Device {
         device_id: String,
     },

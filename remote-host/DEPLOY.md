@@ -5,7 +5,7 @@ on one listener, reached by disjoint route paths.
 
 | Role | When it runs | Routes | What it does |
 |------|--------------|--------|--------------|
-| **relay** | always on | `/pair/host/{code}`, `/pair/join/{code}`, `/control`, `/content/join/{node}`, `/content/host/{key}` | Blind WebSocket rendezvous for pairing + content (NAT'd gateways). Stateless. |
+| **relay** | always on | `/pair/host/{rendezvous_id}`, `/pair/join/{rendezvous_id}`, `/control`, `/content/join/{node}`, `/content/host/{key}` | Blind WebSocket rendezvous for pairing + content (NAT'd gateways). Stateless. |
 | **push** | auto, when an APNs `.p8` is configured (`APNS_P8_HOST_PATH`) | `POST /notify`, `POST /register` | Holds the APNs `.p8`; signs ES256 JWTs and POSTs the blind encrypted preview to Apple. |
 
 So a bare config runs relay only; fill the APNs section in `.env` to add push.
@@ -83,7 +83,8 @@ network).
 The allow-list of gateway `remote_api_key`s is a **SQLite table**, not env. The runtime polls it (every `ADMISSION_POLL_SECS`, default 30s), so you add/remove gateways **without a restart**. The DB is bind-mounted (`./data/admission.db` by default), so you edit it from the host:
 
 ```bash
-# admit a gateway (the remote_api_key from its baybo.json):
+# admit the remote_api_key you pass to `baybo device pair --remote-api-key`
+# (or `guest`, if using the built-in trial key):
 sqlite3 ./data/admission.db \
   "INSERT INTO remote_api_keys(remote_api_key, label) VALUES('<key>', 'my gateway');"
 # revoke:
@@ -96,14 +97,31 @@ The `remote_api_keys` table is created on first start; an empty table admits no 
 
 **Revoking is enforced on live connections, not just new ones.** On each poll, any key that was dropped from the table has its live relay connections (the gateway's control channel + any in-flight pairing/content legs) closed within the poll interval — so a revoked gateway is disconnected, not left running until it happens to drop. (The push role is per-request, so a revoked key simply gets `401` on its next `/notify`.)
 
-**Per-gateway connection cap.** Each admitted gateway may hold a bounded number of simultaneous relay connections, so a buggy or abusive one can't exhaust C. The limit is the row's `max_conns` column (NULL → the server default `MAX_CONNS_PER_REMOTE_API_KEY`, **64**), hot-reloaded with the rest of the table. Pairing/content host legs over the cap are refused with `429`; the gateway's one control channel is exempt, so a gateway at its limit can always reconnect control. Raise it per gateway for one serving many concurrent device sessions:
+**Per-key connection cap.** Each admitted `remote_api_key` may hold a bounded
+number of simultaneous relay connections, so a buggy or abusive gateway can't
+exhaust C. The limit is the row's `max_conns` column (NULL → the configured
+`MAX_CONNS_PER_REMOTE_API_KEY`; Docker Compose defaults it to **64**, while the
+binary fallback is **200**), hot-reloaded with the rest of the table. Pairing and
+chat host legs over the cap are refused with `429`; blob host legs use
+`cap - CHAT_CONN_RESERVE` so chat can still reconnect; the gateway's one control
+channel is exempt. Raise it per key for a deployment serving many concurrent
+device sessions:
 
 ```bash
 sqlite3 ./data/admission.db \
   "UPDATE remote_api_keys SET max_conns = 200 WHERE remote_api_key='<key>';"
 ```
 
-**Per-gateway relay bandwidth.** Content sessions (the bandwidth-heavy traffic) are throttled per gateway: the relay only authenticates the gateway (the phone-side leg is anonymous), so the cap is keyed by `remote_api_key` and aggregates **both directions across all of that gateway's content legs**. The default rate is a fixed **1 MiB/s**, overridable per gateway by the row's `max_bps` column in bytes/sec (NULL → the default), hot-reloaded with the table. Enforcement is *throttle, not drop* — a gateway over its rate is paced via TCP backpressure, nothing is lost. (Pairing legs are tiny SPAKE2 blobs and are not throttled.) Raise it for a gateway serving many concurrent sessions or large attachments:
+**Per-key relay bandwidth.** Content and blob legs are throttled per
+`remote_api_key`: the relay only authenticates the gateway (the phone-side leg is
+anonymous), so the cap aggregates both directions across all content/blob legs
+for that key. The default rate is **1 MiB/s**, overridable by the row's `max_bps`
+column in bytes/sec (NULL → the default), hot-reloaded with the table. A
+per-`(remote_api_key, server)` sub-cap can be set with `per_server_max_bps`.
+Enforcement is *throttle, not drop* — a gateway over its rate is paced via TCP
+backpressure, nothing is lost. Pairing legs carry small Noise XXpsk0 frames and
+are not bandwidth-throttled. Raise the cap for a key serving many concurrent
+sessions or large attachments:
 
 ```bash
 sqlite3 ./data/admission.db \
@@ -141,7 +159,7 @@ That single WS URL covers both roles: the gateway dials `wss://c.example.com` fo
 ## Notes
 
 - **Relay-only / `.p8` isolation.** Leave the APNs section of `.env` blank and only the relay runs — no `.p8` on that host. Fill it in to add push. The `.p8` lives solely where you configure it.
-- **State.** The admission allow-list is the SQLite table, persisted on the `./data` volume (survives restart). Device-token registrations are in-memory — dropped on restart, but devices re-register on their next pairing/heartbeat and the gateway re-registers an approved device before its first push.
+- **State.** The admission allow-list is the SQLite table, persisted on the `./data` volume (survives restart). Device-token registrations are in-memory — dropped on restart, but a device registers on its next pairing and the gateway re-registers an approved device before its first push attempt.
 - **APNs environment.** Push targets sandbox vs production **per device registration** (the token's env), so one deployment serves both — no env switch here. A debug-built app registers a sandbox token.
 - **Logs** go to stderr (the relay has no `tracing` subscriber wired, so only the `eprintln!` startup/error lines are guaranteed).
 - **Secrets.** `.env` and `*.p8` are gitignored. The `.p8` is mounted read-only as a Docker secret at `/run/secrets/apns_p8`; it never enters an image layer.

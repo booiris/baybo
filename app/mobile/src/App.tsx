@@ -40,8 +40,8 @@ function parseScan(text: string): {
   } catch {
     /* not a pairing URL */
   }
-  // No bare-code fallback: a pairing QR must carry both the rendezvous id and
-  // the high-entropy secret.
+  // No manual/short-code fallback: a pairing QR must carry both the rendezvous
+  // id and the high-entropy secret.
   return null;
 }
 
@@ -97,9 +97,8 @@ type StagedAttachment = {
   error?: string;
 };
 
-// Pairing defaults now that the manual form is gone: the QR carries the relay
-// endpoint (`h=`), so we only fall back to the public proxy when a bare-code QR
-// omits it.
+// Pairing default for QR payloads that omit `h=`. The QR must still carry the
+// rendezvous id and high-entropy secret.
 const DEFAULT_ENDPOINT = "wss://proxy.baybo.space";
 
 // The windowed scanner draws the camera behind the webview and exposes no
@@ -117,7 +116,7 @@ const DEBUG = import.meta.env.DEV || import.meta.env.TAURI_ENV_DEBUG === "true";
 
 // Reveal only a short prefix + length of a secret, so the debug readout proves
 // what was scanned (and lets you cross-check the prefix against the terminal)
-// without printing the full pairing code on screen.
+// without printing the full QR secret on screen.
 function maskSecret(s: string): string {
   if (s.length <= 4) return s.length ? "•".repeat(s.length) : "—";
   return `${s.slice(0, 3)}…(${s.length})`;
@@ -352,7 +351,7 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
           setStatus(`Stream reset: ${frame.reason}`);
           break;
         default:
-          break; // reasoning / tool progress / etc. not surfaced in phase 1
+          break; // reasoning / tool progress / etc. not surfaced in mobile chat
       }
     };
     setStatus("Connecting…");
@@ -638,7 +637,7 @@ export default function App() {
       const res = await bs.scan({ windowed: true, formats: [bs.Format.QRCode] });
       const parsed = parseScan(res.content);
       if (!parsed) {
-        setStatus("That QR isn't a Baybo pairing code. Scan the one shown by `baybo device pair`.");
+        setStatus("That QR isn't a Baybo pairing QR. Scan the one shown by `baybo device pair`.");
         return;
       }
       if (DEBUG) {
@@ -682,8 +681,8 @@ export default function App() {
     setScanPhase("idle");
   }
 
-  // Phase 1: connect + SPAKE2 → get the confirmation code to show the user.
-  // Called straight off a successful scan with the QR's endpoint/code.
+  // Connect and run the pairing handshake up to the confirmation-code step.
+  // Called straight off a successful scan with the QR's endpoint/rendezvous id.
   async function pairBegin(opts: {
     endpoint: string;
     rendezvousId: string;
@@ -908,7 +907,7 @@ export default function App() {
     <>
       <main className="container">
         <h1>Baybo</h1>
-        <p className="muted">Scan the pairing code shown by <code>baybo device pair</code>.</p>
+        <p className="muted">Scan the pairing QR shown by <code>baybo device pair</code>.</p>
 
         <div className="row">
           <button onClick={scan} disabled={busy}>Scan QR</button>

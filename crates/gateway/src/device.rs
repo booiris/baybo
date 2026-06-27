@@ -3,9 +3,9 @@
 //! The gateway (A) holds one X25519 static keypair, persisted in the
 //! [`SecretVault`] so it is stable across restarts — a paired device caches
 //! A's public half and authenticates every later Noise session against it, so
-//! the key must not rotate underneath an already-paired device. The public
-//! half is advertised inside the SPAKE2 K-channel at pairing; the secret half
-//! never leaves the vault.
+//! the key must not rotate underneath an already-paired device. The public half
+//! is advertised as an XXpsk0 handshake token at pairing; the secret half never
+//! leaves the vault.
 
 use baybo_security::SecretVault;
 use device_proto::noise::StaticKeypair;

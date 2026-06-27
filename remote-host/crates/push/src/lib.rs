@@ -6,10 +6,6 @@
 //! into the APNs payload and signs the provider token — it never decrypts.
 //! Built as its own crate/binary so the crown-jewel key stays isolatable from
 //! the high-exposure relay surface.
-//!
-//! This first slice implements the ES256 provider-token signer ([`jwt`]); the
-//! `/notify` ingest, the APNs sender seam (+ mock), and the
-//! `device_id → { token, env }` store follow.
 
 pub mod apns;
 pub mod apns_http;

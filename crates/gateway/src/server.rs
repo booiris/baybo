@@ -4,8 +4,9 @@
 //!
 //! * **Admin** — TCP, bearer-token authenticated. Hosts config,
 //!   status, jobs, cron, memory, traces, skills, tools, llm, and a
-//!   read-only channel list. No chat content flows through these
-//!   endpoints.
+//!   read-only channel list. Also co-hosts the channel-token web chat
+//!   routes (`/v1/channel-ws`, `/v1/blobs/*`) so browser clients can
+//!   reach them over the public bind.
 //! * **Channel** — loopback TCP (`127.0.0.1:<ephemeral>`),
 //!   channel-token authenticated against [`ChannelTokenTable`] (see
 //!   [`crate::channel_listener`] and [`crate::auth::channel`]). Hosts

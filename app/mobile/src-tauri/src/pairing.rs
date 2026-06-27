@@ -1,5 +1,5 @@
 //! The pairing command's transport: dial the gateway's `/v1/device/pair` WS and
-//! drive the SPAKE2 + mutual-confirm handshake through
+//! drive the XXpsk0 + mutual-confirm handshake through
 //! `baybo_mobile_core::PairingClient`.
 //!
 //! The handshake pauses for a human decision, so it is split across two Tauri
@@ -110,11 +110,11 @@ fn load_or_create_device_identity() -> Result<StaticKeypair, String> {
 /// referring to them as `pairing::*`.
 pub use baybo_mobile_core::{PairAborted, PairChallenge, PairedSummary};
 
-/// Phase 1: dial `endpoint`, run SPAKE2 + send the sealed `DeviceHello`, and
-/// return the confirmation code for the user to compare against the operator's
-/// terminal. Hands the live session to a background [`run_pair_pump`] task that
-/// watches for a gateway abort (pushing [`PairAborted`] over `on_abort`) and
-/// finishes the handshake once the user decides via [`pair_confirm`].
+/// Dial `endpoint`, run XXpsk0 through the `DeviceHello` step, and return the
+/// confirmation code for the user to compare against the operator's terminal.
+/// Hands the live session to a background [`run_pair_pump`] task that watches
+/// for a gateway abort (pushing [`PairAborted`] over `on_abort`) and finishes the
+/// handshake once the user decides via [`pair_confirm`].
 pub async fn pair_begin(
     sessions: &PairingSessions,
     endpoint: &str,
