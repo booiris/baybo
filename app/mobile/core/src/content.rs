@@ -48,6 +48,18 @@ impl ContentHandshake {
             reassembler: FrameReassembler::new(),
         })
     }
+
+    /// Like [`finish`](Self::finish), but finalize into a [`BlobSession`](crate::blob::BlobSession)
+    /// for a **blob leg** — the same Noise IK handshake, then the blob
+    /// sub-protocol instead of the `Frame` loop. The leg is dialed with the
+    /// `x-relay-leg-class: blob` header so the relay meters it as background.
+    pub fn finish_blob(mut self, reply: &[u8]) -> Result<crate::blob::BlobSession, MobileError> {
+        let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
+        self.state.read_message(reply, &mut buf)?;
+        Ok(crate::blob::BlobSession::new(
+            self.state.into_transport_mode()?,
+        ))
+    }
 }
 
 /// An established E2E content session. Seal `Frame`s to send and open received

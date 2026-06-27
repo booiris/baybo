@@ -88,7 +88,10 @@ pub struct WsChannelState {
     /// The relay is device-blind (Noise runs after the byte-splice), so a stale,
     /// half-open leg can only be reaped here: when a fresh leg completes its Noise
     /// handshake and resolves the same `device_id`, it aborts the predecessor.
-    /// Bounded by the approved-device count (~1 — one gateway = one app).
+    /// Bounded by the approved-device count (~1 — one gateway = one app). Only the
+    /// **chat** content leg dedups; blob legs run concurrently (one per transfer,
+    /// bounded by the relay's per-key connection cap), so they are not registered
+    /// here.
     pub device_leg_registry: Arc<DashMap<String, tokio::task::AbortHandle>>,
     /// Backing store for non-text media. Sidecars upload via
     /// `POST /v1/blobs`, the agent emits replies that reference blobs

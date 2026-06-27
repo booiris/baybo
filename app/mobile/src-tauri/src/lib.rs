@@ -6,6 +6,7 @@
 //! Extension under `../apple`). The protocol/crypto live in the shared crates,
 //! so interop with the gateway is guaranteed by construction.
 
+mod blob;
 mod content;
 mod keychain;
 mod pairing;
@@ -102,6 +103,28 @@ async fn content_disconnect(sessions: State<'_, ContentSessions>) -> Result<(), 
     Ok(())
 }
 
+/// Download an attachment `blob_id` to `dest_path` over a dedicated blob leg,
+/// resuming from a partial file if present. `on_progress` streams cumulative bytes.
+#[tauri::command]
+async fn blob_download(
+    blob_id: String,
+    dest_path: String,
+    on_progress: Channel<u64>,
+) -> Result<(), String> {
+    blob::download(blob_id, dest_path, on_progress).await
+}
+
+/// Upload the local file at `src_path` as `mime_type` over a dedicated blob leg,
+/// returning the content-addressed `blob_id` to reference in the next message.
+#[tauri::command]
+async fn blob_upload(
+    src_path: String,
+    mime_type: String,
+    on_progress: Channel<u64>,
+) -> Result<String, String> {
+    blob::upload(src_path, mime_type, on_progress).await
+}
+
 /// Debug-only: seed a known push key into the shared App Group keychain so the
 /// NSE decrypt path can be exercised with `xcrun simctl push` without a live
 /// gateway pairing. Reads `BAYBO_SEED_PUSH_KEY` as `<bid>:<64-hex-key>` (absent
@@ -178,7 +201,9 @@ pub fn run() {
             forget_pairing,
             content_connect,
             content_send,
-            content_disconnect
+            content_disconnect,
+            blob_download,
+            blob_upload
         ])
         .build(tauri::generate_context!())
     {

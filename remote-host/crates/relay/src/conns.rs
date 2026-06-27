@@ -19,10 +19,21 @@ use tokio::sync::oneshot;
 /// Fallback cap on simultaneous relay connections one admitted `remote_api_key`
 /// may hold (control + pairing/content host legs) when the key sets no cap of its
 /// own. Bounds a buggy or abusive gateway from exhausting C, while staying
-/// generous for a real gateway (one control connection plus a leg per active
-/// pairing/content session). Override the fallback with `MAX_CONNS_PER_REMOTE_API_KEY`;
+/// generous for a real gateway: one control connection, the chat content leg, and
+/// — since blob transfers run **concurrently, one dedicated leg each** (not a
+/// single deduped warm leg) — a leg per in-flight blob transfer. This cap is
+/// therefore the effective per-device concurrent-transfer bound (minus the chat
+/// [`CHAT_CONN_RESERVE`]). Override the fallback with `MAX_CONNS_PER_REMOTE_API_KEY`;
 /// override per-key via the `max_conns` column in the admission table.
-pub const DEFAULT_MAX_CONNS_PER_KEY: usize = 64;
+pub const DEFAULT_MAX_CONNS_PER_KEY: usize = 200;
+
+/// Connection slots withheld from background (blob) legs and kept for the key's
+/// interactive legs. A [`register_background`](ConnectionRegistry::register_background)
+/// caller may use at most `cap - CHAT_CONN_RESERVE` slots, so a blob-leg flood
+/// can't `429` a chat host leg's (re)establishment under a shared `remote_api_key`.
+/// The `/control` connection is already cap-exempt; this protects chat *content*
+/// legs.
+pub const CHAT_CONN_RESERVE: usize = 4;
 
 /// Registry of live connections' kick channels, keyed by `remote_api_key`. Cheap
 /// per-connection registration; the only bulk op is [`kick`](Self::kick) on a
@@ -70,6 +81,33 @@ impl ConnectionRegistry {
         max_override: Option<usize>,
     ) -> Option<(ConnGuard, oneshot::Receiver<()>)> {
         let cap = max_override.unwrap_or(self.max_per_key);
+        self.register_capped(remote_api_key, cap)
+    }
+
+    /// Like [`register`](Self::register) but for a **background (blob) leg**: it may
+    /// use at most `cap - CHAT_CONN_RESERVE` of the key's budget, leaving a headroom
+    /// a chat host leg can always (re)claim. Returns `None` once the key is at the
+    /// reduced cap.
+    pub(crate) fn register_background(
+        self: &Arc<Self>,
+        remote_api_key: &str,
+        max_override: Option<usize>,
+    ) -> Option<(ConnGuard, oneshot::Receiver<()>)> {
+        let cap = max_override
+            .unwrap_or(self.max_per_key)
+            .saturating_sub(CHAT_CONN_RESERVE)
+            .max(1);
+        self.register_capped(remote_api_key, cap)
+    }
+
+    /// Shared body of [`register`](Self::register) /
+    /// [`register_background`](Self::register_background): admit one connection for
+    /// `remote_api_key` under `cap`, returning `None` if it is already at `cap`.
+    fn register_capped(
+        self: &Arc<Self>,
+        remote_api_key: &str,
+        cap: usize,
+    ) -> Option<(ConnGuard, oneshot::Receiver<()>)> {
         let mut conns = self.conns.lock();
         let entry = conns.entry(remote_api_key.to_string()).or_default();
         if entry.len() >= cap {
@@ -218,6 +256,27 @@ mod tests {
         assert!(
             reg.register("k", Some(3)).is_none(),
             "4th exceeds the override"
+        );
+    }
+
+    #[test]
+    fn background_legs_are_capped_below_the_chat_reserve() {
+        let reg = Arc::new(ConnectionRegistry::new().with_max_per_key(CHAT_CONN_RESERVE + 2));
+        // A background (blob) leg may use only cap - CHAT_CONN_RESERVE = 2 slots.
+        let _a = reg
+            .register_background("k", None)
+            .expect("1st background under the reduced cap");
+        let _b = reg
+            .register_background("k", None)
+            .expect("2nd background under the reduced cap");
+        assert!(
+            reg.register_background("k", None).is_none(),
+            "a 3rd background leg exceeds cap - reserve"
+        );
+        // ...but a chat (full) register can still claim the reserved slots.
+        assert!(
+            reg.register("k", None).is_some(),
+            "chat still claims a slot the reserve kept for it"
         );
     }
 

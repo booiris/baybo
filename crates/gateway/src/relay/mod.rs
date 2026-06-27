@@ -77,7 +77,7 @@ async fn read_relay_node_id(vault: &SecretVault) -> anyhow::Result<Option<String
 
 /// The control-plane wire types ([`ControlHello`] A sends, [`ControlSignal`] C
 /// pushes) live in the shared protocol crate, so A and C agree by construction.
-pub use remote_host_protocol::relay::{ControlHello, ControlSignal};
+pub use remote_host_protocol::relay::{ControlHello, ControlSignal, LegClass};
 
 #[derive(Debug, Error)]
 pub enum ControlError {
@@ -228,6 +228,7 @@ mod tests {
             *state.received_hello.lock() = Some(hello);
             let sig = ControlSignal::OpenDataLeg {
                 relay_key: "leg-xyz".into(),
+                class: LegClass::Chat,
             };
             let _ = socket
                 .send(AxumMsg::Binary(serde_json::to_vec(&sig).unwrap().into()))
@@ -268,6 +269,7 @@ mod tests {
             sig,
             ControlSignal::OpenDataLeg {
                 relay_key: "leg-xyz".into(),
+                class: LegClass::Chat,
             },
         );
 
@@ -287,9 +289,11 @@ mod tests {
     fn open_data_leg_wire_shape_is_stable() {
         let sig = ControlSignal::OpenDataLeg {
             relay_key: "k".into(),
+            class: LegClass::Chat,
         };
         let v: serde_json::Value = serde_json::to_value(&sig).unwrap();
         assert_eq!(v["t"], "open_data_leg");
         assert_eq!(v["relay_key"], "k");
+        assert_eq!(v["class"], "chat");
     }
 }

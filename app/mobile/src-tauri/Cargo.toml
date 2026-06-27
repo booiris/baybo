@@ -22,8 +22,9 @@ remote-host-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+sha2 = { workspace = true }
 futures-util = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "macros", "sync", "fs", "io-util"] }
 tokio-tungstenite = { workspace = true }
 # Selects + installs the rustls crypto provider for tokio-tungstenite's wss
 # dials (see run() in lib.rs); tokio-tungstenite itself pulls rustls with no

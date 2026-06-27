@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use baybo_model::BlobRef;
@@ -20,9 +21,8 @@ use baybo_store::blob::{
 };
 
 /// In-memory `BlobStore` for tests. Bytes live in a `Mutex<HashMap>`,
-/// keyed by the same `sha256:<hex>` blob id the libsql backend uses, so
-/// downstream tests can swap between fakes and real stores without
-/// changing assertion strings.
+/// keyed by the same `sha256:<hex>.<read_token>` capability id shape the libsql
+/// backend uses, so downstream tests can swap between fakes and real stores.
 #[derive(Debug, Default)]
 pub struct MemoryBlobStore {
     blobs: Mutex<HashMap<String, MemoryBlob>>,
@@ -32,6 +32,7 @@ pub struct MemoryBlobStore {
 struct MemoryBlob {
     bytes: Vec<u8>,
     mime_type: String,
+    uploader_identity: Option<String>,
     created_at: i64,
     last_accessed_at: i64,
     read_token: String,
@@ -59,18 +60,23 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+fn next_read_token() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!("fake-token-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 #[async_trait]
 impl BlobStore for MemoryBlobStore {
     async fn put(
         &self,
         bytes: &[u8],
         mime_type: &str,
-        _uploader_identity: Option<&str>,
+        uploader_identity: Option<&str>,
     ) -> BlobResult<BlobRef> {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         let hex = hex_encode(&hasher.finalize());
-        let read_token = "fake-token";
+        let read_token = next_read_token();
         let blob_id = format!("{SHA256_PREFIX}{hex}.{read_token}");
         let now = chrono::Utc::now().timestamp_micros();
         let mut guard = self.blobs.lock();
@@ -83,9 +89,10 @@ impl BlobStore for MemoryBlobStore {
             .or_insert(MemoryBlob {
                 bytes: bytes.to_vec(),
                 mime_type: mime_type.to_owned(),
+                uploader_identity: uploader_identity.map(str::to_owned),
                 created_at: now,
                 last_accessed_at: now,
-                read_token: read_token.to_owned(),
+                read_token,
             });
         Ok(BlobRef { blob_id })
     }
@@ -130,6 +137,16 @@ impl BlobStore for MemoryBlobStore {
         Ok(Box::pin(Cursor::new(bytes)))
     }
 
+    async fn uploaded_bytes(&self, uploader_identity: &str) -> BlobResult<u64> {
+        Ok(self
+            .blobs
+            .lock()
+            .values()
+            .filter(|blob| blob.uploader_identity.as_deref() == Some(uploader_identity))
+            .map(|blob| blob.bytes.len() as u64)
+            .sum())
+    }
+
     async fn stat(&self, blob_id: &str) -> BlobResult<BlobMeta> {
         let (_hex, token) = split_id(blob_id)?;
         let now = chrono::Utc::now().timestamp_micros();
@@ -159,13 +176,6 @@ impl BlobStore for MemoryBlobStore {
         let _ = split_id(blob_id)?;
         self.blobs.lock().remove(blob_id);
         Ok(())
-    }
-
-    async fn purge_older_than(&self, cutoff_unix: i64) -> BlobResult<u64> {
-        let mut guard = self.blobs.lock();
-        let before = guard.len();
-        guard.retain(|_, blob| blob.last_accessed_at >= cutoff_unix);
-        Ok((before - guard.len()) as u64)
     }
 }
 

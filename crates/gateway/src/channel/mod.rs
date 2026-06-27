@@ -19,6 +19,7 @@
 //! the streaming frames and render the final `Message`.
 
 pub(crate) mod adapter;
+pub(crate) mod blob_content;
 pub(crate) mod blobs;
 pub mod boot;
 pub mod bot_reconciler;

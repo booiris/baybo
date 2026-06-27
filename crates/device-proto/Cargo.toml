@@ -8,6 +8,7 @@ doctest = false
 
 [dependencies]
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 rmp-serde = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }

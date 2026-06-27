@@ -34,7 +34,7 @@ use snow::TransportState;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 
 /// An outbound relay data leg (the gateway dialed C's `/content/host/{key}`).
-type RelayWs =
+pub(crate) type RelayWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 use super::adapter::{FrameSink, FrameSource, Sidecar};
@@ -73,46 +73,9 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
     state: &WsChannelState,
     dedup: Option<LegDedup>,
 ) -> Result<(), String> {
-    let gateway_static = load_or_create_static_keypair(&state.secret_vault)
-        .await
-        .map_err(|e| format!("gateway static key: {e}"))?;
-
-    // Noise IK responder handshake (2 messages): read the initiator's `msg1`
-    // (which carries its static key), authenticate it, then send `msg2` and
-    // enter transport mode.
-    let mut handshake = gateway_static
-        .ik_responder()
-        .map_err(|e| format!("build ik responder: {e}"))?;
-    let msg1 = recv_handshake(&mut source, HANDSHAKE_TIMEOUT).await?;
-    let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
-    handshake
-        .read_message(&msg1, &mut buf)
-        .map_err(|e| format!("read handshake msg1: {e}"))?;
-    let remote_static = handshake
-        .get_remote_static()
-        .ok_or_else(|| "initiator sent no static key".to_string())?
-        .to_vec();
-
-    // No prior channel-auth ran (the gateway dialed the relay data leg blind), so
-    // authenticate the device purely by matching the Noise IK initiator's static
-    // key to an approved device row.
-    let row = state
-        .device_store
-        .lookup_approved_by_pubkey(&remote_static)
-        .await
-        .map_err(|e| format!("device lookup by pubkey: {e}"))?
-        .ok_or_else(|| "no approved device for this static key".to_string())?;
-    let device_id = row.device_id;
-
-    let n = handshake
-        .write_message(&[], &mut buf)
-        .map_err(|e| format!("write handshake msg2: {e}"))?;
-    sink.send_bytes(buf[..n].to_vec())
-        .await
-        .map_err(|()| "send handshake msg2".to_string())?;
-    let transport = handshake
-        .into_transport_mode()
-        .map_err(|e| format!("enter transport mode: {e}"))?;
+    // Authenticate the device and bring up the Noise transport (shared with the
+    // blob leg — both authenticate the same way before diverging).
+    let (transport, device_id) = responder_handshake(&mut sink, &mut source, state).await?;
     let transport = Arc::new(Mutex::new(transport));
 
     // Gateway-only device dedup: now that this leg has a viable Noise session, make
@@ -128,12 +91,6 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
         device = %super::short_hash(&device_id),
         "device content session established",
     );
-
-    // Best-effort liveness bump for the operator's device list.
-    let now = chrono::Utc::now().timestamp();
-    if let Err(e) = state.device_store.touch_last_seen(&device_id, now).await {
-        tracing::debug!(error = %e, "touch device last_seen failed");
-    }
 
     // From here on the device is an ordinary `Subscribed`-channel connection,
     // just with a Noise-wrapped transport: reuse the channel registry + the
@@ -183,6 +140,63 @@ async fn recv_handshake<So: BinarySource>(
         .ok_or_else(|| "peer closed during handshake".to_string())
 }
 
+/// Run the Noise IK responder handshake over the leg and authenticate the device
+/// by matching the initiator's static key to an *approved* device row, returning
+/// the established [`TransportState`] and the device's id. No prior channel-auth
+/// ran (the gateway dialed the relay data leg blind), so the static-key match is
+/// the sole gate — and C, a relay, can't MITM it. Shared by the chat content
+/// session and the blob leg, which authenticate identically before diverging.
+pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
+    sink: &mut Si,
+    source: &mut So,
+    state: &WsChannelState,
+) -> Result<(TransportState, String), String> {
+    let gateway_static = load_or_create_static_keypair(&state.secret_vault)
+        .await
+        .map_err(|e| format!("gateway static key: {e}"))?;
+
+    // 2 messages: read the initiator's `msg1` (carrying its static key),
+    // authenticate it, then send `msg2` and enter transport mode.
+    let mut handshake = gateway_static
+        .ik_responder()
+        .map_err(|e| format!("build ik responder: {e}"))?;
+    let msg1 = recv_handshake(source, HANDSHAKE_TIMEOUT).await?;
+    let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
+    handshake
+        .read_message(&msg1, &mut buf)
+        .map_err(|e| format!("read handshake msg1: {e}"))?;
+    let remote_static = handshake
+        .get_remote_static()
+        .ok_or_else(|| "initiator sent no static key".to_string())?
+        .to_vec();
+
+    let row = state
+        .device_store
+        .lookup_approved_by_pubkey(&remote_static)
+        .await
+        .map_err(|e| format!("device lookup by pubkey: {e}"))?
+        .ok_or_else(|| "no approved device for this static key".to_string())?;
+    let device_id = row.device_id;
+
+    let n = handshake
+        .write_message(&[], &mut buf)
+        .map_err(|e| format!("write handshake msg2: {e}"))?;
+    sink.send_bytes(buf[..n].to_vec())
+        .await
+        .map_err(|()| "send handshake msg2".to_string())?;
+    let transport = handshake
+        .into_transport_mode()
+        .map_err(|e| format!("enter transport mode: {e}"))?;
+
+    // Best-effort liveness bump for the operator's device list.
+    let now = chrono::Utc::now().timestamp();
+    if let Err(e) = state.device_store.touch_last_seen(&device_id, now).await {
+        tracing::debug!(error = %e, "touch device last_seen failed");
+    }
+
+    Ok((transport, device_id))
+}
+
 /// A binary-message duplex the content responder runs over: the outbound relay
 /// data leg ([`TungBinSink`]/[`TungBinSource`]). Only opaque binary frames cross
 /// it (Noise ciphertext); ping/pong are skipped, anything else ends the stream.
@@ -200,8 +214,8 @@ pub(crate) trait BinarySource: Send {
 }
 
 /// The outbound `tokio-tungstenite` relay data leg's split halves.
-struct TungBinSink(SplitSink<RelayWs, TungMessage>);
-struct TungBinSource(SplitStream<RelayWs>);
+pub(crate) struct TungBinSink(pub(crate) SplitSink<RelayWs, TungMessage>);
+pub(crate) struct TungBinSource(pub(crate) SplitStream<RelayWs>);
 
 #[async_trait::async_trait]
 impl BinarySink for TungBinSink {

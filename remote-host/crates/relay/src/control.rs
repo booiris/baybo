@@ -21,7 +21,7 @@ const CONTROL_CHANNEL_CAP: usize = 32;
 /// The control-plane wire types ([`ControlHello`] in, [`ControlSignal`] out)
 /// live in the shared protocol crate, so the gateway encodes/decodes the exact
 /// same definitions.
-pub use remote_host_protocol::relay::{ControlHello, ControlSignal};
+pub use remote_host_protocol::relay::{ControlHello, ControlSignal, LegClass};
 
 /// A gateway's live control connection: the signal channel plus its admitted
 /// `remote_api_key`, so the relay can attribute the anonymous phone-side content
@@ -61,12 +61,18 @@ impl ControlRegistry {
         rx
     }
 
-    /// Signal a registered gateway to open a data leg under `relay_key`. Returns
-    /// the gateway's `remote_api_key` on success (so the caller can meter the
-    /// resulting leg against it), or `None` if the gateway isn't connected (the
-    /// phone's relay attempt then fails fast rather than hanging) or its control
-    /// channel is closed.
-    pub async fn signal_open(&self, relay_node_id: &str, relay_key: &str) -> Option<String> {
+    /// Signal a registered gateway to open a data leg under `relay_key` of the
+    /// given `class` (so the gateway runs the chat loop or the blob sub-protocol
+    /// and meters accordingly). Returns the gateway's `remote_api_key` on success
+    /// (so the caller can meter the resulting leg against it), or `None` if the
+    /// gateway isn't connected (the phone's relay attempt then fails fast rather
+    /// than hanging) or its control channel is closed.
+    pub async fn signal_open(
+        &self,
+        relay_node_id: &str,
+        relay_key: &str,
+        class: LegClass,
+    ) -> Option<String> {
         // Clone the sender + key out of the lock so the await never holds it.
         let entry = self
             .instances
@@ -76,6 +82,7 @@ impl ControlRegistry {
         let (tx, remote_api_key) = entry?;
         tx.send(ControlSignal::OpenDataLeg {
             relay_key: relay_key.to_string(),
+            class,
         })
         .await
         .ok()
@@ -106,32 +113,41 @@ mod tests {
 
         // The signal succeeds and reports the gateway's owning remote_api_key.
         assert_eq!(
-            reg.signal_open("node-1", "leg-abc").await,
+            reg.signal_open("node-1", "leg-abc", LegClass::Chat).await,
             Some("inst-A".to_string())
         );
         assert_eq!(
             rx.recv().await.unwrap(),
             ControlSignal::OpenDataLeg {
                 relay_key: "leg-abc".into(),
+                class: LegClass::Chat,
             },
         );
     }
 
     #[test]
     fn open_data_leg_serializes_to_gateway_wire_shape() {
-        // Must match the gateway's `ControlServerMsg` JSON byte-for-byte.
+        // Must match the gateway's `ControlServerMsg` JSON byte-for-byte. A Chat
+        // leg omits no field the gateway requires; `class` rides as a snake_case
+        // string (and a pre-class gateway tolerates it via `#[serde(default)]`).
         let v = serde_json::to_value(ControlSignal::OpenDataLeg {
             relay_key: "k".into(),
+            class: LegClass::Blob,
         })
         .unwrap();
         assert_eq!(v["t"], "open_data_leg");
         assert_eq!(v["relay_key"], "k");
+        assert_eq!(v["class"], "blob");
     }
 
     #[tokio::test]
     async fn signal_to_unknown_gateway_fails_fast() {
         let reg = ControlRegistry::new();
-        assert!(reg.signal_open("ghost", "k").await.is_none());
+        assert!(
+            reg.signal_open("ghost", "k", LegClass::Chat)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -140,7 +156,7 @@ mod tests {
         let _rx = reg.register("n", "inst-A");
         reg.unregister("n");
         assert_eq!(reg.connected(), 0);
-        assert!(reg.signal_open("n", "k").await.is_none());
+        assert!(reg.signal_open("n", "k", LegClass::Chat).await.is_none());
     }
 
     /// The control plane + the byte-pipe compose: C signals A to open a leg
@@ -157,12 +173,12 @@ mod tests {
         // signals A to open the matching data leg.
         let phone = broker.join("leg-xyz").expect("phone leg parks");
         assert_eq!(
-            reg.signal_open("node-1", "leg-xyz").await,
+            reg.signal_open("node-1", "leg-xyz", LegClass::Chat).await,
             Some("inst-A".to_string())
         );
 
         // A acts on the signal: opens a data leg under the same key.
-        let ControlSignal::OpenDataLeg { relay_key } = a_control.recv().await.unwrap();
+        let ControlSignal::OpenDataLeg { relay_key, .. } = a_control.recv().await.unwrap();
         let mut gateway = broker.join(&relay_key).expect("gateway leg matches");
 
         // The two legs are matched; opaque frames flow blind.

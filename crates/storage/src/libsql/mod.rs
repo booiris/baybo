@@ -494,6 +494,9 @@ impl LibsqlPool {
                     created_at        INTEGER NOT NULL,
                     last_accessed_at  INTEGER NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_blobs_uploader_identity_size
+                    ON blobs(uploader_identity, size)
+                    WHERE uploader_identity IS NOT NULL;
 
                 CREATE TABLE IF NOT EXISTS channel_pairings (
                     channel_type TEXT    NOT NULL,

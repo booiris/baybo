@@ -20,4 +20,9 @@ pub enum MobileError {
     /// The handshake was driven out of order (a programming error in the shell).
     #[error("protocol state: {0}")]
     State(&'static str),
+
+    /// A blob-leg transfer failed: the gateway reported an error, or a received
+    /// response broke the protocol (out-of-order chunk, size/digest mismatch).
+    #[error("blob: {0}")]
+    Blob(String),
 }

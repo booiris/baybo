@@ -20,11 +20,11 @@ pub type ByteStream = BoxStream<'static, std::io::Result<Bytes>>;
 /// body without buffering the file.
 pub type BlobReader = Pin<Box<dyn AsyncRead + Send>>;
 
-/// Algorithm prefix used in every minted `BlobRef::blob_id`. The full id
-/// is `"sha256:<64 lower-hex>"`, so callers can recognize a content-
-/// addressed blob from a glance and the prefix gives us room to add
-/// other digests later without breaking parsers.
-pub const SHA256_PREFIX: &str = "sha256:";
+/// Algorithm prefix on every minted `BlobRef::blob_id`. Re-exported from
+/// [`baybo_model`] (its single source of truth, next to `BlobRef`) so existing
+/// `baybo_store::SHA256_PREFIX` / `baybo_store::blob::SHA256_PREFIX` callers are
+/// unchanged.
+pub use baybo_model::SHA256_PREFIX;
 
 /// Metadata for a stored blob. Returned by [`BlobStore::stat`].
 ///
@@ -92,22 +92,47 @@ pub trait BlobStore: Send + Sync {
     /// loading large blobs into memory before responding.
     async fn open(&self, blob_id: &str) -> Result<BlobReader>;
 
+    /// Open a streaming reader beginning at byte `offset` (resumable
+    /// downloads — e.g. the relay blob leg's `BlobPull{offset}`).
+    ///
+    /// **Token gate (security-critical):** the offset path MUST enforce
+    /// the same `read_token` check as [`open`]/[`stat`] — never resolve a
+    /// caller-supplied id by its bare hex digest. The default upholds this
+    /// by going through [`open`] (which `stat`s first) and discarding
+    /// `offset` bytes; a backend with seekable storage should override to
+    /// seek natively, but only after re-`stat`ing. `offset` past the
+    /// blob's length yields an empty reader.
+    async fn open_at(&self, blob_id: &str, offset: u64) -> Result<BlobReader> {
+        let mut reader = self.open(blob_id).await?;
+        // `open` already enforced the token gate; skip to `offset`.
+        let mut remaining = offset;
+        if remaining > 0 {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 64 * 1024];
+            while remaining > 0 {
+                let want = remaining.min(buf.len() as u64) as usize;
+                let n = reader.read(&mut buf[..want]).await.map_err(|e| {
+                    StorageError::Internal(anyhow::anyhow!("blob skip to offset: {e}"))
+                })?;
+                if n == 0 {
+                    break; // offset past EOF → an empty reader
+                }
+                remaining -= n as u64;
+            }
+        }
+        Ok(reader)
+    }
+
     /// Return metadata only. Same not-found semantics as `get`.
     async fn stat(&self, blob_id: &str) -> Result<BlobMeta>;
+
+    /// Total durable bytes attributed to `uploader_identity` (the sum of `size`
+    /// over its blobs). Backs the per-device upload quota on the relay blob leg —
+    /// a device's uploads stamp its `device_id` as the uploader.
+    async fn uploaded_bytes(&self, uploader_identity: &str) -> Result<u64>;
 
     /// Hard-delete the metadata row and unlink the on-disk payload
     /// (when no other live row resolves to the same content path).
     /// Idempotent on missing ids.
     async fn delete(&self, blob_id: &str) -> Result<()>;
-
-    /// Bulk garbage-collect every blob whose `last_accessed_at <
-    /// cutoff_us` (Unix microseconds). LRU semantics: a successful
-    /// `get`/`stat`/`open` bumps `last_accessed_at`, so blobs the
-    /// system is still reading stay out of the sweep regardless of
-    /// when they were first written. Hard-deletes the metadata row and
-    /// (where the backend keeps payload files on disk) unlinks the
-    /// byte file iff no remaining row resolves to the same on-disk
-    /// path. Returns the number of rows removed. Idempotent: a no-op
-    /// when no row matches.
-    async fn purge_older_than(&self, cutoff_us: i64) -> Result<u64>;
 }

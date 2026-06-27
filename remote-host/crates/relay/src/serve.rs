@@ -36,10 +36,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use remote_host_admission::{Admission, AdmissionEntry, Admit};
 use remote_host_protocol::relay::{
-    CONTENT_HOST, CONTENT_JOIN, CONTROL, PAIR_HOST, PAIR_JOIN, REMOTE_API_KEY_HEADER,
+    CONTENT_HOST, CONTENT_JOIN, CONTROL, LegClass, PAIR_HOST, PAIR_JOIN, RELAY_LEG_CLASS_HEADER,
+    REMOTE_API_KEY_HEADER,
 };
 
-use crate::bandwidth::BandwidthRegistry;
+use crate::bandwidth::{BandwidthRegistry, LegClass as BwClass};
 use crate::broker::{ParkOutcome, RelayBroker};
 use crate::conns::ConnectionRegistry;
 use crate::control::{ControlHello, ControlRegistry};
@@ -177,13 +178,14 @@ struct RelayState {
     /// per-`(key, server)` sub-cap); content legs throttle against the owning
     /// gateway's buckets (pairing legs are tiny and unthrottled).
     bandwidth: Arc<BandwidthRegistry>,
-    /// `relay_key` → `relay_node_id` (the `server_id`) for content legs awaiting
-    /// their gateway host. The phone's content-join writes it (it knows both);
-    /// the gateway's content-host reads it to meter the leg against the right
-    /// per-server bandwidth bucket (the host dial carries only the `relay_key`).
-    /// Removed when the host claims it, on a signaling failure, or when the
-    /// phone leg ends unclaimed — so it never leaks.
-    pending_content_legs: Arc<parking_lot::Mutex<HashMap<String, String>>>,
+    /// `relay_key` → (`relay_node_id` (the `server_id`), [`LegClass`]) for content
+    /// legs awaiting their gateway host. The phone's content-join writes it (it
+    /// knows the server and authored the class); the gateway's content-host reads
+    /// it to meter the leg against the right per-server bandwidth bucket *and*
+    /// class (the host dial carries only the `relay_key`). Removed when the host
+    /// claims it, on a signaling failure, or when the phone leg ends unclaimed —
+    /// so it never leaks.
+    pending_content_legs: Arc<parking_lot::Mutex<HashMap<String, (String, LegClass)>>>,
     /// Monotonic source of per-data-leg `relay_key`s. Uniqueness (not secrecy)
     /// is all that's needed: the content-host route is admission-gated, so a
     /// guessed key can't be hosted by anyone but the real gateway.
@@ -302,6 +304,16 @@ async fn limit_per_ip(State(state): State<RelayState>, req: Request, next: Next)
 /// `401 Unauthorized` for a missing or unadmitted `remote_api_key`.
 fn unadmitted() -> Response {
     (StatusCode::UNAUTHORIZED, "remote_api_key not admitted").into_response()
+}
+
+/// Map a wire [`LegClass`] to its relay bandwidth class: a `Blob` leg meters as
+/// `Background` (yields the chat headroom on the shared bucket), a `Chat` leg as
+/// `Interactive`.
+fn bandwidth_class(class: LegClass) -> BwClass {
+    match class {
+        LegClass::Blob => BwClass::Background,
+        LegClass::Chat => BwClass::Interactive,
+    }
 }
 
 /// TOCTOU recheck used by the host handlers: a key admitted by the pre-layer may
@@ -532,21 +544,34 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
 async fn content_join_handler(
     Path(relay_node_id): Path<String>,
     State(state): State<RelayState>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // The phone authors the leg class on its own join (the relay copies it, never
+    // authors it). Absent/unparseable ⇒ Chat — a bad hint must never fail a join.
+    let class = headers
+        .get(RELAY_LEG_CLASS_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(LegClass::from_header_value)
+        .unwrap_or_default();
     let relay_key = format!("dl-{}", state.seq.fetch_add(1, Ordering::Relaxed));
-    // Record this leg's server (the relay_node_id) so the gateway's content-host —
-    // whose dial carries only the relay_key — can meter against the right per-server
-    // bucket. Inserted *before* signaling, since the signal is what makes the
-    // gateway dial host (which could otherwise race ahead of this write).
+    // Record this leg's server (the relay_node_id) and class so the gateway's
+    // content-host — whose dial carries only the relay_key — can meter against the
+    // right per-server bucket *and* class. Inserted *before* signaling, since the
+    // signal is what makes the gateway dial host (which could otherwise race ahead
+    // of this write).
     state
         .pending_content_legs
         .lock()
-        .insert(relay_key.clone(), relay_node_id.clone());
+        .insert(relay_key.clone(), (relay_node_id.clone(), class));
     // The phone leg is admitted by the pre-layer like every other route, but
     // metering keys on the *gateway's* remote_api_key (resolved by signaling) and
     // its server, so both legs of a content session share one bucket pair.
-    let Some(remote_api_key) = state.control.signal_open(&relay_node_id, &relay_key).await else {
+    let Some(remote_api_key) = state
+        .control
+        .signal_open(&relay_node_id, &relay_key, class)
+        .await
+    else {
         // No gateway connected, so nobody will claim this leg — don't leak the map.
         state.pending_content_legs.lock().remove(&relay_key);
         // The route exists and the key is admitted — the named gateway just holds
@@ -560,10 +585,10 @@ async fn content_join_handler(
         Admit::Ok(e) => (e.max_bps, e.per_server_max_bps),
         Admit::Unknown | Admit::Expired => (None, None),
     };
-    let limiter =
-        state
-            .bandwidth
-            .limiter_for(&remote_api_key, &relay_node_id, max_bps, per_server_max_bps);
+    let limiter = state
+        .bandwidth
+        .limiter_for(&remote_api_key, &relay_node_id, max_bps, per_server_max_bps)
+        .with_class(bandwidth_class(class));
     let Some(leg) = state.broker.join(&relay_key) else {
         state.pending_content_legs.lock().remove(&relay_key);
         return at_capacity();
@@ -592,11 +617,25 @@ async fn content_host_handler(
     }): Extension<Admitted>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Cap how many connections one remote_api_key may hold (control + legs).
-    let Some((guard, kick)) = state
-        .conns
-        .register(&key, entry.max_conns.map(|c| c as usize))
-    else {
+    // Recover the (server, class) the phone-side recorded for this leg, so both
+    // legs meter against the same per-server bucket *and* class. Removing it here is
+    // the claim (the phone-side backstop only fires if we never do). A miss (the
+    // phone leg ended first) falls back to a per-leg id + Chat — harmless, since the
+    // broker.join below then finds no parked phone half and the leg is refused.
+    let (server_id, class) = state
+        .pending_content_legs
+        .lock()
+        .remove(&relay_key)
+        .unwrap_or_else(|| (relay_key.clone(), LegClass::Chat));
+    // Cap how many connections one remote_api_key may hold (control + legs). A blob
+    // leg is held below the chat reserve so a blob flood can't refuse a chat leg.
+    let max_conns = entry.max_conns.map(|c| c as usize);
+    let registered = match class {
+        LegClass::Blob => state.conns.register_background(&key, max_conns),
+        LegClass::Chat => state.conns.register(&key, max_conns),
+    };
+    let Some((guard, kick)) = registered else {
+        state.broker.cancel(&relay_key);
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "connection limit reached for this remote_api_key",
@@ -608,23 +647,15 @@ async fn content_host_handler(
     // future polls won't re-target an already-removed key — so re-check and abort
     // rather than linger un-kicked. (`guard` drops here, deregistering.)
     if !still_admitted(state.admitted.as_ref(), &key) {
+        state.broker.cancel(&relay_key);
         return unadmitted();
     }
-    // Recover the server (relay_node_id) the phone-side recorded for this leg, so
-    // both legs meter against the same per-server bucket. Removing it here is the
-    // claim (the phone-side backstop only fires if we never do). A miss (the phone
-    // leg ended first) falls back to a per-leg id — harmless, since the broker.join
-    // below then finds no parked phone half and the leg is refused.
-    let server_id = state
-        .pending_content_legs
-        .lock()
-        .remove(&relay_key)
-        .unwrap_or_else(|| relay_key.clone());
-    let limiter =
-        state
-            .bandwidth
-            .limiter_for(&key, &server_id, entry.max_bps, entry.per_server_max_bps);
+    let limiter = state
+        .bandwidth
+        .limiter_for(&key, &server_id, entry.max_bps, entry.per_server_max_bps)
+        .with_class(bandwidth_class(class));
     let Some(leg) = state.broker.join(&relay_key) else {
+        state.broker.cancel(&relay_key);
         return at_capacity();
     };
     let broker = Arc::clone(&state.broker);

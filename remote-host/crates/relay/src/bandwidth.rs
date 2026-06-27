@@ -41,6 +41,28 @@ type SharedBucket = Arc<Mutex<TokenBucket>>;
 /// brief spike passes without stutter.
 pub const RELAY_BYTES_PER_SEC: u64 = 1024 * 1024;
 
+/// Fraction of each bucket's burst kept exclusively for interactive (chat)
+/// traffic. A [`Background`](LegClass::Background) leg borrows only the tokens
+/// *above* this floor, so a saturating blob transfer leaves a chat frame this
+/// large (≈256 KiB at the default rate) un-paced. Sized comfortably above the
+/// 64 KiB blob chunk so the floor is never fully eaten by one in-flight chunk.
+const CHAT_HEADROOM_FRACTION: f64 = 0.25;
+
+/// The traffic class a leg's bytes meter as. Both classes draw on the **same**
+/// `(key)` / `(key, server)` bucket pair — there is one per-tenant wall — but a
+/// [`Background`](Self::Background) leg yields a [`CHAT_HEADROOM_FRACTION`] of
+/// each bucket to [`Interactive`](Self::Interactive) traffic so a bulk blob
+/// transfer never paces chat. Defaults to `Interactive`; a blob leg opts into
+/// `Background` via [`BandwidthLimiter::with_class`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LegClass {
+    /// Chat and other latency-sensitive traffic; draws the full bucket.
+    #[default]
+    Interactive,
+    /// Bulk blob traffic; draws only above the interactive headroom.
+    Background,
+}
+
 /// Registry of the two bucket levels. A key's first content leg lazily creates its
 /// per-key bucket and the per-`(key, server)` bucket; subsequent legs for the same
 /// pair share them. Both maps are bounded by the admitted set × its few servers,
@@ -94,6 +116,7 @@ impl BandwidthRegistry {
         BandwidthLimiter {
             per_key_bucket,
             per_server_bucket,
+            class: LegClass::Interactive,
         }
     }
 
@@ -120,23 +143,53 @@ impl BandwidthRegistry {
 
 /// A shared handle on one gateway leg's two nested byte buckets. Cloning is cheap
 /// (two `Arc`s); all clones for the same `(key, server)` meter against the same
-/// pair.
+/// pair. The `class` is per-handle: a `Background` clone yields the chat headroom
+/// while still sharing the very same buckets (one wall).
 #[derive(Clone)]
 pub struct BandwidthLimiter {
     per_key_bucket: SharedBucket,
     per_server_bucket: SharedBucket,
+    class: LegClass,
 }
 
 impl BandwidthLimiter {
+    /// Set this handle's traffic class (default [`Interactive`](LegClass::Interactive)).
+    /// A blob leg calls `.with_class(LegClass::Background)` so its bytes draw only
+    /// above the interactive headroom — without changing which buckets it shares.
+    pub fn with_class(mut self, class: LegClass) -> Self {
+        self.class = class;
+        self
+    }
+
     /// Reserve `nbytes` against **both** buckets synchronously (no await between, so
     /// the two debits share the same instant) and return the larger of the two
     /// debts — the delay owed before forwarding so neither cap is exceeded. Sync;
     /// no lock is held across the sleep. Separated from [`throttle`](Self::throttle)
-    /// so the rate math is testable without real time.
+    /// so the rate math is testable without real time. An `Interactive` handle
+    /// draws the full bucket; a `Background` handle leaves a [`CHAT_HEADROOM_FRACTION`]
+    /// of each bucket for interactive traffic.
     fn reserve(&self, nbytes: usize) -> Duration {
-        let key_delay = self.per_key_bucket.lock().reserve(nbytes as f64);
-        let server_delay = self.per_server_bucket.lock().reserve(nbytes as f64);
-        key_delay.max(server_delay)
+        let n = nbytes as f64;
+        match self.class {
+            LegClass::Interactive => {
+                let key_delay = self.per_key_bucket.lock().reserve(n);
+                let server_delay = self.per_server_bucket.lock().reserve(n);
+                key_delay.max(server_delay)
+            }
+            LegClass::Background => {
+                let key_delay = {
+                    let mut b = self.per_key_bucket.lock();
+                    let headroom = b.capacity() * CHAT_HEADROOM_FRACTION;
+                    b.reserve_background(n, headroom)
+                };
+                let server_delay = {
+                    let mut b = self.per_server_bucket.lock();
+                    let headroom = b.capacity() * CHAT_HEADROOM_FRACTION;
+                    b.reserve_background(n, headroom)
+                };
+                key_delay.max(server_delay)
+            }
+        }
     }
 
     /// Account `nbytes` against both buckets and sleep off any debt, pacing the
@@ -153,9 +206,27 @@ impl BandwidthLimiter {
     /// two-level accounting deterministically (no wall-clock refill between calls).
     #[cfg(test)]
     fn reserve_at(&self, nbytes: usize, now: std::time::Instant) -> Duration {
-        let key_delay = self.per_key_bucket.lock().reserve_at(nbytes as f64, now);
-        let server_delay = self.per_server_bucket.lock().reserve_at(nbytes as f64, now);
-        key_delay.max(server_delay)
+        let n = nbytes as f64;
+        match self.class {
+            LegClass::Interactive => {
+                let key_delay = self.per_key_bucket.lock().reserve_at(n, now);
+                let server_delay = self.per_server_bucket.lock().reserve_at(n, now);
+                key_delay.max(server_delay)
+            }
+            LegClass::Background => {
+                let key_delay = {
+                    let mut b = self.per_key_bucket.lock();
+                    let headroom = b.capacity() * CHAT_HEADROOM_FRACTION;
+                    b.reserve_background_at(n, headroom, now)
+                };
+                let server_delay = {
+                    let mut b = self.per_server_bucket.lock();
+                    let headroom = b.capacity() * CHAT_HEADROOM_FRACTION;
+                    b.reserve_background_at(n, headroom, now)
+                };
+                key_delay.max(server_delay)
+            }
+        }
     }
 }
 
@@ -184,6 +255,57 @@ mod tests {
         assert!(
             !gateway.reserve_at(1, now).is_zero(),
             "the partner leg sees the shared debt"
+        );
+    }
+
+    #[test]
+    fn background_leg_yields_the_chat_headroom_on_the_shared_bucket() {
+        let now = Instant::now();
+        let reg = BandwidthRegistry::new();
+        // Same (key, server): chat and blob share ONE bucket pair (one wall).
+        let chat = reg.limiter_for("key", "srv", None, None);
+        let blob = reg
+            .limiter_for("key", "srv", None, None)
+            .with_class(LegClass::Background);
+
+        let cap = RELAY_BYTES_PER_SEC as usize; // bucket capacity == 1s burst
+        let headroom = (cap as f64 * CHAT_HEADROOM_FRACTION) as usize;
+        let chunk = 64 * 1024; // a blob chunk, well under the headroom
+
+        // Blob saturates: it drains everything ABOVE the headroom for free...
+        assert_eq!(blob.reserve_at(cap - headroom, now), Duration::ZERO);
+        // ...then a further chunk is paced (no free tokens above the floor).
+        assert!(
+            !blob.reserve_at(chunk, now).is_zero(),
+            "background past the headroom floor is paced"
+        );
+        // Despite blob saturating the shared bucket, chat still draws up to
+        // headroom-minus-one-chunk instantly — its reserve is protected.
+        assert_eq!(
+            chat.reserve_at(headroom - chunk, now),
+            Duration::ZERO,
+            "chat keeps its reserved headroom on the shared bucket",
+        );
+    }
+
+    #[test]
+    fn an_interactive_leg_can_still_starve_itself_but_not_via_background() {
+        let now = Instant::now();
+        let reg = BandwidthRegistry::new();
+        let blob = reg
+            .limiter_for("key", "srv", None, None)
+            .with_class(LegClass::Background);
+        let cap = RELAY_BYTES_PER_SEC as usize;
+        let headroom = (cap as f64 * CHAT_HEADROOM_FRACTION) as usize;
+        // A background leg can never drive the *interactive* headroom negative on
+        // its own: after draining to the floor, the floor's worth is still free to
+        // an interactive draw.
+        assert_eq!(blob.reserve_at(cap - headroom, now), Duration::ZERO);
+        let chat = reg.limiter_for("key", "srv", None, None);
+        assert_eq!(
+            chat.reserve_at(headroom, now),
+            Duration::ZERO,
+            "the full headroom remains for chat after background drained to the floor",
         );
     }
 

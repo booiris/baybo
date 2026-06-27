@@ -107,7 +107,7 @@ pub enum ActivityKind {
 )]
 pub struct WireAttachment {
     pub kind: AttachmentKind,
-    /// Content-addressed id from the `BlobStore` (`"sha256:<64hex>"`).
+    /// Capability id from the `BlobStore` (`"sha256:<64hex>.<read_token>"`).
     pub blob_id: String,
     pub mime_type: String,
     /// Byte length of the underlying blob. Sidecars consume this to

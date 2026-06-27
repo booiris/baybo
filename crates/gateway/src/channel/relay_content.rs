@@ -25,9 +25,10 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+use super::blob_content::run_blob_over_relay;
 use super::device_content::run_content_over_relay;
 use super::state::{LegDedup, WsChannelState};
-use remote_host_protocol::relay::REMOTE_API_KEY_HEADER;
+use remote_host_protocol::relay::{LegClass, REMOTE_API_KEY_HEADER};
 
 use crate::relay::{ControlHello, ControlSignal, connect_control, load_or_create_relay_node_id};
 
@@ -179,7 +180,7 @@ async fn run_once(
     loop {
         tokio::select! {
             signal = rx.recv() => match signal {
-                Some(ControlSignal::OpenDataLeg { relay_key }) => {
+                Some(ControlSignal::OpenDataLeg { relay_key, class }) => {
                     let state = state.clone();
                     let relay_url = settings.relay_url.clone();
                     let remote_api_key = settings.remote_api_key.clone();
@@ -188,7 +189,15 @@ async fn run_once(
                     // resolves the device_id — and a newer leg can abort this one.
                     let (ah_tx, ah_rx) = tokio::sync::oneshot::channel();
                     let abort = legs.spawn(async move {
-                        open_data_leg(&state, &relay_url, &remote_api_key, &relay_key, ah_rx).await;
+                        open_data_leg(
+                            &state,
+                            &relay_url,
+                            &remote_api_key,
+                            &relay_key,
+                            class,
+                            ah_rx,
+                        )
+                        .await;
                     });
                     let _ = ah_tx.send(abort);
                 }
@@ -227,15 +236,19 @@ async fn run_once(
     }
 }
 
-/// Dial a content data leg for `relay_key` and run the Noise content responder.
-/// `ah_rx` delivers this task's own [`AbortHandle`](tokio::task::AbortHandle) (sent
-/// by the spawner), which the content session registers in the device-dedup
-/// registry once it resolves the `device_id`.
+/// Dial a content data leg for `relay_key` and run the responder for its `class`:
+/// the Noise chat content session ([`LegClass::Chat`]) or the blob sub-protocol
+/// ([`LegClass::Blob`]). `ah_rx` delivers this task's own
+/// [`AbortHandle`](tokio::task::AbortHandle) (sent by the spawner), which the
+/// session registers in the matching device-dedup registry once it resolves the
+/// `device_id` — chat and blob use *separate* registries so a blob leg never
+/// aborts the chat leg.
 async fn open_data_leg(
     state: &WsChannelState,
     relay_url: &str,
     remote_api_key: &str,
     relay_key: &str,
+    class: LegClass,
     ah_rx: tokio::sync::oneshot::Receiver<tokio::task::AbortHandle>,
 ) {
     let url = remote_host_protocol::relay::content_host_url(relay_url, relay_key);
@@ -262,13 +275,26 @@ async fn open_data_leg(
             return;
         }
     };
-    // Learn our own AbortHandle (sent immediately after spawn) so the session can
-    // dedup this device's legs; if it never arrives, run without dedup.
-    let dedup = ah_rx.await.ok().map(|abort| LegDedup {
-        registry: state.device_leg_registry.clone(),
-        abort,
-    });
-    run_content_over_relay(ws, state, dedup).await;
+    match class {
+        // Blob legs run **concurrently** — one per transfer — so they are NOT
+        // deduped: a second blob transfer for the same device must not abort the
+        // first. Concurrency is bounded by the relay's per-key connection cap.
+        // (The leg's own AbortHandle oneshot goes unused; drop it.)
+        LegClass::Blob => {
+            drop(ah_rx);
+            run_blob_over_relay(ws, state).await;
+        }
+        // Chat dedups to one live leg per device: learn our own AbortHandle (sent
+        // right after spawn) so a fresh leg aborts a stale predecessor; if it never
+        // arrives, run without dedup.
+        LegClass::Chat => {
+            let dedup = ah_rx.await.ok().map(|abort| LegDedup {
+                registry: state.device_leg_registry.clone(),
+                abort,
+            });
+            run_content_over_relay(ws, state, dedup).await;
+        }
+    }
 }
 
 #[cfg(test)]

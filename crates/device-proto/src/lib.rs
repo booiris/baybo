@@ -28,6 +28,7 @@
 //! same protocol.
 
 pub mod aead;
+pub mod blob;
 pub mod error;
 pub mod fixtures;
 pub mod kdf;
