@@ -54,6 +54,19 @@ pub struct RelayLeg {
     pub from_peer: mpsc::Receiver<Vec<u8>>,
 }
 
+/// Outcome of a park-only host [`join`](RelayBroker::park). A host never matches
+/// an existing half, so the two non-parking outcomes are refusals the caller
+/// turns into an HTTP status (the gateway then retries its host leg).
+pub enum ParkOutcome {
+    /// Parked; the leg waits for an app to [`try_match`](RelayBroker::try_match) it.
+    Parked(RelayLeg),
+    /// A live host already holds this rendezvous — refuse rather than splice two
+    /// host legs together.
+    Occupied,
+    /// The global parked-leg ceiling ([`MAX_PENDING_LEGS`]) is reached.
+    AtCapacity,
+}
+
 /// The first leg's counterpart channels, parked until a partner joins.
 struct PendingHalf {
     /// First-leg → second-leg frames (the second leg reads these).
@@ -92,10 +105,19 @@ impl RelayBroker {
         self
     }
 
-    /// Join the relay under `key`. The first caller gets a leg and parks; the
-    /// second caller with the same key is matched, and frames then flow blind
-    /// between the two. A re-join while a leg is still pending replaces the
-    /// parked half (last-writer-wins on a stale leg).
+    /// Join the relay under `key` — **symmetric**: the first caller parks, the
+    /// second caller with the same key is **matched** to it (the parked half is
+    /// removed and the two are spliced), and frames flow blind between them. Use
+    /// this where either leg may arrive first **and the key is unique to the one
+    /// pair** — the content data leg: the phone `/content/join` signals then
+    /// parks, the gateway `/content/host` dials on the signal, and the order is
+    /// not guaranteed, but the `relay_key` is C-issued and used by exactly those
+    /// two legs.
+    ///
+    /// The pairing **host** must NOT use this: its `rendezvous_id` is public and
+    /// shared, so a second host's `join` would be spliced to the first host (not
+    /// to an app). It uses [`park`](Self::park) (park-only) instead, with the app
+    /// side on [`try_match`](Self::try_match).
     ///
     /// Returns `None` only when a *new* park would exceed [`MAX_PENDING_LEGS`]
     /// (after a sweep) — the global flood backstop. Matching an already-parked
@@ -138,6 +160,42 @@ impl RelayBroker {
                 from_peer: second_to_first_rx,
             })
         }
+    }
+
+    /// Park a host leg under `key`, **never** matching an existing half — the
+    /// park-only, asymmetric host side of the pairing rendezvous (the app side
+    /// uses [`try_match`](Self::try_match), so a host only ever parks and waits).
+    ///
+    /// Refusing to match a pre-existing half is what makes it **structurally
+    /// impossible to splice two host legs to each other** — a re-host race, a
+    /// duplicate, or a bug yields [`ParkOutcome::Occupied`] (the caller retries)
+    /// rather than a host↔host pipe. A stale (expired) half is swept first, so
+    /// `Occupied` means a *live* host genuinely holds the rendezvous.
+    pub fn park(&self, key: &str) -> ParkOutcome {
+        let mut pending = self.pending.lock();
+        // Reap expired halves first, so a timed-out prior host doesn't block the
+        // re-host, and the cap below counts only live legs.
+        Self::sweep_pending(&mut pending, PENDING_TTL);
+        if pending.contains_key(key) {
+            return ParkOutcome::Occupied;
+        }
+        if pending.len() >= self.max_pending {
+            return ParkOutcome::AtCapacity;
+        }
+        let (first_to_second_tx, first_to_second_rx) = mpsc::channel(LEG_CHANNEL_CAP);
+        let (second_to_first_tx, second_to_first_rx) = mpsc::channel(LEG_CHANNEL_CAP);
+        pending.insert(
+            key.to_string(),
+            PendingHalf {
+                from_first: first_to_second_rx,
+                to_first: second_to_first_tx,
+                parked_at: Instant::now(),
+            },
+        );
+        ParkOutcome::Parked(RelayLeg {
+            to_peer: first_to_second_tx,
+            from_peer: second_to_first_rx,
+        })
     }
 
     /// Drop pending legs parked longer than `ttl` (their partner never arrived),
@@ -229,6 +287,68 @@ mod tests {
         // The freed slot lets a new key park again.
         let _c = broker.join("k3").expect("a freed slot admits a new park");
         assert_eq!(broker.pending_len(), 2);
+    }
+
+    #[tokio::test]
+    async fn park_refuses_a_second_host_then_app_try_matches_the_first() {
+        let broker = RelayBroker::new();
+        // First host parks.
+        let host = match broker.park("rid") {
+            ParkOutcome::Parked(leg) => leg,
+            other => panic!("first host should park, got {}", park_name(&other)),
+        };
+        assert_eq!(broker.pending_len(), 1);
+        // A second host under the same id is refused — NOT spliced to the first.
+        assert!(
+            matches!(broker.park("rid"), ParkOutcome::Occupied),
+            "a second host must be refused, never matched"
+        );
+        assert_eq!(broker.pending_len(), 1, "the refusal parked nothing");
+        // The app side still matches the first host via try_match.
+        let mut app = broker
+            .try_match("rid")
+            .expect("app matches the parked host");
+        host.to_peer.send(b"a->p".to_vec()).await.unwrap();
+        assert_eq!(app.from_peer.recv().await.unwrap(), b"a->p");
+    }
+
+    #[test]
+    fn park_reuses_a_slot_freed_by_the_ttl_sweep() {
+        let broker = RelayBroker::new();
+        let _stale = match broker.park("rid") {
+            ParkOutcome::Parked(leg) => leg,
+            other => panic!("parks, got {}", park_name(&other)),
+        };
+        // Force the parked half to look expired, then a fresh park sweeps it and
+        // succeeds rather than reporting Occupied on a dead host.
+        {
+            let mut p = broker.pending.lock();
+            if let Some(h) = p.get_mut("rid") {
+                h.parked_at = Instant::now() - PENDING_TTL - Duration::from_secs(1);
+            }
+        }
+        assert!(
+            matches!(broker.park("rid"), ParkOutcome::Parked(_)),
+            "an expired host is swept, so the slot re-parks"
+        );
+    }
+
+    #[test]
+    fn park_refuses_at_the_pending_ceiling() {
+        let broker = RelayBroker::new().with_max_pending(1);
+        assert!(matches!(broker.park("a"), ParkOutcome::Parked(_)));
+        assert!(
+            matches!(broker.park("b"), ParkOutcome::AtCapacity),
+            "a new host past the ceiling is refused"
+        );
+    }
+
+    fn park_name(o: &ParkOutcome) -> &'static str {
+        match o {
+            ParkOutcome::Parked(_) => "Parked",
+            ParkOutcome::Occupied => "Occupied",
+            ParkOutcome::AtCapacity => "AtCapacity",
+        }
     }
 
     #[test]

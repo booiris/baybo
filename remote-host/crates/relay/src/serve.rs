@@ -40,7 +40,7 @@ use remote_host_protocol::relay::{
 };
 
 use crate::bandwidth::BandwidthRegistry;
-use crate::broker::RelayBroker;
+use crate::broker::{ParkOutcome, RelayBroker};
 use crate::conns::ConnectionRegistry;
 use crate::control::{ControlHello, ControlRegistry};
 use crate::ip_limit::IpRateLimiter;
@@ -301,6 +301,14 @@ fn at_capacity() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "relay at capacity").into_response()
 }
 
+/// `409 Conflict` when a host leg targets a rendezvous another host already holds.
+/// Refusing (rather than splicing the two hosts) is the structural guard; the
+/// gateway re-hosts after a short backoff, by when the prior host's leg has been
+/// cancelled or TTL-swept.
+fn host_occupied() -> Response {
+    (StatusCode::CONFLICT, "rendezvous already hosted").into_response()
+}
+
 /// The admitted instance key for a request, stashed by [`require_admitted`] so
 /// the handlers that meter on it (the connection cap / bandwidth bucket) can read
 /// it back as an `Extension`.
@@ -357,10 +365,13 @@ async fn host_handler(
     if !state.admitted.is_admitted(&key) {
         return unadmitted();
     }
-    // Refuse to park past the broker's global parked-leg ceiling (the `guard`
-    // drops here, freeing the per-instance slot it just took).
-    let Some(leg) = state.broker.join(&rendezvous_id) else {
-        return at_capacity();
+    // Park-only: the host never matches an existing half, so two host legs on the
+    // same (public) rendezvous id can't be spliced to each other — a second one is
+    // refused `409` and its `guard` drops here, freeing the per-instance slot.
+    let leg = match state.broker.park(&rendezvous_id) {
+        ParkOutcome::Parked(leg) => leg,
+        ParkOutcome::Occupied => return host_occupied(),
+        ParkOutcome::AtCapacity => return at_capacity(),
     };
     let broker = Arc::clone(&state.broker);
     capped(ws).on_upgrade(move |socket| async move {
@@ -372,7 +383,9 @@ async fn host_handler(
             _ = kick => {}
         }
         // If the app never matched (the host disconnected first), drop the
-        // still-parked leg so a stale rendezvous can't linger.
+        // still-parked leg so a stale rendezvous can't linger. Only one host half
+        // ever exists under a rendezvous id (`park` refuses a second), so this
+        // removes our own half, never a newer host's.
         broker.cancel(&rendezvous_id);
     })
 }
@@ -723,6 +736,35 @@ mod tests {
         };
         assert!(closed, "server closes the leg on an oversized frame");
         drop(host);
+    }
+
+    /// Two host legs on the same rendezvous: the second is refused `409` (the
+    /// park-only guard), never spliced to the first — and the first stays parked
+    /// and matchable by the app.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_host_on_a_rendezvous_is_refused_409() {
+        let port = serve().await;
+        // The first host parks synchronously inside the handler before its 101.
+        let mut host1 = connect_host(port, "RID", Some("inst-A")).await;
+
+        // A second host on the same id is refused with 409 — not matched to host1.
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut req = format!("ws://127.0.0.1:{port}/pair/host/RID")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert(INSTANCE_KEY_HEADER, "inst-A".parse().unwrap());
+        match client_async(req, stream).await {
+            Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::CONFLICT),
+            other => panic!("expected 409 for a second host, got {other:?}"),
+        }
+
+        // host1 is intact: the app matches it and bytes flow.
+        let mut app = connect_join(port, "RID", Some("inst-A"))
+            .await
+            .expect("app matches the still-parked first host");
+        host1.send(Message::Binary(b"a->p".to_vec())).await.unwrap();
+        assert_eq!(recv_bin(&mut app).await, b"a->p");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
