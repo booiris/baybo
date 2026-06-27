@@ -30,7 +30,7 @@ use std::net::SocketAddr;
 use axum::Router;
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Extension, Path, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -119,6 +119,51 @@ impl JoinRateLimiter {
     }
 }
 
+/// How the per-IP limiter resolves the **client** address of a request.
+///
+/// `enabled` mounts the limiter at all. `trusted_headers` are header names tried
+/// **in order** to read the real client IP (e.g. `["cf-connecting-ip"]` behind
+/// Cloudflare) — the first that holds a parseable address wins, else the socket
+/// peer ([`ConnectInfo`]) is used. An empty list means socket-peer only.
+///
+/// **Trust these headers ONLY when the origin is reachable solely via the proxy
+/// that sets them** (Cloudflare IP allowlist / Tunnel / Authenticated Origin
+/// Pulls). A client header is otherwise forgeable: a direct-to-origin attacker
+/// could set any `cf-connecting-ip` to evade the limit or frame an arbitrary IP.
+#[derive(Clone, Default)]
+pub struct IpLimitConfig {
+    pub enabled: bool,
+    pub trusted_headers: Vec<HeaderName>,
+}
+
+impl IpLimitConfig {
+    /// Limiter off entirely.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            trusted_headers: Vec::new(),
+        }
+    }
+
+    /// Limiter on, keying on the socket peer (no proxy-header trust). Correct when
+    /// remote-host terminates TLS itself (the peer is the real client).
+    pub fn socket_peer() -> Self {
+        Self {
+            enabled: true,
+            trusted_headers: Vec::new(),
+        }
+    }
+
+    /// Limiter on, resolving the client IP from `headers` (tried in order) before
+    /// falling back to the socket peer. See the type docs for the trust caveat.
+    pub fn with_trusted_headers(headers: Vec<HeaderName>) -> Self {
+        Self {
+            enabled: true,
+            trusted_headers: headers,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RelayState {
     broker: Arc<RelayBroker>,
@@ -138,8 +183,11 @@ struct RelayState {
     /// Per-rendezvous `/pair/join` throttle (anti-grief; see [`JoinRateLimiter`]).
     join_limiter: Arc<JoinRateLimiter>,
     /// Per-source-IP upgrade throttle ahead of admission (flood backstop; see
-    /// [`IpRateLimiter`]). Skipped when the server carries no client-address info.
+    /// [`IpRateLimiter`]). Skipped when no client IP can be resolved.
     ip_limiter: Arc<IpRateLimiter>,
+    /// Header names tried in order to resolve the real client IP behind a trusted
+    /// proxy (see [`IpLimitConfig`]); empty = socket-peer only.
+    ip_trusted_headers: Arc<Vec<HeaderName>>,
 }
 
 /// Assemble the relay router. `admission` is the shared, hot-reloaded allow-list
@@ -147,16 +195,17 @@ struct RelayState {
 /// revoke (an admission reload that dropped a key) can kick them; `bandwidth`
 /// throttles each gateway's aggregate content throughput.
 ///
-/// `per_ip_limit` mounts the per-source-IP upgrade throttle (see
-/// [`IpRateLimiter`]). Leave it **on** when remote-host terminates TLS itself
-/// (the peer is the real client); turn it **off** behind an L4/L7 TLS terminator,
-/// where every client shares the proxy's address and one bucket would throttle
-/// them all — rate-limit at the proxy there instead.
+/// `ip_limit` configures the per-source-IP upgrade throttle (see
+/// [`IpRateLimiter`] / [`IpLimitConfig`]). Enable it keying on the socket peer
+/// when remote-host terminates TLS itself (the peer is the real client); behind a
+/// proxy, either disable it (rate-limit at the proxy) or give it the trusted
+/// client-IP header(s) the proxy sets (e.g. `cf-connecting-ip`) — see the
+/// `IpLimitConfig` trust caveat.
 pub fn build_router(
     admission: Arc<dyn Admission>,
     conns: Arc<ConnectionRegistry>,
     bandwidth: Arc<BandwidthRegistry>,
-    per_ip_limit: bool,
+    ip_limit: IpLimitConfig,
 ) -> Router {
     let state = RelayState {
         broker: Arc::new(RelayBroker::new()),
@@ -167,6 +216,7 @@ pub fn build_router(
         seq: Arc::new(AtomicU64::new(0)),
         join_limiter: Arc::new(JoinRateLimiter::default()),
         ip_limiter: Arc::new(IpRateLimiter::new()),
+        ip_trusted_headers: Arc::new(ip_limit.trusted_headers),
     };
     // Every route admits via the shared `x-instance-key` pre-layer — including
     // `/control`, whose key now rides the dial header too (its hello carries only
@@ -184,9 +234,9 @@ pub fn build_router(
             require_admitted,
         ));
     // The per-IP limiter is added *after* admission so it wraps it as the
-    // outermost layer (tower runs outer→inner), shedding a flood by source IP
-    // before the admission check and any upgrade work. Off behind a TLS proxy.
-    let router = if per_ip_limit {
+    // outermost layer (tower runs outer→inner), shedding a flood by client IP
+    // before the admission check and any upgrade work.
+    let router = if ip_limit.enabled {
         router.route_layer(middleware::from_fn_with_state(state.clone(), limit_per_ip))
     } else {
         router
@@ -203,14 +253,37 @@ fn too_many_from_ip() -> Response {
         .into_response()
 }
 
-/// Outermost pre-layer: throttle WS-upgrade attempts per source IP (flood
-/// backstop, ahead of admission). The peer address is read from the
-/// [`ConnectInfo`] the server's make-service inserts; when it is absent (the
-/// server was served without client-address info, e.g. a unit test), the limiter
-/// is skipped so behaviour is unchanged there.
+/// Resolve the request's **client** IP for the per-IP limiter: try each trusted
+/// proxy header in order (the first parseable address wins), else the socket peer
+/// from [`ConnectInfo`]. `None` only when neither yields an address (no trusted
+/// header present *and* the server carries no client-address info, e.g. a unit
+/// test served without connect-info) — the caller then skips the limiter.
+///
+/// For a single-value header (`cf-connecting-ip`) the whole value is the IP; for a
+/// list-valued one (`x-forwarded-for`) the **left-most** token is the original
+/// client. Both are only trustworthy when the origin is locked to the proxy (see
+/// [`IpLimitConfig`]).
+fn resolve_client_ip(req: &Request, trusted_headers: &[HeaderName]) -> Option<std::net::IpAddr> {
+    for name in trusted_headers {
+        if let Some(value) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
+            let first = value.split(',').next().unwrap_or("").trim();
+            if let Ok(ip) = first.parse::<std::net::IpAddr>() {
+                return Some(ip);
+            }
+        }
+    }
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
+}
+
+/// Outermost pre-layer: throttle WS-upgrade attempts per client IP (flood
+/// backstop, ahead of admission). The client IP comes from the configured trusted
+/// proxy header(s) if present, else the socket peer; when neither is available the
+/// limiter is skipped so behaviour is unchanged there.
 async fn limit_per_ip(State(state): State<RelayState>, req: Request, next: Next) -> Response {
-    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>()
-        && !state.ip_limiter.check(addr.ip())
+    if let Some(ip) = resolve_client_ip(&req, &state.ip_trusted_headers)
+        && !state.ip_limiter.check(ip)
     {
         return too_many_from_ip();
     }
@@ -508,7 +581,7 @@ mod tests {
             admission,
             Arc::new(ConnectionRegistry::new()),
             Arc::new(BandwidthRegistry::new()),
-            true,
+            IpLimitConfig::socket_peer(),
         );
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -520,6 +593,12 @@ mod tests {
     /// per-IP limiter middleware sees a peer address. The plain [`serve`] omits it
     /// — that path proves the limiter is skipped (not 500s) without connect info.
     async fn serve_with_connect_info() -> u16 {
+        serve_with_ip_limit(IpLimitConfig::socket_peer()).await
+    }
+
+    /// Like [`serve_with_connect_info`] but with an explicit limiter config, so a
+    /// test can exercise trusted-header client-IP resolution.
+    async fn serve_with_ip_limit(ip_limit: IpLimitConfig) -> u16 {
         let admission = Arc::new(remote_host_admission::InMemoryAdmission::with_keys([
             "inst-A",
         ]));
@@ -529,7 +608,7 @@ mod tests {
             admission,
             Arc::new(ConnectionRegistry::new()),
             Arc::new(BandwidthRegistry::new()),
-            true,
+            ip_limit,
         );
         tokio::spawn(async move {
             let _ = axum::serve(
@@ -548,6 +627,24 @@ mod tests {
         let req = format!("ws://127.0.0.1:{port}/pair/host/x")
             .into_client_request()
             .unwrap();
+        match client_async(req, stream).await {
+            Err(WsError::Http(resp)) => resp.status(),
+            other => panic!("expected an HTTP rejection, got {other:?}"),
+        }
+    }
+
+    /// Like [`host_attempt_status`] but carrying a `CF-Connecting-IP` header (when
+    /// `cf_ip` is `Some`), so a test can drive the trusted-header IP resolution
+    /// over a single loopback socket.
+    async fn host_attempt_with_cf_ip(port: u16, cf_ip: Option<&str>) -> WsStatus {
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut req = format!("ws://127.0.0.1:{port}/pair/host/x")
+            .into_client_request()
+            .unwrap();
+        if let Some(ip) = cf_ip {
+            req.headers_mut()
+                .insert("cf-connecting-ip", ip.parse().unwrap());
+        }
         match client_async(req, stream).await {
             Err(WsError::Http(resp)) => resp.status(),
             other => panic!("expected an HTTP rejection, got {other:?}"),
@@ -700,6 +797,87 @@ mod tests {
             saw_429,
             "the burst is eventually exhausted and 429'd by source IP"
         );
+    }
+
+    /// With a trusted `cf-connecting-ip` header configured, the limiter buckets by
+    /// the **header** value, not the (shared) socket peer — so a flood from one CF
+    /// client IP doesn't throttle a different CF client IP, and a request without
+    /// the header falls back to the socket peer's own bucket. All over one loopback
+    /// socket, proving the header (not the peer) is the key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_ip_limit_keys_on_the_trusted_cf_header() {
+        let port = serve_with_ip_limit(IpLimitConfig::with_trusted_headers(vec![
+            HeaderName::from_static("cf-connecting-ip"),
+        ]))
+        .await;
+
+        // Flood one CF client IP until it is throttled.
+        let mut saw_429 = false;
+        for _ in 0..(crate::ip_limit::IP_BURST as usize + 8) {
+            match host_attempt_with_cf_ip(port, Some("203.0.113.1")).await {
+                WsStatus::UNAUTHORIZED => {}
+                WsStatus::TOO_MANY_REQUESTS => {
+                    saw_429 = true;
+                    break;
+                }
+                other => panic!("unexpected status: {other}"),
+            }
+        }
+        assert!(saw_429, "a flood from one CF client IP is throttled");
+
+        // A *different* CF client IP — same socket — has its own bucket.
+        assert_eq!(
+            host_attempt_with_cf_ip(port, Some("203.0.113.2")).await,
+            WsStatus::UNAUTHORIZED,
+            "a distinct CF client IP is bucketed independently of the flooded one",
+        );
+
+        // No header → fall back to the socket peer (127.0.0.1), its own bucket.
+        assert_eq!(
+            host_attempt_with_cf_ip(port, None).await,
+            WsStatus::UNAUTHORIZED,
+            "without the trusted header the limiter falls back to the socket peer",
+        );
+    }
+
+    #[test]
+    fn resolve_client_ip_prefers_trusted_header_then_falls_back() {
+        use axum::body::Body;
+        let cf = HeaderName::from_static("cf-connecting-ip");
+        let xff = HeaderName::from_static("x-forwarded-for");
+        let peer = SocketAddr::from(([10, 0, 0, 9], 4000));
+        let trusted = [cf.clone(), xff.clone()];
+
+        let build = |headers: &[(&str, &str)]| {
+            let mut b = Request::builder();
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            let mut req = b.body(Body::empty()).unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+
+        // The trusted CF header wins over the socket peer.
+        assert_eq!(
+            resolve_client_ip(&build(&[("cf-connecting-ip", "203.0.113.7")]), &trusted),
+            Some("203.0.113.7".parse().unwrap())
+        );
+        // CF absent, XFF present → the left-most token is the original client.
+        assert_eq!(
+            resolve_client_ip(
+                &build(&[("x-forwarded-for", "203.0.113.8, 70.0.0.1")]),
+                &trusted
+            ),
+            Some("203.0.113.8".parse().unwrap())
+        );
+        // A malformed header value falls through to the socket peer.
+        assert_eq!(
+            resolve_client_ip(&build(&[("cf-connecting-ip", "not-an-ip")]), &trusted),
+            Some(peer.ip())
+        );
+        // No trusted headers configured → socket peer.
+        assert_eq!(resolve_client_ip(&build(&[]), &[]), Some(peer.ip()));
     }
 
     /// Symmetric admission: the app's join leg also needs an admitted key — a
@@ -871,7 +1049,7 @@ mod tests {
             admission,
             conns.clone(),
             Arc::new(BandwidthRegistry::new()),
-            true,
+            IpLimitConfig::socket_peer(),
         );
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;

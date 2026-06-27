@@ -9,12 +9,16 @@
 //! source IP, drawn one token per WS-upgrade attempt, applied ahead of admission
 //! so even unadmitted floods are shed cheaply.
 //!
-//! **Deployment caveat.** The key is the *socket* peer IP. With remote-host
-//! terminating TLS itself that is the real client (or its NAT). Behind an L4/L7
-//! TLS terminator the peer is the proxy, so every client shares one bucket — in
-//! that topology disable this (it offers no isolation) and rate-limit at the
-//! proxy, which sees the true client address. The limiter is skipped entirely
-//! when the server is served without client-address info (e.g. unit tests).
+//! **Deployment caveat.** By default the key is the *socket* peer IP. With
+//! remote-host terminating TLS itself that is the real client (or its NAT). Behind
+//! a proxy (e.g. Cloudflare) the peer is the proxy's edge, so every client would
+//! share one bucket. Two postures fix that, configured at [`build_router`](crate::serve::build_router)
+//! via [`IpLimitConfig`](crate::serve::IpLimitConfig): disable the limiter and
+//! rate-limit at the proxy, **or** give it the trusted client-IP header(s) the
+//! proxy sets (e.g. `cf-connecting-ip`) so it keys on the real client. Trust such
+//! a header **only** when the origin is reachable solely via that proxy — it is
+//! otherwise forgeable. The limiter is skipped for a request whose client IP can't
+//! be resolved (no trusted header *and* no client-address info, e.g. unit tests).
 //!
 //! Mirrors [`NotifyRateLimiter`](../../push/src/ratelimit.rs): one [`TokenBucket`]
 //! per key at a fixed rate, with brim-full (idle) buckets evicted over a soft cap

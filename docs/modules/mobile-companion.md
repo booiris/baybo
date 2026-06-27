@@ -185,10 +185,11 @@ C's blind relay, which only matches two legs by key and copies opaque frames
   per-signal data legs), and drains on shutdown.
 - **Relay hardening** (C side): a per-instance connection cap + per-gateway
   content-bandwidth throttle, a per-rendezvous `/pair/join` limiter, a parked-leg
-  **TTL sweep** + a hard `MAX_PENDING_LEGS` ceiling, and a per-source-IP
-  upgrade limiter ahead of admission (`RELAY_PER_IP_LIMIT`, default on; off behind
-  a TLS terminator). An admission reload that drops a key kicks that gateway's
-  live connections, not just future ones.
+  **TTL sweep** + a hard `MAX_PENDING_LEGS` ceiling, and a per-client-IP
+  upgrade limiter ahead of admission (`RELAY_PER_IP_LIMIT`, default on, socket-peer
+  keyed; behind a proxy disable it or resolve the real client via
+  `RELAY_CLIENT_IP_HEADERS=cf-connecting-ip` — see `DEPLOY.md`). An admission reload
+  that drops a key kicks that gateway's live connections, not just future ones.
 
 ## App lifecycle & persistence
 

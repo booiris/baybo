@@ -112,12 +112,21 @@ sqlite3 ./data/admission.db \
 
 **Push frequency control.** `POST /notify` is rate-limited per `(instance_key, device_id)` so a buggy or abusive gateway can't hammer APNs or spam a phone. Over the limit it returns `429` (the gateway backs off and retries). The limit is a fixed **60 pushes/min sustained, burst 20** per device; only admitted, registered devices are metered. Hardcoded, not configurable.
 
-**Per-source-IP flood backstop.** Ahead of admission, every relay WS-upgrade attempt is throttled per **source IP** (a token bucket, **10/s sustained, burst 60**), so a single host spraying upgrades across many rendezvous/node ids — or failing admission on each — is shed with `429` before any upgrade work. It also bounds the broker's pending map with a hard ceiling (`MAX_PENDING_LEGS`, **1024**): a new parked leg past the cap is refused `503` while matching an already-parked leg is exempt. The per-IP limiter keys on the **socket** peer, so it defaults **on** when remote-host terminates TLS itself (the peer is the real client). Behind an L4/L7 TLS terminator the peer is the proxy and one bucket would throttle every client — disable it there and rate-limit at the proxy:
+**Per-source-IP flood backstop.** Ahead of admission, every relay WS-upgrade attempt is throttled per **client IP** (a token bucket, **10/s sustained, burst 60**), so a single host spraying upgrades across many rendezvous/node ids — or failing admission on each — is shed with `429` before any upgrade work. It also bounds the broker's pending map with a hard ceiling (`MAX_PENDING_LEGS`, **1024**): a new parked leg past the cap is refused `503` while matching an already-parked leg is exempt.
+
+By default the client IP is the **socket peer**, which is correct when remote-host terminates TLS itself. **Behind a proxy (e.g. Cloudflare) the socket peer is the proxy's edge IP, so every client shares one bucket — this would throttle legitimate traffic.** Two ways to handle a proxied deployment:
 
 ```bash
-# In the remote-host environment (compose `.env` / unit):
+# (a) Turn the origin limiter off and rate-limit at the proxy (it sees the real client):
 RELAY_PER_IP_LIMIT=0
+
+# (b) Resolve the real client IP from the proxy's header(s), tried in order
+#     (e.g. behind Cloudflare; the first parseable IP wins, else the socket peer):
+RELAY_CLIENT_IP_HEADERS=cf-connecting-ip
+#     (or, with a fallback:)  RELAY_CLIENT_IP_HEADERS=cf-connecting-ip,x-forwarded-for
 ```
+
+> **Trust a client-IP header ONLY when the origin is reachable solely via that proxy** — a [Cloudflare IP allowlist](https://www.cloudflare.com/ips/), a `cloudflared` Tunnel (no public origin), or Authenticated Origin Pulls (CF mTLS). Otherwise a direct-to-origin attacker can forge `cf-connecting-ip` to evade the limit or frame an arbitrary IP. For `x-forwarded-for` the **left-most** entry is taken as the original client, so it too is only safe behind a proxy that overwrites/anchors it.
 
 ## Gateway wiring (pair against this host)
 

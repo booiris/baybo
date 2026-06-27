@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::http::HeaderName;
 use remote_host_push::serve::{PushConfig, build_router as push_router};
-use remote_host_relay::serve::build_router as relay_router;
+use remote_host_relay::serve::{IpLimitConfig, build_router as relay_router};
 
 mod admission_db;
 mod serve;
@@ -89,19 +90,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         roles.push("push");
     }
 
-    // Relay is always on. The per-source-IP upgrade throttle defaults on (the
-    // primary path terminates TLS here, so the peer is the real client); set
-    // `RELAY_PER_IP_LIMIT=0` behind a TLS terminator, where the peer is the proxy
-    // and one shared bucket would throttle every client.
-    let per_ip_limit = std::env::var("RELAY_PER_IP_LIMIT")
+    // Relay is always on. The per-source-IP upgrade throttle defaults on, keying
+    // on the socket peer (the primary path terminates TLS here, so the peer is the
+    // real client). Two env knobs adjust it for a proxied deployment:
+    //   RELAY_PER_IP_LIMIT=0          → off (rate-limit at your proxy instead).
+    //   RELAY_CLIENT_IP_HEADERS=h1,h2 → resolve the client IP from these headers,
+    //     in order, before the socket peer (e.g. `cf-connecting-ip` behind
+    //     Cloudflare). Trust them ONLY when the origin is reachable solely via that
+    //     proxy (CF IP allowlist / Tunnel / Authenticated Origin Pulls) — a client
+    //     header is otherwise forgeable.
+    let ip_limit = if std::env::var("RELAY_PER_IP_LIMIT")
         .ok()
-        .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
-        .unwrap_or(true);
+        .map(|v| matches!(v.trim(), "0" | "false" | "off" | "no"))
+        .unwrap_or(false)
+    {
+        IpLimitConfig::disabled()
+    } else {
+        let trusted_headers: Vec<HeaderName> = std::env::var("RELAY_CLIENT_IP_HEADERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .filter_map(|h| HeaderName::from_bytes(h.to_ascii_lowercase().as_bytes()).ok())
+            .collect();
+        IpLimitConfig::with_trusted_headers(trusted_headers)
+    };
     app = app.merge(relay_router(
         admission.clone(),
         conns.clone(),
         bandwidth.clone(),
-        per_ip_limit,
+        ip_limit,
     ));
     roles.push("relay");
 
