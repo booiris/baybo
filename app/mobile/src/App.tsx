@@ -8,6 +8,13 @@ import type { PairAborted } from "./generated/PairAborted";
 import type { PairChallenge } from "./generated/PairChallenge";
 import type { PairedSummary } from "./generated/PairedSummary";
 
+/// Foreground signals (page visibility, window focus, the native `app-resumed`
+/// event) can fire 2–3 times on a single iOS resume; coalesce them into one
+/// reconnect so we don't open several content-join legs. The Rust shell also
+/// guards against a concurrent dial, but debouncing here avoids queueing the work
+/// at all.
+const FOREGROUND_RECONNECT_DEBOUNCE_MS = 400;
+
 /// Parse a `baybo://pair?h=<relay>&r=<rendezvous-id>&s=<secret>&k=<instance-key>`
 /// QR payload. Both `r` (public rendezvous id) and `s` (the 256-bit secret, the
 /// Noise PSK) are required — there is no typeable fallback, because a short
@@ -217,21 +224,31 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
   }, [sessionId]);
 
   useEffect(() => {
-    connect();
+    connect(); // first connect is immediate — no foreground burst to coalesce yet
+
     // iOS suspends the app without ever marking the WKWebView page hidden, so the
     // page's own `visibilitychange` never fires on resume — the chat would keep
     // using a relay leg the OS froze. Reconnect on every foreground signal we can
     // get: page visibility (covers a reloaded webview and dev/browser), window
     // `focus`, and — the reliable one on iOS — the native `app-resumed` event the
-    // Rust shell emits from `RunEvent::Resumed`.
+    // Rust shell emits from `RunEvent::Resumed`. A single resume fires several of
+    // these, so debounce them into one reconnect.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const scheduleConnect = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = undefined;
+        connect();
+      }, FOREGROUND_RECONNECT_DEBOUNCE_MS);
+    };
     const onVisible = () => {
-      if (document.visibilityState === "visible") connect();
+      if (document.visibilityState === "visible") scheduleConnect();
     };
     document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", connect);
+    window.addEventListener("focus", scheduleConnect);
     let unlisten: (() => void) | undefined;
     let cancelled = false;
-    listen("app-resumed", () => connect())
+    listen("app-resumed", () => scheduleConnect())
       .then((un) => {
         // The effect may have already torn down before listen() resolved.
         if (cancelled) un();
@@ -240,8 +257,9 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
       .catch(() => {});
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", connect);
+      window.removeEventListener("focus", scheduleConnect);
       unlisten?.();
       invoke("content_disconnect").catch(() => {});
     };

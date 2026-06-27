@@ -13,6 +13,7 @@
 //! relay-only — the app reaches the (possibly NAT'd) gateway through C's blind
 //! content-join leg.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use baybo_mobile_core::{
@@ -49,10 +50,29 @@ const CONTENT_DIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// with catch-up instead of writing into a black hole.
 const INBOUND_LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// The single live content session, if any. Replaced (and the prior task
-/// aborted) every time the UI opens a new one.
+/// The single live content session plus a "currently dialing" flag.
 #[derive(Default)]
-pub struct ContentSessions(Mutex<Option<ContentHandle>>);
+pub struct ContentSessions {
+    /// The live session, if any. Replaced (and the prior task aborted) every time
+    /// the UI opens a new one.
+    handle: Mutex<Option<ContentHandle>>,
+    /// `true` while a [`connect`] is mid-dial, so concurrent connects coalesce to
+    /// one. iOS can fire several foreground signals on a single resume; the JS
+    /// shell debounces them, and this is the backstop for any that still race —
+    /// without it each would run a full `dial_relay` and open another content-join
+    /// leg before the loser's task is aborted.
+    connecting: AtomicBool,
+}
+
+/// Clears [`ContentSessions::connecting`] on drop, so the flag is released on
+/// every exit from [`connect`] (success, error, or early `?`).
+struct ConnectingGuard<'a>(&'a AtomicBool);
+
+impl Drop for ConnectingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 struct ContentHandle {
     /// User messages the UI submits, handed to the pump task to seal + send.
@@ -80,6 +100,15 @@ pub async fn connect(
     since_ordinal: Option<i64>,
     on_frame: Channel<Frame>,
 ) -> Result<(), String> {
+    // Coalesce concurrent dials: if one is already in flight, skip this one rather
+    // than open a second content-join leg. The in-flight connect drives the same
+    // UI state (each foreground reconnect re-subscribes with catch-up), so the
+    // redundant dial is pure waste. `swap` claims the slot atomically.
+    if sessions.connecting.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+    let _connecting = ConnectingGuard(&sessions.connecting);
+
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
     if record.relay_node_id.is_empty() {
@@ -110,7 +139,7 @@ pub async fn connect(
         outbound_rx,
     ));
 
-    let mut guard = sessions.0.lock().await;
+    let mut guard = sessions.handle.lock().await;
     if let Some(prev) = guard.take() {
         prev.task.abort();
     }
@@ -120,7 +149,7 @@ pub async fn connect(
 
 /// Queue a user message on the live session for the pump task to seal + send.
 pub async fn send(sessions: &ContentSessions, text: String, msg_id: String) -> Result<(), String> {
-    let guard = sessions.0.lock().await;
+    let guard = sessions.handle.lock().await;
     let handle = guard.as_ref().ok_or("no active content session")?;
     handle
         .outbound_tx
@@ -130,7 +159,7 @@ pub async fn send(sessions: &ContentSessions, text: String, msg_id: String) -> R
 
 /// Tear down the live session (if any).
 pub async fn disconnect(sessions: &ContentSessions) {
-    if let Some(prev) = sessions.0.lock().await.take() {
+    if let Some(prev) = sessions.handle.lock().await.take() {
         prev.task.abort();
     }
 }
