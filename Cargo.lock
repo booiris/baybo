@@ -610,7 +610,9 @@ dependencies = [
  "libc",
  "parking_lot",
  "rand 0.10.1",
+ "remote-host-admission",
  "remote-host-protocol",
+ "remote-host-relay",
  "reqwest 0.13.2",
  "rustls",
  "serde",
@@ -3855,10 +3857,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "remote-host-admission"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+]
+
+[[package]]
 name = "remote-host-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "remote-host-ratelimit"
+version = "0.1.0"
+
+[[package]]
+name = "remote-host-relay"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "parking_lot",
+ "remote-host-admission",
+ "remote-host-protocol",
+ "remote-host-ratelimit",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

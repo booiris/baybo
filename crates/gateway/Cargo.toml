@@ -123,3 +123,7 @@ chrono = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
+# Boot a real remote-host relay (C) in-process for the relay-content e2e harness,
+# so the spliced A<->C<->P path is proven across the workspace boundary.
+remote-host-relay = { workspace = true }
+remote-host-admission = { workspace = true }

@@ -29,6 +29,8 @@ pub(crate) mod device_pair;
 pub(crate) mod handshake;
 pub(crate) mod history;
 pub(crate) mod relay_content;
+#[cfg(test)]
+mod relay_e2e;
 pub(crate) mod relay_pair;
 pub mod route;
 pub(crate) mod session_pulse;
