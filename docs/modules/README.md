@@ -60,6 +60,11 @@ Bottom-up along the dependency graph:
 - **[tui](tui.md)** — Interactive terminal UI (`baybo-tui`). Ratatui + Crossterm frontend driven by a WS+MessagePack `WsTransport` client of `baybo-gateway`; no local manager graph, no workspace singleton. Hosts `TuiAdapter`, `TuiSlashHandler`, and `TuiDashboardProvider`. Input-history persistence is delivered over the same WS via `Frame::HistorySnapshot` / `Frame::HistoryAppend` — the TUI never opens the vault itself. Depends on `baybo-channels` for shared trait definitions only.
 - **[gateway](gateway.md)** — Headless HTTP backend (`baybo-gateway`). One axum server is both a `ChannelType::Http` adapter (chat flows through the normal Router path) and an admin REST/SSE API mirroring the CLI families. Auth is a dynamic per-install token stored in `SecretVault`; platform service units live behind `linux` / `macos` Cargo features (one knob per OS; reuse these for any future platform-specific gateway code). Driven by the `baybo gateway …` command tree.
 
+## Feature Subsystems (cross-crate)
+
+- [mobile-companion.md](mobile-companion.md) — The iOS companion app (`app/mobile`): scan-to-connect pairing + end-to-end-encrypted remote notifications. Spans `device-proto` (XXpsk0 pairing + Noise IK content + AEAD previews), `pairing` (`DevicePairingService`), `gateway` (the A-side host leg, content responder, relay-content manager, push dispatcher), and the separate `remote-host/` workspace (C — blind relay + APNs). 1:1 binding, the content/pairing relay path, push pipeline, and the cross-workspace e2e harness.
+- [mobile-pairing-security.md](mobile-pairing-security.md) — The pairing **threat model** and crypto design: why device pairing is safe against a hostile relay. The `rendezvous_id` / 256-bit-`secret` split, `Noise_XXpsk0`, the high-entropy-secret invariant, prologue binding, confirm-code channel binding, and secret hygiene.
+
 ## Cross-Cutting Guides
 
 - [testing.md](../testing.md) — Test pyramid (unit / crate-level / cross-crate), `test-support` gating, fixture inventory, and the six conventions every new test should follow.
