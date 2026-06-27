@@ -250,12 +250,6 @@ impl GatewayServer {
     pub fn new(deps: GatewayDeps) -> Self {
         let bind = deps.runtime_config.admin_bind;
         let shutdown_grace = deps.runtime_config.shutdown_grace;
-        // Content control connection: hold an outbound A->C link so a phone can
-        // reach this (possibly NAT'd) gateway for chat via the relay. The manager
-        // self-gates on the approved device row (idle until one is paired), reading
-        // the relay URL + admission key from it — there is no `relay` config block.
-        // It installs its own rustls CryptoProvider (it owns the wss dial).
-        crate::channel::relay_content::spawn(WsChannelState::from_deps(&deps));
         let router = build_admin_router(deps);
         Self {
             bind,
@@ -292,6 +286,22 @@ impl GatewayServer {
             .await
             .map_err(|e| GatewayError::Internal(format!("serve error: {e}")))
     }
+}
+
+/// Spawn the relay-**content** control manager and return its join handle for the
+/// caller to track under the shared shutdown drain.
+///
+/// Holds an outbound A→C control link so a phone can reach this (possibly NAT'd)
+/// gateway for chat via the relay. The manager self-gates on the approved device
+/// row (idle until one is paired), reading the relay URL + admission key from it —
+/// there is no `relay` config block. It installs its own rustls CryptoProvider (it
+/// owns the wss dial). Spawned alongside the other gateway managers so it rides the
+/// same `ShutdownSignal` + task tracker and is drained on shutdown.
+pub fn spawn_relay_content(
+    deps: &GatewayDeps,
+    shutdown: ShutdownSignal,
+) -> tokio::task::JoinHandle<()> {
+    crate::channel::relay_content::spawn(WsChannelState::from_deps(deps), shutdown)
 }
 
 fn build_admin_router(deps: GatewayDeps) -> Router {

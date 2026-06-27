@@ -572,6 +572,19 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         }
     }
 
+    // Content control connection: an outbound A->C link so a phone can reach this
+    // (possibly NAT'd) gateway for chat via the relay. Self-gates on the approved
+    // device row (idle until one is paired). Spawned + tracked here alongside the
+    // other managers so it rides the shared shutdown drain rather than leaking as
+    // a detached task.
+    {
+        let relay_content_shutdown = shutdown.clone();
+        task_tracker.track(baybo_gateway::spawn_relay_content(
+            &deps,
+            relay_content_shutdown,
+        ));
+    }
+
     let server = GatewayServer::new(deps);
     let banner_bind = server.bind();
     // Dashboard URL first, then the admin token on its own line for the

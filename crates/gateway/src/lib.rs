@@ -52,7 +52,7 @@ pub use crate::installer::{
 };
 pub use crate::log_buffer::{LogBuffer, LogBufferLayer, LogLevel, LogPage, LogQuery, LogRecord};
 pub use crate::reload::{ConfigReloader, ReloadError, ReloadOutcome};
-pub use crate::server::{GatewayDeps, GatewayServer};
+pub use crate::server::{GatewayDeps, GatewayServer, spawn_relay_content};
 pub use crate::sidecar::{
     BUN_BINARY_ENV, NODE_BINARY_ENV, SidecarError, SidecarRuntime, SidecarSupervisor,
     collect_profiles, node_binary,
