@@ -539,7 +539,19 @@ pub enum DeviceCmd {
     /// Pair a new device: mint a code for the iOS app to scan, then confirm a
     /// Bluetooth-style code on both the phone and this terminal. Interactive —
     /// it stays live until both sides confirm (or it times out).
-    Pair,
+    Pair {
+        /// Relay (remote-host) to pair against — a bare host (`c.example.com`,
+        /// defaults to `wss://`) or an explicit `ws://`/`wss://` URL. Recorded on
+        /// the device row so the gateway reuses it for its relay control connection
+        /// + push (same host over https). Defaults to the built-in public proxy.
+        #[arg(long, value_name = "HOST")]
+        relay_url: Option<String>,
+        /// Relay admission key (`x-instance-key`) to present on the pairing legs.
+        /// Must be admitted on the relay. Defaults to `guest`, the built-in public
+        /// proxy's trial key; pass your own when using `--relay-url`.
+        #[arg(long, value_name = "KEY", default_value = "guest")]
+        instance_key: String,
+    },
     /// List registered devices. With no flag, shows every row; pass
     /// `--approved` to show only active devices.
     List {

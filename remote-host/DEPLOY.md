@@ -112,16 +112,15 @@ sqlite3 ./data/admission.db \
 
 **Push frequency control.** `POST /notify` is rate-limited per `(instance_key, device_id)` so a buggy or abusive gateway can't hammer APNs or spam a phone. Over the limit it returns `429` (the gateway backs off and retries). The limit is a fixed **60 pushes/min sustained, burst 20** per device; only admitted, registered devices are metered. Hardcoded, not configurable.
 
-## Gateway wiring (`baybo.json`)
+## Gateway wiring (pair against this host)
 
-The gateway holds **no** `.p8` — it only knows the C base URL + its admission key:
+The gateway holds **no** `.p8`, and there is **no `relay`/`push` block in `baybo.json`** — relay control + push are driven by the approved device row. Point them at this host by pairing with `--relay-url` (a one-time per-device choice, recorded on the row):
 
-```jsonc
-"push":  { "enabled": true, "gateway_url": "https://c.example.com", "instance_key": "<admitted key>" },
-"relay": { "enabled": true, "url": "wss://c.example.com",            "instance_key": "<admitted key>" }
+```sh
+baybo device pair --relay-url wss://c.example.com --instance-key <admitted key>
 ```
 
-Both URLs resolve to the one `remote-host` listener (the disjoint paths route to the right role). The `instance_key` must be admitted in the `admitted_instances` table (see **Admission** above) — one key serves both roles.
+That single WS URL covers both roles: the gateway dials `wss://c.example.com` for the relay control/content legs and POSTs push to `https://c.example.com/notify` (same host, scheme swapped). Omit the flags to use the built-in public proxy + its trial key `guest`. The `instance_key` must be admitted in the `admitted_instances` table (see **Admission** above) — one key serves both roles. To move an already-paired device to a different host, re-pair with the new `--relay-url`.
 
 ## Notes
 

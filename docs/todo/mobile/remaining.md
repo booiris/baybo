@@ -284,14 +284,58 @@ The short version:
 
    Removing a row revokes it within one poll and kicks its live connections.
 3. Gateway: **no `relay`/`push` config block** — both are driven by the approved
-   device row. Run `baybo device pair` and enter an admitted instance key at the
-   prompt; the relay URL is the built-in `wss://proxy.baybo.space` (not
-   operator-configurable yet) and, together with the key, is recorded on the device
-   row (`DeviceRow::relay_url` / `instance_key`). The gateway then auto-starts its
-   relay control connection + push when an approved device exists (polling the row,
-   `channel/relay_content.rs` `approved_relay_settings`) and tears them down on
-   revoke; push (`push/mod.rs`) reads the same URL+key per device, swapping the
-   scheme to `https` for `/notify` + `/register`. Pointing at a self-hosted
-   `remote-host` (e.g. `c.example.com`) needs the relay URL to become configurable
-   first — today it is fixed to the built-in proxy. Still admit the instance key on
-   the remote host (step 2) before it will accept the gateway's control/host legs.
+   device row. Pair against your host; the endpoint + key are recorded on the row:
+
+   ```sh
+   baybo device pair --relay-url c.example.com --instance-key <admitted key>
+   ```
+
+   `--relay-url` takes a bare host (defaults to `wss://`) or an explicit
+   `ws://`/`wss://` URL; `--instance-key` defaults to `guest` (the built-in proxy's
+   trial key). Both are baked into the QR and written to the device row
+   (`DeviceRow::relay_url` / `instance_key`). The gateway then auto-starts its relay
+   control connection + push when an approved device exists (the
+   `channel/relay_content.rs` manager polls the row, idling when none) and tears
+   them down on revoke; push (`push/mod.rs`) POSTs to the **same host over `https`**
+   (`/notify` + `/register`). Omit the flags to use the built-in public proxy +
+   `guest`. To move an already-paired device to a different host, re-pair with the
+   new `--relay-url`. The key must be admitted on the remote host (step 2) first.
+
+## Testing push end-to-end (self-hosted remote-host)
+
+The built-in public proxy (`wss://proxy.baybo.space`) can relay **content** but
+**cannot** deliver APNs **pushes** for a self-built app — it holds no `.p8` for
+your bundle id / team, so `/notify` + `/register` 404 there. That's exactly why
+foreground chat works (it rides the relay WS, live) while backgrounded the phone
+goes quiet: a suspended app reaches you only via APNs push, which needs your own C
+holding your APNs key. To test the lock-screen path:
+
+1. **Deploy `remote-host` with push on** (deploy steps above) plus the APNs section
+   of `.env`: `APNS_P8_PATH` (your `.p8`), `APNS_KEY_ID`, `TEAM_ID`, `BUNDLE_ID`
+   (= the `apns-topic`, your app's bundle id), and TLS (`TLS_CERT`/`TLS_KEY`, or a
+   TLS terminator in front). Push mounts only when `APNS_P8_PATH` is set. The `.p8`
+   is a **team** auth key (one key covers sandbox + prod); the per-device env flows
+   through the registration, so there's no env switch on C.
+2. **Admit your gateway's instance key** in `admitted_instances` (deploy step 2).
+3. **Re-pair against your host** (writes the host + key onto the device row, which
+   both relay and push then read):
+
+   ```sh
+   baybo device pair --relay-url c.example.com --instance-key <admitted key>
+   ```
+
+4. **Alignment prerequisites** (push silently no-ops otherwise): a code-signed build
+   with the Push Notifications capability, on a **real device** (the simulator gets
+   no APNs token), with notifications allowed; the `.p8`'s team + the `apns-topic`
+   must match the app's signing + bundle id; a debug build registers a **sandbox**
+   token.
+5. **Verify:**
+   - **Gateway** — run with `RUST_LOG=baybo_gateway::push=debug`, send a real chat
+     turn, and watch for `push: preview posted to remote host device=…` (a 2xx from
+     C). `push: skipped a device error="notify status 4xx"` or `… re-registration
+     failed` points at an unregistered device / unadmitted key / `.p8`-topic
+     mismatch.
+   - **Phone** — background the app and send a turn from another channel (or the web
+     chat); a lock-screen banner should arrive (the NSE decrypts the blind preview).
+     Re-opening the app lands back in the chat and catches up the missed messages
+     (the persist + reconnect-with-catch-up path in `App.tsx` / `content.rs`).

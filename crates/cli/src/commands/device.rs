@@ -31,13 +31,16 @@ const OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const SCAN_WAIT: Duration = Duration::from_secs(300);
 /// How long to wait for the gateway to finalize once the operator confirmed.
 const OUTCOME_WAIT: Duration = Duration::from_secs(125);
-/// Built-in public relay embedded in the pairing QR when the operator has not
-/// configured their own `gateway.relay`.
+/// Built-in public relay embedded in the pairing QR when `--relay-url` is not
+/// passed. Point `--relay-url` at a self-hosted `remote-host` to use your own.
 const DEFAULT_GATEWAY_ENDPOINT: &str = "wss://proxy.baybo.space";
 
 pub async fn handle(ctx: &CommandContext, cmd: DeviceCmd) -> Result<CommandOutput> {
     match cmd {
-        DeviceCmd::Pair => pair(ctx).await,
+        DeviceCmd::Pair {
+            relay_url,
+            instance_key,
+        } => pair(ctx, relay_url, instance_key).await,
         DeviceCmd::List { approved } => list(ctx, approved).await,
         DeviceCmd::Revoke { device_id, yes } => revoke(ctx, device_id, yes).await,
     }
@@ -108,7 +111,11 @@ fn qr_encode(s: &str) -> String {
         .collect()
 }
 
-async fn pair(ctx: &CommandContext) -> Result<CommandOutput> {
+async fn pair(
+    ctx: &CommandContext,
+    relay_url: Option<String>,
+    instance_key: String,
+) -> Result<CommandOutput> {
     let svc = require_service(ctx)?;
 
     // 1:1 binding: the gateway binds at most one device (one gateway = one app).
@@ -145,17 +152,15 @@ async fn pair(ctx: &CommandContext) -> Result<CommandOutput> {
         .await
         .map_err(|e| CliError::Manager(format!("mint device pairing: {e}")))?;
 
-    // Pairing always runs through the relay: the operator supplies its admission
-    // key, baked into the QR so the app presents it on its join leg (the relay
-    // admits both sides).
-    let (endpoint, default_key) = relay_endpoint();
-    let key_label = if endpoint == DEFAULT_GATEWAY_ENDPOINT {
-        // `guest` is the trial key for the built-in public proxy.
-        "Relay instance key (enter `guest` to try it out)"
-    } else {
-        "Relay instance key"
+    // Pairing always runs through the relay. The endpoint defaults to the built-in
+    // public proxy; `--relay-url` points it at a self-hosted remote-host. The
+    // admission key (`--instance-key`, default `guest`) and the endpoint are baked
+    // into the QR and recorded on the device row so the gateway reuses them for its
+    // relay control connection + push.
+    let endpoint = match relay_url {
+        Some(url) => normalize_relay_url(&url)?,
+        None => DEFAULT_GATEWAY_ENDPOINT.to_string(),
     };
-    let instance_key = prompt::prompt_with_default(key_label, &default_key)?;
     let k = qr_encode(&instance_key);
     // `s=` is the 256-bit secret, hex-encoded; it is bearer credential material.
     // The whole payload is rendered as a QR only — never echoed to the terminal
@@ -470,14 +475,25 @@ async fn wait_for_paired(
     }
 }
 
-/// The relay endpoint to embed in the pairing QR (the app joins via
-/// `/pair/join/<code>` on it), plus the default admission key to offer at the
-/// prompt. The relay URL is not operator-configurable yet — always the built-in
-/// public proxy (whose trial key is `guest`); the operator may still override the
-/// key at the prompt. Both the chosen endpoint and key are recorded on the device
-/// row at pairing so the gateway re-uses them for its relay/push connections.
-fn relay_endpoint() -> (String, String) {
-    (DEFAULT_GATEWAY_ENDPOINT.to_string(), "guest".to_string())
+/// Normalize a `--relay-url` to a WebSocket base URL. A bare host (`c.example.com`
+/// or `host:port`) defaults to `wss://`; an explicit `ws://`/`wss://` is kept (use
+/// `ws://` for a local plaintext relay). Any other scheme is rejected — the app
+/// dials `ws(s)://…` and the gateway derives the `https` push base from the same
+/// value, so a bad scheme would break both legs.
+fn normalize_relay_url(input: &str) -> Result<String> {
+    let url = input.trim();
+    if url.is_empty() {
+        return Err(CliError::Config("--relay-url must not be empty".into()));
+    }
+    if url.starts_with("wss://") || url.starts_with("ws://") {
+        Ok(url.to_string())
+    } else if url.contains("://") {
+        Err(CliError::Config(format!(
+            "--relay-url must be a host or a ws://|wss:// URL (got `{url}`)"
+        )))
+    } else {
+        Ok(format!("wss://{url}"))
+    }
 }
 
 /// Render `payload` as a QR for the terminal (unicode half-blocks). `None` if
@@ -592,5 +608,30 @@ mod tests {
             qr.contains('█') || qr.contains('▀') || qr.contains('▄'),
             "rendered with half-block glyphs"
         );
+    }
+
+    #[test]
+    fn normalize_relay_url_defaults_bare_host_to_wss() {
+        // A bare host (with or without a port) gets the wss:// scheme.
+        assert_eq!(
+            normalize_relay_url("c.example.com").unwrap(),
+            "wss://c.example.com"
+        );
+        assert_eq!(
+            normalize_relay_url(" c.example.com:8443 ").unwrap(),
+            "wss://c.example.com:8443"
+        );
+        // An explicit ws/wss scheme is preserved (ws:// for a local plaintext relay).
+        assert_eq!(
+            normalize_relay_url("wss://c.example.com").unwrap(),
+            "wss://c.example.com"
+        );
+        assert_eq!(
+            normalize_relay_url("ws://127.0.0.1:7777").unwrap(),
+            "ws://127.0.0.1:7777"
+        );
+        // Any other scheme, or an empty value, is rejected.
+        assert!(normalize_relay_url("https://c.example.com").is_err());
+        assert!(normalize_relay_url("").is_err());
     }
 }
