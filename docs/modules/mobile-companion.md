@@ -3,14 +3,14 @@
 The iOS companion app pairs a phone to a Baybo gateway and gives it two
 user-facing features:
 
-1. **Scan-to-connect (扫码连接)** — pair the phone to a gateway by scanning a QR
-   code. A mutual-confirm handshake establishes a device identity; both the phone
-   user and the operator confirm a code derived from the handshake, and the
-   gateway is then reachable for chat.
-2. **Remote notifications (远程通知)** — when an agent turn completes, the phone
-   gets a push whose lock-screen preview is **end-to-end encrypted**: the gateway
-   encrypts, the operator's remote host forwards ciphertext blind, and the phone
-   decrypts locally in a Notification Service Extension (NSE).
+1. **Scan-to-connect** — pair the phone to a gateway by scanning a QR code. A
+   mutual-confirm handshake establishes a device identity; both the phone user and
+   the operator confirm a code derived from the handshake, and the gateway is then
+   reachable for chat.
+2. **Remote notifications** — when an agent turn completes, the phone gets a push
+   whose lock-screen preview is **end-to-end encrypted**: the gateway encrypts, the
+   operator's remote host forwards ciphertext blind, and the phone decrypts locally
+   in a Notification Service Extension (NSE).
 
 The app is a **Tauri 2** shell (`app/mobile`) over a host-tested, FFI-free Rust
 core (`baybo-mobile-core`); the protocol + crypto live in shared crates so the
