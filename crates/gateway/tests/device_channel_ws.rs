@@ -34,6 +34,8 @@ fn approved_device(token: &str) -> DeviceRow {
         created_at: 1,
         approved_at: Some(2),
         last_seen_at: None,
+        relay_url: "wss://relay.test".into(),
+        instance_key: "inst-test".into(),
     }
 }
 

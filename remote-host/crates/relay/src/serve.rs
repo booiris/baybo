@@ -369,7 +369,10 @@ async fn content_join_handler(
     // metering keys on the *gateway's* instance key (resolved by signaling) so
     // both legs of a content session share one bandwidth bucket.
     let Some(instance_key) = state.control.signal_open(&relay_node_id, &relay_key).await else {
-        return (StatusCode::NOT_FOUND, "gateway not connected").into_response();
+        // The route exists and the key is admitted — the named gateway just holds
+        // no control connection right now (offline, or mid-reconnect). 503, not
+        // 404, so the phone tells "gateway offline, retry" apart from a route-miss.
+        return (StatusCode::SERVICE_UNAVAILABLE, "gateway not connected").into_response();
     };
     let limiter = state
         .bandwidth
@@ -690,8 +693,8 @@ mod tests {
     async fn content_join_without_a_connected_gateway_is_refused() {
         let port = serve().await;
         match connect_content_join(port, "ghost-node", Some("inst-A")).await {
-            Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::NOT_FOUND),
-            other => panic!("expected 404, got {other:?}"),
+            Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::SERVICE_UNAVAILABLE),
+            other => panic!("expected 503, got {other:?}"),
         }
     }
 
@@ -717,8 +720,8 @@ mod tests {
         }
         // No gateway registered for node-x, so a phone naming it is refused.
         match connect_content_join(port, "node-x", Some("inst-A")).await {
-            Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::NOT_FOUND),
-            other => panic!("expected 404, got {other:?}"),
+            Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::SERVICE_UNAVAILABLE),
+            other => panic!("expected 503, got {other:?}"),
         }
     }
 

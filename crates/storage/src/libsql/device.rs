@@ -15,14 +15,14 @@ impl LibsqlDeviceStore {
 }
 
 const COLS: &str = "device_id, device_pubkey, auth_token, status, \
-     rendezvous_id, created_at, approved_at, last_seen_at";
+     rendezvous_id, created_at, approved_at, last_seen_at, relay_url, instance_key";
 
 /// Shared INSERT for a device row — reused by `create` and the transactional
 /// `create_replacing_approved` so the column list has one source of truth.
 const INSERT_DEVICE: &str = "INSERT INTO devices
      (device_id, device_pubkey, auth_token, status,
-      rendezvous_id, created_at, approved_at, last_seen_at)
- VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+      rendezvous_id, created_at, approved_at, last_seen_at, relay_url, instance_key)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
 
 /// Re-pair tail appended to [`INSERT_DEVICE`], used only by
 /// [`LibsqlDeviceStore::create_replacing_approved`]. `device_id` is a stable,
@@ -38,7 +38,9 @@ const REPAIR_UPSERT_TAIL: &str = " ON CONFLICT(device_id) DO UPDATE SET \
      status = excluded.status, \
      rendezvous_id = excluded.rendezvous_id, \
      approved_at = excluded.approved_at, \
-     last_seen_at = excluded.last_seen_at";
+     last_seen_at = excluded.last_seen_at, \
+     relay_url = excluded.relay_url, \
+     instance_key = excluded.instance_key";
 
 fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Internal(anyhow::anyhow!("libsql {ctx}: {e}"))
@@ -72,6 +74,8 @@ fn insert_params(row: &DeviceRow) -> Vec<libsql::Value> {
         Value::Integer(row.created_at),
         opt_int(row.approved_at),
         opt_int(row.last_seen_at),
+        Value::Text(row.relay_url.clone()),
+        Value::Text(row.instance_key.clone()),
     ]
 }
 
@@ -91,6 +95,8 @@ async fn fetch_row(rows: &mut libsql::Rows) -> Result<Option<DeviceRow>> {
         created_at: row.get(5).map_err(|e| col_err("get created_at", e))?,
         approved_at: row.get(6).map_err(|e| col_err("get approved_at", e))?,
         last_seen_at: row.get(7).map_err(|e| col_err("get last_seen_at", e))?,
+        relay_url: row.get(8).map_err(|e| col_err("get relay_url", e))?,
+        instance_key: row.get(9).map_err(|e| col_err("get instance_key", e))?,
     }))
 }
 
@@ -272,6 +278,8 @@ mod tests {
             created_at: 100,
             approved_at: Some(100),
             last_seen_at: None,
+            relay_url: "wss://relay.test".into(),
+            instance_key: "inst-test".into(),
         }
     }
 

@@ -13,6 +13,8 @@
 //! relay-only — the app reaches the (possibly NAT'd) gateway through C's blind
 //! content-join leg.
 
+use std::time::Duration;
+
 use baybo_mobile_core::{
     ContentHandshake, ContentSession, Frame, subscribe_frame, user_text_frame,
 };
@@ -21,12 +23,21 @@ use futures_util::{SinkExt, StreamExt};
 use tauri::ipc::Channel;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message, http::StatusCode};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::pairing::{PairedRecord, load_paired_record};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Retry budget for the content dial while the gateway's relay control link is
+/// briefly absent. The gateway re-dials the relay on a fixed backoff after any
+/// drop (5s `RECONNECT_BACKOFF` in the gateway's `relay_content`), so a phone
+/// that opens chat inside that window would otherwise get a hard error; this
+/// budget outlasts it. Only a `503 gateway not connected` is retried — a
+/// permanent refusal (e.g. `401` for an unadmitted key) surfaces at once.
+const CONTENT_DIAL_RETRIES: usize = 14;
+const CONTENT_DIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// The single live content session, if any. Replaced (and the prior task
 /// aborted) every time the UI opens a new one.
@@ -105,6 +116,9 @@ pub async fn disconnect(sessions: &ContentSessions) {
 /// The relay admits this leg by the instance key (symmetric with the gateway's
 /// host leg); end-to-end, the gateway authenticates this device by matching the
 /// Noise IK initiator's static against an approved device row.
+///
+/// Retries a `503 gateway not connected` (the gateway is offline or mid-reconnect
+/// to the relay) for a bounded window; every other failure surfaces at once.
 async fn dial_relay(
     node_id: &str,
     record: &PairedRecord,
@@ -117,22 +131,44 @@ async fn dial_relay(
     }
     let base = record.relay_url.trim_end_matches('/');
     let url = remote_host_protocol::relay::content_join_url(base, node_id);
-    // Present the admission key the QR carried at pairing — the relay admits the
-    // phone leg too now.
-    let mut req = url
-        .into_client_request()
-        .map_err(|e| format!("bad relay url {base}: {e}"))?;
-    if !record.instance_key.is_empty() {
-        let value = record
-            .instance_key
-            .parse()
-            .map_err(|e| format!("bad instance key header: {e}"))?;
-        req.headers_mut()
-            .insert(remote_host_protocol::relay::INSTANCE_KEY_HEADER, value);
-    }
-    let (ws, _) = connect_async(req)
-        .await
-        .map_err(|e| format!("relay connect {base}: {e}"))?;
+
+    let mut attempt = 0usize;
+    let ws = loop {
+        // Rebuilt per attempt (`into_client_request` yields an owned request).
+        // Present the admission key the QR carried at pairing — the relay admits
+        // the phone leg too now.
+        let mut req = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| format!("bad relay url {base}: {e}"))?;
+        if !record.instance_key.is_empty() {
+            let value = record
+                .instance_key
+                .parse()
+                .map_err(|e| format!("bad instance key header: {e}"))?;
+            req.headers_mut()
+                .insert(remote_host_protocol::relay::INSTANCE_KEY_HEADER, value);
+        }
+        match connect_async(req).await {
+            Ok((ws, _)) => break ws,
+            // The relay's `content_join` returns 503 while no gateway holds a live
+            // control connection for this node; it re-dials the relay on a fixed
+            // backoff, so retry briefly rather than failing the open.
+            Err(WsError::Http(resp))
+                if resp.status() == StatusCode::SERVICE_UNAVAILABLE
+                    && attempt < CONTENT_DIAL_RETRIES =>
+            {
+                attempt += 1;
+                tokio::time::sleep(CONTENT_DIAL_RETRY_DELAY).await;
+            }
+            Err(WsError::Http(resp)) if resp.status() == StatusCode::SERVICE_UNAVAILABLE => {
+                return Err(format!(
+                    "gateway offline: {base} has no relay control connection; ensure the paired gateway is running with relay enabled"
+                ));
+            }
+            Err(e) => return Err(format!("relay connect {base}: {e}")),
+        }
+    };
     handshake_over(ws, record, local).await
 }
 

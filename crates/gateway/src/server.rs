@@ -251,22 +251,11 @@ impl GatewayServer {
         let bind = deps.runtime_config.admin_bind;
         let shutdown_grace = deps.runtime_config.shutdown_grace;
         // Content control connection: hold an outbound A->C link so a phone can
-        // reach this (possibly NAT'd) gateway for chat via the relay. A no-op when
-        // the `relay` block is disabled.
-        if let Some(relay) = deps.runtime_config.relay.clone() {
-            // tokio-tungstenite dials `wss://` using rustls's process-default
-            // CryptoProvider; our graph enables both aws-lc-rs and ring, so install
-            // aws-lc-rs explicitly before the first dial or connect_async panics
-            // (idempotent; Err = already installed).
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-            crate::channel::relay_content::spawn(
-                WsChannelState::from_deps(&deps),
-                crate::channel::relay_content::RelayContentConfig {
-                    relay_url: relay.url,
-                    instance_key: relay.instance_key,
-                },
-            );
-        }
+        // reach this (possibly NAT'd) gateway for chat via the relay. The manager
+        // self-gates on the approved device row (idle until one is paired), reading
+        // the relay URL + admission key from it — there is no `relay` config block.
+        // It installs its own rustls CryptoProvider (it owns the wss dial).
+        crate::channel::relay_content::spawn(WsChannelState::from_deps(&deps));
         let router = build_admin_router(deps);
         Self {
             bind,

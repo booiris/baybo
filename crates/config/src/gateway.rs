@@ -34,41 +34,6 @@ pub struct GatewayConfig {
     /// Seconds the process waits for graceful shutdown before the
     /// force-exit watchdog kicks in.
     pub shutdown_grace_secs: u64,
-    /// Blind remote-host push: when enabled, A POSTs an operator-encrypted
-    /// lock-screen preview to the remote host (C) on every real user turn.
-    pub push: PushConfig,
-    /// Relay (C): when enabled, the gateway holds an outbound control link so a
-    /// NAT'd gateway stays reachable for post-pairing content, and
-    /// `baybo device pair` hosts its pairing legs on this same relay.
-    pub relay: RelayConfig,
-}
-
-/// A-side relay config (the `relay` block in `baybo.json`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default)]
-pub struct RelayConfig {
-    /// When false, the gateway opens no relay control connection (it is then
-    /// reachable only via its direct candidates).
-    pub enabled: bool,
-    /// The relay's base WS URL, e.g. `wss://proxy.baybo.space`.
-    pub url: String,
-    /// The gateway's admission key — a `RELAY_INSTANCE_KEYS` entry on the relay.
-    /// Typically the same key as [`PushConfig::instance_key`].
-    pub instance_key: String,
-}
-
-/// A-side push config (the `push` block in `baybo.json`). A holds only the
-/// remote-host URL + its per-instance admission key — never the `.p8`, which
-/// lives solely in C.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default)]
-pub struct PushConfig {
-    /// When false, no push dispatcher runs.
-    pub enabled: bool,
-    /// The remote host's base URL, e.g. `https://remote.baybo.example`.
-    pub gateway_url: String,
-    /// Per-instance admission key C validates on every `/notify`.
-    pub instance_key: String,
 }
 
 impl Default for GatewayConfig {
@@ -79,8 +44,6 @@ impl Default for GatewayConfig {
             port: 8888,
             cors_allowed_origins: Vec::new(),
             shutdown_grace_secs: 30,
-            push: PushConfig::default(),
-            relay: RelayConfig::default(),
         }
     }
 }

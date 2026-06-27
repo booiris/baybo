@@ -463,31 +463,24 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     }
 
     // Blind remote-host push: on every completed real user turn, encrypt a
-    // per-device preview and POST it to the remote host (C). Off unless the
-    // `push` block is configured.
-    if graph.config.gateway.push.enabled && !graph.config.gateway.push.gateway_url.is_empty() {
-        let push_cfg = &graph.config.gateway.push;
+    // per-device preview and POST it to the remote host (C). Always wired — the
+    // dispatcher self-gates on the approved device row, reading the remote-host
+    // URL + admission key recorded on it at pairing (no `push` config block).
+    {
         // Proxy-aware client: /notify + /register POST to the remote host (C), a
         // non-loopback egress target subject to the operator's egress proxy.
         let push_client =
             baybo_security::http::client(boot::proxy_settings(&graph.config).as_ref())?;
-        let registrar: Arc<dyn baybo_gateway::push::ApnsRegistrar> =
-            Arc::new(baybo_gateway::push::HttpApnsRegistrar::new(
-                &push_cfg.gateway_url,
-                push_cfg.instance_key.clone(),
-                push_client.clone(),
-            ));
+        let registrar: Arc<dyn baybo_gateway::push::ApnsRegistrar> = Arc::new(
+            baybo_gateway::push::HttpApnsRegistrar::new(push_client.clone()),
+        );
         let dispatcher = Arc::new(baybo_gateway::push::PushDispatcher::new(
             graph.stores.device.clone(),
             graph.stores.session.clone(),
             Arc::clone(&graph.session_manager),
             Arc::clone(&graph.secret_vault),
-            Arc::new(baybo_gateway::push::HttpNotifySink::new(
-                &push_cfg.gateway_url,
-                push_client,
-            )),
+            Arc::new(baybo_gateway::push::HttpNotifySink::new(push_client)),
             Some(registrar),
-            push_cfg.instance_key.clone(),
         ));
         let push_shutdown = shutdown.clone();
         task_tracker.track(baybo_gateway::push::spawn(

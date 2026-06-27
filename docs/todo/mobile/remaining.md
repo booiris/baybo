@@ -76,7 +76,8 @@ above.)
 ### 2. Content relay — content traffic for a NAT'd gateway ✅ done
 
 A NAT'd gateway now serves content through the blind relay. The gateway holds a
-persistent A→C control connection at boot (`channel/relay_content.rs` +
+persistent A→C control connection whenever an approved device exists (the manager
+polls the device row and idles when none — `channel/relay_content.rs` +
 `relay/mod.rs` `connect_control`/`pump_control`), presenting a persisted
 `relay_node_id` (`load_or_create_relay_node_id`) it also advertises in
 `GatewayWelcome` (+ `relay_url`). C mounts `/control`, `/content/join/{node}`
@@ -282,9 +283,15 @@ The short version:
    ```
 
    Removing a row revokes it within one poll and kicks its live connections.
-3. Gateway `baybo.json` (both URLs resolve to the one `remote-host` listener):
-
-   ```jsonc
-   "push":  { "enabled": true, "gateway_url": "https://c.example.com", "instance_key": "<admitted key>" },
-   "relay": { "enabled": true, "url": "wss://c.example.com",            "instance_key": "<admitted key>" }
-   ```
+3. Gateway: **no `relay`/`push` config block** — both are driven by the approved
+   device row. Run `baybo device pair` and enter an admitted instance key at the
+   prompt; the relay URL is the built-in `wss://proxy.baybo.space` (not
+   operator-configurable yet) and, together with the key, is recorded on the device
+   row (`DeviceRow::relay_url` / `instance_key`). The gateway then auto-starts its
+   relay control connection + push when an approved device exists (polling the row,
+   `channel/relay_content.rs` `approved_relay_settings`) and tears them down on
+   revoke; push (`push/mod.rs`) reads the same URL+key per device, swapping the
+   scheme to `https` for `/notify` + `/register`. Pointing at a self-hosted
+   `remote-host` (e.g. `c.example.com`) needs the relay URL to become configurable
+   first — today it is fixed to the built-in proxy. Still admit the instance key on
+   the remote host (step 2) before it will accept the gateway's control/host legs.

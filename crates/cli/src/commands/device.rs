@@ -148,7 +148,7 @@ async fn pair(ctx: &CommandContext) -> Result<CommandOutput> {
     // Pairing always runs through the relay: the operator supplies its admission
     // key, baked into the QR so the app presents it on its join leg (the relay
     // admits both sides).
-    let (endpoint, default_key) = relay_endpoint(ctx);
+    let (endpoint, default_key) = relay_endpoint();
     let key_label = if endpoint == DEFAULT_GATEWAY_ENDPOINT {
         // `guest` is the trial key for the built-in public proxy.
         "Relay instance key (enter `guest` to try it out)"
@@ -193,6 +193,7 @@ async fn pair(ctx: &CommandContext) -> Result<CommandOutput> {
         device_pairing: Arc::clone(svc),
         secret_vault,
         relay_url: endpoint.clone(),
+        instance_key: instance_key.clone(),
     };
     let mut host = {
         let (relay_url, key, rid) = (
@@ -471,13 +472,11 @@ async fn wait_for_paired(
 
 /// The relay endpoint to embed in the pairing QR (the app joins via
 /// `/pair/join/<code>` on it), plus the default admission key to offer at the
-/// prompt. Prefers the operator's configured `gateway.relay`; else the built-in
-/// public proxy (whose trial key is `guest`).
-fn relay_endpoint(ctx: &CommandContext) -> (String, String) {
-    let relay = &ctx.config.gateway.relay;
-    if relay.enabled && !relay.url.is_empty() {
-        return (relay.url.clone(), relay.instance_key.clone());
-    }
+/// prompt. The relay URL is not operator-configurable yet — always the built-in
+/// public proxy (whose trial key is `guest`); the operator may still override the
+/// key at the prompt. Both the chosen endpoint and key are recorded on the device
+/// row at pairing so the gateway re-uses them for its relay/push connections.
+fn relay_endpoint() -> (String, String) {
     (DEFAULT_GATEWAY_ENDPOINT.to_string(), "guest".to_string())
 }
 

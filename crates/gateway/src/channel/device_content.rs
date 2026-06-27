@@ -315,6 +315,8 @@ mod tests {
             created_at: 0,
             approved_at: Some(0),
             last_seen_at: None,
+            relay_url: "wss://relay.test".into(),
+            instance_key: "inst-test".into(),
         }
     }
 

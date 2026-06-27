@@ -55,6 +55,10 @@ pub struct PairingHostDeps {
     /// value must agree (anti-cross-binding: the relay can't wire the app to a
     /// gateway on a different endpoint).
     pub relay_url: String,
+    /// The relay admission key (`x-instance-key`) the pairing legs present.
+    /// Persisted on the device row at `complete` so the gateway's later relay
+    /// control connection + push reuse the same key without a config block.
+    pub instance_key: String,
 }
 
 /// Per-step receive timeout — a stalled peer must not pin a connection.
@@ -195,7 +199,13 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     //    in-band) + consume the slot (zeroizing the secret it held).
     let row = state
         .device_pairing
-        .complete(&slot, &hello.device_id, app_static.to_vec())
+        .complete(
+            &slot,
+            &hello.device_id,
+            app_static.to_vec(),
+            &state.relay_url,
+            &state.instance_key,
+        )
         .await
         .map_err(|e| format!("complete pairing: {e}"))?;
 
@@ -371,6 +381,7 @@ mod tests {
             device_pairing: Arc::clone(&device_pairing),
             secret_vault: tg.deps.secret_vault.clone(),
             relay_url: String::new(),
+            instance_key: String::new(),
         };
         (deps, device_pairing)
     }

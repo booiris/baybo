@@ -500,6 +500,8 @@ mod tests {
                 created_at: 1,
                 approved_at: Some(2),
                 last_seen_at: None,
+                relay_url: "wss://relay.test".into(),
+                instance_key: "inst-test".into(),
             })
             .await
             .unwrap();
@@ -534,6 +536,8 @@ mod tests {
                 created_at: 1,
                 approved_at: Some(1),
                 last_seen_at: None,
+                relay_url: "wss://relay.test".into(),
+                instance_key: "inst-test".into(),
             })
             .await
             .unwrap();

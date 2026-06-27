@@ -28,7 +28,7 @@ use baybo_job::{JobInputKind, JobLifecycle, JobLifecycleEvent, JobPhase, JobShap
 use baybo_model::{ContentBlock, Role, SessionId};
 use baybo_security::SecretVault;
 use baybo_session::SessionManager;
-use baybo_store::{DeviceStatus, DeviceStore, SessionStore};
+use baybo_store::{DeviceRow, DeviceStatus, DeviceStore, SessionStore};
 use device_proto::aead;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -87,33 +87,31 @@ fn to_wire_env(env: device_proto::pairing::ApnsEnv) -> remote_host_protocol::pus
 /// mock so the whole dispatch path is host-testable.
 #[async_trait::async_trait]
 pub trait NotifySink: Send + Sync {
-    async fn post(&self, body: &NotifyRequest) -> Result<(), String>;
+    async fn post(&self, notify_url: &str, body: &NotifyRequest) -> Result<(), String>;
 }
 
-/// reqwest-backed sink POSTing to `<gateway_url>/notify`.
+/// reqwest-backed sink POSTing to a per-device `<base>/notify`. The base is
+/// derived from the device row's relay URL at dispatch time, so the sink holds
+/// only the (proxy-aware) client.
 pub struct HttpNotifySink {
     client: reqwest::Client,
-    notify_url: String,
 }
 
 impl HttpNotifySink {
     /// `client` should be the workspace's proxy-aware client
     /// ([`baybo_security::http::client`]) — these POST to the remote host (C),
     /// a non-loopback egress target subject to the operator's egress proxy.
-    pub fn new(gateway_url: &str, client: reqwest::Client) -> Self {
-        Self {
-            client,
-            notify_url: remote_host_protocol::push::notify_url(gateway_url),
-        }
+    pub fn new(client: reqwest::Client) -> Self {
+        Self { client }
     }
 }
 
 #[async_trait::async_trait]
 impl NotifySink for HttpNotifySink {
-    async fn post(&self, body: &NotifyRequest) -> Result<(), String> {
+    async fn post(&self, notify_url: &str, body: &NotifyRequest) -> Result<(), String> {
         let resp = self
             .client
-            .post(&self.notify_url)
+            .post(notify_url)
             .json(body)
             .send()
             .await
@@ -133,33 +131,27 @@ impl NotifySink for HttpNotifySink {
 pub trait ApnsRegistrar: Send + Sync {
     async fn register_device(
         &self,
+        register_url: &str,
+        instance_key: &str,
         device_id: &str,
         apns_token: &str,
         env: device_proto::pairing::ApnsEnv,
     ) -> Result<(), String>;
 }
 
-/// reqwest-backed registrar POSTing to `<gateway_url>/register`.
+/// reqwest-backed registrar POSTing to a per-device `<base>/register`. The base +
+/// admission key come from the device row at dispatch time, so it holds only the
+/// (proxy-aware) client.
 pub struct HttpApnsRegistrar {
     client: reqwest::Client,
-    register_url: String,
-    instance_key: String,
 }
 
 impl HttpApnsRegistrar {
     /// `client` should be the workspace's proxy-aware client
     /// ([`baybo_security::http::client`]) — `/register` POSTs to the remote
     /// host (C), a non-loopback egress target subject to the egress proxy.
-    pub fn new(
-        gateway_url: &str,
-        instance_key: impl Into<String>,
-        client: reqwest::Client,
-    ) -> Self {
-        Self {
-            client,
-            register_url: remote_host_protocol::push::register_url(gateway_url),
-            instance_key: instance_key.into(),
-        }
+    pub fn new(client: reqwest::Client) -> Self {
+        Self { client }
     }
 }
 
@@ -167,19 +159,21 @@ impl HttpApnsRegistrar {
 impl ApnsRegistrar for HttpApnsRegistrar {
     async fn register_device(
         &self,
+        register_url: &str,
+        instance_key: &str,
         device_id: &str,
         apns_token: &str,
         env: device_proto::pairing::ApnsEnv,
     ) -> Result<(), String> {
         let body = RegisterRequest {
-            instance_key: self.instance_key.clone(),
+            instance_key: instance_key.to_string(),
             device_id: device_id.to_string(),
             apns_token: apns_token.to_string(),
             env: to_wire_env(env),
         };
         let resp = self
             .client
-            .post(&self.register_url)
+            .post(register_url)
             .json(&body)
             .send()
             .await
@@ -202,7 +196,6 @@ pub struct PushDispatcher {
     /// Re-registers an approved device with C from the material A persisted at
     /// pairing, self-healing a transient pairing-time `/register` failure.
     apns_registrar: Option<Arc<dyn ApnsRegistrar>>,
-    instance_key: String,
     /// device_ids re-registered with C this run (so we retry at most once per
     /// device per dispatcher lifetime).
     registered: Mutex<HashSet<String>>,
@@ -216,7 +209,6 @@ impl PushDispatcher {
         secret_vault: Arc<SecretVault>,
         sink: Arc<dyn NotifySink>,
         apns_registrar: Option<Arc<dyn ApnsRegistrar>>,
-        instance_key: impl Into<String>,
     ) -> Self {
         Self {
             device_store,
@@ -225,7 +217,6 @@ impl PushDispatcher {
             secret_vault,
             sink,
             apns_registrar,
-            instance_key: instance_key.into(),
             registered: Mutex::new(HashSet::new()),
         }
     }
@@ -280,26 +271,44 @@ impl PushDispatcher {
             return;
         }
         let preview = self.build_preview(&ev.session_id, reply_ordinal).await;
-        for d in devices {
-            if let Err(e) = self
-                .dispatch_to_device(&d.device_id, &ev.session_id, &preview)
-                .await
-            {
-                tracing::debug!(error = %e, "push: skipped a device");
+        for d in &devices {
+            match self.dispatch_to_device(d, &ev.session_id, &preview).await {
+                // A 2xx from C's `/notify` — the encrypted preview is on its way to
+                // APNs. Logged so the push path is observable end to end.
+                Ok(()) => {
+                    tracing::debug!(device = %d.device_id, "push: preview posted to remote host")
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, device = %d.device_id, "push: skipped a device")
+                }
             }
         }
     }
 
     async fn dispatch_to_device(
         &self,
-        device_id: &str,
+        device: &DeviceRow,
         session_id: &SessionId,
         preview: &str,
     ) -> Result<(), String> {
-        self.ensure_registered(device_id).await;
-        let key = self.load_push_key(device_id).await?;
-        let body = build_notify_body(&self.instance_key, device_id, session_id, &key, preview)?;
-        self.sink.post(&body).await
+        // Relay and push share the device's recorded endpoint + admission key;
+        // push is plain HTTP, so swap the relay's `wss`/`ws` scheme to `https`/
+        // `http`. An empty relay URL means a row paired before this existed.
+        let base = relay_url_to_http_base(&device.relay_url);
+        if base.is_empty() {
+            return Err("device row has no relay url (re-pair to populate)".into());
+        }
+        self.ensure_registered(device, &base).await;
+        let key = self.load_push_key(&device.device_id).await?;
+        let body = build_notify_body(
+            &device.instance_key,
+            &device.device_id,
+            session_id,
+            &key,
+            preview,
+        )?;
+        let notify_url = remote_host_protocol::push::notify_url(&base);
+        self.sink.post(&notify_url, &body).await
     }
 
     /// Best-effort: re-register an approved device with C from the material A
@@ -307,10 +316,11 @@ impl PushDispatcher {
     /// this a transient `/register` failure at pairing leaves C unaware of the
     /// device, so every `/notify` is rejected as unknown until the user
     /// re-pairs. Cached so it costs at most one `/register` per device per run.
-    async fn ensure_registered(&self, device_id: &str) {
+    async fn ensure_registered(&self, device: &DeviceRow, base_http: &str) {
         let Some(registrar) = &self.apns_registrar else {
             return;
         };
+        let device_id = device.device_id.as_str();
         if self.registered.lock().contains(device_id) {
             return;
         }
@@ -327,8 +337,15 @@ impl PushDispatcher {
         if reg.apns_token.is_empty() {
             return;
         }
+        let register_url = remote_host_protocol::push::register_url(base_http);
         match registrar
-            .register_device(device_id, &reg.apns_token, reg.apns_env)
+            .register_device(
+                &register_url,
+                &device.instance_key,
+                device_id,
+                &reg.apns_token,
+                reg.apns_env,
+            )
             .await
         {
             Ok(()) => {
@@ -423,6 +440,20 @@ fn build_notify_body(
         enc: b64.encode(&ciphertext),
         n: b64.encode(&nonce),
     })
+}
+
+/// Derive the HTTP base for push (`/notify`, `/register`) from a device row's
+/// relay base URL: relay legs dial `wss://`/`ws://`, push POSTs plain HTTP to the
+/// same host. Returns the input unchanged when it isn't a ws(s) URL (already
+/// `http(s)`, or empty — the caller treats empty as "no relay url recorded").
+fn relay_url_to_http_base(relay_url: &str) -> String {
+    if let Some(rest) = relay_url.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = relay_url.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        relay_url.to_string()
+    }
 }
 
 /// Subscribe to the lifecycle bus and dispatch pushes until `shutdown` fires.
@@ -581,8 +612,25 @@ mod tests {
     }
 
     #[test]
-    fn register_url_is_derived_from_gateway_url() {
-        let r = HttpApnsRegistrar::new("https://remote.example/", "inst-A", reqwest::Client::new());
-        assert_eq!(r.register_url, "https://remote.example/register");
+    fn relay_ws_base_maps_to_http_for_push() {
+        // Relay legs dial wss/ws; push POSTs plain HTTP to the same host.
+        assert_eq!(
+            relay_url_to_http_base("wss://proxy.baybo.space"),
+            "https://proxy.baybo.space"
+        );
+        assert_eq!(
+            relay_url_to_http_base("ws://127.0.0.1:8080"),
+            "http://127.0.0.1:8080"
+        );
+        // Already-HTTP or empty is passed through unchanged.
+        assert_eq!(relay_url_to_http_base("https://x"), "https://x");
+        assert_eq!(relay_url_to_http_base(""), "");
+        // …and the protocol builder appends the push path onto the derived base.
+        assert_eq!(
+            remote_host_protocol::push::register_url(&relay_url_to_http_base(
+                "wss://proxy.baybo.space"
+            )),
+            "https://proxy.baybo.space/register"
+        );
     }
 }

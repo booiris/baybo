@@ -174,6 +174,8 @@ impl DevicePairingService {
         slot: &DevicePairingSlot,
         device_id: &str,
         device_pubkey: Vec<u8>,
+        relay_url: &str,
+        instance_key: &str,
     ) -> Result<DeviceRow, DevicePairingError> {
         // Consume the single-use slot up front: a second finalize for the same
         // rendezvous (a retrying leg) gets `SlotConsumed` and is refused, so one
@@ -198,6 +200,11 @@ impl DevicePairingService {
             created_at: now,
             approved_at: Some(now),
             last_seen_at: None,
+            // Recorded so the gateway re-dials the relay (and pushes) to the same
+            // endpoint/key without a config block; both come from the pairing
+            // transport (the QR `h=` + admission key).
+            relay_url: relay_url.to_string(),
+            instance_key: instance_key.to_string(),
         };
         let replaced = self.devices.create_replacing_approved(&row).await?;
         if !replaced.is_empty() {
@@ -277,7 +284,16 @@ mod tests {
         );
 
         // Finalize → an active (approved) row, token live from creation.
-        let row = svc.complete(&slot, "dev-abc", vec![3u8; 32]).await.unwrap();
+        let row = svc
+            .complete(
+                &slot,
+                "dev-abc",
+                vec![3u8; 32],
+                "wss://relay.test",
+                "inst-test",
+            )
+            .await
+            .unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
         assert_eq!(row.approved_at, Some(row.created_at));
         assert_eq!(row.device_pubkey, vec![3u8; 32]);
@@ -305,9 +321,24 @@ mod tests {
         let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
         // The first finalize consumes the slot; the second is refused, so the
         // rendezvous can't mint a second approvable device.
-        svc.complete(&slot, "dev-1", vec![1u8; 32]).await.unwrap();
+        svc.complete(
+            &slot,
+            "dev-1",
+            vec![1u8; 32],
+            "wss://relay.test",
+            "inst-test",
+        )
+        .await
+        .unwrap();
         assert!(matches!(
-            svc.complete(&slot, "dev-2", vec![2u8; 32]).await,
+            svc.complete(
+                &slot,
+                "dev-2",
+                vec![2u8; 32],
+                "wss://relay.test",
+                "inst-test"
+            )
+            .await,
             Err(DevicePairingError::SlotConsumed),
         ));
         let all = svc.list(None).await.unwrap();
@@ -332,7 +363,10 @@ mod tests {
         let svc = service();
         let (rid, _) = svc.mint().await.unwrap();
         let slot = svc.claim_slot(&rid).await.unwrap().unwrap();
-        let row = svc.complete(&slot, "d1", vec![1u8; 32]).await.unwrap();
+        let row = svc
+            .complete(&slot, "d1", vec![1u8; 32], "wss://relay.test", "inst-test")
+            .await
+            .unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
         assert!(svc.revoke("d1").await.unwrap());
         // Revoked devices don't show under the Approved filter.
@@ -350,7 +384,15 @@ mod tests {
         // First device.
         let (r1, _) = svc.mint().await.unwrap();
         let slot1 = svc.claim_slot(&r1).await.unwrap().unwrap();
-        svc.complete(&slot1, "dev-a", vec![1u8; 32]).await.unwrap();
+        svc.complete(
+            &slot1,
+            "dev-a",
+            vec![1u8; 32],
+            "wss://relay.test",
+            "inst-test",
+        )
+        .await
+        .unwrap();
         assert_eq!(
             svc.current_device().await.unwrap().unwrap().device_id,
             "dev-a"
@@ -359,7 +401,15 @@ mod tests {
         // A second pairing supersedes it: one gateway = one app.
         let (r2, _) = svc.mint().await.unwrap();
         let slot2 = svc.claim_slot(&r2).await.unwrap().unwrap();
-        svc.complete(&slot2, "dev-b", vec![2u8; 32]).await.unwrap();
+        svc.complete(
+            &slot2,
+            "dev-b",
+            vec![2u8; 32],
+            "wss://relay.test",
+            "inst-test",
+        )
+        .await
+        .unwrap();
 
         let approved = svc.list(Some(DeviceStatus::Approved)).await.unwrap();
         assert_eq!(approved.len(), 1, "exactly one approved device");

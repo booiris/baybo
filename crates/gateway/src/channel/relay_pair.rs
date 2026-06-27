@@ -130,9 +130,10 @@ pub async fn host_pairing_leg(
     rendezvous_id: &str,
 ) -> Result<(), String> {
     // `baybo device pair` calls this from the CLI process — outside the gateway
-    // server, which installs the provider in GatewayServer::new — and our graph
-    // enables both aws-lc-rs and ring, so install one before the wss dial below or
-    // connect_async panics. Idempotent: Err means one is already installed.
+    // daemon (whose own dialer installs the provider in `relay_content::spawn`) —
+    // and our graph enables both aws-lc-rs and ring, so install one before the wss
+    // dial below or connect_async panics. Idempotent: Err means one is already
+    // installed.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     loop {
         // Keep whether this was a handshake abort (re-park now) or a connect
