@@ -52,15 +52,6 @@ button.danger { background: #ff3b30; }
 
 .status { color: #0a84ff; font-size: 0.9rem; }
 
-/* Debug-only readout of the last scanned QR (secret masked). */
-.scan-debug {
-  margin: 0.5rem 0 0;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.72rem;
-  color: #888;
-  word-break: break-all;
-}
-
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.4rem 1rem; }
 .kv dt { color: #888; }
 .kv dd { margin: 0; word-break: break-all; }

@@ -109,19 +109,6 @@ const DEFAULT_ENDPOINT = "wss://proxy.baybo.space";
 // plugin (it has none).
 const CAMERA_WARMUP_MS = 300;
 
-// True under `tauri ios dev` (Vite dev server) and `tauri ios build --debug`,
-// false in release. Gates the on-screen scan readout below — never shown in a
-// shipped build.
-const DEBUG = import.meta.env.DEV || import.meta.env.TAURI_ENV_DEBUG === "true";
-
-// Reveal only a short prefix + length of a secret, so the debug readout proves
-// what was scanned (and lets you cross-check the prefix against the terminal)
-// without printing the full QR secret on screen.
-function maskSecret(s: string): string {
-  if (s.length <= 4) return s.length ? "•".repeat(s.length) : "—";
-  return `${s.slice(0, 3)}…(${s.length})`;
-}
-
 // Chat persistence. iOS reclaims a backgrounded WKWebView's content process (and
 // can relaunch the app), which reloads the page and wipes React state. So the
 // active chat is mirrored to localStorage (disk-backed — survives a reload and a
@@ -581,8 +568,6 @@ export default function App() {
   // Flips true once the camera has had a beat to warm up: drops the warm-up cover
   // and mounts the reticle, revealing the already-transparent live feed.
   const [cameraUp, setCameraUp] = useState(false);
-  // Debug-only readout of the last scanned QR (sensitive code masked).
-  const [scanInfo, setScanInfo] = useState<string | null>(null);
   const scanCancelled = useRef(false);
   // One app binds one gateway, so re-pairing or unpairing is an explicit,
   // confirmed action. `null` = showing the normal connected actions; otherwise
@@ -639,11 +624,6 @@ export default function App() {
       if (!parsed) {
         setStatus("That QR isn't a Baybo pairing QR. Scan the one shown by `baybo device pair`.");
         return;
-      }
-      if (DEBUG) {
-        setScanInfo(
-          `QR · host=${parsed.endpoint ?? "(default)"} · secret=${maskSecret(parsed.secret)}`,
-        );
       }
       // Success: buzz, pop a green dot at the reticle centre, then briefly hold
       // and cross-fade out (same background, so no abrupt wipe).
@@ -885,7 +865,6 @@ export default function App() {
           </button>
         </div>
         {status && <p className="status">{status}</p>}
-        {DEBUG && scanInfo && <p className="scan-debug">{scanInfo}</p>}
       </main>
     );
   }
@@ -914,7 +893,6 @@ export default function App() {
         </div>
 
         {status && <p className="status">{status}</p>}
-        {DEBUG && scanInfo && <p className="scan-debug">{scanInfo}</p>}
       </main>
 
       {scanPhase === "scanning" && !cameraUp && <div className="scan-warming" />}
