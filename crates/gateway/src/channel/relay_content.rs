@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use baybo_agent::service::ShutdownSignal;
 use baybo_store::DeviceStatus;
+use rand::RngExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
@@ -30,8 +31,22 @@ use remote_host_protocol::relay::INSTANCE_KEY_HEADER;
 
 use crate::relay::{ControlHello, ControlSignal, connect_control, load_or_create_relay_node_id};
 
-/// Backoff between control-connection (re)dials.
+/// Mean backoff between control-connection (re)dials. The actual wait is
+/// jittered around this (see [`reconnect_delay`]).
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Multiplicative jitter applied to [`RECONNECT_BACKOFF`]: the wait is the base
+/// times a factor in this range. A symmetric ±50% (mean unchanged) is enough to
+/// **decorrelate phase** across a fleet — one C fronts many gateways, so without
+/// jitter a C restart drops every gateway's control connection at once and they
+/// all redial in lockstep at `T+5s, T+10s, …`, a synchronized accept/handshake
+/// spike. This is phase spreading only, not a change to the recovery cadence.
+const RECONNECT_JITTER: std::ops::Range<f64> = 0.5..1.5;
+
+/// One jittered control-redial wait (see [`RECONNECT_JITTER`]).
+fn reconnect_delay() -> Duration {
+    RECONNECT_BACKOFF.mul_f64(rand::rng().random_range(RECONNECT_JITTER))
+}
 
 /// Poll cadence for the approved device row — both while idle (waiting for a
 /// pairing) and while a control connection is live (watching for a revoke).
@@ -115,7 +130,7 @@ async fn run(state: WsChannelState, shutdown: ShutdownSignal) {
             break;
         }
         tokio::select! {
-            _ = tokio::time::sleep(RECONNECT_BACKOFF) => {}
+            _ = tokio::time::sleep(reconnect_delay()) => {}
             _ = shutdown.wait() => break,
         }
     }
@@ -263,5 +278,27 @@ mod tests {
             .await
             .expect("manager returns promptly on shutdown")
             .expect("manager task did not panic");
+    }
+
+    /// The jittered redial wait always lands in [0.5×, 1.5×] of the base, so phase
+    /// is spread without ever collapsing to ~0 (a hot redial) or drifting far past
+    /// the intended cadence. Sampled over many draws to exercise the range.
+    #[test]
+    fn reconnect_delay_stays_within_the_jitter_band() {
+        let lo = RECONNECT_BACKOFF.mul_f64(RECONNECT_JITTER.start);
+        let hi = RECONNECT_BACKOFF.mul_f64(RECONNECT_JITTER.end);
+        let mut saw_below_base = false;
+        let mut saw_above_base = false;
+        for _ in 0..1_000 {
+            let d = reconnect_delay();
+            assert!(d >= lo && d < hi, "delay {d:?} outside [{lo:?}, {hi:?})");
+            saw_below_base |= d < RECONNECT_BACKOFF;
+            saw_above_base |= d > RECONNECT_BACKOFF;
+        }
+        // The jitter is two-sided (not just a one-directional shave).
+        assert!(
+            saw_below_base && saw_above_base,
+            "jitter should spread both under and over the base"
+        );
     }
 }
