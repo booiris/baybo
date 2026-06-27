@@ -216,7 +216,7 @@ impl Tool for ReadTool {
         // safe direction. No-op when no tracker is wired (system passes,
         // argv-mode, tests).
         if let (Some(tracker), Some(meta)) = (&ctx.read_tracker, &meta) {
-            tracker.record(&p.file_path, crate::FileFingerprint::from_metadata(meta));
+            tracker.record_read(&p.file_path, crate::FileFingerprint::from_metadata(meta));
         }
 
         Ok(ToolOutput::Text(out))
@@ -437,11 +437,10 @@ mod tests {
             .execute(json!({ "file_path": p }), &ctx)
             .await
             .unwrap();
+        // The read is staged (visible via `get`); a same-response check still
+        // reports NeverRead until a response boundary promotes it.
         let current = crate::FileFingerprint::from_metadata(&std::fs::metadata(&p).unwrap());
-        assert_eq!(
-            tracker.check(&p, current),
-            crate::read_tracker::ReadCheck::Current
-        );
+        assert_eq!(tracker.get(&p), Some(current));
     }
 
     #[tokio::test]

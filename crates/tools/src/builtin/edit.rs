@@ -212,7 +212,7 @@ impl Tool for EditTool {
         // Re-anchor the read baseline to the file we just wrote so a chained
         // Edit on the same file does not demand an intervening re-read.
         if let Some(tracker) = &ctx.read_tracker {
-            tracker.record_from_disk(&p.file_path);
+            tracker.record_write_from_disk(&p.file_path);
         }
 
         let replaced = if p.replace_all { matches } else { 1 };
@@ -559,7 +559,7 @@ mod tests {
         let p = dir.path().join("f.txt");
         tokio::fs::write(&p, "alpha beta gamma").await.unwrap();
         let tracker = crate::ReadTracker::default();
-        tracker.record_from_disk(&p);
+        tracker.record_write_from_disk(&p);
         tool()
             .execute(
                 json!({ "file_path": p, "old_string": "beta", "new_string": "BETA" }),
@@ -579,7 +579,7 @@ mod tests {
         let p = dir.path().join("f.txt");
         tokio::fs::write(&p, "alpha beta gamma").await.unwrap();
         let tracker = crate::ReadTracker::default();
-        tracker.record_from_disk(&p);
+        tracker.record_write_from_disk(&p);
         // External modification of a different length flips the fingerprint
         // regardless of mtime resolution.
         tokio::fs::write(&p, "alpha beta gamma delta epsilon")
@@ -606,7 +606,7 @@ mod tests {
         let p = dir.path().join("f.txt");
         tokio::fs::write(&p, "a b c").await.unwrap();
         let tracker = crate::ReadTracker::default();
-        tracker.record_from_disk(&p);
+        tracker.record_write_from_disk(&p);
         let ctx = ctx_with_tracker(tracker);
         tool()
             .execute(

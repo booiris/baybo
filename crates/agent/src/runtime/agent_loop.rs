@@ -1156,6 +1156,11 @@ impl AgentLoop {
         let notifier_for_calls = notifier.clone();
         let llm_for_calls = Arc::clone(&self.llm_client);
         let registry_for_calls = Arc::clone(&self.tool_registry);
+        // Promote the previous response's staged reads before this batch runs,
+        // so a `Read` and an `Edit`/`Write` of the same file in THIS response
+        // can't authorize each other: the read stays staged until the next
+        // response boundary (by when the model has actually seen its result).
+        self.read_tracker.begin_response();
         let read_tracker_for_calls = self.read_tracker.clone();
         let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
         let exec_futures = response.tool_calls.iter().map(|tc| {

@@ -110,7 +110,7 @@ impl Tool for WriteTool {
         // Anchor the read baseline to the file we just wrote so an Edit that
         // follows this Write does not demand a separate Read.
         if let Some(tracker) = &ctx.read_tracker {
-            tracker.record_from_disk(&p.file_path);
+            tracker.record_write_from_disk(&p.file_path);
         }
 
         Ok(ToolOutput::Text(format!(
@@ -218,7 +218,7 @@ mod tests {
         let p = dir.path().join("exists.txt");
         tokio::fs::write(&p, "old").await.unwrap();
         let tracker = crate::ReadTracker::default();
-        tracker.record_from_disk(&p);
+        tracker.record_write_from_disk(&p);
         tool()
             .execute(
                 json!({ "file_path": p, "content": "new" }),
@@ -235,7 +235,7 @@ mod tests {
         let p = dir.path().join("exists.txt");
         tokio::fs::write(&p, "old").await.unwrap();
         let tracker = crate::ReadTracker::default();
-        tracker.record_from_disk(&p);
+        tracker.record_write_from_disk(&p);
         tokio::fs::write(&p, "changed out from under us")
             .await
             .unwrap();
