@@ -14,8 +14,8 @@ mod push_register;
 use baybo_mobile_core::Frame;
 use content::ContentSessions;
 use pairing::{PairAborted, PairChallenge, PairedSummary, PairingSessions};
-use tauri::State;
 use tauri::ipc::Channel;
+use tauri::{Emitter, State};
 
 /// Scan-to-connect, phase 1: dial the gateway, run the XXpsk0 handshake + send
 /// `DeviceHello`, and return the Bluetooth-style confirmation code the UI shows
@@ -162,7 +162,7 @@ pub fn run() {
     let builder = builder
         .plugin(tauri_plugin_barcode_scanner::init())
         .plugin(tauri_plugin_haptics::init());
-    let result = builder
+    let app = match builder
         .manage(PairingSessions::default())
         .manage(ContentSessions::default())
         .setup(|_app| {
@@ -180,8 +180,25 @@ pub fn run() {
             content_send,
             content_disconnect
         ])
-        .run(tauri::generate_context!());
-    if let Err(e) = result {
-        eprintln!("baybo: fatal error while running the app: {e}");
-    }
+        .build(tauri::generate_context!())
+    {
+        Ok(app) => app,
+        Err(e) => {
+            eprintln!("baybo: fatal error while building the app: {e}");
+            return;
+        }
+    };
+
+    // Bridge the iOS app lifecycle into the webview. iOS suspends the whole app
+    // without ever marking the WKWebView page hidden, so the page's own
+    // `visibilitychange` never fires on resume and the chat view would keep using a
+    // relay leg the OS froze. On every foreground (`Resumed`) emit `app-resumed` so
+    // the webview re-dials its content session and replays the catch-up gap.
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Resumed)
+            && let Err(e) = app_handle.emit("app-resumed", ())
+        {
+            eprintln!("baybo: emit app-resumed failed: {e}");
+        }
+    });
 }

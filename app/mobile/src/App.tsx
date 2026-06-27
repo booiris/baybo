@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 // PairChallenge / PairedSummary are generated from the src-tauri IPC structs by
 // ts-rs (cargo test -p baybo-mobile-app --features ts-export); the bindings are
 // regenerated + drift-checked by scripts/check-ts-bindings.sh.
@@ -217,12 +218,31 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
 
   useEffect(() => {
     connect();
+    // iOS suspends the app without ever marking the WKWebView page hidden, so the
+    // page's own `visibilitychange` never fires on resume — the chat would keep
+    // using a relay leg the OS froze. Reconnect on every foreground signal we can
+    // get: page visibility (covers a reloaded webview and dev/browser), window
+    // `focus`, and — the reliable one on iOS — the native `app-resumed` event the
+    // Rust shell emits from `RunEvent::Resumed`.
     const onVisible = () => {
       if (document.visibilityState === "visible") connect();
     };
     document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", connect);
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listen("app-resumed", () => connect())
+      .then((un) => {
+        // The effect may have already torn down before listen() resolved.
+        if (cancelled) un();
+        else unlisten = un;
+      })
+      .catch(() => {});
     return () => {
+      cancelled = true;
       document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", connect);
+      unlisten?.();
       invoke("content_disconnect").catch(() => {});
     };
   }, [connect]);

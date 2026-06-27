@@ -39,6 +39,16 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const CONTENT_DIAL_RETRIES: usize = 14;
 const CONTENT_DIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// If the content leg goes this long without any inbound WS message, the pump
+/// treats it as dead and exits. The gateway sends an application keepalive every
+/// 20s (`KEEPALIVE_PING_INTERVAL` on its side), so a silent window this long means
+/// the socket is gone — classically a leg iOS froze across a background round-trip,
+/// whose read side never yields again on resume even though the write side still
+/// buffers our sends. Exiting drops `outbound_rx`, so the next `content_send` fails
+/// loudly ("content session closed") and the foreground reconnect re-subscribes
+/// with catch-up instead of writing into a black hole.
+const INBOUND_LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// The single live content session, if any. Replaced (and the prior task
 /// aborted) every time the UI opens a new one.
 #[derive(Default)]
@@ -75,7 +85,18 @@ pub async fn connect(
     if record.relay_node_id.is_empty() {
         return Err("paired gateway has no relay route; re-pair".into());
     }
-    let established = dial_relay(&record.relay_node_id, &record, &local).await?;
+    // Tear the previous session down if this dial fails: leaving the stale handle
+    // in place lets `content_send` keep enqueueing onto a pump whose socket is
+    // already gone (the UI then shows phantom "sent" bubbles and nothing ever
+    // forces a reconnect). On success the old task is still swapped out below,
+    // after the new leg is up, so a healthy reconnect keeps its no-gap handoff.
+    let established = match dial_relay(&record.relay_node_id, &record, &local).await {
+        Ok(established) => established,
+        Err(e) => {
+            disconnect(sessions).await;
+            return Err(e);
+        }
+    };
 
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
     let device_id = record.device_id.clone();
@@ -234,38 +255,50 @@ async fn pump(
         Err(_) => return,
     }
 
+    // Inbound-liveness watchdog: reset on every message the socket yields (the
+    // gateway's periodic keepalive alone keeps it fed). If it ever lapses the leg
+    // is read-dead — see `INBOUND_LIVENESS_TIMEOUT` — so the pump exits and lets
+    // the next foreground reconnect stand a fresh leg up.
+    let liveness = tokio::time::sleep(INBOUND_LIVENESS_TIMEOUT);
+    tokio::pin!(liveness);
+
     'session: loop {
         tokio::select! {
-            inbound = stream.next() => match inbound {
-                Some(Ok(Message::Binary(bytes))) => {
-                    // One Noise message may complete zero, one, or several frames.
-                    let frames = match session.open(&bytes) {
-                        Ok(f) => f,
-                        // A decrypt failure means the Noise stream desynced —
-                        // unrecoverable, so end the session.
-                        Err(_) => break 'session,
-                    };
-                    for frame in frames {
-                        // Answer the gateway's keepalive itself, don't forward it.
-                        if matches!(frame, Frame::Ping) {
-                            if let Ok(messages) = session.seal(&Frame::Pong) {
-                                for b in messages {
-                                    let _ = sink.send(Message::Binary(b)).await;
+            inbound = stream.next() => {
+                liveness
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + INBOUND_LIVENESS_TIMEOUT);
+                match inbound {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        // One Noise message may complete zero, one, or several frames.
+                        let frames = match session.open(&bytes) {
+                            Ok(f) => f,
+                            // A decrypt failure means the Noise stream desynced —
+                            // unrecoverable, so end the session.
+                            Err(_) => break 'session,
+                        };
+                        for frame in frames {
+                            // Answer the gateway's keepalive itself, don't forward it.
+                            if matches!(frame, Frame::Ping) {
+                                if let Ok(messages) = session.seal(&Frame::Pong) {
+                                    for b in messages {
+                                        let _ = sink.send(Message::Binary(b)).await;
+                                    }
                                 }
+                                continue;
                             }
-                            continue;
-                        }
-                        if on_frame.send(frame).is_err() {
-                            // The webview dropped the channel (navigated away).
-                            break 'session;
+                            if on_frame.send(frame).is_err() {
+                                // The webview dropped the channel (navigated away).
+                                break 'session;
+                            }
                         }
                     }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => break 'session,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break 'session,
                 }
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                Some(Ok(Message::Close(_))) | None => break 'session,
-                Some(Ok(_)) => {}
-                Some(Err(_)) => break 'session,
-            },
+            }
             cmd = outbound_rx.recv() => match cmd {
                 Some(OutboundCmd::Send { text, msg_id }) => {
                     let frame = user_text_frame(&session_id, &device_id, &text, &msg_id);
@@ -283,6 +316,11 @@ async fn pump(
                 // Every sender dropped (handle replaced/torn down).
                 None => break 'session,
             },
+            // No inbound traffic for the whole window — not even the gateway's
+            // keepalive — so the leg is dead (e.g. frozen across an iOS background
+            // round-trip). Exit so the handle becomes send-Err and a reconnect
+            // re-subscribes with catch-up.
+            _ = &mut liveness => break 'session,
         }
     }
     let _ = sink.close().await;
