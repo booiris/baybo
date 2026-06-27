@@ -11,9 +11,6 @@ pub enum SetupError {
     #[error("interactive setup requires a TTY on both stdin and stderr")]
     NotATerminal,
 
-    #[error("setup was cancelled by the user")]
-    Cancelled,
-
     #[error("filesystem error at {path}: {reason}")]
     Io { path: PathBuf, reason: String },
 

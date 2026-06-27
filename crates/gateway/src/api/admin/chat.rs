@@ -1861,6 +1861,7 @@ fn reconstruct_transcript(
                     if let ContentBlock::ToolResult {
                         tool_use_id,
                         content,
+                        ..
                     } = block
                         && let Some(&idx) = work.pending_tools.get(tool_use_id)
                         && let Some(step) = work.steps.get_mut(idx)

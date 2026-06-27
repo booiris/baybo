@@ -148,8 +148,7 @@ tmux pane at a forced size and reads back the rendered screen with
 `capture-pane`. tmux interprets escape sequences exactly like a real
 terminal, so the capture is ground truth (a raw PTY would hand the bytes
 back uninterpreted and hide the bugs); this is the same technique that
-caught the setup picker's short-window clamp garble and its resize
-regression.
+caught the TUI's inline-viewport resize ghosting.
 
 The harness API: `TmuxSession::launch(LaunchSpec { program, args, width,
 height, env })`, then `send_keys`/`send_text`, `resize`, `capture`, and
@@ -173,16 +172,11 @@ The probe pattern (used by both suites below):
 - A probe that finishes its work and exits would lose its final frame:
   tmux's `remain-on-exit` keeps the pane but scrolls a row off and
   overlays a "Pane is dead" footer. So probes **block after their work**
-  (the picker probe reads stdin forever; the chat probe runs until
-  Ctrl+C) and the test captures while the program is still alive. The
-  harness kills the pane on `Drop`.
+  (the chat probe runs until Ctrl+C) and the test captures while the
+  program is still alive. The harness kills the pane on `Drop`.
 
 Current real-terminal suites:
 
-- `crates/setup/tests/picker_render.rs` (probe `picker_probe`) — the
-  single/multi-select picker: cursor movement and wrap, Enter/Escape
-  outcomes, short-window windowing + footer without label garble, and
-  resize re-windowing.
 - `crates/tui/tests/chat_render.rs` (probe `chat_smoke`) — the
   inline-viewport chat UI driven against an in-process stub gateway that
   speaks `baybo_channels::wire`. The stub dispatches on the typed message
@@ -220,7 +214,6 @@ cargo test                                              # full workspace
 cargo test -p baybo-security                             # one crate
 cargo test -p baybo-integration-tests --test security_pipeline   # one file
 cargo test -p baybo-integration-tests --test tool_boundary -- --nocapture
-cargo test -p baybo-setup --test picker_render           # real-terminal (needs tmux)
 cargo test -p baybo-tui   --test chat_render             # real-terminal (needs tmux)
 ```
 

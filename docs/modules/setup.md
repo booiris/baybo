@@ -182,6 +182,30 @@ There is no `setup_state.json` or partial-progress file: a Ctrl-C
 mid-wizard leaves `baybo.json` unchanged, and the next run just
 prompts again.
 
+### Prompt style — plain line input
+
+Every prompt is ordinary line input: the question (and, for the
+single/multi pickers, a 1-based numbered menu) is printed to stderr, then
+one line is read from stdin and parsed. There is **no** alternate screen,
+raw-mode arrow-key navigation, or full-screen repaint — the wizard never
+takes the terminal over, so each step stays in normal scrollback exactly
+like answering a shell prompt:
+
+- `select` prints `1) … 2) …` and reads the chosen number; an
+  out-of-range or non-numeric line re-prints just the input line.
+- `multi_select` prints the menu with each row's `[x]`/`[ ]` pre-checked
+  state and reads a comma/space-separated list of numbers. An empty line
+  keeps the pre-checked default; a lone `0` (or `none`) selects nothing.
+- `text` / `confirm` are `label [default]:` / `question [Y/n]:` reads.
+- `password` is the one prompt that briefly toggles termios
+  `ECHO`/`ICANON` to mask the secret with `*` as it's typed.
+
+Because nothing depends on a live terminal's escape-sequence handling,
+the pickers are plain functions over an in-memory reader/writer and are
+covered by ordinary unit tests (`crates/setup/src/tty.rs`) — no tmux
+harness. `Ctrl-C` (SIGINT) or `Ctrl-D` (EOF) at any prompt aborts the
+run before the final `baybo.json` write, per the β2 commit rule.
+
 ### TTY-only / `--json` refusal
 
 `baybo setup --json` errors out with a clear message: an interactive

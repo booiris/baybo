@@ -104,6 +104,9 @@ impl Tool for EditTool {
          false (default), `old_string` must appear exactly once — otherwise \
          the tool fails without touching the file. Provide enough surrounding \
          context in `old_string` to ensure a unique match.\n\n\
+         READ FIRST: you must Read the file before editing it. If it changed \
+         on disk since your last Read, Read it again — the edit is rejected \
+         until your view is current.\n\n\
          PATHS: `file_path` MUST be an absolute filesystem path. Relative \
          paths are rejected."
             .to_string()
@@ -169,6 +172,19 @@ impl Tool for EditTool {
             None
         };
 
+        // Read-before-write contract: the file must have been read in this
+        // session and be unchanged since. `stat` it for the current
+        // fingerprint; a file that fails to stat (missing) skips the check
+        // and is reported by the read below.
+        if let Some(tracker) = &ctx.read_tracker
+            && let Ok(meta) = tokio::fs::metadata(&p.file_path).await
+            && let Some(reason) = tracker
+                .check(&p.file_path, crate::FileFingerprint::from_metadata(&meta))
+                .rejection(&p.file_path, "editing it")
+        {
+            return Err(ToolError::Execution(reason));
+        }
+
         let contents = tokio::fs::read_to_string(&p.file_path)
             .await
             .map_err(|e| ToolError::Execution(format!("read {}: {e}", p.file_path.display())))?;
@@ -192,6 +208,12 @@ impl Tool for EditTool {
         tokio::fs::write(&p.file_path, &updated)
             .await
             .map_err(|e| ToolError::Execution(format!("write {}: {e}", p.file_path.display())))?;
+
+        // Re-anchor the read baseline to the file we just wrote so a chained
+        // Edit on the same file does not demand an intervening re-read.
+        if let Some(tracker) = &ctx.read_tracker {
+            tracker.record_write_from_disk(&p.file_path);
+        }
 
         let replaced = if p.replace_all { matches } else { 1 };
         let mut text = format!(
@@ -328,57 +350,34 @@ mod tests {
     use baybo_model::{ChannelType, User};
     use baybo_workspace::WorkspacePaths;
     use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: baybo_model::JobId::default(),
-            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
                 channel: ChannelType::tui(),
             },
             timeout: Duration::from_secs(5),
-            cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
             workspace_paths: WorkspacePaths::new("/tmp"),
-            sandbox: None,
-            approval: None,
-            notifier: None,
-            events: crate::noop_event_sink(),
-            llm: None,
-            secrets: None,
-            virtual_reads: None,
-            background_jobs: None,
-            background_control: None,
+            ..ToolContext::for_test()
         }
     }
 
     fn ctx_with_paths(paths: WorkspacePaths) -> ToolContext {
         ToolContext {
             session_id: "sess-test".into(),
-            job_id: baybo_model::JobId::default(),
-            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
                 channel: ChannelType::tui(),
             },
             timeout: Duration::from_secs(10),
-            cancellation_token: CancellationToken::new(),
             workspace_root: paths.work_dir(),
             workspace_paths: paths,
-            sandbox: None,
-            approval: None,
-            notifier: None,
-            events: crate::noop_event_sink(),
-            llm: None,
-            secrets: None,
-            virtual_reads: None,
-            background_jobs: None,
-            background_control: None,
+            ..ToolContext::for_test()
         }
     }
 
@@ -522,6 +521,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "y y y");
+    }
+
+    fn ctx_with_tracker(tracker: crate::ReadTracker) -> ToolContext {
+        ToolContext {
+            read_tracker: Some(tracker),
+            ..ctx()
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_edit_without_prior_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.txt");
+        tokio::fs::write(&p, "alpha beta gamma").await.unwrap();
+        let err = tool()
+            .execute(
+                json!({ "file_path": p, "old_string": "beta", "new_string": "BETA" }),
+                &ctx_with_tracker(crate::ReadTracker::default()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref m) if m.contains("has not been read")),
+            "got: {err:?}"
+        );
+        // File untouched on a contract rejection.
+        assert_eq!(
+            tokio::fs::read_to_string(&p).await.unwrap(),
+            "alpha beta gamma"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_edit_after_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.txt");
+        tokio::fs::write(&p, "alpha beta gamma").await.unwrap();
+        let tracker = crate::ReadTracker::default();
+        tracker.record_write_from_disk(&p);
+        tool()
+            .execute(
+                json!({ "file_path": p, "old_string": "beta", "new_string": "BETA" }),
+                &ctx_with_tracker(tracker),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&p).await.unwrap(),
+            "alpha BETA gamma"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_edit_when_file_changed_since_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.txt");
+        tokio::fs::write(&p, "alpha beta gamma").await.unwrap();
+        let tracker = crate::ReadTracker::default();
+        tracker.record_write_from_disk(&p);
+        // External modification of a different length flips the fingerprint
+        // regardless of mtime resolution.
+        tokio::fs::write(&p, "alpha beta gamma delta epsilon")
+            .await
+            .unwrap();
+        let err = tool()
+            .execute(
+                json!({ "file_path": p, "old_string": "beta", "new_string": "BETA" }),
+                &ctx_with_tracker(tracker),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref m) if m.contains("changed on disk")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chained_edits_need_only_one_read() {
+        // A successful Edit re-anchors the baseline, so the second Edit on the
+        // same file succeeds without an intervening Read.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.txt");
+        tokio::fs::write(&p, "a b c").await.unwrap();
+        let tracker = crate::ReadTracker::default();
+        tracker.record_write_from_disk(&p);
+        let ctx = ctx_with_tracker(tracker);
+        tool()
+            .execute(
+                json!({ "file_path": p, "old_string": "a", "new_string": "A" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        tool()
+            .execute(
+                json!({ "file_path": p, "old_string": "b", "new_string": "B" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "A B c");
     }
 
     #[tokio::test]

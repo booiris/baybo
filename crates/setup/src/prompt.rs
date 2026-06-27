@@ -8,10 +8,10 @@ use crate::error::Result;
 /// `baybo_channels::registration::Prompter`'s own `Send` bound.
 pub trait Prompter: Send {
     fn select(&mut self, label: &str, options: &[&str]) -> Result<usize>;
-    /// Multi-select checkbox picker. `initial[i]` seeds option `i`'s
-    /// checked state (missing entries default to unchecked). Returns the
-    /// checked indices in ascending order — empty when the operator
-    /// confirms with nothing checked.
+    /// Multi-select prompt. `initial[i]` seeds option `i`'s checked
+    /// state (missing entries default to unchecked) and is the value kept
+    /// when the operator submits an empty line. Returns the checked
+    /// indices in ascending order — empty when nothing is checked.
     fn multi_select(
         &mut self,
         label: &str,
