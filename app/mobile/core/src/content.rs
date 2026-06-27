@@ -17,7 +17,7 @@
 use baybo_model::{ChannelType, SessionId};
 use device_proto::noise::{FrameReassembler, NOISE_MAX_MESSAGE, StaticKeypair, write_chunked};
 use snow::{HandshakeState, TransportState};
-use wire::{Frame, Message, MessageRole, decode, encode};
+use wire::{Frame, Message, MessageRole, WireAttachment, decode, encode};
 
 use crate::error::MobileError;
 
@@ -98,14 +98,18 @@ pub fn subscribe_frame(session_id: &str, since_ordinal: Option<i64>) -> Frame {
     }
 }
 
-/// An outbound user-text [`Frame::Message`] on `session_id`. `platform_msg_id`
-/// is a client-chosen idempotency key (a fresh UUID per send) so a retry after
-/// a transport blip doesn't double-fire the agent.
-pub fn user_text_frame(
+/// An outbound user [`Frame::Message`] on `session_id` carrying `attachments` —
+/// content-addressed [`WireAttachment`] refs the app has already uploaded over a
+/// blob leg (the bytes never ride this frame). `platform_msg_id` is a
+/// client-chosen idempotency key (a fresh UUID per send) so a retry after a
+/// transport blip doesn't double-fire the agent. `text` may be empty when the
+/// message is attachment-only — the gateway drops the leading empty text block.
+pub fn user_message_frame(
     session_id: &str,
     user_id: &str,
     text: &str,
     platform_msg_id: &str,
+    attachments: Vec<WireAttachment>,
 ) -> Frame {
     Frame::Message(Message {
         content: text.to_owned(),
@@ -113,11 +117,21 @@ pub fn user_text_frame(
         user_id: user_id.to_owned(),
         channel_type: ChannelType::ios(),
         bot_id: String::new(),
-        attachments: Vec::new(),
+        attachments,
         platform_msg_id: platform_msg_id.to_owned(),
         role: MessageRole::User,
         ordinal: None,
     })
+}
+
+/// A text-only [`user_message_frame`] (no attachments).
+pub fn user_text_frame(
+    session_id: &str,
+    user_id: &str,
+    text: &str,
+    platform_msg_id: &str,
+) -> Frame {
+    user_message_frame(session_id, user_id, text, platform_msg_id, Vec::new())
 }
 
 #[cfg(test)]

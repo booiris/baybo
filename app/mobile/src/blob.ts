@@ -7,6 +7,26 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 
+/** A media reference carried on a chat message — mirrors the Rust
+ * `wire::WireAttachment` (snake_case fields, as sent over `content_send` and
+ * received on inbound frames). The bytes never ride the message; only this id
+ * does — fetch them with {@link imageObjectUrl}. */
+export type WireAttachment = {
+  kind: "image" | "audio" | "file";
+  blob_id: string;
+  mime_type: string;
+  size: number;
+  filename?: string;
+};
+
+/** Bucket a mime type into the wire attachment kind — same rule the web chat and
+ * gateway use (the kind selects the agent-side content block). */
+export function attachmentKind(mime: string): WireAttachment["kind"] {
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("audio/")) return "audio";
+  return "file";
+}
+
 /** Cumulative bytes transferred so far (for a progress bar). */
 export type BlobProgress = (bytesSoFar: number) => void;
 
@@ -43,4 +63,27 @@ export async function uploadBlob(
     progress.onmessage = onProgress;
   }
   return invoke<string>("blob_upload", { srcPath, mimeType, onProgress: progress });
+}
+
+/**
+ * Upload raw image `bytes` the webview read from a user-picked `File` (iOS hands
+ * the webview a `File`, not a path), returning the content-addressed `blob_id` to
+ * reference in the next message. The bytes ride the IPC bridge as a raw body
+ * (efficient — not a JSON number array); the mime travels in a header. No progress
+ * channel on this path — picked images upload near-instantly.
+ */
+export async function uploadBytes(bytes: ArrayBuffer, mimeType: string): Promise<string> {
+  return invoke<string>("blob_upload_bytes", bytes, {
+    headers: { "x-baybo-mime": mimeType || "application/octet-stream" },
+  });
+}
+
+/**
+ * Fetch attachment `blobId` over a blob leg (cached on device by content hash, and
+ * digest-verified during download) and return an object URL to use as an `<img>`
+ * src. The caller owns the URL and must `URL.revokeObjectURL` it when done.
+ */
+export async function imageObjectUrl(blobId: string, mimeType: string): Promise<string> {
+  const buf = await invoke<ArrayBuffer>("blob_image", { blobId });
+  return URL.createObjectURL(new Blob([buf], { type: mimeType || "application/octet-stream" }));
 }

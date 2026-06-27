@@ -38,6 +38,15 @@ const BLOB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// One transfer per leg, so a fixed request id is enough.
 const REQUEST_ID: u64 = 1;
 
+/// Subdir of the OS temp dir where fetched-for-display attachments are cached
+/// (keyed by content hash, so re-rendering the same image never re-downloads).
+const BLOB_CACHE_SUBDIR: &str = "baybo-blob-cache";
+
+/// Subdir of the OS temp dir where a webview-picked image is staged before its
+/// blob-leg push (the webview hands us bytes, not a path). Deleted as soon as the
+/// push lands. iOS may purge `tmp/` between sessions — harmless for both uses.
+const BLOB_STAGING_SUBDIR: &str = "baybo-blob-staging";
+
 /// Minimum spacing between progress events sent to the webview. A fast transfer
 /// emits a chunk every few ms (~1700 for a 100 MiB blob); coalescing to one update
 /// per this interval keeps the JS UI thread from thrashing on re-renders. The
@@ -176,7 +185,23 @@ pub async fn download(
     dest_path: String,
     on_progress: Channel<u64>,
 ) -> Result<(), String> {
-    let expected_hex = blob::blob_id_sha256_hex(&blob_id)
+    download_to_path(
+        &blob_id,
+        &dest_path,
+        Some(ProgressThrottle::new(on_progress)),
+    )
+    .await
+}
+
+/// Shared download core: streams `blob_id` to `dest_path` (via a `.part` sibling),
+/// verifying the content digest. `progress` is `None` for internal fetches (e.g.
+/// the display cache) that don't surface a progress bar.
+async fn download_to_path(
+    blob_id: &str,
+    dest_path: &str,
+    mut progress: Option<ProgressThrottle>,
+) -> Result<(), String> {
+    let expected_hex = blob::blob_id_sha256_hex(blob_id)
         .filter(|hex| is_sha256_hex(hex))
         .ok_or_else(|| "invalid blob id".to_string())?
         .to_owned();
@@ -198,7 +223,7 @@ pub async fn download(
         .map_err(|e| format!("open part: {e}"))?;
 
     for m in session
-        .seal(&blob::pull(REQUEST_ID, &blob_id, resume_from))
+        .seal(&blob::pull(REQUEST_ID, blob_id, resume_from))
         .map_err(|e| format!("seal pull: {e}"))?
     {
         ws.send(Message::Binary(m))
@@ -206,8 +231,7 @@ pub async fn download(
             .map_err(|e| format!("send pull: {e}"))?;
     }
 
-    let mut download = BlobDownload::new(REQUEST_ID, &blob_id, resume_from);
-    let mut progress = ProgressThrottle::new(on_progress);
+    let mut download = BlobDownload::new(REQUEST_ID, blob_id, resume_from);
     let mut written = resume_from;
     loop {
         let bytes = recv_binary(&mut ws).await?;
@@ -228,7 +252,9 @@ pub async fn download(
                         .map_err(|e| format!("write part: {e}"))?;
                     hasher.update(&data);
                     written += data.len() as u64;
-                    progress.update(written);
+                    if let Some(p) = progress.as_mut() {
+                        p.update(written);
+                    }
                 }
                 DownloadStep::Done => {
                     let actual_hex = hex::encode(hasher.finalize());
@@ -241,10 +267,12 @@ pub async fn download(
                     // Flush + close the staged file, then atomically publish it.
                     file.flush().await.map_err(|e| format!("flush part: {e}"))?;
                     drop(file);
-                    tokio::fs::rename(&part_path, &dest_path)
+                    tokio::fs::rename(&part_path, dest_path)
                         .await
                         .map_err(|e| format!("rename part -> dest: {e}"))?;
-                    progress.finish(written);
+                    if let Some(p) = progress.as_ref() {
+                        p.finish(written);
+                    }
                     let _ = ws.close(None).await;
                     return Ok(());
                 }
@@ -293,23 +321,44 @@ pub async fn upload(
     mime_type: String,
     on_progress: Channel<u64>,
 ) -> Result<String, String> {
+    upload_from_path(
+        &src_path,
+        &mime_type,
+        None,
+        Some(ProgressThrottle::new(on_progress)),
+    )
+    .await
+}
+
+/// Shared upload core: pushes the file at `src_path` as `mime_type` over a blob
+/// leg and returns the minted `blob_id`. `filename_override` lets a caller declare
+/// the original name when `src_path` is a staging file (defaults to the path's
+/// basename); `progress` is `None` for internal uploads with no progress bar.
+async fn upload_from_path(
+    src_path: &str,
+    mime_type: &str,
+    filename_override: Option<String>,
+    mut progress: Option<ProgressThrottle>,
+) -> Result<String, String> {
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
 
     // Hash + size the file up front: the gateway content-addresses what it receives
     // and rejects a mismatch, so the phone must declare the true digest.
-    let (sha256_hex, size) = hash_file(&src_path).await?;
-    let filename = Path::new(&src_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_owned());
+    let (sha256_hex, size) = hash_file(src_path).await?;
+    let filename = filename_override.or_else(|| {
+        Path::new(src_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_owned())
+    });
 
     let (mut ws, mut session) = dial_blob_leg(&record, &local).await?;
 
     for m in session
         .seal(&blob::push(
             REQUEST_ID,
-            &mime_type,
+            mime_type,
             size,
             &sha256_hex,
             filename,
@@ -340,7 +389,7 @@ pub async fn upload(
     };
 
     // Stream the file from the granted resume offset.
-    let mut src = tokio::fs::File::open(&src_path)
+    let mut src = tokio::fs::File::open(src_path)
         .await
         .map_err(|e| format!("open src: {e}"))?;
     if resume_offset > 0 {
@@ -350,7 +399,6 @@ pub async fn upload(
     }
     let mut offset = resume_offset;
     let mut buf = vec![0u8; MAX_BLOB_CHUNK];
-    let mut progress = ProgressThrottle::new(on_progress);
     loop {
         let n = src
             .read(&mut buf)
@@ -366,12 +414,16 @@ pub async fn upload(
                 .map_err(|e| format!("send chunk: {e}"))?;
         }
         offset += n as u64;
-        progress.update(offset);
+        if let Some(p) = progress.as_mut() {
+            p.update(offset);
+        }
         if last || n == 0 {
             break;
         }
     }
-    progress.finish(offset);
+    if let Some(p) = progress.as_ref() {
+        p.finish(offset);
+    }
 
     // Await the finalized id.
     loop {
@@ -387,6 +439,49 @@ pub async fn upload(
             }
         }
     }
+}
+
+/// Upload raw `bytes` the webview read from a user-picked image (iOS has no path
+/// for a Photos pick, so the bytes cross the IPC bridge). Stages them to a
+/// content-addressed temp file, uploads it over a blob leg, then removes the
+/// staging file. Returns the minted `blob_id` to reference in the next message.
+pub async fn upload_bytes(bytes: Vec<u8>, mime_type: String) -> Result<String, String> {
+    let dir = std::env::temp_dir().join(BLOB_STAGING_SUBDIR);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("create staging dir: {e}"))?;
+    // Name by content hash so two concurrent picks can't collide on one path.
+    let staged = dir.join(hex::encode(Sha256::digest(&bytes)));
+    let staged_str = staged.to_str().ok_or("non-utf8 staging path")?.to_owned();
+    tokio::fs::write(&staged, &bytes)
+        .await
+        .map_err(|e| format!("write staging file: {e}"))?;
+    let result = upload_from_path(&staged_str, &mime_type, None, None).await;
+    let _ = tokio::fs::remove_file(&staged).await;
+    result
+}
+
+/// Fetch attachment `blob_id` for display, returning its (digest-verified) bytes.
+/// Reuses the on-device cache (keyed by the blob's content hash) if present, else
+/// downloads it over a blob leg and caches it. The webview wraps the bytes in an
+/// object URL for an `<img>`.
+pub async fn image_data(blob_id: String) -> Result<Vec<u8>, String> {
+    let content_hex = blob::blob_id_sha256_hex(&blob_id)
+        .filter(|hex| is_sha256_hex(hex))
+        .ok_or_else(|| "invalid blob id".to_string())?
+        .to_owned();
+    let dir = std::env::temp_dir().join(BLOB_CACHE_SUBDIR);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("create cache dir: {e}"))?;
+    let path = dir.join(&content_hex);
+    let path_str = path.to_str().ok_or("non-utf8 cache path")?.to_owned();
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        download_to_path(&blob_id, &path_str, None).await?;
+    }
+    tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("read cached blob: {e}"))
 }
 
 /// SHA-256 hex + byte length of a file, streamed (no full-file buffering).

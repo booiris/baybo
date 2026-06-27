@@ -1,6 +1,6 @@
 # Relay Blob Transfer (Mobile Companion)
 
-**Status:** implemented (branch `feat/mobile-companion`), modulo two follow-ups noted
+**Status:** implemented (branch `feat/mobile-companion`), modulo one follow-up noted
 below. This is the approved design for moving blob bytes (images, files, voice notes) to
 and from the NAT-traversed mobile companion over the relay. It is the product of an
 adversarial design review; §"Adversarial review" lists the holes the review found and the
@@ -16,11 +16,15 @@ mobile client (Rust core `app/mobile/core/src/blob.rs` + Tauri shell
 `app/mobile/src-tauri/src/blob.rs` + TS `app/mobile/src/blob.ts`). **No background blob
 sweeper:** there is deliberately no LRU janitor and no `BlobStore::purge_older_than` —
 device-uploaded blobs are durable, and disk is bounded by the per-device upload quota
-(plus the per-blob 100 MiB cap), not by an age-based delete. **Deferred:** (1) the mobile UI
-UX — wiring the attachment thumbnail render + file-picker into the chat view (the typed
-`downloadBlob`/`uploadBlob` data layer is ready); (2) the global disk ceiling +
+(plus the per-blob 100 MiB cap), not by an age-based delete. **Deferred:** the global disk ceiling +
 reference-tied-lifetime sweep from the adversarial review (the per-device quota is in;
 these need extra `BlobStore` surface).
+
+The mobile chat-view UI is now wired (`app/mobile/src/App.tsx` + `blob.ts`): an
+`accept="image/*"` picker stages picked images and uploads them over a blob leg
+(`blob_upload_bytes`, raw IPC body since iOS hands the webview `File` bytes, not a path),
+the outgoing `Frame::Message` carries the resulting `WireAttachment`s, and inbound/restored
+image attachments render via a download-to-cache + object-URL component (`blob_image`).
 
 The shape in one line: a **dedicated relay leg per blob transfer** (separate TCP + Noise +
 pump from chat), metered against the **same** per-tenant bandwidth budget as chat but as a

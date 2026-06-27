@@ -17,12 +17,15 @@ pub mod error;
 pub mod pairing;
 
 pub use blob::{BlobDownload, BlobRequest, BlobResponse, BlobSession, DownloadStep};
-pub use content::{ContentHandshake, ContentSession, subscribe_frame, user_text_frame};
+pub use content::{
+    ContentHandshake, ContentSession, subscribe_frame, user_message_frame, user_text_frame,
+};
 pub use error::MobileError;
 pub use pairing::{
     PairAborted, PairChallenge, PairedGateway, PairedSummary, PairingClient, PairingRequest,
 };
 
-// Re-export the wire `Frame` so the shell renders threads against the same type
+// Re-export the wire `Frame` (and the attachment types it carries) so the shell
+// renders threads — and builds outbound attachment refs — against the same types
 // the gateway emits.
-pub use wire::Frame;
+pub use wire::{AttachmentKind, Frame, WireAttachment};

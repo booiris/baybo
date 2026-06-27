@@ -12,7 +12,7 @@ mod keychain;
 mod pairing;
 mod push_register;
 
-use baybo_mobile_core::Frame;
+use baybo_mobile_core::{Frame, WireAttachment};
 use content::ContentSessions;
 use pairing::{PairAborted, PairChallenge, PairedSummary, PairingSessions};
 use tauri::ipc::Channel;
@@ -86,14 +86,17 @@ async fn content_connect(
 }
 
 /// Send a user message on the live content session. `msgId` is a fresh per-send
-/// idempotency key so a retry doesn't double-fire the agent.
+/// idempotency key so a retry doesn't double-fire the agent. `attachments` are
+/// content-addressed blobs already uploaded over a blob leg (omitted/empty for a
+/// text-only send).
 #[tauri::command]
 async fn content_send(
     sessions: State<'_, ContentSessions>,
     text: String,
     msg_id: String,
+    attachments: Option<Vec<WireAttachment>>,
 ) -> Result<(), String> {
-    content::send(&sessions, text, msg_id).await
+    content::send(&sessions, text, msg_id, attachments.unwrap_or_default()).await
 }
 
 /// Tear down the live content session (the user left the chat view).
@@ -123,6 +126,37 @@ async fn blob_upload(
     on_progress: Channel<u64>,
 ) -> Result<String, String> {
     blob::upload(src_path, mime_type, on_progress).await
+}
+
+/// Upload a webview-picked image over a dedicated blob leg. The raw bytes ride the
+/// IPC bridge as the request body (efficient — not a JSON number array); the mime
+/// rides an `x-baybo-mime` header. iOS gives the webview a `File` (bytes), not a
+/// path, so this is the entry point an image pick uses. Returns the `blob_id`.
+#[tauri::command]
+async fn blob_upload_bytes(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("blob_upload_bytes expects a raw byte body".into());
+        }
+    };
+    let mime_type = request
+        .headers()
+        .get("x-baybo-mime")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    blob::upload_bytes(bytes, mime_type).await
+}
+
+/// Fetch an attachment `blob_id` for display: download it over a blob leg into a
+/// content-addressed on-device cache (reused on the next render), then return the
+/// verified bytes to the webview as a raw `ArrayBuffer` to wrap in an object URL.
+#[tauri::command]
+async fn blob_image(blob_id: String) -> Result<tauri::ipc::Response, String> {
+    blob::image_data(blob_id)
+        .await
+        .map(tauri::ipc::Response::new)
 }
 
 /// Debug-only: seed a known push key into the shared App Group keychain so the
@@ -203,7 +237,9 @@ pub fn run() {
             content_send,
             content_disconnect,
             blob_download,
-            blob_upload
+            blob_upload,
+            blob_upload_bytes,
+            blob_image
         ])
         .build(tauri::generate_context!())
     {

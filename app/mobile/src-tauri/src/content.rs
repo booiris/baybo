@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use baybo_mobile_core::{
-    ContentHandshake, ContentSession, Frame, subscribe_frame, user_text_frame,
+    ContentHandshake, ContentSession, Frame, WireAttachment, subscribe_frame, user_message_frame,
 };
 use device_proto::noise::StaticKeypair;
 use futures_util::{SinkExt, StreamExt};
@@ -81,8 +81,13 @@ struct ContentHandle {
 }
 
 enum OutboundCmd {
-    /// Send a user message; `msg_id` is the per-message idempotency key.
-    Send { text: String, msg_id: String },
+    /// Send a user message; `msg_id` is the per-message idempotency key and
+    /// `attachments` the content-addressed blobs to reference (empty for text).
+    Send {
+        text: String,
+        msg_id: String,
+        attachments: Vec<WireAttachment>,
+    },
 }
 
 /// An established, handshaken session ready to pump.
@@ -147,13 +152,23 @@ pub async fn connect(
     Ok(())
 }
 
-/// Queue a user message on the live session for the pump task to seal + send.
-pub async fn send(sessions: &ContentSessions, text: String, msg_id: String) -> Result<(), String> {
+/// Queue a user message (with any uploaded `attachments`) on the live session for
+/// the pump task to seal + send.
+pub async fn send(
+    sessions: &ContentSessions,
+    text: String,
+    msg_id: String,
+    attachments: Vec<WireAttachment>,
+) -> Result<(), String> {
     let guard = sessions.handle.lock().await;
     let handle = guard.as_ref().ok_or("no active content session")?;
     handle
         .outbound_tx
-        .send(OutboundCmd::Send { text, msg_id })
+        .send(OutboundCmd::Send {
+            text,
+            msg_id,
+            attachments,
+        })
         .map_err(|_| "content session closed".to_string())
 }
 
@@ -329,8 +344,9 @@ async fn pump(
                 }
             }
             cmd = outbound_rx.recv() => match cmd {
-                Some(OutboundCmd::Send { text, msg_id }) => {
-                    let frame = user_text_frame(&session_id, &device_id, &text, &msg_id);
+                Some(OutboundCmd::Send { text, msg_id, attachments }) => {
+                    let frame =
+                        user_message_frame(&session_id, &device_id, &text, &msg_id, attachments);
                     match session.seal(&frame) {
                         Ok(messages) => {
                             for bytes in messages {
