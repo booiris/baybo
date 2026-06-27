@@ -25,9 +25,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use std::net::SocketAddr;
+
 use axum::Router;
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Extension, Path, Request, State};
+use axum::extract::{ConnectInfo, Extension, Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -41,6 +43,7 @@ use crate::bandwidth::BandwidthRegistry;
 use crate::broker::RelayBroker;
 use crate::conns::ConnectionRegistry;
 use crate::control::{ControlHello, ControlRegistry};
+use crate::ip_limit::IpRateLimiter;
 use crate::ws::pump_ws;
 
 /// Drop a gateway control connection that has gone silent for this long. The
@@ -134,16 +137,26 @@ struct RelayState {
     seq: Arc<AtomicU64>,
     /// Per-rendezvous `/pair/join` throttle (anti-grief; see [`JoinRateLimiter`]).
     join_limiter: Arc<JoinRateLimiter>,
+    /// Per-source-IP upgrade throttle ahead of admission (flood backstop; see
+    /// [`IpRateLimiter`]). Skipped when the server carries no client-address info.
+    ip_limiter: Arc<IpRateLimiter>,
 }
 
 /// Assemble the relay router. `admission` is the shared, hot-reloaded allow-list
 /// of admitted gateway instance keys; `conns` tracks live connections so a
 /// revoke (an admission reload that dropped a key) can kick them; `bandwidth`
 /// throttles each gateway's aggregate content throughput.
+///
+/// `per_ip_limit` mounts the per-source-IP upgrade throttle (see
+/// [`IpRateLimiter`]). Leave it **on** when remote-host terminates TLS itself
+/// (the peer is the real client); turn it **off** behind an L4/L7 TLS terminator,
+/// where every client shares the proxy's address and one bucket would throttle
+/// them all — rate-limit at the proxy there instead.
 pub fn build_router(
     admission: Arc<dyn Admission>,
     conns: Arc<ConnectionRegistry>,
     bandwidth: Arc<BandwidthRegistry>,
+    per_ip_limit: bool,
 ) -> Router {
     let state = RelayState {
         broker: Arc::new(RelayBroker::new()),
@@ -153,11 +166,12 @@ pub fn build_router(
         bandwidth,
         seq: Arc::new(AtomicU64::new(0)),
         join_limiter: Arc::new(JoinRateLimiter::default()),
+        ip_limiter: Arc::new(IpRateLimiter::new()),
     };
     // Every route admits via the shared `x-instance-key` pre-layer — including
     // `/control`, whose key now rides the dial header too (its hello carries only
     // the relay_node_id).
-    Router::new()
+    let router = Router::new()
         .route(PAIR_HOST, get(host_handler))
         .route(PAIR_JOIN, get(join_handler))
         // Content relay (phase 2): the gateway holds a control connection; a
@@ -168,13 +182,50 @@ pub fn build_router(
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admitted,
-        ))
-        .with_state(state)
+        ));
+    // The per-IP limiter is added *after* admission so it wraps it as the
+    // outermost layer (tower runs outer→inner), shedding a flood by source IP
+    // before the admission check and any upgrade work. Off behind a TLS proxy.
+    let router = if per_ip_limit {
+        router.route_layer(middleware::from_fn_with_state(state.clone(), limit_per_ip))
+    } else {
+        router
+    };
+    router.with_state(state)
+}
+
+/// `429 Too Many Requests` for a source IP over its relay-upgrade rate.
+fn too_many_from_ip() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many relay connections from this address",
+    )
+        .into_response()
+}
+
+/// Outermost pre-layer: throttle WS-upgrade attempts per source IP (flood
+/// backstop, ahead of admission). The peer address is read from the
+/// [`ConnectInfo`] the server's make-service inserts; when it is absent (the
+/// server was served without client-address info, e.g. a unit test), the limiter
+/// is skipped so behaviour is unchanged there.
+async fn limit_per_ip(State(state): State<RelayState>, req: Request, next: Next) -> Response {
+    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>()
+        && !state.ip_limiter.check(addr.ip())
+    {
+        return too_many_from_ip();
+    }
+    next.run(req).await
 }
 
 /// `401 Unauthorized` for a missing or unadmitted instance key.
 fn unadmitted() -> Response {
     (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response()
+}
+
+/// `503 Service Unavailable` when the broker's parked-leg ceiling is reached —
+/// a transient global flood backstop, so the dialer can back off and retry.
+fn at_capacity() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "relay at capacity").into_response()
 }
 
 /// The admitted instance key for a request, stashed by [`require_admitted`] so
@@ -233,7 +284,11 @@ async fn host_handler(
     if !state.admitted.is_admitted(&key) {
         return unadmitted();
     }
-    let leg = state.broker.join(&rendezvous_id);
+    // Refuse to park past the broker's global parked-leg ceiling (the `guard`
+    // drops here, freeing the per-instance slot it just took).
+    let Some(leg) = state.broker.join(&rendezvous_id) else {
+        return at_capacity();
+    };
     let broker = Arc::clone(&state.broker);
     capped(ws).on_upgrade(move |socket| async move {
         let _guard = guard;
@@ -377,7 +432,9 @@ async fn content_join_handler(
     let limiter = state
         .bandwidth
         .limiter_for(&instance_key, state.admitted.max_bps(&instance_key));
-    let leg = state.broker.join(&relay_key);
+    let Some(leg) = state.broker.join(&relay_key) else {
+        return at_capacity();
+    };
     let broker = Arc::clone(&state.broker);
     capped(ws).on_upgrade(move |socket| async move {
         pump_ws(socket, leg, Some(limiter)).await;
@@ -416,7 +473,9 @@ async fn content_host_handler(
     let limiter = state
         .bandwidth
         .limiter_for(&key, state.admitted.max_bps(&key));
-    let leg = state.broker.join(&relay_key);
+    let Some(leg) = state.broker.join(&relay_key) else {
+        return at_capacity();
+    };
     let broker = Arc::clone(&state.broker);
     capped(ws).on_upgrade(move |socket| async move {
         let _guard = guard;
@@ -449,11 +508,50 @@ mod tests {
             admission,
             Arc::new(ConnectionRegistry::new()),
             Arc::new(BandwidthRegistry::new()),
+            true,
         );
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
         port
+    }
+
+    /// Serve with the client socket address attached (as production does), so the
+    /// per-IP limiter middleware sees a peer address. The plain [`serve`] omits it
+    /// — that path proves the limiter is skipped (not 500s) without connect info.
+    async fn serve_with_connect_info() -> u16 {
+        let admission = Arc::new(remote_host_admission::InMemoryAdmission::with_keys([
+            "inst-A",
+        ]));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = build_router(
+            admission,
+            Arc::new(ConnectionRegistry::new()),
+            Arc::new(BandwidthRegistry::new()),
+            true,
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        port
+    }
+
+    /// One keyless `/pair/host` upgrade attempt; returns the HTTP status the
+    /// server rejected it with (it never completes the WS handshake).
+    async fn host_attempt_status(port: u16) -> WsStatus {
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let req = format!("ws://127.0.0.1:{port}/pair/host/x")
+            .into_client_request()
+            .unwrap();
+        match client_async(req, stream).await {
+            Err(WsError::Http(resp)) => resp.status(),
+            other => panic!("expected an HTTP rejection, got {other:?}"),
+        }
     }
 
     async fn connect_host(port: u16, code: &str, key: Option<&str>) -> WebSocketStream<TcpStream> {
@@ -571,6 +669,37 @@ mod tests {
             }
         }
         assert!(limiter.allow("rid-1"), "a fresh window admits again");
+    }
+
+    /// A flood of upgrade attempts from one source IP is shed with `429` once the
+    /// per-IP burst is spent — and the limiter runs *ahead* of admission, so even
+    /// keyless attempts (otherwise `401`) are throttled. Served *with* connect
+    /// info so the middleware sees a peer address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flood_from_one_ip_is_throttled_with_429() {
+        let port = serve_with_connect_info().await;
+        // Each keyless attempt draws one token then 401s; once the burst is spent
+        // the limiter (outermost) 429s before admission even runs.
+        let mut saw_401 = false;
+        let mut saw_429 = false;
+        for _ in 0..(crate::ip_limit::IP_BURST as usize + 8) {
+            match host_attempt_status(port).await {
+                WsStatus::UNAUTHORIZED => saw_401 = true,
+                WsStatus::TOO_MANY_REQUESTS => {
+                    saw_429 = true;
+                    break;
+                }
+                other => panic!("unexpected status during flood: {other}"),
+            }
+        }
+        assert!(
+            saw_401,
+            "early attempts pass the limiter and 401 at admission"
+        );
+        assert!(
+            saw_429,
+            "the burst is eventually exhausted and 429'd by source IP"
+        );
     }
 
     /// Symmetric admission: the app's join leg also needs an admitted key — a
@@ -738,7 +867,12 @@ mod tests {
         let conns = Arc::new(ConnectionRegistry::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = build_router(admission, conns.clone(), Arc::new(BandwidthRegistry::new()));
+        let app = build_router(
+            admission,
+            conns.clone(),
+            Arc::new(BandwidthRegistry::new()),
+            true,
+        );
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });

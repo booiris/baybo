@@ -112,6 +112,13 @@ sqlite3 ./data/admission.db \
 
 **Push frequency control.** `POST /notify` is rate-limited per `(instance_key, device_id)` so a buggy or abusive gateway can't hammer APNs or spam a phone. Over the limit it returns `429` (the gateway backs off and retries). The limit is a fixed **60 pushes/min sustained, burst 20** per device; only admitted, registered devices are metered. Hardcoded, not configurable.
 
+**Per-source-IP flood backstop.** Ahead of admission, every relay WS-upgrade attempt is throttled per **source IP** (a token bucket, **10/s sustained, burst 60**), so a single host spraying upgrades across many rendezvous/node ids — or failing admission on each — is shed with `429` before any upgrade work. It also bounds the broker's pending map with a hard ceiling (`MAX_PENDING_LEGS`, **1024**): a new parked leg past the cap is refused `503` while matching an already-parked leg is exempt. The per-IP limiter keys on the **socket** peer, so it defaults **on** when remote-host terminates TLS itself (the peer is the real client). Behind an L4/L7 TLS terminator the peer is the proxy and one bucket would throttle every client — disable it there and rate-limit at the proxy:
+
+```bash
+# In the remote-host environment (compose `.env` / unit):
+RELAY_PER_IP_LIMIT=0
+```
+
 ## Gateway wiring (pair against this host)
 
 The gateway holds **no** `.p8`, and there is **no `relay`/`push` block in `baybo.json`** — relay control + push are driven by the approved device row. Point them at this host by pairing with `--relay-url` (a one-time per-device choice, recorded on the row):

@@ -35,6 +35,16 @@ const LEG_CHANNEL_CAP: usize = 256;
 /// rendezvous latency (both legs arrive within seconds).
 const PENDING_TTL: Duration = Duration::from_secs(120);
 
+/// Hard ceiling on simultaneously-parked legs across **all** keys — a global
+/// backstop the TTL sweep can't provide (the sweep only bounds *age*, not
+/// *count*, so a fast enough spray of distinct keys could still spike memory
+/// between sweeps). Once the map is at the cap a new park is refused (the caller
+/// returns `503`), while matching an already-parked leg always succeeds (it
+/// shrinks the map). Generous: a healthy relay parks a handful per gateway and
+/// both legs of every rendezvous arrive within seconds, so the steady state is
+/// far below this — only a flood approaches it.
+const MAX_PENDING_LEGS: usize = 1024;
+
 /// One end of a matched relay pair. Frames written to [`to_peer`](Self::to_peer)
 /// surface at the partner leg's [`from_peer`](Self::from_peer), blind.
 pub struct RelayLeg {
@@ -55,9 +65,19 @@ struct PendingHalf {
 }
 
 /// Matches two legs by key and pipes opaque bytes between them, blind.
-#[derive(Default)]
 pub struct RelayBroker {
     pending: Mutex<HashMap<String, PendingHalf>>,
+    /// Hard ceiling on simultaneously-parked legs (see [`MAX_PENDING_LEGS`]).
+    max_pending: usize,
+}
+
+impl Default for RelayBroker {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            max_pending: MAX_PENDING_LEGS,
+        }
+    }
 }
 
 impl RelayBroker {
@@ -65,23 +85,44 @@ impl RelayBroker {
         Self::default()
     }
 
+    /// Override the parked-leg ceiling (tests; an operator-tunable cap could ride
+    /// this later). Clamped to ≥ 1 so the broker can always park at least one leg.
+    pub fn with_max_pending(mut self, max: usize) -> Self {
+        self.max_pending = max.max(1);
+        self
+    }
+
     /// Join the relay under `key`. The first caller gets a leg and parks; the
     /// second caller with the same key is matched, and frames then flow blind
     /// between the two. A re-join while a leg is still pending replaces the
     /// parked half (last-writer-wins on a stale leg).
-    pub fn join(&self, key: &str) -> RelayLeg {
+    ///
+    /// Returns `None` only when a *new* park would exceed [`MAX_PENDING_LEGS`]
+    /// (after a sweep) — the global flood backstop. Matching an already-parked
+    /// leg never hits the cap (it removes an entry), so an in-progress rendezvous
+    /// always completes.
+    pub fn join(&self, key: &str) -> Option<RelayLeg> {
         let mut pending = self.pending.lock();
         if let Some(half) = pending.remove(key) {
             // Second leg: write toward the first, read what the first writes.
-            RelayLeg {
+            Some(RelayLeg {
                 to_peer: half.to_first,
                 from_peer: half.from_first,
-            }
+            })
         } else {
             // About to park a new half: first reap any whose partner never
             // arrived, so a dropped upgrade or a no-show gateway can't grow the
             // map without bound. (Matching above is never swept — only parking.)
             Self::sweep_pending(&mut pending, PENDING_TTL);
+            // Even after the sweep, refuse to park past the hard ceiling — the
+            // sweep bounds age, this bounds count against a fast distinct-key spray.
+            if pending.len() >= self.max_pending {
+                tracing::warn!(
+                    cap = self.max_pending,
+                    "relay: parked-leg ceiling reached; refusing new park"
+                );
+                return None;
+            }
             let (first_to_second_tx, first_to_second_rx) = mpsc::channel(LEG_CHANNEL_CAP);
             let (second_to_first_tx, second_to_first_rx) = mpsc::channel(LEG_CHANNEL_CAP);
             pending.insert(
@@ -92,10 +133,10 @@ impl RelayBroker {
                     parked_at: Instant::now(),
                 },
             );
-            RelayLeg {
+            Some(RelayLeg {
                 to_peer: first_to_second_tx,
                 from_peer: second_to_first_rx,
-            }
+            })
         }
     }
 
@@ -149,9 +190,9 @@ mod tests {
     #[tokio::test]
     async fn matched_legs_pipe_blind_both_ways() {
         let broker = RelayBroker::new();
-        let mut app = broker.join("node-1");
+        let mut app = broker.join("node-1").expect("first leg parks");
         assert_eq!(broker.pending_len(), 1, "first leg parks");
-        let mut gw = broker.join("node-1");
+        let mut gw = broker.join("node-1").expect("second leg matches");
         assert_eq!(broker.pending_len(), 0, "second leg matched");
 
         app.to_peer.send(b"app->gw".to_vec()).await.unwrap();
@@ -164,16 +205,37 @@ mod tests {
     #[tokio::test]
     async fn distinct_keys_do_not_match() {
         let broker = RelayBroker::new();
-        let _a = broker.join("k1");
-        let _b = broker.join("k2");
+        let _a = broker.join("k1").expect("k1 parks");
+        let _b = broker.join("k2").expect("k2 parks");
+        assert_eq!(broker.pending_len(), 2);
+    }
+
+    #[test]
+    fn park_is_refused_at_the_ceiling_but_matching_still_succeeds() {
+        let broker = RelayBroker::new().with_max_pending(2);
+        let _a = broker.join("k1").expect("1st park under the cap");
+        let _b = broker.join("k2").expect("2nd park under the cap");
+        // A third *distinct* key would park a new leg → refused at the ceiling.
+        assert!(
+            broker.join("k3").is_none(),
+            "parking past the ceiling is refused"
+        );
+        assert_eq!(broker.pending_len(), 2, "the refused park added nothing");
+        // Matching an already-parked key shrinks the map, so it is never capped.
+        let _match = broker
+            .join("k1")
+            .expect("matching an existing key is exempt");
+        assert_eq!(broker.pending_len(), 1, "k1 matched and unparked");
+        // The freed slot lets a new key park again.
+        let _c = broker.join("k3").expect("a freed slot admits a new park");
         assert_eq!(broker.pending_len(), 2);
     }
 
     #[test]
     fn sweep_reaps_only_stale_pending_legs() {
         let broker = RelayBroker::new();
-        let _a = broker.join("k1");
-        let _b = broker.join("k2");
+        let _a = broker.join("k1").expect("k1 parks");
+        let _b = broker.join("k2").expect("k2 parks");
         assert_eq!(broker.pending_len(), 2);
         // Nothing is older than a long TTL — both survive.
         assert_eq!(broker.sweep(Duration::from_secs(3600)), 0);
@@ -188,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_drops_pending_leg() {
         let broker = RelayBroker::new();
-        let _a = broker.join("k");
+        let _a = broker.join("k").expect("k parks");
         assert!(broker.cancel("k"));
         assert_eq!(broker.pending_len(), 0);
         assert!(!broker.cancel("k"), "cancel of an unknown key is a no-op");
@@ -197,8 +259,8 @@ mod tests {
     #[tokio::test]
     async fn peer_drop_closes_the_pipe() {
         let broker = RelayBroker::new();
-        let app = broker.join("k");
-        let mut gw = broker.join("k");
+        let app = broker.join("k").expect("first leg parks");
+        let mut gw = broker.join("k").expect("second leg matches");
         drop(app); // app disconnects
         // The peer's stream ends cleanly rather than hanging.
         assert!(gw.from_peer.recv().await.is_none());
@@ -212,7 +274,7 @@ mod tests {
         assert_eq!(broker.pending_len(), 0, "try_match never parks a leg");
 
         // The admitted gateway hosts the code (parks); the app then matches.
-        let mut host = broker.join("code-1");
+        let mut host = broker.join("code-1").expect("host parks");
         assert_eq!(broker.pending_len(), 1);
         let mut app = broker.try_match("code-1").expect("host was waiting");
         assert_eq!(broker.pending_len(), 0);

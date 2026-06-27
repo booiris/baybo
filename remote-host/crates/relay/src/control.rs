@@ -155,7 +155,7 @@ mod tests {
 
         // A phone arrives at the relay for node-1: it joins the broker and C
         // signals A to open the matching data leg.
-        let phone = broker.join("leg-xyz");
+        let phone = broker.join("leg-xyz").expect("phone leg parks");
         assert_eq!(
             reg.signal_open("node-1", "leg-xyz").await,
             Some("inst-A".to_string())
@@ -163,7 +163,7 @@ mod tests {
 
         // A acts on the signal: opens a data leg under the same key.
         let ControlSignal::OpenDataLeg { relay_key } = a_control.recv().await.unwrap();
-        let mut gateway = broker.join(&relay_key);
+        let mut gateway = broker.join(&relay_key).expect("gateway leg matches");
 
         // The two legs are matched; opaque frames flow blind.
         phone.to_peer.send(b"noise-frame".to_vec()).await.unwrap();

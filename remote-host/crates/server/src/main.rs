@@ -89,11 +89,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         roles.push("push");
     }
 
-    // Relay is always on.
+    // Relay is always on. The per-source-IP upgrade throttle defaults on (the
+    // primary path terminates TLS here, so the peer is the real client); set
+    // `RELAY_PER_IP_LIMIT=0` behind a TLS terminator, where the peer is the proxy
+    // and one shared bucket would throttle every client.
+    let per_ip_limit = std::env::var("RELAY_PER_IP_LIMIT")
+        .ok()
+        .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true);
     app = app.merge(relay_router(
         admission.clone(),
         conns.clone(),
         bandwidth.clone(),
+        per_ip_limit,
     ));
     roles.push("relay");
 

@@ -94,7 +94,7 @@ mod tests {
         Path(key): Path<String>,
         State(broker): State<Arc<RelayBroker>>,
     ) -> impl IntoResponse {
-        let leg = broker.join(&key);
+        let leg = broker.join(&key).expect("test leg parks under the cap");
         ws.on_upgrade(move |socket| pump_ws(socket, leg, None))
     }
 

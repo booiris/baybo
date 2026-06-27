@@ -17,6 +17,7 @@ pub mod broker;
 pub mod conns;
 pub mod control;
 pub mod error;
+pub mod ip_limit;
 pub mod serve;
 pub mod ws;
 

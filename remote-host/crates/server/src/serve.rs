@@ -59,6 +59,9 @@ pub(crate) async fn serve(
                 addr: bind_addr.to_owned(),
                 reason: e.to_string(),
             })?;
+    // Serve with the client socket address attached (`ConnectInfo<SocketAddr>`)
+    // so the relay's per-IP flood limiter can read the peer address. Behind a TLS
+    // terminator this is the proxy's address — see the limiter's deployment note.
     match tls {
         Some(paths) => {
             // rustls 0.23 needs a process-wide crypto provider. Install the
@@ -70,12 +73,16 @@ pub(crate) async fn serve(
                     .await
                     .map_err(|e| ServeError::Tls(e.to_string()))?;
             axum_server::bind_rustls(addr, config)
-                .serve(router.into_make_service())
+                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                 .await?;
         }
         None => {
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, router).await?;
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
         }
     }
     Ok(())
