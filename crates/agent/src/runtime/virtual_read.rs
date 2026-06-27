@@ -152,6 +152,7 @@ fn render_transcript(messages: &[ChatMessage]) -> String {
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,
+                    ..
                 } => {
                     out.push_str(&format!("← tool_result ({tool_use_id})\n"));
                     out.push_str(content);
@@ -236,6 +237,7 @@ mod tests {
             ChatMessage::agent_context(vec![ContentBlock::ToolResult {
                 tool_use_id: "t1".into(),
                 content: "body line A\nbody line B".into(),
+                meta: None,
             }]),
         ];
         let out = render_transcript(&messages);

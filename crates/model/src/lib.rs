@@ -3,6 +3,7 @@ mod control_event;
 mod cost;
 mod cron;
 mod external_agent;
+mod fingerprint;
 mod folder;
 mod governance;
 mod ids;
@@ -23,13 +24,14 @@ pub use cron::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus
 pub use external_agent::{
     BAYBO_BACKEND_TAG, ExternalAgentKind, SubagentBackend, SubagentBackendKind, SubagentBackendTag,
 };
+pub use fingerprint::FileFingerprint;
 pub use folder::{FolderId, FolderSummary, MAX_FOLDER_NAME_LEN};
 pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLevel};
 pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId, TaskId};
 pub use llm_entry_name::LlmEntryName;
 pub use message::{
     BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role,
-    TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX, ThinkingContent,
+    TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX, ThinkingContent, ToolResultMeta,
 };
 pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};

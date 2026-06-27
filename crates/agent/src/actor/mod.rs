@@ -1183,6 +1183,7 @@ mod tests {
         assert!(!is_compact_command(&[ContentBlock::ToolResult {
             tool_use_id: "x".into(),
             content: "/compact".into(),
+            meta: None,
         }]));
     }
 
