@@ -67,6 +67,7 @@ struct Established {
 pub async fn connect(
     sessions: &ContentSessions,
     session_id: String,
+    since_ordinal: Option<i64>,
     on_frame: Channel<Frame>,
 ) -> Result<(), String> {
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
@@ -83,6 +84,7 @@ pub async fn connect(
         established.session,
         session_id,
         device_id,
+        since_ordinal,
         on_frame,
         outbound_rx,
     ));
@@ -212,14 +214,16 @@ async fn pump(
     mut session: ContentSession,
     session_id: String,
     device_id: String,
+    since_ordinal: Option<i64>,
     on_frame: Channel<Frame>,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
 ) {
     let (mut sink, mut stream) = ws.split();
 
-    // Self-pull: subscribe to the session so the gateway replays the thread and
-    // streams live agent output.
-    match session.seal(&subscribe_frame(&session_id, None)) {
+    // Self-pull: subscribe to the session so the gateway streams live agent output
+    // and replays any thread rows above `since_ordinal` (the catch-up gap on a
+    // reconnect after the app was backgrounded; `None` = no catch-up).
+    match session.seal(&subscribe_frame(&session_id, since_ordinal)) {
         Ok(messages) => {
             for bytes in messages {
                 if sink.send(Message::Binary(bytes)).await.is_err() {

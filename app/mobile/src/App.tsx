@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 // PairChallenge / PairedSummary are generated from the src-tauri IPC structs by
 // ts-rs (cargo test -p baybo-mobile-app --features ts-export); the bindings are
@@ -40,7 +40,15 @@ function parseScan(text: string): {
 /// MessagePack field names round-trip as snake_case JSON; we only model the few
 /// variants the chat view renders and tolerate the rest.
 type WireFrame =
-  | { kind: "message"; content: string; role?: "user" | "assistant"; platform_msg_id?: string }
+  | {
+      kind: "message";
+      content: string;
+      role?: "user" | "assistant";
+      platform_msg_id?: string;
+      // The reply's persisted row ordinal — the catch-up cursor on reconnect.
+      // Present on durable rows (live final messages + replayed history).
+      ordinal?: number;
+    }
   | { kind: "answer_delta"; text: string }
   | { kind: "turn_state"; active: boolean }
   | { kind: "notice"; level: string; text: string }
@@ -77,31 +85,99 @@ function maskSecret(s: string): string {
   return `${s.slice(0, 3)}…(${s.length})`;
 }
 
-/// The post-pairing chat: opens a Noise content session for a fresh session id,
-/// renders the agent's streamed reply, and sends user messages.
-function ChatView({ onClose }: { onClose: () => void }) {
-  const [sessionId] = useState(() => crypto.randomUUID());
-  const [messages, setMessages] = useState<ChatMsg[]>([]);
+// Chat persistence. iOS reclaims a backgrounded WKWebView's content process (and
+// can relaunch the app), which reloads the page and wipes React state. So the
+// active chat is mirrored to localStorage (disk-backed — survives a reload and a
+// cold start); on remount we restore it instantly, then reconnect and replay only
+// the gap above `lastOrdinal`, so a background round-trip lands back in the live
+// chat instead of the landing screen.
+const CHAT_ACTIVE_KEY = "baybo.chat.active";
+const CHAT_SESSION_KEY = "baybo.chat.session";
+const CHAT_STATE_KEY = "baybo.chat.state";
+
+type ChatState = { sessionId: string; messages: ChatMsg[]; lastOrdinal: number };
+
+function loadChatState(sessionId: string): ChatState | null {
+  try {
+    const raw = localStorage.getItem(CHAT_STATE_KEY);
+    if (!raw) return null;
+    const s = JSON.parse(raw) as ChatState;
+    // Ignore a thread persisted under a different session id (stale).
+    if (s.sessionId !== sessionId || !Array.isArray(s.messages)) return null;
+    return s;
+  } catch {
+    return null;
+  }
+}
+
+function saveChatState(s: ChatState) {
+  try {
+    localStorage.setItem(CHAT_STATE_KEY, JSON.stringify(s));
+  } catch {
+    /* quota exceeded / storage disabled — persistence is best-effort */
+  }
+}
+
+function clearChatState() {
+  try {
+    localStorage.removeItem(CHAT_ACTIVE_KEY);
+    localStorage.removeItem(CHAT_SESSION_KEY);
+    localStorage.removeItem(CHAT_STATE_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+/// The post-pairing chat: opens a Noise content session for `sessionId`, renders
+/// the agent's streamed reply, and sends user messages. Survives a background
+/// round-trip: the thread is persisted, and the session reconnects + replays the
+/// gap whenever the app returns to the foreground.
+function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => void }) {
+  // Parsed once on mount (lazy initializer), then reused for the initial state.
+  const [restored] = useState(() => loadChatState(sessionId));
+  const [messages, setMessages] = useState<ChatMsg[]>(restored?.messages ?? []);
   const [streaming, setStreaming] = useState("");
   const [turnActive, setTurnActive] = useState(false);
   const [input, setInput] = useState("");
   const [status, setStatus] = useState<string | null>("Connecting…");
-  // Idempotency keys we've optimistically rendered, so the server's echo of our
-  // own message doesn't render it a second time.
-  const sentIds = useRef<Set<string>>(new Set());
+  // platform_msg_ids already rendered (our optimistic sends + anything restored),
+  // so the server's echo or a catch-up replay doesn't render them twice.
+  const sentIds = useRef<Set<string>>(
+    new Set((restored?.messages ?? []).filter((m) => m.role === "user").map((m) => m.id)),
+  );
+  // Highest durable ordinal rendered — the cursor a reconnect catches up from.
+  const lastOrdinal = useRef<number>(restored?.lastOrdinal ?? 0);
 
+  // Mirror the thread to disk on every change so a reload/relaunch restores it.
   useEffect(() => {
+    saveChatState({ sessionId, messages, lastOrdinal: lastOrdinal.current });
+  }, [sessionId, messages]);
+
+  // (Re)open the content session, replaying only the gap above what we've already
+  // rendered. Re-run on every foreground: iOS suspends the WS (and may reclaim the
+  // webview) in the background, so a resume needs a fresh connection to go live
+  // again. Catch-up keys on the ordinal, so reconnecting when nothing changed
+  // appends nothing — a cheap no-op.
+  const connect = useCallback(() => {
     const channel = new Channel<WireFrame>();
     channel.onmessage = (frame) => {
       switch (frame.kind) {
         case "message": {
+          // Advance the cursor first — even for our own echo we dedup below — so a
+          // later reconnect doesn't re-replay this row.
+          if (typeof frame.ordinal === "number" && frame.ordinal > lastOrdinal.current) {
+            lastOrdinal.current = frame.ordinal;
+          }
           const role = frame.role === "user" ? "user" : "assistant";
           if (
             role === "user" &&
             frame.platform_msg_id &&
             sentIds.current.has(frame.platform_msg_id)
           ) {
-            return; // our own message, already shown optimistically
+            return; // our own message / already rendered
+          }
+          if (role === "user" && frame.platform_msg_id) {
+            sentIds.current.add(frame.platform_msg_id);
           }
           setStreaming("");
           setMessages((m) => [
@@ -129,13 +205,27 @@ function ChatView({ onClose }: { onClose: () => void }) {
           break; // reasoning / tool progress / etc. not surfaced in phase 1
       }
     };
-    invoke("content_connect", { sessionId, onFrame: channel })
+    setStatus("Connecting…");
+    invoke("content_connect", {
+      sessionId,
+      sinceOrdinal: lastOrdinal.current > 0 ? lastOrdinal.current : null,
+      onFrame: channel,
+    })
       .then(() => setStatus(null))
       .catch((e) => setStatus(`Connect failed: ${e}`));
+  }, [sessionId]);
+
+  useEffect(() => {
+    connect();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") connect();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
+      document.removeEventListener("visibilitychange", onVisible);
       invoke("content_disconnect").catch(() => {});
     };
-  }, [sessionId]);
+  }, [connect]);
 
   async function send() {
     const text = input.trim();
@@ -191,8 +281,11 @@ export default function App() {
   const [paired, setPaired] = useState<PairedSummary | null>(null);
   // On launch, a persisted pairing means we can skip straight to "connected".
   const [rememberedDevice, setRememberedDevice] = useState<string | null>(null);
-  // Whether the chat view is open (a live content session).
-  const [chatting, setChatting] = useState(false);
+  // Whether the chat view is open, and the active session id. Both are restored
+  // from localStorage so a backgrounded webview reload / app relaunch drops the
+  // user straight back into the live chat rather than the landing screen.
+  const [chatting, setChatting] = useState(() => localStorage.getItem(CHAT_ACTIVE_KEY) === "1");
+  const [sessionId, setSessionId] = useState(() => localStorage.getItem(CHAT_SESSION_KEY) ?? "");
   // QR scan flow. "scanning" makes the page transparent so the native camera
   // (drawn behind the webview) shows through; "success" plays a brief
   // confirmation beat on the app background, covering the camera teardown so the
@@ -382,7 +475,30 @@ export default function App() {
       setPendingAction(null);
       setPaired(null);
       setRememberedDevice(null);
+      // No gateway → no chat: drop any persisted session so it can't resurrect.
+      clearChatState();
+      setSessionId("");
+      setChatting(false);
     }
+  }
+
+  // Open a fresh chat: a new session id, persisted with the active flag (and the
+  // previous thread dropped), so a mid-chat reload restores *this* conversation.
+  function openChat() {
+    const id = crypto.randomUUID();
+    clearChatState();
+    localStorage.setItem(CHAT_SESSION_KEY, id);
+    localStorage.setItem(CHAT_ACTIVE_KEY, "1");
+    setSessionId(id);
+    setChatting(true);
+  }
+
+  // Leave the chat (explicit Back): forget the persisted session so the next open
+  // starts clean and a later reload won't resurrect a chat the user closed.
+  function closeChat() {
+    clearChatState();
+    setSessionId("");
+    setChatting(false);
   }
 
   // Re-pair: go to the scan screen to bind a different gateway. The current
@@ -435,7 +551,7 @@ export default function App() {
     }
     return (
       <div className="row">
-        <button onClick={() => setChatting(true)}>Open chat</button>
+        <button onClick={openChat}>Open chat</button>
         <button onClick={() => setPendingAction("replace")}>Replace pairing</button>
         <button className="danger" onClick={() => setPendingAction("forget")}>
           Forget
@@ -444,8 +560,8 @@ export default function App() {
     );
   }
 
-  if (chatting) {
-    return <ChatView onClose={() => setChatting(false)} />;
+  if (chatting && sessionId) {
+    return <ChatView sessionId={sessionId} onClose={closeChat} />;
   }
 
   if (paired) {

@@ -70,14 +70,18 @@ fn forget_pairing() -> Result<(), String> {
 
 /// Open the E2E content session for `sessionId`: connect to the paired gateway,
 /// run the Noise handshake, subscribe, and stream decrypted frames to the
-/// webview over `onFrame`.
+/// webview over `onFrame`. `sinceOrdinal` is the highest ordinal the webview has
+/// already rendered — the gateway replays only the gap above it (so a reconnect
+/// after a background/reload catches up without re-sending the whole thread);
+/// `null` is a fresh subscribe with no catch-up.
 #[tauri::command]
 async fn content_connect(
     sessions: State<'_, ContentSessions>,
     session_id: String,
+    since_ordinal: Option<i64>,
     on_frame: Channel<Frame>,
 ) -> Result<(), String> {
-    content::connect(&sessions, session_id, on_frame).await
+    content::connect(&sessions, session_id, since_ordinal, on_frame).await
 }
 
 /// Send a user message on the live content session. `msgId` is a fresh per-send
