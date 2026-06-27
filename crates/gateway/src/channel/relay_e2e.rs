@@ -32,7 +32,7 @@ use device_proto::pairing::{ApnsEnv, DeviceConfirm, DeviceHello, GatewayWelcome,
 use device_proto::psk_pair::{PskHandshake, build_prologue};
 use futures::{SinkExt, StreamExt};
 use remote_host_admission::InMemoryAdmission;
-use remote_host_protocol::relay::INSTANCE_KEY_HEADER;
+use remote_host_protocol::relay::REMOTE_API_KEY_HEADER;
 use remote_host_relay::serve::{IpLimitConfig, build_router};
 use remote_host_relay::{BandwidthRegistry, ConnectionRegistry};
 use snow::TransportState;
@@ -50,14 +50,14 @@ use crate::test_support::build_test_deps;
 /// A `tokio-tungstenite` client leg into the relay (plaintext `ws://` in-test).
 type ClientWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-const INSTANCE_KEY: &str = "inst-A";
+const REMOTE_API_KEY: &str = "inst-A";
 const NODE_ID: &str = "node-1";
 
 /// Boot a real remote-host relay (C) on an ephemeral loopback port, admitting one
 /// instance key. The per-IP limiter is off — irrelevant to the splice and it
 /// would only see loopback. Returns the bound port.
 async fn boot_relay() -> u16 {
-    let admission = Arc::new(InMemoryAdmission::with_keys([INSTANCE_KEY]));
+    let admission = Arc::new(InMemoryAdmission::with_keys([REMOTE_API_KEY]));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = build_router(
@@ -83,7 +83,7 @@ async fn try_dial(port: u16, path: &str) -> Result<ClientWs, String> {
     let url = format!("ws://127.0.0.1:{port}{path}");
     let mut req = url.into_client_request().map_err(|e| e.to_string())?;
     req.headers_mut()
-        .insert(INSTANCE_KEY_HEADER, INSTANCE_KEY.parse().unwrap());
+        .insert(REMOTE_API_KEY_HEADER, REMOTE_API_KEY.parse().unwrap());
     connect_async(req)
         .await
         .map(|(ws, _)| ws)
@@ -149,7 +149,7 @@ fn device_row(device_id: &str, pubkey: Vec<u8>) -> DeviceRow {
         approved_at: Some(0),
         last_seen_at: None,
         relay_url: "ws://relay.test".into(),
-        instance_key: INSTANCE_KEY.into(),
+        remote_api_key: REMOTE_API_KEY.into(),
     }
 }
 
@@ -211,7 +211,7 @@ async fn real_relay_splices_gateway_responder_and_mock_app() {
     let host_ws = dial(port, &format!("/content/host/{relay_key}")).await;
     let responder_state = state.clone();
     tokio::spawn(async move {
-        run_content_over_relay(host_ws, &responder_state).await;
+        run_content_over_relay(host_ws, &responder_state, None).await;
     });
 
     // The mock app: IK initiator handshake over the spliced relay legs.
@@ -312,12 +312,12 @@ async fn real_relay_pairs_gateway_and_mock_app() {
         device_pairing: Arc::clone(&device_pairing),
         secret_vault: tg.deps.secret_vault.clone(),
         relay_url: relay_url.clone(),
-        instance_key: INSTANCE_KEY.into(),
+        remote_api_key: REMOTE_API_KEY.into(),
     };
     let gateway = {
         let relay_url = relay_url.clone();
         let rid = rid.clone();
-        tokio::spawn(async move { host_pairing_leg(&deps, &relay_url, INSTANCE_KEY, &rid).await })
+        tokio::spawn(async move { host_pairing_leg(&deps, &relay_url, REMOTE_API_KEY, &rid).await })
     };
 
     // Mock app dials `/pair/join`; the join uses try-match (never parks), so retry

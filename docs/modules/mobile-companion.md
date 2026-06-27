@@ -30,8 +30,17 @@ phone and the gateway agree by construction.
 
 C is a **separate Cargo workspace** that deliberately depends on no `baybo-*`
 crate — its `/notify` + `/register` payloads are a JSON contract
-(`remote-host-protocol`), so the `.p8`-holding push role stays isolatable. One C
-fronts many gateways, admitted by `instance_key`.
+(`remote-host-protocol`), so the `.p8`-holding push role stays isolatable. One C is
+a **multi-tenant** host fronting many, possibly mutually-distrusting gateways: the
+`remote_api_key` each presents (in the `x-remote-api-key` dial header, or the push
+body) is C's *only* notion of a tenant — the throttle + isolation boundary it
+enforces against. C has **no "account" abstraction** and no `account_id`; it knows
+only `remote_api_key`s and their limits. Who owns or bills a key is a
+**control-plane** concern C never sees (`billing_account → {remote_api_key…}`, N:1);
+a leaked key is rotated by re-issuing under the same billing account, relay-agnostic.
+A key is one of two **tiers**: `guest` (auto-issued, shared trial key, low default
+limits, GC-able) or `registered` (control-plane-provisioned, explicit per-row
+limits, no TTL).
 
 ## 1:1 binding
 
@@ -83,10 +92,10 @@ shared blind relay and is **not** bound 1:1.
   (`push/mod.rs`).
 - `remote-host/` (C, separate workspace):
   - `crates/protocol` — `remote-host-protocol`, the wire contract (route paths,
-    `x-instance-key`, `/notify` + `/register` bodies, `ControlHello` /
+    `x-remote-api-key`, `/notify` + `/register` bodies, `ControlHello` /
     `ControlSignal`, `ApnsEnv`, URL builders); path-depended across the boundary.
   - `crates/relay` — the blind byte-pipe `RelayBroker` + the WS rendezvous/content
-    server; `crates/admission` — the hot-reloaded `instance_key` allow-list;
+    server; `crates/admission` — the hot-reloaded `remote_api_key` allow-list;
     `crates/push` — APNs (HTTP/2 sender, ES256 `.p8` JWT, `/notify` + `/register`);
     `crates/server` — the single binary serving relay + push on one listener.
 - `app/mobile/core` (`baybo-mobile-core`) — P-side: `PairingClient`,
@@ -122,7 +131,7 @@ Both ends derive the same keys from the Noise handshake hash `h` via HKDF: the
 `secret` used as the XXpsk0 PSK that C never sees. The full threat model,
 prologue binding, and secret hygiene are in
 [`mobile-pairing-security.md`](mobile-pairing-security.md). The QR payload is
-`baybo://pair?h={endpoint}&r={rendezvous_id}&s={secret}&k={instance_key}`
+`baybo://pair?h={endpoint}&r={rendezvous_id}&s={secret}&k={remote_api_key}`
 (`crates/cli/src/commands/device.rs`).
 
 ### Content session (post-pairing chat)
@@ -159,7 +168,7 @@ consumer (CryptoKit `ChaChaPoly`) are pinned to one byte-exact vector in
 `device_proto::fixtures`; a drift on either side fails a test.
 
 **Registration:** after a successful handshake the gateway
-(`HttpApnsRegistrar`, best-effort) POSTs `{instance_key, device_id, apns_token,
+(`HttpApnsRegistrar`, best-effort) POSTs `{remote_api_key, device_id, apns_token,
 env}` to C's `/register`, so the phone never holds a C credential. The device
 token is captured at launch by hooking the Tauri/wry-owned
 `UIApplicationDelegate` (`push_register.rs`, `class_addMethod` on
@@ -183,13 +192,40 @@ C's blind relay, which only matches two legs by key and copies opaque frames
   is spawned + tracked under the shared `ShutdownSignal`
   (`baybo_gateway::spawn_relay_content`), owns its child tasks (the control pump +
   per-signal data legs), and drains on shutdown.
-- **Relay hardening** (C side): a per-instance connection cap + per-gateway
-  content-bandwidth throttle, a per-rendezvous `/pair/join` limiter, a parked-leg
-  **TTL sweep** + a hard `MAX_PENDING_LEGS` ceiling, and a per-client-IP
-  upgrade limiter ahead of admission (`RELAY_PER_IP_LIMIT`, default on, socket-peer
-  keyed; behind a proxy disable it or resolve the real client via
-  `RELAY_CLIENT_IP_HEADERS=cf-connecting-ip` — see `DEPLOY.md`). An admission reload
-  that drops a key kicks that gateway's live connections, not just future ones.
+- **Device dedup is gateway-only** (`channel/state.rs` `LegDedup`): the relay is
+  **device-blind** — Noise runs *after* C splices the two legs, so C never learns
+  `device_id` and cannot dedup. Instead, each content leg is handed its own
+  `AbortHandle`; once its handshake resolves the `device_id` it registers in
+  `WsChannelState.device_leg_registry` (`device_id → AbortHandle`) and **aborts the
+  stale predecessor** for that device (e.g. a half-open leg from a prior foreground
+  reconnect). `DashMap::insert` is atomic, so two legs racing for one `device_id`
+  leave exactly one survivor; one gateway = one app, so the map holds ~one entry.
+- **Relay hardening** (C side) — all anti-abuse keys on `remote_api_key`, resolved
+  through one shared seam (`Admission::resolve(remote_api_key) -> Admit{Ok|Unknown|
+  Expired}`, which applies the guest-tier defaults and the expiry check; both the
+  relay's `require_admitted` pre-layer and push's `/notify` + `/register` call it):
+  - a **single-level connection cap** — a per-`remote_api_key` ceiling over all its
+    legs (fallback `MAX_CONNS_PER_REMOTE_API_KEY`, per-row `max_conns` override; the
+    one control leg is exempt so a gateway at its cap can still reconnect control).
+    There is **no** per-server connection sub-cap — a gateway holds too few legs
+    (~one control + ~one data) for one to bind.
+  - a **two-level, AND-enforced content-bandwidth throttle**: a per-`remote_api_key`
+    ceiling (`max_bps`, the cross-tenant wall) **and** a per-`(remote_api_key,
+    server)` sub-cap (`per_server_max_bps`, so one of a tenant's own gateways can't
+    starve the others). Every byte debits **both** buckets and owes the larger debt;
+    enforcement is *throttle, not drop* (TCP backpressure paces the sender). Per-row
+    overrides are in `DEPLOY.md`; the guest-tier defaults (and the per-server
+    sub-cap) are consts in `remote-host/crates/admission/src/lib.rs`.
+  - a per-rendezvous `/pair/join` limiter, a parked-leg **TTL sweep** + a hard
+    `MAX_PENDING_LEGS` ceiling, and a per-client-IP upgrade limiter ahead of
+    admission (`RELAY_PER_IP_LIMIT`, default on, socket-peer keyed; behind a proxy
+    disable it or resolve the real client via
+    `RELAY_CLIENT_IP_HEADERS=cf-connecting-ip` — see `DEPLOY.md`).
+  - an admission reload that drops a key **kicks that key's live connections and
+    forgets all its bandwidth buckets**, not just refusing future dials. Guest rows
+    may carry an `expires_at`; `gc_expired_guests` + the load-time filter drop
+    expired guests (the periodic sweep is unset this round, so guests created with
+    `expires_at = NULL` never expire yet).
 
 ## App lifecycle & persistence
 
@@ -249,9 +285,9 @@ pinned by `device_proto::fixtures` + `apple/verify-crypto.swift`.
 
 Canonical deploy doc: [`remote-host/DEPLOY.md`](../../remote-host/DEPLOY.md). The
 short version: deploy the single `remote-host` binary (relay always on; push
-mounts when `APNS_P8_PATH` is set), admit each gateway's `instance_key` in the
-polled SQLite `admitted_instances` table, then pair the gateway against the host
-with `baybo device pair --relay-url <host> --instance-key <admitted key>` — the
+mounts when `APNS_P8_PATH` is set), admit each gateway's `remote_api_key` in the
+polled SQLite `remote_api_keys` table, then pair the gateway against the host
+with `baybo device pair --relay-url <host> --remote-api-key <admitted key>` — the
 endpoint + key are baked into the QR and written to the device row, and the
 gateway auto-starts its relay control connection + push from that row.
 

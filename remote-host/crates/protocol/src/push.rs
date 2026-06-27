@@ -21,7 +21,7 @@ pub enum ApnsEnv {
 /// APNs payload); C never decrypts them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotifyRequest {
-    pub instance_key: String,
+    pub remote_api_key: String,
     pub device_id: String,
     pub collapse_id: String,
     pub kid: u32,
@@ -34,7 +34,7 @@ pub struct NotifyRequest {
 /// (gateway-mediated, so the app never holds a C credential).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterRequest {
-    pub instance_key: String,
+    pub remote_api_key: String,
     pub device_id: String,
     pub apns_token: String,
     pub env: ApnsEnv,

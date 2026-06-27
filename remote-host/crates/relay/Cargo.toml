@@ -21,9 +21,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # The shared admission trait (relay checks the live allow-list).
 remote-host-admission = { workspace = true }
-# The shared wire contract: route paths, x-instance-key, ControlHello/Signal.
+# The shared wire contract: route paths, x-remote-api-key, ControlHello/Signal.
 remote-host-protocol = { workspace = true }
-# The token-bucket primitive backing the per-instance bandwidth throttle.
+# The token-bucket primitive backing the per-key bandwidth throttle.
 remote-host-ratelimit = { workspace = true }
 
 [dev-dependencies]

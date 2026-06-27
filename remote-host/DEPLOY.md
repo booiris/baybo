@@ -80,37 +80,37 @@ network).
 
 ## Admission (which gateways may connect)
 
-The allow-list of gateway `instance_key`s is a **SQLite table**, not env. The runtime polls it (every `ADMISSION_POLL_SECS`, default 30s), so you add/remove gateways **without a restart**. The DB is bind-mounted (`./data/admission.db` by default), so you edit it from the host:
+The allow-list of gateway `remote_api_key`s is a **SQLite table**, not env. The runtime polls it (every `ADMISSION_POLL_SECS`, default 30s), so you add/remove gateways **without a restart**. The DB is bind-mounted (`./data/admission.db` by default), so you edit it from the host:
 
 ```bash
-# admit a gateway (the instance_key from its baybo.json):
+# admit a gateway (the remote_api_key from its baybo.json):
 sqlite3 ./data/admission.db \
-  "INSERT INTO admitted_instances(instance_key, label) VALUES('<key>', 'my gateway');"
+  "INSERT INTO remote_api_keys(remote_api_key, label) VALUES('<key>', 'my gateway');"
 # revoke:
-sqlite3 ./data/admission.db "DELETE FROM admitted_instances WHERE instance_key='<key>';"
+sqlite3 ./data/admission.db "DELETE FROM remote_api_keys WHERE remote_api_key='<key>';"
 # list:
-sqlite3 ./data/admission.db "SELECT instance_key, label, max_conns, max_bps FROM admitted_instances;"
+sqlite3 ./data/admission.db "SELECT remote_api_key, label, max_conns, max_bps FROM remote_api_keys;"
 ```
 
-The `admitted_instances` table is created on first start; an empty table admits no one (fail-closed). The same list gates both roles.
+The `remote_api_keys` table is created on first start; an empty table admits no one (fail-closed). The same list gates both roles.
 
 **Revoking is enforced on live connections, not just new ones.** On each poll, any key that was dropped from the table has its live relay connections (the gateway's control channel + any in-flight pairing/content legs) closed within the poll interval — so a revoked gateway is disconnected, not left running until it happens to drop. (The push role is per-request, so a revoked key simply gets `401` on its next `/notify`.)
 
-**Per-gateway connection cap.** Each admitted gateway may hold a bounded number of simultaneous relay connections, so a buggy or abusive one can't exhaust C. The limit is the row's `max_conns` column (NULL → the server default `MAX_CONNS_PER_INSTANCE`, **64**), hot-reloaded with the rest of the table. Pairing/content host legs over the cap are refused with `429`; the gateway's one control channel is exempt, so a gateway at its limit can always reconnect control. Raise it per gateway for one serving many concurrent device sessions:
+**Per-gateway connection cap.** Each admitted gateway may hold a bounded number of simultaneous relay connections, so a buggy or abusive one can't exhaust C. The limit is the row's `max_conns` column (NULL → the server default `MAX_CONNS_PER_REMOTE_API_KEY`, **64**), hot-reloaded with the rest of the table. Pairing/content host legs over the cap are refused with `429`; the gateway's one control channel is exempt, so a gateway at its limit can always reconnect control. Raise it per gateway for one serving many concurrent device sessions:
 
 ```bash
 sqlite3 ./data/admission.db \
-  "UPDATE admitted_instances SET max_conns = 200 WHERE instance_key='<key>';"
+  "UPDATE remote_api_keys SET max_conns = 200 WHERE remote_api_key='<key>';"
 ```
 
-**Per-gateway relay bandwidth.** Content sessions (the bandwidth-heavy traffic) are throttled per gateway: the relay only authenticates the gateway (the phone-side leg is anonymous), so the cap is keyed by `instance_key` and aggregates **both directions across all of that gateway's content legs**. The default rate is a fixed **1 MiB/s**, overridable per gateway by the row's `max_bps` column in bytes/sec (NULL → the default), hot-reloaded with the table. Enforcement is *throttle, not drop* — a gateway over its rate is paced via TCP backpressure, nothing is lost. (Pairing legs are tiny SPAKE2 blobs and are not throttled.) Raise it for a gateway serving many concurrent sessions or large attachments:
+**Per-gateway relay bandwidth.** Content sessions (the bandwidth-heavy traffic) are throttled per gateway: the relay only authenticates the gateway (the phone-side leg is anonymous), so the cap is keyed by `remote_api_key` and aggregates **both directions across all of that gateway's content legs**. The default rate is a fixed **1 MiB/s**, overridable per gateway by the row's `max_bps` column in bytes/sec (NULL → the default), hot-reloaded with the table. Enforcement is *throttle, not drop* — a gateway over its rate is paced via TCP backpressure, nothing is lost. (Pairing legs are tiny SPAKE2 blobs and are not throttled.) Raise it for a gateway serving many concurrent sessions or large attachments:
 
 ```bash
 sqlite3 ./data/admission.db \
-  "UPDATE admitted_instances SET max_bps = 4194304 WHERE instance_key='<key>';"
+  "UPDATE remote_api_keys SET max_bps = 4194304 WHERE remote_api_key='<key>';"
 ```
 
-**Push frequency control.** `POST /notify` is rate-limited per `(instance_key, device_id)` so a buggy or abusive gateway can't hammer APNs or spam a phone. Over the limit it returns `429` (the gateway backs off and retries). The limit is a fixed **60 pushes/min sustained, burst 20** per device; only admitted, registered devices are metered. Hardcoded, not configurable.
+**Push frequency control.** `POST /notify` is rate-limited per `(remote_api_key, device_id)` so a buggy or abusive gateway can't hammer APNs or spam a phone. Over the limit it returns `429` (the gateway backs off and retries). The limit is a fixed **60 pushes/min sustained, burst 20** per device; only admitted, registered devices are metered. Hardcoded, not configurable.
 
 **Per-source-IP flood backstop.** Ahead of admission, every relay WS-upgrade attempt is throttled per **client IP** (a token bucket, **10/s sustained, burst 60**), so a single host spraying upgrades across many rendezvous/node ids — or failing admission on each — is shed with `429` before any upgrade work. It also bounds the broker's pending map with a hard ceiling (`MAX_PENDING_LEGS`, **1024**): a new parked leg past the cap is refused `503` while matching an already-parked leg is exempt.
 
@@ -133,10 +133,10 @@ RELAY_CLIENT_IP_HEADERS=cf-connecting-ip
 The gateway holds **no** `.p8`, and there is **no `relay`/`push` block in `baybo.json`** — relay control + push are driven by the approved device row. Point them at this host by pairing with `--relay-url` (a one-time per-device choice, recorded on the row):
 
 ```sh
-baybo device pair --relay-url wss://c.example.com --instance-key <admitted key>
+baybo device pair --relay-url wss://c.example.com --remote-api-key <admitted key>
 ```
 
-That single WS URL covers both roles: the gateway dials `wss://c.example.com` for the relay control/content legs and POSTs push to `https://c.example.com/notify` (same host, scheme swapped). Omit the flags to use the built-in public proxy + its trial key `guest`. The `instance_key` must be admitted in the `admitted_instances` table (see **Admission** above) — one key serves both roles. To move an already-paired device to a different host, re-pair with the new `--relay-url`.
+That single WS URL covers both roles: the gateway dials `wss://c.example.com` for the relay control/content legs and POSTs push to `https://c.example.com/notify` (same host, scheme swapped). Omit the flags to use the built-in public proxy + its trial key `guest`. The `remote_api_key` must be admitted in the `remote_api_keys` table (see **Admission** above) — one key serves both roles. To move an already-paired device to a different host, re-pair with the new `--relay-url`.
 
 ## Notes
 

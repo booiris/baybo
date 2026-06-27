@@ -92,10 +92,10 @@ pub struct DeviceRow {
     /// before this column existed (re-pair to populate). Not operator-configurable
     /// yet — always the built-in relay endpoint.
     pub relay_url: String,
-    /// The relay admission key (`x-instance-key`) used at pairing. The gateway
+    /// The relay admission key (`x-remote-api-key`) used at pairing. The gateway
     /// presents it on its relay control/host legs and on push `/notify` +
     /// `/register`; relay and push share this one value. Empty for pre-existing rows.
-    pub instance_key: String,
+    pub remote_api_key: String,
 }
 
 /// Persistence contract for device-registry rows.

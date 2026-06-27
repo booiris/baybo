@@ -175,7 +175,7 @@ impl DevicePairingService {
         device_id: &str,
         device_pubkey: Vec<u8>,
         relay_url: &str,
-        instance_key: &str,
+        remote_api_key: &str,
     ) -> Result<DeviceRow, DevicePairingError> {
         // Consume the single-use slot up front: a second finalize for the same
         // rendezvous (a retrying leg) gets `SlotConsumed` and is refused, so one
@@ -204,7 +204,7 @@ impl DevicePairingService {
             // endpoint/key without a config block; both come from the pairing
             // transport (the QR `h=` + admission key).
             relay_url: relay_url.to_string(),
-            instance_key: instance_key.to_string(),
+            remote_api_key: remote_api_key.to_string(),
         };
         let replaced = self.devices.create_replacing_approved(&row).await?;
         if !replaced.is_empty() {

@@ -1,11 +1,11 @@
-//! Live, admission-gated relay connections tracked by instance key, so an
+//! Live, admission-gated relay connections tracked by `remote_api_key`, so an
 //! admission hot-reload can **drop** the connections of a revoked key — not just
 //! refuse new ones. Admission is checked once, at connect time; without this a
 //! gateway whose key is removed from the allow-list would stay connected until
 //! it happened to disconnect on its own.
 //!
 //! Each live connection (the gateway control channel, and the pairing/content
-//! host legs) registers a one-shot "kick" channel under its instance key and
+//! host legs) registers a one-shot "kick" channel under its `remote_api_key` and
 //! drops a [`ConnGuard`] when it ends. A revoke fires every channel for the
 //! removed keys; the connection's loop awaits its receiver and closes.
 
@@ -16,15 +16,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
-/// Fallback cap on simultaneous relay connections one admitted instance key may
-/// hold (control + pairing/content host legs) when the key sets no cap of its
+/// Fallback cap on simultaneous relay connections one admitted `remote_api_key`
+/// may hold (control + pairing/content host legs) when the key sets no cap of its
 /// own. Bounds a buggy or abusive gateway from exhausting C, while staying
 /// generous for a real gateway (one control connection plus a leg per active
-/// pairing/content session). Override the fallback with `MAX_CONNS_PER_INSTANCE`;
+/// pairing/content session). Override the fallback with `MAX_CONNS_PER_REMOTE_API_KEY`;
 /// override per-key via the `max_conns` column in the admission table.
 pub const DEFAULT_MAX_CONNS_PER_KEY: usize = 64;
 
-/// Registry of live connections' kick channels, keyed by instance key. Cheap
+/// Registry of live connections' kick channels, keyed by `remote_api_key`. Cheap
 /// per-connection registration; the only bulk op is [`kick`](Self::kick) on a
 /// poll that removed keys. Also caps how many connections one key may hold.
 pub struct ConnectionRegistry {
@@ -58,7 +58,7 @@ impl ConnectionRegistry {
         self
     }
 
-    /// Register a live connection for `instance_key`, enforcing its connection
+    /// Register a live connection for `remote_api_key`, enforcing its connection
     /// cap: `max_override` (the key's per-key cap from admission) if set, else the
     /// registry's fallback default. Returns `None` if the key is already at the
     /// cap — the caller must refuse the new one. Await the returned receiver in
@@ -66,23 +66,23 @@ impl ConnectionRegistry {
     /// the connection's lifetime (dropping it deregisters).
     pub(crate) fn register(
         self: &Arc<Self>,
-        instance_key: &str,
+        remote_api_key: &str,
         max_override: Option<usize>,
     ) -> Option<(ConnGuard, oneshot::Receiver<()>)> {
         let cap = max_override.unwrap_or(self.max_per_key);
         let mut conns = self.conns.lock();
-        let entry = conns.entry(instance_key.to_string()).or_default();
+        let entry = conns.entry(remote_api_key.to_string()).or_default();
         if entry.len() >= cap {
             // `or_default` only inserts an empty map for a brand-new key, which is
             // never at the cap; an at-cap key already existed, so nothing leaks.
             drop(conns);
-            tracing::warn!(cap, "relay: instance key at its connection cap; refusing");
+            tracing::warn!(cap, "relay: remote_api_key at its connection cap; refusing");
             return None;
         }
         let (tx, rx) = oneshot::channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         entry.insert(id, tx);
-        Some((self.guard(instance_key, id), rx))
+        Some((self.guard(remote_api_key, id), rx))
     }
 
     /// Register the gateway's control connection — exempt from the cap so a
@@ -90,27 +90,27 @@ impl ConnectionRegistry {
     /// and kickable like any other connection.
     pub(crate) fn register_unchecked(
         self: &Arc<Self>,
-        instance_key: &str,
+        remote_api_key: &str,
     ) -> (ConnGuard, oneshot::Receiver<()>) {
         let (tx, rx) = oneshot::channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.conns
             .lock()
-            .entry(instance_key.to_string())
+            .entry(remote_api_key.to_string())
             .or_default()
             .insert(id, tx);
-        (self.guard(instance_key, id), rx)
+        (self.guard(remote_api_key, id), rx)
     }
 
-    fn guard(self: &Arc<Self>, instance_key: &str, id: u64) -> ConnGuard {
+    fn guard(self: &Arc<Self>, remote_api_key: &str, id: u64) -> ConnGuard {
         ConnGuard {
             registry: Arc::clone(self),
-            key: instance_key.to_string(),
+            key: remote_api_key.to_string(),
             id,
         }
     }
 
-    /// Drop every live connection whose instance key is in `revoked` (called on
+    /// Drop every live connection whose `remote_api_key` is in `revoked` (called on
     /// an admission hot-reload that removed keys). Dropping each sender resolves
     /// its receiver, whose `select!` arm closes the connection. Returns the
     /// number of connections signalled.
@@ -131,18 +131,18 @@ impl ConnectionRegistry {
         if kicked > 0 {
             tracing::info!(
                 connections = kicked,
-                "relay: instance key revoked; dropping live connections"
+                "relay: remote_api_key revoked; dropping live connections"
             );
         }
         kicked
     }
 
-    fn deregister(&self, instance_key: &str, id: u64) {
+    fn deregister(&self, remote_api_key: &str, id: u64) {
         let mut conns = self.conns.lock();
-        if let Some(map) = conns.get_mut(instance_key) {
+        if let Some(map) = conns.get_mut(remote_api_key) {
             map.remove(&id);
             if map.is_empty() {
-                conns.remove(instance_key);
+                conns.remove(remote_api_key);
             }
         }
     }

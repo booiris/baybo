@@ -1,14 +1,14 @@
-//! Per-`(instance_key, device_id)` frequency control for `POST /notify`.
+//! Per-`(remote_api_key, device_id)` frequency control for `POST /notify`.
 //!
 //! A gateway POSTs `/notify` on every pushable turn; this bounds how fast it can
 //! push to a single device, so a buggy or abusive gateway can neither hammer
-//! APNs nor spam a phone. The key is `(instance_key, device_id)` — the gateway is
-//! authenticated by its admitted instance key, and per-device keying means one
+//! APNs nor spam a phone. The key is `(remote_api_key, device_id)` — the gateway is
+//! authenticated by its admitted `remote_api_key`, and per-device keying means one
 //! chatty device can't starve another. Over the limit, the caller returns `429`
 //! and the gateway can back off and retry.
 //!
 //! The rate is fixed ([`NOTIFY_RATE_PER_MIN`] sustained, [`NOTIFY_BURST`] burst),
-//! not configurable. Each `(instance, device)` gets a [`TokenBucket`]; an over-cap
+//! not configurable. Each `(key, device)` gets a [`TokenBucket`]; an over-cap
 //! soft limit evicts brim-full (idle) buckets so a churn of device ids can't grow
 //! the map without bound. Time is injectable for deterministic tests.
 
@@ -36,7 +36,7 @@ const SECS_PER_MIN: f64 = 60.0;
 /// (a re-created one also starts full), so eviction is free of fairness risk.
 const BUCKET_SOFT_CAP: usize = 16_384;
 
-/// One token-bucket per `(instance_key, device_id)`, all at the fixed rate.
+/// One token-bucket per `(remote_api_key, device_id)`, all at the fixed rate.
 #[derive(Default)]
 pub struct NotifyRateLimiter {
     buckets: Mutex<HashMap<(String, String), TokenBucket>>,
@@ -47,19 +47,19 @@ impl NotifyRateLimiter {
         Self::default()
     }
 
-    /// Account one push for `(instance_key, device_id)`; returns whether it is
+    /// Account one push for `(remote_api_key, device_id)`; returns whether it is
     /// within the rate. A `false` means the caller should refuse with `429`.
-    pub fn check(&self, instance_key: &str, device_id: &str) -> bool {
-        self.check_at(instance_key, device_id, Instant::now())
+    pub fn check(&self, remote_api_key: &str, device_id: &str) -> bool {
+        self.check_at(remote_api_key, device_id, Instant::now())
     }
 
-    fn check_at(&self, instance_key: &str, device_id: &str, now: Instant) -> bool {
+    fn check_at(&self, remote_api_key: &str, device_id: &str, now: Instant) -> bool {
         let mut buckets = self.buckets.lock();
         if buckets.len() >= BUCKET_SOFT_CAP {
             buckets.retain(|_, b| !b.is_full_at(now));
         }
         buckets
-            .entry((instance_key.to_string(), device_id.to_string()))
+            .entry((remote_api_key.to_string(), device_id.to_string()))
             .or_insert_with(|| {
                 TokenBucket::new_at(NOTIFY_BURST, NOTIFY_RATE_PER_MIN / SECS_PER_MIN, now)
             })

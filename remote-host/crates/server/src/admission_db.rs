@@ -4,30 +4,37 @@
 //! reacting to in-process writes.
 
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use libsql::Builder;
-use remote_host_admission::{AdmissionEntry, InMemoryAdmission};
+use remote_host_admission::{AdmissionEntry, InMemoryAdmission, Tier};
 
-/// Source-of-truth table: one row per admitted gateway instance key. `label` +
-/// `created_at` are for whoever administers it. `max_conns` is the key's optional
-/// per-key connection cap (NULL → the server's `MAX_CONNS_PER_INSTANCE` default)
-/// and `max_bps` its optional relay-bandwidth ceiling in bytes/sec (NULL → the
-/// relay's hardcoded `RELAY_BYTES_PER_SEC` default).
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS admitted_instances (\
-    instance_key TEXT PRIMARY KEY, \
+/// Source-of-truth table: one row per admitted `remote_api_key`. `label` +
+/// `created_at` are for whoever administers it. `tier` is `'guest'` (auto-issued,
+/// carries the guest default limits, GC-eligible) or `'registered'` (control-plane
+/// provisioned, explicit per-row limits). `max_conns` / `max_bps` /
+/// `per_server_max_bps` are the key's optional limits (NULL → the guest default for
+/// guest rows, else the server's conservative role floor). `expires_at` is the
+/// guest-TTL wall clock (NULL → never expires).
+///
+/// Pre-release: redefined clean, no back-compat migration.
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS remote_api_keys (\
+    remote_api_key TEXT PRIMARY KEY, \
     label TEXT, \
+    tier TEXT NOT NULL DEFAULT 'registered', \
     max_conns INTEGER, \
     max_bps INTEGER, \
+    per_server_max_bps INTEGER, \
+    expires_at TEXT, \
     created_at TEXT NOT NULL DEFAULT (datetime('now')))";
 
-/// Per-key limit columns added after the table's original shape. Each ALTER
-/// errors harmlessly ("duplicate column") once present, so a re-run is a no-op.
-const MIGRATIONS: &[&str] = &[
-    "ALTER TABLE admitted_instances ADD COLUMN max_conns INTEGER",
-    "ALTER TABLE admitted_instances ADD COLUMN max_bps INTEGER",
-];
+/// Keep an admitted-but-expired guest out of the in-memory view: drop a row only
+/// when it is a guest, carries an `expires_at`, and that instant has passed. NULL
+/// expiry and registered rows are always kept.
+const NOT_EXPIRED_GUEST: &str =
+    "NOT (tier = 'guest' AND expires_at IS NOT NULL AND expires_at < datetime('now'))";
 
 /// Open the libsql DB at `path`, ensure the table, load the allow-list, and
 /// spawn a task that re-reads it every `poll` to pick up external edits. On each
@@ -45,11 +52,6 @@ where
     let db = Builder::new_local(path).build().await?;
     let conn = db.connect()?;
     conn.execute(SCHEMA, ()).await?;
-    // Bring a table created before the per-key limit columns existed up to date;
-    // each ALTER is harmless once its column is present.
-    for migration in MIGRATIONS {
-        let _ = conn.execute(migration, ()).await;
-    }
 
     let admission = Arc::new(InMemoryAdmission::new());
     // Initial load: nothing was admitted before, so nothing to revoke.
@@ -81,73 +83,185 @@ where
 async fn load(conn: &libsql::Connection) -> Result<HashMap<String, AdmissionEntry>, libsql::Error> {
     let mut rows = conn
         .query(
-            "SELECT instance_key, max_conns, max_bps FROM admitted_instances",
+            &format!(
+                "SELECT remote_api_key, tier, max_conns, max_bps, per_server_max_bps, expires_at \
+                 FROM remote_api_keys WHERE {NOT_EXPIRED_GUEST}"
+            ),
             (),
         )
         .await?;
     let mut keys = HashMap::new();
     while let Some(row) = rows.next().await? {
         let key = row.get::<String>(0)?;
+        // `tier` is NOT NULL DEFAULT 'registered'; an unknown string falls back to
+        // the conservative registered tier (caller floors NULL limits).
+        let tier = Tier::from_str(&row.get::<String>(1)?).unwrap_or_default();
         // Nullable INTEGERs -> per-key overrides; NULL or out-of-range -> None
-        // (the caller's default applies).
+        // (the guest default or the caller's floor applies).
         let max_conns = row
-            .get::<Option<i64>>(1)?
+            .get::<Option<i64>>(2)?
             .and_then(|v| u32::try_from(v).ok());
         let max_bps = row
-            .get::<Option<i64>>(2)?
+            .get::<Option<i64>>(3)?
             .and_then(|v| u64::try_from(v).ok());
-        keys.insert(key, AdmissionEntry { max_conns, max_bps });
+        let per_server_max_bps = row
+            .get::<Option<i64>>(4)?
+            .and_then(|v| u64::try_from(v).ok());
+        let expires_at = row.get::<Option<String>>(5)?;
+        keys.insert(
+            key,
+            AdmissionEntry {
+                tier,
+                max_conns,
+                max_bps,
+                per_server_max_bps,
+                expires_at,
+            },
+        );
     }
     Ok(keys)
+}
+
+/// Durably delete expired guest rows from the `remote_api_keys` allow-list,
+/// returning the number removed. This is an **infra / admission** GC, NOT session
+/// data — the "never delete sessions" rule does not apply.
+///
+/// Hook for the guest-TTL sweep: intentionally **not** invoked this round (no TTL
+/// is set, so guests are created with `expires_at = NULL` and never expire). Wire
+/// it to a periodic task once `GUEST_TTL` / `GUEST_SWEEP_INTERVAL` are chosen.
+#[allow(dead_code)]
+pub(crate) async fn gc_expired_guests(conn: &libsql::Connection) -> Result<u64, libsql::Error> {
+    conn.execute(
+        "DELETE FROM remote_api_keys \
+         WHERE tier = 'guest' AND expires_at IS NOT NULL AND expires_at < datetime('now')",
+        (),
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A DB created before the per-key limit columns existed must migrate cleanly
-    /// and `load` (the widened SELECT) must read every column. Guards the
-    /// migration↔SELECT contract: if the two ever drift, `open` fails on every
-    /// upgraded deployment.
-    #[tokio::test]
-    async fn migrates_an_old_shape_db_and_loads_every_limit_column() {
+    async fn mem_conn() -> libsql::Connection {
         let db = Builder::new_local(":memory:").build().await.unwrap();
         let conn = db.connect().unwrap();
-        // The original table shape (instance_key, label, max_conns, created_at).
+        conn.execute(SCHEMA, ()).await.unwrap();
+        conn
+    }
+
+    /// `load` reads every column: tier, all three limits, and `expires_at`.
+    #[tokio::test]
+    async fn load_reads_tier_and_every_limit_column() {
+        let conn = mem_conn().await;
         conn.execute(
-            "CREATE TABLE admitted_instances (instance_key TEXT PRIMARY KEY, label TEXT, \
-             max_conns INTEGER, created_at TEXT)",
+            "INSERT INTO remote_api_keys(remote_api_key, tier, max_conns, max_bps, per_server_max_bps) \
+             VALUES('tuned', 'registered', 8, 4194304, 1048576)",
             (),
         )
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO admitted_instances(instance_key, max_conns) VALUES('legacy', 7)",
+            "INSERT INTO remote_api_keys(remote_api_key, tier) VALUES('bare-guest', 'guest')",
             (),
         )
         .await
         .unwrap();
 
-        // Apply the migrations open() runs, then load via the widened SELECT.
-        for migration in MIGRATIONS {
-            let _ = conn.execute(migration, ()).await;
-        }
         let loaded = load(&conn).await.unwrap();
-        let legacy = loaded.get("legacy").expect("the old-shape row is admitted");
-        assert_eq!(legacy.max_conns, Some(7));
-        assert_eq!(
-            legacy.max_bps, None,
-            "added column defaults to NULL -> no override"
-        );
 
-        // A row using the new column round-trips through load().
+        let tuned = loaded.get("tuned").expect("registered row admitted");
+        assert_eq!(tuned.tier, Tier::Registered);
+        assert_eq!(tuned.max_conns, Some(8));
+        assert_eq!(tuned.max_bps, Some(4_194_304));
+        assert_eq!(tuned.per_server_max_bps, Some(1_048_576));
+        assert_eq!(tuned.expires_at, None);
+
+        let guest = loaded.get("bare-guest").expect("guest row admitted");
+        assert_eq!(guest.tier, Tier::Guest);
+        assert_eq!(
+            guest.max_conns, None,
+            "NULL stays None; resolve() defaults it"
+        );
+    }
+
+    /// An expired guest row is filtered out of the in-memory view; a registered
+    /// row past its (unusual) `expires_at` and a far-future guest both survive.
+    #[tokio::test]
+    async fn load_filters_only_expired_guests() {
+        let conn = mem_conn().await;
         conn.execute(
-            "INSERT INTO admitted_instances(instance_key, max_bps) VALUES('tuned', 4194304)",
+            "INSERT INTO remote_api_keys(remote_api_key, tier, expires_at) \
+             VALUES('stale', 'guest', '2000-01-01 00:00:00')",
             (),
         )
         .await
         .unwrap();
-        let tuned = load(&conn).await.unwrap();
-        assert_eq!(tuned.get("tuned").unwrap().max_bps, Some(4_194_304));
+        conn.execute(
+            "INSERT INTO remote_api_keys(remote_api_key, tier, expires_at) \
+             VALUES('fresh', 'guest', '2999-01-01 00:00:00')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO remote_api_keys(remote_api_key, tier, expires_at) \
+             VALUES('reg-stale', 'registered', '2000-01-01 00:00:00')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let loaded = load(&conn).await.unwrap();
+        assert!(!loaded.contains_key("stale"), "expired guest is filtered");
+        assert!(loaded.contains_key("fresh"), "future guest kept");
+        assert!(
+            loaded.contains_key("reg-stale"),
+            "the load filter only drops guests"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_deletes_only_expired_guests() {
+        let conn = mem_conn().await;
+        conn.execute(
+            "INSERT INTO remote_api_keys(remote_api_key, tier, expires_at) \
+             VALUES('stale', 'guest', '2000-01-01 00:00:00')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO remote_api_keys(remote_api_key, tier) VALUES('never', 'guest')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO remote_api_keys(remote_api_key, tier, expires_at) \
+             VALUES('reg-stale', 'registered', '2000-01-01 00:00:00')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let removed = gc_expired_guests(&conn).await.unwrap();
+        assert_eq!(removed, 1, "only the expired guest is deleted");
+
+        let mut rows = conn
+            .query(
+                "SELECT remote_api_key FROM remote_api_keys ORDER BY remote_api_key",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut survivors = Vec::new();
+        while let Some(r) = rows.next().await.unwrap() {
+            survivors.push(r.get::<String>(0).unwrap());
+        }
+        assert_eq!(
+            survivors,
+            vec!["never".to_string(), "reg-stale".to_string()]
+        );
     }
 }

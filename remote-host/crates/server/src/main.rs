@@ -52,9 +52,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     // Track live relay connections so an admission reload that drops a key can
     // kick that gateway's connections, not just refuse new ones — and cap how many
-    // connections one instance key may hold (override with MAX_CONNS_PER_INSTANCE).
+    // connections one remote_api_key may hold (override the fallback default with
+    // MAX_CONNS_PER_REMOTE_API_KEY).
     let registry = remote_host_relay::ConnectionRegistry::new();
-    let registry = match std::env::var("MAX_CONNS_PER_INSTANCE")
+    let registry = match std::env::var("MAX_CONNS_PER_REMOTE_API_KEY")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
     {
@@ -62,13 +63,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => registry,
     };
     let conns = Arc::new(registry);
-    // Per-gateway content-bandwidth throttle (fixed rate; see RELAY_BYTES_PER_SEC).
+    // Two-level content-bandwidth throttle: per-remote_api_key ceiling ∧ per-server
+    // sub-cap (see RELAY_BYTES_PER_SEC).
     let bandwidth = Arc::new(remote_host_relay::BandwidthRegistry::new());
     let admission = {
         let conns = conns.clone();
         let bandwidth = bandwidth.clone();
         admission_db::open(&db_path, poll, move |revoked| {
-            // A revoked key loses its live connections and its bandwidth bucket.
+            // A revoked key loses its live connections and all its bandwidth buckets.
             conns.kick(&revoked);
             bandwidth.forget(&revoked);
         })
@@ -124,7 +126,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     roles.push("relay");
 
     // TODO(dashboard): wire in `remote-host-dashboard` here — a blind,
-    // metadata-only status router (counts of admitted instances / device tokens /
+    // metadata-only status router (counts of admitted keys / device tokens /
     // connected gateways / pending relay legs, never content). It needs a
     // `MetadataProvider` impl over the push `DeviceTokenStore` + the relay
     // `ControlRegistry`/broker, then `app = app.merge(remote_host_dashboard::

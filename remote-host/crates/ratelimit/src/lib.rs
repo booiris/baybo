@@ -1,6 +1,6 @@
 //! A monotonic-clock token bucket — the one rate-limiting primitive shared by
-//! the push frequency control (per `(instance_key, device_id)`) and the relay
-//! bandwidth throttle (per `instance_key`).
+//! the push frequency control (per `(remote_api_key, device_id)`) and the relay
+//! bandwidth throttle (per `remote_api_key`, and per `(remote_api_key, server)`).
 //!
 //! The bucket holds up to `capacity` tokens and refills at `refill_per_sec`.
 //! Refill is lazy — computed from the elapsed monotonic time on each access — so

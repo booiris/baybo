@@ -83,6 +83,13 @@ pub struct WsChannelState {
     /// Noise IK initiator's static key, matching it against an approved row's
     /// `device_pubkey` from pairing.
     pub device_store: Arc<dyn DeviceStore>,
+    /// Gateway-only **device dedup** for relay content legs: `device_id` → the
+    /// [`AbortHandle`](tokio::task::AbortHandle) of that device's live content leg.
+    /// The relay is device-blind (Noise runs after the byte-splice), so a stale,
+    /// half-open leg can only be reaped here: when a fresh leg completes its Noise
+    /// handshake and resolves the same `device_id`, it aborts the predecessor.
+    /// Bounded by the approved-device count (~1 — one gateway = one app).
+    pub device_leg_registry: Arc<DashMap<String, tokio::task::AbortHandle>>,
     /// Backing store for non-text media. Sidecars upload via
     /// `POST /v1/blobs`, the agent emits replies that reference blobs
     /// the gateway already has, and `GET /v1/blobs/{id}` lets sidecars
@@ -133,10 +140,95 @@ impl WsChannelState {
             bot_reconciler: Arc::clone(&deps.bot_reconciler),
             pairing,
             device_store: deps.stores.device.clone(),
+            device_leg_registry: Arc::new(DashMap::new()),
             blob_store: deps.stores.blob.clone(),
             task_store: deps.stores.task.clone(),
             job_lifecycle: Arc::clone(&deps.job_lifecycle),
             inbound_dedup: Arc::new(InboundDedup::new()),
         }
+    }
+}
+
+/// A relay content leg's handle into the [`WsChannelState::device_leg_registry`].
+/// The relay-content manager builds one from the leg's own `AbortHandle`; the
+/// content session calls [`install`](Self::install) once Noise resolves the
+/// `device_id`, registering this leg as the device's live one and aborting any
+/// stale predecessor. Only the relay path carries one — the device-blind relay
+/// can't dedup, so the gateway must.
+pub(crate) struct LegDedup {
+    pub(crate) registry: Arc<DashMap<String, tokio::task::AbortHandle>>,
+    pub(crate) abort: tokio::task::AbortHandle,
+}
+
+impl LegDedup {
+    /// Install this leg as the live one for `device_id`, aborting the stale leg it
+    /// displaces (if any). `DashMap::insert` is atomic per key, so two legs racing
+    /// for the same `device_id` leave exactly one survivor — the last to install.
+    pub(crate) fn install(self, device_id: &str) {
+        if let Some(stale) = self.registry.insert(device_id.to_string(), self.abort) {
+            stale.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A second leg for the same `device_id` displaces and aborts the first; the
+    /// survivor is the last to install (the relay-content dedup invariant).
+    #[tokio::test]
+    async fn dedup_aborts_the_displaced_leg_for_a_device() {
+        let registry: Arc<DashMap<String, tokio::task::AbortHandle>> = Arc::new(DashMap::new());
+        let first = tokio::spawn(std::future::pending::<()>());
+        let second = tokio::spawn(std::future::pending::<()>());
+        let second_handle = second.abort_handle();
+
+        LegDedup {
+            registry: Arc::clone(&registry),
+            abort: first.abort_handle(),
+        }
+        .install("dev-1");
+        LegDedup {
+            registry: Arc::clone(&registry),
+            abort: second.abort_handle(),
+        }
+        .install("dev-1");
+
+        assert!(
+            first.await.unwrap_err().is_cancelled(),
+            "the displaced leg is aborted"
+        );
+        assert!(
+            !second_handle.is_finished(),
+            "the surviving leg keeps running"
+        );
+        second.abort();
+    }
+
+    /// Legs for different devices are independent — installing one never aborts
+    /// the other.
+    #[tokio::test]
+    async fn dedup_is_per_device() {
+        let registry: Arc<DashMap<String, tokio::task::AbortHandle>> = Arc::new(DashMap::new());
+        let a = tokio::spawn(std::future::pending::<()>());
+        let b = tokio::spawn(std::future::pending::<()>());
+        let (a_handle, b_handle) = (a.abort_handle(), b.abort_handle());
+
+        LegDedup {
+            registry: Arc::clone(&registry),
+            abort: a.abort_handle(),
+        }
+        .install("dev-1");
+        LegDedup {
+            registry: Arc::clone(&registry),
+            abort: b.abort_handle(),
+        }
+        .install("dev-2");
+
+        assert!(!a_handle.is_finished(), "dev-1 leg untouched");
+        assert!(!b_handle.is_finished(), "dev-2 leg untouched");
+        a.abort();
+        b.abort();
     }
 }

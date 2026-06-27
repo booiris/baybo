@@ -55,7 +55,7 @@ slot. Lacking the PSK, C cannot complete the handshake with either side, so it i
 reduced from MITM to **denial-of-service**.
 
 The QR encodes both:
-`baybo://pair?h={endpoint}&r={rendezvous_id}&s={secret}&k={instance_key}`.
+`baybo://pair?h={endpoint}&r={rendezvous_id}&s={secret}&k={remote_api_key}`.
 
 ## The handshake: `Noise_XXpsk0_25519_ChaChaPoly_SHA256`
 
@@ -168,9 +168,13 @@ never the secret or the confirm code.
 - **Relay-only.** Pairing runs exclusively over the relay; there is no direct/LAN
   pairing route. The prologue binds `endpoint`, which is what prevents cross-relay
   binding.
-- **Relay admission (`instance_key`) is orthogonal.** It is C's *own* anti-abuse
-  allow-list, **not** protection against a hostile C — the PSK is what defends the
-  app↔gateway channel. Do not conflate.
+- **Relay admission (`remote_api_key`) is orthogonal.** It is C's *own* per-tenant
+  anti-abuse allow-list on a multi-tenant host (a per-key connection cap, two-level
+  bandwidth limits, and `guest`/`registered` tiers; resolved through one shared
+  `Admission::resolve` seam), **not** protection against a hostile C — the PSK is
+  what defends the app↔gateway channel. A leaked `remote_api_key` only lets someone
+  burn C's quota (rotated control-plane-side, relay-agnostic); it can never MITM a
+  pairing. Do not conflate.
 
 ## Residual DoS (availability only)
 

@@ -193,13 +193,13 @@ async fn dial_relay(
             .as_str()
             .into_client_request()
             .map_err(|e| format!("bad relay url {base}: {e}"))?;
-        if !record.instance_key.is_empty() {
+        if !record.remote_api_key.is_empty() {
             let value = record
-                .instance_key
+                .remote_api_key
                 .parse()
                 .map_err(|e| format!("bad instance key header: {e}"))?;
             req.headers_mut()
-                .insert(remote_host_protocol::relay::INSTANCE_KEY_HEADER, value);
+                .insert(remote_host_protocol::relay::REMOTE_API_KEY_HEADER, value);
         }
         match connect_async(req).await {
             Ok((ws, _)) => break ws,

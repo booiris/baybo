@@ -29,7 +29,7 @@ async fn pair_begin(
     endpoint: String,
     rendezvous_id: String,
     secret: String,
-    instance_key: Option<String>,
+    remote_api_key: Option<String>,
     on_abort: Channel<PairAborted>,
 ) -> Result<PairChallenge, String> {
     pairing::pair_begin(
@@ -37,7 +37,7 @@ async fn pair_begin(
         &endpoint,
         &rendezvous_id,
         &secret,
-        instance_key,
+        remote_api_key,
         on_abort,
     )
     .await

@@ -546,11 +546,11 @@ pub enum DeviceCmd {
         /// + push (same host over https). Defaults to the built-in public proxy.
         #[arg(long, value_name = "HOST")]
         relay_url: Option<String>,
-        /// Relay admission key (`x-instance-key`) to present on the pairing legs.
+        /// Relay admission key (`x-remote-api-key`) to present on the pairing legs.
         /// Must be admitted on the relay. Defaults to `guest`, the built-in public
         /// proxy's trial key; pass your own when using `--relay-url`.
         #[arg(long, value_name = "KEY", default_value = "guest")]
-        instance_key: String,
+        remote_api_key: String,
     },
     /// List registered devices. With no flag, shows every row; pass
     /// `--approved` to show only active devices.

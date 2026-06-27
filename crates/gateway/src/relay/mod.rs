@@ -1,9 +1,10 @@
 //! The gateway's outbound **A↔C control connection**.
 //!
 //! A NAT'd gateway can't be dialed by the remote host (C), so A instead holds a
-//! **persistent outbound control connection** to C. On open it sends a
-//! [`ControlHello`] (its `relay_node_id` + its per-instance admission
-//! key); thereafter C pushes [`ControlSignal`] signals — today only
+//! **persistent outbound control connection** to C. On open it names itself with a
+//! [`ControlHello`] (its `relay_node_id`); its `remote_api_key` rides the
+//! `x-remote-api-key` dial header (the shared admission pre-layer), not the hello.
+//! Thereafter C pushes [`ControlSignal`] signals — today only
 //! `OpenDataLeg`, meaning a phone is waiting at the relay and A should open a
 //! data leg to meet it.
 //!
@@ -112,7 +113,7 @@ where
 /// closes or errors so the caller can reconnect.
 pub async fn connect_control(
     url: &str,
-    instance_key: &str,
+    remote_api_key: &str,
     hello: &ControlHello,
     signals: mpsc::Sender<ControlSignal>,
 ) -> Result<(), ControlError> {
@@ -121,12 +122,12 @@ pub async fn connect_control(
         .map_err(|e| ControlError::Codec(format!("bad url: {e}")))?;
     // Admission rides the dial header now (the relay's shared pre-layer), so the
     // hello carries only the relay_node_id.
-    let value = instance_key
+    let value = remote_api_key
         .parse()
         .map_err(|e| ControlError::Codec(format!("bad instance key header: {e}")))?;
     request
         .headers_mut()
-        .insert(remote_host_protocol::relay::INSTANCE_KEY_HEADER, value);
+        .insert(remote_host_protocol::relay::REMOTE_API_KEY_HEADER, value);
     let (ws, _) = connect_async(request).await?;
     pump_control(ws, hello, signals).await
 }

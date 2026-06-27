@@ -38,7 +38,7 @@ type RelayWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 use super::adapter::{FrameSink, FrameSource, Sidecar};
-use super::state::WsChannelState;
+use super::state::{LegDedup, WsChannelState};
 use crate::device::load_or_create_static_keypair;
 
 /// How long the responder waits for the initiator's first handshake message
@@ -50,9 +50,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// prior channel-auth ran — the gateway dialed blind — so the device is
 /// authenticated purely by matching the Noise IK initiator's static to an
 /// approved device row.
-pub(crate) async fn run_content_over_relay(ws: RelayWs, state: &WsChannelState) {
+pub(crate) async fn run_content_over_relay(
+    ws: RelayWs,
+    state: &WsChannelState,
+    dedup: Option<LegDedup>,
+) {
     let (sink, source) = ws.split();
-    if let Err(reason) = run_content_session(TungBinSink(sink), TungBinSource(source), state).await
+    if let Err(reason) =
+        run_content_session(TungBinSink(sink), TungBinSource(source), state, dedup).await
     {
         tracing::debug!(reason = %reason, "relay content session aborted");
     }
@@ -66,6 +71,7 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
     mut sink: Si,
     mut source: So,
     state: &WsChannelState,
+    dedup: Option<LegDedup>,
 ) -> Result<(), String> {
     let gateway_static = load_or_create_static_keypair(&state.secret_vault)
         .await
@@ -108,6 +114,15 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
         .into_transport_mode()
         .map_err(|e| format!("enter transport mode: {e}"))?;
     let transport = Arc::new(Mutex::new(transport));
+
+    // Gateway-only device dedup: now that this leg has a viable Noise session, make
+    // it the live leg for `device_id` and abort any stale predecessor (e.g. a
+    // half-open leg left by a prior foreground reconnect). The relay can't do this —
+    // it never learns `device_id` — so it is enforced here. Done only after the
+    // handshake succeeds, so a failed dial never kills a working session.
+    if let Some(dedup) = dedup {
+        dedup.install(&device_id);
+    }
 
     tracing::info!(
         device = %super::short_hash(&device_id),
@@ -316,7 +331,7 @@ mod tests {
             approved_at: Some(0),
             last_seen_at: None,
             relay_url: "wss://relay.test".into(),
-            instance_key: "inst-test".into(),
+            remote_api_key: "inst-test".into(),
         }
     }
 
@@ -383,7 +398,7 @@ mod tests {
         let (gw_tx, mut phone_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16); // gateway -> phone
         let (phone_tx, gw_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16); // phone -> gateway
         tokio::spawn(async move {
-            let _ = run_content_session(ChanSink(gw_tx), ChanSource(gw_rx), &state).await;
+            let _ = run_content_session(ChanSink(gw_tx), ChanSource(gw_rx), &state, None).await;
         });
 
         // The phone: IK initiator handshake, then Subscribe + a message.
@@ -465,7 +480,7 @@ mod tests {
         let (gw_tx, mut phone_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let (phone_tx, gw_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         tokio::spawn(async move {
-            let _ = run_content_session(ChanSink(gw_tx), ChanSource(gw_rx), &state).await;
+            let _ = run_content_session(ChanSink(gw_tx), ChanSource(gw_rx), &state, None).await;
         });
 
         // msg1 carries the (unknown) static; the gateway aborts, so msg2 never comes.

@@ -39,8 +39,8 @@ pub async fn handle(ctx: &CommandContext, cmd: DeviceCmd) -> Result<CommandOutpu
     match cmd {
         DeviceCmd::Pair {
             relay_url,
-            instance_key,
-        } => pair(ctx, relay_url, instance_key).await,
+            remote_api_key,
+        } => pair(ctx, relay_url, remote_api_key).await,
         DeviceCmd::List { approved } => list(ctx, approved).await,
         DeviceCmd::Revoke { device_id, yes } => revoke(ctx, device_id, yes).await,
     }
@@ -114,7 +114,7 @@ fn qr_encode(s: &str) -> String {
 async fn pair(
     ctx: &CommandContext,
     relay_url: Option<String>,
-    instance_key: String,
+    remote_api_key: String,
 ) -> Result<CommandOutput> {
     let svc = require_service(ctx)?;
 
@@ -154,14 +154,14 @@ async fn pair(
 
     // Pairing always runs through the relay. The endpoint defaults to the built-in
     // public proxy; `--relay-url` points it at a self-hosted remote-host. The
-    // admission key (`--instance-key`, default `guest`) and the endpoint are baked
+    // admission key (`--remote-api-key`, default `guest`) and the endpoint are baked
     // into the QR and recorded on the device row so the gateway reuses them for its
     // relay control connection + push.
     let endpoint = match relay_url {
         Some(url) => normalize_relay_url(&url)?,
         None => DEFAULT_GATEWAY_ENDPOINT.to_string(),
     };
-    let k = qr_encode(&instance_key);
+    let k = qr_encode(&remote_api_key);
     // `s=` is the 256-bit secret, hex-encoded; it is bearer credential material.
     // The whole payload is rendered as a QR only — never echoed to the terminal
     // or any log.
@@ -198,12 +198,12 @@ async fn pair(
         device_pairing: Arc::clone(svc),
         secret_vault,
         relay_url: endpoint.clone(),
-        instance_key: instance_key.clone(),
+        remote_api_key: remote_api_key.clone(),
     };
     let mut host = {
         let (relay_url, key, rid) = (
             endpoint.clone(),
-            instance_key.clone(),
+            remote_api_key.clone(),
             rendezvous_id.clone(),
         );
         StopHosting::new(tokio::spawn(async move {

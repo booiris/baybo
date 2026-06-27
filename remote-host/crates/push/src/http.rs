@@ -113,7 +113,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
 
     fn body(instance: &str, device: &str) -> serde_json::Value {
         serde_json::json!({
-            "instance_key": instance,
+            "remote_api_key": instance,
             "device_id": device,
             "collapse_id": "dev-1:sess-1",
             "kid": 0,
@@ -135,7 +135,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
 
     fn reg_body(instance: &str) -> serde_json::Value {
         serde_json::json!({
-            "instance_key": instance,
+            "remote_api_key": instance,
             "device_id": "dev-new",
             "apns_token": "apns-tok-new",
             "env": "sandbox",

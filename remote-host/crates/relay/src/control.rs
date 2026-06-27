@@ -24,11 +24,11 @@ const CONTROL_CHANNEL_CAP: usize = 32;
 pub use remote_host_protocol::relay::{ControlHello, ControlSignal};
 
 /// A gateway's live control connection: the signal channel plus its admitted
-/// `instance_key`, so the relay can attribute the anonymous phone-side content
+/// `remote_api_key`, so the relay can attribute the anonymous phone-side content
 /// leg (which names only the `relay_node_id`) back to the owning gateway.
 struct ControlEntry {
     tx: mpsc::Sender<ControlSignal>,
-    instance_key: String,
+    remote_api_key: String,
 }
 
 /// Registry of gateways' live control connections, keyed by `relay_node_id`.
@@ -43,26 +43,26 @@ impl ControlRegistry {
     }
 
     /// A gateway registers its control connection under `relay_node_id` (with its
-    /// admitted `instance_key`) and gets the receiver its control loop acts on. A
+    /// admitted `remote_api_key`) and gets the receiver its control loop acts on. A
     /// re-register supersedes a stale connection (reconnect wins).
     pub fn register(
         &self,
         relay_node_id: &str,
-        instance_key: &str,
+        remote_api_key: &str,
     ) -> mpsc::Receiver<ControlSignal> {
         let (tx, rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
         self.instances.lock().insert(
             relay_node_id.to_string(),
             ControlEntry {
                 tx,
-                instance_key: instance_key.to_string(),
+                remote_api_key: remote_api_key.to_string(),
             },
         );
         rx
     }
 
     /// Signal a registered gateway to open a data leg under `relay_key`. Returns
-    /// the gateway's `instance_key` on success (so the caller can meter the
+    /// the gateway's `remote_api_key` on success (so the caller can meter the
     /// resulting leg against it), or `None` if the gateway isn't connected (the
     /// phone's relay attempt then fails fast rather than hanging) or its control
     /// channel is closed.
@@ -72,14 +72,14 @@ impl ControlRegistry {
             .instances
             .lock()
             .get(relay_node_id)
-            .map(|e| (e.tx.clone(), e.instance_key.clone()));
-        let (tx, instance_key) = entry?;
+            .map(|e| (e.tx.clone(), e.remote_api_key.clone()));
+        let (tx, remote_api_key) = entry?;
         tx.send(ControlSignal::OpenDataLeg {
             relay_key: relay_key.to_string(),
         })
         .await
         .ok()
-        .map(|()| instance_key)
+        .map(|()| remote_api_key)
     }
 
     /// Drop a gateway's control connection (on disconnect).
@@ -104,7 +104,7 @@ mod tests {
         let mut rx = reg.register("node-1", "inst-A");
         assert_eq!(reg.connected(), 1);
 
-        // The signal succeeds and reports the gateway's owning instance key.
+        // The signal succeeds and reports the gateway's owning remote_api_key.
         assert_eq!(
             reg.signal_open("node-1", "leg-abc").await,
             Some("inst-A".to_string())

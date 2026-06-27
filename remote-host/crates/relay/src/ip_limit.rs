@@ -1,7 +1,7 @@
 //! Per-client-IP connection-rate limiting for the relay's WS routes.
 //!
 //! The per-rendezvous [`JoinRateLimiter`](crate::serve) throttles leg-stealing on
-//! *one* rendezvous, and the per-instance connection cap
+//! *one* rendezvous, and the per-`remote_api_key` connection cap
 //! ([`ConnectionRegistry`](crate::conns)) bounds an *admitted* gateway — but
 //! neither bounds a single host spraying *connection upgrades* across many
 //! rendezvous/node ids (or failing admission on each), which can still churn

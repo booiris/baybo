@@ -8,3 +8,4 @@ doctest = false
 
 [dependencies]
 parking_lot = { workspace = true }
+chrono = { workspace = true }

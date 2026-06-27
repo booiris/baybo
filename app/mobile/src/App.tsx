@@ -15,7 +15,7 @@ import type { PairedSummary } from "./generated/PairedSummary";
 /// at all.
 const FOREGROUND_RECONNECT_DEBOUNCE_MS = 400;
 
-/// Parse a `baybo://pair?h=<relay>&r=<rendezvous-id>&s=<secret>&k=<instance-key>`
+/// Parse a `baybo://pair?h=<relay>&r=<rendezvous-id>&s=<secret>&k=<remote-api-key>`
 /// QR payload. Both `r` (public rendezvous id) and `s` (the 256-bit secret, the
 /// Noise PSK) are required — there is no typeable fallback, because a short
 /// secret would be offline-crackable by a hostile relay. Pairing is relay-only:
@@ -25,7 +25,7 @@ function parseScan(text: string): {
   endpoint?: string;
   rendezvousId: string;
   secret: string;
-  instanceKey?: string;
+  remoteApiKey?: string;
 } | null {
   try {
     const url = new URL(text);
@@ -34,7 +34,7 @@ function parseScan(text: string): {
       const r = url.searchParams.get("r");
       const s = url.searchParams.get("s");
       const k = url.searchParams.get("k") ?? undefined;
-      if (r && s) return { endpoint: h, rendezvousId: r, secret: s, instanceKey: k };
+      if (r && s) return { endpoint: h, rendezvousId: r, secret: s, remoteApiKey: k };
     }
   } catch {
     /* not a pairing URL */
@@ -413,7 +413,7 @@ export default function App() {
         endpoint: parsed.endpoint ?? DEFAULT_ENDPOINT,
         rendezvousId: parsed.rendezvousId,
         secret: parsed.secret,
-        instanceKey: parsed.instanceKey,
+        remoteApiKey: parsed.remoteApiKey,
       });
     } catch (e) {
       setStatus(scanCancelled.current ? null : `Scan failed: ${e}`);
@@ -439,7 +439,7 @@ export default function App() {
     endpoint: string;
     rendezvousId: string;
     secret: string;
-    instanceKey?: string;
+    remoteApiKey?: string;
   }) {
     setBusy(true);
     setStatus("Connecting…");
@@ -456,7 +456,7 @@ export default function App() {
         endpoint: opts.endpoint,
         rendezvousId: opts.rendezvousId,
         secret: opts.secret,
-        instanceKey: opts.instanceKey,
+        remoteApiKey: opts.remoteApiKey,
         onAbort,
       });
       setChallenge(c);

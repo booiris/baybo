@@ -3,10 +3,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Admission header the gateway presents on the host-side WS upgrades
-/// ([`PAIR_HOST`], [`CONTENT_HOST`]); its value must be an admitted instance key.
-/// The app/phone-side routes carry no credential.
-pub const INSTANCE_KEY_HEADER: &str = "x-instance-key";
+/// Admission header presented on every relay WS upgrade — the gateway host legs
+/// ([`PAIR_HOST`], [`CONTENT_HOST`], [`CONTROL`]) and the phone join legs
+/// ([`PAIR_JOIN`], [`CONTENT_JOIN`]) alike. Its value must be an admitted
+/// `remote_api_key` (the relay's sole anti-abuse credential).
+pub const REMOTE_API_KEY_HEADER: &str = "x-remote-api-key";
 
 /// Route templates (axum-style `{param}` tokens). The server registers these
 /// directly; clients build a concrete URL via the helpers below.
@@ -21,7 +22,7 @@ pub const CONTENT_JOIN: &str = "/content/join/{relay_node_id}";
 pub const CONTENT_HOST: &str = "/content/host/{relay_key}";
 
 /// First binary-JSON frame on [`CONTROL`] (gateway → C): the gateway names
-/// itself by `relay_node_id`. Admission rides the `x-instance-key` header on the
+/// itself by `relay_node_id`. Admission rides the `x-remote-api-key` header on the
 /// dial (the shared pre-layer), like every other route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlHello {

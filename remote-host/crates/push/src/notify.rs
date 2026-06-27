@@ -1,7 +1,7 @@
 //! The `/notify` pipeline: admit → resolve token → sign → send blind → prune.
 //!
 //! A gateway (A) POSTs a [`NotifyRequest`] on every pushable turn. The push
-//! role validates the instance key, looks up the device's APNs token, builds a
+//! role validates the `remote_api_key`, looks up the device's APNs token, builds a
 //! blind payload (a generic visible alert the NSE later rewrites, plus the
 //! verbatim `enc`/`n`/`kid`/`bid`), signs the provider token, and sends via the
 //! [`ApnsSender`] seam — pruning the token on a `400`/`410`. It never decrypts
@@ -16,7 +16,7 @@ use crate::apns::{ApnsOutcome, ApnsRequest, ApnsSender};
 use crate::error::PushError;
 use crate::jwt::ApnsProviderToken;
 use crate::ratelimit::NotifyRateLimiter;
-use crate::store::{Admission, DeviceRegistration, DeviceTokenStore};
+use crate::store::{Admission, Admit, DeviceRegistration, DeviceTokenStore};
 
 /// The `/notify` + `/register` request bodies live in the shared protocol crate,
 /// so the gateway POSTs the exact same shapes (re-exported here for the rest of
@@ -27,7 +27,7 @@ pub use remote_host_protocol::push::{NotifyRequest, RegisterRequest};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterOutcome {
     Registered,
-    /// `instance_key` is not admitted.
+    /// `remote_api_key` is not admitted.
     Unadmitted,
 }
 
@@ -35,9 +35,9 @@ pub enum RegisterOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifyOutcome {
     Delivered,
-    /// `instance_key` is not admitted.
+    /// `remote_api_key` is not admitted.
     Unadmitted,
-    /// `(instance_key, device_id)` is pushing faster than its allowed rate; the
+    /// `(remote_api_key, device_id)` is pushing faster than its allowed rate; the
     /// gateway should back off and retry (`429`).
     RateLimited,
     /// No APNs binding for `device_id`.
@@ -55,7 +55,7 @@ pub struct NotifyService {
     store: Arc<dyn DeviceTokenStore>,
     sender: Arc<dyn ApnsSender>,
     signer: Arc<ApnsProviderToken>,
-    /// Per-`(instance_key, device_id)` frequency control, checked before any APNs
+    /// Per-`(remote_api_key, device_id)` frequency control, checked before any APNs
     /// work so a flood is cheap to refuse.
     rate: NotifyRateLimiter,
     /// The last signed provider JWT and its `iat`, reused across requests until
@@ -100,13 +100,13 @@ impl NotifyService {
     }
 
     /// Bind (or rebind) a device's APNs token, authenticated by the gateway's
-    /// instance key. The push role's only per-device write outside `/notify`.
+    /// `remote_api_key`. The push role's only per-device write outside `/notify`.
     pub fn register(&self, req: RegisterRequest) -> RegisterOutcome {
-        if !self.admission.is_admitted(&req.instance_key) {
+        if !matches!(self.admission.resolve(&req.remote_api_key), Admit::Ok(_)) {
             return RegisterOutcome::Unadmitted;
         }
         self.store.register(
-            &req.instance_key,
+            &req.remote_api_key,
             &req.device_id,
             DeviceRegistration {
                 apns_token: req.apns_token,
@@ -118,7 +118,7 @@ impl NotifyService {
 
     /// Process one notify. `now` (unix seconds) stamps the provider token.
     pub async fn notify(&self, req: NotifyRequest, now: u64) -> NotifyOutcome {
-        if !self.admission.is_admitted(&req.instance_key) {
+        if !matches!(self.admission.resolve(&req.remote_api_key), Admit::Ok(_)) {
             return NotifyOutcome::Unadmitted;
         }
         // Resolve the device BEFORE the rate check: an unknown `device_id` is
@@ -126,11 +126,11 @@ impl NotifyService {
         // the registered-device set (the store) rather than by attacker-supplied
         // `device_id`s — a `/notify` flood of fresh ids can't grow it. There's no
         // egress to bound for an unknown device anyway.
-        let Some(reg) = self.store.get(&req.instance_key, &req.device_id) else {
+        let Some(reg) = self.store.get(&req.remote_api_key, &req.device_id) else {
             return NotifyOutcome::UnknownDevice;
         };
         // Frequency control gates before signing / egress.
-        if !self.rate.check(&req.instance_key, &req.device_id) {
+        if !self.rate.check(&req.remote_api_key, &req.device_id) {
             return NotifyOutcome::RateLimited;
         }
         let jwt = match self.provider_jwt(now) {
@@ -149,7 +149,7 @@ impl NotifyService {
             ApnsOutcome::Delivered => NotifyOutcome::Delivered,
             ApnsOutcome::BadDeviceToken | ApnsOutcome::Unregistered { .. } => {
                 // Unbind the APNs token only — never the gateway's device row.
-                self.store.unbind(&req.instance_key, &req.device_id);
+                self.store.unbind(&req.remote_api_key, &req.device_id);
                 NotifyOutcome::Pruned
             }
             ApnsOutcome::TransientError(e) => NotifyOutcome::Failed(e),
@@ -218,7 +218,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
 
     fn req(instance: &str, device: &str) -> NotifyRequest {
         NotifyRequest {
-            instance_key: instance.into(),
+            remote_api_key: instance.into(),
             device_id: device.into(),
             collapse_id: "dev-1:sess-1".into(),
             kid: 0,
@@ -248,7 +248,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
 
         assert_eq!(
             svc.register(RegisterRequest {
-                instance_key: "inst-A".into(),
+                remote_api_key: "inst-A".into(),
                 device_id: "dev-9".into(),
                 apns_token: "tok-9".into(),
                 env: ApnsEnv::Production,
@@ -266,7 +266,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         // An unadmitted instance can't bind a token.
         assert_eq!(
             svc.register(RegisterRequest {
-                instance_key: "nope".into(),
+                remote_api_key: "nope".into(),
                 device_id: "dev-x".into(),
                 apns_token: "t".into(),
                 env: ApnsEnv::Sandbox,
@@ -277,7 +277,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     }
 
     #[tokio::test]
-    async fn unadmitted_instance_key_rejected() {
+    async fn unadmitted_remote_api_key_rejected() {
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), store);
         assert_eq!(
@@ -457,7 +457,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     }
 
     #[tokio::test]
-    async fn an_instance_cannot_touch_another_tenants_device() {
+    async fn a_key_cannot_touch_another_tenants_device() {
         let store: Arc<dyn DeviceTokenStore> = Arc::new(InMemoryDeviceTokenStore::new());
         store.register(
             "inst-A",
@@ -467,7 +467,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
                 env: ApnsEnv::Sandbox,
             },
         );
-        // Both instances are admitted, but the store partitions by instance, so
+        // Both keys are admitted, but the store partitions by remote_api_key, so
         // inst-B sees no binding for dev-1 — no hijack, no suppression.
         let svc = NotifyService::new(
             Arc::new(InMemoryAdmission::with_keys(["inst-A", "inst-B"])),

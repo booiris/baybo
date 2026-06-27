@@ -72,7 +72,7 @@ pub(crate) struct PairedRecord {
     /// The relay admission key (the QR's `k`) this device presents on the relay
     /// content-join leg. Symmetric with the gateway's host-side key.
     #[serde(default)]
-    pub(crate) instance_key: String,
+    pub(crate) remote_api_key: String,
     /// The app's long-term Noise static identity (its content-session identity):
     /// the secret drives the IK initiator; the public half completes the keypair
     /// `device-proto` expects (snow re-derives it from the secret regardless).
@@ -120,7 +120,7 @@ pub async fn pair_begin(
     endpoint: &str,
     rendezvous_id: &str,
     secret: &str,
-    instance_key: Option<String>,
+    remote_api_key: Option<String>,
     on_abort: Channel<PairAborted>,
 ) -> Result<PairChallenge, String> {
     let base = endpoint.trim_end_matches('/');
@@ -128,7 +128,7 @@ pub async fn pair_begin(
     // id (`/pair/join/{rendezvous_id}`); the operator's `baybo device pair` hosts
     // the other leg on the relay.
     let url = remote_host_protocol::relay::pair_join_url(base, rendezvous_id);
-    let mut ws = connect_pair(&url, instance_key.as_deref()).await?;
+    let mut ws = connect_pair(&url, remote_api_key.as_deref()).await?;
 
     // Decode the QR secret (the Noise PSK). It must be exactly 32 bytes — a
     // short/typeable secret is forbidden (offline-crackable by the relay).
@@ -188,7 +188,7 @@ pub async fn pair_begin(
         client,
         device_id.clone(),
         keypair,
-        instance_key.unwrap_or_default(),
+        remote_api_key.unwrap_or_default(),
         on_abort,
         decision_rx,
         outcome_tx,
@@ -246,7 +246,7 @@ async fn run_pair_pump(
     mut client: PairingClient,
     device_id: String,
     keypair: StaticKeypair,
-    instance_key: String,
+    remote_api_key: String,
     on_abort: Channel<PairAborted>,
     mut decision_rx: oneshot::Receiver<bool>,
     outcome_tx: oneshot::Sender<Result<PairedSummary, String>>,
@@ -299,7 +299,7 @@ async fn run_pair_pump(
         &mut client,
         &device_id,
         &keypair,
-        &instance_key,
+        &remote_api_key,
         accepted,
     )
     .await;
@@ -316,7 +316,7 @@ async fn finish_pair(
     client: &mut PairingClient,
     device_id: &str,
     keypair: &StaticKeypair,
-    instance_key: &str,
+    remote_api_key: &str,
     accepted: bool,
 ) -> Result<PairedSummary, String> {
     let confirm = client.confirm(accepted).map_err(|e| e.to_string())?;
@@ -356,7 +356,7 @@ async fn finish_pair(
         gateway_static_pubkey: paired.gateway_static_pubkey,
         relay_node_id: paired.relay_node_id.clone(),
         relay_url: paired.relay_url.clone(),
-        instance_key: instance_key.to_string(),
+        remote_api_key: remote_api_key.to_string(),
         noise_secret: keypair.secret(),
         noise_public: keypair.public(),
     };
@@ -391,7 +391,7 @@ type Ws =
 
 /// Dial the relay pairing WS. The operator's host leg may not be parked the
 /// instant the app scans, so retry briefly on connect failure.
-async fn connect_pair(url: &str, instance_key: Option<&str>) -> Result<Ws, String> {
+async fn connect_pair(url: &str, remote_api_key: Option<&str>) -> Result<Ws, String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let attempts = 30;
@@ -399,16 +399,16 @@ async fn connect_pair(url: &str, instance_key: Option<&str>) -> Result<Ws, Strin
     for i in 0..attempts {
         // A Request is consumed by `connect_async` and isn't cheaply cloneable,
         // so rebuild it each attempt. On the relay path the app presents the QR's
-        // admission key as `x-instance-key`, matching the gateway's host leg.
+        // admission key as `x-remote-api-key`, matching the gateway's host leg.
         let mut req = match url.into_client_request() {
             Ok(r) => r,
             Err(e) => return Err(format!("bad pairing url {url}: {e}")),
         };
-        if let Some(key) = instance_key {
+        if let Some(key) = remote_api_key {
             match key.parse() {
                 Ok(v) => {
                     req.headers_mut()
-                        .insert(remote_host_protocol::relay::INSTANCE_KEY_HEADER, v);
+                        .insert(remote_host_protocol::relay::REMOTE_API_KEY_HEADER, v);
                 }
                 Err(e) => return Err(format!("bad instance key header: {e}")),
             }

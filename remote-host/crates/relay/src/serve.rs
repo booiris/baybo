@@ -4,15 +4,15 @@
 //! `rendezvous_id`** (a UUID):
 //!
 //! - `GET /pair/host/{rendezvous_id}` — the **gateway** side. Authenticated by
-//!   the gateway's admission key ([`INSTANCE_KEY_HEADER`]); on success it parks a
-//!   leg under `rendezvous_id` and waits for the app.
+//!   the gateway's `remote_api_key` ([`REMOTE_API_KEY_HEADER`]); on success it
+//!   parks a leg under `rendezvous_id` and waits for the app.
 //! - `GET /pair/join/{rendezvous_id}` — the **app** side. Also gated by an
-//!   admitted instance key ([`INSTANCE_KEY_HEADER`], the one the QR carries), so
-//!   only key-holders can use the relay's pairing rendezvous. It [`try_match`]es
+//!   admitted `remote_api_key` ([`REMOTE_API_KEY_HEADER`], the one the QR carries),
+//!   so only key-holders can use the relay's pairing rendezvous. It [`try_match`]es
 //!   an already-hosted rendezvous and is refused if no admitted gateway hosts it.
 //!
 //! Both legs must present an admitted key, but only the gateway's host leg parks
-//! and counts against the per-instance connection cap; the ephemeral app leg
+//! and counts against the per-key connection cap; the ephemeral app leg
 //! does not. C sees only the public `rendezvous_id` and copies opaque Noise
 //! frames blind — the QR **secret** (the pairing handshake's PSK) never reaches
 //! C, so a hostile relay cannot complete the handshake with either side (MITM is
@@ -34,9 +34,9 @@ use axum::http::{HeaderName, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use remote_host_admission::Admission;
+use remote_host_admission::{Admission, AdmissionEntry, Admit};
 use remote_host_protocol::relay::{
-    CONTENT_HOST, CONTENT_JOIN, CONTROL, INSTANCE_KEY_HEADER, PAIR_HOST, PAIR_JOIN,
+    CONTENT_HOST, CONTENT_JOIN, CONTROL, PAIR_HOST, PAIR_JOIN, REMOTE_API_KEY_HEADER,
 };
 
 use crate::bandwidth::BandwidthRegistry;
@@ -170,12 +170,20 @@ struct RelayState {
     admitted: Arc<dyn Admission>,
     /// Live gateway control connections, keyed by `relay_node_id`.
     control: Arc<ControlRegistry>,
-    /// Live admission-gated connections keyed by instance key, so an admission
+    /// Live admission-gated connections keyed by `remote_api_key`, so an admission
     /// hot-reload can drop the connections of a revoked key.
     conns: Arc<ConnectionRegistry>,
-    /// Per-instance content-bandwidth buckets; content legs throttle against the
-    /// owning gateway's bucket (pairing legs are tiny and unthrottled).
+    /// Two-level content-bandwidth buckets (per-`remote_api_key` ceiling ∧
+    /// per-`(key, server)` sub-cap); content legs throttle against the owning
+    /// gateway's buckets (pairing legs are tiny and unthrottled).
     bandwidth: Arc<BandwidthRegistry>,
+    /// `relay_key` → `relay_node_id` (the `server_id`) for content legs awaiting
+    /// their gateway host. The phone's content-join writes it (it knows both);
+    /// the gateway's content-host reads it to meter the leg against the right
+    /// per-server bandwidth bucket (the host dial carries only the `relay_key`).
+    /// Removed when the host claims it, on a signaling failure, or when the
+    /// phone leg ends unclaimed — so it never leaks.
+    pending_content_legs: Arc<parking_lot::Mutex<HashMap<String, String>>>,
     /// Monotonic source of per-data-leg `relay_key`s. Uniqueness (not secrecy)
     /// is all that's needed: the content-host route is admission-gated, so a
     /// guessed key can't be hosted by anyone but the real gateway.
@@ -191,9 +199,9 @@ struct RelayState {
 }
 
 /// Assemble the relay router. `admission` is the shared, hot-reloaded allow-list
-/// of admitted gateway instance keys; `conns` tracks live connections so a
-/// revoke (an admission reload that dropped a key) can kick them; `bandwidth`
-/// throttles each gateway's aggregate content throughput.
+/// of admitted `remote_api_key`s; `conns` tracks live connections so a revoke (an
+/// admission reload that dropped a key) can kick them; `bandwidth` throttles each
+/// gateway's content throughput at two levels (per key ∧ per server).
 ///
 /// `ip_limit` configures the per-source-IP upgrade throttle (see
 /// [`IpRateLimiter`] / [`IpLimitConfig`]). Enable it keying on the socket peer
@@ -213,12 +221,13 @@ pub fn build_router(
         control: Arc::new(ControlRegistry::new()),
         conns,
         bandwidth,
+        pending_content_legs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         seq: Arc::new(AtomicU64::new(0)),
         join_limiter: Arc::new(JoinRateLimiter::default()),
         ip_limiter: Arc::new(IpRateLimiter::new()),
         ip_trusted_headers: Arc::new(ip_limit.trusted_headers),
     };
-    // Every route admits via the shared `x-instance-key` pre-layer — including
+    // Every route admits via the shared `x-remote-api-key` pre-layer — including
     // `/control`, whose key now rides the dial header too (its hello carries only
     // the relay_node_id).
     let router = Router::new()
@@ -290,9 +299,15 @@ async fn limit_per_ip(State(state): State<RelayState>, req: Request, next: Next)
     next.run(req).await
 }
 
-/// `401 Unauthorized` for a missing or unadmitted instance key.
+/// `401 Unauthorized` for a missing or unadmitted `remote_api_key`.
 fn unadmitted() -> Response {
-    (StatusCode::UNAUTHORIZED, "instance key not admitted").into_response()
+    (StatusCode::UNAUTHORIZED, "remote_api_key not admitted").into_response()
+}
+
+/// TOCTOU recheck used by the host handlers: a key admitted by the pre-layer may
+/// have been revoked before the handler registered its connection.
+fn still_admitted(admission: &dyn Admission, remote_api_key: &str) -> bool {
+    matches!(admission.resolve(remote_api_key), Admit::Ok(_))
 }
 
 /// `503 Service Unavailable` when the broker's parked-leg ceiling is reached —
@@ -309,16 +324,19 @@ fn host_occupied() -> Response {
     (StatusCode::CONFLICT, "rendezvous already hosted").into_response()
 }
 
-/// The admitted instance key for a request, stashed by [`require_admitted`] so
-/// the handlers that meter on it (the connection cap / bandwidth bucket) can read
-/// it back as an `Extension`.
+/// The admitted `remote_api_key` for a request plus its resolved limits, stashed by
+/// [`require_admitted`] so the handlers that meter on it (the connection cap /
+/// bandwidth buckets) can read it back as an `Extension` without re-resolving.
 #[derive(Clone)]
-struct AdmittedKey(String);
+struct Admitted {
+    remote_api_key: String,
+    entry: AdmissionEntry,
+}
 
-/// Admission pre-layer for the header-gated routes: `401` unless `x-instance-key`
-/// is present and admitted, then stash the validated key as an [`AdmittedKey`]
-/// extension. `/control` admits via its WS hello frame, so it is not behind this
-/// layer.
+/// Admission pre-layer for the header-gated routes: `401` unless `x-remote-api-key`
+/// resolves to an admitted, unexpired key, then stash the key + its limits as an
+/// [`Admitted`] extension. `/control` admits via this same layer (its key rides the
+/// dial header; the WS hello carries only the `relay_node_id`).
 async fn require_admitted(
     State(state): State<RelayState>,
     mut req: Request,
@@ -326,35 +344,43 @@ async fn require_admitted(
 ) -> Response {
     let Some(key) = req
         .headers()
-        .get(INSTANCE_KEY_HEADER)
+        .get(REMOTE_API_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned())
     else {
         return unadmitted();
     };
-    if !state.admitted.is_admitted(key) {
-        return unadmitted();
+    match state.admitted.resolve(&key) {
+        Admit::Ok(entry) => {
+            req.extensions_mut().insert(Admitted {
+                remote_api_key: key,
+                entry,
+            });
+            next.run(req).await
+        }
+        Admit::Unknown | Admit::Expired => unadmitted(),
     }
-    let key = key.to_owned();
-    req.extensions_mut().insert(AdmittedKey(key));
-    next.run(req).await
 }
 
-/// Gateway side: the admission pre-layer authenticates the instance key, then we
-/// park a leg under `rendezvous_id`.
+/// Gateway side: the admission pre-layer authenticates the `remote_api_key`, then
+/// we park a leg under `rendezvous_id`.
 async fn host_handler(
     Path(rendezvous_id): Path<String>,
     State(state): State<RelayState>,
-    Extension(AdmittedKey(key)): Extension<AdmittedKey>,
+    Extension(Admitted {
+        remote_api_key: key,
+        entry,
+    }): Extension<Admitted>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Cap how many connections one instance key may hold (control + legs).
+    // Cap how many connections one remote_api_key may hold (control + legs).
     let Some((guard, kick)) = state
         .conns
-        .register(&key, state.admitted.max_conns(&key).map(|c| c as usize))
+        .register(&key, entry.max_conns.map(|c| c as usize))
     else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            "instance connection limit reached",
+            "connection limit reached for this remote_api_key",
         )
             .into_response();
     };
@@ -362,12 +388,12 @@ async fn host_handler(
     // above and registering, a concurrent kick may have already passed us by, and
     // future polls won't re-target an already-removed key — so re-check and abort
     // rather than linger un-kicked. (`guard` drops here, deregistering.)
-    if !state.admitted.is_admitted(&key) {
+    if !still_admitted(state.admitted.as_ref(), &key) {
         return unadmitted();
     }
     // Park-only: the host never matches an existing half, so two host legs on the
     // same (public) rendezvous id can't be spliced to each other — a second one is
-    // refused `409` and its `guard` drops here, freeing the per-instance slot.
+    // refused `409` and its `guard` drops here, freeing the per-key slot.
     let leg = match state.broker.park(&rendezvous_id) {
         ParkOutcome::Parked(leg) => leg,
         ParkOutcome::Occupied => return host_occupied(),
@@ -379,7 +405,7 @@ async fn host_handler(
         tokio::select! {
             // Pairing frames are tiny opaque Noise blobs — not bandwidth-throttled.
             _ = pump_ws(socket, leg, None) => {}
-            // The gateway's instance key was revoked mid-connection.
+            // The gateway's remote_api_key was revoked mid-connection.
             _ = kick => {}
         }
         // If the app never matched (the host disconnected first), drop the
@@ -393,7 +419,7 @@ async fn host_handler(
 /// App side: match an already-hosted code; never park. Symmetric admission — the
 /// pre-layer requires the app to present an admitted key too (the one the QR
 /// carries). The phone leg is ephemeral, so — unlike the host leg — it is not
-/// registered against the gateway's per-instance connection cap.
+/// registered against the gateway's per-key connection cap.
 async fn join_handler(
     Path(rendezvous_id): Path<String>,
     State(state): State<RelayState>,
@@ -418,12 +444,15 @@ async fn join_handler(
 }
 
 /// Gateway control connection. The admission pre-layer authenticates the
-/// `x-instance-key` header; the gateway then holds the WS open, naming itself
+/// `x-remote-api-key` header; the gateway then holds the WS open, naming itself
 /// with a [`ControlHello`] (`relay_node_id`). C pushes `ControlSignal`s ("a phone
 /// arrived, open a data leg") over it.
 async fn control_handler(
     State(state): State<RelayState>,
-    Extension(AdmittedKey(key)): Extension<AdmittedKey>,
+    Extension(Admitted {
+        remote_api_key: key,
+        ..
+    }): Extension<Admitted>,
     ws: WebSocketUpgrade,
 ) -> Response {
     capped(ws).on_upgrade(move |socket| run_control(socket, state, key))
@@ -446,7 +475,7 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
     let (_kick_guard, mut kick) = state.conns.register_unchecked(&key);
     // Close the TOCTOU window (see the host handlers): the pre-layer admitted the
     // key, but a concurrent revoke's kick may have run before we registered.
-    if !state.admitted.is_admitted(&key) {
+    if !still_admitted(state.admitted.as_ref(), &key) {
         return;
     }
     let mut rx = state.control.register(&hello.relay_node_id, &key);
@@ -455,9 +484,9 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
     let mut superseded = false;
     loop {
         tokio::select! {
-            // The gateway's instance key was revoked (admission hot-reload).
+            // The gateway's remote_api_key was revoked (admission hot-reload).
             _ = &mut kick => {
-                tracing::info!(node = %hello.relay_node_id, "control: instance key revoked; closing");
+                tracing::info!(node = %hello.relay_node_id, "control: remote_api_key revoked; closing");
                 break;
             }
             sig = rx.recv() => match sig {
@@ -506,25 +535,47 @@ async fn content_join_handler(
     ws: WebSocketUpgrade,
 ) -> Response {
     let relay_key = format!("dl-{}", state.seq.fetch_add(1, Ordering::Relaxed));
+    // Record this leg's server (the relay_node_id) so the gateway's content-host —
+    // whose dial carries only the relay_key — can meter against the right per-server
+    // bucket. Inserted *before* signaling, since the signal is what makes the
+    // gateway dial host (which could otherwise race ahead of this write).
+    state
+        .pending_content_legs
+        .lock()
+        .insert(relay_key.clone(), relay_node_id.clone());
     // The phone leg is admitted by the pre-layer like every other route, but
-    // metering keys on the *gateway's* instance key (resolved by signaling) so
-    // both legs of a content session share one bandwidth bucket.
-    let Some(instance_key) = state.control.signal_open(&relay_node_id, &relay_key).await else {
+    // metering keys on the *gateway's* remote_api_key (resolved by signaling) and
+    // its server, so both legs of a content session share one bucket pair.
+    let Some(remote_api_key) = state.control.signal_open(&relay_node_id, &relay_key).await else {
+        // No gateway connected, so nobody will claim this leg — don't leak the map.
+        state.pending_content_legs.lock().remove(&relay_key);
         // The route exists and the key is admitted — the named gateway just holds
         // no control connection right now (offline, or mid-reconnect). 503, not
         // 404, so the phone tells "gateway offline, retry" apart from a route-miss.
         return (StatusCode::SERVICE_UNAVAILABLE, "gateway not connected").into_response();
     };
-    let limiter = state
-        .bandwidth
-        .limiter_for(&instance_key, state.admitted.max_bps(&instance_key));
+    // Pull the gateway key's limits; if it was revoked since it registered control,
+    // fall back to the role floor (the conn kick tears the session down anyway).
+    let (max_bps, per_server_max_bps) = match state.admitted.resolve(&remote_api_key) {
+        Admit::Ok(e) => (e.max_bps, e.per_server_max_bps),
+        Admit::Unknown | Admit::Expired => (None, None),
+    };
+    let limiter =
+        state
+            .bandwidth
+            .limiter_for(&remote_api_key, &relay_node_id, max_bps, per_server_max_bps);
     let Some(leg) = state.broker.join(&relay_key) else {
+        state.pending_content_legs.lock().remove(&relay_key);
         return at_capacity();
     };
     let broker = Arc::clone(&state.broker);
+    let pending = Arc::clone(&state.pending_content_legs);
     capped(ws).on_upgrade(move |socket| async move {
         pump_ws(socket, leg, Some(limiter)).await;
         broker.cancel(&relay_key);
+        // Backstop: if the gateway host never claimed this leg, drop the mapping so
+        // it can't linger after the phone leg ends.
+        pending.lock().remove(&relay_key);
     })
 }
 
@@ -535,17 +586,20 @@ async fn content_join_handler(
 async fn content_host_handler(
     Path(relay_key): Path<String>,
     State(state): State<RelayState>,
-    Extension(AdmittedKey(key)): Extension<AdmittedKey>,
+    Extension(Admitted {
+        remote_api_key: key,
+        entry,
+    }): Extension<Admitted>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Cap how many connections one instance key may hold (control + legs).
+    // Cap how many connections one remote_api_key may hold (control + legs).
     let Some((guard, kick)) = state
         .conns
-        .register(&key, state.admitted.max_conns(&key).map(|c| c as usize))
+        .register(&key, entry.max_conns.map(|c| c as usize))
     else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            "instance connection limit reached",
+            "connection limit reached for this remote_api_key",
         )
             .into_response();
     };
@@ -553,12 +607,23 @@ async fn content_host_handler(
     // above and registering, a concurrent kick may have already passed us by, and
     // future polls won't re-target an already-removed key — so re-check and abort
     // rather than linger un-kicked. (`guard` drops here, deregistering.)
-    if !state.admitted.is_admitted(&key) {
+    if !still_admitted(state.admitted.as_ref(), &key) {
         return unadmitted();
     }
-    let limiter = state
-        .bandwidth
-        .limiter_for(&key, state.admitted.max_bps(&key));
+    // Recover the server (relay_node_id) the phone-side recorded for this leg, so
+    // both legs meter against the same per-server bucket. Removing it here is the
+    // claim (the phone-side backstop only fires if we never do). A miss (the phone
+    // leg ended first) falls back to a per-leg id — harmless, since the broker.join
+    // below then finds no parked phone half and the leg is refused.
+    let server_id = state
+        .pending_content_legs
+        .lock()
+        .remove(&relay_key)
+        .unwrap_or_else(|| relay_key.clone());
+    let limiter =
+        state
+            .bandwidth
+            .limiter_for(&key, &server_id, entry.max_bps, entry.per_server_max_bps);
     let Some(leg) = state.broker.join(&relay_key) else {
         return at_capacity();
     };
@@ -567,7 +632,7 @@ async fn content_host_handler(
         let _guard = guard;
         tokio::select! {
             _ = pump_ws(socket, leg, Some(limiter)) => {}
-            // The gateway's instance key was revoked mid-session.
+            // The gateway's remote_api_key was revoked mid-session.
             _ = kick => {}
         }
         broker.cancel(&relay_key);
@@ -671,7 +736,7 @@ mod tests {
             .unwrap();
         if let Some(k) = key {
             req.headers_mut()
-                .insert(INSTANCE_KEY_HEADER, k.parse().unwrap());
+                .insert(REMOTE_API_KEY_HEADER, k.parse().unwrap());
         }
         client_async(req, stream).await.unwrap().0
     }
@@ -687,7 +752,7 @@ mod tests {
             .unwrap();
         if let Some(k) = key {
             req.headers_mut()
-                .insert(INSTANCE_KEY_HEADER, k.parse().unwrap());
+                .insert(REMOTE_API_KEY_HEADER, k.parse().unwrap());
         }
         Ok(client_async(req, stream).await?.0)
     }
@@ -753,7 +818,7 @@ mod tests {
             .into_client_request()
             .unwrap();
         req.headers_mut()
-            .insert(INSTANCE_KEY_HEADER, "inst-A".parse().unwrap());
+            .insert(REMOTE_API_KEY_HEADER, "inst-A".parse().unwrap());
         match client_async(req, stream).await {
             Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::CONFLICT),
             other => panic!("expected 409 for a second host, got {other:?}"),
@@ -774,7 +839,7 @@ mod tests {
         let req = format!("ws://127.0.0.1:{port}/pair/host/CODE2")
             .into_client_request()
             .unwrap();
-        // No instance-key header → the upgrade is refused with 401.
+        // No remote-api-key header → the upgrade is refused with 401.
         match client_async(req, stream).await {
             Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::UNAUTHORIZED),
             other => panic!("expected 401, got {other:?}"),
@@ -944,7 +1009,7 @@ mod tests {
             .unwrap();
         if let Some(k) = key {
             req.headers_mut()
-                .insert(INSTANCE_KEY_HEADER, k.parse().unwrap());
+                .insert(REMOTE_API_KEY_HEADER, k.parse().unwrap());
         }
         Ok(client_async(req, stream).await?.0)
     }
@@ -960,7 +1025,7 @@ mod tests {
             .unwrap();
         if let Some(k) = key {
             req.headers_mut()
-                .insert(INSTANCE_KEY_HEADER, k.parse().unwrap());
+                .insert(REMOTE_API_KEY_HEADER, k.parse().unwrap());
         }
         Ok(client_async(req, stream).await?.0)
     }
@@ -968,14 +1033,14 @@ mod tests {
     async fn connect_content_host(
         port: u16,
         key: &str,
-        instance_key: &str,
+        remote_api_key: &str,
     ) -> WebSocketStream<TcpStream> {
         let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let mut req = format!("ws://127.0.0.1:{port}/content/host/{key}")
             .into_client_request()
             .unwrap();
         req.headers_mut()
-            .insert(INSTANCE_KEY_HEADER, instance_key.parse().unwrap());
+            .insert(REMOTE_API_KEY_HEADER, remote_api_key.parse().unwrap());
         client_async(req, stream).await.unwrap().0
     }
 
@@ -1074,7 +1139,7 @@ mod tests {
         }
     }
 
-    /// Revoking an admitted gateway's instance key (an admission reload that
+    /// Revoking an admitted gateway's remote_api_key (an admission reload that
     /// dropped it) kicks its already-live control connection, not just future
     /// dials.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

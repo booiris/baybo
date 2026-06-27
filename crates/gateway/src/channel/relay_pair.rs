@@ -24,7 +24,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use remote_host_protocol::relay::INSTANCE_KEY_HEADER;
+use remote_host_protocol::relay::REMOTE_API_KEY_HEADER;
 
 use super::device_pair::{PairTransport, PairingHostDeps, drive};
 
@@ -75,19 +75,19 @@ enum LegEnd {
     Handshake(String),
 }
 
-/// Open a single `/pair/host/{rendezvous_id}` leg authenticated by `instance_key`
+/// Open a single `/pair/host/{rendezvous_id}` leg authenticated by `remote_api_key`
 /// and run one pairing handshake over it.
 async fn host_leg_once(
     deps: &PairingHostDeps,
     relay_url: &str,
-    instance_key: &str,
+    remote_api_key: &str,
     rendezvous_id: &str,
 ) -> LegEnd {
     let url = remote_host_protocol::relay::pair_host_url(relay_url, rendezvous_id);
     let req = match url.into_client_request() {
-        Ok(mut req) => match instance_key.parse() {
+        Ok(mut req) => match remote_api_key.parse() {
             Ok(value) => {
-                req.headers_mut().insert(INSTANCE_KEY_HEADER, value);
+                req.headers_mut().insert(REMOTE_API_KEY_HEADER, value);
                 req
             }
             Err(e) => return LegEnd::Connect(format!("bad instance key header: {e}")),
@@ -117,7 +117,7 @@ async fn host_leg_once(
 /// see [`host_pairing_leg`].
 const REHOST_BACKOFF: Duration = Duration::from_millis(500);
 
-/// Host `/pair/host/{rendezvous_id}` on `relay_url` with `instance_key` and run
+/// Host `/pair/host/{rendezvous_id}` on `relay_url` with `remote_api_key` and run
 /// the pairing handshake, re-opening the leg while the slot stays live (the
 /// operator may not have shown the QR yet, or a leg may time out / be stolen).
 /// Returns `Ok(())` once a handshake completes, or `Err` once the slot is gone
@@ -126,7 +126,7 @@ const REHOST_BACKOFF: Duration = Duration::from_millis(500);
 pub async fn host_pairing_leg(
     deps: &PairingHostDeps,
     relay_url: &str,
-    instance_key: &str,
+    remote_api_key: &str,
     rendezvous_id: &str,
 ) -> Result<(), String> {
     // `baybo device pair` calls this from the CLI process — outside the gateway
@@ -139,7 +139,7 @@ pub async fn host_pairing_leg(
         // Keep whether this was a handshake abort (re-park now) or a connect
         // failure (back off) alongside the reason, so there is one source of truth.
         let (reason, handshake_abort) =
-            match host_leg_once(deps, relay_url, instance_key, rendezvous_id).await {
+            match host_leg_once(deps, relay_url, remote_api_key, rendezvous_id).await {
                 LegEnd::Done => return Ok(()),
                 LegEnd::Handshake(reason) => (reason, true),
                 LegEnd::Connect(reason) => (reason, false),

@@ -132,7 +132,7 @@ pub trait ApnsRegistrar: Send + Sync {
     async fn register_device(
         &self,
         register_url: &str,
-        instance_key: &str,
+        remote_api_key: &str,
         device_id: &str,
         apns_token: &str,
         env: device_proto::pairing::ApnsEnv,
@@ -160,13 +160,13 @@ impl ApnsRegistrar for HttpApnsRegistrar {
     async fn register_device(
         &self,
         register_url: &str,
-        instance_key: &str,
+        remote_api_key: &str,
         device_id: &str,
         apns_token: &str,
         env: device_proto::pairing::ApnsEnv,
     ) -> Result<(), String> {
         let body = RegisterRequest {
-            instance_key: instance_key.to_string(),
+            remote_api_key: remote_api_key.to_string(),
             device_id: device_id.to_string(),
             apns_token: apns_token.to_string(),
             env: to_wire_env(env),
@@ -301,7 +301,7 @@ impl PushDispatcher {
         self.ensure_registered(device, &base).await;
         let key = self.load_push_key(&device.device_id).await?;
         let body = build_notify_body(
-            &device.instance_key,
+            &device.remote_api_key,
             &device.device_id,
             session_id,
             &key,
@@ -341,7 +341,7 @@ impl PushDispatcher {
         match registrar
             .register_device(
                 &register_url,
-                &device.instance_key,
+                &device.remote_api_key,
                 device_id,
                 &reg.apns_token,
                 reg.apns_env,
@@ -422,7 +422,7 @@ fn preview_json(text: Option<&str>) -> String {
 /// `/notify` body. Extracted so the encrypt path is unit-testable without any
 /// stores.
 fn build_notify_body(
-    instance_key: &str,
+    remote_api_key: &str,
     device_id: &str,
     session_id: &SessionId,
     key: &[u8; aead::KEY_LEN],
@@ -432,7 +432,7 @@ fn build_notify_body(
         aead::seal(key, preview.as_bytes()).map_err(|e| format!("seal: {e}"))?;
     let b64 = base64::engine::general_purpose::STANDARD;
     Ok(NotifyRequest {
-        instance_key: instance_key.to_string(),
+        remote_api_key: remote_api_key.to_string(),
         device_id: device_id.to_string(),
         collapse_id: format!("{device_id}:{session_id}"),
         kid: PHASE1_KID,
@@ -557,7 +557,7 @@ mod tests {
         let body = build_notify_body("inst-A", "dev-1", &SessionId::from("sess-7"), &key, preview)
             .unwrap();
 
-        assert_eq!(body.instance_key, "inst-A");
+        assert_eq!(body.remote_api_key, "inst-A");
         assert_eq!(body.device_id, "dev-1");
         assert_eq!(body.bid, "dev-1");
         assert_eq!(body.collapse_id, "dev-1:sess-7");
@@ -598,13 +598,13 @@ mod tests {
     #[test]
     fn register_body_matches_remote_host_wire_shape() {
         let body = RegisterRequest {
-            instance_key: "inst-A".into(),
+            remote_api_key: "inst-A".into(),
             device_id: "dev-1".into(),
             apns_token: "tok".into(),
             env: remote_host_protocol::push::ApnsEnv::Sandbox,
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
-        assert_eq!(v["instance_key"], "inst-A");
+        assert_eq!(v["remote_api_key"], "inst-A");
         assert_eq!(v["device_id"], "dev-1");
         assert_eq!(v["apns_token"], "tok");
         // Must serialize the same as the push role's RegisterRequest.env.

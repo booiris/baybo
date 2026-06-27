@@ -519,7 +519,7 @@ impl LibsqlPool {
                     approved_at   INTEGER,
                     last_seen_at  INTEGER,
                     relay_url     TEXT    NOT NULL DEFAULT '',
-                    instance_key  TEXT    NOT NULL DEFAULT '',
+                    remote_api_key  TEXT    NOT NULL DEFAULT '',
                     PRIMARY KEY (device_id)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_auth_token
@@ -550,7 +550,7 @@ impl LibsqlPool {
             "ALTER TABLE cost_records ADD COLUMN reason TEXT",
             "ALTER TABLE sessions ADD COLUMN folder_id TEXT",
             "ALTER TABLE devices ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE devices ADD COLUMN instance_key TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE devices ADD COLUMN remote_api_key TEXT NOT NULL DEFAULT ''",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {

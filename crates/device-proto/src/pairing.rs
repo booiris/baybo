@@ -60,7 +60,7 @@ pub struct DeviceHello {
 pub struct GatewayWelcome {
     /// Non-secret routing id the app uses to reach a NAT'd A via the blind
     /// relay (the gateway's stable `relay_node_id`). P never holds A's
-    /// `instance_key`. Empty when the gateway has no relay configured.
+    /// `remote_api_key`. Empty when the gateway has no relay configured.
     pub relay_node_id: String,
     /// Base WS URL of the blind relay (C), e.g. `wss://proxy.baybo.space`. The app
     /// dials `{relay_url}/content/join/{relay_node_id}` to reach the (possibly

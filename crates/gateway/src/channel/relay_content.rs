@@ -10,7 +10,7 @@
 //! There is **no `relay` config block**: the manager is driven by the single
 //! approved device row (one gateway = one app). It idles until a device is
 //! paired, then dials the relay URL + admission key recorded on that row at
-//! pairing ([`baybo_store::DeviceRow::relay_url`] / `instance_key`), re-dialing
+//! pairing ([`baybo_store::DeviceRow::relay_url`] / `remote_api_key`), re-dialing
 //! with a fixed backoff after any drop. When the device is revoked the control
 //! connection is torn down promptly, so the gateway stops advertising a route it
 //! can no longer authenticate a content session for.
@@ -26,8 +26,8 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use super::device_content::run_content_over_relay;
-use super::state::WsChannelState;
-use remote_host_protocol::relay::INSTANCE_KEY_HEADER;
+use super::state::{LegDedup, WsChannelState};
+use remote_host_protocol::relay::REMOTE_API_KEY_HEADER;
 
 use crate::relay::{ControlHello, ControlSignal, connect_control, load_or_create_relay_node_id};
 
@@ -57,7 +57,7 @@ const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// approved device row.
 struct RelaySettings {
     relay_url: String,
-    instance_key: String,
+    remote_api_key: String,
 }
 
 /// Resolve the relay settings from the approved device row (one gateway = one
@@ -71,12 +71,12 @@ async fn approved_relay_settings(state: &WsChannelState) -> Option<RelaySettings
         .ok()?
         .into_iter()
         .next()?;
-    if row.relay_url.is_empty() || row.instance_key.is_empty() {
+    if row.relay_url.is_empty() || row.remote_api_key.is_empty() {
         return None;
     }
     Some(RelaySettings {
         relay_url: row.relay_url,
-        instance_key: row.instance_key,
+        remote_api_key: row.remote_api_key,
     })
 }
 
@@ -159,8 +159,8 @@ async fn run_once(
             relay_node_id: relay_node_id.to_owned(),
         };
         let control_url = control_url.to_owned();
-        let instance_key = settings.instance_key.clone();
-        async move { connect_control(&control_url, &instance_key, &hello, tx).await }
+        let remote_api_key = settings.remote_api_key.clone();
+        async move { connect_control(&control_url, &remote_api_key, &hello, tx).await }
     });
 
     // In-flight content data legs. Tracked (not detached) so they're aborted when
@@ -182,10 +182,15 @@ async fn run_once(
                 Some(ControlSignal::OpenDataLeg { relay_key }) => {
                     let state = state.clone();
                     let relay_url = settings.relay_url.clone();
-                    let instance_key = settings.instance_key.clone();
-                    legs.spawn(async move {
-                        open_data_leg(&state, &relay_url, &instance_key, &relay_key).await;
+                    let remote_api_key = settings.remote_api_key.clone();
+                    // Hand the leg its own AbortHandle over a oneshot so the content
+                    // session can register it in the device-dedup registry once Noise
+                    // resolves the device_id — and a newer leg can abort this one.
+                    let (ah_tx, ah_rx) = tokio::sync::oneshot::channel();
+                    let abort = legs.spawn(async move {
+                        open_data_leg(&state, &relay_url, &remote_api_key, &relay_key, ah_rx).await;
                     });
+                    let _ = ah_tx.send(abort);
                 }
                 // The control connection closed (the pump dropped `tx`).
                 None => break,
@@ -223,11 +228,15 @@ async fn run_once(
 }
 
 /// Dial a content data leg for `relay_key` and run the Noise content responder.
+/// `ah_rx` delivers this task's own [`AbortHandle`](tokio::task::AbortHandle) (sent
+/// by the spawner), which the content session registers in the device-dedup
+/// registry once it resolves the `device_id`.
 async fn open_data_leg(
     state: &WsChannelState,
     relay_url: &str,
-    instance_key: &str,
+    remote_api_key: &str,
     relay_key: &str,
+    ah_rx: tokio::sync::oneshot::Receiver<tokio::task::AbortHandle>,
 ) {
     let url = remote_host_protocol::relay::content_host_url(relay_url, relay_key);
     let mut req = match url.into_client_request() {
@@ -237,12 +246,12 @@ async fn open_data_leg(
             return;
         }
     };
-    match instance_key.parse() {
+    match remote_api_key.parse() {
         Ok(v) => {
-            req.headers_mut().insert(INSTANCE_KEY_HEADER, v);
+            req.headers_mut().insert(REMOTE_API_KEY_HEADER, v);
         }
         Err(e) => {
-            tracing::warn!(error = %e, "relay-content: bad instance key header");
+            tracing::warn!(error = %e, "relay-content: bad remote_api_key header");
             return;
         }
     }
@@ -253,7 +262,13 @@ async fn open_data_leg(
             return;
         }
     };
-    run_content_over_relay(ws, state).await;
+    // Learn our own AbortHandle (sent immediately after spawn) so the session can
+    // dedup this device's legs; if it never arrives, run without dedup.
+    let dedup = ah_rx.await.ok().map(|abort| LegDedup {
+        registry: state.device_leg_registry.clone(),
+        abort,
+    });
+    run_content_over_relay(ws, state, dedup).await;
 }
 
 #[cfg(test)]
