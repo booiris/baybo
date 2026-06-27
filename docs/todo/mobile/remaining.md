@@ -105,14 +105,18 @@ falls back to the gateway's out-of-band re-registration. Compiles + clippy-clean
 for host and `aarch64-apple-ios-sim`; real end-to-end delivery still needs #4
 (paid account + device).
 
-### 4. External blockers (need resources, not just code)
+### 4. External blockers (need resources, not just code) ✅ verified end-to-end
 
-- **M4 real end-to-end APNs delivery**: paid Apple Developer account + a real
-  device (the simulator can't receive real APNs).
-- **App Group keychain / provisioned, code-signed build**: paid account + Xcode
-  automatic signing, so the NSE can read the push key on-device (see the
-  empirical boundary notes in `phase1.md`). Until then the live NSE decrypt path
-  is unverifiable.
+The code side was always ready (token capture, keychain `SecItemAdd`, NSE target,
+`DeviceHello.apns_token` injection); these only ever needed external resources.
+Both are now **verified working** on a real provisioned build/device by the
+operator:
+
+- **M4 real end-to-end APNs delivery** — exercised with a paid Apple Developer
+  account + a real device (the simulator can't receive real APNs).
+- **App Group keychain on a provisioned, code-signed build** — the NSE reads the
+  push key on-device and decrypts the blind preview (see the empirical boundary
+  notes in `phase1.md`).
 
 ### 5. Hardening / smaller follow-ups
 
@@ -122,34 +126,51 @@ for host and `aarch64-apple-ios-sim`; real end-to-end delivery still needs #4
   `broker.join` (its `on_upgrade` cancel never runs) or a no-show gateway can't
   grow the pending map without bound. (`remote-host/crates/relay/src/broker.rs`,
   `sweep`.)
-- **Relay flood / rate-limiting** — lower priority now: `/pair/join` uses
-  `try_match` (never parks); `/content/join` parks only *after* `signal_open`
-  succeeds for a currently-connected gateway, and that gateway's control channel
-  is capped (32), so the park rate is already throttled; the TTL sweep bounds any
-  residue. A dedicated per-IP limiter / hard pending-cap remains optional.
-- **Graceful shutdown for the relay managers** — lower value now: the managers
-  (`relay_pair`, `relay_content`) spawn detached child tasks (per-slot pairing
-  drives, the content control pump), so a correct drain would track + abort them,
-  and the gateway process exits moments after the shutdown signal regardless. C
-  already self-heals from an abrupt gateway disconnect (the control idle-timeout
-  + the broker TTL sweep above), so the residual benefit is small.
-- **No automated cross-workspace e2e** for relay pairing/content (relay and
-  gateway are separate Cargo workspaces); each side is unit/integration-tested,
-  but the spliced path is only proven on deployment. A harness that boots
-  `remote-host` + a test gateway + a mock app would close this.
+- **Relay flood / rate-limiting** ✅ done — on top of the existing throttles
+  (`/pair/join` `try_match` never parks; `/content/join` parks only *after*
+  `signal_open` for a connected gateway; the per-instance connection cap; the
+  per-rendezvous `/pair/join` limiter; the TTL sweep) the relay now adds the two
+  formerly-optional pieces: a **hard `MAX_PENDING_LEGS` ceiling** on the broker's
+  pending map (`broker.rs` — a new park past the cap is refused `503`, while
+  matching an already-parked leg is exempt) and a **per-source-IP upgrade limiter**
+  (`relay/src/ip_limit.rs`, a `TokenBucket` registry keyed on `IpAddr`) mounted as
+  the outermost layer ahead of admission (`serve.rs` `limit_per_ip`). The IP
+  limiter defaults on (the server now serves with `ConnectInfo<SocketAddr>`) and is
+  disabled with `RELAY_PER_IP_LIMIT=0` behind a TLS terminator, where the peer is
+  the proxy.
+- **Graceful shutdown for the relay managers** ✅ done — `relay_content`'s manager
+  is no longer a detached fire-and-forget from `GatewayServer::new`. It takes a
+  `ShutdownSignal`, is spawned + tracked by the shared `task_tracker` in
+  `gateway_cmd.rs` (via `baybo_gateway::spawn_relay_content`), and owns its child
+  tasks: the control pump (a `JoinHandle`, aborted on revoke/shutdown) and the
+  per-signal content data legs (a `tokio::task::JoinSet`, reaped as they finish and
+  drained on return). The idle and reconnect-backoff waits also select on shutdown
+  so it stops promptly. (`relay_pair` is CLI-driven — `baybo device pair` awaits it
+  — so it spawns nothing to drain.)
+- **Automated cross-workspace e2e** for relay pairing/content ✅ done — the relay
+  and gateway are still separate Cargo workspaces, but `remote-host-relay` /
+  `remote-host-admission` are now path-depended across the boundary as gateway
+  **dev-dependencies** (like `remote-host-protocol`), so
+  `crates/gateway/src/channel/relay_e2e.rs` boots a **real** `remote-host` relay
+  in-process and proves the full spliced path through it: a real Noise IK content
+  responder + mock app (`real_relay_splices_gateway_responder_and_mock_app`) and
+  the real XXpsk0 pairing entry + mock app landing an approved row
+  (`real_relay_pairs_gateway_and_mock_app`).
 - **Multi-gateway persist** — resolved by the **1:1 binding policy** (see
   [§7](#7-one-gateway--one-app-11-binding--done)): one app binds exactly one gateway,
   so the single fixed `PairedRecord` account is the design, not a limitation. The
   silent overwrite is gone — re-pairing is an explicit *Replace* (kept until the
   new pairing finishes) and there's an explicit *Forget* unpair. Multi-gateway is
   intentionally not supported.
-- **Dashboard not wired in** — `remote-host-dashboard` (a blind, metadata-only
-  status router: counts of admitted instances / device tokens / connected
-  gateways / pending legs, never content) compiles as a workspace member but
-  nothing mounts it. To enable: impl its `MetadataProvider` over the real
-  push/relay components and `app.merge(remote_host_dashboard::router(provider))`
-  in `remote-host/crates/server/src/main.rs` (see the `TODO(dashboard)` there),
-  likely behind a `DASHBOARD_ENABLE` env gate.
+- **Dashboard not wired in** (still open) — `remote-host-dashboard` (a blind,
+  metadata-only status router: counts of admitted instances / device tokens /
+  connected gateways / pending legs, never content) **compiles but nothing mounts
+  it** — it isn't even in `remote-host/crates/server/Cargo.toml`, only a
+  `TODO(dashboard)` in `main.rs`, no real `MetadataProvider` impl (just a test
+  fixture), no env gate. To enable: add the dep, impl its `MetadataProvider` over
+  the real push/relay components, and `app.merge(remote_host_dashboard::
+  router(provider))` behind a `DASHBOARD_ENABLE` env gate. Intentionally left for a
+  follow-up.
 - **PR #132** is closed; reopen or open a fresh PR when ready.
 
 ### 6. Pairing malicious-relay MITM (SECURITY) ✅ done
@@ -204,14 +225,13 @@ always behind an explicit confirm — never a silent clobber.
 **Gateway (A) side — at most one Approved device per user:**
 
 - **DB backstop**: a partial unique index
-  `idx_devices_one_approved_per_user ON devices(user_id) WHERE status='approved'`
-  (`crates/storage/src/libsql/mod.rs`) makes a second live device structurally
-  impossible. Revoked rows drop out of the partial index, so the audit trail of
-  superseded devices is unbounded as before. The schema init runs an **idempotent
-  reconciliation** right before building the index — keep each user's newest
-  approved device, revoke older ones — so a DB that predates the policy (≥2
-  approved rows for a user) converges to the invariant instead of failing index
-  creation and bricking startup.
+  `idx_devices_one_approved ON devices(status) WHERE status='approved'`
+  (`crates/storage/src/libsql/mod.rs`) admits exactly one approved row at a time,
+  making a second live device structurally impossible. The companion is
+  single-user (`user_id` was removed from the whole device-pairing domain), so the
+  constraint is a **single global approved row**, not per-user — the index keys on
+  the constant-valued `status` column of approved rows. Revoked rows drop out of
+  the partial index, so the audit trail of superseded devices stays unbounded.
 - **Atomic replace at finalize**: `DeviceStore::create_replacing_approved`
   (`crates/store/src/device.rs`, libsql impl in `.../libsql/device.rs`) revokes
   every still-approved row for the user and inserts the new one **in one

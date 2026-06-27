@@ -32,9 +32,9 @@ A↔P is the only durable binding; C is a shared, blind relay and is **not**
 bound 1:1 (one C fronts many gateways, admitted by `instance_key`). Re-pairing
 **replaces** the prior binding (newest wins) behind an explicit confirm on both
 ends; there is an explicit unpair (*Forget*). The mechanism — the
-`idx_devices_one_approved_per_user` partial index, the atomic
-`create_replacing_approved` swap at finalize, and the app's single keychain
-record + Replace/Forget UX — is specified in
+`idx_devices_one_approved` partial index (one approved row, keyed on `status`),
+the atomic `create_replacing_approved` swap at finalize, and the app's single
+keychain record + Replace/Forget UX — is specified in
 [`remaining.md` §7](remaining.md#7-one-gateway--one-app-11-binding--done).
 
 ## Crates
@@ -118,7 +118,7 @@ device_id, apns_token, env}` to C, so the phone never holds a C credential.
 | **M2** | Remote host (C): push (HTTP/2 APNs, ES256 `.p8` JWT, `/notify`, `/register`) + blind relay | ✅ done |
 | **M3** | Tauri iOS app + React UI + NSE Xcode target | ✅ done — `Baybo.app` builds, NSE `.appex` embedded, installs + launches on the iOS 26 simulator |
 | **M3.5** | Push-key keychain persistence + provisional notification auth (the NSE keystone) | ✅ implemented + verified to the signing boundary (see below) |
-| **M4** | Real end-to-end APNs delivery (device token → C → APNs → device) | ⚠️ blocked on external resources |
+| **M4** | Real end-to-end APNs delivery (device token → C → APNs → device) | ✅ verified on a real provisioned build + device |
 
 ## iOS app structure
 
@@ -172,17 +172,19 @@ build + signing + seed + push and, when the App Group is not yet provisioned,
 detects the launch denial and prints this path. PASS = a notification reading
 *"Baybo / The agent finished replying."*
 
-## Remaining M4 work (needs the external resources above)
+## M4 work — done (verified on a real provisioned build + device)
 
-1. **Device-token capture** — `registerForRemoteNotifications` is triggered, but
-   the token arrives at `application:didRegisterForRemoteNotificationsWithDevice
-   Token:` on the `UIApplicationDelegate`, which the Tauri/wry runtime owns.
-   Capture it by adding that delegate method at runtime (objc2 `class_addMethod`
-   on the live delegate, or a small Tauri iOS plugin), store the hex token, and
-   feed it into `PairingRequest.apns_token` (currently `String::new()`). Only
-   yields a *real* token on a signed build with `aps-environment` (dev account).
-2. **`.p8` provisioning** — register the APNs auth key with the operator's push
-   role (`remote-host/crates/push`) and the App ID's Push Notifications capability.
-3. **Device enrollment** — exercise the live `.p8` send to a physical device
-   (the simulator can't receive real APNs); confirm A→C `/register` and the
-   completed-turn → `/notify` → APNs → NSE path end-to-end.
+All three pieces are implemented and have now been exercised end-to-end by the
+operator on a paid Apple Developer account + a real device:
+
+1. **Device-token capture** ✅ — the runtime hooks the Tauri/wry-owned
+   `UIApplicationDelegate` via `class_addMethod`, capturing the token iOS delivers
+   to `didRegisterForRemoteNotificationsWithDeviceToken` and threading it (hex) +
+   the build's APNs env into `DeviceHello` (`push_register.rs`, `pairing.rs`). A
+   real token requires a signed build with `aps-environment` (dev account).
+2. **`.p8` provisioning** ✅ — the APNs auth key is registered with the operator's
+   push role (`remote-host/crates/push`) and the App ID's Push Notifications
+   capability.
+3. **Device enrollment** ✅ — the live `.p8` send was exercised to a physical
+   device; A→C `/register` and the completed-turn → `/notify` → APNs → NSE
+   decrypt path are confirmed end-to-end.
