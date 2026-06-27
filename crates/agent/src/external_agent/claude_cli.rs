@@ -499,6 +499,9 @@ impl UserBlock {
             } => Some(ContentBlock::ToolResult {
                 tool_use_id,
                 content: content.into_string(),
+                // External-agent transcript projection; the read-before-write
+                // tracker is local to Baybo's own tools, not the CLI's.
+                meta: None,
             }),
             Self::Other => None,
         }
@@ -725,6 +728,7 @@ mod tests {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                ..
             } => {
                 assert_eq!(tool_use_id, "toolu_1");
                 assert_eq!(content, "ok");

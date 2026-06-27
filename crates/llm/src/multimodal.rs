@@ -29,6 +29,7 @@ pub fn content_block_to_text(block: &ContentBlock) -> String {
         ContentBlock::ToolResult {
             tool_use_id,
             content,
+            ..
         } => {
             format!("[tool_result: id={tool_use_id} content={content}]")
         }

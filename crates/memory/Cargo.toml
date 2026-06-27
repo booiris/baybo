@@ -35,6 +35,7 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+baybo-tools = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 axum = { workspace = true }
 hyper = { workspace = true }

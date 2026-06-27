@@ -56,31 +56,19 @@ mod tests {
     use super::*;
     use baybo_model::{ChannelType, User};
     use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: baybo_model::JobId::default(),
-            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
                 channel: ChannelType::tui(),
             },
             timeout: Duration::from_secs(1),
-            cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
-            sandbox: None,
-            approval: None,
-            notifier: None,
-            events: crate::noop_event_sink(),
-            llm: None,
-            secrets: None,
-            virtual_reads: None,
-            background_jobs: None,
-            background_control: None,
+            ..ToolContext::for_test()
         }
     }
 

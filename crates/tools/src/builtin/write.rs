@@ -43,7 +43,9 @@ impl Tool for WriteTool {
          Always use this instead of Bash commands like echo with \
          redirection or cat with heredoc. Prefer `Edit` for modifying \
          existing files — only use `Write` for new files or complete \
-         rewrites. Parent directories must already exist.\n\n\
+         rewrites. Overwriting a file that already exists requires you to \
+         have Read it first (and it must be unchanged since); creating a new \
+         file does not. Parent directories must already exist.\n\n\
          PATHS: `file_path` MUST be an absolute filesystem path. Relative \
          paths are rejected."
             .to_string()
@@ -82,15 +84,34 @@ impl Tool for WriteTool {
         vec![ResourceAccess::WriteFile { path }]
     }
 
-    async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
         require_absolute(&p.file_path, "Write", "file_path")?;
 
+        // Read-before-write contract, but only for an overwrite: a successful
+        // `stat` means the path already exists → the file must have been read
+        // and be unchanged. A missing file is a fresh create, which has
+        // nothing to have read, so it proceeds straight to the write.
+        if let Some(tracker) = &ctx.read_tracker
+            && let Ok(meta) = tokio::fs::metadata(&p.file_path).await
+            && let Some(reason) = tracker
+                .check(&p.file_path, crate::FileFingerprint::from_metadata(&meta))
+                .rejection(&p.file_path, "overwriting it with Write")
+        {
+            return Err(ToolError::Execution(reason));
+        }
+
         tokio::fs::write(&p.file_path, &p.content)
             .await
             .map_err(|e| ToolError::Execution(format!("write {}: {e}", p.file_path.display())))?;
+
+        // Anchor the read baseline to the file we just wrote so an Edit that
+        // follows this Write does not demand a separate Read.
+        if let Some(tracker) = &ctx.read_tracker {
+            tracker.record_from_disk(&p.file_path);
+        }
 
         Ok(ToolOutput::Text(format!(
             "wrote {} bytes to {}",
@@ -105,31 +126,26 @@ mod tests {
     use super::*;
     use baybo_model::{ChannelType, User};
     use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: baybo_model::JobId::default(),
-            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
                 channel: ChannelType::tui(),
             },
             timeout: Duration::from_secs(5),
-            cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
-            sandbox: None,
-            approval: None,
-            notifier: None,
-            events: crate::noop_event_sink(),
-            llm: None,
-            secrets: None,
-            virtual_reads: None,
-            background_jobs: None,
-            background_control: None,
+            ..ToolContext::for_test()
+        }
+    }
+
+    fn ctx_with_tracker(tracker: crate::ReadTracker) -> ToolContext {
+        ToolContext {
+            read_tracker: Some(tracker),
+            ..ctx()
         }
     }
 
@@ -156,6 +172,82 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, ToolError::InvalidParams(ref m) if m.contains("absolute")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_file_needs_no_prior_read() {
+        // Creating a fresh file has nothing to have read — the contract does
+        // not apply even with a tracker wired.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("new.txt");
+        tool()
+            .execute(
+                json!({ "file_path": p, "content": "hi" }),
+                &ctx_with_tracker(crate::ReadTracker::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "hi");
+    }
+
+    #[tokio::test]
+    async fn rejects_overwrite_without_prior_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("exists.txt");
+        tokio::fs::write(&p, "old").await.unwrap();
+        let err = tool()
+            .execute(
+                json!({ "file_path": p, "content": "new" }),
+                &ctx_with_tracker(crate::ReadTracker::default()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref m) if m.contains("has not been read")),
+            "got: {err:?}"
+        );
+        // Existing content preserved on rejection.
+        assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn allows_overwrite_after_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("exists.txt");
+        tokio::fs::write(&p, "old").await.unwrap();
+        let tracker = crate::ReadTracker::default();
+        tracker.record_from_disk(&p);
+        tool()
+            .execute(
+                json!({ "file_path": p, "content": "new" }),
+                &ctx_with_tracker(tracker),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "new");
+    }
+
+    #[tokio::test]
+    async fn rejects_overwrite_when_file_changed_since_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("exists.txt");
+        tokio::fs::write(&p, "old").await.unwrap();
+        let tracker = crate::ReadTracker::default();
+        tracker.record_from_disk(&p);
+        tokio::fs::write(&p, "changed out from under us")
+            .await
+            .unwrap();
+        let err = tool()
+            .execute(
+                json!({ "file_path": p, "content": "new" }),
+                &ctx_with_tracker(tracker),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref m) if m.contains("changed on disk")),
             "got: {err:?}"
         );
     }

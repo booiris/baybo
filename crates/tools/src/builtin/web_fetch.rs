@@ -792,7 +792,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
-    use tokio_util::sync::CancellationToken;
 
     fn billed(stub: Arc<dyn LlmCompletion>) -> Arc<dyn BilledChat> {
         unbilled_chat(BillableLlm::passthrough(stub))
@@ -801,26 +800,15 @@ mod tests {
     fn ctx_with_timeout(timeout: Duration) -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: baybo_model::JobId::default(),
-            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
                 channel: ChannelType::tui(),
             },
             timeout,
-            cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
-            sandbox: None,
-            approval: None,
-            notifier: None,
-            events: crate::noop_event_sink(),
-            llm: None,
-            secrets: None,
-            virtual_reads: None,
-            background_jobs: None,
-            background_control: None,
+            ..ToolContext::for_test()
         }
     }
 

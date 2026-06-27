@@ -645,7 +645,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
 
     const TEST_PARENT_SESSION: &str = "parent-sess";
 
@@ -656,26 +655,15 @@ mod tests {
     fn ctx_with_session(session_id: &str) -> ToolContext {
         ToolContext {
             session_id: session_id.into(),
-            job_id: baybo_model::JobId::default(),
-            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
                 channel: ChannelType::tui(),
             },
             timeout: Duration::from_secs(5),
-            cancellation_token: CancellationToken::new(),
             workspace_root: PathBuf::from("/tmp"),
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
-            sandbox: None,
-            approval: None,
-            notifier: None,
-            events: baybo_tools::noop_event_sink(),
-            llm: None,
-            secrets: None,
-            virtual_reads: None,
-            background_jobs: None,
-            background_control: None,
+            ..ToolContext::for_test()
         }
     }
 

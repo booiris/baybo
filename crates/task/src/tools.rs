@@ -554,26 +554,15 @@ mod tests {
     fn ctx(session: &str) -> ToolContext {
         ToolContext {
             session_id: session.into(),
-            job_id: baybo_model::JobId::default(),
-            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u1".into(),
                 name: None,
                 channel: ChannelType::tui(),
             },
             timeout: Duration::from_secs(5),
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
-            sandbox: None,
-            approval: None,
-            notifier: None,
-            events: baybo_tools::noop_event_sink(),
-            llm: None,
-            secrets: None,
-            virtual_reads: None,
-            background_jobs: None,
-            background_control: None,
+            ..ToolContext::for_test()
         }
     }
 

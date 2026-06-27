@@ -11,9 +11,12 @@ use crate::{
     ResourceAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, VirtualReadAccess,
 };
 
-/// Canonical name of the file-reading builtin. A const so `name()` and the
-/// `require_absolute` label share one source of truth for the literal.
-const READ_TOOL_NAME: &str = "Read";
+/// Canonical name of the file-reading builtin. A const so `name()`, the
+/// `require_absolute` label, and the read-before-write tracker's transcript
+/// reconstruction (`ReadTracker::rebuild_from_messages`) share one source of
+/// truth for the literal. Re-exported at the crate root as
+/// [`crate::READ_TOOL_NAME`].
+pub const READ_TOOL_NAME: &str = "Read";
 
 const DEFAULT_LIMIT: usize = 800;
 const MAX_LIMIT: usize = 50_00;
@@ -172,10 +175,8 @@ impl Tool for ReadTool {
         let limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         let end = start.saturating_add(limit);
 
-        let total_size = tokio::fs::metadata(&p.file_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let meta = tokio::fs::metadata(&p.file_path).await.ok();
+        let total_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
 
         let file = tokio::fs::File::open(&p.file_path)
             .await
@@ -208,6 +209,16 @@ impl Tool for ReadTool {
             out.push_str("(file is empty or range out of bounds)");
         }
 
+        // Record the read so `Edit`/`Write` can enforce the read-before-write
+        // contract. Anchored to the metadata captured before the read: if the
+        // file changes during the read, the recorded mtime stays "older" than
+        // the post-change file, so a later edit is forced to re-read — the
+        // safe direction. No-op when no tracker is wired (system passes,
+        // argv-mode, tests).
+        if let (Some(tracker), Some(meta)) = (&ctx.read_tracker, &meta) {
+            tracker.record(&p.file_path, crate::FileFingerprint::from_metadata(meta));
+        }
+
         Ok(ToolOutput::Text(out))
     }
 }
@@ -218,39 +229,25 @@ mod tests {
     use baybo_model::{ChannelType, User};
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "test".into(),
-            job_id: baybo_model::JobId::default(),
-            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
                 channel: ChannelType::tui(),
             },
             timeout: Duration::from_secs(5),
-            cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
-            sandbox: None,
-            approval: None,
-            notifier: None,
-            events: crate::noop_event_sink(),
-            llm: None,
-            secrets: None,
-            virtual_reads: None,
-            background_jobs: None,
-            background_control: None,
+            ..ToolContext::for_test()
         }
     }
 
     fn ctx_with(resolver: Arc<dyn crate::VirtualReadResolver>) -> ToolContext {
         ToolContext {
             virtual_reads: Some(resolver),
-            background_jobs: None,
-            background_control: None,
             ..ctx()
         }
     }
@@ -422,6 +419,29 @@ mod tests {
             .unwrap();
         let ToolOutput::Text(s) = out else { panic!() };
         assert!(s.contains("from disk"));
+    }
+
+    #[tokio::test]
+    async fn records_fingerprint_into_tracker() {
+        // A real read records the file's fingerprint so a later Edit/Write
+        // can see it. A virtual read must NOT (no on-disk backing).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.txt");
+        tokio::fs::write(&p, "hello").await.unwrap();
+        let tracker = crate::ReadTracker::default();
+        let ctx = ToolContext {
+            read_tracker: Some(tracker.clone()),
+            ..ctx()
+        };
+        ReadTool
+            .execute(json!({ "file_path": p }), &ctx)
+            .await
+            .unwrap();
+        let current = crate::FileFingerprint::from_metadata(&std::fs::metadata(&p).unwrap());
+        assert_eq!(
+            tracker.check(&p, current),
+            crate::read_tracker::ReadCheck::Current
+        );
     }
 
     #[tokio::test]
