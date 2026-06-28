@@ -59,7 +59,6 @@ The gateway (A) encrypts the preview and the push role (C) sends APNs this body
   "aps": { "alert": { "title": "Baybo", "body": "New message" }, "mutable-content": 1 },
   "enc": "<base64 ciphertext||tag>",
   "n":   "<base64 12-byte nonce>",
-  "kid": "<key id>",
   "bid": "<binding/device id>"
 }
 ```

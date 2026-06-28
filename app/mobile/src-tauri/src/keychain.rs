@@ -273,6 +273,31 @@ pub fn read_device_identity() -> Result<Option<DeviceIdentity>, String> {
     Ok(Some((secret, public)))
 }
 
+/// Account holding the device's long-term **Ed25519 push-delegation identity**
+/// (a 32-byte seed), kept in the app's private keychain. Its public half is the
+/// `device_id` (`ios-<hex(pub)>`), and at pairing the app signs a delegation
+/// with it authorizing the gateway's push key — so it must be stable across
+/// re-pairings (a re-pair under the same physical device keeps the same id).
+const DEVICE_SIGN_KEY_ACCOUNT: &str = "baybo.device-sign-key";
+
+/// Persist the device's Ed25519 push-signing seed (32 bytes).
+pub fn store_device_sign_key(seed: &[u8; KEY_LEN]) -> Result<(), String> {
+    imp::store_private_blob(DEVICE_SIGN_KEY_ACCOUNT, seed)
+}
+
+/// Read the persisted Ed25519 push-signing seed. `Ok(None)` = unset (first
+/// launch, or a desktop dev build with no on-device keychain).
+pub fn read_device_sign_key() -> Result<Option<[u8; KEY_LEN]>, String> {
+    match imp::read_private_blob(DEVICE_SIGN_KEY_ACCOUNT)? {
+        Some(b) => b
+            .as_slice()
+            .try_into()
+            .map(Some)
+            .map_err(|_| "stored device sign key has the wrong length".to_string()),
+        None => Ok(None),
+    }
+}
+
 /// Delete a device's push key from the shared keychain (the write side is
 /// [`store_push_key`]). Called on unpair so a stale per-device key can't linger.
 pub fn delete_push_key(bid: &str) -> Result<(), String> {

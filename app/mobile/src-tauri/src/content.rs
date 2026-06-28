@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use baybo_mobile_core::{
-    ContentHandshake, ContentSession, Frame, WireAttachment, subscribe_frame, user_message_frame,
+    ContentHandshake, ContentSession, Frame, WireAttachment, apns_token_frame, subscribe_frame,
+    user_message_frame,
 };
 use device_proto::noise::StaticKeypair;
 use futures_util::{SinkExt, StreamExt};
@@ -297,6 +298,25 @@ async fn pump(
             }
         }
         Err(_) => return,
+    }
+
+    // Tell the gateway our current APNs token so it can keep C's push binding
+    // fresh across token rotation (reinstall / restore / new device). Best-effort
+    // and idempotent — the gateway re-registers only when it changed; skipped when
+    // iOS hasn't issued a token yet.
+    if let Some(token) = crate::push_register::apns_token() {
+        let env = if cfg!(debug_assertions) {
+            "sandbox"
+        } else {
+            "production"
+        };
+        if let Ok(messages) = session.seal(&apns_token_frame(&token, env)) {
+            for bytes in messages {
+                if sink.send(Message::Binary(bytes)).await.is_err() {
+                    return;
+                }
+            }
+        }
     }
 
     // Inbound-liveness watchdog: reset on every message the socket yields (the

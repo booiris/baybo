@@ -20,8 +20,9 @@
 //! best-effort, so a lag just drops that buzz).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use base64::Engine;
 use baybo_job::{JobInputKind, JobLifecycle, JobLifecycleEvent, JobPhase, JobShape};
@@ -30,18 +31,17 @@ use baybo_security::SecretVault;
 use baybo_session::SessionManager;
 use baybo_store::{DeviceRow, DeviceStatus, DeviceStore, SessionStore};
 use device_proto::aead;
+use device_proto::delegation;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::OnceCell;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 /// Max preview characters (kept well under the 4 KB APNs payload once
 /// encrypted + base64'd).
 const PREVIEW_MAX_CHARS: usize = 200;
-/// `kid` epoch — always 0 today (the field exists so rotation needs no
-/// payload change).
-const PUSH_KEY_EPOCH: u32 = 0;
 /// How many active rows to pull from the reply's ordinal when building the
 /// preview — 1 is enough (the reply sits exactly at `reply_ordinal`); a small
 /// margin tolerates an interleaved row without a second round-trip.
@@ -66,6 +66,80 @@ pub(crate) fn device_apns_secret_name(device_id: &str) -> String {
 pub(crate) struct DeviceApnsRegistration {
     pub apns_token: String,
     pub apns_env: device_proto::pairing::ApnsEnv,
+}
+
+/// Secret-vault name for a device's push delegation — the 64-byte Ed25519
+/// signature the device made at pairing authorizing A's gateway push key to
+/// manage its APNs binding at C. Absent → push is disabled for the device (the
+/// gateway can't prove ownership to C under a shared `remote_api_key`).
+pub(crate) fn device_push_delegation_secret_name(device_id: &str) -> String {
+    format!("device.{device_id}.push_delegation")
+}
+
+/// `SecretVault` key holding A's gateway Ed25519 push-signing key (32-byte seed).
+/// One per gateway, stable across restarts — a paired device delegated to its
+/// public half, so rotating it forces re-pairing to re-delegate.
+const PUSH_SIGNING_VAULT_KEY: &str = "gateway.push_signing_key";
+
+/// Load A's gateway push-signing key, generating + persisting one on first use.
+pub(crate) async fn load_or_create_push_signing_key(
+    vault: &SecretVault,
+) -> anyhow::Result<delegation::SigningKey> {
+    if let Some(secret) = vault
+        .get_secret(PUSH_SIGNING_VAULT_KEY)
+        .await
+        .map_err(|e| anyhow::anyhow!("vault get {PUSH_SIGNING_VAULT_KEY}: {e}"))?
+    {
+        if let Ok(seed) = <[u8; delegation::SEED_LEN]>::try_from(secret.as_bytes()) {
+            return Ok(delegation::SigningKey::from_bytes(&seed));
+        }
+        tracing::warn!(
+            "{PUSH_SIGNING_VAULT_KEY} is malformed; regenerating A's gateway push \
+             key (paired devices will need to re-pair to re-delegate)",
+        );
+    }
+    let key = delegation::generate_signing_key();
+    vault
+        .store_secret(PUSH_SIGNING_VAULT_KEY, key.to_bytes().as_slice())
+        .await
+        .map_err(|e| anyhow::anyhow!("vault store {PUSH_SIGNING_VAULT_KEY}: {e}"))?;
+    Ok(key)
+}
+
+/// Strictly-increasing replay counter for signed pushes, seeded from the wall
+/// clock so it keeps rising across restarts; the atomic guarantees strict
+/// monotonicity within a process even if two pushes read the same instant. A
+/// globally-increasing value is per-device increasing too, so C can reject a
+/// `/register`/`/notify` whose counter doesn't exceed the device's last accepted.
+static PUSH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_push_counter() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut last = PUSH_COUNTER.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last.wrapping_add(1));
+        match PUSH_COUNTER.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(observed) => last = observed,
+        }
+    }
+}
+
+/// The APNs `apns-collapse-id` for a (device, session): a short hash, never the
+/// raw `device_id:session_id`. This keeps it under APNs' 64-byte collapse-id
+/// limit (a 32-byte Ed25519 `device_id` alone would overflow the old form) and
+/// stops C from learning the cleartext `session_id`, while preserving per-session
+/// coalescing on the lock screen (the hash is stable per device+session).
+fn push_collapse_id(device_id: &str, session_id: &SessionId) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(device_id.as_bytes());
+    h.update(b":");
+    h.update(session_id.to_string().as_bytes());
+    hex::encode(&h.finalize()[..16])
 }
 
 /// The `/notify` + `/register` request bodies are the shared protocol wire
@@ -130,14 +204,7 @@ impl NotifySink for HttpNotifySink {
 /// mock.
 #[async_trait::async_trait]
 pub trait ApnsRegistrar: Send + Sync {
-    async fn register_device(
-        &self,
-        register_url: &str,
-        remote_api_key: &str,
-        device_id: &str,
-        apns_token: &str,
-        env: device_proto::pairing::ApnsEnv,
-    ) -> Result<(), String>;
+    async fn register(&self, register_url: &str, body: &RegisterRequest) -> Result<(), String>;
 }
 
 /// reqwest-backed registrar POSTing to a per-device `<base>/register`. The base +
@@ -158,24 +225,11 @@ impl HttpApnsRegistrar {
 
 #[async_trait::async_trait]
 impl ApnsRegistrar for HttpApnsRegistrar {
-    async fn register_device(
-        &self,
-        register_url: &str,
-        remote_api_key: &str,
-        device_id: &str,
-        apns_token: &str,
-        env: device_proto::pairing::ApnsEnv,
-    ) -> Result<(), String> {
-        let body = RegisterRequest {
-            remote_api_key: remote_api_key.to_string(),
-            device_id: device_id.to_string(),
-            apns_token: apns_token.to_string(),
-            env: to_wire_env(env),
-        };
+    async fn register(&self, register_url: &str, body: &RegisterRequest) -> Result<(), String> {
         let resp = self
             .client
             .post(register_url)
-            .json(&body)
+            .json(body)
             .send()
             .await
             .map_err(|e| format!("register post: {e}"))?;
@@ -197,9 +251,14 @@ pub struct PushDispatcher {
     /// Re-registers an approved device with C from the material A persisted at
     /// pairing, self-healing a missing or stale remote-host APNs binding.
     apns_registrar: Option<Arc<dyn ApnsRegistrar>>,
-    /// device_ids re-registered with C this run (so we retry at most once per
-    /// device per dispatcher lifetime).
-    registered: Mutex<HashSet<String>>,
+    /// The APNs token last registered with C per device this run, so we register
+    /// at most once per (device, token): a token that **changed** (APNs rotation,
+    /// pushed to A over the content channel via `Frame::UpdateApnsToken`) differs
+    /// from the cached one and re-registers; an unchanged token is skipped.
+    registered: Mutex<HashMap<String, String>>,
+    /// A's gateway Ed25519 push-signing key, lazily loaded from the vault and
+    /// cached for the dispatcher's lifetime.
+    push_signing_key: OnceCell<Arc<delegation::SigningKey>>,
 }
 
 impl PushDispatcher {
@@ -218,8 +277,22 @@ impl PushDispatcher {
             secret_vault,
             sink,
             apns_registrar,
-            registered: Mutex::new(HashSet::new()),
+            registered: Mutex::new(HashMap::new()),
+            push_signing_key: OnceCell::new(),
         }
+    }
+
+    /// A's gateway push-signing key, loaded from the vault and cached on first push.
+    async fn signing_key(&self) -> Result<Arc<delegation::SigningKey>, String> {
+        self.push_signing_key
+            .get_or_try_init(|| async {
+                load_or_create_push_signing_key(&self.secret_vault)
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map(Arc::clone)
     }
 
     /// True iff this terminal event should buzz a phone: a successfully-
@@ -300,6 +373,7 @@ impl PushDispatcher {
             return Err("device row has no relay url (re-pair to populate)".into());
         }
         self.ensure_registered(device, &base).await;
+        let signing_key = self.signing_key().await?;
         let key = self.load_push_key(&device.device_id).await?;
         let body = build_notify_body(
             &device.remote_api_key,
@@ -307,6 +381,8 @@ impl PushDispatcher {
             session_id,
             &key,
             preview,
+            &signing_key,
+            next_push_counter(),
         )?;
         let notify_url = remote_host_protocol::push::notify_url(&base);
         self.sink.post(&notify_url, &body).await
@@ -322,9 +398,6 @@ impl PushDispatcher {
             return;
         };
         let device_id = device.device_id.as_str();
-        if self.registered.lock().contains(device_id) {
-            return;
-        }
         let Ok(Some(secret)) = self
             .secret_vault
             .get_secret(&device_apns_secret_name(device_id))
@@ -338,19 +411,42 @@ impl PushDispatcher {
         if reg.apns_token.is_empty() {
             return;
         }
-        let register_url = remote_host_protocol::push::register_url(base_http);
-        match registrar
-            .register_device(
-                &register_url,
-                &device.remote_api_key,
-                device_id,
-                &reg.apns_token,
-                reg.apns_env,
-            )
+        // Already registered this exact token this run → nothing to do. A token
+        // that changed (read from the vault after the app pushed a fresh one over
+        // the content channel) differs here and re-registers below.
+        if self.registered.lock().get(device_id) == Some(&reg.apns_token) {
+            return;
+        }
+        // The binding is authenticated to C by the device's pairing-time
+        // delegation plus our gateway push signature. No delegation (older
+        // pairing, or it never arrived) → we can't prove ownership under a shared
+        // `remote_api_key`, so skip registration rather than send an unverifiable one.
+        let Ok(signing_key) = self.signing_key().await else {
+            return;
+        };
+        let Ok(Some(delegation_sig)) = self
+            .secret_vault
+            .get_secret(&device_push_delegation_secret_name(device_id))
             .await
-        {
+        else {
+            tracing::debug!(device = %device_id, "push: no delegation stored; skipping register");
+            return;
+        };
+        let body = build_register_body(
+            &device.remote_api_key,
+            device_id,
+            &reg.apns_token,
+            reg.apns_env,
+            &signing_key,
+            delegation_sig.as_bytes(),
+            next_push_counter(),
+        );
+        let register_url = remote_host_protocol::push::register_url(base_http);
+        match registrar.register(&register_url, &body).await {
             Ok(()) => {
-                self.registered.lock().insert(device_id.to_string());
+                self.registered
+                    .lock()
+                    .insert(device_id.to_string(), reg.apns_token);
             }
             Err(e) => {
                 tracing::debug!(error = %e, "push: device re-registration with remote host failed; will retry")
@@ -422,25 +518,65 @@ fn preview_json(text: Option<&str>) -> String {
 /// Pure: AEAD-seal `preview` under `key`, base64 the output, and frame the
 /// `/notify` body. Extracted so the encrypt path is unit-testable without any
 /// stores.
+#[allow(clippy::too_many_arguments)]
 fn build_notify_body(
     remote_api_key: &str,
     device_id: &str,
     session_id: &SessionId,
     key: &[u8; aead::KEY_LEN],
     preview: &str,
+    signing_key: &delegation::SigningKey,
+    counter: u64,
 ) -> Result<NotifyRequest, String> {
     let (nonce, ciphertext) =
         aead::seal(key, preview.as_bytes()).map_err(|e| format!("seal: {e}"))?;
     let b64 = base64::engine::general_purpose::STANDARD;
+    let enc = b64.encode(&ciphertext);
+    let n = b64.encode(&nonce);
+    // Sign the notify so C can reject a co-tenant's push to this device_id under a
+    // shared `remote_api_key` (verified against the gateway key C stored at register).
+    let sig = delegation::sign_notify(signing_key, device_id, &enc, &n, device_id, counter);
     Ok(NotifyRequest {
         remote_api_key: remote_api_key.to_string(),
         device_id: device_id.to_string(),
-        collapse_id: format!("{device_id}:{session_id}"),
-        kid: PUSH_KEY_EPOCH,
+        collapse_id: push_collapse_id(device_id, session_id),
         bid: device_id.to_string(),
-        enc: b64.encode(&ciphertext),
-        n: b64.encode(&nonce),
+        enc,
+        n,
+        sig: b64.encode(sig.to_bytes()),
+        counter,
     })
+}
+
+/// Pure: build + sign a `/register` body. The gateway proves ownership of the
+/// binding to C with the device's pairing-time `delegation_sig` (device→gateway)
+/// plus its own signature over the binding, so C accepts it even under a shared
+/// `remote_api_key`.
+fn build_register_body(
+    remote_api_key: &str,
+    device_id: &str,
+    apns_token: &str,
+    env: device_proto::pairing::ApnsEnv,
+    signing_key: &delegation::SigningKey,
+    delegation_sig: &[u8],
+    counter: u64,
+) -> RegisterRequest {
+    let env_byte = match env {
+        device_proto::pairing::ApnsEnv::Sandbox => delegation::ENV_SANDBOX,
+        device_proto::pairing::ApnsEnv::Production => delegation::ENV_PRODUCTION,
+    };
+    let sig = delegation::sign_register(signing_key, device_id, apns_token, env_byte, counter);
+    let b64 = base64::engine::general_purpose::STANDARD;
+    RegisterRequest {
+        remote_api_key: remote_api_key.to_string(),
+        device_id: device_id.to_string(),
+        apns_token: apns_token.to_string(),
+        env: to_wire_env(env),
+        gateway_pubkey: b64.encode(signing_key.verifying_key().to_bytes()),
+        delegation: b64.encode(delegation_sig),
+        sig: b64.encode(sig.to_bytes()),
+        counter,
+    }
 }
 
 /// Derive the HTTP base for push (`/notify`, `/register`) from a device row's
@@ -555,17 +691,34 @@ mod tests {
     fn notify_body_is_decryptable_with_the_push_key() {
         let key = [9u8; aead::KEY_LEN];
         let preview = r#"{"title":"Baybo","body":"the agent finished"}"#;
-        let body = build_notify_body("inst-A", "dev-1", &SessionId::from("sess-7"), &key, preview)
-            .unwrap();
+        let session = SessionId::from("sess-7");
+        let signing = delegation::generate_signing_key();
+        let body =
+            build_notify_body("inst-A", "dev-1", &session, &key, preview, &signing, 11).unwrap();
 
         assert_eq!(body.remote_api_key, "inst-A");
         assert_eq!(body.device_id, "dev-1");
         assert_eq!(body.bid, "dev-1");
-        assert_eq!(body.collapse_id, "dev-1:sess-7");
-        assert_eq!(body.kid, 0);
+        assert_eq!(body.counter, 11);
+        // collapse_id is now a short hash — it neither equals the raw
+        // device_id:session_id nor leaks the session id, but is stable per pair.
+        assert_eq!(body.collapse_id, push_collapse_id("dev-1", &session));
+        assert_ne!(body.collapse_id, "dev-1:sess-7");
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // The notify is signed by the gateway key over the exact wire fields.
+        let sig = delegation::signature_from_bytes(&b64.decode(&body.sig).unwrap()).unwrap();
+        assert!(delegation::verify_notify(
+            &signing.verifying_key(),
+            &body.device_id,
+            &body.enc,
+            &body.n,
+            &body.bid,
+            body.counter,
+            &sig,
+        ));
 
         // The NSE recovers the preview from enc/n with the push key.
-        let b64 = base64::engine::general_purpose::STANDARD;
         let nonce = b64.decode(&body.n).unwrap();
         let ct = b64.decode(&body.enc).unwrap();
         let plaintext = aead::open(&key, &nonce, &ct).unwrap();
@@ -590,26 +743,48 @@ mod tests {
     fn notify_body_uses_a_fresh_nonce_each_time() {
         let key = [1u8; aead::KEY_LEN];
         let s = SessionId::from("s");
-        let a = build_notify_body("i", "d", &s, &key, "same").unwrap();
-        let b = build_notify_body("i", "d", &s, &key, "same").unwrap();
+        let signing = delegation::generate_signing_key();
+        let a = build_notify_body("i", "d", &s, &key, "same", &signing, 1).unwrap();
+        let b = build_notify_body("i", "d", &s, &key, "same", &signing, 2).unwrap();
         assert_ne!(a.n, b.n, "nonce must be random per message");
         assert_ne!(a.enc, b.enc, "ciphertext differs under a fresh nonce");
     }
 
     #[test]
     fn register_body_matches_remote_host_wire_shape() {
-        let body = RegisterRequest {
-            remote_api_key: "inst-A".into(),
-            device_id: "dev-1".into(),
-            apns_token: "tok".into(),
-            env: remote_host_protocol::push::ApnsEnv::Sandbox,
-        };
+        let signing = delegation::generate_signing_key();
+        let body = build_register_body(
+            "inst-A",
+            "dev-1",
+            "tok",
+            device_proto::pairing::ApnsEnv::Sandbox,
+            &signing,
+            &[7u8; 64],
+            5,
+        );
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["remote_api_key"], "inst-A");
         assert_eq!(v["device_id"], "dev-1");
         assert_eq!(v["apns_token"], "tok");
         // Must serialize the same as the push role's RegisterRequest.env.
         assert_eq!(v["env"], "sandbox");
+        assert_eq!(v["counter"], 5);
+        // The signing material rides the wire (base64), so C can verify the chain.
+        assert!(!v["gateway_pubkey"].as_str().unwrap().is_empty());
+        assert!(!v["delegation"].as_str().unwrap().is_empty());
+        assert!(!v["sig"].as_str().unwrap().is_empty());
+
+        // The register signature verifies under the gateway key over the binding.
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let sig = delegation::signature_from_bytes(&b64.decode(&body.sig).unwrap()).unwrap();
+        assert!(delegation::verify_register(
+            &signing.verifying_key(),
+            "dev-1",
+            "tok",
+            delegation::ENV_SANDBOX,
+            5,
+            &sig,
+        ));
     }
 
     #[test]

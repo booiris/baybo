@@ -98,6 +98,16 @@ pub fn subscribe_frame(session_id: &str, since_ordinal: Option<i64>) -> Frame {
     }
 }
 
+/// An [`Frame::UpdateApnsToken`] telling the gateway the device's current APNs
+/// token (and env, `"sandbox"`/`"production"`). Sent on every content connect so
+/// the gateway keeps C's push binding fresh across APNs token rotation.
+pub fn apns_token_frame(apns_token: &str, apns_env: &str) -> Frame {
+    Frame::UpdateApnsToken {
+        apns_token: apns_token.to_owned(),
+        apns_env: apns_env.to_owned(),
+    }
+}
+
 /// An outbound user [`Frame::Message`] on `session_id` carrying `attachments` —
 /// content-addressed [`WireAttachment`] refs the app has already uploaded over a
 /// blob leg (the bytes never ride this frame). `platform_msg_id` is a

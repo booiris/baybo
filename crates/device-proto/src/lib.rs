@@ -29,6 +29,7 @@
 
 pub mod aead;
 pub mod blob;
+pub mod delegation;
 pub mod error;
 pub mod fixtures;
 pub mod kdf;

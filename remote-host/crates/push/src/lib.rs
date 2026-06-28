@@ -2,13 +2,14 @@
 //!
 //! It relays operator-encrypted lock-screen-preview blobs to APNs for any Baybo
 //! gateway, staying **blind**: the gateway (A) encrypts the preview with the
-//! device's push key, this component copies the opaque `enc`/`n`/`kid`/`bid`
+//! device's push key, this component copies the opaque `enc`/`n`/`bid`
 //! into the APNs payload and signs the provider token — it never decrypts.
 //! Built as its own crate/binary so the crown-jewel key stays isolatable from
 //! the high-exposure relay surface.
 
 pub mod apns;
 pub mod apns_http;
+pub mod delegation;
 pub mod error;
 pub mod http;
 pub mod jwt;

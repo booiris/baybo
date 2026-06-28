@@ -121,7 +121,7 @@ echo "  (expected: store=ok readback=match)"
 
 PAYLOAD="$(mktemp -t baybo-push).json"
 cat > "$PAYLOAD" <<JSON
-{"aps":{"alert":{"title":"New message","body":"Open Baybo"},"mutable-content":1},"enc":"$ENC","n":"$NONCE_B64","bid":"$BID","kid":0}
+{"aps":{"alert":{"title":"New message","body":"Open Baybo"},"mutable-content":1},"enc":"$ENC","n":"$NONCE_B64","bid":"$BID"}
 JSON
 xcrun simctl terminate "$UDID" com.baybo.app 2>/dev/null || true
 xcrun simctl push "$UDID" com.baybo.app "$PAYLOAD"

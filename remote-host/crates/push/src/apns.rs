@@ -1,7 +1,7 @@
 //! The APNs send seam.
 //!
 //! The push role builds a blind APNs request — the operator-encrypted preview
-//! (`enc`/`n`/`kid`/`bid`) copied verbatim into the payload, plus a signed
+//! (`enc`/`n`/`bid`) copied verbatim into the payload, plus a signed
 //! provider token — and hands it to an [`ApnsSender`]. The trait keeps the real
 //! HTTP/2 transport (driven against `api.push.apple.com` only on a real device,
 //! M4) behind a seam so the whole `/notify` path is host-testable against a
@@ -37,7 +37,7 @@ pub struct ApnsRequest {
     pub collapse_id: String,
     /// `authorization: bearer <jwt>` — the ES256 provider token.
     pub provider_jwt: String,
-    /// The JSON payload body (`aps` + the verbatim `enc`/`n`/`kid`/`bid`).
+    /// The JSON payload body (`aps` + the verbatim `enc`/`n`/`bid`).
     pub payload: Vec<u8>,
 }
 

@@ -32,8 +32,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use device_proto::delegation;
 use device_proto::kdf::{derive_confirm_code, derive_push_key};
-use device_proto::pairing::{self, DeviceConfirm, DeviceHello, GatewayWelcome, PairFrame};
+use device_proto::pairing::{
+    self, DeviceConfirm, DeviceDelegation, DeviceHello, GatewayWelcome, PairFrame,
+};
 use device_proto::psk_pair::{PskHandshake, PskTransport, build_prologue};
 
 use baybo_pairing::DevicePairingService;
@@ -70,6 +73,11 @@ const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Poll cadence for the operator's confirm decision on the shared slot.
 const CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(400);
+
+/// How long A waits, after the welcome, for the device's push delegation. Bounded
+/// short: its absence only disables push for the device (relay/content are
+/// unaffected), so a misbehaving or older app must not pin the leg for long.
+const DELEGATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn drive<T: PairTransport + ?Sized>(
     transport: &mut T,
@@ -213,6 +221,15 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         (node_id, state.relay_url.clone())
     };
 
+    // A's gateway push-signing key (Ed25519, vault-persisted, stable across
+    // restarts). Its public half rides the welcome so the device can sign a
+    // delegation authorizing it; its secret signs every later /register and
+    // /notify so C can reject a co-tenant's push under a shared remote_api_key.
+    let push_signing_key = crate::push::load_or_create_push_signing_key(&state.secret_vault)
+        .await
+        .map_err(|e| format!("push signing key: {e}"))?;
+    let gateway_push_pubkey = push_signing_key.verifying_key().to_bytes().to_vec();
+
     // 6. Stage: write a non-authenticating provisioning row (pinning the app
     //    static learned in-band) + consume the slot (zeroizing the secret it
     //    held). The token becomes active only after the welcome frame has been
@@ -263,6 +280,7 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         relay_url,
         rendezvous_id: slot.rendezvous_id.clone(),
         auth_token: row.auth_token.clone(),
+        gateway_push_pubkey,
     };
     let sealed = noise
         .write(&pairing::encode(&welcome).map_err(|e| format!("encode welcome: {e}"))?)
@@ -280,11 +298,68 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         return Err(format!("approve pairing: {e}"));
     }
 
+    // 8. DeviceDelegation — the device authorizes our push key to manage its APNs
+    //    binding at C. Best-effort and after approval: a missing/invalid
+    //    delegation only disables push for this device (relay/content still work),
+    //    so it must neither delay approval nor fail the pair.
+    let gateway_push_pub = push_signing_key.verifying_key();
+    match read_device_delegation(transport, &mut noise, &hello.device_id, &gateway_push_pub).await {
+        Ok(sig) => {
+            if let Err(e) = state
+                .secret_vault
+                .store_secret(
+                    &crate::push::device_push_delegation_secret_name(&hello.device_id),
+                    &sig,
+                )
+                .await
+            {
+                tracing::warn!(
+                    device = %super::short_hash(&hello.device_id),
+                    error = %e,
+                    "failed to store push delegation; push disabled for this device",
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            device = %super::short_hash(&hello.device_id),
+            error = %e,
+            "no valid push delegation; push disabled for this device",
+        ),
+    }
+
     tracing::info!(
         device = %super::short_hash(&hello.device_id),
         "device paired",
     );
     Ok(())
+}
+
+/// Receive the device's sealed [`DeviceDelegation`] (the 6th pairing message) and
+/// verify it authorizes our push key. The signature must be by the device
+/// identity key whose public half is encoded in `device_id` (so the binding
+/// self-certifies at C). Returns the 64-byte delegation signature to persist.
+async fn read_device_delegation<T: PairTransport + ?Sized>(
+    transport: &mut T,
+    noise: &mut PskTransport,
+    device_id: &str,
+    gateway_push_pub: &delegation::VerifyingKey,
+) -> Result<Vec<u8>, String> {
+    let PairFrame::Sealed { msg } = transport.recv_frame(DELEGATION_TIMEOUT).await? else {
+        return Err("expected sealed DeviceDelegation".into());
+    };
+    let plaintext = noise
+        .read(&msg)
+        .map_err(|e| format!("open DeviceDelegation: {e}"))?;
+    let deleg: DeviceDelegation =
+        pairing::decode(&plaintext).map_err(|e| format!("decode DeviceDelegation: {e}"))?;
+    let device_pub = delegation::device_pubkey_from_id(device_id)
+        .map_err(|e| format!("device_id is not an Ed25519 identity: {e}"))?;
+    let sig = delegation::signature_from_bytes(&deleg.delegation)
+        .map_err(|e| format!("malformed delegation signature: {e}"))?;
+    if !delegation::verify_delegation(&device_pub, gateway_push_pub, &sig) {
+        return Err("device delegation failed to verify".into());
+    }
+    Ok(deleg.delegation)
 }
 
 async fn revoke_staged_device(state: &PairingHostDeps, device_id: &str) {
@@ -495,7 +570,11 @@ mod tests {
         let (server, mut client) = duplex();
         let drive_task = spawn_drive(server, deps);
 
-        let mut app = app_handshake(&mut client, &rid, &secret, "", "dev-xyz").await;
+        // The app's Ed25519 identity; its public half is the device_id.
+        let app_ed = delegation::generate_signing_key();
+        let device_id = delegation::device_id_for(&app_ed.verifying_key());
+
+        let mut app = app_handshake(&mut client, &rid, &secret, "", &device_id).await;
         let app_static = *app.remote_static(); // A's static, learned in-band
         let confirm_code = derive_confirm_code(app.handshake_hash()).unwrap();
 
@@ -530,11 +609,30 @@ mod tests {
         let welcome: GatewayWelcome = pairing::decode(&app.read(&msg).unwrap()).unwrap();
         assert!(!welcome.auth_token.is_empty());
         assert_eq!(welcome.rendezvous_id, rid);
+        assert_eq!(welcome.gateway_push_pubkey.len(), 32);
+
+        // 6th message: the device delegates the gateway push key (signed under the
+        // device identity whose public half is the device_id).
+        let gw_push = delegation::verifying_key_from_bytes(&welcome.gateway_push_pubkey).unwrap();
+        let deleg = delegation::sign_delegation(&app_ed, &gw_push);
+        let deleg_frame = app
+            .write(
+                &pairing::encode(&DeviceDelegation {
+                    delegation: deleg.to_bytes().to_vec(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        client
+            .send_frame(&PairFrame::Sealed { msg: deleg_frame })
+            .await
+            .unwrap();
+
         drive_task.await.unwrap().unwrap();
 
         // An approved device row landed pinning the app's in-band static + the
         // active token, and the per-device push key (HKDF of `h`) is stored.
-        let row = device_store.get("dev-xyz").await.unwrap().unwrap();
+        let row = device_store.get(&device_id).await.unwrap().unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
         assert_eq!(row.auth_token, welcome.auth_token);
         // The gateway pinned A's *peer* static — i.e. the app's static key.
@@ -546,11 +644,19 @@ mod tests {
         );
         let push_key = derive_push_key(app.handshake_hash()).unwrap();
         let pk = vault
-            .get_secret("device.dev-xyz.push_key")
+            .get_secret(&format!("device.{device_id}.push_key"))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(pk.as_bytes(), push_key.as_slice());
+
+        // The verified push delegation was persisted so the dispatcher can sign.
+        let stored_deleg = vault
+            .get_secret(&format!("device.{device_id}.push_delegation"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_deleg.as_bytes(), deleg.to_bytes().as_slice());
 
         // The durable row retains the public rendezvous id it paired under.
         assert_eq!(row.rendezvous_id.as_deref(), Some(rid.as_str()));

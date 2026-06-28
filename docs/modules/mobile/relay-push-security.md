@@ -46,11 +46,18 @@ C is allowed to see:
   C-minted `relay_key`.
 - Relay connection source address, connection time, close time, byte lengths,
   timing, and traffic class (`chat` or `blob`).
-- Push registration metadata: `device_id`, APNs token, and APNs environment.
-- Push `/notify` metadata: `device_id`, `bid`, `kid`, `collapse_id`, `enc`, `n`,
-  and ciphertext length.
+- Push registration metadata: `device_id` (a 32-byte Ed25519 public key, hex),
+  APNs token, APNs environment, and the binding-authentication fields
+  (`gateway_pubkey`, `delegation`, `sig`, `counter`).
+- Push `/notify` metadata: `device_id`, `bid`, `collapse_id`, `enc`, `n`,
+  the gateway `sig`, the replay `counter`, and ciphertext length.
 
-The current protocol does not attempt to hide those metadata fields. In
+`collapse_id` is an opaque short hash of `(device_id, session_id)`, **not** the
+raw `device_id:session_id`. So C learns neither the cleartext `session_id` (which
+stays protected on every leg) nor anything beyond a stable per-conversation
+coalescing key.
+
+The current protocol does not attempt to hide the remaining metadata fields. In
 particular, the relay is not length-hiding, and the push path does not hide that
 a notification occurred.
 
@@ -147,7 +154,8 @@ fails. A short fallback would be offline-crackable by a hostile relay.
    - A persists APNs registration material for retry.
    - A returns `auth_token`, gateway static public key, `relay_node_id`, and
      relay settings in the sealed welcome.
-   - P stores the paired record and the `push_key` in the App Group keychain.
+   - P stores the paired record and its device Ed25519 identity in its private
+     keychain, and the `push_key` in the shared App Group keychain.
 
 Security property: scanning transfers a 256-bit PSK out of band and binds it to
 a live XXpsk0 transcript plus human comparison. C may see `h`, `r`, and `k`, and
@@ -234,9 +242,17 @@ P -> A   Hello { rendezvous_id, msg=e }
 A -> P   HandshakeReply { msg=(e, ee, s, es) }
 P -> A   HandshakeFinal { msg=(s, se), payload=DeviceHello }
           both enter transport mode and share handshake hash h
-P -> A   Sealed(DeviceConfirm)
-A -> P   Sealed(GatewayWelcome)
+P -> A   Sealed(DeviceConfirm)     # the phone user's accept/decline
+A -> P   Sealed(GatewayWelcome)    # routing, auth_token, gateway push pubkey
+P -> A   Sealed(DeviceDelegation)  # device authorizes the gateway push key
 ```
+
+`DeviceConfirm` carries the phone user's pairing decision; `DeviceDelegation`
+(sent after the welcome, because it signs over the gateway push key the welcome
+carries) authorizes A's push key to manage the device's APNs binding at C. Both
+are best-effort tails of an otherwise-complete pair: a device confirmed by both
+humans is approved even if the delegation never arrives (push is then disabled
+until re-pair).
 
 The QR splits routing from authentication:
 
@@ -275,50 +291,74 @@ listed in A's approved device row.
 
 ### 5. Push registration and encrypted-preview authentication
 
-Push has two separate checks:
+Push has three separate checks:
 
-- C authenticates the gateway tenant with `remote_api_key`.
+- C authenticates the gateway tenant with `remote_api_key` (admission only).
+- C authenticates the **binding** with a per-device Ed25519 delegation chain, so
+  one tenant cannot touch another's binding under a *shared* `remote_api_key`
+  (see [Guest-tier tenancy](#guest-tier-tenancy-and-push-binding-authentication)).
 - P authenticates preview content locally with the `push_key` AEAD tag.
+
+The binding is owned by the device's Ed25519 identity: `device_id ==
+ios-<hex(device_pubkey)>`, so it self-certifies at C. At pairing the device signs
+a **delegation** authorizing A's gateway push key, and A signs every `/register`
+and `/notify`. The signed byte layout is pinned in `device-proto`'s `delegation`
+module; C re-implements verification against it.
 
 Registration:
 
 1. P obtains an APNs device token from iOS.
-2. During pairing, P sends `device_id`, APNs env, and the APNs token if iOS has
-   already delivered it in the authenticated `DeviceHello` payload.
-3. A persists the approved device row, stores the `push_key` in `SecretVault`,
-   and persists the APNs registration material it received. That material is
-   usable for retry only when the token is non-empty.
-4. If the token arrives after pairing, the paired app best-effort POSTs the same
-   registration body directly to C's `/register` using the relay admission key it
-   already holds from the QR:
+2. During pairing, P sends `device_id`, APNs env, and the APNs token (if iOS has
+   already delivered it) in the authenticated `DeviceHello`. A advertises its
+   gateway push public key in `GatewayWelcome`; P then sends a sealed
+   `DeviceDelegation` (the 6th pairing message) signed under its device identity.
+3. A persists the approved device row, stores the `push_key` and the verified
+   delegation in `SecretVault`, and persists the APNs registration material it
+   received (usable for retry only when the token is non-empty).
+4. Before A's first push to a device in a gateway run, A best-effort POSTs a
+   **signed** `/register` from its persisted APNs material:
 
 ```json
 {
   "remote_api_key": "...",
-  "device_id": "ios-...",
+  "device_id": "ios-<hex(ed25519 pubkey)>",
   "apns_token": "...",
-  "env": "sandbox"
+  "env": "sandbox",
+  "gateway_pubkey": "base64(gateway ed25519 pub)",
+  "delegation": "base64(device→gateway signature)",
+  "sig": "base64(gateway signature over this register)",
+  "counter": 173000000000000000
 }
 ```
 
-5. Before A's first push to a device in a gateway run, A also best-effort POSTs
-   `/register` from its persisted APNs material when that material is non-empty.
-   This self-heals a restarted or pruned C-side token store.
-6. C stores `(remote_api_key, device_id) -> { apns_token, env }`.
+   C verifies `device_id == ios-<hex(device_pubkey)>`, the delegation under the
+   device key, the register signature under `gateway_pubkey`, and that `counter`
+   strictly exceeds the device's last accepted one; then it stores `device_id ->
+   { apns_token, env, gateway_pubkey, last_counter }`. The app no longer registers
+   directly with C (it holds no gateway push key). Instead the app sends its
+   current APNs token to the gateway on every content connect (a sealed
+   `Frame::UpdateApnsToken` over the Noise IK leg); the gateway persists it and
+   re-registers (signed) on its next push when the token changed — so a token that
+   arrived after pairing, or rotated later (reinstall / restore / new device), is
+   bound on the next connect with no re-pair.
 
 Notification:
 
 1. A encrypts the preview JSON with ChaCha20-Poly1305 under the 32-byte
-   `push_key`.
-2. A sends ciphertext and nonce to C's `/notify`.
-3. C admits by `remote_api_key`, resolves the APNs token by
-   `(remote_api_key, device_id)`, rate limits, signs the APNs provider JWT, and
-   forwards the ciphertext.
+   `push_key`, and signs the `/notify` with the gateway push key under a fresh
+   `counter`.
+2. A sends ciphertext, nonce, signature, and counter to C's `/notify`.
+3. C admits by `remote_api_key`, resolves the binding by `device_id`, verifies
+   the notify signature against the stored `gateway_pubkey`, rejects a
+   non-advancing `counter` (replay), rate limits per `device_id`, signs the APNs
+   provider JWT, and forwards the ciphertext.
 4. P's Notification Service Extension reads `baybo.push-key.<bid>` from the
    shared keychain access group and verifies/decrypts the ciphertext locally.
 
 Security property: C can decide whether to send a notification, but cannot read
-or generate a valid encrypted Baybo preview without `push_key`.
+or generate a valid encrypted Baybo preview without `push_key`, and — crucially
+under a shared `remote_api_key` — cannot register, redirect, suppress, or notify
+a device's binding without the gateway's push signing key, which it never holds.
 
 ## Relay Communication Flow After Authentication
 
@@ -396,16 +436,87 @@ succeeds and the `device_id` is known; the new leg aborts the stale predecessor.
 
 Relevant code:
 
-- A push dispatcher: `crates/gateway/src/push/mod.rs`
+- A push dispatcher (preview + signed register/notify): `crates/gateway/src/push/mod.rs`
+- A delegation capture at pairing: `crates/gateway/src/channel/device_pair.rs`
+- A token refresh on the content leg: `crates/gateway/src/channel/device_content.rs`
+- P APNs token capture: `app/mobile/src-tauri/src/push_register.rs`
+- Delegation crypto (A signs, C verifies, byte layout pinned):
+  `crates/device-proto/src/delegation.rs`, `remote-host/crates/push/src/delegation.rs`
 - AEAD framing: `crates/device-proto/src/aead.rs`
 - push key derivation: `crates/device-proto/src/kdf.rs`
 - C push protocol: `remote-host/crates/protocol/src/push.rs`
 - C push pipeline: `remote-host/crates/push/src/notify.rs`
 - C push HTTP routes: `remote-host/crates/push/src/http.rs`
+- C device-token store: `remote-host/crates/push/src/store.rs`
 - P NSE decrypt path:
   `app/mobile/apple/NotificationExtension/NotificationService.swift`
 - P NSE keychain path:
   `app/mobile/apple/NotificationExtension/PushKeyStore.swift`
+
+The push flow has two stages: **register** the device's APNs binding with C
+(gateway-signed, once per `(device, token)`), then per pushable turn **notify** —
+encrypt the preview, sign it, and post it for C to forward blind.
+
+### Registration lifecycle
+
+C must hold an authenticated APNs binding before any preview can be delivered.
+Registration is gateway-mediated and signed end to end; the app never POSTs C's
+`/register` itself.
+
+Keys (all established at pairing — see
+[Guest-tier tenancy](#guest-tier-tenancy-and-push-binding-authentication)):
+
+- Device Ed25519 identity `D` — `device_id == ios-<hex(D_pub)>` — in P's private
+  keychain.
+- Gateway Ed25519 push key `G`, vault-persisted on A (`gateway.push_signing_key`),
+  one per gateway.
+- Per-device `push_key` (HKDF of the pairing handshake hash `h`), on both ends
+  (A's `SecretVault`, P's App Group keychain) for preview AEAD.
+- The device→gateway delegation (`D`-signature over `G_pub`), on A at
+  `device.<device_id>.push_delegation`.
+
+1. **iOS token capture.** P calls `registerForRemoteNotifications()` at launch;
+   iOS later hands it an APNs device token. APNs tokens are not stable (they change
+   on reinstall / restore / new device), so P re-fetches every launch.
+2. **Pairing.** P sends `device_id`, APNs env, and the token if already issued, in
+   the authenticated `DeviceHello`. A advertises `G_pub` in `GatewayWelcome`; P
+   returns the sealed `DeviceDelegation`. A persists the approved row, the
+   `push_key`, the verified delegation, and the APNs material it received.
+3. **Signed `/register`.** Before A's first push to a device in a run, A
+   best-effort POSTs a signed `/register` built from the persisted APNs material —
+   skipped when the token is empty or no delegation is stored. The body carries
+   `D`'s delegation, `G_pub`, A's `G`-signature over the binding, and a monotonic
+   `counter`:
+
+   ```json
+   {
+     "remote_api_key": "...",
+     "device_id": "ios-<hex(D_pub)>",
+     "apns_token": "...",
+     "env": "sandbox",
+     "gateway_pubkey": "base64(G_pub)",
+     "delegation": "base64(D over G_pub)",
+     "sig": "base64(G over this register)",
+     "counter": 173000000000000000
+   }
+   ```
+
+   C verifies `device_id == ios-<hex(D_pub)>`, the delegation under `D_pub`, the
+   register signature under `G_pub`, and `counter` strictly above the device's last
+   accepted; on success it stores `device_id -> { apns_token, env, gateway_pubkey,
+   last_counter }`. Any failure → `403`, binding untouched. A caches the
+   last-registered token per device and re-registers at most once per
+   `(device, token)` per run.
+4. **Token refresh.** A token that missed `DeviceHello`, or rotated after pairing,
+   reaches A over the content channel: P sends its current token in a sealed
+   `Frame::UpdateApnsToken { apns_token, apns_env }` over the Noise IK content leg
+   on every connect. A intercepts it before the generic router and persists it
+   (`device.<device_id>.apns`); because the cached token now differs, the
+   dispatcher re-registers (signed, as in step 3) on its next push — no re-pair.
+5. **Pruning.** When APNs rejects a token (`400`/`410`), C unbinds it (the device
+   row on A is never touched); a later push re-registers from A's persisted material.
+
+### Notify flow
 
 Dispatch trigger:
 
@@ -431,29 +542,36 @@ Preview construction:
 
 Encryption and `/notify`:
 
-1. A loads `device.<device_id>.push_key` from `SecretVault`.
+1. A loads `device.<device_id>.push_key` and its gateway push signing key from
+   `SecretVault`.
 2. A generates a fresh random 12-byte nonce.
 3. A encrypts the preview with ChaCha20-Poly1305, empty AAD, producing
    `ciphertext || 16-byte tag`.
-4. A POSTs to C:
+4. A signs the notify (over `device_id`, `enc`, `n`, `bid`, `counter`) with the
+   gateway push key, under a fresh strictly-increasing `counter`.
+5. A POSTs to C (`collapse_id` is a short hash of `(device_id, session_id)`, so
+   it fits APNs' 64-byte collapse-id limit and reveals no `session_id`):
 
 ```json
 {
   "remote_api_key": "...",
-  "device_id": "ios-...",
-  "collapse_id": "ios-...:session-id",
-  "kid": 0,
+  "device_id": "ios-<hex(ed25519 pubkey)>",
+  "collapse_id": "<hex(sha256(device_id || ':' || session_id))[..16]>",
   "bid": "ios-...",
   "enc": "base64(ciphertext||tag)",
-  "n": "base64(nonce)"
+  "n": "base64(nonce)",
+  "sig": "base64(gateway signature over this notify)",
+  "counter": 173000000000000000
 }
 ```
 
 C to APNs:
 
 1. C validates `remote_api_key`.
-2. C resolves `(remote_api_key, device_id)` to APNs token and env.
-3. C applies per-`(remote_api_key, device_id)` notification rate limiting.
+2. C resolves the binding by `device_id` and verifies `sig` against the stored
+   `gateway_pubkey`; a forged or co-tenant signature is rejected (`403`).
+3. C rejects a `counter` that does not strictly exceed the device's last accepted
+   one (replay), then applies per-`device_id` notification rate limiting.
 4. C signs or reuses an APNs provider JWT.
 5. C sends an APNs payload with a generic visible alert and the ciphertext fields:
 
@@ -465,7 +583,6 @@ C to APNs:
   },
   "enc": "...",
   "n": "...",
-  "kid": 0,
   "bid": "ios-..."
 }
 ```
@@ -541,7 +658,7 @@ C sees and can act on push routing metadata, but not preview plaintext:
 
 - C stores APNs token and env.
 - C receives `enc` and `n`, but not `push_key`.
-- C copies `enc`, `n`, `kid`, and `bid` into the APNs payload.
+- C copies `enc`, `n`, and `bid` into the APNs payload.
 - C cannot encrypt an attacker-chosen preview that the NSE will accept.
 - Tampering with `enc`, `n`, or `bid` causes local decrypt failure on P.
 
@@ -549,6 +666,67 @@ The proof is limited to encrypted preview content. It does not claim that a
 malicious APNs provider can never display any text; a `.p8` holder can send an
 ordinary APNs alert. It only cannot produce a valid encrypted Baybo preview
 without the `push_key`.
+
+## Guest-tier tenancy and push-binding authentication
+
+Relevant code:
+
+- Pinned signing layout: `crates/device-proto/src/delegation.rs`
+- C-side verification: `remote-host/crates/push/src/delegation.rs`
+- C device-token store (keyed by `device_id`): `remote-host/crates/push/src/store.rs`
+
+C is multi-tenant and its only tenant key is `remote_api_key`. The built-in public
+proxy hands out one **shared** trial key, `guest`, so many mutually-distrusting
+devices use the *same* `remote_api_key`. The push device-token store therefore
+cannot rely on the admission key to isolate one device's APNs binding from
+another's: under `guest`, `remote_api_key` is not a tenant boundary at all.
+
+The threat, absent further defense: C's `/register` would be an unconditional
+overwrite gated only by admission, and `device_id` is visible to C and listed as
+guessable. So a co-tenant who learned a victim `device_id` could overwrite the
+binding (redirect the victim's encrypted previews to a device it controls), prune
+it (suppress the victim's pushes), or spam `/notify` (lock-screen buzz / replay).
+Previews stay encrypted throughout (no `push_key`), but delivery routing and
+metadata would be at the co-tenant's mercy.
+
+### Delegation chain
+
+The binding is authenticated to its **device key**, independent of the shared
+admission key:
+
+- The device holds an Ed25519 identity key `D`. Its `device_id` *is* that public
+  key (`ios-<hex(D_pub)>`), so the binding self-certifies — C re-derives
+  `device_id` from the key carried in the request.
+- At pairing the device signs a delegation authorizing the gateway's Ed25519 push
+  key `G` (carried in `GatewayWelcome`); it sends the delegation as the sealed 6th
+  pairing message.
+- The gateway signs every `/register` and `/notify` with `G`, including a
+  strictly-increasing `counter`.
+
+C verifies, with **no stored secret and no trust-on-first-use**: `device_id ==
+ios-<hex(D_pub)>`, the delegation under `D_pub`, the request signature under
+`G_pub` (stored at register), and `counter` strictly greater than the device's
+last accepted. Only the holder of `D` can authorize a `G`, and only the holder of
+`G` can mutate or notify the binding.
+
+### Properties and limits
+
+- A co-tenant under a shared `remote_api_key` cannot register over, redirect,
+  suppress, replay, or spam another device's binding — it can forge neither `D`'s
+  delegation nor `G`'s signature.
+- `device_id` is a full 32-byte Ed25519 public key, so it is not enumerable; the
+  delegation makes its confidentiality non-load-bearing anyway.
+- C (a separate workspace) re-implements verification against the byte layout
+  pinned in `device-proto`; a pinned cross-implementation test vector guards the
+  two against drift.
+- The gateway is the **only** registrar (it holds `G`). A token that missed
+  `DeviceHello`, or rotated after pairing (APNs tokens are not stable across
+  reinstall / restore / new device), reaches the gateway over the content channel:
+  the app sends its current token in a sealed `Frame::UpdateApnsToken` on every
+  connect, and the gateway persists it and re-registers (signed) on its next push
+  when it changed — no re-pair needed.
+- This protects binding *integrity and delivery routing*, not the existence or
+  timing of a push, nor preview confidentiality (which `push_key` already covers).
 
 ## Security Proof Sketches
 
@@ -597,16 +775,25 @@ the incoming notification content.
 Therefore C can drop, delay, or replay ciphertext notifications, but cannot learn
 or newly forge encrypted preview plaintext.
 
-### Claim 4: C's tenant isolation is scoped to `remote_api_key`
+### Claim 4: a shared `remote_api_key` does not let one tenant touch another's push binding
 
-Relay and push both resolve `remote_api_key` through a shared admission seam.
-Relay quotas are keyed by that admission key. Push APNs bindings are keyed by
-`(remote_api_key, device_id)`.
+Admission (`remote_api_key`) is *not* the binding's isolation boundary — the
+built-in `guest` trial key is shared by many mutually-distrusting tenants. Binding
+integrity instead comes from the per-device Ed25519 delegation chain C verifies
+statelessly (see
+[Guest-tier tenancy](#guest-tier-tenancy-and-push-binding-authentication)):
+`device_id` self-certifies its device key, `/register` carries the device's
+delegation + the gateway's signature, `/notify` is verified against the
+`gateway_pubkey` stored at register, and both carry a strictly-increasing replay
+`counter`.
 
-Therefore one tenant cannot use its own admitted key to claim another tenant's
-pending content leg, overwrite another tenant's APNs token, or prune another
-tenant's binding. This is quota and binding isolation. End-to-end content
-security still comes from Noise and `push_key`, not from C admission.
+Therefore a tenant holding the same `remote_api_key` cannot register over,
+redirect, suppress, replay, or spam another device's binding, even knowing its
+`device_id` — it can forge neither the device delegation nor the gateway
+signature. Relay quotas remain keyed by `remote_api_key` (and, for bandwidth,
+`(remote_api_key, server_id)`); the push binding store and notify rate limiter are
+keyed by the globally-unique `device_id`. End-to-end content security still comes
+from Noise and `push_key`, not from C admission.
 
 ## Security Boundaries
 
@@ -618,8 +805,9 @@ security still comes from Noise and `push_key`, not from C admission.
   whether to call APNs, and tamper with APNs payloads.
 - Network attackers can observe public traffic to C, while TLS still protects
   HTTP/WS transport to C.
-- Other tenants can try to spend their own `remote_api_key` quota, guess device
-  ids, or race public rendezvous joins.
+- Other tenants — including co-holders of a **shared** `remote_api_key` such as
+  the `guest` trial key — can try to spend that key's quota, guess device ids,
+  register/notify another device id, or race public rendezvous joins.
 
 ### Out of scope
 
@@ -627,11 +815,8 @@ security still comes from Noise and `push_key`, not from C admission.
 - A same-UID malicious process on the gateway host reading `SecretVault`, the
   master key, process memory, or local files.
 - A malicious app or extension in the same iOS keychain access group.
-- APNs availability and push metadata privacy.
+- APNs availability and push metadata privacy (existence/timing of a push).
 - Relay length and timing privacy.
-- Push anti-replay. The current AEAD payload has no timestamp, monotonic counter,
-  or AAD-bound collapse id; C can replay a previously seen `enc` / `n` / `bid`
-  and cause the device to show the old decrypted preview again.
 - Ordinary APNs alert anti-forgery under `.p8` compromise. If C is malicious and
   holds the provider key, it can send arbitrary non-decrypted APNs alerts. It
   still cannot generate a valid encrypted Baybo preview.
@@ -649,9 +834,8 @@ security still comes from Noise and `push_key`, not from C admission.
 - Send the honest generic placeholder notification.
 - If malicious and holding `.p8`, send arbitrary ordinary APNs alerts outside the
   encrypted-preview path.
-- Replay an old encrypted preview payload.
 - Leak metadata it sees, such as APNs token, device id, `remote_api_key`, and
-  `collapse_id`.
+  `collapse_id` (an opaque hash).
 
 ### C cannot do, assuming endpoint keys stay secret
 
@@ -662,24 +846,30 @@ security still comes from Noise and `push_key`, not from C admission.
 - Recover push preview plaintext from ciphertext.
 - Generate a new encrypted preview that the NSE decrypts to attacker-chosen
   plaintext.
-- Use one tenant's `remote_api_key` to overwrite another tenant's APNs token
-  binding.
+- Register over, redirect, suppress, replay, or spam a device's push binding —
+  including from a co-holder of a shared `remote_api_key` — without the gateway's
+  push signing key (the per-device delegation chain + replay counter gate it).
 
 ## Operational Notes
 
 - `remote_api_key` leakage is primarily a resource-abuse risk. It is not a
-  content decryption key and not the pairing MITM defense.
+  content decryption key, not the pairing MITM defense, and — because the push
+  binding is gated by the per-device delegation chain, not the admission key — not
+  a way to hijack, redirect, or suppress another device's push binding.
 - C's `.p8` is an APNs provider credential. If it leaks, an attacker can send
   notifications to known APNs tokens, but cannot generate valid encrypted
   previews.
 - When a device is revoked, A's relay-content manager observes the absence of an
   approved device row and tears down the control connection, so A stops
   advertising the `relay_node_id`.
-- `/register` can be sent by A from persisted pairing material or by P when iOS
-  delivers the APNs token after pairing. P never holds APNs provider credentials.
-- A retries push registration from non-empty APNs material persisted in the vault
-  before its first push in a run, which self-heals a missing C-side token binding
-  when the token was available to A.
+- `/register` is sent only by A (it holds the gateway push signing key the binding
+  is authenticated with); P cannot register directly, and never holds APNs
+  provider credentials. P keeps the binding current by sending its APNs token to A
+  over the content channel (`Frame::UpdateApnsToken`) on every connect, so a token
+  that missed `DeviceHello` or rotated later is re-registered without a re-pair.
+- A retries push registration (signed) from non-empty APNs material persisted in
+  the vault before its first push in a run, which self-heals a missing C-side
+  token binding when the token was available to A.
 - Blob transfer uses the same Noise IK authentication as chat, but on a separate
   relay data leg with traffic class `blob`; C meters it as background traffic.
   See [`blob-transfer.md`](blob-transfer.md).

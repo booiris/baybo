@@ -336,6 +336,17 @@ pub enum Frame {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
     },
+    /// Client → server, **iOS only**. The device's current APNs token (+ env
+    /// `"sandbox"`/`"production"`), sent on every content connect so the gateway
+    /// can keep C's push binding fresh across APNs token rotation (reinstall,
+    /// restore-from-backup, new device — Apple does not guarantee a stable
+    /// token). The gateway persists it and re-registers (signed) with C when the
+    /// token changed. Handled on the device content leg before the generic
+    /// router; other channels never send it.
+    UpdateApnsToken {
+        apns_token: String,
+        apns_env: String,
+    },
     /// Server → client. The connection's live stream is in an
     /// indeterminate state (slow-consumer drop, server-side
     /// reconfiguration, etc.); clients should re-subscribe and refetch

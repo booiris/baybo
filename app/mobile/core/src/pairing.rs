@@ -23,7 +23,9 @@
 
 use device_proto::aead::KEY_LEN;
 use device_proto::kdf::{derive_confirm_code, derive_push_key};
-use device_proto::pairing::{self, ApnsEnv, DeviceConfirm, DeviceHello, GatewayWelcome, PairFrame};
+use device_proto::pairing::{
+    self, ApnsEnv, DeviceConfirm, DeviceDelegation, DeviceHello, GatewayWelcome, PairFrame,
+};
 use device_proto::psk_pair::{PairingSecret, PskHandshake, PskTransport, build_prologue};
 use serde::Serialize;
 
@@ -72,6 +74,11 @@ pub struct PairedGateway {
     pub relay_url: String,
     /// The public rendezvous id this device paired under (retained for audit).
     pub rendezvous_id: String,
+    /// The gateway's Ed25519 push-signing public key (from the welcome), or
+    /// `None` when the gateway has no relay/push configured. The app signs a
+    /// delegation authorizing it to manage its APNs binding at C
+    /// ([`PairingClient::seal_delegation`]).
+    pub gateway_push_pubkey: Option<[u8; KEY_LEN]>,
 }
 
 /// What `pair_begin` returns (a Tauri IPC DTO): the confirmation code to show
@@ -210,6 +217,11 @@ impl PairingClient {
         let welcome: GatewayWelcome = pairing::decode(&transport.read(msg)?)?;
         let push_key = derive_push_key(transport.handshake_hash())?;
         let gateway_static_pubkey = *transport.remote_static();
+        let gateway_push_pubkey = (welcome.gateway_push_pubkey.len() == KEY_LEN).then(|| {
+            let mut k = [0u8; KEY_LEN];
+            k.copy_from_slice(&welcome.gateway_push_pubkey);
+            k
+        });
         Ok(PairedGateway {
             auth_token: welcome.auth_token,
             gateway_static_pubkey,
@@ -217,7 +229,23 @@ impl PairingClient {
             relay_node_id: welcome.relay_node_id,
             relay_url: welcome.relay_url,
             rendezvous_id: welcome.rendezvous_id,
+            gateway_push_pubkey,
         })
+    }
+
+    /// Seal the device's push delegation — the 6th (final) pairing message.
+    /// `delegation` is the 64-byte Ed25519 signature the app made over the
+    /// gateway push key from [`PairedGateway::gateway_push_pubkey`], authorizing
+    /// it to manage the device's APNs binding at C. Returns the sealed transport
+    /// frame to send last. Signing happens in the shell (which holds the device
+    /// Ed25519 identity); the core only frames it through the Noise transport.
+    pub fn seal_delegation(&mut self, delegation: Vec<u8>) -> Result<PairFrame, MobileError> {
+        let transport = self
+            .transport
+            .as_mut()
+            .ok_or(MobileError::State("transport not ready"))?;
+        let msg = transport.write(&pairing::encode(&DeviceDelegation { delegation })?)?;
+        Ok(PairFrame::Sealed { msg })
     }
 }
 
@@ -284,13 +312,15 @@ mod tests {
         let device_confirm: DeviceConfirm = pairing::decode(&gw_t.read(&cc).unwrap()).unwrap();
         assert!(device_confirm.accepted);
 
-        // gateway seals GatewayWelcome (with the issued token; its static is NOT
-        // carried — the app already learned it as an XX token)
+        // gateway seals GatewayWelcome (with the issued token + its Ed25519 push
+        // key; its Noise static is NOT carried — learned in-band as an XX token)
+        let gw_push = device_proto::delegation::generate_signing_key();
         let welcome = GatewayWelcome {
             relay_node_id: "node-1".into(),
             relay_url: "wss://proxy.baybo.space".into(),
             rendezvous_id: RID.into(),
             auth_token: "issued-token".into(),
+            gateway_push_pubkey: gw_push.verifying_key().to_bytes().to_vec(),
         };
         let wc = gw_t.write(&pairing::encode(&welcome).unwrap()).unwrap();
 
@@ -300,11 +330,32 @@ mod tests {
         assert_eq!(paired.gateway_static_pubkey, gw_static.public());
         assert_eq!(paired.relay_node_id, "node-1");
         assert_eq!(paired.rendezvous_id, RID);
+        assert_eq!(
+            paired.gateway_push_pubkey,
+            Some(gw_push.verifying_key().to_bytes())
+        );
         // Both ends derived the same push key from `h`.
         assert_eq!(
             paired.push_key,
             derive_push_key(gw_t.handshake_hash()).unwrap()
         );
+
+        // The app signs a delegation over the gateway push key and seals it as the
+        // 6th message; the gateway opens and verifies it.
+        let app_ed = device_proto::delegation::generate_signing_key();
+        let deleg = device_proto::delegation::sign_delegation(&app_ed, &gw_push.verifying_key());
+        let PairFrame::Sealed { msg: dmsg } =
+            client.seal_delegation(deleg.to_bytes().to_vec()).unwrap()
+        else {
+            panic!("expected sealed DeviceDelegation");
+        };
+        let got: DeviceDelegation = pairing::decode(&gw_t.read(&dmsg).unwrap()).unwrap();
+        let got_sig = device_proto::delegation::signature_from_bytes(&got.delegation).unwrap();
+        assert!(device_proto::delegation::verify_delegation(
+            &app_ed.verifying_key(),
+            &gw_push.verifying_key(),
+            &got_sig,
+        ));
     }
 
     #[test]

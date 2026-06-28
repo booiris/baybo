@@ -6,8 +6,8 @@
 //! device-token issuance, and hooks the UIApplicationDelegate so the token that
 //! iOS delivers to `application:didRegisterForRemoteNotificationsWithDeviceToken:`
 //! is captured into a process-global ([`apns_token`]); pairing threads it into
-//! `DeviceHello` when available, and a paired app also re-registers the token
-//! directly with C's `/register` when iOS delivers it later.
+//! `DeviceHello`, and the gateway registers it with C under a gateway-signed
+//! binding (the app holds no gateway push key, so it cannot register directly).
 //!
 //! The delegate is owned by the Tauri/wry runtime, so the two APNs callbacks are
 //! added to its class at launch via the Objective-C runtime (`class_addMethod`).
@@ -18,90 +18,23 @@
 
 use std::sync::Mutex;
 
-use remote_host_protocol::push::{ApnsEnv, RegisterRequest};
-
 /// The captured APNs device token as lowercase hex, set once
 /// `didRegisterForRemoteNotifications` fires (a few seconds after launch). `None`
 /// until then, and always `None` off iOS.
 static APNS_TOKEN: Mutex<Option<String>> = Mutex::new(None);
 
 /// The captured APNs device token (hex), if registration has completed. Pairing
-/// reads this for `DeviceHello.apns_token`; if the token arrives later, the
-/// paired app POSTs C's `/register` directly with the same relay admission key.
+/// reads this for `DeviceHello.apns_token`; the **gateway** then persists it and
+/// registers it with C under a gateway-signed binding.
+///
+/// The app no longer registers with C directly: C now requires the binding to be
+/// signed by the gateway push key the device delegated at pairing, and the app
+/// holds no such key. A token that missed `DeviceHello`, or rotated after pairing,
+/// instead reaches the gateway over the content channel — the content pump sends a
+/// `Frame::UpdateApnsToken` with this value on every connect, and the gateway
+/// persists it and re-registers (signed) when it changed.
 pub fn apns_token() -> Option<String> {
     APNS_TOKEN.lock().ok().and_then(|t| t.clone())
-}
-
-/// If an APNs token is already available, try to bind it to the current paired
-/// record at C. Used after pairing completes, because the iOS token may have
-/// arrived before the app had a durable `PairedRecord` to register against.
-pub fn spawn_register_current_token() {
-    if let Some(token) = apns_token() {
-        spawn_register_token(token);
-    }
-}
-
-fn spawn_register_token(token: String) {
-    if token.is_empty() {
-        return;
-    }
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = register_token_with_remote(&token).await {
-            eprintln!("baybo: APNs remote registration skipped: {e}");
-        }
-    });
-}
-
-async fn register_token_with_remote(token: &str) -> Result<(), String> {
-    let Some(record) = crate::pairing::load_paired_record()? else {
-        return Ok(());
-    };
-    if record.remote_api_key.is_empty()
-        || record.relay_url.is_empty()
-        || record.device_id.is_empty()
-    {
-        return Ok(());
-    }
-    let base = relay_url_to_http_base(&record.relay_url);
-    if base.is_empty() {
-        return Ok(());
-    }
-    let body = RegisterRequest {
-        remote_api_key: record.remote_api_key,
-        device_id: record.device_id,
-        apns_token: token.to_string(),
-        env: current_apns_env(),
-    };
-    let url = remote_host_protocol::push::register_url(&base);
-    let resp = reqwest::Client::new()
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("register post: {e}"))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("register status {}", resp.status()))
-    }
-}
-
-fn relay_url_to_http_base(relay_url: &str) -> String {
-    if let Some(rest) = relay_url.strip_prefix("wss://") {
-        format!("https://{rest}")
-    } else if let Some(rest) = relay_url.strip_prefix("ws://") {
-        format!("http://{rest}")
-    } else {
-        relay_url.to_string()
-    }
-}
-
-fn current_apns_env() -> ApnsEnv {
-    if cfg!(debug_assertions) {
-        ApnsEnv::Sandbox
-    } else {
-        ApnsEnv::Production
-    }
 }
 
 #[cfg(target_os = "ios")]
@@ -136,9 +69,8 @@ pub fn register() {
 #[cfg(target_os = "ios")]
 fn set_apns_token(hex: String) {
     if let Ok(mut slot) = APNS_TOKEN.lock() {
-        *slot = Some(hex.clone());
+        *slot = Some(hex);
     }
-    spawn_register_token(hex);
 }
 
 /// iOS delivers the APNs device token here; capture it as hex.
@@ -237,24 +169,3 @@ fn install_token_capture(app: &objc2_ui_kit::UIApplication) {
 
 #[cfg(not(target_os = "ios"))]
 pub fn register() {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn relay_ws_base_maps_to_http_for_register() {
-        assert_eq!(
-            relay_url_to_http_base("wss://proxy.baybo.space"),
-            "https://proxy.baybo.space"
-        );
-        assert_eq!(
-            relay_url_to_http_base("ws://127.0.0.1:9000"),
-            "http://127.0.0.1:9000"
-        );
-        assert_eq!(
-            relay_url_to_http_base("https://proxy.baybo.space"),
-            "https://proxy.baybo.space"
-        );
-    }
-}

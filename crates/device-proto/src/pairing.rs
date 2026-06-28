@@ -14,7 +14,13 @@
 //!    decision), a Noise **transport** message (implicit nonce).
 //! 5. A → P [`PairFrame::Sealed`] — the [`GatewayWelcome`], a transport
 //!    message, sent only once the operator confirmed too (or
-//!    [`PairFrame::Reject`]).
+//!    [`PairFrame::Reject`]). It carries the gateway's Ed25519 push-signing
+//!    public key.
+//! 6. P → A [`PairFrame::Sealed`] — the [`DeviceDelegation`], a transport
+//!    message: the device signs (under its Ed25519 identity key, whose public
+//!    half is its `device_id`) an authorization for the gateway push key from
+//!    step 5 to manage its APNs binding at C. This is what lets C reject another
+//!    tenant's `/register`/`/notify` under a shared `remote_api_key`.
 //!
 //! The statics are exchanged in-band as XX handshake tokens, so neither
 //! [`DeviceHello`] nor [`GatewayWelcome`] carries a `static_pubkey` field — each
@@ -75,6 +81,24 @@ pub struct GatewayWelcome {
     /// moment this `GatewayWelcome` is sent — the gateway only seals it after
     /// both the phone user and the operator confirmed the pairing.
     pub auth_token: String,
+    /// The gateway's Ed25519 push-signing public key (32 bytes). The device
+    /// signs a [`DeviceDelegation`] authorizing this key to manage its APNs
+    /// binding at C. Empty when the gateway has no relay/push configured.
+    #[serde(default)]
+    pub gateway_push_pubkey: Vec<u8>,
+}
+
+/// App → gateway, the final sealed pairing message (a Noise transport message).
+/// The device authorizes the gateway's push-signing key (from
+/// [`GatewayWelcome::gateway_push_pubkey`]) to bind/notify its APNs token at the
+/// untrusted host C. The signature is over the gateway push pubkey under the
+/// device's Ed25519 identity key (its public half is the `device_id`); the
+/// byte layout is [`crate::delegation::sign_delegation`]. Sent last because the
+/// device needs the gateway push key the welcome carries to sign it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceDelegation {
+    /// 64-byte Ed25519 delegation signature.
+    pub delegation: Vec<u8>,
 }
 
 /// App → gateway, as a Noise transport message: the phone user's pairing
@@ -154,9 +178,19 @@ mod tests {
             relay_url: "wss://proxy.baybo.space".into(),
             rendezvous_id: "11111111-2222-4333-8444-555555555555".into(),
             auth_token: "deadbeef".into(),
+            gateway_push_pubkey: vec![7u8; 32],
         };
         let decoded: GatewayWelcome = decode(&encode(&welcome).unwrap()).unwrap();
         assert_eq!(welcome, decoded);
+    }
+
+    #[test]
+    fn device_delegation_round_trips() {
+        let d = DeviceDelegation {
+            delegation: vec![9u8; 64],
+        };
+        let decoded: DeviceDelegation = decode(&encode(&d).unwrap()).unwrap();
+        assert_eq!(d, decoded);
     }
 
     #[test]
@@ -236,6 +270,7 @@ mod tests {
             relay_url: String::new(),
             rendezvous_id: "rid".into(),
             auth_token: "tok".into(),
+            gateway_push_pubkey: vec![3u8; 32],
         };
         let sealed = gw_t.write(&encode(&welcome).unwrap()).unwrap();
         let got: GatewayWelcome = decode(&app_t.read(&sealed).unwrap()).unwrap();

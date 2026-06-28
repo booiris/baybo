@@ -34,6 +34,8 @@ async fn register(State(state): State<PushState>, Json(req): Json<RegisterReques
     match state.service.register(req) {
         RegisterOutcome::Registered => StatusCode::OK,
         RegisterOutcome::Unadmitted => StatusCode::UNAUTHORIZED,
+        // The delegation chain / signature / counter didn't verify.
+        RegisterOutcome::Rejected => StatusCode::FORBIDDEN,
     }
 }
 
@@ -48,6 +50,8 @@ async fn notify(State(state): State<PushState>, Json(req): Json<NotifyRequest>) 
         NotifyOutcome::Unadmitted => StatusCode::UNAUTHORIZED,
         NotifyOutcome::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         NotifyOutcome::UnknownDevice => StatusCode::NOT_FOUND,
+        // Signature / delegation / replay-counter verification failed.
+        NotifyOutcome::Rejected => StatusCode::FORBIDDEN,
         NotifyOutcome::Failed(_) => StatusCode::BAD_GATEWAY,
     }
 }
@@ -56,6 +60,7 @@ async fn notify(State(state): State<PushState>, Json(req): Json<NotifyRequest>) 
 mod tests {
     use super::*;
     use crate::apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender};
+    use crate::delegation::{ENV_SANDBOX, test_sign};
     use crate::jwt::ApnsProviderToken;
     use crate::store::{
         Admission, DeviceRegistration, DeviceTokenStore, InMemoryAdmission,
@@ -64,6 +69,8 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, header};
+    use base64::Engine;
+    use ed25519_dalek::SigningKey;
     use tower::ServiceExt;
 
     const TEST_P8: &str = r#"-----BEGIN PRIVATE KEY-----
@@ -80,14 +87,28 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         }
     }
 
+    fn device() -> SigningKey {
+        test_sign::signing_key(1)
+    }
+    fn gateway() -> SigningKey {
+        test_sign::signing_key(2)
+    }
+    fn device_id() -> String {
+        test_sign::device_id_for(&device().verifying_key())
+    }
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
     fn app() -> Router {
         let store = InMemoryDeviceTokenStore::new();
         store.register(
-            "inst-A",
-            "dev-1",
+            &device_id(),
             DeviceRegistration {
                 apns_token: "tok".into(),
                 env: ApnsEnv::Sandbox,
+                gateway_pubkey: gateway().verifying_key().to_bytes(),
+                last_counter: 0,
             },
         );
         let admission: Arc<dyn Admission> = Arc::new(InMemoryAdmission::with_keys(["inst-A"]));
@@ -111,15 +132,18 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         app().oneshot(req).await.unwrap().status()
     }
 
-    fn body(instance: &str, device: &str) -> serde_json::Value {
+    fn notify_body(instance: &str, device_id: &str, counter: u64) -> serde_json::Value {
+        let (enc, n) = ("Y2lwaGVy", "bm9uY2U=");
+        let sig = test_sign::sign_notify(&gateway(), device_id, enc, n, device_id, counter);
         serde_json::json!({
             "remote_api_key": instance,
-            "device_id": device,
-            "collapse_id": "dev-1:sess-1",
-            "kid": 0,
-            "bid": "dev-1",
-            "enc": "Y2lwaGVy",
-            "n": "bm9uY2U=",
+            "device_id": device_id,
+            "collapse_id": "c",
+            "bid": device_id,
+            "enc": enc,
+            "n": n,
+            "sig": b64(&sig.to_bytes()),
+            "counter": counter,
         })
     }
 
@@ -133,68 +157,92 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         app().oneshot(req).await.unwrap().status()
     }
 
-    fn reg_body(instance: &str) -> serde_json::Value {
+    fn reg_body(instance: &str, counter: u64) -> serde_json::Value {
+        let did = device_id();
+        let deleg = test_sign::sign_delegation(&device(), &gateway().verifying_key());
+        let sig = test_sign::sign_register(&gateway(), &did, "apns-tok-new", ENV_SANDBOX, counter);
         serde_json::json!({
             "remote_api_key": instance,
-            "device_id": "dev-new",
+            "device_id": did,
             "apns_token": "apns-tok-new",
             "env": "sandbox",
+            "gateway_pubkey": b64(&gateway().verifying_key().to_bytes()),
+            "delegation": b64(&deleg.to_bytes()),
+            "sig": b64(&sig.to_bytes()),
+            "counter": counter,
         })
     }
 
     #[tokio::test]
     async fn register_admitted_returns_200_unadmitted_401() {
-        assert_eq!(post_register(reg_body("inst-A")).await, StatusCode::OK);
+        assert_eq!(post_register(reg_body("inst-A", 1)).await, StatusCode::OK);
         assert_eq!(
-            post_register(reg_body("nope")).await,
+            post_register(reg_body("nope", 1)).await,
             StatusCode::UNAUTHORIZED,
         );
     }
 
     #[tokio::test]
     async fn admitted_known_device_returns_200() {
-        assert_eq!(post_notify(body("inst-A", "dev-1")).await, StatusCode::OK);
+        assert_eq!(
+            post_notify(notify_body("inst-A", &device_id(), 1)).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
     async fn unadmitted_instance_returns_401() {
         assert_eq!(
-            post_notify(body("nope", "dev-1")).await,
+            post_notify(notify_body("nope", &device_id(), 1)).await,
             StatusCode::UNAUTHORIZED,
         );
     }
 
     #[tokio::test]
     async fn unknown_device_returns_404() {
+        let other = test_sign::device_id_for(&test_sign::signing_key(5).verifying_key());
         assert_eq!(
-            post_notify(body("inst-A", "ghost")).await,
+            post_notify(notify_body("inst-A", &other, 1)).await,
             StatusCode::NOT_FOUND,
         );
     }
 
     #[tokio::test]
+    async fn forged_signature_returns_403() {
+        // A valid wire shape but a counter the signature doesn't cover → reject.
+        let mut body = notify_body("inst-A", &device_id(), 1);
+        body["counter"] = serde_json::json!(999);
+        assert_eq!(post_notify(body).await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn over_rate_returns_429() {
         // One shared router (cloned per request) keeps the limiter state across the
-        // whole burst; the push past it maps to 429.
+        // whole burst; each request carries a fresh counter (the replay floor).
         let app = app();
-        let post = || {
+        let did = device_id();
+        let post = |counter: u64| {
             Request::builder()
                 .method("POST")
                 .uri("/notify")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(&body("inst-A", "dev-1")).unwrap(),
+                    serde_json::to_vec(&notify_body("inst-A", &did, counter)).unwrap(),
                 ))
                 .unwrap()
         };
-        for _ in 0..crate::ratelimit::NOTIFY_BURST as usize {
+        for i in 1..=crate::ratelimit::NOTIFY_BURST as u64 {
             assert_eq!(
-                app.clone().oneshot(post()).await.unwrap().status(),
+                app.clone().oneshot(post(i)).await.unwrap().status(),
                 StatusCode::OK
             );
         }
         assert_eq!(
-            app.clone().oneshot(post()).await.unwrap().status(),
+            app.clone()
+                .oneshot(post(crate::ratelimit::NOTIFY_BURST as u64 + 1))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::TOO_MANY_REQUESTS,
         );
     }

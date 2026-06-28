@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use baybo_mobile_core::{PairingClient, PairingRequest};
 use device_proto::aead::KEY_LEN;
+use device_proto::delegation;
 use device_proto::noise::StaticKeypair;
 use device_proto::pairing::{self, ApnsEnv, PairFrame};
 use device_proto::psk_pair::PairingSecret;
@@ -104,6 +105,20 @@ fn load_or_create_device_identity() -> Result<StaticKeypair, String> {
     Ok(keypair)
 }
 
+/// The app's long-term **Ed25519 push-delegation identity** — distinct from the
+/// X25519 Noise static above. Its public half is the `device_id`
+/// (`ios-<hex(pub)>`), so the APNs binding self-certifies to C; the secret signs
+/// the pairing-time delegation authorizing the gateway's push key. Loaded from
+/// (or minted into) the keychain so the `device_id` is stable across re-pairings.
+fn load_or_create_device_sign_key() -> Result<delegation::SigningKey, String> {
+    if let Some(seed) = crate::keychain::read_device_sign_key()? {
+        return Ok(delegation::SigningKey::from_bytes(&seed));
+    }
+    let key = delegation::generate_signing_key();
+    crate::keychain::store_device_sign_key(&key.to_bytes())?;
+    Ok(key)
+}
+
 /// The IPC DTOs ([`PairChallenge`] / [`PairedSummary`]) live in
 /// baybo-mobile-core beside [`PairedGateway`], where ts-rs generates their TS
 /// (core's `ts-export` feature). Re-exported so the commands + lib.rs keep
@@ -138,7 +153,11 @@ pub async fn pair_begin(
     // keychain so the derived device_id stays stable across re-pairings and
     // launches, and content sessions reuse the same static across relaunches.
     let keypair = load_or_create_device_identity()?;
-    let device_id = format!("ios-{}", hex::encode(&keypair.public()[..8]));
+    // The device's Ed25519 push-delegation identity; its public half IS the
+    // device_id, so C can self-certify the APNs binding. Separate from the X25519
+    // Noise static above (which authenticates content sessions).
+    let sign_key = load_or_create_device_sign_key()?;
+    let device_id = delegation::device_id_for(&sign_key.verifying_key());
 
     let req = PairingRequest {
         rendezvous_id: rendezvous_id.to_string(),
@@ -189,6 +208,7 @@ pub async fn pair_begin(
         client,
         device_id.clone(),
         keypair,
+        sign_key,
         remote_api_key.unwrap_or_default(),
         on_abort,
         decision_rx,
@@ -247,6 +267,7 @@ async fn run_pair_pump(
     mut client: PairingClient,
     device_id: String,
     keypair: StaticKeypair,
+    sign_key: delegation::SigningKey,
     remote_api_key: String,
     on_abort: Channel<PairAborted>,
     mut decision_rx: oneshot::Receiver<bool>,
@@ -300,6 +321,7 @@ async fn run_pair_pump(
         &mut client,
         &device_id,
         &keypair,
+        &sign_key,
         &remote_api_key,
         accepted,
     )
@@ -317,6 +339,7 @@ async fn finish_pair(
     client: &mut PairingClient,
     device_id: &str,
     keypair: &StaticKeypair,
+    sign_key: &delegation::SigningKey,
     remote_api_key: &str,
     accepted: bool,
 ) -> Result<PairedSummary, String> {
@@ -342,6 +365,19 @@ async fn finish_pair(
         _ => return Err("expected sealed GatewayWelcome".into()),
     };
 
+    // 6th message: authorize the gateway's push key to manage our APNs binding at
+    // C, signed under our Ed25519 device identity (whose public half is the
+    // device_id). Best-effort — if the gateway advertised no push key (relay off)
+    // or the send fails, the pairing still stands; only push is affected.
+    if let Some(gw_push) = paired.gateway_push_pubkey
+        && let Ok(gw_push_key) = delegation::verifying_key_from_bytes(&gw_push)
+    {
+        let sig = delegation::sign_delegation(sign_key, &gw_push_key);
+        if let Ok(frame) = client.seal_delegation(sig.to_bytes().to_vec()) {
+            let _ = send(ws, &frame).await;
+        }
+    }
+
     // Persist the push key to the shared App Group keychain so the NSE can
     // decrypt lock-screen previews (account `baybo.push-key.<device_id>`, since
     // the gateway stamps `bid = device_id` into every push payload).
@@ -364,7 +400,6 @@ async fn finish_pair(
     let bytes = serde_json::to_vec(&record).map_err(|e| format!("encode paired record: {e}"))?;
     crate::keychain::store_paired_record(&bytes)
         .map_err(|e| format!("persist paired record: {e}"))?;
-    crate::push_register::spawn_register_current_token();
 
     Ok(PairedSummary::from(&paired))
 }

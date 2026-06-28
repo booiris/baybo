@@ -41,4 +41,10 @@ pub enum ProtoError {
     /// hostile length, refused before allocating.
     #[error("content frame too large: {len} bytes")]
     FrameTooLarge { len: usize },
+
+    /// An Ed25519 push-delegation key/signature was malformed or failed to
+    /// verify. `stage` names the operation, never the secret — verification is
+    /// constant in what it reveals.
+    #[error("signature {stage} failed")]
+    Signature { stage: &'static str },
 }

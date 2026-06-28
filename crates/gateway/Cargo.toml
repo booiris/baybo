@@ -76,6 +76,7 @@ chrono = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
+sha2 = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true, features = ["ws"] }

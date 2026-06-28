@@ -1,7 +1,7 @@
 // NotificationService.swift — the Baybo push Notification Service Extension (NSE).
 //
 // APNs delivers a generic, visible "New message" alert with `mutable-content: 1`
-// plus the operator-encrypted lock-screen preview (`enc`/`n`/`kid`/`bid`). This
+// plus the operator-encrypted lock-screen preview (`enc`/`n`/`bid`). This
 // extension wakes, decrypts the preview *locally* with CryptoKit, and rewrites
 // the visible title/body. It never touches the network and holds no remote-host
 // (C) credential — C relayed the ciphertext blind.
