@@ -2,10 +2,12 @@
 //!
 //! C (this crate) cannot link the gateway/app `device-proto` crate (separate
 //! workspace), so it re-implements *verification* of the signatures those sign,
-//! against the byte layout pinned in `device-proto`'s `delegation` module. The
-//! context strings, the `env` byte mapping, and the length-prefix framing below
-//! are the cross-implementation contract — they MUST match `device-proto`
-//! exactly or every signature will (safely) fail to verify.
+//! against `device-proto`'s byte layout. The domain-separation context strings
+//! come from the shared `remote-host-protocol` crate both workspaces link (a
+//! single source of truth); the `env` byte mapping and the length-prefix framing
+//! below are re-implemented here and MUST match `device-proto` exactly, or every
+//! signature will (safely) fail to verify — drift in that part is caught by the
+//! pinned cross-impl vector in `verify_accepts_pinned_device_proto_vector`.
 //!
 //! C verifies, with no stored secret and no trust-on-first-use:
 //! - `device_id == ios-<hex(device_pubkey)>` — the binding self-certifies;
@@ -18,13 +20,10 @@
 //! request signature.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use remote_host_protocol::push::{DELEGATION_CONTEXT, NOTIFY_CONTEXT, REGISTER_CONTEXT};
 
 /// `device_id` text prefix; the remainder is `hex(device_pubkey)` (32 bytes).
 pub const DEVICE_ID_PREFIX: &str = "ios-";
-
-const DELEGATION_CONTEXT: &[u8] = b"baybo/push/delegation/v1";
-const REGISTER_CONTEXT: &[u8] = b"baybo/push/register/v1";
-const NOTIFY_CONTEXT: &[u8] = b"baybo/push/notify/v1";
 
 /// Canonical `env` byte in the signed register message (matches `device-proto`).
 pub const ENV_SANDBOX: u8 = 0;

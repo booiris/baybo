@@ -24,14 +24,17 @@
 //! the request signature under `G_pub`. Only the holder of `D` can authorize a
 //! `G`, and only the holder of `G` can mutate/notify the binding — independent of
 //! the shared admission key. C (a separate Cargo workspace that cannot link this
-//! crate) re-implements verification against the byte layout pinned here; the
-//! context strings, the `env` byte mapping, and the length-prefix framing below
-//! are the cross-implementation contract.
+//! crate) re-implements verification against this byte layout. The domain-
+//! separation context strings are a single source of truth in the shared
+//! `remote-host-protocol` crate both workspaces link; the `env` byte mapping and
+//! the length-prefix framing below stay defined here and are guarded against
+//! drift by the cross-impl `pinned_vector` test.
 
 use zeroize::Zeroize;
 
 pub use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use ed25519_dalek::{Signer, Verifier};
+use remote_host_protocol::push::{DELEGATION_CONTEXT, NOTIFY_CONTEXT, REGISTER_CONTEXT};
 
 use crate::error::ProtoError;
 
@@ -44,12 +47,6 @@ pub const PUBLIC_LEN: usize = 32;
 pub const SIGNATURE_LEN: usize = 64;
 /// Ed25519 secret seed length.
 pub const SEED_LEN: usize = 32;
-
-/// Domain-separation contexts. Distinct per message kind so a signature minted
-/// for one role can never verify as another.
-const DELEGATION_CONTEXT: &[u8] = b"baybo/push/delegation/v1";
-const REGISTER_CONTEXT: &[u8] = b"baybo/push/register/v1";
-const NOTIFY_CONTEXT: &[u8] = b"baybo/push/notify/v1";
 
 /// Canonical `env` byte in the signed register message: APNs sandbox vs
 /// production. Pinned here so C's independent verifier maps identically.
