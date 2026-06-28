@@ -128,6 +128,29 @@ sqlite3 ./data/admission.db \
   "UPDATE remote_api_keys SET max_bps = 4194304 WHERE remote_api_key='<key>';"
 ```
 
+**Guest tier & its defaults.** A row's `tier` is `'registered'` (the default —
+explicit per-row limits) or `'guest'` (the shared trial tier). A guest row that
+leaves `max_conns` / `max_bps` / `per_server_max_bps` NULL inherits the **guest-tier
+defaults** instead of the registered role floor — and those defaults are simply the
+columns on the reserved **`guest`** row itself (the shared trial key doubles as the
+tier template). So you tune the whole guest tier with one ordinary `UPDATE`, no
+separate config — any column the `guest` row also leaves NULL falls back to the
+built-in default (**conns 2000**, **bps 20 MiB/s**, **per-server 2 MiB/s**):
+
+```bash
+# retune the guest tier (bytes/sec for the two bps columns):
+sqlite3 ./data/admission.db \
+  "UPDATE remote_api_keys SET max_conns = 500, max_bps = 10485760 \
+   WHERE remote_api_key = 'guest';"
+# (if the guest row doesn't exist yet, insert it as tier='guest'):
+sqlite3 ./data/admission.db \
+  "INSERT OR IGNORE INTO remote_api_keys(remote_api_key, tier, label) \
+   VALUES('guest', 'guest', 'shared trial tier');"
+```
+
+These set the tier *defaults*; an individual guest row with its own non-NULL limit
+still wins for that column, and registered rows are unaffected.
+
 **Push frequency control.** `POST /notify` is rate-limited per `(remote_api_key, device_id)` so a buggy or abusive gateway can't hammer APNs or spam a phone. Over the limit it returns `429` (the gateway backs off and retries). The limit is a fixed **60 pushes/min sustained, burst 20** per device; only admitted, registered devices are metered. Hardcoded, not configurable.
 
 **Per-source-IP flood backstop.** Ahead of admission, every relay WS-upgrade attempt is throttled per **client IP** (a token bucket, **10/s sustained, burst 60**), so a single host spraying upgrades across many rendezvous/node ids — or failing admission on each — is shed with `429` before any upgrade work. It also bounds the broker's pending map with a hard ceiling (`MAX_PENDING_LEGS`, **1024**): a new parked leg past the cap is refused `503` while matching an already-parked leg is exempt.

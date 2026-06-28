@@ -15,9 +15,10 @@ use remote_host_admission::{AdmissionEntry, InMemoryAdmission, Tier};
 /// `created_at` are for whoever administers it. `tier` is `'guest'` (auto-issued,
 /// carries the guest default limits, GC-eligible) or `'registered'` (control-plane
 /// provisioned, explicit per-row limits). `max_conns` / `max_bps` /
-/// `per_server_max_bps` are the key's optional limits (NULL → the guest default for
-/// guest rows, else the server's conservative role floor). `expires_at` is the
-/// guest-TTL wall clock (NULL → never expires).
+/// `per_server_max_bps` are the key's optional limits (NULL → for a guest row, the
+/// `'guest'` template row's column, else the `GUEST_*` const; for a registered row,
+/// the server's conservative role floor). `expires_at` is the guest-TTL wall clock
+/// (NULL → never expires).
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS remote_api_keys (\
     remote_api_key TEXT PRIMARY KEY, \
     label TEXT, \
