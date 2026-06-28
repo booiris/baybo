@@ -1,0 +1,56 @@
+# remote-host "C" role — one service, one listener. The relay is always on; the
+# push role turns on automatically when you configure an APNs .p8
+# (APNS_P8_HOST_PATH in .env). Their route paths are disjoint (/notify +
+# /register vs /pair, /content, /control).
+#
+# Admitted gateways live in a SQLite table (./data/admission.db by default),
+# hot-reloaded by polling — add/remove keys out of band (see DEPLOY.md), no
+# restart needed.
+#
+# Serves plain ws/http by default. Set TLS_CERT_HOST_PATH + TLS_KEY_HOST_PATH in
+# .env and it serves wss/https instead; set PORT=443 for port-less URLs.
+#
+# One-click:
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d --build
+
+secrets:
+  # The .p8 — falls back to a /dev/null placeholder when unset (push stays off,
+  # so it's never read). Mounted read-only; never enters an image layer.
+  apns_p8:
+    file: ${APNS_P8_HOST_PATH:-/dev/null}
+
+services:
+  remote-host:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: remote-host:latest
+    restart: unless-stopped
+    environment:
+      # The listen port, host + container the same (default 7777). The container
+      # runs as root, so a privileged PORT like 443 binds fine.
+      BIND_ADDR: 0.0.0.0:${PORT:-7777}
+      # gateway admission allow-list — a SQLite table on the /data volume
+      ADMISSION_DB_PATH: /data/admission.db
+      ADMISSION_POLL_SECS: ${ADMISSION_POLL_SECS:-30}
+      # fallback cap on simultaneous relay connections one admitted key may hold
+      MAX_CONNS_PER_REMOTE_API_KEY: ${MAX_CONNS_PER_REMOTE_API_KEY:-64}
+      # push — enabled automatically when APNS_P8_HOST_PATH is set in .env
+      APNS_P8_PATH: ${APNS_P8_HOST_PATH:+/run/secrets/apns_p8}
+      APNS_KEY_ID: ${APNS_KEY_ID:-}
+      APNS_TEAM_ID: ${APNS_TEAM_ID:-}
+      APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:-}
+      # TLS — set only when a cert is configured (-> wss/https), else blank (-> ws/http)
+      TLS_CERT: ${TLS_CERT_HOST_PATH:+/run/tls/cert.pem}
+      TLS_KEY: ${TLS_KEY_HOST_PATH:+/run/tls/key.pem}
+    secrets:
+      - apns_p8
+    volumes:
+      # The admission DB — bind-mounted so you can edit it from the host
+      # (sqlite3 ./data/admission.db ...).
+      - ${ADMISSION_DIR:-./data}:/data
+      - ${TLS_CERT_HOST_PATH:-/dev/null}:/run/tls/cert.pem:ro
+      - ${TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/key.pem:ro
+    ports:
+      - "${PORT:-7777}:${PORT:-7777}"

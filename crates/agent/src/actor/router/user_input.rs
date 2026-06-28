@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use baybo_channels::wire::MAX_MESSAGE_BATCH_MESSAGES;
 use baybo_channels::{
     AgentEvent, AgentOutput, IncomingMessage, NoticeLevel, OutgoingMessage, STOP_COMMAND_NAME,
 };
@@ -201,6 +202,9 @@ impl Router {
     /// construction — the client never batches a slash command (a coalescing
     /// barrier), sending those as individual messages instead.
     async fn route_incoming_batch(&mut self, batch: Vec<IncomingMessage>) -> anyhow::Result<()> {
+        if batch.len() > MAX_MESSAGE_BATCH_MESSAGES {
+            anyhow::bail!("message batch exceeds {MAX_MESSAGE_BATCH_MESSAGES} messages");
+        }
         // Non-empty: handle_incoming_batch returned early otherwise. All entries
         // share one session — the client batches per session.
         let first = &batch[0];
@@ -215,9 +219,11 @@ impl Router {
         );
         let _guard = span.enter();
 
-        if !self.rate_limiter.check(&user.id) {
-            warn!(user_id = %user.id, session_id = %session_id, "user rate-limited (batch)");
-            anyhow::bail!("rate limit exceeded for user '{}'", user.id);
+        for _ in 0..batch.len() {
+            if !self.rate_limiter.check(&user.id) {
+                warn!(user_id = %user.id, session_id = %session_id, "user rate-limited (batch)");
+                anyhow::bail!("rate limit exceeded for user '{}'", user.id);
+            }
         }
         self.cost_manager.check().map_err(|e| {
             warn!(user_id = %user.id, session_id = %session_id, error = %e, "cost manager rejected batch");

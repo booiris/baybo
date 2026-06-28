@@ -1,6 +1,14 @@
 //! Wire protocol shared by the gateway channel server and every
 //! channel client.
 //!
+//! These are the **pure wire types** — `Frame`, `Message`, `MessageRole`,
+//! the attachment / folder / task projections — plus the MessagePack codec.
+//! They were extracted from `baybo-channels` into their own crate so the iOS
+//! companion's `baybo-mobile-core` can speak the exact same protocol without
+//! pulling `baybo-channels → baybo-tools → { libsql, axum, reqwest, … }`, a
+//! chain that cannot cross-compile to iOS. `baybo-channels` re-exports this
+//! crate as its `wire` module, so server-side consumers are unchanged.
+//!
 //! After the Channel / Connection / Subscription refactor a Register
 //! frame only names the channel a connection serves; per-session
 //! routing is expressed by explicit `Subscribe` / `Unsubscribe` frames
@@ -9,17 +17,33 @@
 //! entirely and see every session of their channel type.
 //!
 //! Consumers: the TypeScript SDK at `sdks/channel-ts/`, the built-in
-//! TUI's WS client, and (forthcoming) the web chat page. All speak the
+//! TUI's WS client, the web chat page, and the iOS companion. All speak the
 //! types below verbatim, both encode/decode via MessagePack with named
 //! fields.
 
-use baybo_model::{ChannelType, ResourceAccess, SessionId};
-use baybo_tools::ApprovalDecision;
+use baybo_model::{ApprovalDecision, ChannelType, ResourceAccess, SessionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::types::MessageRole;
+/// Role discriminator on a [`Message`].
+///
+/// In-tree producers always set this explicitly: the agent emits
+/// `Assistant`, sidecars and inbound echo emit `User`. Default is
+/// `Assistant` so a wire frame that omits the field decodes as an
+/// agent reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub enum MessageRole {
+    User,
+    #[default]
+    Assistant,
+}
 
 /// Error surface for frame encode/decode.
 #[derive(Debug, Error)]
@@ -83,7 +107,7 @@ pub enum ActivityKind {
 )]
 pub struct WireAttachment {
     pub kind: AttachmentKind,
-    /// Content-addressed id from the `BlobStore` (`"sha256:<64hex>"`).
+    /// Capability id from the `BlobStore` (`"sha256:<64hex>.<read_token>"`).
     pub blob_id: String,
     pub mime_type: String,
     /// Byte length of the underlying blob. Sidecars consume this to
@@ -150,6 +174,20 @@ pub struct Message {
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub ordinal: Option<i64>,
 }
+
+/// Maximum number of user messages allowed in one inbound [`Frame::Messages`]
+/// batch. Gateway validation and agent-side defense-in-depth share this so the
+/// WS boundary and router contract cannot drift.
+pub const MAX_MESSAGE_BATCH_MESSAGES: usize = 64;
+
+/// Maximum aggregate UTF-8 text bytes allowed across one inbound
+/// [`Frame::Messages`] batch.
+pub const MAX_MESSAGE_BATCH_TEXT_BYTES: usize = 64 * 1024;
+
+/// Maximum aggregate attachments allowed across one inbound [`Frame::Messages`]
+/// batch. Attachments carry blob IDs, not bytes; this caps fan-out and downstream
+/// per-message conversion work.
+pub const MAX_MESSAGE_BATCH_ATTACHMENTS: usize = 64;
 
 /// One slash command published to a sidecar's native command surface
 /// (Telegram `setMyCommands`, Discord application commands, …). The
@@ -297,6 +335,17 @@ pub enum Frame {
     Unsubscribe {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
+    },
+    /// Client → server, **iOS only**. The device's current APNs token (+ env
+    /// `"sandbox"`/`"production"`), sent on every content connect so the gateway
+    /// can keep C's push binding fresh across APNs token rotation (reinstall,
+    /// restore-from-backup, new device — Apple does not guarantee a stable
+    /// token). The gateway persists it and re-registers (signed) with C when the
+    /// token changed. Handled on the device content leg before the generic
+    /// router; other channels never send it.
+    UpdateApnsToken {
+        apns_token: String,
+        apns_env: String,
     },
     /// Server → client. The connection's live stream is in an
     /// indeterminate state (slow-consumer drop, server-side

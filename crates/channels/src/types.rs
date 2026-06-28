@@ -69,25 +69,6 @@ pub struct OutgoingMessage {
     pub ordinal: Option<i64>,
 }
 
-/// Role discriminator on a wire-shape [`crate::wire::Message`].
-///
-/// In-tree producers always set this explicitly: the agent emits
-/// `Assistant`, sidecars and inbound echo emit `User`. Default is
-/// `Assistant` so a wire frame that omits the field decodes as an
-/// agent reply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(
-    feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
-)]
-pub enum MessageRole {
-    User,
-    #[default]
-    Assistant,
-}
-
 /// Something the agent emits about an in-flight turn, addressed to one
 /// session. The addressing triple (`session_id` / `user_id` / `channel`)
 /// is hoisted into this envelope so every [`AgentEvent`] variant shares

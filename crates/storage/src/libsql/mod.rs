@@ -4,6 +4,7 @@ mod channel_pairing;
 mod channel_session;
 mod cost;
 mod cron;
+mod device;
 mod job;
 mod secret;
 mod session;
@@ -20,6 +21,7 @@ pub use channel_pairing::LibsqlChannelPairingStore;
 pub use channel_session::LibsqlChannelSessionStore;
 pub use cost::LibsqlCostStore;
 pub use cron::LibsqlCronStore;
+pub use device::LibsqlDeviceStore;
 pub use job::LibsqlJobStore;
 pub use secret::LibsqlSecretStore;
 pub use session::LibsqlSessionStore;
@@ -492,6 +494,9 @@ impl LibsqlPool {
                     created_at        INTEGER NOT NULL,
                     last_accessed_at  INTEGER NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_blobs_uploader_identity_size
+                    ON blobs(uploader_identity, size)
+                    WHERE uploader_identity IS NOT NULL;
 
                 CREATE TABLE IF NOT EXISTS channel_pairings (
                     channel_type TEXT    NOT NULL,
@@ -505,7 +510,32 @@ impl LibsqlPool {
                     PRIMARY KEY (channel_type, bot_id, user_id)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_pairings_code
-                    ON channel_pairings(code);",
+                    ON channel_pairings(code);
+
+                CREATE TABLE IF NOT EXISTS devices (
+                    device_id     TEXT    NOT NULL,
+                    device_pubkey BLOB    NOT NULL,
+                    auth_token    TEXT    NOT NULL,
+                    status        TEXT    NOT NULL,
+                    rendezvous_id TEXT,
+                    created_at    INTEGER NOT NULL,
+                    approved_at   INTEGER,
+                    last_seen_at  INTEGER,
+                    relay_url     TEXT    NOT NULL DEFAULT '',
+                    remote_api_key  TEXT    NOT NULL DEFAULT '',
+                    PRIMARY KEY (device_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_auth_token
+                    ON devices(auth_token);
+                -- One gateway = one app: at most one Approved device at a time.
+                -- A partial unique index on the (constant-valued) status column
+                -- of approved rows admits exactly one such row. Re-pairing the
+                -- same device refreshes its row in place; a different device
+                -- supersedes the prior binding (see
+                -- DeviceStore::create_replacing_approved), whose row goes Revoked
+                -- and drops out of this partial index.
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_one_approved
+                    ON devices(status) WHERE status = 'approved';",
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;
@@ -522,6 +552,8 @@ impl LibsqlPool {
             "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE cost_records ADD COLUMN reason TEXT",
             "ALTER TABLE sessions ADD COLUMN folder_id TEXT",
+            "ALTER TABLE devices ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE devices ADD COLUMN remote_api_key TEXT NOT NULL DEFAULT ''",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {

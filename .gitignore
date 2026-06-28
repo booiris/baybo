@@ -28,6 +28,7 @@ origin_channel_plugin
 
 # editor / tooling
 .idea
+.zed/
 .claude/agents
 .claude/commands
 .claude/settings.json
@@ -36,3 +37,7 @@ origin_channel_plugin
 # stray submodule manifest from local sandbox
 .gitmodules
 .antigravitycli
+
+# macOS
+.DS_Store
+**/.DS_Store

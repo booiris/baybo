@@ -63,6 +63,20 @@ impl ChannelServer {
     /// and assemble the channel router with the given token table.
     /// Always loopback — the bind address is not configurable.
     pub fn bind(deps: &GatewayDeps, port_file: PathBuf, tokens: ChannelTokenTable) -> Result<Self> {
+        Self::bind_with_device_store(deps, port_file, tokens, None)
+    }
+
+    /// Like [`Self::bind`] but also wires the device registry so a presented
+    /// device `auth_token` resolves to [`crate::auth::AuthedClient::Device`].
+    /// (Production devices reach the admin listener, not this loopback one; this
+    /// path exists so crate-level tests can exercise device channel auth on the
+    /// proven WS-serving stack.)
+    pub fn bind_with_device_store(
+        deps: &GatewayDeps,
+        port_file: PathBuf,
+        tokens: ChannelTokenTable,
+        device_store: Option<std::sync::Arc<dyn baybo_store::DeviceStore>>,
+    ) -> Result<Self> {
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         // Use std bind first so we can read `local_addr` before
         // handing the fd to tokio. `TcpListener::from_std` wants a
@@ -88,7 +102,10 @@ impl ChannelServer {
         })?;
 
         let port_file = PortFileGuard::write(&port_file, local_addr.port())?;
-        let auth_state = ChannelAuthState::new(tokens);
+        let mut auth_state = ChannelAuthState::new(tokens);
+        if let Some(device_store) = device_store {
+            auth_state = auth_state.with_device_store(device_store);
+        }
         let router = build_channel_router(deps, auth_state);
         let shutdown_grace = deps.runtime_config.shutdown_grace;
         Ok(Self {

@@ -99,8 +99,17 @@ impl JobInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobOutput {
-    /// The final user-facing reply (for chat-style jobs).
-    Message { content: Vec<ContentBlock> },
+    /// The final user-facing reply (for chat-style jobs). `ordinal` is the
+    /// persisted `session_messages.ordinal` of that reply row, captured from the
+    /// store append; it rides the `Completed` lifecycle event so the push
+    /// dispatcher reads exactly this reply without a read-after-write poll.
+    /// `None` only when the turn ran with no durable store (ephemeral/test) or
+    /// for a legacy row persisted before this field existed.
+    Message {
+        content: Vec<ContentBlock>,
+        #[serde(default)]
+        ordinal: Option<i64>,
+    },
     /// Structured payload (for tool-direct cron jobs, system jobs whose
     /// product is structured data, etc.).
     Structured { value: Value },
@@ -146,7 +155,10 @@ mod tests {
 
     #[test]
     fn output_round_trips_through_serde() {
-        let o = JobOutput::Message { content: vec![] };
+        let o = JobOutput::Message {
+            content: vec![],
+            ordinal: None,
+        };
         let s = serde_json::to_string(&o).unwrap();
         let _: JobOutput = serde_json::from_str(&s).unwrap();
     }

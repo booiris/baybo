@@ -36,6 +36,8 @@ baybo-context = { workspace = true }
 baybo-config = { workspace = true }
 baybo-cron = { workspace = true }
 baybo-cost = { workspace = true }
+device-proto = { workspace = true }
+remote-host-protocol = { workspace = true }
 baybo-job = { workspace = true }
 baybo-llm = { workspace = true }
 baybo-model = { workspace = true }
@@ -53,6 +55,10 @@ baybo-workspace = { workspace = true, features = ["io"] }
 anyhow = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+# Noise IK responder for the device-content session (transport-wraps the
+# channel frame loop). Same major as device-proto so the handshake/transport
+# types unify across the two crates.
+snow = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["io"] }
 tokio-stream = { workspace = true }
@@ -69,8 +75,22 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+reqwest = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
+# A holds an outbound control WS to the remote host (C); `handshake` is enough
+# (the caller dials TCP/TLS and hands us the stream). `connect` + rustls roots
+# add the outbound `wss://` client the relay-pairing host manager dials.
+tokio-tungstenite = { workspace = true, features = [
+    "connect",
+    "rustls-tls-webpki-roots",
+] }
+# Pin the process-wide rustls CryptoProvider before the relay wss client dials
+# (see GatewayServer::new) — the graph has both aws-lc-rs + ring, so rustls can't
+# auto-select and connect_async would panic.
+rustls = { workspace = true }
 libc = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -102,5 +122,10 @@ baybo-config = { workspace = true }
 baybo-model = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
+# Boot a real remote-host relay (C) in-process for the relay-content e2e harness,
+# so the spliced A<->C<->P path is proven across the workspace boundary.
+remote-host-relay = { workspace = true }
+remote-host-admission = { workspace = true }

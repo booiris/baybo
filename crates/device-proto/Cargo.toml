@@ -1,0 +1,23 @@
+[package]
+name = "device-proto"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+rmp-serde = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+snow = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+chacha20poly1305 = { workspace = true }
+ed25519-dalek = { workspace = true }
+
+[dev-dependencies]

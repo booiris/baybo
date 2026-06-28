@@ -1,0 +1,10 @@
+# Deploy secrets — never commit these.
+.env
+.env.*
+!.env.example
+*.p8
+
+# Admission DB (the runtime's local state / bind-mount dir).
+/data/
+*.db
+*.db-*

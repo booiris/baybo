@@ -18,12 +18,12 @@ Bottom-up along the dependency graph:
 ### Foundational Types Layer
 
 - **model** — Shared content primitives (ChatMessage, ContentBlock, Role, BlobRef, MessageMetadata, MessageSource), governance types (TrustLevel, ArtifactSource, ExtensionManifest), and pure-data persistence types (`CronJob` family, `CostRecord`/`CostSummary`/`TimeRange`). No business traits.
-- **store** — `baybo-store`: the persistence **ports** crate. Owns the shared `StorageError` and **every** `*Store` trait contract (`SessionStore`, `SessionSummaryStore`, `JobStore`, `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`, `ChannelPairingStore`, `ChannelSessionStore`, `ChannelBotStore`, `SkillRiskStore`) plus the row/DTO types those traits exchange. Depends only on `model`; `baybo-storage` is the libsql adapter that implements the traits. `JobStore` / `TraceStore` trade in row DTOs (`JobRow` / `JobTransitionRow`, `StepRow` / `SpanRow` / `SpanEventRow` — a queryable key plus the serialized entity in `data`) so the trait can sit here as a leaf while the rich `Job` / `Step` / `Span` types and their state-machine / recorder logic stay in `job` / `trace`, which own the `to_row` / `from_row` conversions.
+- **store** — `baybo-store`: the persistence **ports** crate. Owns the shared `StorageError` and every `*Store` trait contract (`SessionStore`, `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `JobStore`, `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`, `ChannelPairingStore`, `ChannelSessionStore`, `ChannelBotStore`, `DeviceStore`, `SkillRiskStore`) plus the row/DTO types those traits exchange. Depends only on `model`; `baybo-storage` is the libsql adapter that implements the traits. `JobStore` / `TraceStore` trade in row DTOs (`JobRow` / `JobTransitionRow`, `StepRow` / `SpanRow` / `SpanEventRow` — a queryable key plus the serialized entity in `data`) so the trait can sit here as a leaf while the rich `Job` / `Step` / `Span` types and their state-machine / recorder logic stay in `job` / `trace`, which own the `to_row` / `from_row` conversions.
 - **config** — Root `BayboConfig` with JSON loading and `validate()`. Sections (llm, agent, session, channels, security, tools, trace, cost, workspace). Uses mirror structs to stay decoupled from domain crates.
 
 ### Ingress and Security Boundary Layer
 
-- **channels** — Channel adapter trait, shared message types (Message, IncomingMessage, OutgoingMessage), slash/dashboard trait definitions (`SlashHandler`, `DashboardProvider`, `ViewKind`), and `ChannelRegistry`. No built-in adapters — the terminal UI now lives in its own `baybo-tui` crate (see [`tui.md`](./tui.md)).
+- **channels** — In-process channel/connection registry, shared channel-domain message types (`IncomingMessage`, `OutgoingMessage`, `AgentEvent`), slash/dashboard trait definitions (`SlashHandler`, `DashboardProvider`, `ViewKind`), and a re-export of the `wire` crate as `baybo_channels::wire`. No built-in adapters — the terminal UI now lives in its own `baybo-tui` crate (see [`tui.md`](./tui.md)).
 - **security** — Cryptographic primitives (EncryptionKey, encrypt/decrypt), leak detection (LeakDetector), error types.
 
 ### Capability and Governance Layer
@@ -59,6 +59,13 @@ Bottom-up along the dependency graph:
 - **cli** — Operator-facing command layer (`baybo-cli`). One `clap` tree drives both argv-mode commands (`baybo config show`) and in-conversation slash commands (`/config show`). Read-only and mutating commands share a single dispatcher; slash input that resolves to a CLI command never enters the agent's context. User-invocable skills are the one sanctioned exception: `/<skill>` is forwarded to the agent as a normal chat message so `SkillRegistry::select` can narrow on the exact-match branch.
 - **[tui](tui.md)** — Interactive terminal UI (`baybo-tui`). Ratatui + Crossterm frontend driven by a WS+MessagePack `WsTransport` client of `baybo-gateway`; no local manager graph, no workspace singleton. Hosts `TuiAdapter`, `TuiSlashHandler`, and `TuiDashboardProvider`. Input-history persistence is delivered over the same WS via `Frame::HistorySnapshot` / `Frame::HistoryAppend` — the TUI never opens the vault itself. Depends on `baybo-channels` for shared trait definitions only.
 - **[gateway](gateway.md)** — Headless HTTP backend (`baybo-gateway`). One axum server is both a `ChannelType::Http` adapter (chat flows through the normal Router path) and an admin REST/SSE API mirroring the CLI families. Auth is a dynamic per-install token stored in `SecretVault`; platform service units live behind `linux` / `macos` Cargo features (one knob per OS; reuse these for any future platform-specific gateway code). Driven by the `baybo gateway …` command tree.
+
+## Feature Subsystems (cross-crate)
+
+- [mobile/companion.md](mobile/companion.md) — The iOS companion app (`app/mobile`): scan-to-connect pairing + end-to-end-encrypted remote notifications. Spans `device-proto` (XXpsk0 pairing + Noise IK content + AEAD previews), `pairing` (`DevicePairingService`), `gateway` (the A-side host leg, content responder, relay-content manager, push dispatcher), and the separate `remote-host/` workspace (C — blind relay + APNs). 1:1 binding, the content/pairing relay path, push pipeline, and the cross-workspace e2e harness.
+- [mobile/pairing-security.md](mobile/pairing-security.md) — The pairing **threat model** and crypto design: why device pairing is safe against a hostile relay. The `rendezvous_id` / 256-bit-`secret` split, `Noise_XXpsk0`, the high-entropy-secret invariant, prologue binding, confirm-code channel binding, and secret hygiene.
+- [mobile/relay-push-security.md](mobile/relay-push-security.md) — The mobile scan-to-pair, relay, and push security note: QR bootstrap, Noise IK content legs, encrypted APNs previews, remote-host transparency, proof sketches, and explicit security boundaries.
+- [mobile/blob-transfer.md](mobile/blob-transfer.md) — Dedicated relay blob legs for mobile attachment download/upload, including chat-priority bandwidth, token-gated `BlobStore::open_at`, upload limits, and the mobile Rust/Tauri/TS client.
 
 ## Cross-Cutting Guides
 
@@ -101,7 +108,7 @@ bootstrap ──► config + all domain crates it assembles (entry point only)
 ## Key Constraints
 
 - Each module defines its own error type; no shared error enum
-- Store traits defined in `storage`; domain types in their own crates; business logic in `agent`; `model` contains shared content primitives
+- Store trait contracts live in `store`; `storage` is the libsql adapter; domain types live in their own crates; business logic stays out of the storage layer
 - Logs, Trace, and Job must not record sensitive plaintext — only placeholders or sanitized summaries
 - Tool/skill extensions must carry source, version, hash, trust level, and capability declarations
 - The Job state machine is fixed: `Pending → InProgress → Completed` (with `Stuck`, `Failed`, and `Cancelled` branches). `Cancelled` carries a `reason` and `partial_artifacts: Vec<SpanId>` for resume context

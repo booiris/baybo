@@ -30,7 +30,7 @@ pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLeve
 pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId, TaskId};
 pub use llm_entry_name::LlmEntryName;
 pub use message::{
-    BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role,
+    BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role, SHA256_PREFIX,
     TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX, ThinkingContent, ToolResultMeta,
 };
 pub use model_tier::ModelTier;

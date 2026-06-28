@@ -38,8 +38,9 @@ const HEADER_USER_ID: &str = "x-baybo-user-id";
 /// Hard cap on a single upload, matched against `DefaultBodyLimit`.
 /// Larger blobs would block the WS-paired connection's Tokio worker
 /// for the duration of a multi-second I/O — sidecars that need to
-/// transfer more than this should chunk on their side.
-const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024;
+/// transfer more than this should chunk on their side. Shared with the
+/// relay blob-leg upload path ([`super::blob_content`]).
+pub(crate) const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024;
 
 /// JSON returned on a successful upload. Mirrors the shape produced by
 /// `BlobStore::put`. Kept tiny by design — sidecars only need the id
@@ -92,6 +93,12 @@ async fn authorize_upload(
         AuthedClient::Tui | AuthedClient::Tool { .. } | AuthedClient::Web { .. } => {
             UploadAuth::Bypass
         }
+        // iOS devices may not upload through the HTTP blob side channel. Mobile
+        // attachment upload uses the E2E relay blob leg instead.
+        AuthedClient::Device { .. } => UploadAuth::Reject(
+            StatusCode::FORBIDDEN,
+            "device tokens may not upload via /v1/blobs",
+        ),
         AuthedClient::Subprocess {
             channel_type: None, ..
         } => UploadAuth::Reject(

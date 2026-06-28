@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/model",
     "crates/channels",
+    "crates/wire",
+    "crates/device-proto",
     "crates/llm",
     "crates/tools",
     "crates/workspace",
@@ -36,7 +38,7 @@ members = [
     "bench/swe",
     "bench/bench-web",
 ]
-exclude = ["crates/security/fuzz"]
+exclude = ["crates/security/fuzz", "remote-host", "app/mobile"]
 
 [workspace.package]
 version = "0.1.0"
@@ -47,6 +49,16 @@ license = "MIT"
 # Internal crates
 baybo-model = { path = "crates/model" }
 baybo-channels = { path = "crates/channels" }
+wire = { path = "crates/wire" }
+device-proto = { path = "crates/device-proto" }
+# The remote-host (C) wire contract, path-depended across the workspace boundary
+# (like wire/device-proto) so the gateway uses C's route paths + types directly.
+remote-host-protocol = { path = "remote-host/crates/protocol" }
+# The relay server + its in-memory admission, path-depended across the boundary
+# for the gateway's relay-content e2e harness ONLY (dev-dependencies). They boot a
+# real C in-process so the spliced relay path is proven without a deployment.
+remote-host-relay = { path = "remote-host/crates/relay" }
+remote-host-admission = { path = "remote-host/crates/admission" }
 baybo-llm = { path = "crates/llm" }
 baybo-tools = { path = "crates/tools" }
 baybo-workspace = { path = "crates/workspace", default-features = false }
@@ -80,6 +92,7 @@ baybo-bench-web = { path = "bench/bench-web" }
 # External dependencies
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
@@ -107,6 +120,16 @@ hmac = "0.12"
 hkdf = "0.12"
 aes-gcm = "0.10"
 rand = "0.10"
+# Device-pairing + E2E secure channel (device-proto, shared by the
+# gateway and the iOS companion's core). Noise XXpsk0 authenticates pairing
+# against a malicious relay (the QR secret is the PSK), Noise XX/IK secures the
+# post-pairing session, ChaCha20-Poly1305 frames the lock-screen-preview the iOS
+# NSE decrypts with CryptoKit. All cross-compile to aarch64-apple-ios.
+snow = "0.9"
+chacha20poly1305 = "0.10"
+# Zeroize the 32-byte pairing secret (the Noise PSK) on drop so it never
+# lingers in freed memory; cross-compiles to aarch64-apple-ios.
+zeroize = { version = "1", features = ["derive"] }
 # Local-only — never connects to a remote turso/libsql server, so we
 # drop default features (`replication`, `remote`, `sync`, `tls`) that
 # would pull in hyper-rustls + an old rustls/webpki tree.
@@ -127,6 +150,12 @@ serenity = { version = "0.12", features = ["client", "gateway", "model"] }
 tower = { version = "0.5", features = ["util"] }
 url = "2"
 reqwest = { version = "0.13", features = ["json", "socks"] }
+# Direct handle on rustls so the gateway can pin the process-wide CryptoProvider
+# before its relay `wss://` client dials. The graph enables BOTH aws-lc-rs and
+# ring (via reqwest/hyper-rustls), so rustls can't auto-select one and
+# connect_async would panic; we install aws-lc-rs explicitly. default-features
+# off — the rest of the graph already unions in std/tls12/ring.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 dom_smoothie = "0.17"
 htmd = "0.5"
 bytes = "1"
@@ -154,6 +183,9 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = [
     "handshake",
 ] }
 rmp-serde = "1"
+# Terminal QR rendering for `device pair`; default-features off drops the heavy
+# `image`/`svg` renderers — we only use the unicode (Dense1x2) renderer.
+qrcode = { version = "0.14", default-features = false }
 ts-rs = { version = "11", features = ["serde-compat", "no-serde-warnings"] }
 # Sidecar embedding: zstd decompresses each esbuild-produced JS bundle
 # at runtime. Bundles themselves are produced by `pnpm bundle` in
@@ -220,6 +252,7 @@ baybo-task = { workspace = true }
 baybo-config = { workspace = true }
 baybo-cli = { workspace = true }
 baybo-gateway = { workspace = true }
+baybo-pairing = { workspace = true }
 baybo-setup = { workspace = true }
 baybo-tui = { workspace = true }
 tokio = { workspace = true }

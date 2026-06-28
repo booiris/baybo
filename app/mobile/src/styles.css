@@ -1,0 +1,281 @@
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color-scheme: light dark;
+  color: #1a1a1a;
+  background: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root { color: #f2f2f2; background: #1a1a1a; }
+  input { background: #2a2a2a; color: #f2f2f2; border-color: #444; }
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+
+.container {
+  max-width: 30rem;
+  margin: 0 auto;
+  padding: env(safe-area-inset-top, 1rem) 1.25rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+h1 { margin: 0.5rem 0 0; }
+.muted { color: #888; margin: 0 0 0.5rem; }
+
+input {
+  padding: 0.6rem 0.7rem;
+  font-size: 1rem;
+  border: 1px solid #ccc;
+  border-radius: 0.5rem;
+}
+
+.row { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+button {
+  flex: 1;
+  padding: 0.7rem 1rem;
+  font-size: 1rem;
+  font-weight: 600;
+  border: 0;
+  border-radius: 0.5rem;
+  background: #0a84ff;
+  color: #fff;
+}
+button:disabled { opacity: 0.5; }
+/* Destructive action (unpair / forget). */
+button.danger { background: #ff3b30; }
+
+/* Inline confirm shown before replacing or forgetting the current gateway. */
+.confirm-inline { margin-top: 0.75rem; }
+
+.status { color: #0a84ff; font-size: 0.9rem; }
+
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.4rem 1rem; }
+.kv dt { color: #888; }
+.kv dd { margin: 0; word-break: break-all; }
+
+/* Chat view */
+.chat { height: 100vh; }
+.chat-header { display: flex; align-items: center; gap: 0.75rem; }
+.chat-header h1 { margin: 0; }
+.chat-header button { flex: 0 0 auto; background: none; color: #0a84ff; padding: 0.4rem 0.2rem; }
+
+.chat-log {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.5rem 0;
+}
+
+.bubble {
+  max-width: 80%;
+  padding: 0.55rem 0.75rem;
+  border-radius: 1rem;
+  font-size: 0.95rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.bubble.user { align-self: flex-end; background: #0a84ff; color: #fff; border-bottom-right-radius: 0.25rem; }
+.bubble.assistant { align-self: flex-start; background: #e9e9eb; color: #1a1a1a; border-bottom-left-radius: 0.25rem; }
+.bubble.assistant.streaming { opacity: 0.85; }
+.bubble.assistant.muted { color: #888; }
+.bubble.notice { align-self: center; background: none; color: #888; font-size: 0.8rem; }
+
+@media (prefers-color-scheme: dark) {
+  .bubble.assistant { background: #2a2a2a; color: #f2f2f2; }
+}
+
+.composer { margin-top: 0; align-items: center; }
+.composer input { flex: 1; }
+.composer button { flex: 0 0 auto; }
+/* Compact circular "+" to open the image picker, set apart from the blue Send. */
+.composer .attach {
+  flex: 0 0 auto;
+  width: 2.6rem;
+  padding: 0;
+  font-size: 1.4rem;
+  line-height: 1;
+  background: #e9e9eb;
+  color: #0a84ff;
+}
+@media (prefers-color-scheme: dark) {
+  .composer .attach { background: #2a2a2a; }
+}
+
+/* The file <input> is opened programmatically by the + button. */
+.hidden { display: none !important; }
+
+/* Image attachments rendered inside a chat bubble. */
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.35rem;
+}
+.attachment-img {
+  display: block;
+  max-width: 100%;
+  max-height: 16rem;
+  border-radius: 0.5rem;
+  object-fit: contain;
+}
+.attachment-loading,
+.attachment-retry {
+  font-size: 0.85rem;
+  color: inherit;
+  opacity: 0.85;
+}
+.attachment-retry {
+  flex: 0 0 auto;
+  padding: 0.4rem 0.7rem;
+  background: rgba(127, 127, 127, 0.25);
+  border-radius: 0.5rem;
+}
+.attachment-file {
+  font-size: 0.85rem;
+  padding: 0.35rem 0.55rem;
+  background: rgba(127, 127, 127, 0.2);
+  border-radius: 0.5rem;
+}
+
+/* Picked-but-not-yet-sent images shown above the composer. */
+.staged {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+}
+.staged-item {
+  position: relative;
+  width: 3.5rem;
+  height: 3.5rem;
+  border-radius: 0.5rem;
+  overflow: hidden;
+  background: #e9e9eb;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+@media (prefers-color-scheme: dark) {
+  .staged-item { background: #2a2a2a; }
+}
+.staged-item img { width: 100%; height: 100%; object-fit: cover; }
+.staged-item.uploading img { opacity: 0.5; }
+.staged-item.error { outline: 2px solid #ff3b30; }
+.staged-file { font-size: 1.4rem; }
+.staged-badge {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  padding: 0 0.3rem;
+  font-size: 0.75rem;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+}
+.staged-badge.err { background: #ff3b30; }
+.staged-remove {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  font-size: 0.9rem;
+  line-height: 1;
+  border-radius: 0 0 0 0.5rem;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+}
+
+/* QR scanner: the windowed barcode scanner renders the camera feed BEHIND the
+   webview, so the page must be transparent while scanning for it to show
+   through. Without this the camera runs but is hidden under the opaque page. */
+html.scanning,
+html.scanning body,
+html.scanning #root {
+  background: transparent !important;
+}
+/* Hide the app UI while the camera is up so nothing paints over the feed. */
+html.scanning .container {
+  display: none;
+}
+/* Camera warm-up cover: held over the page (which stays opaque) until the feed
+   is up, so the reveal goes cover->camera rather than flashing a black frame.
+   Black so it reads as the camera viewport initialising, not an app screen. */
+.scan-warming {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  background: #000;
+}
+
+.scan-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+/* iOS-style viewfinder: four thick, fully-rounded corner brackets (SVG so the
+   bends and the line ends are both rounded). stroke-width is in viewBox units;
+   non-scaling-stroke keeps it a constant on-screen thickness at any size. */
+.scan-reticle {
+  width: min(80vw, 330px);
+  aspect-ratio: 1;
+  filter: drop-shadow(0 0 4px rgba(0, 0, 0, 0.5));
+}
+.scan-reticle path {
+  vector-effect: non-scaling-stroke;
+}
+.scan-cancel {
+  position: absolute;
+  right: calc(env(safe-area-inset-right, 0px) + 1.5rem);
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 1.75rem);
+  pointer-events: auto;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  border: none;
+  border-radius: 999px;
+  padding: 0.7rem 1.6rem;
+  font-size: 1rem;
+  font-weight: 500;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+/* Scan success: a green dot pops at the reticle centre on a panel the same
+   colour as the app background, which then fades out as the handshake begins —
+   a gentle cross-fade rather than an abrupt camera->app wipe. */
+.scan-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+  animation: scan-settle 0.6s ease-out forwards;
+}
+@media (prefers-color-scheme: dark) {
+  .scan-panel { background: #1a1a1a; }
+}
+.scan-panel .scan-dot {
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  background: #34c759;
+  animation: scan-dot-pop 0.3s cubic-bezier(0.2, 0.7, 0.2, 1.5) both;
+}
+@keyframes scan-dot-pop {
+  from { transform: scale(0); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+@keyframes scan-settle {
+  0%, 45% { opacity: 1; }
+  100% { opacity: 0; }
+}

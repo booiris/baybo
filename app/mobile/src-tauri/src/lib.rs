@@ -1,0 +1,265 @@
+//! The Baybo iOS companion (Tauri shell).
+//!
+//! A thin native shell around the host-tested `baybo-mobile-core`: the webview
+//! drives scan-to-connect, chat, and attachments, while remote notifications are
+//! handled out-of-process by the Notification Service Extension under `../apple`.
+//! The protocol/crypto live in the shared crates, so interop with the gateway is
+//! guaranteed by construction.
+
+mod blob;
+mod content;
+mod keychain;
+mod pairing;
+mod push_register;
+
+use baybo_mobile_core::{Frame, WireAttachment};
+use content::ContentSessions;
+use pairing::{PairAborted, PairChallenge, PairedSummary, PairingSessions};
+use tauri::ipc::Channel;
+use tauri::{Emitter, State};
+
+/// Scan-to-connect: dial the gateway, run the XXpsk0 handshake through
+/// `DeviceHello`, and return the confirmation code the UI shows the user to
+/// compare against the operator's terminal. `rendezvous_id` + `secret` come from
+/// the QR (the secret is the Noise PSK). `on_abort` carries a gateway-side
+/// cancellation that lands before the user decides, so the UI can dismiss the
+/// confirm screen.
+#[tauri::command]
+async fn pair_begin(
+    sessions: State<'_, PairingSessions>,
+    endpoint: String,
+    rendezvous_id: String,
+    secret: String,
+    remote_api_key: Option<String>,
+    on_abort: Channel<PairAborted>,
+) -> Result<PairChallenge, String> {
+    pairing::pair_begin(
+        &sessions,
+        &endpoint,
+        &rendezvous_id,
+        &secret,
+        remote_api_key,
+        on_abort,
+    )
+    .await
+}
+
+/// Phase 2: send the user's decision. On accept — and once the operator also
+/// confirms on their terminal — pairing finalizes and the UI renders the summary.
+#[tauri::command]
+async fn pair_confirm(
+    sessions: State<'_, PairingSessions>,
+    device_id: String,
+    accepted: bool,
+) -> Result<PairedSummary, String> {
+    pairing::pair_confirm(&sessions, &device_id, accepted).await
+}
+
+/// The device id of a persisted pairing, if the app is already paired — so a
+/// relaunch can show "connected" instead of the pairing form.
+#[tauri::command]
+fn paired_device() -> Option<String> {
+    pairing::paired_device()
+}
+
+/// Forget the current pairing (unpair): clear the keychain record + push key so
+/// the app returns to the scan screen. One app binds one gateway.
+#[tauri::command]
+fn forget_pairing() -> Result<(), String> {
+    pairing::forget_pairing()
+}
+
+/// Open the E2E content session for `sessionId`: connect to the paired gateway,
+/// run the Noise handshake, subscribe, and stream decrypted frames to the
+/// webview over `onFrame`. `sinceOrdinal` is the highest ordinal the webview has
+/// already rendered — the gateway replays only the gap above it (so a reconnect
+/// after a background/reload catches up without re-sending the whole thread);
+/// `null` is a fresh subscribe with no catch-up.
+#[tauri::command]
+async fn content_connect(
+    sessions: State<'_, ContentSessions>,
+    session_id: String,
+    since_ordinal: Option<i64>,
+    on_frame: Channel<Frame>,
+) -> Result<(), String> {
+    content::connect(&sessions, session_id, since_ordinal, on_frame).await
+}
+
+/// Send a user message on the live content session. `msgId` is a fresh per-send
+/// idempotency key so a retry doesn't double-fire the agent. `attachments` are
+/// content-addressed blobs already uploaded over a blob leg (omitted/empty for a
+/// text-only send).
+#[tauri::command]
+async fn content_send(
+    sessions: State<'_, ContentSessions>,
+    text: String,
+    msg_id: String,
+    attachments: Option<Vec<WireAttachment>>,
+) -> Result<(), String> {
+    content::send(&sessions, text, msg_id, attachments.unwrap_or_default()).await
+}
+
+/// Tear down the live content session (the user left the chat view).
+#[tauri::command]
+async fn content_disconnect(sessions: State<'_, ContentSessions>) -> Result<(), String> {
+    content::disconnect(&sessions).await;
+    Ok(())
+}
+
+/// Download an attachment `blob_id` to `dest_path` over a dedicated blob leg,
+/// resuming from a partial file if present. `on_progress` streams cumulative bytes.
+#[tauri::command]
+async fn blob_download(
+    blob_id: String,
+    dest_path: String,
+    on_progress: Channel<u64>,
+) -> Result<(), String> {
+    blob::download(blob_id, dest_path, on_progress).await
+}
+
+/// Upload the local file at `src_path` as `mime_type` over a dedicated blob leg,
+/// returning the content-addressed `blob_id` to reference in the next message.
+#[tauri::command]
+async fn blob_upload(
+    src_path: String,
+    mime_type: String,
+    on_progress: Channel<u64>,
+) -> Result<String, String> {
+    blob::upload(src_path, mime_type, on_progress).await
+}
+
+/// Upload a webview-picked image over a dedicated blob leg. The raw bytes ride the
+/// IPC bridge as the request body (efficient — not a JSON number array); the mime
+/// rides an `x-baybo-mime` header. iOS gives the webview a `File` (bytes), not a
+/// path, so this is the entry point an image pick uses. Returns the `blob_id`.
+#[tauri::command]
+async fn blob_upload_bytes(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("blob_upload_bytes expects a raw byte body".into());
+        }
+    };
+    let mime_type = request
+        .headers()
+        .get("x-baybo-mime")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    blob::upload_bytes(bytes, mime_type).await
+}
+
+/// Fetch an attachment `blob_id` for display: download it over a blob leg into a
+/// content-addressed on-device cache (reused on the next render), then return the
+/// verified bytes to the webview as a raw `ArrayBuffer` to wrap in an object URL.
+#[tauri::command]
+async fn blob_image(blob_id: String) -> Result<tauri::ipc::Response, String> {
+    blob::image_data(blob_id)
+        .await
+        .map(tauri::ipc::Response::new)
+}
+
+/// Debug-only: seed a known push key into the shared App Group keychain so the
+/// NSE decrypt path can be exercised with `xcrun simctl push` without a live
+/// gateway pairing. Reads `BAYBO_SEED_PUSH_KEY` as `<bid>:<64-hex-key>` (absent
+/// => no-op). Compiled out of release builds; never logs the key or the bid.
+#[cfg(all(debug_assertions, target_os = "ios"))]
+fn debug_seed_push_key() {
+    let Ok(spec) = std::env::var("BAYBO_SEED_PUSH_KEY") else {
+        return;
+    };
+    let Some((bid, key_hex)) = spec.split_once(':') else {
+        return;
+    };
+    let bid = bid.trim();
+    let key: [u8; device_proto::aead::KEY_LEN] = match hex::decode(key_hex.trim()) {
+        Ok(b) => match b.try_into() {
+            Ok(k) => k,
+            Err(_) => return,
+        },
+        Err(_) => return,
+    };
+    // Store, then read back (the same lookup the NSE does) and report the
+    // round-trip to a file in the app container so the host test harness can
+    // read it (the eprintln does not reach simctl's console on iOS). No secret
+    // or bid is written — only the round-trip verdict.
+    let result = match keychain::store_push_key(bid, &key) {
+        Ok(()) => match keychain::read_push_key(bid) {
+            Ok(Some(k)) if k == key => "store=ok readback=match".to_string(),
+            Ok(Some(_)) => "store=ok readback=mismatch".to_string(),
+            Ok(None) => "store=ok readback=not_found".to_string(),
+            Err(e) => format!("store=ok readback_err={e}"),
+        },
+        Err(e) => format!("store_err={e}"),
+    };
+    let _ = std::fs::write(std::env::temp_dir().join("baybo-seed-result.txt"), &result);
+    eprintln!("baybo(debug): keychain self-check: {result}");
+}
+
+/// Select the rustls crypto provider for the process. `tokio-tungstenite` pulls
+/// rustls with `default-features = false` (no provider), so the first `wss://`
+/// dial — pairing or content — would panic building its `ClientConfig`. Install
+/// `ring` once here, before any command can run, so every dial finds a provider.
+fn install_crypto_provider() {
+    // Err only if a provider is already installed — harmless, so ignore it.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    install_crypto_provider();
+
+    #[cfg(all(debug_assertions, target_os = "ios"))]
+    debug_seed_push_key();
+
+    let builder = tauri::Builder::default();
+    // The barcode/camera + haptics plugins are mobile-only (the QR
+    // scan-to-connect path and the scan-success buzz).
+    #[cfg(mobile)]
+    let builder = builder
+        .plugin(tauri_plugin_barcode_scanner::init())
+        .plugin(tauri_plugin_haptics::init());
+    let app = match builder
+        .manage(PairingSessions::default())
+        .manage(ContentSessions::default())
+        .setup(|_app| {
+            // Request provisional notification auth + remote-notification
+            // registration once the app is up (main thread). No-op off iOS.
+            push_register::register();
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            pair_begin,
+            pair_confirm,
+            paired_device,
+            forget_pairing,
+            content_connect,
+            content_send,
+            content_disconnect,
+            blob_download,
+            blob_upload,
+            blob_upload_bytes,
+            blob_image
+        ])
+        .build(tauri::generate_context!())
+    {
+        Ok(app) => app,
+        Err(e) => {
+            eprintln!("baybo: fatal error while building the app: {e}");
+            return;
+        }
+    };
+
+    // Bridge the iOS app lifecycle into the webview. iOS suspends the whole app
+    // without ever marking the WKWebView page hidden, so the page's own
+    // `visibilitychange` never fires on resume and the chat view would keep using a
+    // relay leg the OS froze. On every foreground (`Resumed`) emit `app-resumed` so
+    // the webview re-dials its content session and replays the catch-up gap.
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Resumed)
+            && let Err(e) = app_handle.emit("app-resumed", ())
+        {
+            eprintln!("baybo: emit app-resumed failed: {e}");
+        }
+    });
+}

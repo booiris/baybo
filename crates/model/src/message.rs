@@ -99,6 +99,13 @@ pub struct BlobRef {
     pub blob_id: String,
 }
 
+/// Algorithm prefix on every [`BlobRef::blob_id`]. The full id is
+/// `"sha256:<64 lower-hex>.<read-token>"`, so a content-addressed blob is
+/// recognizable at a glance while the suffix stays the read capability. Lives in
+/// `model` (next to [`BlobRef`]) so both the server (`baybo-store`, which mints
+/// ids) and the device client (which parses them) reference one source of truth.
+pub const SHA256_PREFIX: &str = "sha256:";
+
 /// Where a [`ChatMessage`] row came from — its provenance, independent of the
 /// LLM-facing [`Role`]. Several distinct origins all ride as a `Role::User`
 /// turn (a human's input, a cron fire's framed prompt, an agent-injected skill

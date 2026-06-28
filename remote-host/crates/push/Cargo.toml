@@ -1,0 +1,35 @@
+[package]
+name = "remote-host-push"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+jsonwebtoken = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+axum = { workspace = true }
+# Real APNs egress: reqwest negotiates HTTP/2 over TLS (ALPN), as APNs requires.
+reqwest = { workspace = true }
+# The shared admission trait (the live allow-list is wired by the server binary).
+remote-host-admission = { workspace = true }
+# The shared wire contract: route paths + NotifyRequest/RegisterRequest/ApnsEnv.
+remote-host-protocol = { workspace = true }
+# The token-bucket primitive backing the per-device /notify frequency control.
+remote-host-ratelimit = { workspace = true }
+# Verify the push-binding delegation + per-request gateway signatures (the gateway
+# /app sign; C only verifies). base64/hex decode the wire-carried keys/sigs.
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tower = { workspace = true }

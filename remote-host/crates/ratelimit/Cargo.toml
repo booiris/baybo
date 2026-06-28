@@ -1,0 +1,7 @@
+[package]
+name = "remote-host-ratelimit"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false

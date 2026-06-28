@@ -1,5 +1,10 @@
 # pairing — Per-Channel User Pairing Gate
 
+This document covers **channel pairing** for sidecar-routed inbound users. It is
+separate from mobile **device pairing**, which is documented in
+[`mobile/companion.md`](mobile/companion.md) and
+[`mobile/pairing-security.md`](mobile/pairing-security.md).
+
 ## Problem
 
 Channel sidecars (Telegram today, future Discord / Slack / HTTP bots)

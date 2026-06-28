@@ -1,5 +1,19 @@
 use thiserror::Error;
 
+/// Error surface for the iOS-companion device-pairing flow. Unlike
+/// [`PairingError`] (whose store returns `String`), the device stores return a
+/// typed [`baybo_store::StorageError`], so it threads through directly.
+#[derive(Debug, Error)]
+pub enum DevicePairingError {
+    #[error("storage: {0}")]
+    Storage(#[from] baybo_store::StorageError),
+
+    /// The single-use pairing slot was already consumed — a second finalize for
+    /// the same code is refused.
+    #[error("pairing slot already consumed")]
+    SlotConsumed,
+}
+
 #[derive(Debug, Error)]
 pub enum PairingError {
     /// Any failure from the persistence layer. Carried as a string so

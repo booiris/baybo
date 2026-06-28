@@ -9,8 +9,8 @@ pub mod test_support;
 // import them from `baybo_store` directly, not via this adapter.
 use baybo_store::{
     BlobStore, ChannelBotStore, ChannelPairingStore, ChannelSessionStore, CostStore, CronStore,
-    JobStore, SecretStore, SessionFolderStore, SessionStore, SessionSummaryStore, SkillRiskStore,
-    TaskStore, TraceStore,
+    DeviceStore, JobStore, SecretStore, SessionFolderStore, SessionStore, SessionSummaryStore,
+    SkillRiskStore, TaskStore, TraceStore,
 };
 
 /// Bundles all store implementations into a single container
@@ -35,6 +35,7 @@ pub struct Store {
     pub channel_session: std::sync::Arc<dyn ChannelSessionStore>,
     pub channel_bot: std::sync::Arc<dyn ChannelBotStore>,
     pub channel_pairing: std::sync::Arc<dyn ChannelPairingStore>,
+    pub device: std::sync::Arc<dyn DeviceStore>,
     pub blob: std::sync::Arc<dyn BlobStore>,
 }
 
@@ -81,7 +82,10 @@ impl Store {
                 pool.clone(),
             )),
             channel_bot: std::sync::Arc::new(libsql::LibsqlChannelBotStore::new(pool.clone())),
-            channel_pairing: std::sync::Arc::new(libsql::LibsqlChannelPairingStore::new(pool)),
+            channel_pairing: std::sync::Arc::new(libsql::LibsqlChannelPairingStore::new(
+                pool.clone(),
+            )),
+            device: std::sync::Arc::new(libsql::LibsqlDeviceStore::new(pool.clone())),
             blob: std::sync::Arc::new(blob),
         })
     }

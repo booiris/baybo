@@ -462,6 +462,34 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
         }));
     }
 
+    // Blind remote-host push: on every completed real user turn, encrypt a
+    // per-device preview and POST it to the remote host (C). Always wired — the
+    // dispatcher self-gates on the approved device row, reading the remote-host
+    // URL + admission key recorded on it at pairing (no `push` config block).
+    {
+        // Proxy-aware client: /notify + /register POST to the remote host (C), a
+        // non-loopback egress target subject to the operator's egress proxy.
+        let push_client =
+            baybo_security::http::client(boot::proxy_settings(&graph.config).as_ref())?;
+        let registrar: Arc<dyn baybo_gateway::push::ApnsRegistrar> = Arc::new(
+            baybo_gateway::push::HttpApnsRegistrar::new(push_client.clone()),
+        );
+        let dispatcher = Arc::new(baybo_gateway::push::PushDispatcher::new(
+            graph.stores.device.clone(),
+            graph.stores.session.clone(),
+            Arc::clone(&graph.session_manager),
+            Arc::clone(&graph.secret_vault),
+            Arc::new(baybo_gateway::push::HttpNotifySink::new(push_client)),
+            Some(registrar),
+        ));
+        let push_shutdown = shutdown.clone();
+        task_tracker.track(baybo_gateway::push::spawn(
+            dispatcher,
+            Arc::clone(&graph.job_lifecycle),
+            async move { push_shutdown.wait().await },
+        ));
+    }
+
     // Build the axum server from the assembled graph.
     let deps = GatewayDeps {
         config: Arc::clone(&graph.config),
@@ -542,6 +570,19 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
                 supervisor.run(sv_shutdown).await;
             }));
         }
+    }
+
+    // Content control connection: an outbound A->C link so a phone can reach this
+    // (possibly NAT'd) gateway for chat via the relay. Self-gates on the approved
+    // device row (idle until one is paired). Spawned + tracked here alongside the
+    // other managers so it rides the shared shutdown drain rather than leaking as
+    // a detached task.
+    {
+        let relay_content_shutdown = shutdown.clone();
+        task_tracker.track(baybo_gateway::spawn_relay_content(
+            &deps,
+            relay_content_shutdown,
+        ));
     }
 
     let server = GatewayServer::new(deps);

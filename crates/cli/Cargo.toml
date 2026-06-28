@@ -23,6 +23,7 @@ baybo-gateway = { workspace = true }
 baybo-cron = { workspace = true }
 baybo-cost = { workspace = true }
 baybo-job = { workspace = true }
+baybo-pairing = { workspace = true }
 baybo-query = { workspace = true }
 baybo-skills = { workspace = true }
 baybo-skills-assessor = { workspace = true }
@@ -46,6 +47,8 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+hex = { workspace = true }
+qrcode = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

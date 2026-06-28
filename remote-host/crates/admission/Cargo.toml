@@ -1,0 +1,11 @@
+[package]
+name = "remote-host-admission"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+parking_lot = { workspace = true }
+chrono = { workspace = true }

@@ -261,10 +261,14 @@ async fn main() -> anyhow::Result<()> {
         )));
     }
     if let Ok((vault, stores)) = runtime::build_bot_registry_deps(&config).await {
+        let device_service = std::sync::Arc::new(baybo_pairing::DevicePairingService::new(
+            stores.device.clone(),
+        ));
         builder = builder
             .secret_vault(vault)
             .channel_bot_store(stores.channel_bot)
-            .channel_pairing_store(stores.channel_pairing);
+            .channel_pairing_store(stores.channel_pairing)
+            .device_pairing_service(device_service);
     }
     let ctx = builder
         .build()

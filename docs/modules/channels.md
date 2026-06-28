@@ -2,10 +2,10 @@
 
 ## Overview
 
-The `channels` crate defines the shared wire contract for everything
-that pipes user messages into the agent and agent output back out, plus
-the in-process plumbing the gateway uses to fan agent emissions back to
-attached transports.
+The `channels` crate owns the in-process plumbing that pipes user messages into
+the agent and fans agent output back to attached transports. The pure WS wire
+types and MessagePack codec live in the separate `wire` crate; `channels`
+re-exports it as `baybo_channels::wire` for existing server-side consumers.
 
 There is **no adapter trait**. A [`Channel`] is a concrete struct — a
 *protocol surface* (telegram, weixin, tui, http, …), 1:1 with
@@ -34,10 +34,10 @@ Core responsibilities:
 - Define error types ([`ChannelError`], [`ConnectionNotFoundError`]).
 - Provide [`ChannelRegistry`] for `Arc<Channel>` install / lookup and
   approval-gate fan-in.
-- Expose the sidecar wire format under `wire::{Frame, Message}`
-  (MessagePack, named fields) so the gateway's WS server, the built-in
-  TUI's private WS client, the embedded web chat client, and the
-  third-party TypeScript SDK all speak the same protocol.
+- Re-export the `wire` crate under `wire::{Frame, Message}` (MessagePack, named
+  fields) so the gateway's WS server, the built-in TUI's private WS client, the
+  embedded web chat client, the iOS companion, and the third-party TypeScript SDK
+  all speak the same protocol.
 - Define the slash-command surface (`slash` module): the
   [`SlashHandler`] / [`DashboardProvider`] traits and their value
   types ([`SlashCommand`], [`SlashOutcome`], [`DashboardSnapshot`],

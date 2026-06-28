@@ -12,7 +12,7 @@ import type { AttachmentKind } from "./AttachmentKind";
  */
 export type WireAttachment = { kind: AttachmentKind, 
 /**
- * Content-addressed id from the `BlobStore` (`"sha256:<64hex>"`).
+ * Capability id from the `BlobStore` (`"sha256:<64hex>.<read_token>"`).
  */
 blob_id: string, mime_type: string, 
 /**

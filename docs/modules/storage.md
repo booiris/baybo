@@ -6,7 +6,11 @@ The `storage` crate is the **libsql adapter**: it implements every `*Store` trai
 
 Its job is:
 
-- Implement every `*Store` trait from `baybo-store` (`SessionStore`, `SessionSummaryStore`, `JobStore`, `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `SkillRiskStore`) via libsql
+- Implement every `*Store` trait from `baybo-store` (`SessionStore`,
+  `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `JobStore`,
+  `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`,
+  `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`,
+  `DeviceStore`, `SkillRiskStore`) via libsql
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
@@ -30,6 +34,9 @@ libsql/channel_session.rs → impl ChannelSessionStore                  (trait f
 libsql/channel_bot.rs     → impl ChannelBotStore                      (trait + ChannelBotRow from baybo-store)
 libsql/channel_pairing.rs → impl ChannelPairingStore                  (trait + ChannelPairingRow / PairingStatus from baybo-store)
 libsql/blob.rs            → impl BlobStore                            (trait + BlobMeta from baybo-store)
+libsql/session_folder.rs  → impl SessionFolderStore                   (trait + SessionFolderRow from baybo-store)
+libsql/task.rs            → impl TaskStore                            (trait + TaskPatch from baybo-store)
+libsql/device.rs          → impl DeviceStore                          (trait + DeviceRow / DeviceStatus from baybo-store)
 ```
 
 Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `libsql/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one.
@@ -177,9 +184,13 @@ Fields difficult to fully structure (`SessionState.extra`, `Job.input/output`) a
 
 Use transactions wherever a multi-statement write must be atomic — most importantly `SessionStore::delete`, which cascades the session's `session_messages` rows and removes the parent row in one `BEGIN IMMEDIATE` transaction (a non-transactional implementation could strand a transcript under a concurrent write).
 
+Session rows and transcripts are user-facing core data: runtime/background
+cleanup must not call the delete path. It exists for explicit destructive flows
+initiated by the user.
+
 ### Hard delete
 
-All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tombstone column, no soft-delete protocol, and no revival semantics — once a row is gone it is gone. The one cadence-driven retention sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow rows), which issues the same `DELETE FROM` against rows past their retention horizon. Blobs are **not** swept on a TTL; the `BlobStore::purge_older_than` capability still exists but is no longer wired to the janitor, so a blob row lives until an explicit `BlobStore::delete` removes it (which unlinks the content-addressed payload once no live row still references it).
+All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tombstone column, no soft-delete protocol, and no revival semantics — once a row is gone it is gone. The one cadence-driven retention sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow rows), which issues the same `DELETE FROM` against rows past their retention horizon. Blobs are **not** swept on a TTL; there is no `BlobStore::purge_older_than` API, so a blob row lives until an explicit `BlobStore::delete` removes it (which unlinks the content-addressed payload once no live row still references it).
 
 ## Constraints
 
@@ -191,7 +202,7 @@ All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tomb
 
 | Module                                   | Role                                                                                      |
 | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
-| `storage` (self)                         | Provides libsql implementations for every Store trait; defines the channel / pairing / cron / risk / blob trait surface |
+| `storage` (self)                         | Provides libsql implementations for every Store trait from `baybo-store`; owns queries and schema initialization |
 | `store`                                  | Owns every `*Store` trait contract + its row/DTO types; `storage` implements them and depends only on this crate (+ `model`) |
 | `model` / `trace` / `job`                | Provide domain types the libsql impls round-trip (`trace` / `job` are `dev-dependencies` only, for the round-trip tests) |
 | `context`                                | Owns `ContextManager`; pure in-memory                                                     |

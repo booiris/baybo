@@ -1,0 +1,63 @@
+# Operator-run shared infrastructure ("C" in the mobile-companion design).
+#
+# A SEPARATE Cargo workspace (the root `[workspace]` excludes it) so it
+# deploys independently of the `baybo` binary and keeps the `.p8`-holding push
+# role isolatable. C is **blind**: it relays operator-encrypted preview blobs
+# and Noise ciphertext, never plaintext, so it deliberately does NOT depend on
+# any `baybo-*` crate — the `/notify` payload is agreed by its JSON contract.
+#
+# See docs/mobile-remote-host.md and docs/todo/mobile/phase1.md.
+[workspace]
+resolver = "2"
+members = ["crates/push", "crates/relay", "crates/dashboard", "crates/server", "crates/admission", "crates/protocol", "crates/ratelimit"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+axum = "0.8"
+# In-process TLS termination (wss/https) so the relay + push can be exposed
+# directly, no reverse proxy needed. rustls is the same stack reqwest already
+# pulls (aws-lc-rs); we only touch it to install the process crypto provider.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
+remote-host-push = { path = "crates/push" }
+remote-host-relay = { path = "crates/relay" }
+remote-host-admission = { path = "crates/admission" }
+# The shared wire contract (routes + serde types) the gateway + app also depend
+# on. Pure serde, no transport/baybo deps.
+remote-host-protocol = { path = "crates/protocol" }
+# The token-bucket primitive shared by the push frequency control + relay
+# bandwidth throttle. Pure std, no deps.
+remote-host-ratelimit = { path = "crates/ratelimit" }
+# Admission allow-list is a libsql/SQLite table, hot-reloaded by polling (it may
+# be updated out of band). `core` = embedded SQLite, no remote/replication.
+libsql = { version = "0.9", default-features = false, features = ["core"] }
+futures = "0.3"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+reqwest = { version = "0.13", features = ["json"] }
+# ES256 provider-token signing for APNs (the `.p8` is a PKCS#8 P-256 key).
+jsonwebtoken = "9"
+tower = { version = "0.5", features = ["util"] }
+parking_lot = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.9"
+# Verify the push-binding delegation chain (device→gateway) and the per-request
+# gateway signatures. C only verifies; the gateway/app sign (in `device-proto`).
+# The byte layout is pinned identically on both sides (no shared crate across the
+# workspace boundary).
+ed25519-dalek = "2"
+# Wall clock for the admission expiry check (`expires_at` vs `Utc::now()`),
+# formatted to match SQLite's `datetime('now')`. `clock` is the only feature used.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
