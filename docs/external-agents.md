@@ -48,7 +48,7 @@ different flavor of LLM:
 - `baybo_agent::external_agent::ExternalAgent` — async trait with one
   method: `run(request) -> Result<Stream<ExternalAgentEvent>>`.
 - `baybo_agent::external_agent::ExternalAgentRegistry` — built at boot
-  in `src/runtime.rs`; the spawn router looks impls up by kind.
+  in `crates/baybo/src/runtime.rs`; the spawn router looks impls up by kind.
 - `baybo_agent::external_agent::claude_cli::ClaudeCliAgent` — concrete
   impl for `claude -p` (subprocess + stream-json NDJSON parser +
   ETXTBSY-retrying existence check).
@@ -183,7 +183,7 @@ subprocess.
 External runs record **no step/span tree** — the agent's internal
 loop is opaque, and faking `LlmCall` spans would pollute cost /
 analytics with calls baybo never made. So the trace detail page
-(`web/src/pages/TraceSessionPage.tsx`) falls back to rendering the
+(`app/web/src/pages/TraceSessionPage.tsx`) falls back to rendering the
 persisted `session_messages` transcript directly when a job has zero
 steps. Net frontend behaviour: the external subagent appears in the
 Traces list with a `subagent` badge + job status, and opening it
@@ -457,7 +457,7 @@ may resolve it.
    agent will return "doesn't support resume").
 3. Optionally add a config section under
    `crates/config/src/external_agents.rs`.
-4. Register in `src/runtime.rs` alongside the `claude`
+4. Register in `crates/baybo/src/runtime.rs` alongside the `claude`
    registration.
 
 That's it — no spawn-protocol changes, no LLM-pool / agent-loop

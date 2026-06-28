@@ -1,7 +1,7 @@
 //! Serves the React dashboard (built from `web/`) baked into the
 //! gateway binary at compile time.
 //!
-//! `build.rs` walks `web/dist/`, zstd-compresses each asset, and emits
+//! `build.rs` walks `app/web/dist/`, zstd-compresses each asset, and emits
 //! a static asset table. The first request lazily decompresses that
 //! table into memory — no embedding crate needed at runtime. If the
 //! frontend hasn't been built, `build.rs` drops a placeholder

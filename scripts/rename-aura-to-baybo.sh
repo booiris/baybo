@@ -37,7 +37,7 @@ do_sweep() {
     case "$f" in
       "$SELF") continue ;;                         # never rewrite this script
       pnpm-lock.yaml) continue ;;                  # regenerated (pnpm install)
-      web/src/api/schema.d.ts) continue ;;         # regenerated (openapi-typescript)
+      app/web/src/api/schema.d.ts) continue ;;         # regenerated (openapi-typescript)
       docs/openapi.json) continue ;;               # regenerated (UPDATE_OPENAPI)
       */generated/*) continue ;;                   # regenerated (ts-rs ts-export)
       *.lock|*.snap) continue ;;                   # regenerated (cargo / UPDATE_CHAT_SNAPSHOT)

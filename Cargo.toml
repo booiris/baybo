@@ -34,10 +34,14 @@ members = [
     "crates/janitor",
     "crates/setup",
     "crates/term-harness",
+    "crates/baybo",
     "bench/memory",
     "bench/swe",
     "bench/bench-web",
 ]
+# `cargo run` / bare `cargo build` operate on the `baybo` binary by default;
+# the rest of the workspace is reached with `--workspace` or `-p <crate>`.
+default-members = ["crates/baybo"]
 exclude = ["crates/security/fuzz", "remote-host", "app/mobile"]
 
 [workspace.package]
@@ -205,72 +209,6 @@ rmcp = { version = "1.5", default-features = false, features = [
 oauth2 = "5"
 open = "5"
 base64 = "0.22"
-
-[package]
-name = "baybo"
-version.workspace = true
-edition.workspace = true
-
-[features]
-# Build a benchmark-only `baybo` that recalls memory but never writes it, so the
-# LOCOMO bench (`bench/memory`) can drive the real agent end-to-end without QA
-# turns polluting the recall scope. Wraps the backend in
-# `baybo_memory::ReadOnlyMemory` (see `src/runtime.rs`). NOT for production.
-bench-readonly-memory = ["baybo-memory/bench-readonly-memory"]
-
-# Compile the Bash tool's bench profile: run shell commands raw inside an
-# already-disposable container — no uv shims, no work-dir jail, cwd inherited
-# from the process, and a dedicated prompt. Also skips the workspace
-# identity-repo `git init` (baybo-workspace) so a bench container needs no `git`
-# on PATH. Distinct from the `sandbox.mode = none` config (which only drops the
-# OS sandbox but keeps uv + the work/ jail). Off by default; absent in every
-# prod build. For bench/swe + bench/terminal-bench-1.0.
-bench-bash = ["baybo-tools/bench-bash", "baybo-workspace/bench-bash"]
-
-[dependencies]
-baybo-model = { workspace = true }
-baybo-channels = { workspace = true }
-baybo-llm = { workspace = true }
-baybo-tools = { workspace = true }
-baybo-workspace = { workspace = true, features = ["io"] }
-baybo-context = { workspace = true }
-baybo-job = { workspace = true }
-baybo-memory = { workspace = true }
-baybo-cost = { workspace = true }
-baybo-trace = { workspace = true }
-baybo-security = { workspace = true }
-baybo-sandbox = { workspace = true }
-baybo-agent = { workspace = true }
-baybo-cron = { workspace = true }
-baybo-janitor = { workspace = true }
-baybo-storage = { workspace = true }
-baybo-store = { workspace = true }
-baybo-skills = { workspace = true }
-baybo-skills-assessor = { workspace = true }
-baybo-subagent = { workspace = true }
-baybo-task = { workspace = true }
-baybo-config = { workspace = true }
-baybo-cli = { workspace = true }
-baybo-gateway = { workspace = true }
-baybo-pairing = { workspace = true }
-baybo-setup = { workspace = true }
-baybo-tui = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-tracing-appender = { workspace = true }
-anyhow = { workspace = true }
-chrono = { workspace = true }
-serde_json = { workspace = true }
-reqwest = { workspace = true }
-async-trait = { workspace = true }
-hex = { workspace = true }
-uuid = { workspace = true }
-clap = { workspace = true }
-parking_lot = { workspace = true }
-regex = { workspace = true }
-futures = { workspace = true }
 
 [profile.release]
 opt-level = 3

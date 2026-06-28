@@ -6,9 +6,9 @@
 # change always lands with the matching TS side.
 #
 # Surfaces:
-#   sdks/channel-ts/src/generated/    ← `wire` (channel WS frames) +
+#   sidecars/sdk/channel-ts/src/generated/    ← `wire` (channel WS frames) +
 #                                        `baybo-channels` (registration wire)
-#   tool-src/browser/src/generated/   ← `baybo-tools::mcp` (MCP `_meta.baybo.*`)
+#   sidecars/tool/browser/src/generated/   ← `baybo-tools::mcp` (MCP `_meta.baybo.*`)
 #   bench/bench-web/web/src/generated/ ← `baybo-bench-web` (bench spine model)
 #   app/mobile/src/generated/         ← `baybo-mobile-core` (Tauri IPC DTOs)
 #
@@ -25,9 +25,9 @@ cd "$REPO_ROOT"
 # from `wire`; the registration-wire types (`PromptKind` /
 # `RegisterIn` / `RegisterOut`) stay in `baybo-channels`.
 SURFACES=(
-    "sdks/channel-ts/src/generated|test -p wire --features ts-export --lib"
-    "sdks/channel-ts/src/generated|test -p baybo-channels --features ts-export --lib register_wire"
-    "tool-src/browser/src/generated|test -p baybo-tools  --features ts-export --lib mcp::access_rule"
+    "sidecars/sdk/channel-ts/src/generated|test -p wire --features ts-export --lib"
+    "sidecars/sdk/channel-ts/src/generated|test -p baybo-channels --features ts-export --lib register_wire"
+    "sidecars/tool/browser/src/generated|test -p baybo-tools  --features ts-export --lib mcp::access_rule"
     "bench/bench-web/web/src/generated|test -p baybo-bench-web --features ts-export --lib model"
     # The mobile app is a separate Cargo workspace; baybo-mobile-core is FFI-free
     # (no Tauri/webkit), so this regen builds on the ubuntu CI runner unchanged.

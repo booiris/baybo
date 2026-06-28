@@ -6,7 +6,7 @@
 // open-source upstream).
 //
 // The sidecar auto-downloads Chrome for Testing into Baybo's cache on
-// first boot (see `tool-src/browser/src/server.ts::findExistingChrome`),
+// first boot (see `sidecars/tool/browser/src/server.ts::findExistingChrome`),
 // so this script is **not required for normal operation**. Run it
 // only when you want to seed the cache before first agent use — e.g.
 // in CI to bake Chrome into a container image, or in air-gapped

@@ -103,9 +103,9 @@ Module index: [`docs/modules/README.md`](docs/modules/README.md)
 For non-module-crate topics, read the relevant doc before touching that area:
 
 - [`docs/webui.md`](docs/webui.md) — embedded React dashboard (`web/`), pnpm/Vite workflow, OpenAPI codegen, Tailwind v4 design tokens.
-- [`docs/web-chat.md`](docs/web-chat.md) — web chat UI **feature** reference (`web/src/pages/ChatPage.tsx` + `web/src/pages/chat/`): conversations/folders/pin, composer + attachments + model switch, slash-command completion, input-history ring, the interjection queue, thread/turn rendering, and the WS data-flow backbone.
+- [`docs/web-chat.md`](docs/web-chat.md) — web chat UI **feature** reference (`app/web/src/pages/ChatPage.tsx` + `app/web/src/pages/chat/`): conversations/folders/pin, composer + attachments + model switch, slash-command completion, input-history ring, the interjection queue, thread/turn rendering, and the WS data-flow backbone.
 - [`docs/bench-web.md`](docs/bench-web.md) — standalone read-only viewer (`bench/bench-web`) for bench `results/` + agent `trace/` artifacts; spine model + per-bench adapters, ts-rs gate.
-- [`docs/sidecars.md`](docs/sidecars.md) — embedded JS sidecars (`channel-src/*`, `tool-src/*`), bundling/install pipeline, domain registration, and the browser sidecar (CDDM wrapper, security trade-offs, docker mode).
+- [`docs/sidecars.md`](docs/sidecars.md) — embedded JS sidecars (`sidecars/channel/*`, `sidecars/tool/*`), bundling/install pipeline, domain registration, and the browser sidecar (CDDM wrapper, security trade-offs, docker mode).
 - [`docs/modules/storage.md`](docs/modules/storage.md) — libsql storage; all deletable tables use plain `DELETE` (no soft-delete tombstones).
 - [`docs/fuzzing.md`](docs/fuzzing.md) — `baybo-security` cargo-fuzz harness and targets.
 - [`docs/testing.md`](docs/testing.md) — test layout, `test-support` gating, shared fixtures.

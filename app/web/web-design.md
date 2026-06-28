@@ -60,7 +60,7 @@ The Baybo Dashboard follows a **warm** "Neo-Brutalist" design language character
 
 ### 3. Chat (three-zone, app/mac-style)
 
-The `/chat` route renders inside the shell as three zones. (This section covers the **layout**; for the full chat feature set — folders, pin, the interjection queue, slash completion, input history, turn rendering — see [`../docs/web-chat.md`](../docs/web-chat.md).)
+The `/chat` route renders inside the shell as three zones. (This section covers the **layout**; for the full chat feature set — folders, pin, the interjection queue, slash completion, input history, turn rendering — see [`../../docs/web-chat.md`](../../docs/web-chat.md).)
 
 1. **Icon rail** (zone 1, the global rail above).
 2. **Session sidebar** (`pages/chat/SessionSidebar.tsx`): a newest-first conversation list of compact single-line rows, organised into a **two-level folder tree** (`@dnd-kit` drag-to-file, with create / rename / delete-dissolve — deleting a folder never deletes its chats), a lifted **Pinned** block on top, and a trailing **Uncategorized** bucket — plus the New-chat button and a coral-highlighted active row. Each row's right slot shows a mono relative timestamp that on row hover **swaps to a pin/unpin + hide (delete) button pair** (no space is reserved for it); badges that persist *without* hover share that slot too — an unread count (background sessions), a parked-interjection-queue count, and an approval-pending dot. Row titles are regular weight; the **active row's title is bold**.

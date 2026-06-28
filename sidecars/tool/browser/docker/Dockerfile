@@ -12,7 +12,7 @@
 # matches what real users have installed and so is harder to flag as
 # automated infrastructure.
 #
-# Build context is `tool-src/browser/docker/`. Tag is computed by the TS
+# Build context is `sidecars/tool/browser/docker/`. Tag is computed by the TS
 # wrapper as `baybo-browser:<sha256(Dockerfile + entrypoint.sh)[..12]>` —
 # any Baybo update that changes either file triggers a rebuild and pulls
 # whatever Chrome stable was current at build time. To force a refresh

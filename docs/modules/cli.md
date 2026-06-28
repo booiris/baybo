@@ -9,7 +9,7 @@ The `baybo-cli` crate is the **operator-facing command layer** for Baybo. It doe
 
 `baybo-cli` adds no business logic. Every command is a thin adapter that turns parsed flags into an existing manager call (`SessionManager`, `JobLifecycle`, `ToolRegistry`, `SkillRegistry`, `CronScheduler`, `SecretVault`, `WorkspaceManager`, `BayboConfig`). When a subsystem is not yet implemented, its command family is omitted — the CLI never surfaces a "zombie" command that prints `not implemented`.
 
-The command taxonomy is organized by subsystem: one family per manager exposed in `src/main.rs`. Subsystems that do not yet exist in Baybo (e.g. service-mode gateway, device pairing, browser control) get no command family at all.
+The command taxonomy is organized by subsystem: one family per manager exposed in `crates/baybo/src/main.rs`. Subsystems that do not yet exist in Baybo (e.g. service-mode gateway, device pairing, browser control) get no command family at all.
 
 ## Design Decisions
 
@@ -145,11 +145,11 @@ variables and ignore them, so a false-positive injection is a no-op.
 | `security`   | `audit` · `leaks check <file>`                                                                            | `SecurityGateway::audit` / `LeakDetector::check_file`                        | read-only; `audit` would return rule count by action + vault master-key flag (never secret material); `leaks check` would report blocked/hits via the shared detector | deferred — no `Security` variant in the clap tree yet |
 | `cost`       | `show [--user <u> \| --session <id> \| --job <id>] [--since <YYYY-MM-DD>] [--until <YYYY-MM-DD>]`        | `QueryApi::cost_summary` (`CostScope::{User, Session, Job, TimeRange}`)      | read-only. Scopes are mutually exclusive: `--user` is bounded by `--since`/`--until` (default = current UTC day); `--session`/`--job` ignore the time range. Output reports total micro-USD + token aggregates (input / output / cached input / cache writes). | shipped (requires the full domain graph; returns a `Manager` error in argv-light boots that lack `QueryApi`) |
 | `status`     | `[--live]`                                                                                                | Static: registries + `LlmClient`. Live: `JobLifecycle::list` + `QueryApi::cost_summary` | `--live` adds in-flight job count, failed-jobs-last-24h, and today's spend (USD + token counts). Each live counter degrades to `(unavailable)` when its manager isn't wired in the current invocation. | shipped (live block populated where managers are wired)  |
-| `gateway`    | `start` · `install [--system] [--exec-start <p>]` · `enable` · `disable` · `uninstall` · `status` · `token {show, rotate}` | `baybo-gateway` installer + `AdminToken`                                      | `start` runs the long-lived server; `install`/`enable`/`disable`/`uninstall` and `token rotate` mutate; `status`/`token show` are read-only | shipped (intercepted in `src/main.rs` before dispatch, runs in `src/gateway_cmd.rs`) |
+| `gateway`    | `start` · `install [--system] [--exec-start <p>]` · `enable` · `disable` · `uninstall` · `status` · `token {show, rotate}` | `baybo-gateway` installer + `AdminToken`                                      | `start` runs the long-lived server; `install`/`enable`/`disable`/`uninstall` and `token rotate` mutate; `status`/`token show` are read-only | shipped (intercepted in `crates/baybo/src/main.rs` before dispatch, runs in `crates/baybo/src/gateway_cmd.rs`) |
 | `pair`       | `list [--pending\|--approved]` · `approve <code>` · `revoke <channel-type> <bot-id> <user-id>`            | `baybo-pair` store via `ChannelPairingStore`                                  | `approve`/`revoke` mutate                                                                          | shipped                                           |
-| `prompt`     | `[PROMPT] [--session <id>] [-y/--dangerously-allow-all] [--timeout <secs>]`                               | Hybrid: WS into a live gateway, else in-process `runtime::build_managers` + `wire_router` | runs one agent turn — persists the session row + transcript + traces + cost like any conversation | shipped (intercepted before dispatch, runs in `src/prompt_cmd.rs`) |
-| `tui`        | `[--session <id>]`                                                                                        | WS client into the gateway's channel listener                                | read-only                                                                                          | shipped (intercepted before dispatch, runs in `src/tui_cmd.rs`) |
-| `setup`      | —                                                                                                         | Interactive first-run wizard (`baybo-setup`)                                  | bootstraps workspace + master key + default `baybo.json`                                            | shipped (intercepted before dispatch, runs in `src/setup_cmd.rs`) |
+| `prompt`     | `[PROMPT] [--session <id>] [-y/--dangerously-allow-all] [--timeout <secs>]`                               | Hybrid: WS into a live gateway, else in-process `runtime::build_managers` + `wire_router` | runs one agent turn — persists the session row + transcript + traces + cost like any conversation | shipped (intercepted before dispatch, runs in `crates/baybo/src/prompt_cmd.rs`) |
+| `tui`        | `[--session <id>]`                                                                                        | WS client into the gateway's channel listener                                | read-only                                                                                          | shipped (intercepted before dispatch, runs in `crates/baybo/src/tui_cmd.rs`) |
+| `setup`      | —                                                                                                         | Interactive first-run wizard (`baybo-setup`)                                  | bootstraps workspace + master key + default `baybo.json`                                            | shipped (intercepted before dispatch, runs in `crates/baybo/src/setup_cmd.rs`) |
 | `doctor`     | —                                                                                                         | Aggregates `BayboConfig::validate`, storage ping, `llm::probe`, env-var audit | read-only                                                                                          | shipped (LLM probe gated on `llm probe` landing)  |
 | `completion` | `<shell>`                                                                                                 | `clap_complete`                                                              | stdout only                                                                                        | shipped                                           |
 
@@ -160,11 +160,11 @@ the assistant's answer to stdout, then exit. It is the non-interactive
 sibling of `tui` — same agent, no UI. With no `PROMPT` argument the text
 is read from stdin (`git diff | baybo prompt "review this"`, `cat task.md |
 baybo prompt`); an argument *plus* piped stdin are concatenated. Lives in
-`src/prompt_cmd.rs`, intercepted in `main.rs` before the generic argv
+`crates/baybo/src/prompt_cmd.rs`, intercepted in `main.rs` before the generic argv
 dispatch (same as `tui`).
 
 **Hybrid runtime, keyed off the singleton lock.** A running gateway holds
-the `<workspace>/state/baybo.lock` flock for its lifetime (`src/singleton.rs`),
+the `<workspace>/state/baybo.lock` flock for its lifetime (`crates/baybo/src/singleton.rs`),
 so `prompt` uses lock acquisition as a gateway-presence probe:
 
 - **Lock held** (a gateway is up) → connect over the same `/v1/channel-ws`
@@ -244,7 +244,7 @@ Each family is added under the same naming scheme when its subsystem ships.
 
 ### Wiring
 
-`baybo tui` is a `/v1/channel-ws` client into a running gateway: `src/tui_cmd.rs` connects via `WsTransport`, builds `baybo_tui::client::TuiSlashHandler` and `TuiDashboardProvider` (both forward calls over the WS to the gateway), and hands them to `TuiAdapter::new().with_slash_handler(...).with_dashboard_provider(...)`. The CLI's `CliSlashHandler` / `CliDashboardProvider` are defined in `baybo-cli` for use by future in-process adapters but are not wired by the binary today. Other adapters (HTTP/Telegram/Discord) accept the same `Arc<dyn SlashHandler>` when they land; `DashboardProvider` is only consumed by adapters that can render interactive views (i.e. TUI).
+`baybo tui` is a `/v1/channel-ws` client into a running gateway: `crates/baybo/src/tui_cmd.rs` connects via `WsTransport`, builds `baybo_tui::client::TuiSlashHandler` and `TuiDashboardProvider` (both forward calls over the WS to the gateway), and hands them to `TuiAdapter::new().with_slash_handler(...).with_dashboard_provider(...)`. The CLI's `CliSlashHandler` / `CliDashboardProvider` are defined in `baybo-cli` for use by future in-process adapters but are not wired by the binary today. Other adapters (HTTP/Telegram/Discord) accept the same `Arc<dyn SlashHandler>` when they land; `DashboardProvider` is only consumed by adapters that can render interactive views (i.e. TUI).
 
 Persistent TUI input history is owned by the gateway, not `baybo-cli`. The TUI loads and appends the ring over the channel WS via `Frame::HistorySnapshot` and `Frame::HistoryAppend`; see [`tui.md`](./tui.md) and [`security.md`](./security.md). This keeps the TUI decoupled from `baybo-security` and ensures a single writer (the gateway) owns the encrypted blob, so concurrent `baybo tui` clients can't clobber each other.
 
@@ -277,7 +277,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 
 | Module                                                                                                              | Role                                                                                                                                                             |
 | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bootstrap` — the `baybo` binary at the **workspace root** (`src/main.rs`, `src/boot.rs`, `src/runtime.rs`, `src/gateway_cmd.rs`, `src/tui_cmd.rs`, `src/setup_cmd.rs`), not `crates/cli` (`baybo-cli` is lib-only, no `main.rs`) | Promotes `--config` into `BAYBO_CONFIG_PATH`, then routes to a per-subcommand entry: `gateway_cmd::run` for `gateway`, `setup_cmd::run` for `setup`, `tui_cmd::run` for `tui`, and the lightweight argv path (`baybo_cli::dispatch::run` against a `CommandContext`) for everything else. The TUI side (`tui_cmd`) wires `baybo-tui`'s WS-backed `TuiSlashHandler` / `TuiDashboardProvider`, not the in-crate `CliSlashHandler`. |
+| `bootstrap` — the `baybo` binary in **`crates/baybo`** (`crates/baybo/src/main.rs`, `crates/baybo/src/boot.rs`, `crates/baybo/src/runtime.rs`, `crates/baybo/src/gateway_cmd.rs`, `crates/baybo/src/tui_cmd.rs`, `crates/baybo/src/setup_cmd.rs`), not `crates/cli` (`baybo-cli` is lib-only, no `main.rs`) | Promotes `--config` into `BAYBO_CONFIG_PATH`, then routes to a per-subcommand entry: `gateway_cmd::run` for `gateway`, `setup_cmd::run` for `setup`, `tui_cmd::run` for `tui`, and the lightweight argv path (`baybo_cli::dispatch::run` against a `CommandContext`) for everything else. The TUI side (`tui_cmd`) wires `baybo-tui`'s WS-backed `TuiSlashHandler` / `TuiDashboardProvider`, not the in-crate `CliSlashHandler`. |
 | `config`                                                                                                            | `config` family directly reads/writes `BayboConfig`; `doctor` calls `validate`.                                                                                   |
 | `agent`                                                                                                             | Supplies all manager `Arc`s.                                                                                              |
 | `channels`                                                                                                          | Owns `SlashHandler`, `SlashOutcome`, `DashboardProvider`, `ViewKind`; `TuiAdapter` is the first consumer of all four.                                            |
@@ -289,7 +289,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 
 1. `docs/modules/cli.md` exists with the seven sections above.
 2. `docs/modules/README.md` lists `cli` in its module groups and Reading Order.
-3. Every command family in the table maps to a manager already present in `src/main.rs`; the remaining "deferred" rows are added as their subsystems land.
+3. Every command family in the table maps to a manager already present in `crates/baybo/src/main.rs`; the remaining "deferred" rows are added as their subsystems land.
 
 **Phase 2a — read-only commands** — complete.
 

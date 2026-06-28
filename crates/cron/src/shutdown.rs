@@ -3,7 +3,7 @@
 //! The scheduler must be able to wait on an external "shutdown requested"
 //! signal without depending on any specific shutdown type — that coupling
 //! belongs to the binary that owns process lifecycle (`baybo-agent` /
-//! `src/main.rs`). Implementers supply the concrete semantics and the
+//! `crates/baybo/src/main.rs`). Implementers supply the concrete semantics and the
 //! scheduler selects on `wait()` inside its tick loop.
 
 use async_trait::async_trait;

@@ -10,7 +10,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "type-check": "tsc -b --noEmit",
-    "gen:api": "openapi-typescript ../docs/openapi.json -o src/api/schema.d.ts"
+    "gen:api": "openapi-typescript ../../docs/openapi.json -o src/api/schema.d.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

@@ -464,7 +464,7 @@ mod tests {
         );
     }
 
-    /// The hand-maintained TS mirror `web/src/types/trace.ts` is **not** covered
+    /// The hand-maintained TS mirror `app/web/src/types/trace.ts` is **not** covered
     /// by `scripts/check-ts-bindings.sh` (that gate only spans the ts-rs
     /// surfaces), so it has silently drifted before. This guards it directly: the
     /// `MessageSource` union there must list exactly the serialized form of every
@@ -472,7 +472,10 @@ mod tests {
     /// stale member the mirror kept.
     #[test]
     fn message_source_matches_ts_mirror() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/src/types/trace.ts");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../app/web/src/types/trace.ts"
+        );
         let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
 
         // Slice the `export type MessageSource = ...;` declaration (robust to the
@@ -498,7 +501,7 @@ mod tests {
 
         assert_eq!(
             rust_members, ts_members,
-            "MessageSource drift between baybo_model and web/src/types/trace.ts — \
+            "MessageSource drift between baybo_model and app/web/src/types/trace.ts — \
              keep the TS union in sync with the Rust enum"
         );
     }

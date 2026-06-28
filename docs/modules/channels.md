@@ -260,7 +260,7 @@ http-channel token lifecycle and the `StashedTokenHandle` /
 WS).
 
 The only public SDK for third-party sidecars is the TypeScript package
-at `sdks/channel-ts/`. Its primary surface is a `Channel` interface
+at `sidecars/sdk/channel-ts/`. Its primary surface is a `Channel` interface
 plus `runChannel(channel)` entry point: the sidecar author implements
 `onMessage`, `inbound(signal)`, and optionally `onApprovalRequested`
 / `onDelta` / `onNotice`, and the SDK handles the WebSocket +
@@ -325,15 +325,15 @@ supervisor patterns: run it as a child of the gateway via
 connects to `/v1/logs`'s admin endpoint. There is no SDK-level shortcut.
 
 **Embedded sidecar toolchain.** `crates/gateway/build.rs` runs
-`pnpm --filter <pkg> bundle` for each `channel-src/*` package; the
+`pnpm --filter <pkg> bundle` for each `sidecars/channel/*` package; the
 `bundle` script in each `package.json` invokes
 `bun build --target=bun --minify` to emit a single self-contained
 `dist/bundle.mjs`. The output, plus any `baybo.auxAssets` declared in
 the package (e.g. weixin's `silk.wasm`), is zstd-compressed into
 `target/sidecar-cache/<fingerprint>/` and embedded via
 `include_bytes!`. Sidecar packaging is keyed by the relevant sidecar
-inputs (workspace lockfiles, `channel-src/*` sources/configs, and
-`sdks/channel-ts/dist`): if those inputs are unchanged, a later
+inputs (workspace lockfiles, `sidecars/channel/*` sources/configs, and
+`sidecars/sdk/channel-ts/dist`): if those inputs are unchanged, a later
 `cargo build` reuses the cached compressed bundles instead of
 re-running bun. `--target=bun` substitutes bun's own polyfills for
 `ws` (WHATWG `WebSocket`) and `node-fetch` (bun's native fetch); the
@@ -353,7 +353,7 @@ callers. There is no Rust SDK — the TUI has its own private WS client,
 and the server is authoritative on the wire format.
 
 The first in-tree sidecar built on the SDK is the Telegram channel at
-`channel-src/telegram/` (package `@baybo/channel-telegram`). It uses
+`sidecars/channel/telegram/` (package `@baybo/channel-telegram`). It uses
 `grammy` for long-polling, maps Telegram `chat_id`s to stable UUIDv5
 `session_id`s, and surfaces `Frame::ApprovalRequested` as an inline-
 keyboard prompt in the originating chat. It's also the working example
@@ -391,7 +391,7 @@ the single `token` string as JSON (the weixin sidecar already uses this
 pattern via its `AuthBlob`).
 
 ```ts
-// channel-src/telegram/src/index.ts (excerpt)
+// sidecars/channel/telegram/src/index.ts (excerpt)
 register: async (ctx) => {
   const token = await ctx.password("bot token: ", { required: true });
   const colon = token.indexOf(":");
@@ -415,8 +415,8 @@ key, `channel.<channel_type>.bot.<bot_id>.token`, mirroring what
 string back via `onStartBot(cmd)` when the gateway later boots the
 bot.
 
-**Reference implementations**: `channel-src/telegram/src/index.ts`
-(single-prompt token validation) and `channel-src/weixin/src/cli.ts`
+**Reference implementations**: `sidecars/channel/telegram/src/index.ts`
+(single-prompt token validation) and `sidecars/channel/weixin/src/cli.ts`
 (non-interactive QR scan with progress on stderr) are the two working
 examples.
 

@@ -46,8 +46,8 @@ The gateway is driven by the `baybo gateway …` command tree. `start` runs
 both listeners in the foreground; `install` / `enable` / `disable` /
 `uninstall` / `status` manage the platform service unit; `token
 {show|rotate}` manages the admin bearer token. The binary entrypoint
-intercepts `Commands::Gateway` in `src/main.rs` before the CLI dispatcher
-and routes it to `src/gateway_cmd.rs` — same pattern as `Commands::Tui`.
+intercepts `Commands::Gateway` in `crates/baybo/src/main.rs` before the CLI dispatcher
+and routes it to `crates/baybo/src/gateway_cmd.rs` — same pattern as `Commands::Tui`.
 
 Configuration lives in `baybo_config::GatewayConfig` (a top-level
 section on `BayboConfig`). The gateway owns its own bind address /
@@ -335,10 +335,10 @@ The `/v1/logs` surface has two endpoints:
 
 - `openapi-typescript` (`npm run gen:api`, also wired into `npm run
   build`) reads `docs/openapi.json` and writes
-  `web/src/api/schema.d.ts` — a pure `.d.ts` with `paths` and
+  `app/web/src/api/schema.d.ts` — a pure `.d.ts` with `paths` and
   `components` maps. No runtime code is emitted.
 - `openapi-fetch` consumes that schema type at runtime. The thin
-  wrapper in `web/src/api/client.ts` (`createAdminClient({ baseUrl,
+  wrapper in `app/web/src/api/client.ts` (`createAdminClient({ baseUrl,
   token })`) returns a typed `Client<paths>` with Bearer auth
   pre-applied. Every admin call the UI makes therefore has request
   paths, params, body shape, and response variants checked by `tsc`
@@ -361,7 +361,7 @@ the relevant `web/` source inputs (`src/`, `index.html`,
 `docs/openapi.json`, and the pnpm lock/workspace files). If those
 inputs changed since the last successful web build, it runs
 `pnpm --filter baybo-web build`; otherwise it reuses the existing
-`web/dist/`. It then zstd-compresses each emitted asset and writes
+`app/web/dist/`. It then zstd-compresses each emitted asset and writes
 `$OUT_DIR/webui_assets.rs` with a static asset table pairing the path,
 pre-computed MIME string, and compressed bytes (`html`, `js`, `css`,
 `svg`, `png`, `ico`, fonts, fallbacks). No `rust-embed`, no
@@ -388,7 +388,7 @@ static inert asset rather than a privileged surface keeps the bearer-
 token contract simple — tokens gate data, not pages.
 
 Admin API calls from the web bundle go through the typed client at
-`web/src/api/client.ts`, which wraps `openapi-fetch` with a
+`app/web/src/api/client.ts`, which wraps `openapi-fetch` with a
 `Client<paths>` derived from the checked-in OpenAPI document. See the
 "OpenAPI spec generation and the TypeScript client" design note above
 for the regeneration flow.
@@ -404,7 +404,7 @@ cargo build --release -p baybo-gateway
 If the tracked web inputs changed, `build.rs` attempts
 `pnpm --filter baybo-web build` automatically during `cargo build`. If
 that build fails or the frontend toolchain isn't available,
-`build.rs` falls back to the existing `web/dist/`; if no dist exists at
+`build.rs` falls back to the existing `app/web/dist/`; if no dist exists at
 all, it writes a one-line placeholder `index.html` so backend-only
 development still compiles.
 
@@ -419,7 +419,7 @@ cargo run -- gateway start
 cd web && npm run dev
 ```
 
-`web/vite.config.ts` proxies `/v1`, `/healthz`, and `/readyz` to
+`app/web/vite.config.ts` proxies `/v1`, `/healthz`, and `/readyz` to
 `127.0.0.1:8888`, so the browser only talks to the Vite origin. This
 avoids the CORS path entirely — `AdminAuthProvider` keeps `baseUrl =
 window.location.origin` (the Vite origin), and bearer-token auth
@@ -480,7 +480,7 @@ inherit the invoking shell's env, so the capture is load-bearing.
 
 Both unit files include a small restart delay (`RestartSec=2s` on
 systemd, `ThrottleInterval=2` on launchd). The per-workspace singleton
-lock (`src/singleton.rs`) will reject a second `start` invocation that
+lock (`crates/baybo/src/singleton.rs`) will reject a second `start` invocation that
 fires before the previous process has unwound; without the delay a
 restart loop can thrash the lock. The systemd unit also sets
 `TimeoutStopSec=30s` to match `GatewayConfig::shutdown_grace_secs`.
@@ -490,7 +490,7 @@ restart loop can thrash the lock. The systemd unit also sets
 All commands live under `baybo gateway` and are also usable over slash
 mode once a channel exposes them (not wired yet; the `Gateway` arm
 returns `UnknownCommand` from the normal dispatcher because
-`src/main.rs` intercepts it before dispatch).
+`crates/baybo/src/main.rs` intercepts it before dispatch).
 
 | Subcommand                                | Effect                                                                                               | Mutating |
 | ----------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------- |
@@ -503,7 +503,7 @@ returns `UnknownCommand` from the normal dispatcher because
 | `token show`                              | Print the current token. Errors if none minted yet.                                                   | —        |
 | `token rotate [--yes]`                    | Overwrite the token with a fresh 32-byte value.                                                       | yes      |
 
-The handler lives in `src/gateway_cmd.rs` and uses the `boot::` helpers
+The handler lives in `crates/baybo/src/gateway_cmd.rs` and uses the `boot::` helpers
 to build a throwaway `SecretVault` when a subcommand needs it. `start`
 acquires the per-workspace singleton, opens the vault to read the admin
 token and mint a fresh TUI token, builds the manager graph via
@@ -708,7 +708,7 @@ themselves. See [`tui.md`](./tui.md) and [`security.md`](./security.md).
 Config mutation endpoints (`PUT /v1/config`, `DELETE /v1/config`, `PUT
 /v1/llm/...`) write through to the same on-disk `baybo.json` that `baybo
 config set/unset` targets, then trigger an **in-process reload** via the
-shared `ConfigReloader` (`src/reload.rs`, re-exported from `lib.rs`).
+shared `ConfigReloader` (`crates/baybo/src/reload.rs`, re-exported from `lib.rs`).
 Hot-updatable fields take effect live; only a non-hot field forces a
 restart, surfaced as `requires_restart: true` (the reloader reports
 `ReloadError::NotHotReloadable`, which the handler maps to "true", not an
@@ -725,11 +725,11 @@ a `ReloadOutcome`. If the gateway was booted without a config path
 `llm_pool: LlmPoolHandle` it's the default client of), `WorkspaceManager`,
 `LeakDetector`, `ChannelRegistry`, `CostManager` — plus a
 `ShutdownSignal` and a `TaskTracker` for graceful teardown. The wiring
-lives in `src/runtime.rs` (the binary crate's `src/`, not under
+lives in `crates/baybo/src/runtime.rs` (the binary crate's `src/`, not under
 `crates/gateway/`):
 
 ```rust
-// src/runtime.rs
+// crates/baybo/src/runtime.rs
 pub struct ManagerGraph { /* all Arcs; llm_client + llm_pool; channels_registry; … */ }
 pub async fn build_managers(
     config: Arc<BayboConfig>,
@@ -805,8 +805,8 @@ subcommands use it for the same reason.
 crates/gateway/
 ├── Cargo.toml               # features above, all deps via workspace = true
 ├── build.rs                 # three pipelines: (1) pnpm install; (2) WebUI → $OUT_DIR/webui_assets.rs;
-│                            #   (3) sidecars → $OUT_DIR/sidecar_assets.rs (bun build for channel-src/*,
-│                            #   esbuild+node for tool-src/*). All assets zstd-compressed + include_bytes!.
+│                            #   (3) sidecars → $OUT_DIR/sidecar_assets.rs (bun build for sidecars/channel/*,
+│                            #   esbuild+node for sidecars/tool/*). All assets zstd-compressed + include_bytes!.
 ├── src/
 │   ├── lib.rs               # re-exports GatewayServer, GatewayDeps, ChannelServer, ConfigReloader, Sidecar*, …
 │   ├── config.rs            # RuntimeGatewayConfig (admin bind + shutdown grace + CORS)
@@ -870,10 +870,10 @@ crates/gateway/
 ```
 
 The frontend sources live outside the crate at `web/` (pnpm workspace,
-not a Cargo member) and produce `web/dist/` which `build.rs` consumes;
-the in-tree JS sidecars live at `channel-src/*` and `tool-src/*` and are
-bundled into `$OUT_DIR/sidecar_assets.rs`. Note `src/runtime.rs` and
-`src/gateway_cmd.rs` (the boot path) live in the **binary** crate's
+not a Cargo member) and produce `app/web/dist/` which `build.rs` consumes;
+the in-tree JS sidecars live at `sidecars/channel/*` and `sidecars/tool/*` and are
+bundled into `$OUT_DIR/sidecar_assets.rs`. Note `crates/baybo/src/runtime.rs` and
+`crates/baybo/src/gateway_cmd.rs` (the boot path) live in the **binary** crate's
 `src/`, not in `crates/gateway/`.
 
 The channel-listener wire constants (`CHANNEL_TOKEN_HEADER`, the
@@ -915,9 +915,9 @@ at runtime and stored in the per-workspace vault.
   reached from the TUI.
 - **cli** — `Commands::Gateway { cmd: GatewayCmd }` is defined in
   `crates/cli/src/cli.rs`; the dispatcher explicitly returns
-  `UnknownCommand` because `src/main.rs` intercepts the variant before
+  `UnknownCommand` because `crates/baybo/src/main.rs` intercepts the variant before
   it reaches dispatch.
-- **bootstrap** — `src/main.rs` intercepts `Commands::Gateway` and calls
+- **bootstrap** — `crates/baybo/src/main.rs` intercepts `Commands::Gateway` and calls
   `gateway_cmd::run`; the long-running `start` path spins up both
   listeners against the same manager graph.
 

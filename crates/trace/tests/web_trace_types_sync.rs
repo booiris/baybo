@@ -1,4 +1,4 @@
-//! Contract test: the web trace types in `web/src/types/trace.ts` are
+//! Contract test: the web trace types in `app/web/src/types/trace.ts` are
 //! hand-maintained (NOT codegen'd from this crate — see that file's header),
 //! so they silently drift when a `StepKind` / `SpanKind` variant is added
 //! here without a matching frontend update. The trace detail page maps each
@@ -14,7 +14,7 @@ use baybo_trace::{SpanKind, StepKind};
 
 /// The hand-maintained frontend mirror of this crate's trace types.
 fn web_trace_types() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/src/types/trace.ts");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../app/web/src/types/trace.ts");
     std::fs::read_to_string(&path).unwrap_or_else(|e| {
         let p = path.display();
         panic!(
@@ -28,7 +28,7 @@ fn web_trace_types() -> String {
 fn assert_kind_listed(ts: &str, ty: &str, tag: &str) {
     assert!(
         ts.contains(&format!("kind: '{tag}'")),
-        "{ty} `{tag}` is not listed in web/src/types/trace.ts. The trace detail \
+        "{ty} `{tag}` is not listed in app/web/src/types/trace.ts. The trace detail \
          page would fall back to a generic row for it (and before that fallback \
          existed, an unknown {ty} white-screened the page — see PR #61's \
          `progress_observer`). Fix: add `| {{ kind: '{tag}' }}` to the `{ty}` \

@@ -55,7 +55,7 @@ pub(crate) enum AppEvent {
 
 /// A single log entry surfaced in the chat scrollback.
 ///
-/// Populated by a tracing `Layer`; see `src/tui_log.rs`. Kept as a flat value
+/// Populated by a tracing `Layer`; see `crates/baybo/src/tui_log.rs`. Kept as a flat value
 /// type so the crate does not need to depend on `tracing` internals.
 #[derive(Debug, Clone)]
 pub struct LogRecord {

@@ -16,7 +16,7 @@ No sidebars. Baybo's operator surface lives in the CLI subcommands; the TUI only
 speaking the same WebSocket + MessagePack protocol every out-of-process
 sidecar uses ([`baybo_channels::wire`]). The TUI ships its own private
 `WsClient` (`crates/tui/src/client/ws.rs`); the only public-SDK form
-of this protocol is the TypeScript package under `sdks/channel-ts/`.
+of this protocol is the TypeScript package under `sidecars/sdk/channel-ts/`.
 It does **not** take the
 workspace singleton lock, does **not** build a manager graph, and does
 **not** own a local `Router`. One workspace runs a long-lived `baybo
@@ -173,7 +173,7 @@ When an approval is pending, keymap translation short-circuits — chat edits, s
 
 ## Boot flow
 
-`src/tui_cmd.rs::run` drives the boot. There is no call to
+`crates/baybo/src/tui_cmd.rs::run` drives the boot. There is no call to
 `singleton::acquire`, no `build_managers`, and no `wire_router` —
 none of those exist on the TUI side.
 
@@ -238,7 +238,7 @@ none of those exist on the TUI side.
 
 Debug builds add a `--dev-auto-gateway` flag. When the initial
 `WsTransport::connect` returns `ChannelError::NotReachable` and the
-flag is set, `src/tui_cmd.rs::dev_auto` spawns
+flag is set, `crates/baybo/src/tui_cmd.rs::dev_auto` spawns
 `Command::new(std::env::current_exe()).args(["gateway", "start"])`
 as a subprocess, polls the admin address with a loopback
 `TcpStream::connect` with exponential backoff (100 ms → 1 s, 15 s
@@ -306,7 +306,7 @@ Single-consumer ordering on the mpsc keeps delta/response ordering correct as WS
 Writing `tracing` records to stdout while ratatui owns raw mode corrupts the frame. Chat mode therefore uses a two-layer subscriber:
 
 - **File layer** — `tracing_appender::rolling::daily("<workspace>/logs", "baybo.log")` wrapped in a non-blocking writer. A `WorkerGuard` held on the stack of `main` flushes pending lines on shutdown.
-- **TUI echo layer** — `TuiLogLayer` (`src/tui_log.rs`) filters **tracing** events to `WARN` and `ERROR` (lower `tracing` levels stay in the file only), extracts `message` + structured fields, and forwards them through `TuiLogSink::emit` as `AppEvent::Log(LogRecord)`. The event loop pushes the record onto the scrollback as a coloured line (`warn` yellow, `error` red, with the event `target` in grey).
+- **TUI echo layer** — `TuiLogLayer` (`crates/baybo/src/tui_log.rs`) filters **tracing** events to `WARN` and `ERROR` (lower `tracing` levels stay in the file only), extracts `message` + structured fields, and forwards them through `TuiLogSink::emit` as `AppEvent::Log(LogRecord)`. The event loop pushes the record onto the scrollback as a coloured line (`warn` yellow, `error` red, with the event `target` in grey).
 
 The `WARN`/`ERROR` cut applies only to this tracing-echo layer. Agent **notices** take a separate route: the transport maps `Frame::Notice` → `TransportEvent::Notice` → `AppEvent::Log` (see [Output path](#output-path)), preserving all three `NoticeLevel`s — `Info` notices reach the same `LogRecord` surface and render as a cyan `info` line (`LogLevel::Info`), so an agent-emitted info notice is not filtered out the way a `tracing` INFO event is.
 
