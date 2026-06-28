@@ -8,7 +8,5 @@ src-tauri/gen/schemas
 src-tauri/gen/apple/.tauri
 src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/Contents.json.bak
 
-# Non-iOS bundle icon outputs are generated on demand by `tauri icon`.
 app-icon.png
 app-icon.svg
-src-tauri/icons/
