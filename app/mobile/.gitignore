@@ -8,8 +8,7 @@ src-tauri/gen/schemas
 src-tauri/gen/apple/.tauri
 src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/Contents.json.bak
 
-# Placeholder icon assets (Tauri defaults) — not committed yet. Regenerate the
-# whole set with `cargo tauri icon <icon.png>` once the real icon is chosen.
+# Non-iOS bundle icon outputs are generated on demand by `tauri icon`.
 app-icon.png
+app-icon.svg
 src-tauri/icons/
-src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/*.png
