@@ -46,7 +46,9 @@ futures = "0.3"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 reqwest = { version = "0.13", features = ["json"] }
 # ES256 provider-token signing for APNs (the `.p8` is a PKCS#8 P-256 key).
-jsonwebtoken = "9"
+# v10 requires picking a crypto backend; use aws_lc_rs to share the same vetted
+# stack rustls/reqwest already pull in (one crypto provider, not two).
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 tower = { version = "0.5", features = ["util"] }
 parking_lot = "0.12"
 sha2 = "0.10"
