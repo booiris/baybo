@@ -10,15 +10,15 @@ It is **not** a reusable library. Alternative entry points (e.g. integration tes
 
 | File | Role |
 |------|------|
-| `src/main.rs` | Argv-mode dispatch. Parses the CLI, promotes `--config` into `BAYBO_CONFIG_PATH`, then either short-circuits to a subcommand entry (`gateway_cmd::run`, `setup_cmd::run`, `tui_cmd::run`) or builds a lightweight `CommandContext` and runs `baybo_cli::dispatch::run`. |
-| `src/boot.rs` | Config → domain translation layer. Pure mappings and small loaders, unit-tested. No `Arc`, no channels, no actor spawning. |
-| `src/runtime.rs` | Shared chat-loop assembly: `build_managers`, `wire_router`, `install_signal_handler`, `build_secret_vault`, `force_exit_watchdog`. Used by both the gateway boot path and the TUI's auto-spawn helper. Vault construction goes through `boot::load_encryption_key` directly. |
-| `src/gateway_cmd.rs` | Long-running entry point for `baybo gateway start` and the supporting installer / token / status subcommands. |
-| `src/setup_cmd.rs` | First-run wizard (`baybo setup`). |
-| `src/tui_cmd.rs` | Interactive `baybo tui` entry point: connects to a running gateway over the channel WS. |
-| `src/reload.rs` | In-process config hot-reload orchestrator. Implements `baybo_gateway::ConfigReloader` with a two-phase prepare→commit swap; lives here because rebuilding the LLM pool needs `boot::build_llm_client_for_entry`. |
-| `src/singleton.rs` | Per-workspace `flock` lock acquired by `gateway_cmd::start`. |
-| `src/tracing_init.rs` / `src/tui_log.rs` | Tracing setup variants (stdout, file, TUI) plus the in-memory `LogBuffer` and TUI mirror sink. |
+| `crates/baybo/src/main.rs` | Argv-mode dispatch. Parses the CLI, promotes `--config` into `BAYBO_CONFIG_PATH`, then either short-circuits to a subcommand entry (`gateway_cmd::run`, `setup_cmd::run`, `tui_cmd::run`) or builds a lightweight `CommandContext` and runs `baybo_cli::dispatch::run`. |
+| `crates/baybo/src/boot.rs` | Config → domain translation layer. Pure mappings and small loaders, unit-tested. No `Arc`, no channels, no actor spawning. |
+| `crates/baybo/src/runtime.rs` | Shared chat-loop assembly: `build_managers`, `wire_router`, `install_signal_handler`, `build_secret_vault`, `force_exit_watchdog`. Used by both the gateway boot path and the TUI's auto-spawn helper. Vault construction goes through `boot::load_encryption_key` directly. |
+| `crates/baybo/src/gateway_cmd.rs` | Long-running entry point for `baybo gateway start` and the supporting installer / token / status subcommands. |
+| `crates/baybo/src/setup_cmd.rs` | First-run wizard (`baybo setup`). |
+| `crates/baybo/src/tui_cmd.rs` | Interactive `baybo tui` entry point: connects to a running gateway over the channel WS. |
+| `crates/baybo/src/reload.rs` | In-process config hot-reload orchestrator. Implements `baybo_gateway::ConfigReloader` with a two-phase prepare→commit swap; lives here because rebuilding the LLM pool needs `boot::build_llm_client_for_entry`. |
+| `crates/baybo/src/singleton.rs` | Per-workspace `flock` lock acquired by `gateway_cmd::start`. |
+| `crates/baybo/src/tracing_init.rs` / `crates/baybo/src/tui_log.rs` | Tracing setup variants (stdout, file, TUI) plus the in-memory `LogBuffer` and TUI mirror sink. |
 
 ## The `boot` module
 
@@ -50,7 +50,7 @@ Loaders return `anyhow::Result` because they surface I/O and format errors that 
 
 ## Startup sequence
 
-`src/main.rs` is short and dispatches to subcommand-specific entries:
+`crates/baybo/src/main.rs` is short and dispatches to subcommand-specific entries:
 
 ```
 Cli::parse()

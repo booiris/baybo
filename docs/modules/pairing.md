@@ -247,15 +247,15 @@ nothing does today.
   `channel_pairing_store`, wired from `Store::channel_pairing`.
   `build_channel_router` constructs the `PairingService`, which owns
   the hardcoded TTL.
-- `src/runtime.rs` — `ManagerGraph` carries `channel_pairing_store`;
+- `crates/baybo/src/runtime.rs` — `ManagerGraph` carries `channel_pairing_store`;
   `build_bot_registry_deps` returns it too so the CLI can reach it.
-- `src/main.rs` / `src/gateway_cmd.rs` — plumb the store through
+- `crates/baybo/src/main.rs` / `crates/baybo/src/gateway_cmd.rs` — plumb the store through
   from `Store::open` to the CLI context / `GatewayDeps`.
 - `crates/cli/src/cli.rs`, `dispatch.rs`, `commands/pair.rs` —
   `baybo pair` subcommand family.
-- `crates/channels/src/wire.rs` + `sdks/channel-ts/src/generated/`
+- `crates/channels/src/wire.rs` + `sidecars/sdk/channel-ts/src/generated/`
   (regen) — `Frame::Message` carries optional `bot_id`.
-- `channel-src/telegram/src/channel.ts` — passes `botId` on the
+- `sidecars/channel/telegram/src/channel.ts` — passes `botId` on the
   `pushInbound` call site (already tracked in `botByUser`).
 
 ### TUI
@@ -304,7 +304,7 @@ doc's `PrincipalSource::Cli` branch.
   `bot_id`.
 - `crates/gateway/src/channel/route.rs` — gate lands right before
   `session_resolver.resolve_or_create` in the empty-session branch.
-- `channel-src/telegram/src/channel.ts` — sends `bot_id` on the
+- `sidecars/channel/telegram/src/channel.ts` — sends `bot_id` on the
   inbound path.
 - `docs/modules/storage.md` — store convention that dictates where
   the trait + row types live.

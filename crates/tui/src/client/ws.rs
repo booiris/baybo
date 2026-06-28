@@ -3,7 +3,7 @@
 //!
 //! This is deliberately not a reusable SDK: the only channel consumer
 //! outside the gateway itself is the TS package under
-//! `sdks/channel-ts/`. Everything here is scoped to the TUI's
+//! `sidecars/sdk/channel-ts/`. Everything here is scoped to the TUI's
 //! token-authenticated flow — the gateway publishes a fresh per-start
 //! token to the secret vault under `gateway.tui_token`; the TUI reads
 //! it and presents it on the WS upgrade in the shared

@@ -85,7 +85,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # Build first: the sidecars import @baybo/channel-sdk, and the
-      # channel-src/* test suites import from the gitignored dist/, so the
+      # sidecars/channel/* test suites import from the gitignored dist/, so the
       # SDK's .d.ts and each package's dist/ must exist before typecheck and
       # test. pnpm builds in dependency order; this also builds the web
       # dashboard (gen:api + tsc -b + vite build).

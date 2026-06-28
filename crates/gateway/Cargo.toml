@@ -108,7 +108,7 @@ tempfile = { workspace = true }
 
 [build-dependencies]
 # build.rs runs `pnpm --filter <sidecar> bundle` (which invokes esbuild)
-# to produce a single ESM file per channel-src/* package, hashes the
+# to produce a single ESM file per sidecars/channel/* package, hashes the
 # inputs, and zstd-compresses each bundle before `include_bytes!`.
 sha2 = { workspace = true }
 zstd = { workspace = true }

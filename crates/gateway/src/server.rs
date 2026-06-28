@@ -61,7 +61,7 @@ use crate::{GatewayError, Result};
 
 /// Caller-supplied managers + config needed to run the gateway.
 ///
-/// Built by the runtime (`src/runtime.rs`) and handed to
+/// Built by the runtime (`crates/baybo/src/runtime.rs`) and handed to
 /// [`GatewayServer::new`]. The gateway takes references (cloning Arcs)
 /// into [`AdminState`] / [`ChannelState`]; the caller keeps the
 /// originals so the same managers can be shared with the router / TUI

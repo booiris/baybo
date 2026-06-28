@@ -1,6 +1,6 @@
 //! Embedded channel-sidecar runtime.
 //!
-//! The gateway ships each in-tree sidecar (`channel-src/*`) as a
+//! The gateway ships each in-tree sidecar (`sidecars/channel/*`) as a
 //! zstd-compressed JS bundle, baked in at build time by `build.rs`.
 //! Sidecars run on the host's `bun` binary (resolved from `PATH`,
 //! override with [`BUN_BINARY_ENV`]) — no JS runtime is shipped

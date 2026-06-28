@@ -9,7 +9,7 @@ doctest = false
 [features]
 # Emits ts-rs-generated TypeScript definitions for the registration-wire
 # types (`PromptKind` / `RegisterIn` / `RegisterOut`) into
-# `sdks/channel-ts/src/generated/`. The `Frame` / `Message` wire types now
+# `sidecars/sdk/channel-ts/src/generated/`. The `Frame` / `Message` wire types now
 # live in `wire` and carry their own `ts-export`; this feature covers
 # only the types still defined in this crate. Kept behind a feature so CI /
 # release builds don't depend on ts-rs.

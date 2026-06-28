@@ -104,7 +104,7 @@ impl CommandContext {
 
 /// Builder for `CommandContext`.
 ///
-/// `src/main.rs` populates the builder after bootstrapping the domain graph;
+/// `crates/baybo/src/main.rs` populates the builder after bootstrapping the domain graph;
 /// each field corresponds to an `Arc` already held by the main process.
 pub struct ContextBuilder {
     config: Arc<BayboConfig>,

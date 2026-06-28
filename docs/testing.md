@@ -113,7 +113,7 @@ Current drift tests:
 | `crates/gateway/tests/openapi_spec_sync.rs`     | `docs/openapi.json`     | `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test openapi_spec_sync`     |
 
 The OpenAPI snapshot is the contract that `web/`'s
-`openapi-typescript` codegen reads to produce `web/src/api/schema.d.ts`;
+`openapi-typescript` codegen reads to produce `app/web/src/api/schema.d.ts`;
 keeping it in lockstep with the Rust router is what lets the frontend
 `tsc` step catch API drift.
 

@@ -16,7 +16,7 @@
 //! channels' connections (telegram, weixin, …) skip subscriptions
 //! entirely and see every session of their channel type.
 //!
-//! Consumers: the TypeScript SDK at `sdks/channel-ts/`, the built-in
+//! Consumers: the TypeScript SDK at `sidecars/sdk/channel-ts/`, the built-in
 //! TUI's WS client, the web chat page, and the iOS companion. All speak the
 //! types below verbatim, both encode/decode via MessagePack with named
 //! fields.
@@ -37,7 +37,7 @@ use thiserror::Error;
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub enum MessageRole {
     User,
@@ -62,7 +62,7 @@ pub enum WireError {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub enum AttachmentKind {
     Image,
@@ -78,7 +78,7 @@ pub enum AttachmentKind {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub enum ActivityKind {
     /// A user message landed on the session — either typed in another
@@ -103,7 +103,7 @@ pub enum ActivityKind {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub struct WireAttachment {
     pub kind: AttachmentKind,
@@ -137,7 +137,7 @@ pub struct WireAttachment {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub struct Message {
     pub content: String,
@@ -202,7 +202,7 @@ pub const MAX_MESSAGE_BATCH_ATTACHMENTS: usize = 64;
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub struct SlashCommandSpec {
     pub command: String,
@@ -217,7 +217,7 @@ pub struct SlashCommandSpec {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub struct FolderView {
     pub id: String,
@@ -240,7 +240,7 @@ pub struct FolderView {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub enum FolderChange {
     Set { id: String },
@@ -256,7 +256,7 @@ pub enum FolderChange {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub struct TaskView {
     pub id: String,
@@ -286,7 +286,7 @@ impl From<baybo_model::Task> for TaskView {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub enum Frame {
     /// First frame after the WebSocket handshake. Names the channel
@@ -702,7 +702,7 @@ pub enum Frame {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub struct SessionPatch {
     /// Populated on Create / Unhide so a sibling tab that doesn't have

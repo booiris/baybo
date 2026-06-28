@@ -281,4 +281,4 @@ pub mod test_support {
 | `baybo-workspace`     | `WorkspacePaths`, `WorkspaceManager::ensure_layout`, `default_workspace_root` |
 | `baybo-gateway`       | `SidecarRuntime`, `BUN_BINARY_ENV`, `SIDECAR_ENV_ALLOWLIST`             |
 | `baybo-cli`           | Wrappers: `commands::llm::add`, `commands::channel::add_bot`            |
-| `src/setup_cmd.rs`   | Binary entry point that owns the wizard process; ahead of `boot::load_config` in `main.rs` |
+| `crates/baybo/src/setup_cmd.rs`   | Binary entry point that owns the wizard process; ahead of `boot::load_config` in `main.rs` |

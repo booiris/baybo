@@ -11,7 +11,7 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024 + 4096;
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub enum PromptKind {
     Input,
@@ -23,7 +23,7 @@ pub enum PromptKind {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub enum RegisterOut {
     Prompt {
@@ -46,7 +46,7 @@ pub enum RegisterOut {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub enum RegisterIn {
     PromptReply { id: String, value: String },

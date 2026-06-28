@@ -6,22 +6,22 @@
 //!
 //! * **pnpm install** — fingerprints `pnpm-lock.yaml`, the root
 //!   `package.json`/`pnpm-workspace.yaml`, and every workspace
-//!   `package.json` under `web/`, `sdks/*`, `channel-src/*`, and
-//!   `tool-src/*`. When the fingerprint changes or
-//!   `node_modules/.modules.yaml` is missing, we run
+//!   `package.json` under `app/web/`, `sidecars/sdk/*`,
+//!   `sidecars/channel/*`, and `sidecars/tool/*`. When the fingerprint
+//!   changes or `node_modules/.modules.yaml` is missing, we run
 //!   `pnpm install` (non-interactive) so the downstream pipelines
 //!   never trip over a stale workspace.
-//! * **WebUI** — watches the relevant `web/` sources, reruns
+//! * **WebUI** — watches the relevant `app/web/` sources, reruns
 //!   `pnpm --filter baybo-web build` when those inputs change, then
-//!   zstd-compresses each emitted `web/dist` asset and writes
+//!   zstd-compresses each emitted `app/web/dist` asset and writes
 //!   `$OUT_DIR/webui_assets.rs` with one compressed `include_bytes!`
 //!   arm per asset. The runtime lazily decompresses the table on first
 //!   request.
 //! * **Sidecars** — runs `pnpm --filter @baybo/channel-<name> bundle`
 //!   (and the analogous tool-sidecar bundle scripts) to produce a
 //!   single self-contained ESM file at `dist/bundle.mjs`. Channel
-//!   sidecars in `channel-src/*` use `bun build`; tool sidecars in
-//!   `tool-src/*` (e.g. the browser sidecar) use `esbuild` + `node`.
+//!   sidecars in `sidecars/channel/*` use `bun build`; tool sidecars in
+//!   `sidecars/tool/*` (e.g. the browser sidecar) use `esbuild` + `node`.
 //!   Each bundle plus any aux assets declared in `package.json` is
 //!   zstd-compressed and emitted into `$OUT_DIR/sidecar_assets.rs`
 //!   for the gateway's `sidecar` module to consume. At runtime
@@ -73,9 +73,10 @@ fn main() {
 /// either the WebUI or sidecar pipelines invoke pnpm scripts. The
 /// fingerprint covers the lockfile, the root `package.json` (whose
 /// `pnpm.overrides` change install output), `pnpm-workspace.yaml`,
-/// and every workspace `package.json` under `web/`, `sdks/*`,
-/// `channel-src/*`, and `tool-src/*`. Steady-state builds find a
-/// matching stamp and skip the pnpm invocation entirely.
+/// and every workspace `package.json` under `app/web/`,
+/// `sidecars/sdk/*`, `sidecars/channel/*`, and `sidecars/tool/*`.
+/// Steady-state builds find a matching stamp and skip the pnpm
+/// invocation entirely.
 fn ensure_pnpm_install(ws_root: &Path) -> Result<(), String> {
     let cache_dir = ws_root.join("target").join("pnpm-install-cache");
     let stamp_path = cache_dir.join("fingerprint.txt");
@@ -134,9 +135,9 @@ fn pnpm_install_inputs(ws_root: &Path) -> Vec<PathBuf> {
         ws_root.join("pnpm-lock.yaml"),
         ws_root.join("pnpm-workspace.yaml"),
         ws_root.join("package.json"),
-        ws_root.join("web/package.json"),
+        ws_root.join("app/web/package.json"),
     ];
-    for dir_root in ["sdks", "channel-src", "tool-src"] {
+    for dir_root in ["sidecars/sdk", "sidecars/channel", "sidecars/tool"] {
         let root = ws_root.join(dir_root);
         let Ok(reader) = fs::read_dir(&root) else {
             continue;
@@ -158,7 +159,7 @@ fn pnpm_install_inputs(ws_root: &Path) -> Vec<PathBuf> {
 // ---------------------------------------------------------------------
 
 fn embed_webui(ws_root: &Path) {
-    let web_root = ws_root.join("web");
+    let web_root = ws_root.join("app/web");
     let dist = web_root.join("dist");
     let index = dist.join("index.html");
     let generated_schema = web_root.join("src/api/schema.d.ts");
@@ -500,19 +501,20 @@ fn embed_sidecars(ws_root: &Path) {
 
     println!("cargo:rerun-if-env-changed={STRICT_SIDECARS_ENV}");
 
-    // `channel-src/` holds channel sidecars, `tool-src/` holds tool
-    // sidecars (browser, …). Both are bundled the same way and emit
-    // into the same asset table; the `name` field (= directory name)
-    // is the unique identifier used by `SidecarRuntime::bundle_for`.
+    // `sidecars/channel/` holds channel sidecars, `sidecars/tool/`
+    // holds tool sidecars (browser, …). Both are bundled the same way
+    // and emit into the same asset table; the `name` field (= directory
+    // name) is the unique identifier used by `SidecarRuntime::bundle_for`.
     // Collisions across pools are a build-time error.
-    // Discovery is now agnostic about which top-level directory a
-    // sidecar lives in. Each `package.json` self-declares its
-    // domain via `baybo.domain`; the directory layout is just file-
-    // system organisation. Adding a third `<x>-src/` is one line
-    // here.
+    // Discovery is agnostic about which sub-directory a sidecar lives
+    // in. Each `package.json` self-declares its domain via
+    // `baybo.domain`; the directory layout is just file-system
+    // organisation. Adding a new domain pool is one line here. The
+    // shared `@baybo/channel-sdk` library lives at `sidecars/sdk/` and
+    // is deliberately NOT scanned — it has no `baybo.domain`.
     let mut sidecar_dirs: Vec<PathBuf> = Vec::new();
-    sidecar_dirs.extend(list_sidecar_dirs(&ws_root.join("channel-src")));
-    sidecar_dirs.extend(list_sidecar_dirs(&ws_root.join("tool-src")));
+    sidecar_dirs.extend(list_sidecar_dirs(&ws_root.join("sidecars/channel")));
+    sidecar_dirs.extend(list_sidecar_dirs(&ws_root.join("sidecars/tool")));
     sidecar_dirs.sort();
     if let Some(dup) = first_duplicate_dir_name(&sidecar_dirs) {
         let msg = format!(
@@ -766,7 +768,7 @@ fn list_sidecar_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Detect the first directory name that appears in more than one sidecar
-/// pool (`channel-src/` + `tool-src/`). Returns `None` when names are
+/// pool (`sidecars/channel/` + `sidecars/tool/`). Returns `None` when names are
 /// unique. The asset table keys on the directory name, so collisions
 /// would silently shadow each other at materialise time.
 fn first_duplicate_dir_name(dirs: &[PathBuf]) -> Option<String> {
@@ -786,15 +788,15 @@ fn sidecar_input_fingerprint(ws_root: &Path, sidecar_dirs: &[PathBuf]) -> Result
     let input_roots = sidecar_input_roots(ws_root, sidecar_dirs);
     println!(
         "cargo:rerun-if-changed={}",
-        ws_root.join("channel-src").display()
+        ws_root.join("sidecars/channel").display()
     );
     println!(
         "cargo:rerun-if-changed={}",
-        ws_root.join("tool-src").display()
+        ws_root.join("sidecars/tool").display()
     );
     println!(
         "cargo:rerun-if-changed={}",
-        ws_root.join("sdks/channel-ts").display()
+        ws_root.join("sidecars/sdk/channel-ts").display()
     );
     for dir in sidecar_dirs {
         println!("cargo:rerun-if-changed={}", dir.display());
@@ -822,9 +824,9 @@ fn sidecar_input_roots(ws_root: &Path, sidecar_dirs: &[PathBuf]) -> Vec<PathBuf>
         // including `dist/` here would mean the fingerprint changes
         // every time we (re)build the SDK, and the cache could never
         // be reused on the next cargo invocation.
-        ws_root.join("sdks/channel-ts/src"),
-        ws_root.join("sdks/channel-ts/package.json"),
-        ws_root.join("sdks/channel-ts/tsconfig.json"),
+        ws_root.join("sidecars/sdk/channel-ts/src"),
+        ws_root.join("sidecars/sdk/channel-ts/package.json"),
+        ws_root.join("sidecars/sdk/channel-ts/tsconfig.json"),
     ];
     for dir in sidecar_dirs {
         paths.push(dir.join("src"));

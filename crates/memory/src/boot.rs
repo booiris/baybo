@@ -1,7 +1,7 @@
 //! Runtime construction of the pluggable memory backend.
 //!
 //! The bootstrapping logic lives next to the trait + implementations so
-//! that adding a new backend is a single-crate change — `src/runtime.rs`
+//! that adding a new backend is a single-crate change — `crates/baybo/src/runtime.rs`
 //! just plumbs `(config.memory, vault, proxy)` in and wires the resulting
 //! handle into the actor graph.
 
@@ -28,7 +28,7 @@ use crate::backends::{mem0, openviking};
 /// All `None` paths log a `warn!` instead of returning an error: the rest
 /// of baybo should still come up, so the operator can fix the credential
 /// and restart. The returned handle's `tools()` should be registered into
-/// the builtin tool registry by the caller (see `src/runtime.rs`); we do
+/// the builtin tool registry by the caller (see `crates/baybo/src/runtime.rs`); we do
 /// not do it here so the function stays free of any mutable-registry
 /// argument.
 pub async fn build_memory_backend(
