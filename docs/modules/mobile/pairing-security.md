@@ -2,10 +2,10 @@
 
 How device pairing stays safe against a **malicious or compromised relay (C)**.
 This is the threat model + cryptographic design behind the
-[mobile companion](mobile-companion.md); read that first for the roles (A =
+[mobile companion](companion.md); read that first for the roles (A =
 gateway, C = remote host, P = phone) and the wire shapes.
 
-> Not to be confused with [`pairing.md`](pairing.md), the *channel*-pairing gate
+> Not to be confused with [`pairing.md`](../pairing.md), the *channel*-pairing gate
 > (a 6-char operator code for sidecar-routed inbound). That code **is**
 > operator-facing and not secret. Device pairing is the opposite posture — it
 > carries a high-entropy secret that must never leak. Same word, different
@@ -200,7 +200,7 @@ availability only (the PSK still blocks MITM). Mitigations:
 
 ## Related
 
-- [`mobile-companion.md`](mobile-companion.md) — the companion architecture.
+- [`companion.md`](companion.md) — the companion architecture.
 - `crates/device-proto/src/psk_pair.rs` — the XXpsk0 state machine + `PairingSecret`.
 - `crates/device-proto/src/kdf.rs` — confirm code + push key from `h`.
 - `crates/gateway/src/channel/device_pair.rs` / `relay_pair.rs` — the A-side

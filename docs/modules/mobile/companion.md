@@ -17,7 +17,7 @@ core (`baybo-mobile-core`); the protocol + crypto live in shared crates so the
 phone and the gateway agree by construction.
 
 > The pairing handshake's **security model** (why it is safe against a hostile
-> relay) is its own document: [`mobile-pairing-security.md`](mobile-pairing-security.md).
+> relay) is its own document: [`pairing-security.md`](pairing-security.md).
 > This file is the architecture/wiring reference.
 
 ## Roles
@@ -131,7 +131,7 @@ Both ends derive the same keys from the Noise handshake hash `h` via HKDF: the
 **`push_key`**. The QR carries the `rendezvous_id` (public) **and** a 256-bit
 `secret` used as the XXpsk0 PSK that C never sees. The full threat model,
 prologue binding, and secret hygiene are in
-[`mobile-pairing-security.md`](mobile-pairing-security.md). The QR payload is
+[`pairing-security.md`](pairing-security.md). The QR payload is
 `baybo://pair?h={endpoint}&r={rendezvous_id}&s={secret}&k={remote_api_key}`
 (`crates/cli/src/commands/device.rs`).
 
@@ -244,7 +244,7 @@ can read it on-device.
 
 Mobile attachments use dedicated relay blob legs rather than the chat leg. The
 blob path, token gate, bandwidth class, and upload quota are documented in
-[`mobile-blob-transfer.md`](mobile-blob-transfer.md).
+[`blob-transfer.md`](blob-transfer.md).
 
 ## Status & open items
 
@@ -287,7 +287,7 @@ pinned by `device_proto::fixtures` + `apple/verify-crypto.swift`.
 
 ## Deploying C
 
-Canonical deploy doc: [`remote-host/DEPLOY.md`](../../remote-host/DEPLOY.md). The
+Canonical deploy doc: [`remote-host/DEPLOY.md`](../../../remote-host/DEPLOY.md). The
 short version: deploy the single `remote-host` binary (relay always on; push
 mounts when `APNS_P8_PATH` is set), admit each gateway's `remote_api_key` in the
 polled SQLite `remote_api_keys` table, then pair the gateway against the host
@@ -297,12 +297,12 @@ gateway auto-starts its relay control connection + push from that row.
 
 ## Related
 
-- [`mobile-pairing-security.md`](mobile-pairing-security.md) — the pairing threat
+- [`pairing-security.md`](pairing-security.md) — the pairing threat
   model (hostile-relay MITM) and the XXpsk0 design.
-- [`mobile-blob-transfer.md`](mobile-blob-transfer.md) — dedicated relay blob
+- [`blob-transfer.md`](blob-transfer.md) — dedicated relay blob
   legs for mobile attachments.
-- [`pairing.md`](pairing.md) — the **channel**-pairing gate (a *different*
+- [`pairing.md`](../pairing.md) — the **channel**-pairing gate (a *different*
   subsystem for sidecar-routed inbound; do not conflate with device pairing).
-- [`gateway.md`](gateway.md) — the gateway crate that hosts the A-side routes,
+- [`gateway.md`](../gateway.md) — the gateway crate that hosts the A-side routes,
   device store, content responder, and push dispatcher.
-- [`remote-host/DEPLOY.md`](../../remote-host/DEPLOY.md) — operating C.
+- [`remote-host/DEPLOY.md`](../../../remote-host/DEPLOY.md) — operating C.

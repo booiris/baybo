@@ -47,7 +47,7 @@ Two hard requirements drove the design:
 1. **Chat stays responsive during a bulk transfer.** A 100 MiB download must not add
    seconds of latency to a streaming answer. This is why the existing `/v1/blobs` HTTP
    side-channel was split off the chat WebSocket in the first place (see
-   [`sidecars.md`](../sidecars.md) §"Media side-channel").
+   [`sidecars.md`](../../sidecars.md) §"Media side-channel").
 2. **One per-tenant bandwidth wall.** Blob traffic must not get its *own* extra ceiling
    that widens a `remote_api_key`'s total relay footprint. Chat and blob share one budget;
    blob yields within it.
@@ -62,7 +62,7 @@ Two hard requirements drove the design:
   plaintext, device identity, or pull-vs-push. It learns one bit per leg — the traffic
   **class** — and copies opaque Noise frames blind, exactly as it does for chat.
 - **Cross-session / multi-user read sharing.** Device pairing is single-user
-  (see [`mobile-companion.md`](mobile-companion.md)); read authorization is the
+  (see [`companion.md`](companion.md)); read authorization is the
   per-blob capability token, not a session ACL.
 
 ## Background
@@ -95,7 +95,7 @@ references it cannot resolve.
    token-bearing `blob_id`, which it only ever obtains over its own authenticated chat
    leg. Identical to `GET /v1/blobs/{id}` (`crates/gateway/src/channel/blobs.rs`).
 4. **Session rows are untouched.** Staging and reclamation operate on blob/temp storage
-   only, never on session rows (see [`CLAUDE.md`](../../CLAUDE.md) §"Session data is core
+   only, never on session rows (see [`CLAUDE.md`](../../../CLAUDE.md) §"Session data is core
    data").
 
 ## Decision: dedicated legs + chat-priority shared bandwidth
@@ -385,8 +385,8 @@ shared bucket, so mislabeling blob-as-chat only forfeits the device's own chat p
 
 ## Related
 
-- [`sidecars.md`](../sidecars.md) — the existing `/v1/blobs/*` media side-channel and
+- [`sidecars.md`](../../sidecars.md) — the existing `/v1/blobs/*` media side-channel and
   `BlobStore` model this extends to NAT'd clients.
-- [`storage.md`](storage.md) — libsql `BlobStore`, `read_token` capability.
-- [`pairing.md`](pairing.md) / [`gateway.md`](gateway.md) —
+- [`storage.md`](../storage.md) — libsql `BlobStore`, `read_token` capability.
+- [`pairing.md`](../pairing.md) / [`gateway.md`](../gateway.md) —
   device pairing, the relay content path, and the gateway channel loop.
