@@ -36,6 +36,16 @@ services:
       ADMISSION_POLL_SECS: ${ADMISSION_POLL_SECS:-30}
       # fallback cap on simultaneous relay connections one admitted key may hold
       MAX_CONNS_PER_REMOTE_API_KEY: ${MAX_CONNS_PER_REMOTE_API_KEY:-64}
+      # per-source-IP relay-upgrade flood backstop. On by default, keyed on the
+      # socket peer — correct when this binary terminates TLS for the real client.
+      # Behind a proxy that terminates TLS (e.g. Cloudflare) the peer is the proxy
+      # edge, so either set RELAY_CLIENT_IP_HEADERS to the proxy's real-client-IP
+      # header (e.g. cf-connecting-ip) or set RELAY_PER_IP_LIMIT=0 and rate-limit at
+      # the proxy. Trust a client-IP header ONLY when this origin is reachable
+      # solely via that proxy (CF IP allowlist / Tunnel / mTLS) — else it's
+      # forgeable. Both blank by default → socket-peer limiter (see DEPLOY.md).
+      RELAY_PER_IP_LIMIT: ${RELAY_PER_IP_LIMIT:-}
+      RELAY_CLIENT_IP_HEADERS: ${RELAY_CLIENT_IP_HEADERS:-}
       # push — enabled automatically when APNS_P8_HOST_PATH is set in .env
       APNS_P8_PATH: ${APNS_P8_HOST_PATH:+/run/secrets/apns_p8}
       APNS_KEY_ID: ${APNS_KEY_ID:-}
