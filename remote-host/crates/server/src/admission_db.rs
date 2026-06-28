@@ -14,11 +14,15 @@ use remote_host_admission::{AdmissionEntry, InMemoryAdmission, Tier};
 /// Source-of-truth table: one row per admitted `remote_api_key`. `label` +
 /// `created_at` are for whoever administers it. `tier` is `'guest'` (auto-issued,
 /// carries the guest default limits, GC-eligible) or `'registered'` (control-plane
-/// provisioned, explicit per-row limits). `max_conns` / `max_bps` /
-/// `per_server_max_bps` are the key's optional limits (NULL → for a guest row, the
-/// `'guest'` template row's column, else the `GUEST_*` const; for a registered row,
-/// the server's conservative role floor). `expires_at` is the guest-TTL wall clock
-/// (NULL → never expires).
+/// provisioned, explicit per-row limits). `max_conns` / `max_bps` are **required on
+/// a registered row** (a registered key must declare its own limits) but stay
+/// optional on a guest row, which inherits a NULL column from the `'guest'` template
+/// row (else the `GUEST_*` const) — enforced by the `CHECK`. `per_server_max_bps` is
+/// always optional (NULL → falls back to the row's `max_bps`). `expires_at` is the
+/// guest-TTL wall clock (NULL → never expires).
+///
+/// The `CHECK` only guards a freshly-created table; `CREATE TABLE IF NOT EXISTS`
+/// can't retrofit it onto a DB made under an older schema.
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS remote_api_keys (\
     remote_api_key TEXT PRIMARY KEY, \
     label TEXT, \
@@ -27,7 +31,8 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS remote_api_keys (\
     max_bps INTEGER, \
     per_server_max_bps INTEGER, \
     expires_at TEXT, \
-    created_at TEXT NOT NULL DEFAULT (datetime('now')))";
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+    CHECK (tier = 'guest' OR (max_conns IS NOT NULL AND max_bps IS NOT NULL)))";
 
 /// Keep an admitted-but-expired guest out of the in-memory view: drop a row only
 /// when it is a guest, carries an `expires_at`, and that instant has passed. NULL
@@ -203,8 +208,8 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO remote_api_keys(remote_api_key, tier, expires_at) \
-             VALUES('reg-stale', 'registered', '2000-01-01 00:00:00')",
+            "INSERT INTO remote_api_keys(remote_api_key, tier, max_conns, max_bps, expires_at) \
+             VALUES('reg-stale', 'registered', 8, 4194304, '2000-01-01 00:00:00')",
             (),
         )
         .await
@@ -236,8 +241,8 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO remote_api_keys(remote_api_key, tier, expires_at) \
-             VALUES('reg-stale', 'registered', '2000-01-01 00:00:00')",
+            "INSERT INTO remote_api_keys(remote_api_key, tier, max_conns, max_bps, expires_at) \
+             VALUES('reg-stale', 'registered', 8, 4194304, '2000-01-01 00:00:00')",
             (),
         )
         .await
@@ -261,5 +266,48 @@ mod tests {
             survivors,
             vec!["never".to_string(), "reg-stale".to_string()]
         );
+    }
+
+    /// The `CHECK` requires `max_conns` + `max_bps` on a registered row but exempts
+    /// guests; `per_server_max_bps` is never required.
+    #[tokio::test]
+    async fn registered_row_requires_max_conns_and_max_bps() {
+        let conn = mem_conn().await;
+
+        // Registered, both limits set + per_server NULL → accepted.
+        conn.execute(
+            "INSERT INTO remote_api_keys(remote_api_key, tier, max_conns, max_bps) \
+             VALUES('ok', 'registered', 8, 4194304)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        // Registered missing max_bps → rejected.
+        let missing_bps = conn
+            .execute(
+                "INSERT INTO remote_api_keys(remote_api_key, tier, max_conns) \
+                 VALUES('no-bps', 'registered', 8)",
+                (),
+            )
+            .await;
+        assert!(missing_bps.is_err(), "registered must set max_bps");
+
+        // Registered missing both (the old bare admit) → rejected.
+        let bare = conn
+            .execute(
+                "INSERT INTO remote_api_keys(remote_api_key, label) VALUES('bare', 'gw')",
+                (),
+            )
+            .await;
+        assert!(bare.is_err(), "a registered row can't omit both limits");
+
+        // Guest with no limits → accepted (it inherits the template / consts).
+        conn.execute(
+            "INSERT INTO remote_api_keys(remote_api_key, tier) VALUES('g', 'guest')",
+            (),
+        )
+        .await
+        .unwrap();
     }
 }
