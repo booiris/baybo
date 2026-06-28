@@ -18,7 +18,9 @@ phone and the gateway agree by construction.
 
 > The pairing handshake's **security model** (why it is safe against a hostile
 > relay) is its own document: [`pairing-security.md`](pairing-security.md).
-> This file is the architecture/wiring reference.
+> The scan-to-pair bootstrap and relay + push threat model are documented in
+> [`relay-push-security.md`](relay-push-security.md). This file is the
+> architecture/wiring reference.
 
 ## Roles
 
@@ -170,15 +172,19 @@ indistinguishable. The Rust producer (`device_proto::aead`) and the Swift
 consumer (CryptoKit `ChaChaPoly`) are pinned to one byte-exact vector in
 `device_proto::fixtures`; a drift on either side fails a test.
 
-**Registration:** after a successful handshake the gateway
+**Registration:** if the APNs token is available during pairing, P threads it
+(hex) plus the build's APNs env into `DeviceHello`, and A persists that
+registration material in its vault. Before each first push in a gateway run, A
 (`HttpApnsRegistrar`, best-effort) POSTs `{remote_api_key, device_id, apns_token,
-env}` to C's `/register`, so the phone never holds the APNs `.p8` or any push
-provider credential. It does persist the relay admission key from the QR and
-presents it on relay joins. The device token is captured at launch by hooking the
-Tauri/wry-owned
-`UIApplicationDelegate` (`push_register.rs`, `class_addMethod` on
-`didRegisterForRemoteNotificationsWithDeviceToken`) and threaded (hex) + the
-build's APNs env into `DeviceHello`.
+env}` to C's `/register` from the persisted material, so a restarted/pruned C can
+recover before `/notify`. If iOS delivers the APNs token after pairing's
+`DeviceHello` already went out, the paired app POSTs the same `/register` body
+directly to C using the QR's relay admission key. The phone never holds the APNs
+`.p8` or any push provider credential; it only holds its APNs device token and
+the relay admission key it already presents on relay joins. The token is captured
+at launch by hooking the Tauri/wry-owned `UIApplicationDelegate`
+(`push_register.rs`, `class_addMethod` on
+`didRegisterForRemoteNotificationsWithDeviceToken`).
 
 ## Reaching a NAT'd gateway (the relay)
 
@@ -299,6 +305,8 @@ gateway auto-starts its relay control connection + push from that row.
 
 - [`pairing-security.md`](pairing-security.md) — the pairing threat
   model (hostile-relay MITM) and the XXpsk0 design.
+- [`relay-push-security.md`](relay-push-security.md) — scan-to-pair,
+  relay, and push security, including remote-host transparency and boundaries.
 - [`blob-transfer.md`](blob-transfer.md) — dedicated relay blob
   legs for mobile attachments.
 - [`pairing.md`](../pairing.md) — the **channel**-pairing gate (a *different*

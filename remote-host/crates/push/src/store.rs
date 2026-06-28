@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use crate::apns::ApnsEnv;
 
-/// A device's APNs binding, registered by its gateway (A) on the device's
-/// behalf (gateway-mediated — the app never holds APNs provider credentials).
+/// A device's APNs binding, registered by A or by the paired app. APNs provider
+/// credentials stay on C.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceRegistration {
     pub apns_token: String,

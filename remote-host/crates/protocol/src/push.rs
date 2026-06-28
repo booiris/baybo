@@ -30,8 +30,8 @@ pub struct NotifyRequest {
     pub n: String,
 }
 
-/// JSON body of `POST /register` — bind/rebind a device's APNs token
-/// (gateway-mediated, so the app never holds APNs provider credentials).
+/// JSON body of `POST /register` — bind/rebind a device's APNs token. The
+/// caller presents the relay admission key; APNs provider credentials stay on C.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterRequest {
     pub remote_api_key: String,

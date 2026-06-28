@@ -60,8 +60,8 @@ pub(crate) fn device_apns_secret_name(device_id: &str) -> String {
 }
 
 /// The per-device APNs registration A persists at pairing (vault, keyed by
-/// device_id) so a transient `/register` failure is retriable — the dispatcher
-/// re-registers an approved device from this before its first push.
+/// device_id) so the dispatcher can restore C's APNs binding before its first
+/// push when the token was available to A.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DeviceApnsRegistration {
     pub apns_token: String,
@@ -124,9 +124,9 @@ impl NotifySink for HttpNotifySink {
     }
 }
 
-/// Seam over the POST to C's `/register`. The device-pair route calls it
-/// (best-effort, gateway-mediated) after a successful handshake so the app
-/// never holds APNs provider credentials. Real impl uses reqwest; tests use a
+/// Seam over the POST to C's `/register`. The dispatcher calls it before a
+/// `/notify`, using APNs material persisted at pairing, so C can recover from a
+/// missing or stale in-memory APNs binding. Real impl uses reqwest; tests use a
 /// mock.
 #[async_trait::async_trait]
 pub trait ApnsRegistrar: Send + Sync {
@@ -195,7 +195,7 @@ pub struct PushDispatcher {
     secret_vault: Arc<SecretVault>,
     sink: Arc<dyn NotifySink>,
     /// Re-registers an approved device with C from the material A persisted at
-    /// pairing, self-healing a transient pairing-time `/register` failure.
+    /// pairing, self-healing a missing or stale remote-host APNs binding.
     apns_registrar: Option<Arc<dyn ApnsRegistrar>>,
     /// device_ids re-registered with C this run (so we retry at most once per
     /// device per dispatcher lifetime).
@@ -312,11 +312,11 @@ impl PushDispatcher {
         self.sink.post(&notify_url, &body).await
     }
 
-    /// Best-effort: re-register an approved device with C from the material A
-    /// persisted at pairing, the first time we push to it this run. Without
-    /// this a transient `/register` failure at pairing leaves C unaware of the
-    /// device, so every `/notify` is rejected as unknown until the user
-    /// re-pairs. Cached so it costs at most one `/register` per device per run.
+    /// Best-effort: register an approved device with C from the material A
+    /// persisted at pairing, the first time we push to it this run. Without this
+    /// a restarted or pruned remote-host token store leaves C unaware of the
+    /// device, so `/notify` would be rejected as unknown until the app registers
+    /// again. Cached so it costs at most one `/register` per device per run.
     async fn ensure_registered(&self, device: &DeviceRow, base_http: &str) {
         let Some(registrar) = &self.apns_registrar else {
             return;

@@ -23,6 +23,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+reqwest = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "macros", "sync", "fs", "io-util"] }
 tokio-tungstenite = { workspace = true }

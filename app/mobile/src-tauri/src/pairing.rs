@@ -151,8 +151,9 @@ pub async fn pair_begin(
         // the public half in-band.
         static_secret: keypair.secret(),
         // Captured from `didRegisterForRemoteNotifications` (registration kicks
-        // off at launch, so by pairing time the token is normally ready); empty
-        // if it hasn't arrived yet, which the gateway re-registers out of band.
+        // off at launch, so by pairing time the token is often ready); empty if
+        // it has not arrived yet, in which case the paired app registers it
+        // directly with C after the later token callback.
         apns_token: crate::push_register::apns_token().unwrap_or_default(),
         // A debug build's token is issued by the APNs sandbox; release/TestFlight
         // by production. The gateway tracks this per-device to pick the right host.
@@ -363,6 +364,7 @@ async fn finish_pair(
     let bytes = serde_json::to_vec(&record).map_err(|e| format!("encode paired record: {e}"))?;
     crate::keychain::store_paired_record(&bytes)
         .map_err(|e| format!("persist paired record: {e}"))?;
+    crate::push_register::spawn_register_current_token();
 
     Ok(PairedSummary::from(&paired))
 }
