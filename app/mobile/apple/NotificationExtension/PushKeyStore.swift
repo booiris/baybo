@@ -1,10 +1,10 @@
 // PushKeyStore.swift — read the per-binding push key from the shared keychain.
 //
 // At pairing the app derives the 32-byte push key and writes it to the App
-// Group keychain (access group `group.<bundle-id>`). The NSE only *reads* it,
+// shared keychain access group. The NSE only *reads* it,
 // so a preview can be decrypted without waking the host app. Key isolation: the
-// push key never leaves the device and is scoped to the App Group, so only the
-// app + its extensions can read it.
+// push key never leaves the device and is scoped to the shared keychain group,
+// so only the app + its extensions can read it.
 
 import CryptoKit
 import Foundation
@@ -14,14 +14,24 @@ enum PushKeyStore {
     /// Keychain account prefix; the per-binding key is stored at
     /// `accountPrefix + bid`. The host app writes the same account at pairing.
     static let accountPrefix = "baybo.push-key."
+    static let accessGroupInfoKey = "BayboKeychainAccessGroup"
 
-    /// The App Group access group. MUST match the `keychain-access-groups`
+    /// The keychain access group. MUST match the `keychain-access-groups`
     /// entitlement shared by the app target and this extension target.
-    /// Replace with your published App Group id.
-    static let accessGroup = "group.com.baybo.app"
+    static var accessGroup: String? {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: accessGroupInfoKey) as? String,
+              !value.isEmpty
+        else {
+            return nil
+        }
+        return value
+    }
 
     /// Fetch the 32-byte push key for a binding id, or nil if absent / wrong size.
     static func pushKey(forBinding bid: String) -> SymmetricKey? {
+        guard let accessGroup else {
+            return nil
+        }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: accountPrefix + bid,

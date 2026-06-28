@@ -118,6 +118,79 @@ impl DeviceStore for LibsqlDeviceStore {
         Ok(())
     }
 
+    async fn create_provisioning(&self, row: &DeviceRow) -> Result<()> {
+        let conn = self.pool.conn();
+        conn.execute(
+            &format!("{INSERT_DEVICE}{REPAIR_UPSERT_TAIL}"),
+            insert_params(row),
+        )
+        .await
+        .map_err(|e| insert_conflict_err(row, e))?;
+        Ok(())
+    }
+
+    async fn approve_replacing(&self, device_id: &str, approved_at: i64) -> Result<Vec<String>> {
+        let conn = self.pool.conn();
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .map_err(|e| col_err("begin approve tx", e))?;
+
+        let mut current = tx
+            .query(
+                "SELECT device_id FROM devices WHERE device_id = ?1",
+                libsql::params![device_id.to_string()],
+            )
+            .await
+            .map_err(|e| col_err("query staged device", e))?;
+        let exists = current
+            .next()
+            .await
+            .map_err(|e| col_err("staged device row", e))?
+            .is_some();
+        drop(current);
+        if !exists {
+            return Err(StorageError::NotFound(format!("device {device_id}")));
+        }
+
+        let mut rows = tx
+            .query(
+                "SELECT device_id FROM devices WHERE status = 'approved' AND device_id != ?1",
+                libsql::params![device_id.to_string()],
+            )
+            .await
+            .map_err(|e| col_err("query approved", e))?;
+        let mut replaced = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|e| col_err("row", e))? {
+            replaced.push(
+                r.get::<String>(0)
+                    .map_err(|e| col_err("get device_id", e))?,
+            );
+        }
+        drop(rows);
+
+        tx.execute(
+            "UPDATE devices SET status = 'revoked'
+             WHERE status = 'approved' AND device_id != ?1",
+            libsql::params![device_id.to_string()],
+        )
+        .await
+        .map_err(|e| col_err("revoke prior approved", e))?;
+
+        tx.execute(
+            "UPDATE devices SET status = 'approved', approved_at = ?2
+             WHERE device_id = ?1",
+            libsql::params![device_id.to_string(), approved_at],
+        )
+        .await
+        .map_err(|e| col_err("approve staged device", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| col_err("commit approve tx", e))?;
+        Ok(replaced)
+    }
+
     async fn create_replacing_approved(&self, row: &DeviceRow) -> Result<Vec<String>> {
         let conn = self.pool.conn();
         // BEGIN IMMEDIATE takes the write lock up front so the revoke + upsert

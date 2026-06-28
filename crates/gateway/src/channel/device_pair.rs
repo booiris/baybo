@@ -195,52 +195,15 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         }
     }
 
-    // 6. Finalize: write an approved device row (pinning the app static learned
-    //    in-band) + consume the slot (zeroizing the secret it held).
-    let row = state
-        .device_pairing
-        .complete(
-            &slot,
-            &hello.device_id,
-            app_static.to_vec(),
-            &state.relay_url,
-            &state.remote_api_key,
-        )
-        .await
-        .map_err(|e| format!("complete pairing: {e}"))?;
-
-    // 6a. Persist the per-device push key (HKDF of `h`) in A's vault, keyed by
-    //     device_id (the NSE selects it by `bid` at push time).
     let push_key =
         derive_push_key(noise.handshake_hash()).map_err(|e| format!("derive push key: {e}"))?;
     let push_key_name = crate::push::device_push_key_secret_name(&hello.device_id);
-    state
-        .secret_vault
-        .store_secret(&push_key_name, &push_key)
-        .await
-        .map_err(|e| format!("store push key: {e}"))?;
-    // 6b. Persist the APNs registration material (token + env) in the vault so a
-    //     transient `/register` failure is retriable — the push dispatcher
-    //     re-registers an approved device from this before its first push.
     let apns_reg = crate::push::DeviceApnsRegistration {
         apns_token: hello.apns_token.clone(),
         apns_env: hello.apns_env,
     };
     let apns_bytes =
         serde_json::to_vec(&apns_reg).map_err(|e| format!("encode apns registration: {e}"))?;
-    state
-        .secret_vault
-        .store_secret(
-            &crate::push::device_apns_secret_name(&hello.device_id),
-            &apns_bytes,
-        )
-        .await
-        .map_err(|e| format!("store apns registration: {e}"))?;
-
-    // 7. Sealed GatewayWelcome — the routing the app reaches A by (the gateway's
-    //    stable relay_node_id + the relay's base URL when a relay is configured)
-    //    + the active auth_token. A's static is not carried: the app already
-    //    learned it as an XX token during the handshake.
     let (relay_node_id, relay_url) = if state.relay_url.is_empty() {
         (String::new(), String::new())
     } else {
@@ -249,6 +212,52 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
             .map_err(|e| format!("relay node id: {e}"))?;
         (node_id, state.relay_url.clone())
     };
+
+    // 6. Stage: write a non-authenticating provisioning row (pinning the app
+    //    static learned in-band) + consume the slot (zeroizing the secret it
+    //    held). The token becomes active only after the welcome frame has been
+    //    sent successfully.
+    let row = state
+        .device_pairing
+        .stage(
+            &slot,
+            &hello.device_id,
+            app_static.to_vec(),
+            &state.relay_url,
+            &state.remote_api_key,
+        )
+        .await
+        .map_err(|e| format!("stage pairing: {e}"))?;
+
+    // 6a. Persist the per-device push key (HKDF of `h`) in A's vault, keyed by
+    //     device_id (the NSE selects it by `bid` at push time).
+    if let Err(e) = state
+        .secret_vault
+        .store_secret(&push_key_name, &push_key)
+        .await
+    {
+        revoke_staged_device(state, &hello.device_id).await;
+        return Err(format!("store push key: {e}"));
+    }
+    // 6b. Persist the APNs registration material (token + env) in the vault so a
+    //     transient `/register` failure is retriable — the push dispatcher
+    //     re-registers an approved device from this before its first push.
+    if let Err(e) = state
+        .secret_vault
+        .store_secret(
+            &crate::push::device_apns_secret_name(&hello.device_id),
+            &apns_bytes,
+        )
+        .await
+    {
+        revoke_staged_device(state, &hello.device_id).await;
+        return Err(format!("store apns registration: {e}"));
+    }
+
+    // 7. Sealed GatewayWelcome — the routing the app reaches A by (the gateway's
+    //    stable relay_node_id + the relay's base URL when a relay is configured)
+    //    + the active auth_token. A's static is not carried: the app already
+    //    learned it as an XX token during the handshake.
     let welcome = GatewayWelcome {
         relay_node_id,
         relay_url,
@@ -258,15 +267,30 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     let sealed = noise
         .write(&pairing::encode(&welcome).map_err(|e| format!("encode welcome: {e}"))?)
         .map_err(|e| format!("seal welcome: {e}"))?;
-    transport
+    if let Err(e) = transport
         .send_frame(&PairFrame::Sealed { msg: sealed })
-        .await?;
+        .await
+    {
+        revoke_staged_device(state, &hello.device_id).await;
+        return Err(e);
+    }
+
+    if let Err(e) = state.device_pairing.approve_staged(&row.device_id).await {
+        revoke_staged_device(state, &hello.device_id).await;
+        return Err(format!("approve pairing: {e}"));
+    }
 
     tracing::info!(
         device = %super::short_hash(&hello.device_id),
         "device paired",
     );
     Ok(())
+}
+
+async fn revoke_staged_device(state: &PairingHostDeps, device_id: &str) {
+    if let Err(e) = state.device_pairing.revoke(device_id).await {
+        tracing::debug!(error = %e, "device pair: failed to revoke staged device");
+    }
 }
 
 /// Whether the phone user's sealed [`DeviceConfirm`] (or its absence) lets the

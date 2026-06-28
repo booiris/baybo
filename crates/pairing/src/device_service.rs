@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
+use crate::device_slot::DevicePairingSlot;
 use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore};
-use baybo_store::device_pairing::DevicePairingSlot;
 use chrono::Utc;
 use device_proto::psk_pair::PairingSecret;
 use parking_lot::Mutex;
@@ -160,16 +160,18 @@ impl DevicePairingService {
             .next())
     }
 
-    /// Finalize a confirmed handshake: write an **approved** device row (with a
-    /// freshly minted, active `auth_token`) and consume the slot. Called only
-    /// once both the phone user and the operator confirmed.
+    /// Stage a confirmed handshake: write a **non-authenticating** provisioning
+    /// device row (with a freshly minted `auth_token`) and consume the slot.
+    /// Called only once both the phone user and the operator confirmed. The row
+    /// becomes active only after [`approve_staged`](Self::approve_staged), which
+    /// the gateway calls after it has sent the welcome frame.
     ///
     /// Enforces the 1:1 binding: any device already bound is atomically revoked
     /// as this one is written, so the gateway is never bound to two devices at
     /// once. The replacement happens **here**, at finalize — not when the
     /// operator first runs `device pair` — so a working binding is kept live
     /// until the new pairing actually completes.
-    pub async fn complete(
+    pub async fn stage(
         &self,
         slot: &DevicePairingSlot,
         device_id: &str,
@@ -193,12 +195,12 @@ impl DevicePairingService {
             device_id: device_id.to_string(),
             device_pubkey,
             auth_token: mint_auth_token(),
-            status: DeviceStatus::Approved,
+            status: DeviceStatus::Provisioning,
             // Only the public rendezvous id lands in the durable row — never the
             // secret.
             rendezvous_id: Some(slot.rendezvous_id.clone()),
             created_at: now,
-            approved_at: Some(now),
+            approved_at: None,
             last_seen_at: None,
             // Recorded so the gateway re-dials the relay (and pushes) to the same
             // endpoint/key without a config block; both come from the pairing
@@ -206,7 +208,18 @@ impl DevicePairingService {
             relay_url: relay_url.to_string(),
             remote_api_key: remote_api_key.to_string(),
         };
-        let replaced = self.devices.create_replacing_approved(&row).await?;
+        self.devices.create_provisioning(&row).await?;
+        Ok(row)
+    }
+
+    /// Promote a staged device row to `Approved` and supersede any prior approved
+    /// binding in one transaction.
+    pub async fn approve_staged(&self, device_id: &str) -> Result<DeviceRow, DevicePairingError> {
+        let approved_at = Utc::now().timestamp();
+        let replaced = self
+            .devices
+            .approve_replacing(device_id, approved_at)
+            .await?;
         if !replaced.is_empty() {
             tracing::info!(
                 new_device = %device_id,
@@ -214,7 +227,25 @@ impl DevicePairingService {
                 "device pairing superseded the prior binding (one gateway = one app)",
             );
         }
-        Ok(row)
+        self.devices.get(device_id).await?.ok_or_else(|| {
+            baybo_store::StorageError::NotFound(format!("device {device_id}")).into()
+        })
+    }
+
+    /// Compatibility helper for tests and non-transport callers: stage and
+    /// approve immediately.
+    pub async fn complete(
+        &self,
+        slot: &DevicePairingSlot,
+        device_id: &str,
+        device_pubkey: Vec<u8>,
+        relay_url: &str,
+        remote_api_key: &str,
+    ) -> Result<DeviceRow, DevicePairingError> {
+        let row = self
+            .stage(slot, device_id, device_pubkey, relay_url, remote_api_key)
+            .await?;
+        self.approve_staged(&row.device_id).await
     }
 
     /// Revoke a device (keeps the row + token slot; the token stops
@@ -295,7 +326,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row.status, DeviceStatus::Approved);
-        assert_eq!(row.approved_at, Some(row.created_at));
+        assert!(row.approved_at.is_some());
         assert_eq!(row.device_pubkey, vec![3u8; 32]);
         assert_eq!(
             row.auth_token.len(),

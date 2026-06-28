@@ -14,6 +14,7 @@ use std::collections::HashMap;
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 /// Bounded backlog of control signals toward one gateway.
 const CONTROL_CHANNEL_CAP: usize = 32;
@@ -29,6 +30,18 @@ pub use remote_host_protocol::relay::{ControlHello, ControlSignal, LegClass};
 struct ControlEntry {
     tx: mpsc::Sender<ControlSignal>,
     remote_api_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlRegisterError {
+    OwnerMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalOpenError {
+    NotConnected,
+    OwnerMismatch,
+    Backpressure,
 }
 
 /// Registry of gateways' live control connections, keyed by `relay_node_id`.
@@ -49,16 +62,22 @@ impl ControlRegistry {
         &self,
         relay_node_id: &str,
         remote_api_key: &str,
-    ) -> mpsc::Receiver<ControlSignal> {
+    ) -> Result<mpsc::Receiver<ControlSignal>, ControlRegisterError> {
         let (tx, rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
-        self.instances.lock().insert(
+        let mut instances = self.instances.lock();
+        if let Some(existing) = instances.get(relay_node_id)
+            && existing.remote_api_key != remote_api_key
+        {
+            return Err(ControlRegisterError::OwnerMismatch);
+        }
+        instances.insert(
             relay_node_id.to_string(),
             ControlEntry {
                 tx,
                 remote_api_key: remote_api_key.to_string(),
             },
         );
-        rx
+        Ok(rx)
     }
 
     /// Signal a registered gateway to open a data leg under `relay_key` of the
@@ -67,31 +86,44 @@ impl ControlRegistry {
     /// (so the caller can meter the resulting leg against it), or `None` if the
     /// gateway isn't connected (the phone's relay attempt then fails fast rather
     /// than hanging) or its control channel is closed.
-    pub async fn signal_open(
+    pub fn signal_open(
         &self,
         relay_node_id: &str,
+        expected_remote_api_key: &str,
         relay_key: &str,
         class: LegClass,
-    ) -> Option<String> {
-        // Clone the sender + key out of the lock so the await never holds it.
+    ) -> Result<String, SignalOpenError> {
         let entry = self
             .instances
             .lock()
             .get(relay_node_id)
             .map(|e| (e.tx.clone(), e.remote_api_key.clone()));
-        let (tx, remote_api_key) = entry?;
-        tx.send(ControlSignal::OpenDataLeg {
+        let Some((tx, remote_api_key)) = entry else {
+            return Err(SignalOpenError::NotConnected);
+        };
+        if remote_api_key != expected_remote_api_key {
+            return Err(SignalOpenError::OwnerMismatch);
+        }
+        let signal = ControlSignal::OpenDataLeg {
             relay_key: relay_key.to_string(),
             class,
-        })
-        .await
-        .ok()
-        .map(|()| remote_api_key)
+        };
+        match tx.try_send(signal) {
+            Ok(()) => Ok(remote_api_key),
+            Err(TrySendError::Closed(_)) => Err(SignalOpenError::NotConnected),
+            Err(TrySendError::Full(_)) => Err(SignalOpenError::Backpressure),
+        }
     }
 
     /// Drop a gateway's control connection (on disconnect).
-    pub fn unregister(&self, relay_node_id: &str) {
-        self.instances.lock().remove(relay_node_id);
+    pub fn unregister(&self, relay_node_id: &str, remote_api_key: &str) {
+        let mut instances = self.instances.lock();
+        if instances
+            .get(relay_node_id)
+            .is_some_and(|entry| entry.remote_api_key == remote_api_key)
+        {
+            instances.remove(relay_node_id);
+        }
     }
 
     /// Number of gateways with a live control connection.
@@ -108,13 +140,13 @@ mod tests {
     #[tokio::test]
     async fn signals_a_registered_gateway_to_open_a_leg() {
         let reg = ControlRegistry::new();
-        let mut rx = reg.register("node-1", "inst-A");
+        let mut rx = reg.register("node-1", "inst-A").unwrap();
         assert_eq!(reg.connected(), 1);
 
         // The signal succeeds and reports the gateway's owning remote_api_key.
         assert_eq!(
-            reg.signal_open("node-1", "leg-abc", LegClass::Chat).await,
-            Some("inst-A".to_string())
+            reg.signal_open("node-1", "inst-A", "leg-abc", LegClass::Chat),
+            Ok("inst-A".to_string())
         );
         assert_eq!(
             rx.recv().await.unwrap(),
@@ -143,20 +175,36 @@ mod tests {
     #[tokio::test]
     async fn signal_to_unknown_gateway_fails_fast() {
         let reg = ControlRegistry::new();
-        assert!(
-            reg.signal_open("ghost", "k", LegClass::Chat)
-                .await
-                .is_none()
-        );
+        assert!(matches!(
+            reg.signal_open("ghost", "inst-A", "k", LegClass::Chat),
+            Err(SignalOpenError::NotConnected)
+        ));
     }
 
     #[tokio::test]
     async fn unregister_drops_the_connection() {
         let reg = ControlRegistry::new();
-        let _rx = reg.register("n", "inst-A");
-        reg.unregister("n");
+        let _rx = reg.register("n", "inst-A").unwrap();
+        reg.unregister("n", "inst-A");
         assert_eq!(reg.connected(), 0);
-        assert!(reg.signal_open("n", "k", LegClass::Chat).await.is_none());
+        assert!(matches!(
+            reg.signal_open("n", "inst-A", "k", LegClass::Chat),
+            Err(SignalOpenError::NotConnected)
+        ));
+    }
+
+    #[test]
+    fn different_key_cannot_replace_registered_node() {
+        let reg = ControlRegistry::new();
+        let _rx = reg.register("node-1", "inst-A").unwrap();
+        assert_eq!(
+            reg.register("node-1", "inst-B").unwrap_err(),
+            ControlRegisterError::OwnerMismatch
+        );
+        assert_eq!(
+            reg.signal_open("node-1", "inst-B", "leg-abc", LegClass::Chat),
+            Err(SignalOpenError::OwnerMismatch)
+        );
     }
 
     /// The control plane + the byte-pipe compose: C signals A to open a leg
@@ -167,14 +215,14 @@ mod tests {
         let broker = RelayBroker::new();
 
         // Gateway A registers its control connection.
-        let mut a_control = reg.register("node-1", "inst-A");
+        let mut a_control = reg.register("node-1", "inst-A").unwrap();
 
         // A phone arrives at the relay for node-1: it joins the broker and C
         // signals A to open the matching data leg.
         let phone = broker.join("leg-xyz").expect("phone leg parks");
         assert_eq!(
-            reg.signal_open("node-1", "leg-xyz", LegClass::Chat).await,
-            Some("inst-A".to_string())
+            reg.signal_open("node-1", "inst-A", "leg-xyz", LegClass::Chat),
+            Ok("inst-A".to_string())
         );
 
         // A acts on the signal: opens a data leg under the same key.

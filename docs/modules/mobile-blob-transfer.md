@@ -11,18 +11,17 @@ Implemented pieces:
 - `x-relay-leg-class` plumbing and connection-cap reserve
   (`remote-host/crates/{protocol,relay}`);
 - the gateway blob responder for download/upload with `BlobStore::open_at`,
-  `uploaded_bytes`, and the per-device quota
-  (`crates/gateway/src/channel/blob_content.rs`, `crates/store`,
-  `crates/storage`);
+  per-blob size enforcement, and content-hash validation
+  (`crates/gateway/src/channel/blob_content.rs`, `crates/store`, `crates/storage`);
 - the shared sub-protocol (`crates/device-proto/src/blob.rs`);
 - the mobile Rust/Tauri/TS client (`app/mobile/core/src/blob.rs`,
   `app/mobile/src-tauri/src/blob.rs`, `app/mobile/src/blob.ts`).
 
 There is deliberately no background blob sweeper and no
-`BlobStore::purge_older_than`: device-uploaded blobs are durable. Disk is bounded
-by the per-device upload quota plus the per-blob 100 MiB cap. A global disk
-ceiling or reference-tied lifetime sweep would need additional `BlobStore`
-surface.
+`BlobStore::purge_older_than`: device-uploaded blobs are durable. The upload
+path keeps the per-blob 100 MiB cap, but does not enforce a per-device aggregate
+quota. A global disk ceiling or reference-tied lifetime sweep would need
+additional `BlobStore` surface.
 
 The mobile chat-view UI is now wired (`app/mobile/src/App.tsx` + `blob.ts`): an
 `accept="image/*"` picker stages picked images and uploads them over a blob leg
@@ -313,24 +312,21 @@ device holding just the bare hex pull from `offset`. `open()` is implemented as
 `open_at(_, 0)`. `stat()` treats a NULL `read_token` as fully open for backward
 compatibility, so legacy NULL-token blobs remain pullable with the bare hex.
 
-### Upload gate and quota
+### Upload gate and limits
 
 The upload path flips the gateway's receive-only posture (`authorize_upload` currently
 rejects `AuthedClient::Device`, `blobs.rs`) only behind these bounds (Adversarial #5):
 
 - **Gate:** the Noise-IK approved-device check already authenticates the leg; no extra
   token needed.
-- **Per-device aggregate durable-byte quota** (`PER_DEVICE_BLOB_QUOTA_BYTES`, via
-  `BlobStore::uploaded_bytes`), checked at `BlobPushGrant` — `put_stream`'s incremental
-  `max_bytes` caps a single blob at 100 MiB (`MAX_BLOB_BYTES`) but not the cumulative
-  footprint. This is the disk bound; **there is no background sweeper** — device-uploaded
-  blobs are durable (no LRU/age-based delete).
+- **Per-blob size cap:** `put_stream`'s incremental `max_bytes` caps a single blob at
+  100 MiB (`MAX_BLOB_BYTES`). There is no per-device aggregate quota on this leg, and
+  device-uploaded blobs are durable (no LRU/age-based delete).
 - **Integrity:** `BlobDone.sha256_hex` / the claimed push hash must equal the **hex prefix**
   of the content-addressed `blob_id` (split on `.`), not the whole id.
 
 **Deferred (needs extra `BlobStore` surface):** a global disk ceiling (for example a
 `total_bytes` method) and a reference-tied-lifetime sweep of unreferenced device uploads.
-With no janitor, the per-device quota is the standing bound.
 
 ## Mobile client
 

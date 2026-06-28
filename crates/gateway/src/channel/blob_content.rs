@@ -11,7 +11,7 @@
 //! - [`BlobRequest::Pull`] → stream the blob from
 //!   [`BlobStore::open_at`](baybo_store::BlobStore::open_at) (token-gated) as
 //!   [`BlobResponse::Chunk`]s, then [`BlobResponse::Done`].
-//! - [`BlobRequest::Push`] → quota-check, [`BlobResponse::PushGrant`], stream the
+//! - [`BlobRequest::Push`] → validate, [`BlobResponse::PushGrant`], stream the
 //!   phone's [`BlobRequest::Chunk`]s into the store stamped with the device id,
 //!   verify the content hash, then [`BlobResponse::PushDone`].
 //! - [`BlobRequest::Abort`] → tear the leg down.
@@ -39,18 +39,19 @@ use super::device_content::{
 };
 use super::state::WsChannelState;
 
-/// Aggregate durable-byte quota per device for blob-leg uploads. Bounds a paired
-/// device from filling the gateway's disk one finalized blob at a time (the
-/// per-blob [`MAX_BLOB_BYTES`] cap only bounds a single upload). Checked against
-/// [`BlobStore::uploaded_bytes`](baybo_store::BlobStore::uploaded_bytes) before a
-/// grant.
-const PER_DEVICE_BLOB_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
 /// How long the leg waits for its (one) request before giving up. The gateway
 /// closes the leg as soon as the transfer finishes, so this only guards the window
 /// *before* the first request — a client that connects + handshakes but never asks
 /// — releasing the relay connection-cap slot rather than pinning it.
 const BLOB_LEG_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// After a push is granted, each next chunk/control frame must arrive within this
+/// window. Without this, a client can pin the store task forever by going idle
+/// after the grant.
+const BLOB_UPLOAD_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Absolute upper bound for one blob upload leg after the grant.
+const BLOB_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Run the blob sub-protocol over an outbound relay blob leg (the gateway dialed
 /// C's `/content/host/{relay_key}` after an `OpenDataLeg{class: Blob}` signal).
@@ -279,11 +280,11 @@ async fn handle_pull<S: BinarySink>(
     Ok(())
 }
 
-/// Receive an upload: quota-check, grant, stream the phone's [`BlobRequest::Chunk`]s
+/// Receive an upload: grant, stream the phone's [`BlobRequest::Chunk`]s
 /// into [`BlobStore::put_stream`](baybo_store::BlobStore::put_stream) (stamping the
 /// `device_id` as uploader), verify the finalized content hash matches the claim,
 /// and reply [`BlobResponse::PushDone`]. The Noise handshake already proved the
-/// device is approved (the upload gate); the quota bounds cumulative disk.
+/// device is approved (the upload gate); [`MAX_BLOB_BYTES`] bounds one upload.
 #[allow(clippy::too_many_arguments)]
 async fn handle_push<Si: BinarySink, So: BinarySource>(
     sink: &mut Si,
@@ -303,22 +304,6 @@ async fn handle_push<Si: BinarySink, So: BinarySource>(
     }
     if !is_sha256_hex(sha256_hex) {
         return Err(XferError::Protocol("invalid content hash".into()));
-    }
-    // Aggregate per-device durable-byte quota (the per-blob cap alone leaves
-    // cumulative disk unbounded across many uploads).
-    let used = match state.blob_store.uploaded_bytes(device_id).await {
-        Ok(used) => used,
-        Err(e) => {
-            tracing::warn!(
-                device = %super::short_hash(device_id),
-                error = %e,
-                "blob upload quota check failed",
-            );
-            return Err(XferError::Protocol("quota check failed".into()));
-        }
-    };
-    if used.saturating_add(size) > PER_DEVICE_BLOB_QUOTA_BYTES {
-        return Err(XferError::Protocol("device blob quota exceeded".into()));
     }
 
     // Authorized; the phone (re)starts at offset 0 (same-session resume of an
@@ -348,12 +333,29 @@ async fn handle_push<Si: BinarySink, So: BinarySource>(
     });
 
     let mut received: u64 = 0;
+    let upload_deadline = tokio::time::Instant::now() + BLOB_UPLOAD_TOTAL_TIMEOUT;
     loop {
-        let req = match next_request(source, transport, reassembler, pending).await {
-            Some(r) => r,
-            None => {
+        let now = tokio::time::Instant::now();
+        let remaining = upload_deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            abort_put_stream(tx, put_task, "upload timed out").await;
+            return Err(XferError::Protocol("upload timed out".into()));
+        }
+        let wait_for = std::cmp::min(remaining, BLOB_UPLOAD_CHUNK_IDLE_TIMEOUT);
+        let req = match tokio::time::timeout(
+            wait_for,
+            next_request(source, transport, reassembler, pending),
+        )
+        .await
+        {
+            Ok(Some(r)) => r,
+            Ok(None) => {
                 abort_put_stream(tx, put_task, "upload leg closed").await;
                 return Err(XferError::Leg);
+            }
+            Err(_) => {
+                abort_put_stream(tx, put_task, "upload timed out").await;
+                return Err(XferError::Protocol("upload timed out".into()));
             }
         };
         match req {
@@ -882,11 +884,9 @@ mod tests {
         assert!(!is_sha256_hex(&non_hex));
     }
 
-    /// A chunk whose offset does not match the bytes already accepted is rejected
-    /// before it reaches `put_stream`, and the abort path feeds an error into the
-    /// upload stream so no partial metadata row is finalized.
+    /// A chunk whose offset does not match the bytes already accepted is rejected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn push_with_a_bad_chunk_offset_is_rejected_without_storing() {
+    async fn push_with_a_bad_chunk_offset_is_rejected() {
         use sha2::{Digest, Sha256};
 
         let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
@@ -901,7 +901,6 @@ mod tests {
             .await
             .unwrap();
         let gw_pub = gw_static.public();
-        let blob_store = tg.deps.stores.blob.clone();
         let state = WsChannelState::from_deps(&tg.deps);
 
         let (gw_tx, mut phone_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -947,11 +946,6 @@ mod tests {
         assert!(
             matches!(resp, BlobResponse::Err { request_id: 11, .. }),
             "a bad offset is rejected, got {resp:?}"
-        );
-        assert_eq!(
-            blob_store.uploaded_bytes("ios-dev").await.unwrap(),
-            0,
-            "protocol-aborted uploads must not finalize a partial blob",
         );
     }
 }

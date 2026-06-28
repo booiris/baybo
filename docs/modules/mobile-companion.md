@@ -161,8 +161,9 @@ runs in production over the outbound relay data leg.
 
 `mutable-content: 1` wakes the NSE; it reads the 32-byte `push_key` for `bid`
 from the shared keychain access group (account `baybo.push-key.<bid>`, access
-group `group.com.baybo.app` in the app/NSE code), ChaCha20-Poly1305-opens `enc`
-with nonce `n`, and
+group `$(AppIdentifierPrefix)com.baybo.app`, expanded by signing and mirrored
+into the app/NSE code through build-time configuration), ChaCha20-Poly1305-opens
+`enc` with nonce `n`, and
 rewrites the visible `title`/`body`. On **any** failure it keeps the generic
 "New message" placeholder — a bad key / wrong nonce / tamper are
 indistinguishable. The Rust producer (`device_proto::aead`) and the Swift
@@ -263,9 +264,8 @@ gap:
 - An unsigned build's `SecItemAdd` returns `errSecMissingEntitlement (-34018)` —
   the code reaches the keychain; only the entitlement is unhonored.
 - `get-task-allow` is mandatory to launch any re-signed build.
-- The simulator rejects `group.com.baybo.app` unless the matching app/keychain
-  group entitlement is provisioned for the signing team; manual `codesign`
-  (ad-hoc or Development) cannot register that capability.
+- The simulator rejects unprovisioned App Group / Keychain Sharing entitlements;
+  manual `codesign` (ad-hoc or Development) cannot register that capability.
 
 The reliable path is **Xcode automatic signing** (set the team on both the app and
 the NSE target — a paid Apple Developer capability). `apple/verify-nse.sh`

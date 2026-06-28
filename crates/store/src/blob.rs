@@ -126,11 +126,6 @@ pub trait BlobStore: Send + Sync {
     /// Return metadata only. Same not-found semantics as `get`.
     async fn stat(&self, blob_id: &str) -> Result<BlobMeta>;
 
-    /// Total durable bytes attributed to `uploader_identity` (the sum of `size`
-    /// over its blobs). Backs the per-device upload quota on the relay blob leg —
-    /// a device's uploads stamp its `device_id` as the uploader.
-    async fn uploaded_bytes(&self, uploader_identity: &str) -> Result<u64>;
-
     /// Hard-delete the metadata row and unlink the on-disk payload
     /// (when no other live row resolves to the same content path).
     /// Idempotent on missing ids.

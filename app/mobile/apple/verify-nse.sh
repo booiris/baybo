@@ -48,6 +48,18 @@ echo "▸ building (debug, aarch64-sim)…"
 IDENTITY="${BAYBO_SIGN_ID:-$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development/{print $2; exit}')}"
 [ -n "$IDENTITY" ] || { echo "✗ no 'Apple Development' code-signing identity found"; exit 1; }
 echo "▸ signing with: $IDENTITY"
+PROJECT_TEAM_ID="$(awk -F': *' '/DEVELOPMENT_TEAM:/ {print $2; exit}' "$GEN/project.yml")"
+case "$PROJECT_TEAM_ID" in
+  *'$('*|*'$'*)
+    PROJECT_TEAM_ID=""
+    ;;
+esac
+LOCAL_TEAM_ID="$(awk -F'= *' '/BAYBO_IOS_DEVELOPMENT_TEAM/ {print $2; exit}' "$GEN/Signing.local.xcconfig" 2>/dev/null || true)"
+TEAM_ID="${BAYBO_TEAM_ID:-${BAYBO_IOS_DEVELOPMENT_TEAM:-$PROJECT_TEAM_ID}}"
+[ -n "$TEAM_ID" ] || TEAM_ID="$LOCAL_TEAM_ID"
+[ -n "$TEAM_ID" ] || { echo "✗ could not infer Team ID; set BAYBO_IOS_DEVELOPMENT_TEAM or BAYBO_TEAM_ID"; exit 1; }
+KEYCHAIN_GROUP="${BAYBO_KEYCHAIN_GROUP:-$TEAM_ID.com.baybo.app}"
+echo "▸ keychain access group: $KEYCHAIN_GROUP"
 
 # Sim-launch entitlements: get-task-allow (REQUIRED — the simulator only launches
 # apps that carry it; the --no-sign linker signature includes it, so re-signing
@@ -56,13 +68,13 @@ echo "▸ signing with: $IDENTITY"
 # restricted push entitlement that needs a provisioning profile, and a local
 # simctl push targets the bundle id directly without it.
 ENT="$(mktemp -t baybo-sim-ent).plist"
-cat > "$ENT" <<'PLIST'
+cat > "$ENT" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>com.apple.security.get-task-allow</key><true/>
   <key>com.apple.security.application-groups</key><array><string>group.com.baybo.app</string></array>
-  <key>keychain-access-groups</key><array><string>group.com.baybo.app</string></array>
+  <key>keychain-access-groups</key><array><string>$KEYCHAIN_GROUP</string></array>
 </dict></plist>
 PLIST
 

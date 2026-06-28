@@ -1,5 +1,10 @@
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
 
 use async_trait::async_trait;
 use baybo_model::BlobRef;
@@ -18,10 +23,12 @@ use baybo_store::blob::{BlobMeta, BlobReader, BlobStore, ByteStream, Result, SHA
 // channel-token boundary is the only gate on user-uploaded media, and
 // world-readable bytes on disk would bypass it. Baybo is Unix-only (see
 // `CLAUDE.md`) so neither needs a cfg gate.
+const BLOB_PATH_LOCK_STRIPES: usize = 64;
 
 pub struct LibsqlBlobStore {
     pool: LibsqlPool,
     root: PathBuf,
+    path_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
 }
 
 impl LibsqlBlobStore {
@@ -33,6 +40,7 @@ impl LibsqlBlobStore {
         Self {
             pool,
             root: root.into(),
+            path_locks: new_path_locks(),
         }
     }
 
@@ -44,7 +52,11 @@ impl LibsqlBlobStore {
             .mode(0o700)
             .create(&root)
             .map_err(|e| anyhow::anyhow!("failed to create blob root {}: {e}", root.display()))?;
-        Ok(Self { pool, root })
+        Ok(Self {
+            pool,
+            root,
+            path_locks: new_path_locks(),
+        })
     }
 
     fn blob_path(&self, hex: &str, ext: &str) -> PathBuf {
@@ -65,6 +77,14 @@ impl LibsqlBlobStore {
     /// and reaped on success (rename) or error (explicit cleanup).
     fn scratch_dir(&self) -> PathBuf {
         self.root.join(".tmp")
+    }
+
+    async fn content_path_guard(&self, hex: &str, ext: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        let mut hasher = DefaultHasher::new();
+        hex.hash(&mut hasher);
+        ext.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % self.path_locks.len();
+        self.path_locks[idx].lock().await
     }
 
     /// Persist the metadata row + return the `BlobRef`. Idempotent:
@@ -114,9 +134,21 @@ impl LibsqlBlobStore {
             )
             .await
         {
-            tracing::warn!(blob_id, error = %e, "blob touch failed");
+            tracing::warn!(
+                blob_id = %redacted_blob_id(blob_id),
+                error = %e,
+                "blob touch failed",
+            );
         }
     }
+}
+
+fn new_path_locks() -> Arc<Vec<tokio::sync::Mutex<()>>> {
+    Arc::new(
+        (0..BLOB_PATH_LOCK_STRIPES)
+            .map(|_| tokio::sync::Mutex::new(()))
+            .collect(),
+    )
 }
 
 fn now_unix() -> i64 {
@@ -273,7 +305,9 @@ impl BlobStore for LibsqlBlobStore {
 
         let hex = hex_encode(&hasher.finalize());
         let read_token = unique_read_token();
-        let final_path = self.blob_path(&hex, mime_extension(mime_type));
+        let ext = mime_extension(mime_type);
+        let final_path = self.blob_path(&hex, ext);
+        let _path_guard = self.content_path_guard(&hex, ext).await;
         // Skip the rename when the canonical path already exists —
         // some other put or a previous attempt got there first. Either
         // way the bytes match (content-addressed) so we just clean
@@ -316,7 +350,10 @@ impl BlobStore for LibsqlBlobStore {
         let path = self.blob_path(hex, mime_extension(&meta.mime_type));
         tokio::fs::read(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound(format!("blob bytes missing for {blob_id}"))
+                StorageError::NotFound(format!(
+                    "blob bytes missing for {}",
+                    redacted_blob_id(blob_id),
+                ))
             } else {
                 StorageError::Internal(anyhow::anyhow!("read blob {}: {e}", path.display()))
             }
@@ -336,7 +373,10 @@ impl BlobStore for LibsqlBlobStore {
         let path = self.blob_path(hex, mime_extension(&meta.mime_type));
         let mut file = tokio::fs::File::open(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound(format!("blob bytes missing for {blob_id}"))
+                StorageError::NotFound(format!(
+                    "blob bytes missing for {}",
+                    redacted_blob_id(blob_id),
+                ))
             } else {
                 StorageError::Internal(anyhow::anyhow!("open blob {}: {e}", path.display()))
             }
@@ -350,27 +390,6 @@ impl BlobStore for LibsqlBlobStore {
                 })?;
         }
         Ok(Box::pin(file))
-    }
-
-    async fn uploaded_bytes(&self, uploader_identity: &str) -> Result<u64> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT COALESCE(SUM(size), 0) FROM blobs WHERE uploader_identity = ?1",
-                libsql::params![uploader_identity.to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql uploaded_bytes: {e}")))?;
-        let total: i64 = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql uploaded_bytes row: {e}")))?
-            .ok_or_else(|| StorageError::Internal(anyhow::anyhow!("uploaded_bytes empty result")))?
-            .get(0)
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql uploaded_bytes get: {e}"))
-            })?;
-        Ok(total.max(0) as u64)
     }
 
     async fn stat(&self, blob_id: &str) -> Result<BlobMeta> {
@@ -389,7 +408,7 @@ impl BlobStore for LibsqlBlobStore {
             .next()
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob row: {e}")))?
-            .ok_or_else(|| StorageError::NotFound(format!("blob {blob_id}")))?;
+            .ok_or_else(|| StorageError::NotFound(format!("blob {}", redacted_blob_id(blob_id))))?;
 
         let id: String = row
             .get(0)
@@ -412,7 +431,10 @@ impl BlobStore for LibsqlBlobStore {
         if let Some(expected) = read_token.as_deref()
             && expected != token
         {
-            return Err(StorageError::NotFound(format!("blob {blob_id}")));
+            return Err(StorageError::NotFound(format!(
+                "blob {}",
+                redacted_blob_id(blob_id),
+            )));
         }
 
         // LRU touch: refresh the access timestamp so the janitor's
@@ -457,25 +479,22 @@ impl BlobStore for LibsqlBlobStore {
         };
         drop(rows);
 
-        let affected = conn
-            .execute(
-                "DELETE FROM blobs WHERE blob_id = ?1",
-                libsql::params![blob_id.to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob delete: {e}")))?;
-
-        if affected > 0
-            && let Some(mime) = mime_type
-        {
+        if let Some(mime) = mime_type {
             let ext = mime_extension(&mime);
             let path = self.blob_path(hex, ext);
+            let _path_guard = self.content_path_guard(hex, ext).await;
+            let affected = conn
+                .execute(
+                    "DELETE FROM blobs WHERE blob_id = ?1",
+                    libsql::params![blob_id.to_string()],
+                )
+                .await
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob delete: {e}")))?;
             // Two puts of the same content (and same mime) share one
             // on-disk file by content addressing; deleting one
             // capability must not yank the file out from under the
             // other. Confirm the path is unreferenced before unlinking.
-            let still_referenced = self.any_live_for_path(hex, ext).await.unwrap_or(false);
-            if !still_referenced {
+            if affected > 0 && !self.any_live_for_path(hex, ext).await.unwrap_or(false) {
                 match tokio::fs::remove_file(&path).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -539,6 +558,18 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+fn redacted_blob_id(blob_id: &str) -> String {
+    let Some(rest) = blob_id.strip_prefix(SHA256_PREFIX) else {
+        return "<invalid>".to_string();
+    };
+    let hex = rest.split_once('.').map(|(hex, _)| hex).unwrap_or(rest);
+    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        format!("{SHA256_PREFIX}{hex}.<redacted>")
+    } else {
+        "<invalid>".to_string()
+    }
+}
+
 /// Per-attempt unique scratch filename for the streaming put path.
 /// `pid` + monotonic counter + nanosecond timestamp keep two concurrent
 /// uploads of identical content from sharing a temp path during the
@@ -567,10 +598,13 @@ fn unique_read_token() -> String {
 fn split_id(blob_id: &str) -> Result<(&str, &str)> {
     let hex_all = blob_id
         .strip_prefix(SHA256_PREFIX)
-        .ok_or_else(|| StorageError::NotFound(format!("invalid blob_id {blob_id}")))?;
+        .ok_or_else(|| StorageError::NotFound("invalid blob_id".to_string()))?;
     let (hex, token) = hex_all.split_once('.').unwrap_or((hex_all, ""));
     if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(StorageError::NotFound(format!("invalid blob_id {blob_id}")));
+        return Err(StorageError::NotFound(format!(
+            "invalid blob_id {}",
+            redacted_blob_id(blob_id),
+        )));
     }
     Ok((hex, token))
 }
@@ -626,28 +660,6 @@ mod tests {
             store.stat(&b.blob_id).await.unwrap().mime_type,
             "image/jpeg"
         );
-    }
-
-    #[tokio::test]
-    async fn uploaded_bytes_sums_only_the_named_uploader() {
-        let (store, _dir) = build().await;
-        store
-            .put(b"one", "text/plain", Some("ios-a"))
-            .await
-            .unwrap();
-        store
-            .put(b"two two", "text/plain", Some("ios-a"))
-            .await
-            .unwrap();
-        store
-            .put(b"other", "text/plain", Some("ios-b"))
-            .await
-            .unwrap();
-        store.put(b"anonymous", "text/plain", None).await.unwrap();
-
-        assert_eq!(store.uploaded_bytes("ios-a").await.unwrap(), 10);
-        assert_eq!(store.uploaded_bytes("ios-b").await.unwrap(), 5);
-        assert_eq!(store.uploaded_bytes("missing").await.unwrap(), 0);
     }
 
     #[tokio::test]

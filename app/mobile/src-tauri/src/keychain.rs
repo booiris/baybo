@@ -1,12 +1,13 @@
-//! Persist the per-device push key into the shared App Group keychain so the
-//! Notification Service Extension can decrypt lock-screen previews.
+//! Persist the per-device push key into the shared keychain access group so the
+//! Notification Service Extension can decrypt lock-screen previews. Longer-lived
+//! app-only credentials stay in the app's private keychain.
 //!
 //! The NSE reads the key in Swift (`apple/NotificationExtension/PushKeyStore
 //! .swift`); this is the matching WRITE side. It calls the Security framework
 //! (`SecItemAdd`) directly from Rust — the framework is already linked into the
 //! app (`Security.framework` in `project.yml`), so no extra Swift in the app
 //! target is needed. On non-iOS targets (the desktop dev build of the shell)
-//! it is a no-op: there is no shared keychain off-device.
+//! it is a no-op: there is no keychain off-device.
 
 use device_proto::aead::KEY_LEN;
 
@@ -46,8 +47,7 @@ mod imp {
     const ERR_SEC_SUCCESS: OSStatus = 0;
     /// `errSecItemNotFound` — a delete of an absent item is a benign no-op.
     const ERR_SEC_ITEM_NOT_FOUND: OSStatus = -25300;
-    /// MUST match `PushKeyStore.accessGroup` / `.accountPrefix` in the NSE.
-    const ACCESS_GROUP: &str = "group.com.baybo.app";
+    const MISSING_ACCESS_GROUP: &str = "missing BAYBO_IOS_KEYCHAIN_ACCESS_GROUP; build through Xcode/Tauri iOS or set BAYBO_IOS_KEYCHAIN_ACCESS_GROUP explicitly";
     const ACCOUNT_PREFIX: &str = "baybo.push-key.";
 
     /// Wrap a `static` Security-framework `CFStringRef` constant as a borrowed
@@ -56,20 +56,28 @@ mod imp {
         unsafe { CFString::wrap_under_get_rule(r) }.as_CFType()
     }
 
-    /// Upsert an opaque blob into the shared App Group keychain under `account`.
-    pub(super) fn store_blob(account: &str, bytes: &[u8]) -> Result<(), String> {
+    fn access_group() -> Result<CFType, String> {
+        option_env!("BAYBO_IOS_KEYCHAIN_ACCESS_GROUP")
+            .filter(|group| !group.is_empty())
+            .map(|group| CFString::new(group).as_CFType())
+            .ok_or_else(|| MISSING_ACCESS_GROUP.to_string())
+    }
+
+    /// Upsert an opaque blob into the keychain under `account`.
+    fn store_blob(account: &str, bytes: &[u8], shared: bool) -> Result<(), String> {
         let account = CFString::new(account).as_CFType();
-        let group = CFString::new(ACCESS_GROUP).as_CFType();
         let data = CFData::from_buffer(bytes).as_CFType();
 
         // SAFETY: the kSec* statics are valid CFStringRefs from the linked
         // Security framework; the dictionaries outlive each Sec* call.
         unsafe {
-            let identity = vec![
+            let mut identity = vec![
                 (constant(kSecClass), constant(kSecClassGenericPassword)),
                 (constant(kSecAttrAccount), account.clone()),
-                (constant(kSecAttrAccessGroup), group.clone()),
             ];
+            if shared {
+                identity.push((constant(kSecAttrAccessGroup), access_group()?));
+            }
             // Upsert: delete-then-add avoids an errSecDuplicateItem on re-pair.
             let query = CFDictionary::from_CFType_pairs(&identity);
             SecItemDelete(query.as_concrete_TypeRef());
@@ -77,8 +85,9 @@ mod imp {
             let mut attrs = identity;
             attrs.push((constant(kSecValueData), data));
             // `AfterFirstUnlock` so the NSE can read the push key on the lock
-            // screen (after the first unlock since boot); the paired record
-            // rides the same class.
+            // screen (after the first unlock since boot). Private app records use
+            // the same accessibility class so app relaunch after reboot behaves
+            // consistently.
             attrs.push((
                 constant(kSecAttrAccessible),
                 constant(kSecAttrAccessibleAfterFirstUnlock),
@@ -94,22 +103,24 @@ mod imp {
     }
 
     /// Read an opaque blob back. `Ok(None)` = not found.
-    pub(super) fn read_blob(account: &str) -> Result<Option<Vec<u8>>, String> {
+    fn read_blob(account: &str, shared: bool) -> Result<Option<Vec<u8>>, String> {
         let account = CFString::new(account).as_CFType();
-        let group = CFString::new(ACCESS_GROUP).as_CFType();
         // SAFETY: as in `store_blob` — valid constants, the dictionary outlives
         // the call, and the returned CFData is owned (create rule).
         unsafe {
-            let query = CFDictionary::from_CFType_pairs(&[
+            let mut attrs = vec![
                 (constant(kSecClass), constant(kSecClassGenericPassword)),
                 (constant(kSecAttrAccount), account),
-                (constant(kSecAttrAccessGroup), group),
                 (
                     constant(kSecReturnData),
                     CFBoolean::true_value().as_CFType(),
                 ),
                 (constant(kSecMatchLimit), constant(kSecMatchLimitOne)),
-            ]);
+            ];
+            if shared {
+                attrs.push((constant(kSecAttrAccessGroup), access_group()?));
+            }
+            let query = CFDictionary::from_CFType_pairs(&attrs);
             let mut out: CFTypeRef = std::ptr::null();
             let status = SecItemCopyMatching(query.as_concrete_TypeRef(), &mut out);
             if status != ERR_SEC_SUCCESS || out.is_null() {
@@ -120,20 +131,21 @@ mod imp {
         }
     }
 
-    /// Delete an item from the shared App Group keychain. A missing item
-    /// (`errSecItemNotFound`) is treated as success — the unpair path is
-    /// idempotent.
-    pub(super) fn delete_blob(account: &str) -> Result<(), String> {
+    /// Delete an item from the keychain. A missing item (`errSecItemNotFound`) is
+    /// treated as success — the unpair path is idempotent.
+    fn delete_blob(account: &str, shared: bool) -> Result<(), String> {
         let account = CFString::new(account).as_CFType();
-        let group = CFString::new(ACCESS_GROUP).as_CFType();
         // SAFETY: as in `store_blob` — valid constants, the dictionary outlives
         // the call.
         unsafe {
-            let query = CFDictionary::from_CFType_pairs(&[
+            let mut attrs = vec![
                 (constant(kSecClass), constant(kSecClassGenericPassword)),
                 (constant(kSecAttrAccount), account),
-                (constant(kSecAttrAccessGroup), group),
-            ]);
+            ];
+            if shared {
+                attrs.push((constant(kSecAttrAccessGroup), access_group()?));
+            }
+            let query = CFDictionary::from_CFType_pairs(&attrs);
             let status = SecItemDelete(query.as_concrete_TypeRef());
             if status == ERR_SEC_SUCCESS || status == ERR_SEC_ITEM_NOT_FOUND {
                 Ok(())
@@ -143,19 +155,31 @@ mod imp {
         }
     }
 
+    pub(super) fn store_private_blob(account: &str, bytes: &[u8]) -> Result<(), String> {
+        store_blob(account, bytes, false)
+    }
+
+    pub(super) fn read_private_blob(account: &str) -> Result<Option<Vec<u8>>, String> {
+        read_blob(account, false)
+    }
+
+    pub(super) fn delete_private_blob(account: &str) -> Result<(), String> {
+        delete_blob(account, false)
+    }
+
     pub(super) fn store_push_key(bid: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
-        store_blob(&format!("{ACCOUNT_PREFIX}{bid}"), &key[..])
+        store_blob(&format!("{ACCOUNT_PREFIX}{bid}"), &key[..], true)
     }
 
     pub(super) fn delete_push_key(bid: &str) -> Result<(), String> {
-        delete_blob(&format!("{ACCOUNT_PREFIX}{bid}"))
+        delete_blob(&format!("{ACCOUNT_PREFIX}{bid}"), true)
     }
 
     /// Read the push key back — the same lookup the NSE's `PushKeyStore` does.
     /// Used by the debug self-check to prove the access-group round-trip.
     #[cfg(debug_assertions)]
     pub(super) fn read_push_key(bid: &str) -> Result<Option<[u8; KEY_LEN]>, String> {
-        match read_blob(&format!("{ACCOUNT_PREFIX}{bid}"))? {
+        match read_blob(&format!("{ACCOUNT_PREFIX}{bid}"), true)? {
             Some(b) => b
                 .as_slice()
                 .try_into()
@@ -172,13 +196,13 @@ mod imp {
     pub(super) fn store_push_key(_bid: &str, _key: &[u8; KEY_LEN]) -> Result<(), String> {
         Ok(())
     }
-    pub(super) fn store_blob(_account: &str, _bytes: &[u8]) -> Result<(), String> {
+    pub(super) fn store_private_blob(_account: &str, _bytes: &[u8]) -> Result<(), String> {
         Ok(())
     }
-    pub(super) fn read_blob(_account: &str) -> Result<Option<Vec<u8>>, String> {
+    pub(super) fn read_private_blob(_account: &str) -> Result<Option<Vec<u8>>, String> {
         Ok(None)
     }
-    pub(super) fn delete_blob(_account: &str) -> Result<(), String> {
+    pub(super) fn delete_private_blob(_account: &str) -> Result<(), String> {
         Ok(())
     }
     pub(super) fn delete_push_key(_bid: &str) -> Result<(), String> {
@@ -200,18 +224,18 @@ const PAIRED_RECORD_ACCOUNT: &str = "baybo.paired-gateway";
 
 /// Persist the paired-gateway record (an opaque serialized blob).
 pub fn store_paired_record(bytes: &[u8]) -> Result<(), String> {
-    imp::store_blob(PAIRED_RECORD_ACCOUNT, bytes)
+    imp::store_private_blob(PAIRED_RECORD_ACCOUNT, bytes)
 }
 
 /// Read the persisted paired-gateway record. `Ok(None)` = not paired yet.
 pub fn read_paired_record() -> Result<Option<Vec<u8>>, String> {
-    imp::read_blob(PAIRED_RECORD_ACCOUNT)
+    imp::read_private_blob(PAIRED_RECORD_ACCOUNT)
 }
 
 /// Delete the persisted paired-gateway record (the unpair / "forget" action).
 /// Idempotent — succeeds even if nothing was stored.
 pub fn delete_paired_record() -> Result<(), String> {
-    imp::delete_blob(PAIRED_RECORD_ACCOUNT)
+    imp::delete_private_blob(PAIRED_RECORD_ACCOUNT)
 }
 
 /// Account holding the device's long-term Noise static identity, stored as the
@@ -230,13 +254,13 @@ pub fn store_device_identity(secret: &[u8; KEY_LEN], public: &[u8; KEY_LEN]) -> 
     let mut blob = Vec::with_capacity(KEY_LEN * 2);
     blob.extend_from_slice(secret);
     blob.extend_from_slice(public);
-    imp::store_blob(DEVICE_IDENTITY_ACCOUNT, &blob)
+    imp::store_private_blob(DEVICE_IDENTITY_ACCOUNT, &blob)
 }
 
 /// Read the persisted identity back as `(secret, public)`. `Ok(None)` = unset
 /// (first launch, or a desktop dev build with no on-device keychain).
 pub fn read_device_identity() -> Result<Option<DeviceIdentity>, String> {
-    let Some(blob) = imp::read_blob(DEVICE_IDENTITY_ACCOUNT)? else {
+    let Some(blob) = imp::read_private_blob(DEVICE_IDENTITY_ACCOUNT)? else {
         return Ok(None);
     };
     if blob.len() != KEY_LEN * 2 {

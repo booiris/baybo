@@ -22,7 +22,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use std::net::SocketAddr;
@@ -43,7 +42,7 @@ use remote_host_protocol::relay::{
 use crate::bandwidth::{BandwidthRegistry, LegClass as BwClass};
 use crate::broker::{ParkOutcome, RelayBroker};
 use crate::conns::ConnectionRegistry;
-use crate::control::{ControlHello, ControlRegistry};
+use crate::control::{ControlHello, ControlRegisterError, ControlRegistry, SignalOpenError};
 use crate::ip_limit::IpRateLimiter;
 use crate::ws::pump_ws;
 
@@ -78,6 +77,11 @@ const JOIN_WINDOW: Duration = Duration::from_secs(10);
 /// Soft cap on tracked rendezvous ids before stale windows are pruned — bounds
 /// memory against an attacker spraying distinct ids.
 const JOIN_LIMITER_MAX_KEYS: usize = 4096;
+
+/// Cap on phone-side content legs that have been signaled but not yet claimed by
+/// the gateway's data leg. This bounds relay memory independently of the broker's
+/// parked-leg cap because this map is the ownership/metering side table.
+const MAX_PENDING_CONTENT_LEGS: usize = 1024;
 
 /// A fixed-window count for one rendezvous id.
 struct JoinWindow {
@@ -118,6 +122,13 @@ impl JoinRateLimiter {
         window.count += 1;
         true
     }
+}
+
+#[derive(Clone)]
+struct PendingContentLeg {
+    server_id: String,
+    class: LegClass,
+    owner_remote_api_key: String,
 }
 
 /// How the per-IP limiter resolves the **client** address of a request.
@@ -178,18 +189,12 @@ struct RelayState {
     /// per-`(key, server)` sub-cap); content legs throttle against the owning
     /// gateway's buckets (pairing legs are tiny and unthrottled).
     bandwidth: Arc<BandwidthRegistry>,
-    /// `relay_key` → (`relay_node_id` (the `server_id`), [`LegClass`]) for content
-    /// legs awaiting their gateway host. The phone's content-join writes it (it
-    /// knows the server and authored the class); the gateway's content-host reads
-    /// it to meter the leg against the right per-server bandwidth bucket *and*
-    /// class (the host dial carries only the `relay_key`). Removed when the host
-    /// claims it, on a signaling failure, or when the phone leg ends unclaimed —
-    /// so it never leaks.
-    pending_content_legs: Arc<parking_lot::Mutex<HashMap<String, (String, LegClass)>>>,
-    /// Monotonic source of per-data-leg `relay_key`s. Uniqueness (not secrecy)
-    /// is all that's needed: the content-host route is admission-gated, so a
-    /// guessed key can't be hosted by anyone but the real gateway.
-    seq: Arc<AtomicU64>,
+    /// `relay_key` → content leg metadata awaiting the gateway host. The phone's
+    /// content-join writes it (it knows the server, class, and owning admission
+    /// key); the gateway's content-host must claim it with that same key before it
+    /// can touch the broker. Removed when the host claims it, on signaling failure,
+    /// or when the phone leg ends unclaimed.
+    pending_content_legs: Arc<parking_lot::Mutex<HashMap<String, PendingContentLeg>>>,
     /// Per-rendezvous `/pair/join` throttle (anti-grief; see [`JoinRateLimiter`]).
     join_limiter: Arc<JoinRateLimiter>,
     /// Per-source-IP upgrade throttle ahead of admission (flood backstop; see
@@ -224,7 +229,6 @@ pub fn build_router(
         conns,
         bandwidth,
         pending_content_legs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        seq: Arc::new(AtomicU64::new(0)),
         join_limiter: Arc::new(JoinRateLimiter::default()),
         ip_limiter: Arc::new(IpRateLimiter::new()),
         ip_trusted_headers: Arc::new(ip_limit.trusted_headers),
@@ -326,6 +330,10 @@ fn still_admitted(admission: &dyn Admission, remote_api_key: &str) -> bool {
 /// a transient global flood backstop, so the dialer can back off and retry.
 fn at_capacity() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "relay at capacity").into_response()
+}
+
+fn new_content_relay_key() -> String {
+    format!("dl-{}", hex::encode(rand::random::<[u8; 16]>()))
 }
 
 /// `409 Conflict` when a host leg targets a rendezvous another host already holds.
@@ -490,7 +498,16 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
     if !still_admitted(state.admitted.as_ref(), &key) {
         return;
     }
-    let mut rx = state.control.register(&hello.relay_node_id, &key);
+    let mut rx = match state.control.register(&hello.relay_node_id, &key) {
+        Ok(rx) => rx,
+        Err(ControlRegisterError::OwnerMismatch) => {
+            tracing::warn!(
+                node = %hello.relay_node_id,
+                "control: relay_node_id already registered to a different remote_api_key"
+            );
+            return;
+        }
+    };
     // `register` replaces any prior slot (reconnect wins); if our slot is
     // superseded, `rx` closes and we must NOT unregister the new owner.
     let mut superseded = false;
@@ -532,7 +549,7 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
         }
     }
     if !superseded {
-        state.control.unregister(&hello.relay_node_id);
+        state.control.unregister(&hello.relay_node_id, &key);
     }
     tracing::info!(node = %hello.relay_node_id, "control: gateway disconnected");
 }
@@ -544,6 +561,10 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
 async fn content_join_handler(
     Path(relay_node_id): Path<String>,
     State(state): State<RelayState>,
+    Extension(Admitted {
+        remote_api_key: phone_key,
+        ..
+    }): Extension<Admitted>,
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -554,31 +575,55 @@ async fn content_join_handler(
         .and_then(|v| v.to_str().ok())
         .map(LegClass::from_header_value)
         .unwrap_or_default();
-    let relay_key = format!("dl-{}", state.seq.fetch_add(1, Ordering::Relaxed));
+    let relay_key = loop {
+        let candidate = new_content_relay_key();
+        let mut pending = state.pending_content_legs.lock();
+        if pending.len() >= MAX_PENDING_CONTENT_LEGS {
+            return at_capacity();
+        }
+        if !pending.contains_key(&candidate) {
+            pending.insert(
+                candidate.clone(),
+                PendingContentLeg {
+                    server_id: relay_node_id.clone(),
+                    class,
+                    owner_remote_api_key: phone_key.clone(),
+                },
+            );
+            break candidate;
+        }
+    };
     // Record this leg's server (the relay_node_id) and class so the gateway's
     // content-host — whose dial carries only the relay_key — can meter against the
     // right per-server bucket *and* class. Inserted *before* signaling, since the
     // signal is what makes the gateway dial host (which could otherwise race ahead
     // of this write).
-    state
-        .pending_content_legs
-        .lock()
-        .insert(relay_key.clone(), (relay_node_id.clone(), class));
     // The phone leg is admitted by the pre-layer like every other route, but
     // metering keys on the *gateway's* remote_api_key (resolved by signaling) and
     // its server, so both legs of a content session share one bucket pair.
-    let Some(remote_api_key) = state
-        .control
-        .signal_open(&relay_node_id, &relay_key, class)
-        .await
-    else {
-        // No gateway connected, so nobody will claim this leg — don't leak the map.
-        state.pending_content_legs.lock().remove(&relay_key);
-        // The route exists and the key is admitted — the named gateway just holds
-        // no control connection right now (offline, or mid-reconnect). 503, not
-        // 404, so the phone tells "gateway offline, retry" apart from a route-miss.
-        return (StatusCode::SERVICE_UNAVAILABLE, "gateway not connected").into_response();
-    };
+    let remote_api_key =
+        match state
+            .control
+            .signal_open(&relay_node_id, &phone_key, &relay_key, class)
+        {
+            Ok(key) => key,
+            Err(SignalOpenError::NotConnected) => {
+                state.pending_content_legs.lock().remove(&relay_key);
+                return (StatusCode::SERVICE_UNAVAILABLE, "gateway not connected").into_response();
+            }
+            Err(SignalOpenError::OwnerMismatch) => {
+                state.pending_content_legs.lock().remove(&relay_key);
+                return (
+                    StatusCode::FORBIDDEN,
+                    "relay node belongs to a different remote_api_key",
+                )
+                    .into_response();
+            }
+            Err(SignalOpenError::Backpressure) => {
+                state.pending_content_legs.lock().remove(&relay_key);
+                return (StatusCode::SERVICE_UNAVAILABLE, "gateway control busy").into_response();
+            }
+        };
     // Pull the gateway key's limits; if it was revoked since it registered control,
     // fall back to the role floor (the conn kick tears the session down anyway).
     let (max_bps, per_server_max_bps) = match state.admitted.resolve(&remote_api_key) {
@@ -617,16 +662,29 @@ async fn content_host_handler(
     }): Extension<Admitted>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Recover the (server, class) the phone-side recorded for this leg, so both
-    // legs meter against the same per-server bucket *and* class. Removing it here is
-    // the claim (the phone-side backstop only fires if we never do). A miss (the
-    // phone leg ended first) falls back to a per-leg id + Chat — harmless, since the
-    // broker.join below then finds no parked phone half and the leg is refused.
-    let (server_id, class) = state
-        .pending_content_legs
-        .lock()
-        .remove(&relay_key)
-        .unwrap_or_else(|| (relay_key.clone(), LegClass::Chat));
+    // Recover the phone-side metadata for this relay key. This is the ownership
+    // gate: only the gateway registered under the same remote_api_key may claim
+    // the pending leg, and an unknown relay key must not be allowed to pre-park in
+    // the broker.
+    let pending_leg = {
+        let mut pending = state.pending_content_legs.lock();
+        let Some(existing) = pending.get(&relay_key) else {
+            return (StatusCode::NOT_FOUND, "no pending content leg").into_response();
+        };
+        if existing.owner_remote_api_key != key {
+            return (
+                StatusCode::FORBIDDEN,
+                "wrong remote_api_key for content leg",
+            )
+                .into_response();
+        }
+        let Some(pending_leg) = pending.remove(&relay_key) else {
+            return (StatusCode::NOT_FOUND, "no pending content leg").into_response();
+        };
+        pending_leg
+    };
+    let server_id = pending_leg.server_id;
+    let class = pending_leg.class;
     // Cap how many connections one remote_api_key may hold (control + legs). A blob
     // leg is held below the chat reserve so a blob flood can't refuse a chat leg.
     let max_conns = entry.max_conns.map(|c| c as usize);
@@ -1075,6 +1133,19 @@ mod tests {
         client_async(req, stream).await.unwrap().0
     }
 
+    async fn content_host_attempt_status(port: u16, key: &str, remote_api_key: &str) -> WsStatus {
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut req = format!("ws://127.0.0.1:{port}/content/host/{key}")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert(REMOTE_API_KEY_HEADER, remote_api_key.parse().unwrap());
+        match client_async(req, stream).await {
+            Err(WsError::Http(resp)) => resp.status(),
+            other => panic!("expected an HTTP rejection, got {other:?}"),
+        }
+    }
+
     async fn recv_control_json(ws: &mut WebSocketStream<TcpStream>) -> serde_json::Value {
         loop {
             match ws.next().await.unwrap().unwrap() {
@@ -1141,6 +1212,16 @@ mod tests {
             Err(WsError::Http(resp)) => assert_eq!(resp.status(), WsStatus::SERVICE_UNAVAILABLE),
             other => panic!("expected 503, got {other:?}"),
         }
+    }
+
+    /// A gateway content-host leg must claim a C-issued pending relay key.
+    /// Unknown keys are rejected instead of parking a broker half that a future
+    /// phone leg could be spliced into.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn content_host_unknown_relay_key_is_refused() {
+        let port = serve().await;
+        let status = content_host_attempt_status(port, "dl-0", "inst-A").await;
+        assert_eq!(status, WsStatus::NOT_FOUND);
     }
 
     /// Symmetric admission on content too: a keyless content-join is 401'd

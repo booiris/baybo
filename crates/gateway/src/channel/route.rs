@@ -13,7 +13,8 @@ use axum::extract::{Extension, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use baybo_channels::wire::{
-    self, AttachmentKind, Frame, Message as WireMessage, TaskView, WireAttachment,
+    self, AttachmentKind, Frame, MAX_MESSAGE_BATCH_ATTACHMENTS, MAX_MESSAGE_BATCH_MESSAGES,
+    MAX_MESSAGE_BATCH_TEXT_BYTES, Message as WireMessage, TaskView, WireAttachment,
 };
 use baybo_channels::{
     ChannelKind, IncomingMessage, Message as AgentMessage, MessageRole, RouterInbound,
@@ -36,6 +37,11 @@ use crate::auth::{AuthedClient, TokenHandle};
 /// pinning a registry slot.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Hard cap for raw channel WS frames. Blob bytes ride HTTP/blob legs; channel
+/// frames are control JSON/MessagePack plus blob references, so 256 KiB is enough
+/// for legitimate batched text while bounding decode memory.
+const MAX_CHANNEL_WS_FRAME_BYTES: usize = 256 * 1024;
+
 /// Hard cap on how many persisted Message rows the gateway will replay
 /// for a single `Subscribe { since_ordinal }`. A client that fell so
 /// far behind that the gap exceeds this is told to refetch via REST
@@ -54,7 +60,9 @@ async fn ws_handler(
     Extension(authed): Extension<AuthedClient>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| run_connection(socket, state, authed))
+    ws.max_message_size(MAX_CHANNEL_WS_FRAME_BYTES)
+        .max_frame_size(MAX_CHANNEL_WS_FRAME_BYTES)
+        .on_upgrade(move |socket| run_connection(socket, state, authed))
         .into_response()
 }
 
@@ -515,6 +523,28 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                 }
             }
             Frame::Messages { messages } => {
+                if let Err(reason) = validate_message_batch(&messages) {
+                    tracing::warn!(
+                        %channel_type,
+                        count = messages.len(),
+                        reason = %reason,
+                        "dropping invalid channel-ws message batch",
+                    );
+                    if let Some(first) = messages.first()
+                        && let Err(e) = sidecar
+                            .send_frame(Frame::Notice {
+                                session_id: first.session_id.clone(),
+                                user_id: first.user_id.clone(),
+                                level: "error".to_string(),
+                                text: reason,
+                                transient: false,
+                            })
+                            .await
+                    {
+                        tracing::debug!(error = %e, "send batch rejection notice failed");
+                    }
+                    continue;
+                }
                 // A client batch ("send every queued message at once"):
                 // build each row, echo each (same fan-out as a single
                 // Message so every tab renders the N rows), then hand the
@@ -617,6 +647,37 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
             }
         }
     }
+}
+
+fn validate_message_batch(messages: &[WireMessage]) -> Result<(), String> {
+    if messages.len() > MAX_MESSAGE_BATCH_MESSAGES {
+        return Err(format!(
+            "message batch exceeds {MAX_MESSAGE_BATCH_MESSAGES} messages",
+        ));
+    }
+    let Some(first) = messages.first() else {
+        return Ok(());
+    };
+    let mut text_bytes = 0usize;
+    let mut attachments = 0usize;
+    for msg in messages {
+        if msg.session_id != first.session_id {
+            return Err("message batch must target one session".to_string());
+        }
+        text_bytes = text_bytes.saturating_add(msg.content.len());
+        attachments = attachments.saturating_add(msg.attachments.len());
+    }
+    if text_bytes > MAX_MESSAGE_BATCH_TEXT_BYTES {
+        return Err(format!(
+            "message batch text exceeds {MAX_MESSAGE_BATCH_TEXT_BYTES} bytes",
+        ));
+    }
+    if attachments > MAX_MESSAGE_BATCH_ATTACHMENTS {
+        return Err(format!(
+            "message batch exceeds {MAX_MESSAGE_BATCH_ATTACHMENTS} attachments",
+        ));
+    }
+    Ok(())
 }
 
 /// Replay persisted Message rows whose ordinal is strictly greater
@@ -1057,5 +1118,29 @@ mod tests {
             }
             other => panic!("expected File block, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn message_batch_validation_rejects_abuse_shapes() {
+        let msg = WireMessage {
+            content: "ok".to_string(),
+            session_id: SessionId::from("s1"),
+            user_id: "u".to_string(),
+            channel_type: ChannelType::from("http"),
+            bot_id: String::new(),
+            attachments: Vec::new(),
+            platform_msg_id: String::new(),
+            role: baybo_channels::MessageRole::User,
+            ordinal: None,
+        };
+
+        assert!(validate_message_batch(std::slice::from_ref(&msg)).is_ok());
+        assert!(
+            validate_message_batch(&vec![msg.clone(); MAX_MESSAGE_BATCH_MESSAGES + 1]).is_err()
+        );
+
+        let mut other_session = msg.clone();
+        other_session.session_id = SessionId::from("s2");
+        assert!(validate_message_batch(&[msg, other_session]).is_err());
     }
 }

@@ -32,7 +32,6 @@ pub struct MemoryBlobStore {
 struct MemoryBlob {
     bytes: Vec<u8>,
     mime_type: String,
-    uploader_identity: Option<String>,
     created_at: i64,
     last_accessed_at: i64,
     read_token: String,
@@ -71,7 +70,7 @@ impl BlobStore for MemoryBlobStore {
         &self,
         bytes: &[u8],
         mime_type: &str,
-        uploader_identity: Option<&str>,
+        _uploader_identity: Option<&str>,
     ) -> BlobResult<BlobRef> {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
@@ -89,7 +88,6 @@ impl BlobStore for MemoryBlobStore {
             .or_insert(MemoryBlob {
                 bytes: bytes.to_vec(),
                 mime_type: mime_type.to_owned(),
-                uploader_identity: uploader_identity.map(str::to_owned),
                 created_at: now,
                 last_accessed_at: now,
                 read_token,
@@ -135,16 +133,6 @@ impl BlobStore for MemoryBlobStore {
     async fn open(&self, blob_id: &str) -> BlobResult<BlobReader> {
         let bytes = self.get(blob_id).await?;
         Ok(Box::pin(Cursor::new(bytes)))
-    }
-
-    async fn uploaded_bytes(&self, uploader_identity: &str) -> BlobResult<u64> {
-        Ok(self
-            .blobs
-            .lock()
-            .values()
-            .filter(|blob| blob.uploader_identity.as_deref() == Some(uploader_identity))
-            .map(|blob| blob.bytes.len() as u64)
-            .sum())
     }
 
     async fn stat(&self, blob_id: &str) -> BlobResult<BlobMeta> {
@@ -240,6 +228,41 @@ impl DeviceStore for MemoryDeviceStore {
             })
             .collect();
         g.insert(row.device_id.clone(), row.clone());
+        Ok(replaced)
+    }
+
+    async fn create_provisioning(&self, row: &DeviceRow) -> DeviceResult<()> {
+        let mut g = self.rows.lock();
+        if g.values()
+            .any(|r| r.auth_token == row.auth_token && r.device_id != row.device_id)
+        {
+            return Err(StorageError::Conflict("auth_token exists".into()));
+        }
+        g.insert(row.device_id.clone(), row.clone());
+        Ok(())
+    }
+
+    async fn approve_replacing(
+        &self,
+        device_id: &str,
+        approved_at: i64,
+    ) -> DeviceResult<Vec<String>> {
+        let mut g = self.rows.lock();
+        if !g.contains_key(device_id) {
+            return Err(StorageError::NotFound(format!("device {device_id}")));
+        }
+        let replaced: Vec<String> = g
+            .values_mut()
+            .filter(|r| r.status == DeviceStatus::Approved && r.device_id != device_id)
+            .map(|r| {
+                r.status = DeviceStatus::Revoked;
+                r.device_id.clone()
+            })
+            .collect();
+        if let Some(row) = g.get_mut(device_id) {
+            row.status = DeviceStatus::Approved;
+            row.approved_at = Some(approved_at);
+        }
         Ok(replaced)
     }
 

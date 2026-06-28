@@ -7,6 +7,9 @@ fileGroups: [../../src]
 configs:
   debug: debug
   release: release
+configFiles:
+  debug: Signing.xcconfig
+  release: Signing.xcconfig
 settingGroups:
   app:
     base:
@@ -53,6 +56,7 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         CFBundleShortVersionString: 0.1.0
         CFBundleVersion: "0.1.0"
+        BayboKeychainAccessGroup: $(AppIdentifierPrefix)com.baybo.app
         NSCameraUsageDescription: Baybo uses the camera to scan the pairing QR code shown by your gateway.
     entitlements:
       path: baybo-mobile-app_iOS/baybo-mobile-app_iOS.entitlements
@@ -60,6 +64,8 @@ targets:
         aps-environment: development
         com.apple.security.application-groups:
           - group.com.baybo.app
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)com.baybo.app
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full
@@ -73,7 +79,7 @@ targets:
         LIBRARY_SEARCH_PATHS[arch=arm64]: $(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: true
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
-        DEVELOPMENT_TEAM: KLK5BP5YS6
+        DEVELOPMENT_TEAM: $(BAYBO_IOS_DEVELOPMENT_TEAM)
         CODE_SIGN_STYLE: Automatic
       groups: [app]
     dependencies:
@@ -114,6 +120,7 @@ targets:
         CFBundleDisplayName: Baybo
         CFBundleShortVersionString: 0.1.0
         CFBundleVersion: "0.1.0"
+        BayboKeychainAccessGroup: $(AppIdentifierPrefix)com.baybo.app
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
@@ -122,6 +129,8 @@ targets:
       properties:
         com.apple.security.application-groups:
           - group.com.baybo.app
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)com.baybo.app
     settings:
       base:
         PRODUCT_NAME: NotificationExtension
@@ -132,7 +141,7 @@ targets:
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
         SKIP_INSTALL: true
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: false
-        DEVELOPMENT_TEAM: KLK5BP5YS6
+        DEVELOPMENT_TEAM: $(BAYBO_IOS_DEVELOPMENT_TEAM)
         CODE_SIGN_STYLE: Automatic
     dependencies:
       - sdk: UserNotifications.framework

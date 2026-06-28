@@ -10,8 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use baybo_pairing::DevicePairingService;
-use baybo_store::device_pairing::DevicePairingSlot;
+use baybo_pairing::{DevicePairingService, DevicePairingSlot};
 use baybo_store::{DeviceRow, DeviceStatus};
 use serde_json::json;
 
@@ -585,6 +584,7 @@ async fn revoke(ctx: &CommandContext, device_id: String, yes: bool) -> Result<Co
 
 fn status_str(row: &DeviceRow) -> &'static str {
     match row.status {
+        DeviceStatus::Provisioning => "PROVISIONING",
         DeviceStatus::Approved => "APPROVED",
         DeviceStatus::Revoked => "REVOKED",
     }

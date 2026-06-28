@@ -175,6 +175,20 @@ pub struct Message {
     pub ordinal: Option<i64>,
 }
 
+/// Maximum number of user messages allowed in one inbound [`Frame::Messages`]
+/// batch. Gateway validation and agent-side defense-in-depth share this so the
+/// WS boundary and router contract cannot drift.
+pub const MAX_MESSAGE_BATCH_MESSAGES: usize = 64;
+
+/// Maximum aggregate UTF-8 text bytes allowed across one inbound
+/// [`Frame::Messages`] batch.
+pub const MAX_MESSAGE_BATCH_TEXT_BYTES: usize = 64 * 1024;
+
+/// Maximum aggregate attachments allowed across one inbound [`Frame::Messages`]
+/// batch. Attachments carry blob IDs, not bytes; this caps fan-out and downstream
+/// per-message conversion work.
+pub const MAX_MESSAGE_BATCH_ATTACHMENTS: usize = 64;
+
 /// One slash command published to a sidecar's native command surface
 /// (Telegram `setMyCommands`, Discord application commands, …). The
 /// gateway is the single source of truth for the command list and

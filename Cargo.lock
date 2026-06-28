@@ -986,7 +986,6 @@ dependencies = [
  "baybo-model",
  "bytes",
  "chrono",
- "device-proto",
  "futures",
  "serde",
  "thiserror 2.0.18",
@@ -3882,7 +3881,9 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures",
+ "hex",
  "parking_lot",
+ "rand 0.9.4",
  "remote-host-admission",
  "remote-host-protocol",
  "remote-host-ratelimit",

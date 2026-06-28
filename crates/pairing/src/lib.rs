@@ -12,10 +12,12 @@
 
 mod code;
 mod device_service;
+mod device_slot;
 mod error;
 mod service;
 
 pub use code::{CODE_LEN, CodeError, generate_code};
 pub use device_service::DevicePairingService;
+pub use device_slot::DevicePairingSlot;
 pub use error::{DevicePairingError, PairingError};
 pub use service::{CheckOutcome, PairingService};

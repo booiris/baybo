@@ -9,11 +9,11 @@
 //! transactionally by [`DeviceStore::create_replacing_approved`] and backstopped
 //! by the `idx_devices_one_approved` partial unique index.
 //!
-//! Lifecycle: a row is written `Approved` the moment the phone user and the
-//! operator both confirm the pairing (carrying the device's static pubkey + an
-//! active `auth_token`), and flipped to `Revoked` on revoke — or when a newer
-//! pairing replaces it. Per the project rule, **revoke never deletes the row**
-//! — it keeps the audit trail (so a superseded device stays visible in
+//! Lifecycle: a row is first written `Provisioning` after both sides confirm,
+//! while the gateway persists the push/APNs material and sends the welcome frame.
+//! Only then is it promoted to `Approved` (active `auth_token`) and any prior
+//! approved binding is revoked. Per the project rule, **revoke never deletes the
+//! row** — it keeps the audit trail (so a superseded device stays visible in
 //! `device list`) and stops the `auth_token` UNIQUE slot from being silently
 //! reused. The APNs token does not live here (it lives in the remote-host push
 //! store); A only needs `device_id` to address a push.
@@ -28,11 +28,12 @@ use crate::StorageError;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
-/// Lifecycle state of a device row. A row exists only once both ends confirmed
-/// the pairing, so there is no inert/pending state — it is `Approved` from
-/// creation until `Revoked`.
+/// Lifecycle state of a device row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceStatus {
+    /// Confirmed by both users, but not yet active. The token does not
+    /// authenticate until the row is promoted to [`Approved`](Self::Approved).
+    Provisioning,
     /// Active — the `auth_token` authenticates the scoped device surface
     /// (`/v1/chat/*` + channel-ws).
     Approved,
@@ -44,6 +45,7 @@ pub enum DeviceStatus {
 impl DeviceStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
+            DeviceStatus::Provisioning => "provisioning",
             DeviceStatus::Approved => "approved",
             DeviceStatus::Revoked => "revoked",
         }
@@ -51,6 +53,7 @@ impl DeviceStatus {
 
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
+            "provisioning" => Some(Self::Provisioning),
             "approved" => Some(Self::Approved),
             "revoked" => Some(Self::Revoked),
             _ => None,
@@ -101,13 +104,24 @@ pub struct DeviceRow {
 /// Persistence contract for device-registry rows.
 #[async_trait]
 pub trait DeviceStore: Send + Sync {
-    /// Insert a freshly-paired (`Approved`) device row. Errors with
+    /// Insert a device row. Errors with
     /// [`StorageError::Conflict`] if the `device_id` or the `auth_token` already
     /// exists. Does **not** enforce the one-approved invariant on its own — the
     /// pairing path uses
     /// [`create_replacing_approved`](Self::create_replacing_approved); plain
     /// `create` is the bare insert primitive (tests, fixtures).
     async fn create(&self, row: &DeviceRow) -> Result<()>;
+
+    /// Insert or refresh a freshly confirmed device row in `Provisioning` status
+    /// without touching the existing approved binding. This row must not
+    /// authenticate until [`approve_replacing`](Self::approve_replacing) promotes
+    /// it.
+    async fn create_provisioning(&self, row: &DeviceRow) -> Result<()>;
+
+    /// Promote a previously staged row to `Approved` and revoke any other
+    /// approved device in the same transaction. Returns the `device_id`s of other
+    /// bindings superseded by this promotion.
+    async fn approve_replacing(&self, device_id: &str, approved_at: i64) -> Result<Vec<String>>;
 
     /// Atomically supersede the current binding with a freshly-paired device: in
     /// one transaction, revoke every still-`Approved` row, then upsert `row`
