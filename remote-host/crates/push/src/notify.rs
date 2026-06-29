@@ -19,6 +19,7 @@ use crate::error::PushError;
 use crate::jwt::ApnsProviderToken;
 use crate::ratelimit::NotifyRateLimiter;
 use crate::store::{DeviceRegistration, DeviceTokenStore};
+use crate::traffic::PushTrafficRegistry;
 
 /// The `/notify` + `/register` request bodies live in the shared protocol crate,
 /// so the gateway POSTs the exact same shapes (re-exported here for the rest of
@@ -67,6 +68,9 @@ pub struct NotifyService {
     store: Arc<dyn DeviceTokenStore>,
     sender: Arc<dyn ApnsSender>,
     signer: Arc<ApnsProviderToken>,
+    /// Per-`device_id` send/byte counters for the durable traffic ledger; every
+    /// issued APNs send is recorded here, off the verdict path.
+    traffic: Arc<PushTrafficRegistry>,
     /// Per-`device_id` frequency control, checked before any APNs work so a flood
     /// is cheap to refuse.
     rate: NotifyRateLimiter,
@@ -82,6 +86,7 @@ impl NotifyService {
         store: Arc<dyn DeviceTokenStore>,
         sender: Arc<dyn ApnsSender>,
         signer: Arc<ApnsProviderToken>,
+        traffic: Arc<PushTrafficRegistry>,
         topic: impl Into<String>,
         rate: NotifyRateLimiter,
     ) -> Self {
@@ -89,6 +94,7 @@ impl NotifyService {
             store,
             sender,
             signer,
+            traffic,
             rate,
             cached_jwt: Mutex::new(None),
             topic: topic.into(),
@@ -217,7 +223,14 @@ impl NotifyService {
             provider_jwt: jwt,
             payload: build_payload(&req),
         };
-        match self.sender.send(apns_req).await {
+        // Capture the egress size before the request is moved into the sender, then
+        // record this send for every outcome — the APNs request went out regardless
+        // of the verdict, so it counts toward "发送次数". (Past the rate / signature
+        // / store checks, so the traffic map is bounded by the registered set.)
+        let payload_len = apns_req.payload.len();
+        let outcome = self.sender.send(apns_req).await;
+        self.traffic.record(&req.device_id, payload_len);
+        match outcome {
             ApnsOutcome::Delivered => {
                 // APNs accepted the token → a real device is behind this binding.
                 // Confirm it so it is exempt from idle eviction and refresh its
@@ -280,6 +293,7 @@ mod tests {
     use crate::apns::ApnsEnv;
     use crate::delegation::{ENV_SANDBOX, test_sign};
     use crate::store::{DeviceRegistration, InMemoryDeviceTokenStore};
+    use crate::traffic::PushTrafficRegistry;
     use async_trait::async_trait;
     use base64::Engine;
     use ed25519_dalek::SigningKey;
@@ -387,10 +401,19 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     }
 
     fn service(sender: Arc<MockApns>, store: Arc<InMemoryDeviceTokenStore>) -> NotifyService {
+        service_with_traffic(sender, store, Arc::new(PushTrafficRegistry::new()))
+    }
+
+    fn service_with_traffic(
+        sender: Arc<MockApns>,
+        store: Arc<InMemoryDeviceTokenStore>,
+        traffic: Arc<PushTrafficRegistry>,
+    ) -> NotifyService {
         NotifyService::new(
             store,
             sender,
             signer(),
+            traffic,
             "com.baybo.app",
             NotifyRateLimiter::default(),
         )
@@ -602,6 +625,73 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         assert_eq!(v["enc"], "Y2lwaGVydGV4dA==");
         assert_eq!(v["n"], "bm9uY2U=");
         assert_eq!(v["bid"], device_id);
+    }
+
+    #[tokio::test]
+    async fn delivered_send_records_one_send_and_its_payload_bytes() {
+        let (_d, gateway, device_id) = keys();
+        let store = Arc::new(InMemoryDeviceTokenStore::new());
+        seed(&store, &gateway, &device_id, "tok");
+        let traffic = Arc::new(PushTrafficRegistry::new());
+        let sender = Arc::new(MockApns::new(ApnsOutcome::Delivered));
+        let svc = service_with_traffic(Arc::clone(&sender), store, Arc::clone(&traffic));
+
+        assert_eq!(
+            svc.notify(notify_req(&gateway, &device_id, 1), 1000).await,
+            NotifyOutcome::Delivered,
+        );
+        let sent_len = sender.last.lock().clone().unwrap().payload.len() as u64;
+        let snap = traffic.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].device_id, device_id);
+        assert_eq!(snap[0].counts.sends, 1);
+        assert_eq!(snap[0].counts.bytes, sent_len);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_still_records_the_egress() {
+        // BadDeviceToken prunes the binding, but the APNs request DID go out — so it
+        // counts toward the device's send total.
+        let (_d, gateway, device_id) = keys();
+        let store = Arc::new(InMemoryDeviceTokenStore::new());
+        seed(&store, &gateway, &device_id, "dead");
+        let traffic = Arc::new(PushTrafficRegistry::new());
+        let svc = service_with_traffic(
+            Arc::new(MockApns::new(ApnsOutcome::BadDeviceToken)),
+            store,
+            Arc::clone(&traffic),
+        );
+        assert_eq!(
+            svc.notify(notify_req(&gateway, &device_id, 1), 1000).await,
+            NotifyOutcome::Pruned,
+        );
+        let snap = traffic.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].counts.sends, 1,
+            "egress counted even on a pruned token"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_outcome_that_never_reaches_apns_records_nothing() {
+        // An unknown device is refused before any send, so nothing egressed.
+        let (_d, gateway, device_id) = keys();
+        let store = Arc::new(InMemoryDeviceTokenStore::new()); // empty
+        let traffic = Arc::new(PushTrafficRegistry::new());
+        let svc = service_with_traffic(
+            Arc::new(MockApns::new(ApnsOutcome::Delivered)),
+            store,
+            Arc::clone(&traffic),
+        );
+        assert_eq!(
+            svc.notify(notify_req(&gateway, &device_id, 1), 1000).await,
+            NotifyOutcome::UnknownDevice,
+        );
+        assert!(
+            traffic.snapshot().is_empty(),
+            "no send issued → no traffic recorded"
+        );
     }
 
     #[tokio::test]

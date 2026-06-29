@@ -74,6 +74,15 @@ services:
       # design for a public endpoint).
       RUST_LOG: ${RUST_LOG:-}
       LOG_DIR: ${LOG_DIR:-/data/logs}
+      # Traffic ledger — per-tenant relay bytes/frames (up/down) + per-device push
+      # sends/bytes accumulated into a SQLite DB on the /data volume
+      # (./data/traffic.db, separate from admission.db; inspect with sqlite3 — see
+      # DEPLOY.md). The data path is lock-free; a background task flushes every
+      # TRAFFIC_FLUSH_SECS. A blank TRAFFIC_DB_PATH keeps in-memory accounting but
+      # persists nothing (no-colon default applies only when unset, so blank passes
+      # through to disable).
+      TRAFFIC_DB_PATH: ${TRAFFIC_DB_PATH-/data/traffic.db}
+      TRAFFIC_FLUSH_SECS: ${TRAFFIC_FLUSH_SECS:-60}
     secrets:
       - apns_p8
     volumes:

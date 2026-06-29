@@ -19,20 +19,21 @@
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 
-use crate::bandwidth::BandwidthLimiter;
 use crate::broker::RelayLeg;
+use crate::traffic::LegMetering;
 
 /// Pump one WebSocket against its matched [`RelayLeg`] until either side closes:
 /// binary frames the client sends go to the partner leg; frames from the
 /// partner go back to the client. Non-binary control frames (ping/pong/text)
 /// are ignored — the relay only carries opaque binary.
 ///
-/// `limiter` (present for content legs, `None` for pairing) throttles bytes
-/// **read from this socket** to the gateway's configured rate: the pump reserves
-/// the frame's bytes and sleeps off any debt before forwarding, so an unread
-/// socket backpressures its sender over TCP. Both legs of a session share one
-/// limiter, so the cap is the gateway's aggregate.
-pub async fn pump_ws(socket: WebSocket, leg: RelayLeg, limiter: Option<BandwidthLimiter>) {
+/// `metering` (present for content legs, `None` for pairing/control) both throttles
+/// and accounts the bytes **read from this socket**: each frame is recorded against
+/// the gateway's `(remote_api_key, server_id)` traffic counters, then the limiter
+/// reserves its bytes and sleeps off any debt before forwarding, so an unread socket
+/// backpressures its sender over TCP. Both legs of a session share one limiter +
+/// counter pair, so the throttle cap and the traffic total are the gateway's aggregate.
+pub async fn pump_ws(socket: WebSocket, leg: RelayLeg, metering: Option<LegMetering>) {
     let (mut sink, mut source) = socket.split();
     let RelayLeg {
         to_peer,
@@ -45,8 +46,11 @@ pub async fn pump_ws(socket: WebSocket, leg: RelayLeg, limiter: Option<Bandwidth
         while let Some(msg) = source.next().await {
             match msg {
                 Ok(Message::Binary(b)) => {
-                    if let Some(limiter) = &limiter {
-                        limiter.throttle(b.len()).await;
+                    if let Some(m) = &metering {
+                        // Account the ingressed bytes (before forwarding, mirroring
+                        // the throttle debit), then pace to the gateway's rate.
+                        m.meter.record(b.len());
+                        m.limiter.throttle(b.len()).await;
                     }
                     if to_peer.send(b.to_vec()).await.is_err() {
                         break; // partner leg gone

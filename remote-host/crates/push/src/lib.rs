@@ -17,6 +17,7 @@ pub mod notify;
 pub mod ratelimit;
 pub mod serve;
 pub mod store;
+pub mod traffic;
 
 pub use apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender};
 pub use apns_http::HttpApnsSender;
@@ -27,3 +28,4 @@ pub use notify::{NotifyOutcome, NotifyRequest, NotifyService, RegisterOutcome, R
 pub use ratelimit::NotifyRateLimiter;
 pub use serve::{PushConfig, PushLimits, build_router};
 pub use store::{DeviceRegistration, DeviceTokenStore, InMemoryDeviceTokenStore};
+pub use traffic::{PushCounts, PushTrafficDelta, PushTrafficRegistry};

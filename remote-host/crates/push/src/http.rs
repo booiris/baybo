@@ -114,6 +114,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             Arc::new(store),
             Arc::new(OkApns),
             Arc::new(ApnsProviderToken::new("KID", "TEAM", TEST_P8.as_bytes()).unwrap()),
+            Arc::new(crate::traffic::PushTrafficRegistry::new()),
             "com.baybo.app",
             crate::ratelimit::NotifyRateLimiter::default(),
         ));
