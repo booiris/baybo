@@ -6,6 +6,19 @@ use serde::{Deserialize, Serialize};
 pub const NOTIFY: &str = "/notify";
 pub const REGISTER: &str = "/register";
 
+/// Ed25519 domain-separation contexts prefixing each signed message in the
+/// push-binding chain, distinct per kind so a signature minted for one role can
+/// never verify as another. The gateway/app (`device-proto`) sign; the host
+/// (`remote-host-push`) verifies — two implementations in workspaces that cannot
+/// link each other. Both consume these consts, so the context bytes are a single
+/// source of truth and cannot silently drift and break every push. The rest of
+/// the signed byte layout (the `env` mapping and the `u32`-LE length-prefix
+/// framing) lives in each `delegation` module, guarded against drift by their
+/// shared pinned-signature cross-impl test vector.
+pub const DELEGATION_CONTEXT: &[u8] = b"baybo/push/delegation/v1";
+pub const REGISTER_CONTEXT: &[u8] = b"baybo/push/register/v1";
+pub const NOTIFY_CONTEXT: &[u8] = b"baybo/push/notify/v1";
+
 /// Which APNs environment a device token is bound to (the `env` of
 /// [`RegisterRequest`]). A sandbox token is rejected by the production host and
 /// vice versa, so it is tracked per device.

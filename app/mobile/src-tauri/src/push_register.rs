@@ -61,10 +61,19 @@ pub fn register() {
         let app = UIApplication::sharedApplication(mtm);
         // Install the token-capture callbacks BEFORE kicking off registration so
         // the async token delivery can't race ahead of the method being added.
-        install_token_capture(&app);
+        // `register` may be called again on foreground to retry a failed launch
+        // registration, so install exactly once — re-adding the delegate methods
+        // each time would only log spurious "already implements" noise.
+        if !CAPTURE_INSTALLED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            install_token_capture(&app);
+        }
         app.registerForRemoteNotifications();
     }
 }
+
+/// Guards the one-time install of the APNs delegate callbacks (see [`register`]).
+#[cfg(target_os = "ios")]
+static CAPTURE_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "ios")]
 fn set_apns_token(hex: String) {
@@ -89,7 +98,9 @@ extern "C-unwind" fn did_register(
 }
 
 /// iOS reports APNs registration failure here; log and leave the token unset.
-/// A later successful token callback will retry registration once paired.
+/// There is no in-callback retry, but the app re-arms `register` on the next
+/// foreground while no token is held (see the `Resumed` handler), so a transient
+/// launch-time failure recovers without a relaunch.
 #[cfg(target_os = "ios")]
 extern "C-unwind" fn did_fail(
     _this: *mut objc2::runtime::AnyObject,

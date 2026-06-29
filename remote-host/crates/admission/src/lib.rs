@@ -13,14 +13,24 @@ use std::str::FromStr;
 use chrono::Utc;
 use parking_lot::RwLock;
 
-/// Guest-tier default limits, applied by [`Admission::resolve`] when a
-/// `tier='guest'` row leaves the matching column NULL. Registered rows have **no**
-/// tier default — a NULL limit there stays `None`, so the caller floors it with its
-/// own conservative global role default (`MAX_CONNS_PER_REMOTE_API_KEY` /
-/// `RELAY_BYTES_PER_SEC`). That asymmetry is what removes any tier inversion.
+/// Guest-tier default limits — the **final** fallback for a `tier='guest'` row that
+/// leaves the matching column NULL, used only when the [`GUEST_TEMPLATE_KEY`] row is
+/// absent or also leaves that column NULL. Registered rows have **no** tier default —
+/// a NULL limit there stays `None`, so the caller floors it with its own conservative
+/// global role default (`MAX_CONNS_PER_REMOTE_API_KEY` / `RELAY_BYTES_PER_SEC`). That
+/// asymmetry is what removes any tier inversion.
 pub const GUEST_MAX_CONNS: u32 = 2_000;
 pub const GUEST_MAX_BPS: u64 = 20_971_520; // 20 MiB/s
 pub const GUEST_PER_SERVER_MAX_BPS: u64 = 2_097_152; // 2 MiB/s
+
+/// The reserved `remote_api_key` whose own row is the **guest-tier template**: a
+/// guest row's NULL limit column inherits this row's value for that column (then the
+/// `GUEST_*` const). It is an ordinary admitted row — the shared trial key — that
+/// doubles as the tier's tunable defaults, so the limits are libsql-configurable
+/// (`UPDATE remote_api_keys SET max_conns=… WHERE remote_api_key='guest'`) with no
+/// separate config table. The lookup is by `remote_api_key`, independent of the
+/// template row's own tier.
+pub const GUEST_TEMPLATE_KEY: &str = "guest";
 
 /// SQLite `datetime('now')` wall-clock shape (UTC, fixed-width). `expires_at` is
 /// stored and compared in exactly this format, so a lexicographic compare here
@@ -76,15 +86,23 @@ impl AdmissionEntry {
         }
     }
 
-    /// Fill NULL guest-tier limits with the guest defaults; registered NULLs stay
-    /// `None` for the caller to floor. Idempotent.
-    fn with_tier_defaults(mut self) -> Self {
-        if self.tier == Tier::Guest {
-            self.max_conns.get_or_insert(GUEST_MAX_CONNS);
-            self.max_bps.get_or_insert(GUEST_MAX_BPS);
-            self.per_server_max_bps
-                .get_or_insert(GUEST_PER_SERVER_MAX_BPS);
-        }
+    /// Fill this guest row's NULL limits from the [`GUEST_TEMPLATE_KEY`] row's
+    /// columns (`template`), falling through per-column to the `GUEST_*` const when
+    /// the template is absent or also NULL there. Caller guarantees
+    /// `self.tier == Tier::Guest`. Idempotent (an explicit per-row limit is kept).
+    fn with_guest_defaults(mut self, template: Option<&AdmissionEntry>) -> Self {
+        self.max_conns.get_or_insert(
+            template
+                .and_then(|t| t.max_conns)
+                .unwrap_or(GUEST_MAX_CONNS),
+        );
+        self.max_bps
+            .get_or_insert(template.and_then(|t| t.max_bps).unwrap_or(GUEST_MAX_BPS));
+        self.per_server_max_bps.get_or_insert(
+            template
+                .and_then(|t| t.per_server_max_bps)
+                .unwrap_or(GUEST_PER_SERVER_MAX_BPS),
+        );
         self
     }
 }
@@ -187,10 +205,18 @@ impl InMemoryAdmission {
 
 impl Admission for InMemoryAdmission {
     fn resolve(&self, remote_api_key: &str) -> Admit {
-        match self.keys.read().get(remote_api_key) {
+        let keys = self.keys.read();
+        match keys.get(remote_api_key) {
             None => Admit::Unknown,
             Some(entry) if entry.is_expired() => Admit::Expired,
-            Some(entry) => Admit::Ok(entry.clone().with_tier_defaults()),
+            Some(entry) if entry.tier == Tier::Guest => {
+                // A guest row's NULL limits inherit the `guest` template row's columns
+                // (then the GUEST_* consts). The template is just another row in this
+                // same map — read under the one shared lock, no extra synchronization.
+                let template = keys.get(GUEST_TEMPLATE_KEY);
+                Admit::Ok(entry.clone().with_guest_defaults(template))
+            }
+            Some(entry) => Admit::Ok(entry.clone()),
         }
     }
 }
@@ -255,6 +281,107 @@ mod tests {
             Some(GUEST_MAX_BPS),
             "the unset one still defaults"
         );
+    }
+
+    #[test]
+    fn guest_template_row_supplies_defaults_to_other_guests() {
+        let a = InMemoryAdmission::new();
+        a.replace_all(keyset([
+            (
+                GUEST_TEMPLATE_KEY,
+                AdmissionEntry {
+                    tier: Tier::Guest,
+                    max_conns: Some(500),
+                    max_bps: Some(10_485_760),
+                    per_server_max_bps: Some(1_048_576),
+                    ..Default::default()
+                },
+            ),
+            ("g2", entry(Tier::Guest)),
+        ]));
+        let Admit::Ok(e) = a.resolve("g2") else {
+            panic!("guest is admitted")
+        };
+        assert_eq!(e.max_conns, Some(500), "inherits the `guest` template row");
+        assert_eq!(e.max_bps, Some(10_485_760));
+        assert_eq!(e.per_server_max_bps, Some(1_048_576));
+    }
+
+    #[test]
+    fn guest_row_explicit_limit_beats_the_template() {
+        let a = InMemoryAdmission::new();
+        a.replace_all(keyset([
+            (
+                GUEST_TEMPLATE_KEY,
+                AdmissionEntry {
+                    tier: Tier::Guest,
+                    max_conns: Some(500),
+                    ..Default::default()
+                },
+            ),
+            (
+                "g2",
+                AdmissionEntry {
+                    tier: Tier::Guest,
+                    max_conns: Some(5),
+                    ..Default::default()
+                },
+            ),
+        ]));
+        let Admit::Ok(e) = a.resolve("g2") else {
+            panic!()
+        };
+        assert_eq!(e.max_conns, Some(5), "the row's explicit limit wins");
+        assert_eq!(
+            e.max_bps,
+            Some(GUEST_MAX_BPS),
+            "a column the template also leaves NULL falls through to the const"
+        );
+    }
+
+    #[test]
+    fn guest_template_null_column_falls_through_to_the_const() {
+        let a = InMemoryAdmission::new();
+        a.replace_all(keyset([
+            (
+                GUEST_TEMPLATE_KEY,
+                AdmissionEntry {
+                    tier: Tier::Guest,
+                    max_conns: Some(500),
+                    // max_bps / per_server_max_bps left NULL on the template.
+                    ..Default::default()
+                },
+            ),
+            ("g2", entry(Tier::Guest)),
+        ]));
+        let Admit::Ok(e) = a.resolve("g2") else {
+            panic!()
+        };
+        assert_eq!(e.max_conns, Some(500), "set template column is inherited");
+        assert_eq!(
+            e.max_bps,
+            Some(GUEST_MAX_BPS),
+            "NULL template column -> const fallback"
+        );
+        assert_eq!(e.per_server_max_bps, Some(GUEST_PER_SERVER_MAX_BPS));
+    }
+
+    #[test]
+    fn guest_template_row_resolves_itself_with_its_own_limits() {
+        let a = InMemoryAdmission::new();
+        a.replace_all(keyset([(
+            GUEST_TEMPLATE_KEY,
+            AdmissionEntry {
+                tier: Tier::Guest,
+                max_conns: Some(500),
+                ..Default::default()
+            },
+        )]));
+        let Admit::Ok(e) = a.resolve(GUEST_TEMPLATE_KEY) else {
+            panic!()
+        };
+        assert_eq!(e.max_conns, Some(500));
+        assert_eq!(e.max_bps, Some(GUEST_MAX_BPS), "its own NULL -> const");
     }
 
     #[test]

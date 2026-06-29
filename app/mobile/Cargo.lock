@@ -782,6 +782,7 @@ dependencies = [
  "hex",
  "hkdf",
  "rand 0.10.1",
+ "remote-host-protocol",
  "rmp-serde",
  "serde",
  "serde_bytes",

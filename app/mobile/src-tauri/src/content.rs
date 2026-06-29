@@ -23,6 +23,16 @@ use baybo_mobile_core::{
 use device_proto::noise::StaticKeypair;
 use futures_util::{SinkExt, StreamExt};
 use tauri::ipc::Channel;
+use tauri::{AppHandle, Emitter};
+
+/// Tauri event the pump emits when a live content session ends on its own (the
+/// socket closed, the inbound-liveness watchdog lapsed, the Noise stream
+/// desynced, or the webview dropped the frame channel) — but NOT when the task is
+/// deliberately aborted by a fresh [`connect`] or [`disconnect`], which cancel it
+/// before this fires. The webview listens and reconnects with backoff, so a chat
+/// that drops mid-session (e.g. a remote-host restart) recovers without waiting
+/// for the next foreground.
+pub(crate) const CONTENT_DISCONNECTED_EVENT: &str = "content-disconnected";
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message, http::StatusCode};
@@ -101,6 +111,7 @@ struct Established {
 /// to `on_frame`. Dials the gateway over the relay's content-join leg, completes
 /// the Noise handshake, then spawns the pump task.
 pub async fn connect(
+    app: AppHandle,
     sessions: &ContentSessions,
     session_id: String,
     since_ordinal: Option<i64>,
@@ -136,6 +147,7 @@ pub async fn connect(
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
     let device_id = record.device_id.clone();
     let task = tokio::spawn(pump(
+        app,
         established.ws,
         established.session,
         session_id,
@@ -273,13 +285,42 @@ async fn recv_binary(ws: &mut Ws) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Own the socket + `ContentSession` for the session's lifetime: subscribe, then
-/// fan inbound (decrypted) frames to `on_frame` and seal outbound user messages.
+/// Own the socket + `ContentSession` for the session's lifetime, then tell the
+/// webview when it ends. Wraps [`run_pump`]: if it returns, the session dropped on
+/// its own and the webview should reconnect; a deliberate teardown aborts this
+/// task before the emit, so [`CONTENT_DISCONNECTED_EVENT`] fires only on an
+/// unsolicited drop.
+#[allow(clippy::too_many_arguments)]
 async fn pump(
+    app: AppHandle,
     ws: Ws,
-    mut session: ContentSession,
+    session: ContentSession,
     session_id: String,
     device_id: String,
+    since_ordinal: Option<i64>,
+    on_frame: Channel<Frame>,
+    outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
+) {
+    run_pump(
+        ws,
+        session,
+        &session_id,
+        &device_id,
+        since_ordinal,
+        on_frame,
+        outbound_rx,
+    )
+    .await;
+    let _ = app.emit(CONTENT_DISCONNECTED_EVENT, &session_id);
+}
+
+/// Subscribe, then fan inbound (decrypted) frames to `on_frame` and seal outbound
+/// user messages, until the session ends for any reason.
+async fn run_pump(
+    ws: Ws,
+    mut session: ContentSession,
+    session_id: &str,
+    device_id: &str,
     since_ordinal: Option<i64>,
     on_frame: Channel<Frame>,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
@@ -289,7 +330,7 @@ async fn pump(
     // Self-pull: subscribe to the session so the gateway streams live agent output
     // and replays any thread rows above `since_ordinal` (the catch-up gap on a
     // reconnect after the app was backgrounded; `None` = no catch-up).
-    match session.seal(&subscribe_frame(&session_id, since_ordinal)) {
+    match session.seal(&subscribe_frame(session_id, since_ordinal)) {
         Ok(messages) => {
             for bytes in messages {
                 if sink.send(Message::Binary(bytes)).await.is_err() {
@@ -366,7 +407,7 @@ async fn pump(
             cmd = outbound_rx.recv() => match cmd {
                 Some(OutboundCmd::Send { text, msg_id, attachments }) => {
                     let frame =
-                        user_message_frame(&session_id, &device_id, &text, &msg_id, attachments);
+                        user_message_frame(session_id, device_id, &text, &msg_id, attachments);
                     match session.seal(&frame) {
                         Ok(messages) => {
                             for bytes in messages {

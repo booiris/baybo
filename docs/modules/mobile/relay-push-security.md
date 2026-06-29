@@ -506,7 +506,13 @@ Keys (all established at pairing — see
    accepted; on success it stores `device_id -> { apns_token, env, gateway_pubkey,
    last_counter }`. Any failure → `403`, binding untouched. A caches the
    last-registered token per device and re-registers at most once per
-   `(device, token)` per run.
+   `(device, token)` per run — **except** that a `/notify` answered `404`
+   (C has no binding for the device, e.g. it restarted and lost its in-memory
+   store) invalidates that cache entry, forces a re-register from persisted
+   material, and retries the push once. So a remote-host restart self-heals on the
+   next push instead of wedging at `404` until A restarts or the token rotates. If
+   the device is still unknown after that re-register (missing delegation/APNs
+   material), A logs a warning rather than failing silently.
 4. **Token refresh.** A token that missed `DeviceHello`, or rotated after pairing,
    reaches A over the content channel: P sends its current token in a sealed
    `Frame::UpdateApnsToken { apns_token, apns_env }` over the Noise IK content leg
@@ -869,7 +875,14 @@ from Noise and `push_key`, not from C admission.
   that missed `DeviceHello` or rotated later is re-registered without a re-pair.
 - A retries push registration (signed) from non-empty APNs material persisted in
   the vault before its first push in a run, which self-heals a missing C-side
-  token binding when the token was available to A.
+  token binding when the token was available to A. A `/notify` answered `404`
+  (C's in-memory binding is gone, e.g. a remote-host restart) additionally
+  invalidates A's per-device register cache and re-registers + retries inline, so
+  recovery does not wait for an A restart or a token rotation.
+- The push replay `counter` keeps a persisted high-water mark in the vault, so it
+  stays strictly increasing across an A restart even if the wall clock steps
+  backward (an NTP correction otherwise risks a counter below C's last accepted,
+  which would `403` every push until the clock caught up).
 - Blob transfer uses the same Noise IK authentication as chat, but on a separate
   relay data leg with traffic class `blob`; C meters it as background traffic.
   See [`blob-transfer.md`](blob-transfer.md).

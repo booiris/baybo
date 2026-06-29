@@ -7,6 +7,9 @@ edition.workspace = true
 doctest = false
 
 [dependencies]
+# Shared single source of truth for the push delegation domain-separation
+# contexts (C's verifier links the same crate; the bytes must agree exactly).
+remote-host-protocol = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 rmp-serde = { workspace = true }
