@@ -1,11 +1,12 @@
-//! The `/notify` pipeline: admit → resolve token → sign → send blind → prune.
+//! The `/notify` pipeline: resolve token → verify → sign → send blind → prune.
 //!
-//! A gateway (A) POSTs a [`NotifyRequest`] on every pushable turn. The push
-//! role validates the `remote_api_key`, looks up the device's APNs token, builds a
-//! blind payload (a generic visible alert the NSE later rewrites, plus the
-//! verbatim `enc`/`n`/`bid`), signs the provider token, and sends via the
-//! [`ApnsSender`] seam — pruning the token on a `400`/`410`. It never decrypts
-//! `enc`.
+//! A gateway (A) POSTs a [`NotifyRequest`] on every pushable turn. The push role
+//! looks up the device's APNs token, verifies the notify under the gateway push
+//! key the device delegated at `/register`, builds a blind payload (a generic
+//! visible alert the NSE later rewrites, plus the verbatim `enc`/`n`/`bid`), signs
+//! the provider token, and sends via the [`ApnsSender`] seam — pruning the token
+//! on a `400`/`410`. It never decrypts `enc`. The routes are keyless: the
+//! delegation chain, not a caller key, authorizes every binding and notify.
 
 use std::sync::Arc;
 
@@ -16,8 +17,8 @@ use crate::apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender};
 use crate::delegation;
 use crate::error::PushError;
 use crate::jwt::ApnsProviderToken;
-use crate::ratelimit::{NotifyRateLimiter, PerKeySendLimiter};
-use crate::store::{Admission, Admit, DeviceRegistration, DeviceTokenStore};
+use crate::ratelimit::NotifyRateLimiter;
+use crate::store::{DeviceRegistration, DeviceTokenStore};
 
 /// The `/notify` + `/register` request bodies live in the shared protocol crate,
 /// so the gateway POSTs the exact same shapes (re-exported here for the rest of
@@ -28,15 +29,13 @@ pub use remote_host_protocol::push::{NotifyRequest, RegisterRequest};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterOutcome {
     Registered,
-    /// `remote_api_key` is not admitted.
-    Unadmitted,
     /// The `apns_token` is implausibly long, so it is refused before an oversized
     /// junk token can bloat a stored binding (`400`).
     InvalidToken,
     /// The device→gateway delegation, the register signature, or the replay
     /// counter failed verification — the caller could not prove ownership of the
-    /// `device_id`, so the binding is left untouched (the defense against a tenant
-    /// hijacking another's binding under a shared `remote_api_key`).
+    /// `device_id`, so the binding is left untouched. The delegation chain is what
+    /// stops anyone from hijacking another device's binding.
     Rejected,
     /// The device-token store is at its hard cap with no idle/unconfirmed binding
     /// to evict, so the registration is shed (`503`) rather than growing the store
@@ -48,15 +47,13 @@ pub enum RegisterOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifyOutcome {
     Delivered,
-    /// `remote_api_key` is not admitted.
-    Unadmitted,
     /// `device_id` is pushing faster than its allowed rate; the gateway should
     /// back off and retry (`429`).
     RateLimited,
     /// No APNs binding for `device_id`.
     UnknownDevice,
     /// The notify signature (under the gateway key the device delegated) or its
-    /// replay counter failed — a tenant cannot push to a device it doesn't own.
+    /// replay counter failed — no one can push to a device it doesn't own.
     Rejected,
     /// APNs rejected the token (`400`/`410`) → the binding was pruned.
     Pruned,
@@ -64,19 +61,15 @@ pub enum NotifyOutcome {
     Failed(String),
 }
 
-/// Wires admission + the device-token store + the provider-token signer + the
-/// APNs seam into the `/notify` pipeline.
+/// Wires the device-token store + the provider-token signer + the APNs seam into
+/// the `/notify` pipeline.
 pub struct NotifyService {
-    admission: Arc<dyn Admission>,
     store: Arc<dyn DeviceTokenStore>,
     sender: Arc<dyn ApnsSender>,
     signer: Arc<ApnsProviderToken>,
     /// Per-`device_id` frequency control, checked before any APNs work so a flood
     /// is cheap to refuse.
     rate: NotifyRateLimiter,
-    /// Per-`remote_api_key` aggregate APNs send ceiling, checked before egress so
-    /// one key cannot monopolize the shared `.p8` however many devices it owns.
-    key_ceiling: PerKeySendLimiter,
     /// The last signed provider JWT and its `iat`, reused across requests until
     /// it ages past the refresh window (APNs accepts a token for up to an hour).
     cached_jwt: Mutex<Option<(String, u64)>>,
@@ -86,21 +79,17 @@ pub struct NotifyService {
 
 impl NotifyService {
     pub fn new(
-        admission: Arc<dyn Admission>,
         store: Arc<dyn DeviceTokenStore>,
         sender: Arc<dyn ApnsSender>,
         signer: Arc<ApnsProviderToken>,
         topic: impl Into<String>,
         rate: NotifyRateLimiter,
-        key_ceiling: PerKeySendLimiter,
     ) -> Self {
         Self {
-            admission,
             store,
             sender,
             signer,
             rate,
-            key_ceiling,
             cached_jwt: Mutex::new(None),
             topic: topic.into(),
         }
@@ -121,12 +110,9 @@ impl NotifyService {
         Ok(jwt)
     }
 
-    /// Bind (or rebind) a device's APNs token, authenticated by the gateway's
-    /// `remote_api_key`. The push role's only per-device write outside `/notify`.
+    /// Bind (or rebind) a device's APNs token, authorized by the device→gateway
+    /// delegation chain. The push role's only per-device write outside `/notify`.
     pub fn register(&self, req: RegisterRequest) -> RegisterOutcome {
-        if !matches!(self.admission.resolve(&req.remote_api_key), Admit::Ok(_)) {
-            return RegisterOutcome::Unadmitted;
-        }
         // Cap the `apns_token` length cheaply, before any Ed25519 work — a
         // self-signed chain can sign any string, so bound how much one stored
         // binding can hold. A bogus-but-bounded token is caught later at /notify by
@@ -136,8 +122,8 @@ impl NotifyService {
         }
         // Verify the device→gateway delegation and the gateway's signature over
         // the binding. `device_id` self-certifies the device key, so C needs no
-        // stored secret and no trust-on-first-use; a co-tenant under a shared key
-        // can forge neither signature.
+        // stored secret and no trust-on-first-use; without the device's key no one
+        // can forge either signature.
         let Some(device_pub) = delegation::device_pubkey_from_id(&req.device_id) else {
             return RegisterOutcome::Rejected;
         };
@@ -183,9 +169,6 @@ impl NotifyService {
 
     /// Process one notify. `now` (unix seconds) stamps the provider token.
     pub async fn notify(&self, req: NotifyRequest, now: u64) -> NotifyOutcome {
-        if !matches!(self.admission.resolve(&req.remote_api_key), Admit::Ok(_)) {
-            return NotifyOutcome::Unadmitted;
-        }
         // Resolve the device BEFORE any heavier work (and before minting a rate
         // bucket): an unknown `device_id` is refused here, so the bucket map is
         // bounded by the registered set, not by attacker-supplied ids.
@@ -193,8 +176,8 @@ impl NotifyService {
             return NotifyOutcome::UnknownDevice;
         };
         // Authenticate the notify under the gateway key the device delegated
-        // (stored at register). A co-tenant under a shared `remote_api_key` can't
-        // forge it, so it can neither spam nor redirect this device.
+        // (stored at register) — without that key no one can spam or redirect this
+        // device, even knowing the `device_id`.
         let Some(gateway_pub) = delegation::verifying_key_from_bytes(&reg.gateway_pubkey) else {
             return NotifyOutcome::Rejected;
         };
@@ -220,13 +203,6 @@ impl NotifyService {
         }
         // Per-device frequency control gates before signing / egress.
         if !self.rate.check(&req.device_id) {
-            return NotifyOutcome::RateLimited;
-        }
-        // Aggregate per-`remote_api_key` ceiling: one key cannot monopolize the
-        // shared `.p8` however many `device_id`s it registered. Counted on
-        // authenticated notifies (post-verify), so it bounds *real* egress, and a
-        // bad-signature flood can't drain a shared key's budget for its co-tenants.
-        if !self.key_ceiling.check(&req.remote_api_key) {
             return NotifyOutcome::RateLimited;
         }
         let jwt = match self.provider_jwt(now) {
@@ -303,7 +279,7 @@ mod tests {
     use super::*;
     use crate::apns::ApnsEnv;
     use crate::delegation::{ENV_SANDBOX, test_sign};
-    use crate::store::{DeviceRegistration, InMemoryAdmission, InMemoryDeviceTokenStore};
+    use crate::store::{DeviceRegistration, InMemoryDeviceTokenStore};
     use async_trait::async_trait;
     use base64::Engine;
     use ed25519_dalek::SigningKey;
@@ -347,7 +323,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
 
     /// A plausible APNs device token (32 bytes hex) that passes the `/register`
     /// shape check — the chain/replay tests care about the chain, not the token,
-    /// but the token must clear F4 to reach those code paths.
+    /// but the token must clear the length cap to reach those code paths.
     const APNS_TOK: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     /// The device identity (seed 1) and its delegated gateway push key (seed 2),
@@ -374,16 +350,10 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     }
 
     /// A `/notify` signed by `gateway` for `device_id` at `counter`.
-    fn notify_req(
-        gateway: &SigningKey,
-        remote_api_key: &str,
-        device_id: &str,
-        counter: u64,
-    ) -> NotifyRequest {
+    fn notify_req(gateway: &SigningKey, device_id: &str, counter: u64) -> NotifyRequest {
         let (enc, n) = ("Y2lwaGVydGV4dA==", "bm9uY2U=");
         let sig = test_sign::sign_notify(gateway, device_id, enc, n, device_id, counter);
         NotifyRequest {
-            remote_api_key: remote_api_key.into(),
             device_id: device_id.into(),
             collapse_id: "collapse".into(),
             bid: device_id.into(),
@@ -399,7 +369,6 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     fn register_req(
         device: &SigningKey,
         gateway: &SigningKey,
-        remote_api_key: &str,
         device_id: &str,
         token: &str,
         counter: u64,
@@ -407,7 +376,6 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let deleg = test_sign::sign_delegation(device, &gateway.verifying_key());
         let sig = test_sign::sign_register(gateway, device_id, token, ENV_SANDBOX, counter);
         RegisterRequest {
-            remote_api_key: remote_api_key.into(),
             device_id: device_id.into(),
             apns_token: token.into(),
             env: ApnsEnv::Sandbox,
@@ -420,13 +388,11 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
 
     fn service(sender: Arc<MockApns>, store: Arc<InMemoryDeviceTokenStore>) -> NotifyService {
         NotifyService::new(
-            Arc::new(InMemoryAdmission::with_keys(["inst-A"])),
             store,
             sender,
             signer(),
             "com.baybo.app",
             NotifyRateLimiter::default(),
-            PerKeySendLimiter::default(),
         )
     }
 
@@ -440,23 +406,13 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         );
 
         assert_eq!(
-            svc.register(register_req(
-                &device, &gateway, "inst-A", &device_id, APNS_TOK, 1
-            )),
+            svc.register(register_req(&device, &gateway, &device_id, APNS_TOK, 1)),
             RegisterOutcome::Registered,
         );
         let stored = store.get(&device_id).unwrap();
         assert_eq!(stored.apns_token, APNS_TOK);
         assert_eq!(stored.gateway_pubkey, gateway.verifying_key().to_bytes());
         assert_eq!(stored.last_counter, 1);
-
-        // An unadmitted instance can't bind a token.
-        assert_eq!(
-            svc.register(register_req(
-                &device, &gateway, "nope", &device_id, APNS_TOK, 2
-            )),
-            RegisterOutcome::Unadmitted,
-        );
     }
 
     #[test]
@@ -471,17 +427,13 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             store.clone(),
         );
         assert_eq!(
-            svc.register(register_req(
-                &impostor, &gateway, "inst-A", &device_id, APNS_TOK, 1
-            )),
+            svc.register(register_req(&impostor, &gateway, &device_id, APNS_TOK, 1)),
             RegisterOutcome::Rejected,
         );
         assert!(store.get(&device_id).is_none());
         // Sanity: the real owner's delegation does bind.
         assert_eq!(
-            svc.register(register_req(
-                &device, &gateway, "inst-A", &device_id, APNS_TOK, 1
-            )),
+            svc.register(register_req(&device, &gateway, &device_id, APNS_TOK, 1)),
             RegisterOutcome::Registered,
         );
     }
@@ -492,23 +444,19 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), store);
         assert_eq!(
-            svc.register(register_req(
-                &device, &gateway, "inst-A", &device_id, APNS_TOK, 5
-            )),
+            svc.register(register_req(&device, &gateway, &device_id, APNS_TOK, 5)),
             RegisterOutcome::Registered,
         );
         // Same/older counter is a replay.
         assert_eq!(
-            svc.register(register_req(
-                &device, &gateway, "inst-A", &device_id, APNS_TOK, 5
-            )),
+            svc.register(register_req(&device, &gateway, &device_id, APNS_TOK, 5)),
             RegisterOutcome::Rejected,
         );
     }
 
     #[test]
     fn register_rejects_an_oversized_apns_token() {
-        // F4: an implausibly long token is refused before it can bloat a stored
+        // An implausibly long token is refused before it can bloat a stored
         // binding, even though the (self-signed) chain would otherwise verify.
         let (device, gateway, device_id) = keys();
         let store = Arc::new(InMemoryDeviceTokenStore::new());
@@ -518,9 +466,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         );
         let oversized = "a".repeat(APNS_TOKEN_MAX_LEN + 1);
         assert_eq!(
-            svc.register(register_req(
-                &device, &gateway, "inst-A", &device_id, &oversized, 1
-            )),
+            svc.register(register_req(&device, &gateway, &device_id, &oversized, 1)),
             RegisterOutcome::InvalidToken,
         );
         assert!(
@@ -529,16 +475,14 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         );
         // A normal-length token binds.
         assert_eq!(
-            svc.register(register_req(
-                &device, &gateway, "inst-A", &device_id, APNS_TOK, 1
-            )),
+            svc.register(register_req(&device, &gateway, &device_id, APNS_TOK, 1)),
             RegisterOutcome::Registered,
         );
     }
 
     #[test]
     fn register_sheds_when_store_is_full_with_nothing_evictable() {
-        // F1: a cap-1 store bound to a fresh unconfirmed device refuses a second
+        // A cap-1 store bound to a fresh unconfirmed device refuses a second
         // distinct device with `Capacity` rather than growing — bounded under a
         // sustained register flood.
         let store = Arc::new(InMemoryDeviceTokenStore::with_limits(
@@ -551,9 +495,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         );
         let (device, gateway, device_id) = keys();
         assert_eq!(
-            svc.register(register_req(
-                &device, &gateway, "inst-A", &device_id, APNS_TOK, 1
-            )),
+            svc.register(register_req(&device, &gateway, &device_id, APNS_TOK, 1)),
             RegisterOutcome::Registered,
         );
         // A second device (distinct identity, valid self-signed chain) finds the
@@ -562,29 +504,10 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let gateway2 = test_sign::signing_key(12);
         let device_id2 = test_sign::device_id_for(&device2.verifying_key());
         assert_eq!(
-            svc.register(register_req(
-                &device2,
-                &gateway2,
-                "inst-A",
-                &device_id2,
-                APNS_TOK,
-                1
-            )),
+            svc.register(register_req(&device2, &gateway2, &device_id2, APNS_TOK, 1)),
             RegisterOutcome::Capacity,
         );
         assert_eq!(store.len(), 1, "store stays bounded at the cap");
-    }
-
-    #[tokio::test]
-    async fn unadmitted_remote_api_key_rejected() {
-        let (_d, gateway, device_id) = keys();
-        let store = Arc::new(InMemoryDeviceTokenStore::new());
-        let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), store);
-        assert_eq!(
-            svc.notify(notify_req(&gateway, "bad-instance", &device_id, 1), 1000)
-                .await,
-            NotifyOutcome::Unadmitted,
-        );
     }
 
     #[tokio::test]
@@ -597,8 +520,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         // next push over the burst is rate-limited.
         for i in 1..=crate::ratelimit::NOTIFY_BURST as u64 {
             assert_eq!(
-                svc.notify(notify_req(&gateway, "inst-A", &device_id, i), 1000)
-                    .await,
+                svc.notify(notify_req(&gateway, &device_id, i), 1000).await,
                 NotifyOutcome::Delivered,
             );
         }
@@ -606,7 +528,6 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             svc.notify(
                 notify_req(
                     &gateway,
-                    "inst-A",
                     &device_id,
                     crate::ratelimit::NOTIFY_BURST as u64 + 1
                 ),
@@ -618,72 +539,40 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     }
 
     #[tokio::test]
-    async fn per_key_ceiling_caps_egress_independent_of_the_device_budget() {
-        // F3: the aggregate per-`remote_api_key` ceiling bounds egress regardless of
-        // how many devices the key owns. Exhaust the key's ceiling directly (a stand
-        // -in for a flood of self-owned devices) while this device's own bucket stays
-        // full; the next notify is rate-limited before any APNs egress.
-        let (_d, gateway, device_id) = keys();
-        let store = Arc::new(InMemoryDeviceTokenStore::new());
-        seed(&store, &gateway, &device_id, "tok");
-        let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), store);
-        for _ in 0..crate::ratelimit::PER_KEY_SEND_BURST as usize {
-            assert!(svc.key_ceiling.check("inst-A"));
-        }
-        assert_eq!(
-            svc.notify(notify_req(&gateway, "inst-A", &device_id, 1), 1000)
-                .await,
-            NotifyOutcome::RateLimited,
-        );
-    }
-
-    #[tokio::test]
     async fn unknown_device_rejected() {
         let (_d, gateway, device_id) = keys();
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), store);
         assert_eq!(
-            svc.notify(notify_req(&gateway, "inst-A", &device_id, 1), 1000)
-                .await,
+            svc.notify(notify_req(&gateway, &device_id, 1), 1000).await,
             NotifyOutcome::UnknownDevice,
         );
     }
 
     #[tokio::test]
-    async fn notify_rejects_a_co_tenant_and_a_replay() {
-        // The binding is owned by `gateway` (the device delegated to it). A
-        // co-tenant on a shared key signing with a *different* gateway key cannot
-        // notify it; nor can a replay of an already-accepted counter.
+    async fn notify_rejects_a_foreign_gateway_key_and_a_replay() {
+        // The binding is owned by `gateway` (the device delegated to it). A notify
+        // signed with a *different* gateway key can't push it; nor can a replay of
+        // an already-accepted counter.
         let (_d, gateway, device_id) = keys();
         let impostor_gateway = test_sign::signing_key(9);
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         seed(&store, &gateway, &device_id, "tok");
-        let svc = NotifyService::new(
-            Arc::new(InMemoryAdmission::with_keys(["inst-A", "inst-B"])),
-            store,
-            Arc::new(MockApns::new(ApnsOutcome::Delivered)),
-            signer(),
-            "com.baybo.app",
-            NotifyRateLimiter::default(),
-            PerKeySendLimiter::default(),
-        );
-        // inst-B is admitted but signs with a gateway key the device never
-        // delegated → rejected (no spam, no redirect).
+        let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), store);
+        // Signed with a gateway key the device never delegated → rejected.
         assert_eq!(
-            svc.notify(notify_req(&impostor_gateway, "inst-B", &device_id, 1), 1000)
+            svc.notify(notify_req(&impostor_gateway, &device_id, 1), 1000)
                 .await,
             NotifyOutcome::Rejected,
         );
         // The legitimate gateway delivers.
         assert_eq!(
-            svc.notify(notify_req(&gateway, "inst-A", &device_id, 1), 1000)
-                .await,
+            svc.notify(notify_req(&gateway, &device_id, 1), 1000).await,
             NotifyOutcome::Delivered,
         );
         // Replaying that same counter is rejected.
         assert_eq!(
-            svc.notify(notify_req(&gateway, "inst-A", &device_id, 1), 1000)
-                .await,
+            svc.notify(notify_req(&gateway, &device_id, 1), 1000).await,
             NotifyOutcome::Rejected,
         );
     }
@@ -696,8 +585,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let sender = Arc::new(MockApns::new(ApnsOutcome::Delivered));
         let svc = service(Arc::clone(&sender), store);
         assert_eq!(
-            svc.notify(notify_req(&gateway, "inst-A", &device_id, 1), 1000)
-                .await,
+            svc.notify(notify_req(&gateway, &device_id, 1), 1000).await,
             NotifyOutcome::Delivered,
         );
 
@@ -726,8 +614,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             Arc::clone(&store),
         );
         assert_eq!(
-            svc.notify(notify_req(&gateway, "inst-A", &device_id, 1), 1000)
-                .await,
+            svc.notify(notify_req(&gateway, &device_id, 1), 1000).await,
             NotifyOutcome::Pruned,
         );
         assert!(store.get(&device_id).is_none(), "dead token unbound");
@@ -745,8 +632,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             Arc::clone(&store),
         );
         assert_eq!(
-            svc.notify(notify_req(&gateway, "inst-A", &device_id, 1), 1000)
-                .await,
+            svc.notify(notify_req(&gateway, &device_id, 1), 1000).await,
             NotifyOutcome::Pruned,
         );
         assert!(store.get(&device_id).is_none());
@@ -762,8 +648,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             Arc::clone(&store),
         );
         assert_eq!(
-            svc.notify(notify_req(&gateway, "inst-A", &device_id, 1), 1000)
-                .await,
+            svc.notify(notify_req(&gateway, &device_id, 1), 1000).await,
             NotifyOutcome::Failed("503".into()),
         );
         assert!(
@@ -780,17 +665,16 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let sender = Arc::new(MockApns::new(ApnsOutcome::Delivered));
         let svc = service(Arc::clone(&sender), store);
 
-        svc.notify(notify_req(&gateway, "inst-A", &device_id, 1), 1000)
-            .await;
+        svc.notify(notify_req(&gateway, &device_id, 1), 1000).await;
         let jwt1 = sender.last.lock().clone().unwrap().provider_jwt;
         // A later push inside the refresh window reuses the same signed token.
-        svc.notify(notify_req(&gateway, "inst-A", &device_id, 2), 1000 + 60)
+        svc.notify(notify_req(&gateway, &device_id, 2), 1000 + 60)
             .await;
         let jwt2 = sender.last.lock().clone().unwrap().provider_jwt;
         assert_eq!(jwt1, jwt2, "token reused within the refresh window");
         // Past the window it is re-signed (new `iat`).
         svc.notify(
-            notify_req(&gateway, "inst-A", &device_id, 3),
+            notify_req(&gateway, &device_id, 3),
             1000 + crate::jwt::TOKEN_REFRESH_SECS + 1,
         )
         .await;

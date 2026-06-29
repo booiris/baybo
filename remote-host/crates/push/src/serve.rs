@@ -1,8 +1,8 @@
 //! Wiring the push role into a runnable service: [`PushConfig`] + the
-//! [`build_router`] that assembles the signer, admission allow-list, device
-//! store, the live [`HttpApnsSender`], and the `/notify` + `/register` routes.
-//! `main.rs` loads the config from the environment, reads the `.p8`, and serves
-//! the returned router; `build_router` is host-tested with a throwaway key.
+//! [`build_router`] that assembles the signer, device store, the live
+//! [`HttpApnsSender`], and the `/notify` + `/register` routes. `main.rs` loads the
+//! config from the environment, reads the `.p8`, and serves the returned router;
+//! `build_router` is host-tested with a throwaway key.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,14 +16,11 @@ use crate::error::PushError;
 use crate::http::{PushState, router};
 use crate::jwt::ApnsProviderToken;
 use crate::notify::NotifyService;
-use crate::ratelimit::{NotifyRateLimiter, PerKeySendLimiter};
-use crate::store::{Admission, InMemoryDeviceTokenStore};
+use crate::ratelimit::NotifyRateLimiter;
+use crate::store::InMemoryDeviceTokenStore;
 
-/// Operator-tunable **global** push limits, each overridable from the
-/// environment; an unset/unparseable/non-positive value falls back to the
-/// built-in const default. These are global (not per-`remote_api_key`) — the
-/// per-key APNs send ceiling stays a fixed const, and relay-style per-key budgets
-/// live in the `remote_api_keys` table, not here.
+/// Operator-tunable push limits, each overridable from the environment; an
+/// unset/unparseable/non-positive value falls back to the built-in const default.
 #[derive(Debug, Clone)]
 pub struct PushLimits {
     /// Device-token store soft cap (`PUSH_DEVICE_STORE_CAP`).
@@ -34,9 +31,6 @@ pub struct PushLimits {
     pub notify_rate_per_min: f64,
     /// Per-device `/notify` burst (`PUSH_NOTIFY_BURST`).
     pub notify_burst: f64,
-    /// Soft cap on the per-device + per-key notify-limiter maps, an internal memory
-    /// edge against a churn of distinct keys (`PUSH_LIMITER_BUCKET_CAP`).
-    pub limiter_bucket_cap: usize,
 }
 
 impl Default for PushLimits {
@@ -46,7 +40,6 @@ impl Default for PushLimits {
             unconfirmed_ttl: crate::store::UNCONFIRMED_TTL,
             notify_rate_per_min: crate::ratelimit::NOTIFY_RATE_PER_MIN,
             notify_burst: crate::ratelimit::NOTIFY_BURST,
-            limiter_bucket_cap: crate::ratelimit::BUCKET_SOFT_CAP,
         }
     }
 }
@@ -60,7 +53,6 @@ impl PushLimits {
             unconfirmed_ttl: env_secs("PUSH_UNCONFIRMED_TTL_SECS", d.unconfirmed_ttl),
             notify_rate_per_min: env_f64("PUSH_NOTIFY_RATE_PER_MIN", d.notify_rate_per_min),
             notify_burst: env_f64("PUSH_NOTIFY_BURST", d.notify_burst),
-            limiter_bucket_cap: env_usize("PUSH_LIMITER_BUCKET_CAP", d.limiter_bucket_cap),
         }
     }
 }
@@ -136,7 +128,6 @@ impl PushConfig {
 pub fn build_router(
     config: &PushConfig,
     p8_pem: &[u8],
-    admission: Arc<dyn Admission>,
     ip_limit: IpLimitConfig,
 ) -> Result<Router, PushError> {
     let signer = Arc::new(ApnsProviderToken::new(
@@ -150,17 +141,15 @@ pub fn build_router(
     ));
     let sender = Arc::new(HttpApnsSender::new());
     let service = Arc::new(NotifyService::new(
-        admission,
         store,
         sender,
         signer,
         config.topic.clone(),
-        NotifyRateLimiter::new(
+        NotifyRateLimiter::for_store_cap(
             config.limits.notify_rate_per_min,
             config.limits.notify_burst,
-            config.limits.limiter_bucket_cap,
+            config.limits.device_store_cap,
         ),
-        PerKeySendLimiter::new(config.limits.limiter_bucket_cap),
     ));
     Ok(ip_limit::apply(router(PushState { service }), ip_limit))
 }
@@ -185,32 +174,14 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         }
     }
 
-    fn admission() -> Arc<dyn Admission> {
-        Arc::new(crate::store::InMemoryAdmission::with_keys(["inst-A"]))
-    }
-
     #[test]
     fn build_router_succeeds_with_a_valid_key() {
-        assert!(
-            build_router(
-                &config(),
-                TEST_P8.as_bytes(),
-                admission(),
-                IpLimitConfig::disabled()
-            )
-            .is_ok()
-        );
+        assert!(build_router(&config(), TEST_P8.as_bytes(), IpLimitConfig::disabled()).is_ok());
     }
 
     #[test]
     fn build_router_rejects_a_bad_key() {
-        let err = build_router(
-            &config(),
-            b"not a pem",
-            admission(),
-            IpLimitConfig::disabled(),
-        )
-        .unwrap_err();
+        let err = build_router(&config(), b"not a pem", IpLimitConfig::disabled()).unwrap_err();
         assert!(matches!(err, PushError::Key(_)));
     }
 
@@ -260,7 +231,6 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let app = build_router(
             &config(),
             TEST_P8.as_bytes(),
-            admission(),
             IpLimitConfig::with_trusted_headers(vec![HeaderName::from_static("cf-connecting-ip")]),
         )
         .unwrap();

@@ -1555,7 +1555,6 @@ dependencies = [
  "hex",
  "jsonwebtoken",
  "parking_lot",
- "remote-host-admission",
  "remote-host-protocol",
  "remote-host-ratelimit",
  "reqwest",

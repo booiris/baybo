@@ -121,12 +121,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let (config, p8_path) = PushConfig::from_env()?;
         let p8_pem = std::fs::read(&p8_path)
             .map_err(|e| format!("read .p8 at {}: {e}", p8_path.display()))?;
-        app = app.merge(push_router(
-            &config,
-            &p8_pem,
-            admission.clone(),
-            push_ip_limit,
-        )?);
+        app = app.merge(push_router(&config, &p8_pem, push_ip_limit)?);
         roles.push("push");
     }
 

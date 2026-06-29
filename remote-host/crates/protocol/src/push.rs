@@ -35,13 +35,11 @@ pub enum ApnsEnv {
 ///
 /// `sig`/`counter` authenticate the notify under the gateway push key the device
 /// delegated to at `/register` (C verifies against the stored `gateway_pubkey`),
-/// so a tenant sharing the `remote_api_key` (e.g. the `guest` trial key) cannot
-/// spam or replay another device's notifications even if it learns the
-/// `device_id`. See `device-proto`'s `delegation` module for the signed byte
-/// layout.
+/// so no one can spam or replay another device's notifications even if it learns
+/// the `device_id` — the binding's delegation chain, not a caller key, is the
+/// guard. See `device-proto`'s `delegation` module for the signed byte layout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotifyRequest {
-    pub remote_api_key: String,
     pub device_id: String,
     pub collapse_id: String,
     pub bid: String,
@@ -55,16 +53,14 @@ pub struct NotifyRequest {
     pub counter: u64,
 }
 
-/// JSON body of `POST /register` — bind/rebind a device's APNs token. The caller
-/// presents the relay admission key for admission, but the binding is owned by
-/// the device's Ed25519 identity (`device_id == ios-<hex(device_pubkey)>`): the
-/// device delegates a gateway push key, and the gateway signs the binding. C
-/// verifies the chain with no stored secret, so under a shared `remote_api_key`
-/// one tenant cannot overwrite, redirect, or suppress another's binding. APNs
-/// provider credentials stay on C.
+/// JSON body of `POST /register` — bind/rebind a device's APNs token. The binding
+/// is owned by the device's Ed25519 identity (`device_id == ios-<hex(device_pubkey)>`):
+/// the device delegates a gateway push key, and the gateway signs the binding. C
+/// verifies the chain with no stored secret, so no one can overwrite, redirect, or
+/// suppress another's binding even without a caller key. APNs provider credentials
+/// stay on C.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterRequest {
-    pub remote_api_key: String,
     pub device_id: String,
     pub apns_token: String,
     pub env: ApnsEnv,

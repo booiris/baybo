@@ -1,17 +1,16 @@
-//! The push role's two registries: which gateways may use it (admission) and
-//! `device_id → { apns_token, env, gateway_pubkey, last_counter }` (the only
-//! per-device state it holds).
+//! The push role's device registry: `device_id → { apns_token, env,
+//! gateway_pubkey, last_counter }` — the only per-device state it holds.
 //!
-//! Neither carries conversation content — admission is machine-to-machine
-//! `remote_api_key`s, and the device store maps an opaque `device_id` to its APNs
-//! token plus the material to authenticate binding mutations.
+//! It carries no conversation content — just the mapping from an opaque
+//! `device_id` to its APNs token plus the material to authenticate binding
+//! mutations.
 //!
 //! The store is keyed by `device_id` alone — a 32-byte Ed25519 public key, so
-//! globally unique. Isolation of one device's binding from another's no longer
-//! comes from the `remote_api_key` partition (a shared `guest` key offers none)
-//! but from the **delegation chain**: a `/register` carries the device's
-//! delegation + the gateway's signature, and a `/notify` is verified against the
-//! `gateway_pubkey` stored at register. A `last_counter` floor rejects replays.
+//! globally unique. The routes are keyless; isolation of one device's binding
+//! from another's comes entirely from the **delegation chain**: a `/register`
+//! carries the device's delegation + the gateway's signature, and a `/notify` is
+//! verified against the `gateway_pubkey` stored at register. A `last_counter`
+//! floor rejects replays.
 //!
 //! The map is **bounded**: a `/register` is a self-signed chain an attacker can
 //! forge per request for a brand-new `device_id`, so the store mirrors the
@@ -184,10 +183,6 @@ impl DeviceTokenStore for InMemoryDeviceTokenStore {
         self.inner.lock().len()
     }
 }
-
-/// Per-key admission (the gateway allow-list) lives in the shared crate, so the
-/// relay and push roles resolve the same live, hot-reloaded list.
-pub use remote_host_admission::{Admission, Admit, InMemoryAdmission};
 
 #[cfg(test)]
 mod tests {

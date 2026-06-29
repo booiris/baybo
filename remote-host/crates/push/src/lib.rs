@@ -24,8 +24,6 @@ pub use error::PushError;
 pub use http::{PushState, router};
 pub use jwt::ApnsProviderToken;
 pub use notify::{NotifyOutcome, NotifyRequest, NotifyService, RegisterOutcome, RegisterRequest};
-pub use ratelimit::{NotifyRateLimiter, PerKeySendLimiter};
+pub use ratelimit::NotifyRateLimiter;
 pub use serve::{PushConfig, PushLimits, build_router};
-pub use store::{
-    Admission, DeviceRegistration, DeviceTokenStore, InMemoryAdmission, InMemoryDeviceTokenStore,
-};
+pub use store::{DeviceRegistration, DeviceTokenStore, InMemoryDeviceTokenStore};

@@ -59,12 +59,11 @@ services:
       APNS_TEAM_ID: ${APNS_TEAM_ID:-}
       APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:-}
       # optional global push-limit overrides (blank -> built-in defaults; see
-      # DEPLOY.md). Per-key send ceiling is fixed and not env-tunable.
+      # DEPLOY.md). The /register + /notify routes are keyless.
       PUSH_DEVICE_STORE_CAP: ${PUSH_DEVICE_STORE_CAP:-}
       PUSH_UNCONFIRMED_TTL_SECS: ${PUSH_UNCONFIRMED_TTL_SECS:-}
       PUSH_NOTIFY_RATE_PER_MIN: ${PUSH_NOTIFY_RATE_PER_MIN:-}
       PUSH_NOTIFY_BURST: ${PUSH_NOTIFY_BURST:-}
-      PUSH_LIMITER_BUCKET_CAP: ${PUSH_LIMITER_BUCKET_CAP:-}
       # TLS — set only when a cert is configured (-> wss/https), else blank (-> ws/http)
       TLS_CERT: ${TLS_CERT_HOST_PATH:+/run/tls/cert.pem}
       TLS_KEY: ${TLS_KEY_HOST_PATH:+/run/tls/key.pem}
