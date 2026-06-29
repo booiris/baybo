@@ -144,6 +144,43 @@ pub fn user_text_frame(
     user_message_frame(session_id, user_id, text, platform_msg_id, Vec::new())
 }
 
+/// The `user_id` the gateway stamps on web-channel (`http`) messages. The direct
+/// (non-relay) transport registers as a web client, so its outbound user
+/// messages carry this id (the relay transport uses the device id instead).
+pub const WEB_OPERATOR_USER_ID: &str = "web-operator";
+
+/// The [`Frame::Register`] a direct (web-identity) client sends right after the
+/// WS upgrade. The gateway ignores the in-frame `token` for web clients (auth is
+/// the upgrade-time channel token) and only requires `channel_type == "http"`.
+pub fn register_http_frame() -> Frame {
+    Frame::Register {
+        token: String::new(),
+        channel_type: ChannelType::http(),
+    }
+}
+
+/// Like [`user_message_frame`] but for the direct (web-identity) transport:
+/// `channel_type = http` and `user_id = WEB_OPERATOR_USER_ID`. Used over the
+/// raw-MessagePack `/v1/channel-ws` leg (no Noise).
+pub fn web_user_message_frame(
+    session_id: &str,
+    text: &str,
+    platform_msg_id: &str,
+    attachments: Vec<WireAttachment>,
+) -> Frame {
+    Frame::Message(Message {
+        content: text.to_owned(),
+        session_id: SessionId::from(session_id),
+        user_id: WEB_OPERATOR_USER_ID.to_owned(),
+        channel_type: ChannelType::http(),
+        bot_id: String::new(),
+        attachments,
+        platform_msg_id: platform_msg_id.to_owned(),
+        role: MessageRole::User,
+        ordinal: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

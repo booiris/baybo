@@ -6,17 +6,51 @@
 //! The protocol/crypto live in the shared crates, so interop with the gateway is
 //! guaranteed by construction.
 
-mod blob;
-mod content;
+mod direct;
 mod keychain;
-mod pairing;
 mod push_register;
+mod relay;
+mod transport;
 
 use baybo_mobile_core::{Frame, WireAttachment};
-use content::ContentSessions;
-use pairing::{PairAborted, PairChallenge, PairedSummary, PairingSessions};
+use relay::RelaySessions;
+use relay::{PairAborted, PairChallenge, PairedSummary, PairingSessions};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
+
+/// Which chat leg an IPC command routes to: the relay (Noise E2E) leg or the
+/// direct (raw-MessagePack `/v1/channel-ws`) leg. Threaded from the webview as a
+/// typed value so the chat/blob commands dispatch with a Rust `match` instead of
+/// the caller picking a per-leg command name by string. The wire values
+/// (`"relay"` / `"direct"`) match the webview's `ChatTransport` type.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ChatLeg {
+    Relay,
+    Direct,
+}
+
+/// Header the raw-body blob upload reads its mime from — the JSON arg slot carries
+/// the bytes, so mime + leg ride headers instead.
+const BLOB_MIME_HEADER: &str = "x-baybo-mime";
+/// Header the raw-body blob upload reads its [`ChatLeg`] from (see [`BLOB_MIME_HEADER`]).
+const BLOB_LEG_HEADER: &str = "x-baybo-leg";
+
+impl ChatLeg {
+    /// Resolve the leg from a raw-body upload's `x-baybo-leg` header — relay when
+    /// absent or unrecognized (the safe default; matches the webview's default).
+    /// The value mirrors the `#[serde(rename_all = "lowercase")]` wire form.
+    fn from_request(request: &tauri::ipc::Request<'_>) -> Self {
+        match request
+            .headers()
+            .get(BLOB_LEG_HEADER)
+            .and_then(|v| v.to_str().ok())
+        {
+            Some("direct") => ChatLeg::Direct,
+            _ => ChatLeg::Relay,
+        }
+    }
+}
 
 /// Scan-to-connect: dial the gateway, run the XXpsk0 handshake through
 /// `DeviceHello`, and return the confirmation code the UI shows the user to
@@ -33,7 +67,7 @@ async fn pair_begin(
     remote_api_key: Option<String>,
     on_abort: Channel<PairAborted>,
 ) -> Result<PairChallenge, String> {
-    pairing::pair_begin(
+    relay::pair_begin(
         &sessions,
         &endpoint,
         &rendezvous_id,
@@ -52,58 +86,127 @@ async fn pair_confirm(
     device_id: String,
     accepted: bool,
 ) -> Result<PairedSummary, String> {
-    pairing::pair_confirm(&sessions, &device_id, accepted).await
+    relay::pair_confirm(&sessions, &device_id, accepted).await
 }
 
 /// The device id of a persisted pairing, if the app is already paired — so a
 /// relaunch can show "connected" instead of the pairing form.
 #[tauri::command]
 fn paired_device() -> Option<String> {
-    pairing::paired_device()
+    relay::paired_device()
+}
+
+/// Direct (non-relay) login: validate the gateway base URL + admin token against
+/// `GET /v1/status`, then persist them. The web-dashboard style of access; see
+/// `direct.rs` for the security trade-off vs scan-to-pair.
+#[tauri::command]
+async fn direct_login(base_url: String, token: String) -> Result<direct::DirectStatus, String> {
+    direct::login(base_url, token).await
+}
+
+/// The current direct connection (base URL only), if the app holds direct
+/// credentials — so a relaunch can show "connected" instead of the login form.
+#[tauri::command]
+fn direct_status() -> Result<Option<direct::DirectStatus>, String> {
+    direct::status()
+}
+
+/// Forget the direct-connection credentials (direct "disconnect"): tear down any
+/// live chat WS AND drop the in-memory session/channel token, then wipe the stored
+/// credentials. (`forget`, not `disconnect`, so the broad channel token doesn't
+/// linger in memory and a later reconnect can't resurrect the session.)
+#[tauri::command]
+async fn direct_logout(sessions: State<'_, direct::DirectSessions>) -> Result<(), String> {
+    direct::forget(&sessions).await;
+    direct::logout()
+}
+
+/// Mint a fresh direct chat session over REST (admin Bearer) and return its
+/// gateway-assigned id; the channel token is stashed for the WS + blob legs.
+#[tauri::command]
+async fn direct_session_create(
+    sessions: State<'_, direct::DirectSessions>,
+) -> Result<direct::DirectSessionRef, String> {
+    direct::session_create(&sessions).await
+}
+
+/// REST refetch of a transcript slice after a `Frame::Reset` (admin Bearer).
+#[tauri::command]
+async fn direct_history(
+    session_id: String,
+    before_ordinal: Option<i64>,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    direct::history(session_id, before_ordinal, limit).await
 }
 
 /// Forget the current pairing (unpair): clear the keychain record + push key so
 /// the app returns to the scan screen. One app binds one gateway.
 #[tauri::command]
 fn forget_pairing() -> Result<(), String> {
-    pairing::forget_pairing()
+    relay::forget_pairing()
 }
 
-/// Open the E2E content session for `sessionId`: connect to the paired gateway,
-/// run the Noise handshake, subscribe, and stream decrypted frames to the
-/// webview over `onFrame`. `sinceOrdinal` is the highest ordinal the webview has
-/// already rendered — the gateway replays only the gap above it (so a reconnect
-/// after a background/reload catches up without re-sending the whole thread);
-/// `null` is a fresh subscribe with no catch-up.
+/// Open the chat session for `sessionId` on `leg` and stream frames to `onFrame`.
+/// Relay runs the Noise E2E content leg (connect to the paired gateway, run the
+/// handshake, subscribe, decrypt); direct runs the raw-MessagePack
+/// `/v1/channel-ws` web-identity leg. `sinceOrdinal` is the highest ordinal the
+/// webview has already rendered — the gateway replays only the gap above it (so a
+/// reconnect after a background/reload catches up without re-sending the whole
+/// thread); `null` is a fresh subscribe with no catch-up. Both legs share one pump
+/// (see `transport.rs`); only the establish/codec seam differs, so this command
+/// just routes to the leg's session registry.
 #[tauri::command]
-async fn content_connect(
+async fn chat_connect(
     app: AppHandle,
-    sessions: State<'_, ContentSessions>,
+    leg: ChatLeg,
+    relay: State<'_, RelaySessions>,
+    direct: State<'_, direct::DirectSessions>,
     session_id: String,
     since_ordinal: Option<i64>,
     on_frame: Channel<Frame>,
 ) -> Result<(), String> {
-    content::connect(app, &sessions, session_id, since_ordinal, on_frame).await
+    match leg {
+        ChatLeg::Relay => relay::connect(app, &relay, session_id, since_ordinal, on_frame).await,
+        ChatLeg::Direct => direct::connect(app, &direct, session_id, since_ordinal, on_frame).await,
+    }
 }
 
-/// Send a user message on the live content session. `msgId` is a fresh per-send
-/// idempotency key so a retry doesn't double-fire the agent. `attachments` are
-/// content-addressed blobs already uploaded over a blob leg (omitted/empty for a
-/// text-only send).
+/// Send a user message on the live chat session for `leg`. `msgId` is a fresh
+/// per-send idempotency key so a retry doesn't double-fire the agent.
+/// `attachments` are content-addressed blobs already uploaded over a blob leg
+/// (omitted/empty for a text-only send). Relay sends as device/ios, direct as
+/// web-operator/http.
 #[tauri::command]
-async fn content_send(
-    sessions: State<'_, ContentSessions>,
+async fn chat_send(
+    leg: ChatLeg,
+    relay: State<'_, RelaySessions>,
+    direct: State<'_, direct::DirectSessions>,
     text: String,
     msg_id: String,
     attachments: Option<Vec<WireAttachment>>,
 ) -> Result<(), String> {
-    content::send(&sessions, text, msg_id, attachments.unwrap_or_default()).await
+    let attachments = attachments.unwrap_or_default();
+    match leg {
+        ChatLeg::Relay => relay::send(&relay, text, msg_id, attachments).await,
+        ChatLeg::Direct => direct::send(&direct, text, msg_id, attachments).await,
+    }
 }
 
-/// Tear down the live content session (the user left the chat view).
+/// Tear down the live chat session for `leg` (the user left the chat view). Any
+/// leg-specific durable state survives: the direct leg keeps its session id +
+/// channel token for reconnect; the relay leg reloads its pairing record on the
+/// next connect.
 #[tauri::command]
-async fn content_disconnect(sessions: State<'_, ContentSessions>) -> Result<(), String> {
-    content::disconnect(&sessions).await;
+async fn chat_disconnect(
+    leg: ChatLeg,
+    relay: State<'_, RelaySessions>,
+    direct: State<'_, direct::DirectSessions>,
+) -> Result<(), String> {
+    match leg {
+        ChatLeg::Relay => relay::disconnect(&relay).await,
+        ChatLeg::Direct => direct::disconnect(&direct).await,
+    }
     Ok(())
 }
 
@@ -115,7 +218,7 @@ async fn blob_download(
     dest_path: String,
     on_progress: Channel<u64>,
 ) -> Result<(), String> {
-    blob::download(blob_id, dest_path, on_progress).await
+    relay::download(blob_id, dest_path, on_progress).await
 }
 
 /// Upload the local file at `src_path` as `mime_type` over a dedicated blob leg,
@@ -126,15 +229,22 @@ async fn blob_upload(
     mime_type: String,
     on_progress: Channel<u64>,
 ) -> Result<String, String> {
-    blob::upload(src_path, mime_type, on_progress).await
+    relay::upload(src_path, mime_type, on_progress).await
 }
 
-/// Upload a webview-picked image over a dedicated blob leg. The raw bytes ride the
-/// IPC bridge as the request body (efficient — not a JSON number array); the mime
-/// rides an `x-baybo-mime` header. iOS gives the webview a `File` (bytes), not a
-/// path, so this is the entry point an image pick uses. Returns the `blob_id`.
+/// Upload a webview-picked image over `leg`'s blob transport. The raw bytes ride
+/// the IPC bridge as the request body (efficient — not a JSON number array); the
+/// mime rides `x-baybo-mime` and the leg rides `x-baybo-leg` (the JSON arg slot is
+/// taken by the raw body). iOS gives the webview a `File` (bytes), not a path, so
+/// this is the entry point an image pick uses. Relay seals + chunks over a
+/// dedicated E2E blob leg; direct POSTs to plain `/v1/blobs` (channel token).
+/// Returns the content-addressed `blob_id`.
 #[tauri::command]
-async fn blob_upload_bytes(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+async fn blob_upload_bytes(
+    direct: State<'_, direct::DirectSessions>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<String, String> {
+    let leg = ChatLeg::from_request(&request);
     let bytes = match request.body() {
         tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
         tauri::ipc::InvokeBody::Json(_) => {
@@ -143,21 +253,32 @@ async fn blob_upload_bytes(request: tauri::ipc::Request<'_>) -> Result<String, S
     };
     let mime_type = request
         .headers()
-        .get("x-baybo-mime")
+        .get(BLOB_MIME_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_owned();
-    blob::upload_bytes(bytes, mime_type).await
+    match leg {
+        ChatLeg::Relay => relay::upload_bytes(bytes, mime_type).await,
+        ChatLeg::Direct => direct::upload_bytes(&direct, bytes, mime_type).await,
+    }
 }
 
-/// Fetch an attachment `blob_id` for display: download it over a blob leg into a
-/// content-addressed on-device cache (reused on the next render), then return the
-/// verified bytes to the webview as a raw `ArrayBuffer` to wrap in an object URL.
+/// Fetch an attachment `blobId` for display over `leg`'s blob transport, returning
+/// the verified bytes to the webview as a raw `ArrayBuffer` to wrap in an object
+/// URL. Relay downloads over a dedicated E2E blob leg into a content-addressed
+/// on-device cache (reused on the next render); direct GETs plain
+/// `/v1/blobs/{id}` (channel token).
 #[tauri::command]
-async fn blob_image(blob_id: String) -> Result<tauri::ipc::Response, String> {
-    blob::image_data(blob_id)
-        .await
-        .map(tauri::ipc::Response::new)
+async fn blob_image(
+    leg: ChatLeg,
+    direct: State<'_, direct::DirectSessions>,
+    blob_id: String,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = match leg {
+        ChatLeg::Relay => relay::image_data(blob_id).await,
+        ChatLeg::Direct => direct::image_data(&direct, blob_id).await,
+    }?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// Debug-only: seed a known push key into the shared App Group keychain so the
@@ -222,7 +343,8 @@ pub fn run() {
         .plugin(tauri_plugin_haptics::init());
     let app = match builder
         .manage(PairingSessions::default())
-        .manage(ContentSessions::default())
+        .manage(RelaySessions::default())
+        .manage(direct::DirectSessions::default())
         .setup(|_app| {
             // Request provisional notification auth + remote-notification
             // registration once the app is up (main thread). No-op off iOS.
@@ -234,9 +356,14 @@ pub fn run() {
             pair_confirm,
             paired_device,
             forget_pairing,
-            content_connect,
-            content_send,
-            content_disconnect,
+            direct_login,
+            direct_status,
+            direct_logout,
+            direct_session_create,
+            direct_history,
+            chat_connect,
+            chat_send,
+            chat_disconnect,
             blob_download,
             blob_upload,
             blob_upload_bytes,

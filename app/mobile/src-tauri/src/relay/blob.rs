@@ -3,7 +3,7 @@
 //! bandwidth), run the Noise IK handshake, then run the blob sub-protocol to
 //! download a blob to a local file or upload a local file.
 //!
-//! Like [`crate::content`], the crypto + codec live in the host-tested core
+//! Like [`crate::relay::chat`], the crypto + codec live in the host-tested core
 //! ([`baybo_mobile_core::blob`]); this is the WebSocket transport + file I/O +
 //! Tauri glue. Each command is a one-shot request/response over its **own**
 //! dedicated leg, so a bulk transfer never shares (or stalls) the chat leg.
@@ -24,7 +24,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message, http::StatusCode};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
-use crate::pairing::{PairedRecord, load_paired_record};
+use super::pairing::{PairedRecord, load_paired_record};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 

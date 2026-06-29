@@ -1,13 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { useTranslation } from "react-i18next";
+import { SUPPORTED_LANGUAGES } from "./i18n";
 // PairChallenge / PairedSummary are generated from the src-tauri IPC structs by
 // ts-rs (cargo test -p baybo-mobile-app --features ts-export); the bindings are
 // regenerated + drift-checked by scripts/check-ts-bindings.sh.
 import type { PairAborted } from "./generated/PairAborted";
 import type { PairChallenge } from "./generated/PairChallenge";
 import type { PairedSummary } from "./generated/PairedSummary";
-import { attachmentKind, imageObjectUrl, uploadBytes, type WireAttachment } from "./blob";
+import {
+  attachmentKind,
+  imageObjectUrl,
+  uploadBytes,
+  type ChatTransport,
+  type WireAttachment,
+} from "./blob";
+import { directSessionCreate } from "./direct";
 
 /// Foreground signals (page visibility, window focus, the native `app-resumed`
 /// event) can fire 2–3 times on a single iOS resume; coalesce them into one
@@ -51,6 +60,18 @@ function parseScan(text: string): {
   // No manual/short-code fallback: a pairing QR must carry both the rendezvous
   // id and the high-entropy secret.
   return null;
+}
+
+/// Light haptic tap fired on a primary button press, so the brutalist "push"
+/// has a physical beat to it. Best-effort: haptics are unavailable on desktop /
+/// dev, so a failure is swallowed.
+async function tapHaptic() {
+  try {
+    const { impactFeedback } = await import("@tauri-apps/plugin-haptics");
+    await impactFeedback("light");
+  } catch {
+    /* haptics unavailable (e.g. desktop) — non-fatal */
+  }
 }
 
 /// A decrypted wire `Frame` as it arrives over the Tauri content channel.
@@ -126,6 +147,9 @@ const CAMERA_WARMUP_MS = 300;
 const CHAT_ACTIVE_KEY = "baybo.chat.active";
 const CHAT_SESSION_KEY = "baybo.chat.session";
 const CHAT_STATE_KEY = "baybo.chat.state";
+// Which transport the active chat uses ("relay" | "direct") — persisted so a
+// reload/relaunch restores the right one (the relay leg vs the direct WS).
+const CHAT_MODE_KEY = "baybo.chat.mode";
 
 type ChatState = { sessionId: string; messages: ChatMsg[]; lastOrdinal: number };
 
@@ -155,8 +179,28 @@ function clearChatState() {
     localStorage.removeItem(CHAT_ACTIVE_KEY);
     localStorage.removeItem(CHAT_SESSION_KEY);
     localStorage.removeItem(CHAT_STATE_KEY);
+    localStorage.removeItem(CHAT_MODE_KEY);
   } catch {
     /* ignore */
+  }
+}
+
+/// Normalize a user-typed Baybo address for the direct-login form: trim, drop a
+/// trailing slash, default to `https://` when no scheme is given, and validate it
+/// parses as an http(s) URL with a host. Returns the normalized URL, or `null`
+/// if it isn't a usable address (mirrors the Rust-side check for early feedback).
+function normalizeBayboAddress(raw: string): string | null {
+  // Detect the scheme on the trimmed-but-NOT-slash-stripped value, so a bare
+  // "http://" (no host) is rejected rather than mangled into "https://http:".
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  try {
+    const u = new URL(withScheme);
+    if ((u.protocol !== "http:" && u.protocol !== "https:") || !u.hostname) return null;
+    return withScheme.replace(/\/+$/, ""); // drop a trailing slash only after it validates
+  } catch {
+    return null;
   }
 }
 
@@ -167,13 +211,21 @@ function clearChatState() {
 function AttachmentImage({
   attachment,
   previewUrl,
+  transport,
+  connEpoch,
 }: {
   attachment: WireAttachment;
   previewUrl?: string;
+  transport: ChatTransport;
+  connEpoch: number;
 }) {
+  const { t } = useTranslation();
   const [url, setUrl] = useState<string | null>(previewUrl ?? null);
   const [failed, setFailed] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  // Mirrors `failed` for the connEpoch retry effect to read without taking `failed`
+  // as a dep (which would refetch in a tight loop the instant a fetch fails).
+  const failedRef = useRef(false);
 
   useEffect(() => {
     if (previewUrl) {
@@ -182,9 +234,10 @@ function AttachmentImage({
     }
     let owned: string | null = null;
     let cancelled = false;
+    failedRef.current = false;
     setFailed(false);
     setUrl(null);
-    imageObjectUrl(attachment.blob_id, attachment.mime_type)
+    imageObjectUrl(attachment.blob_id, attachment.mime_type, transport)
       .then((u) => {
         if (cancelled) {
           URL.revokeObjectURL(u);
@@ -194,24 +247,35 @@ function AttachmentImage({
         setUrl(u);
       })
       .catch(() => {
-        if (!cancelled) setFailed(true);
+        if (!cancelled) {
+          failedRef.current = true;
+          setFailed(true);
+        }
       });
     // We own only URLs we downloaded; never revoke the caller's previewUrl here.
     return () => {
       cancelled = true;
       if (owned) URL.revokeObjectURL(owned);
     };
-  }, [attachment.blob_id, attachment.mime_type, previewUrl, attempt]);
+  }, [attachment.blob_id, attachment.mime_type, previewUrl, attempt, transport]);
+
+  // A restored image can race ahead of its leg going live — a direct chat's channel
+  // token is only stashed once `chat_connect` completes, so an early fetch fails
+  // with "no active direct session". Retry the moment a (re)connect lands instead
+  // of stranding it on tap-to-load.
+  useEffect(() => {
+    if (failedRef.current) setAttempt((a) => a + 1);
+  }, [connEpoch]);
 
   if (failed) {
     return (
       <button className="attachment-retry" onClick={() => setAttempt((a) => a + 1)}>
-        ↻ Tap to load image
+        ↻ {t("chat.tapToLoad")}
       </button>
     );
   }
-  if (!url) return <div className="attachment-loading">Loading image…</div>;
-  return <img className="attachment-img" src={url} alt={attachment.filename ?? "image"} />;
+  if (!url) return <div className="attachment-loading">{t("chat.loadingImage")}</div>;
+  return <img className="attachment-img" src={url} alt={attachment.filename ?? t("chat.imageAlt")} />;
 }
 
 /// Render a message's attachments: images inline (via [`AttachmentImage`]), any
@@ -220,9 +284,13 @@ function AttachmentImage({
 function AttachmentList({
   attachments,
   previews,
+  transport,
+  connEpoch,
 }: {
   attachments: WireAttachment[];
   previews: Map<string, string>;
+  transport: ChatTransport;
+  connEpoch: number;
 }) {
   return (
     <div className="attachments">
@@ -232,6 +300,8 @@ function AttachmentList({
             key={`${a.blob_id}-${i}`}
             attachment={a}
             previewUrl={previews.get(a.blob_id)}
+            transport={transport}
+            connEpoch={connEpoch}
           />
         ) : (
           <div key={`${a.blob_id}-${i}`} className="attachment-file">
@@ -247,14 +317,30 @@ function AttachmentList({
 /// the agent's streamed reply, and sends user messages. Survives a background
 /// round-trip: the thread is persisted, and the session reconnects + replays the
 /// gap whenever the app returns to the foreground.
-function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => void }) {
+function ChatView({
+  sessionId,
+  transport,
+  onClose,
+}: {
+  sessionId: string;
+  transport: ChatTransport;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  // The chat commands are transport-agnostic: relay (Noise content leg) vs direct
+  // (raw-MessagePack /v1/channel-ws) is selected by passing `leg: transport` to a
+  // single backend command, which routes to the right session registry.
   // Parsed once on mount (lazy initializer), then reused for the initial state.
   const [restored] = useState(() => loadChatState(sessionId));
   const [messages, setMessages] = useState<ChatMsg[]>(restored?.messages ?? []);
   const [streaming, setStreaming] = useState("");
   const [turnActive, setTurnActive] = useState(false);
   const [input, setInput] = useState("");
-  const [status, setStatus] = useState<string | null>("Connecting…");
+  const [status, setStatus] = useState<string | null>(() => t("chat.connecting"));
+  // Bumped on each successful (re)connect. A restored attachment image that failed
+  // to load before its leg was live (e.g. a direct chat whose channel token isn't
+  // stashed until `chat_connect` completes) re-fetches when this changes.
+  const [connEpoch, setConnEpoch] = useState(0);
   // platform_msg_ids already rendered (our optimistic sends + anything restored),
   // so the server's echo or a catch-up replay doesn't render them twice.
   const sentIds = useRef<Set<string>>(
@@ -264,17 +350,28 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
   const lastOrdinal = useRef<number>(restored?.lastOrdinal ?? 0);
   // Images picked but not yet sent (uploading or ready), shown in the composer.
   const [staged, setStaged] = useState<StagedAttachment[]>([]);
+  const stagedRef = useRef<StagedAttachment[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // blob_id -> in-session local object URL for images this client sent, so a sent
   // image renders instantly from the picked file instead of re-downloading it.
   const localPreviews = useRef<Map<string, string>>(new Map());
 
-  // Revoke every local preview URL on unmount (leaving the chat) so the object
-  // URLs we held for instant render don't leak.
+  useEffect(() => {
+    stagedRef.current = staged;
+  }, [staged]);
+
+  // Revoke every local/staged preview URL on unmount (leaving the chat) so object
+  // URLs held for instant render or unsent composer picks don't leak.
   useEffect(() => {
     const previews = localPreviews.current;
     return () => {
-      for (const u of previews.values()) URL.revokeObjectURL(u);
+      const sentPreviewUrls = new Set(previews.values());
+      for (const u of sentPreviewUrls) URL.revokeObjectURL(u);
+      for (const stagedItem of stagedRef.current) {
+        if (stagedItem.previewUrl && !sentPreviewUrls.has(stagedItem.previewUrl)) {
+          URL.revokeObjectURL(stagedItem.previewUrl);
+        }
+      }
     };
   }, []);
 
@@ -343,27 +440,36 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
           ]);
           break;
         case "reset":
-          setStatus(`Stream reset: ${frame.reason}`);
+          setStatus(t("chat.streamReset", { reason: frame.reason }));
           break;
         default:
           break; // reasoning / tool progress / etc. not surfaced in mobile chat
       }
     };
-    setStatus("Connecting…");
+    setStatus(t("chat.connecting"));
     // Returns the dial promise (rejections propagate) so the caller can back off
-    // and retry — see `attemptConnect` in the mount effect.
+    // and retry — see `attemptConnect` in the mount effect. `leg: transport` picks
+    // the active transport (relay vs direct) backend-side.
     //
     // Always send a number, never null: the gateway replays the rows ABOVE this
     // ordinal, so `0` (the value when localStorage was evicted and we have nothing
     // rendered) backfills the whole thread from the server instead of leaving the
     // chat blank until the next turn. A genuinely empty session replays nothing; an
     // over-cap history yields a `Frame::Reset` (handled in the frame switch).
-    return invoke("content_connect", {
+    return invoke("chat_connect", {
+      leg: transport,
       sessionId,
       sinceOrdinal: lastOrdinal.current,
       onFrame: channel,
-    }).then(() => setStatus(null));
-  }, [sessionId]);
+    }).then(() => {
+      setStatus(null);
+      setConnEpoch((e) => e + 1);
+    });
+    // `t` is intentionally omitted from deps: re-creating `connect` on a language
+    // switch would tear down + re-dial the live session. Status strings set by a
+    // later reconnect simply use the language captured here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, transport]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -375,7 +481,7 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
     // foreground.
     const attemptConnect = () => {
       connect().catch((e) => {
-        setStatus(`Connect failed: ${e}`);
+        setStatus(t("chat.connectFailed", { error: String(e) }));
         scheduleReconnect();
       });
     };
@@ -424,7 +530,9 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
     // a remote-host restart) — the Rust pump emits this only on an UNsolicited
     // exit (a deliberate reconnect/disconnect aborts the task instead). Reconnect
     // with catch-up so chat recovers without a foreground round-trip.
-    listen("content-disconnected", () => scheduleReconnect())
+    listen<string>("content-disconnected", (event) => {
+      if (event.payload === sessionId) scheduleReconnect();
+    })
       .then((un) => {
         if (cancelled) un();
         else unlistenDropped = un;
@@ -438,7 +546,7 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
       window.removeEventListener("focus", scheduleConnect);
       unlisten?.();
       unlistenDropped?.();
-      invoke("content_disconnect").catch(() => {});
+      invoke("chat_disconnect", { leg: transport }).catch(() => {});
     };
   }, [connect]);
 
@@ -454,7 +562,7 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
       if (file.size > MAX_ATTACHMENT_BYTES) {
         setStaged((s) => [
           ...s,
-          { localId, filename: file.name, mime, size: file.size, status: "error", error: "Too large (max 100 MB)" },
+          { localId, filename: file.name, mime, size: file.size, status: "error", error: t("chat.tooLarge") },
         ]);
         continue;
       }
@@ -464,7 +572,7 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
         { localId, filename: file.name, mime, size: file.size, previewUrl, status: "uploading" },
       ]);
       try {
-        const blobId = await uploadBytes(await file.arrayBuffer(), mime);
+        const blobId = await uploadBytes(await file.arrayBuffer(), mime, transport);
         if (previewUrl) localPreviews.current.set(blobId, previewUrl);
         setStaged((s) =>
           s.map((a) => (a.localId === localId ? { ...a, blobId, status: "ready" } : a)),
@@ -492,7 +600,7 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
     const ready = staged.filter((a) => a.status === "ready" && a.blobId);
     if (!text && ready.length === 0) return;
     if (staged.some((a) => a.status === "uploading")) {
-      setStatus("Waiting for the image to finish uploading…");
+      setStatus(t("chat.waitingUpload"));
       return;
     }
     const msgId = crypto.randomUUID();
@@ -516,23 +624,28 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
     }
     setStaged([]);
     try {
-      await invoke("content_send", { text, msgId, attachments });
+      await invoke("chat_send", { leg: transport, text, msgId, attachments });
     } catch (e) {
-      setStatus(`Send failed: ${e}`);
+      setStatus(t("chat.sendFailed", { error: String(e) }));
     }
   }
 
   return (
-    <main className="container chat">
+    <main className="screen chat">
       <div className="chat-header">
-        <button onClick={onClose}>← Back</button>
-        <h1>Chat</h1>
+        <button onClick={onClose}>← {t("chat.back")}</button>
+        <h1>{t("chat.title")}</h1>
       </div>
       <div className="chat-log">
         {messages.map((m) => (
           <div key={m.id} className={`bubble ${m.role}`}>
             {m.attachments && m.attachments.length > 0 && (
-              <AttachmentList attachments={m.attachments} previews={localPreviews.current} />
+              <AttachmentList
+                attachments={m.attachments}
+                previews={localPreviews.current}
+                transport={transport}
+                connEpoch={connEpoch}
+              />
             )}
             {m.content}
           </div>
@@ -556,7 +669,7 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
                   !
                 </span>
               )}
-              <button className="staged-remove" onClick={() => removeStaged(a.localId)} aria-label="Remove">
+              <button className="staged-remove" onClick={() => removeStaged(a.localId)} aria-label={t("chat.remove")}>
                 ×
               </button>
             </div>
@@ -571,7 +684,7 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
           className="hidden"
           onChange={onPickFiles}
         />
-        <button className="attach" onClick={() => fileInputRef.current?.click()} aria-label="Add image">
+        <button className="attach" onClick={() => fileInputRef.current?.click()} aria-label={t("chat.addImage")}>
           ＋
         </button>
         <input
@@ -580,7 +693,7 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
           onKeyDown={(e) => {
             if (e.key === "Enter") send();
           }}
-          placeholder="Message…"
+          placeholder={t("chat.placeholder")}
         />
         <button
           onClick={send}
@@ -589,25 +702,70 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
             (!input.trim() && !staged.some((a) => a.status === "ready" && a.blobId))
           }
         >
-          Send
+          {t("chat.send")}
         </button>
       </div>
     </main>
   );
 }
 
+/// The language toggle shown top-right on the landing: a line-art globe + the
+/// current language's short code; tapping advances to the next supported
+/// language (i18next persists the choice to localStorage).
+function LangSwitcher() {
+  const { t, i18n } = useTranslation();
+  const idx = SUPPORTED_LANGUAGES.findIndex((l) => l.code === i18n.resolvedLanguage);
+  const current = SUPPORTED_LANGUAGES[idx >= 0 ? idx : 0];
+  const next = SUPPORTED_LANGUAGES[(idx + 1) % SUPPORTED_LANGUAGES.length];
+  return (
+    <button
+      className="lang-switch"
+      onClick={() => void i18n.changeLanguage(next.code)}
+      // Include the visible label (current.short) in the accessible name so it
+      // satisfies WCAG Label-in-Name (voice control), then state the action.
+      aria-label={`${t("lang.label")}: ${current.short} → ${next.label}`}
+    >
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <circle cx="12" cy="12" r="9" />
+        <path d="M3 12h18" />
+        <path d="M12 3c2.6 2.6 2.6 15.4 0 18M12 3c-2.6 2.6-2.6 15.4 0 18" />
+      </svg>
+      <span>{current.short}</span>
+    </button>
+  );
+}
+
 export default function App() {
+  const { t } = useTranslation();
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [challenge, setChallenge] = useState<PairChallenge | null>(null);
   const [paired, setPaired] = useState<PairedSummary | null>(null);
   // On launch, a persisted pairing means we can skip straight to "connected".
   const [rememberedDevice, setRememberedDevice] = useState<string | null>(null);
+  // Direct (non-relay) connection: the gateway base URL once connected (null =
+  // not in direct mode), the landing's method view, and the login form fields.
+  const [directConnected, setDirectConnected] = useState<{ baseUrl: string } | null>(null);
+  const [landingView, setLandingView] = useState<"menu" | "direct">("menu");
+  const [directUrl, setDirectUrl] = useState("");
+  const [directToken, setDirectToken] = useState("");
   // Whether the chat view is open, and the active session id. Both are restored
   // from localStorage so a backgrounded webview reload / app relaunch drops the
   // user straight back into the live chat rather than the landing screen.
   const [chatting, setChatting] = useState(() => localStorage.getItem(CHAT_ACTIVE_KEY) === "1");
   const [sessionId, setSessionId] = useState(() => localStorage.getItem(CHAT_SESSION_KEY) ?? "");
+  // Transport of the active/last chat, restored so a reload re-dials the right leg.
+  const [chatTransport, setChatTransport] = useState<ChatTransport>(() =>
+    localStorage.getItem(CHAT_MODE_KEY) === "direct" ? "direct" : "relay",
+  );
   // QR scan flow. "scanning" makes the page transparent so the native camera
   // (drawn behind the webview) shows through; "success" plays a brief
   // confirmation beat on the app background, covering the camera teardown so the
@@ -626,6 +784,12 @@ export default function App() {
   useEffect(() => {
     invoke<string | null>("paired_device")
       .then((d) => setRememberedDevice(d))
+      .catch(() => {});
+    // A persisted direct connection skips straight to the direct "connected" view.
+    invoke<{ base_url: string } | null>("direct_status")
+      .then((d) => {
+        if (d) setDirectConnected({ baseUrl: d.base_url });
+      })
       .catch(() => {});
   }, []);
 
@@ -660,7 +824,7 @@ export default function App() {
         perm = await bs.requestPermissions();
       }
       if (perm !== "granted") {
-        setStatus("Camera access is off — enable it for Baybo in Settings, then try again.");
+        setStatus(t("scan.permissionOff"));
         await bs.openAppSettings().catch(() => {});
         return;
       }
@@ -671,7 +835,7 @@ export default function App() {
       const res = await bs.scan({ windowed: true, formats: [bs.Format.QRCode] });
       const parsed = parseScan(res.content);
       if (!parsed) {
-        setStatus("That QR isn't a Baybo pairing QR. Scan the one shown by `baybo device pair`.");
+        setStatus(t("scan.notBaybo"));
         return;
       }
       // Success: buzz, pop a green dot at the reticle centre, then briefly hold
@@ -693,7 +857,7 @@ export default function App() {
         remoteApiKey: parsed.remoteApiKey,
       });
     } catch (e) {
-      setStatus(scanCancelled.current ? null : `Scan failed: ${e}`);
+      setStatus(scanCancelled.current ? null : t("scan.failed", { error: String(e) }));
     } finally {
       setScanPhase("idle");
     }
@@ -719,14 +883,14 @@ export default function App() {
     remoteApiKey?: string;
   }) {
     setBusy(true);
-    setStatus("Connecting…");
+    setStatus(t("pair.connecting"));
     // The gateway can cancel pairing (the operator declined, or the link dropped)
     // while we sit on the confirm screen. Listen for that so the screen dismisses
     // itself instead of hanging until the user taps.
     const onAbort = new Channel<PairAborted>();
     onAbort.onmessage = (ev) => {
       setChallenge(null);
-      setStatus(`Pairing cancelled: ${ev.reason}`);
+      setStatus(t("pair.cancelledReason", { reason: ev.reason }));
     };
     try {
       const c = await invoke<PairChallenge>("pair_begin", {
@@ -739,7 +903,7 @@ export default function App() {
       setChallenge(c);
       setStatus(null);
     } catch (e) {
-      setStatus(`Pairing failed: ${e}`);
+      setStatus(t("pair.failed", { error: String(e) }));
     } finally {
       setBusy(false);
     }
@@ -750,7 +914,7 @@ export default function App() {
   async function confirmPair(accepted: boolean) {
     if (!challenge) return;
     setBusy(true);
-    setStatus(accepted ? "Confirming…" : "Cancelling…");
+    setStatus(accepted ? t("pair.confirming") : t("pair.cancelling"));
     try {
       if (accepted) {
         const summary = await invoke<PairedSummary>("pair_confirm", {
@@ -759,6 +923,10 @@ export default function App() {
         });
         setPaired(summary);
         setChallenge(null);
+        // A finalized relay pairing supersedes any direct connection (Rust deletes
+        // the direct credentials at finalize). `directConnected` gates ahead of
+        // `paired`, so clear it or the now-defunct direct screen would keep showing.
+        setDirectConnected(null);
         setStatus(null);
       } else {
         // The decline path intentionally returns an error on the Rust side.
@@ -766,10 +934,10 @@ export default function App() {
           () => {},
         );
         setChallenge(null);
-        setStatus("Pairing cancelled.");
+        setStatus(t("pair.cancelled"));
       }
     } catch (e) {
-      setStatus(`Pairing failed: ${e}`);
+      setStatus(t("pair.failed", { error: String(e) }));
       setChallenge(null);
     } finally {
       setBusy(false);
@@ -784,7 +952,7 @@ export default function App() {
       await invoke("forget_pairing");
       setStatus(null);
     } catch (e) {
-      setStatus(`Couldn't forget the pairing: ${e}`);
+      setStatus(t("connected.forgetFailed", { error: String(e) }));
     } finally {
       setBusy(false);
       setPendingAction(null);
@@ -797,13 +965,30 @@ export default function App() {
     }
   }
 
-  // Open a fresh chat: a new session id, persisted with the active flag (and the
-  // previous thread dropped), so a mid-chat reload restores *this* conversation.
-  function openChat() {
-    const id = crypto.randomUUID();
+  // Open a fresh chat (the previous thread is dropped), persisted with the active
+  // flag + transport so a mid-chat reload restores *this* conversation on the
+  // right leg. The relay path mints a client UUID; the direct path must use the
+  // gateway-assigned session id from `direct_session_create`.
+  async function openChat(transport: ChatTransport) {
+    let id: string;
+    if (transport === "direct") {
+      setBusy(true);
+      try {
+        id = await directSessionCreate();
+      } catch (e) {
+        setStatus(t("direct.failed", { error: String(e) }));
+        return;
+      } finally {
+        setBusy(false);
+      }
+    } else {
+      id = crypto.randomUUID();
+    }
     clearChatState();
     localStorage.setItem(CHAT_SESSION_KEY, id);
     localStorage.setItem(CHAT_ACTIVE_KEY, "1");
+    localStorage.setItem(CHAT_MODE_KEY, transport);
+    setChatTransport(transport);
     setSessionId(id);
     setChatting(true);
   }
@@ -811,6 +996,64 @@ export default function App() {
   // Leave the chat (explicit Back): forget the persisted session so the next open
   // starts clean and a later reload won't resurrect a chat the user closed.
   function closeChat() {
+    clearChatState();
+    setSessionId("");
+    setChatting(false);
+  }
+
+  // Direct (web-style) login: validate the gateway URL + admin token against
+  // `/v1/status` (Rust), persist them, and drop into the direct "connected" view.
+  async function directConnect() {
+    const token = directToken.trim();
+    if (!directUrl.trim() || !token || busy) return;
+    // Validate + normalize the address up front (mirrors the Rust check) so a
+    // typo gets immediate feedback instead of a confusing network error.
+    const baseUrl = normalizeBayboAddress(directUrl);
+    if (!baseUrl) {
+      setStatus(t("direct.invalidUrl"));
+      return;
+    }
+    setBusy(true);
+    setStatus(t("direct.connecting"));
+    try {
+      const s = await invoke<{ base_url: string }>("direct_login", { baseUrl, token });
+      setDirectToken(""); // don't retain the admin token in React state after use
+      setStatus(null);
+      setLandingView("menu");
+      setDirectConnected({ baseUrl: s.base_url });
+      // A direct login supersedes any relay pairing (Rust wipes it — see
+      // direct::login -> relay::forget_pairing), so drop the relay React state.
+      // Otherwise a later disconnect would fall through the render gates to a
+      // stale relay "remembered" screen for a pairing that no longer exists.
+      setRememberedDevice(null);
+      setPaired(null);
+      setPendingAction(null);
+    } catch (e) {
+      const msg = String(e);
+      // `invalid_token` is a stable discriminator the Rust side returns for a 401
+      // (see direct.rs) — matched here to show the localized message; any other
+      // error string is surfaced verbatim.
+      setStatus(msg === "invalid_token" ? t("direct.invalidToken") : t("direct.failed", { error: msg }));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Direct "disconnect": tear down any live chat, wipe the stored credentials,
+  // and return to the landing.
+  async function directDisconnect() {
+    setBusy(true);
+    try {
+      await invoke("direct_logout");
+    } catch {
+      /* best-effort — clear the UI regardless */
+    }
+    setDirectConnected(null);
+    setDirectUrl("");
+    setDirectToken("");
+    setStatus(null);
+    setBusy(false);
+    // No connection → no chat: drop any persisted session so it can't resurrect.
     clearChatState();
     setSessionId("");
     setChatting(false);
@@ -832,15 +1075,13 @@ export default function App() {
     if (pendingAction === "forget") {
       return (
         <div className="confirm-inline">
-          <p className="muted">
-            Forget this gateway? Notifications and chat stop until you pair again.
-          </p>
+          <p className="muted">{t("connected.forgetConfirm")}</p>
           <div className="row">
             <button onClick={() => setPendingAction(null)} disabled={busy}>
-              Cancel
+              {t("pair.cancel")}
             </button>
             <button className="danger" onClick={forgetPairing} disabled={busy}>
-              Forget
+              {t("connected.forget")}
             </button>
           </div>
         </div>
@@ -849,16 +1090,13 @@ export default function App() {
     if (pendingAction === "replace") {
       return (
         <div className="confirm-inline">
-          <p className="muted">
-            Replace this pairing? You'll scan a new gateway; the current one stays
-            until the new pairing finishes.
-          </p>
+          <p className="muted">{t("connected.replaceConfirm")}</p>
           <div className="row">
             <button onClick={() => setPendingAction(null)} disabled={busy}>
-              Cancel
+              {t("pair.cancel")}
             </button>
             <button onClick={startReplace} disabled={busy}>
-              Replace
+              {t("connected.replace")}
             </button>
           </div>
         </div>
@@ -866,28 +1104,49 @@ export default function App() {
     }
     return (
       <div className="row">
-        <button onClick={openChat}>Open chat</button>
-        <button onClick={() => setPendingAction("replace")}>Replace pairing</button>
+        <button onClick={() => openChat("relay")}>{t("connected.openChat")}</button>
+        <button onClick={() => setPendingAction("replace")}>{t("connected.replace")}</button>
         <button className="danger" onClick={() => setPendingAction("forget")}>
-          Forget
+          {t("connected.forget")}
         </button>
       </div>
     );
   }
 
   if (chatting && sessionId) {
-    return <ChatView sessionId={sessionId} onClose={closeChat} />;
+    return <ChatView sessionId={sessionId} transport={chatTransport} onClose={closeChat} />;
+  }
+
+  // Direct (non-relay) connection.
+  if (directConnected) {
+    return (
+      <main className="screen screen-center">
+        <LangSwitcher />
+        <h1>{t("connected.title")}</h1>
+        <p className="muted">{t("connected.directReady", { url: directConnected.baseUrl })}</p>
+        <div className="row">
+          <button onClick={() => openChat("direct")} disabled={busy}>
+            {t("connected.openChat")}
+          </button>
+          <button className="danger" onClick={directDisconnect} disabled={busy}>
+            {t("connected.disconnect")}
+          </button>
+        </div>
+        {status && <p className="status">{status}</p>}
+      </main>
+    );
   }
 
   if (paired) {
     return (
-      <main className="container">
-        <h1>Connected</h1>
-        <p className="muted">Paired and ready.</p>
+      <main className="screen screen-center">
+        <LangSwitcher />
+        <h1>{t("connected.title")}</h1>
+        <p className="muted">{t("connected.ready")}</p>
         <dl className="kv">
-          <dt>Rendezvous</dt>
+          <dt>{t("connected.rendezvous")}</dt>
           <dd>{paired.rendezvousId}</dd>
-          <dt>Relay node</dt>
+          <dt>{t("connected.relayNode")}</dt>
           <dd>{paired.relayNodeId || "—"}</dd>
         </dl>
         {connectedActions()}
@@ -898,19 +1157,17 @@ export default function App() {
 
   if (challenge) {
     return (
-      <main className="container">
-        <h1>Confirm pairing</h1>
-        <p className="muted">
-          Check this code matches the one shown on the computer running{" "}
-          <code>baybo device pair</code>, then pair on both.
-        </p>
+      <main className="screen screen-center">
+        <LangSwitcher />
+        <h1>{t("pair.confirmTitle")}</h1>
+        <p className="muted">{t("pair.confirmHint")}</p>
         <div className="confirm-code">{challenge.confirmCode}</div>
         <div className="row">
           <button onClick={() => confirmPair(false)} disabled={busy}>
-            Cancel
+            {t("pair.cancel")}
           </button>
           <button onClick={() => confirmPair(true)} disabled={busy}>
-            Pair
+            {t("pair.pair")}
           </button>
         </div>
         {status && <p className="status">{status}</p>}
@@ -920,11 +1177,10 @@ export default function App() {
 
   if (rememberedDevice) {
     return (
-      <main className="container">
-        <h1>Connected</h1>
-        <p className="muted">
-          Paired (remembered from a previous session).
-        </p>
+      <main className="screen screen-center">
+        <LangSwitcher />
+        <h1>{t("connected.title")}</h1>
+        <p className="muted">{t("connected.remembered")}</p>
         {connectedActions()}
         {status && <p className="status">{status}</p>}
       </main>
@@ -933,15 +1189,91 @@ export default function App() {
 
   return (
     <>
-      <main className="container">
-        <h1>Baybo</h1>
-        <p className="muted">Scan the pairing QR shown by <code>baybo device pair</code>.</p>
-
-        <div className="row">
-          <button onClick={scan} disabled={busy}>Scan QR</button>
+      <main className="screen landing">
+        <LangSwitcher />
+        <div className="landing-hero">
+          <h1 className="wordmark">Baybo</h1>
+          <div className="rule" />
+          {landingView === "menu" ? (
+            <>
+              <p className="muted landing-sub">{t("landing.subtitle")}</p>
+              <button className="cta" onClick={scan} onPointerDown={tapHaptic} disabled={busy}>
+                {t("landing.scan")}
+              </button>
+              <button
+                className="cta cta-secondary"
+                onClick={() => {
+                  setStatus(null);
+                  setLandingView("direct");
+                }}
+                onPointerDown={tapHaptic}
+                disabled={busy}
+              >
+                {t("landing.direct")}
+              </button>
+              {status && <p className="status">{status}</p>}
+            </>
+          ) : (
+            <div className="direct-form">
+              <p className="muted landing-sub">{t("direct.hint")}</p>
+              <label className="field">
+                <span className="field-label">{t("direct.urlLabel")}</span>
+                <input
+                  type="url"
+                  inputMode="url"
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  placeholder="https://…"
+                  value={directUrl}
+                  onChange={(e) => setDirectUrl(e.target.value)}
+                />
+              </label>
+              <div className="field">
+                {/* explicit htmlFor (not a wrapping label) so the hint below can
+                    be a sibling — keeping it out of the input's accessible name. */}
+                <label className="field-label" htmlFor="direct-token">
+                  {t("direct.tokenLabel")}
+                </label>
+                <input
+                  id="direct-token"
+                  type="password"
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  aria-describedby="direct-token-hint"
+                  placeholder={t("direct.tokenPlaceholder")}
+                  value={directToken}
+                  onChange={(e) => setDirectToken(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") directConnect();
+                  }}
+                />
+                <span className="field-hint" id="direct-token-hint">{t("direct.tokenHint")}</span>
+              </div>
+              <button
+                className="cta"
+                onClick={directConnect}
+                onPointerDown={tapHaptic}
+                disabled={busy || !directUrl.trim() || !directToken.trim()}
+              >
+                {busy ? t("direct.connecting") : t("direct.connect")}
+              </button>
+              <button
+                className="link-btn"
+                onClick={() => {
+                  setStatus(null);
+                  setLandingView("menu");
+                }}
+                disabled={busy}
+              >
+                ← {t("direct.back")}
+              </button>
+              {status && <p className="status">{status}</p>}
+            </div>
+          )}
         </div>
-
-        {status && <p className="status">{status}</p>}
+        <p className="landing-foot">v{__APP_VERSION__}</p>
       </main>
 
       {scanPhase === "scanning" && !cameraUp && <div className="scan-warming" />}
@@ -953,7 +1285,7 @@ export default function App() {
             viewBox="0 0 100 100"
             fill="none"
             stroke="#fff"
-            strokeWidth="8"
+            strokeWidth="5"
             strokeLinecap="round"
             strokeLinejoin="round"
           >
@@ -963,7 +1295,7 @@ export default function App() {
             <path d="M92 76 L92 78 Q92 92 78 92 L76 92" />
           </svg>
           <button className="scan-cancel" onClick={cancelScan}>
-            Cancel
+            {t("scan.cancel")}
           </button>
         </div>
       )}
