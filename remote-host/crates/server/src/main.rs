@@ -17,6 +17,7 @@ use remote_host_ratelimit::IpLimitConfig;
 use remote_host_relay::serve::build_router as relay_router;
 
 mod admission_db;
+mod logging;
 mod serve;
 
 use serve::TlsPaths;
@@ -32,10 +33,13 @@ const DEFAULT_POLL_SECS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Install the subscriber before anything logs; hold the guard so the
+    // non-blocking file writer flushes on exit (including the fatal arm below).
+    let _log_guard = logging::init();
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("remote-host: {e}");
+            tracing::error!("remote-host: {e}");
             ExitCode::FAILURE
         }
     }
@@ -143,9 +147,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         "http/ws"
     };
-    eprintln!(
-        "remote-host: listening on {bind_addr} ({scheme}) — roles: {}",
-        roles.join(" + "),
+    tracing::info!(
+        %bind_addr,
+        %scheme,
+        roles = %roles.join(" + "),
+        "remote-host: listening",
     );
     serve::serve(&bind_addr, tls, app).await?;
     Ok(())

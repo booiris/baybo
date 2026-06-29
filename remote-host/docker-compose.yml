@@ -67,6 +67,13 @@ services:
       # TLS — set only when a cert is configured (-> wss/https), else blank (-> ws/http)
       TLS_CERT: ${TLS_CERT_HOST_PATH:+/run/tls/cert.pem}
       TLS_KEY: ${TLS_KEY_HOST_PATH:+/run/tls/key.pem}
+      # Logging — rolling daily files at LOG_DIR (on the /data volume, so they
+      # land on the host ./data/logs and survive `up --build`), 14 days retained,
+      # also mirrored to stderr/`docker compose logs`. RUST_LOG tunes verbosity;
+      # blank -> the built-in default (deps at warn, our crates at info — quiet by
+      # design for a public endpoint).
+      RUST_LOG: ${RUST_LOG:-}
+      LOG_DIR: ${LOG_DIR:-/data/logs}
     secrets:
       - apns_p8
     volumes:
@@ -77,3 +84,10 @@ services:
       - ${TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/key.pem:ro
     ports:
       - "${PORT:-7777}:${PORT:-7777}"
+    # The durable log copy is the rolling file on the /data volume (./data/logs).
+    # This caps the Docker-captured stderr mirror so it can't grow unbounded.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
