@@ -76,7 +76,7 @@ where
                         on_revoke(revoked);
                     }
                 }
-                Err(e) => eprintln!("remote-host: admission poll failed: {e}"),
+                Err(e) => tracing::error!(error = %e, "remote-host: admission poll failed"),
             }
         }
     });
@@ -124,22 +124,6 @@ async fn load(conn: &libsql::Connection) -> Result<HashMap<String, AdmissionEntr
         );
     }
     Ok(keys)
-}
-
-/// Durably delete expired guest rows from the `remote_api_keys` allow-list,
-/// returning the number removed. This is an **infra / admission** GC, NOT session
-/// data — the "never delete sessions" rule does not apply.
-///
-/// Expired guests are already filtered on load; no durable periodic sweep is
-/// mounted today.
-#[allow(dead_code)]
-pub(crate) async fn gc_expired_guests(conn: &libsql::Connection) -> Result<u64, libsql::Error> {
-    conn.execute(
-        "DELETE FROM remote_api_keys \
-         WHERE tier = 'guest' AND expires_at IS NOT NULL AND expires_at < datetime('now')",
-        (),
-    )
-    .await
 }
 
 #[cfg(test)]
@@ -221,50 +205,6 @@ mod tests {
         assert!(
             loaded.contains_key("reg-stale"),
             "the load filter only drops guests"
-        );
-    }
-
-    #[tokio::test]
-    async fn gc_deletes_only_expired_guests() {
-        let conn = mem_conn().await;
-        conn.execute(
-            "INSERT INTO remote_api_keys(remote_api_key, tier, expires_at) \
-             VALUES('stale', 'guest', '2000-01-01 00:00:00')",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO remote_api_keys(remote_api_key, tier) VALUES('never', 'guest')",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO remote_api_keys(remote_api_key, tier, max_conns, max_bps, expires_at) \
-             VALUES('reg-stale', 'registered', 8, 4194304, '2000-01-01 00:00:00')",
-            (),
-        )
-        .await
-        .unwrap();
-
-        let removed = gc_expired_guests(&conn).await.unwrap();
-        assert_eq!(removed, 1, "only the expired guest is deleted");
-
-        let mut rows = conn
-            .query(
-                "SELECT remote_api_key FROM remote_api_keys ORDER BY remote_api_key",
-                (),
-            )
-            .await
-            .unwrap();
-        let mut survivors = Vec::new();
-        while let Some(r) = rows.next().await.unwrap() {
-            survivors.push(r.get::<String>(0).unwrap());
-        }
-        assert_eq!(
-            survivors,
-            vec!["never".to_string(), "reg-stale".to_string()]
         );
     }
 

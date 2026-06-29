@@ -130,8 +130,9 @@ async fn register_push(
     })?;
     let device_id = delegation::device_id_for(&device_pub);
 
-    // Verify the delegation authorizes THIS gateway's push key — without it the
-    // binding can't prove ownership to C under a shared remote_api_key.
+    // Verify the delegation authorizes THIS gateway's push key — push is keyless,
+    // so the delegation chain is the SOLE authorization C verifies, and a binding
+    // without it can't prove ownership to C at all.
     let signing_key = load_or_create_push_signing_key(&state.secret_vault)
         .await
         .map_err(|e| GatewayError::Internal(format!("load push signing key: {e}")))?;
@@ -166,7 +167,6 @@ async fn register_push(
     let binding = web::WebPushBinding {
         device_id: device_id.clone(),
         relay_url: push_cfg.relay_url.clone(),
-        remote_api_key: push_cfg.remote_api_key.clone(),
         created_at: chrono::Utc::now().timestamp(),
     };
     web::store_binding(

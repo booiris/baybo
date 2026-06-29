@@ -2,17 +2,17 @@
 //!
 //! A gateway POSTs `/notify` on every pushable turn; this bounds how fast a
 //! single device can be pushed to, so a buggy or abusive gateway can neither
-//! hammer APNs nor spam a phone. The key is `device_id` alone — a 32-byte Ed25519
-//! public key, globally unique — so the budget follows the physical device, and
+//! hammer APNs nor spam a phone. The key is `device_id` — a 32-byte Ed25519
+//! public key, globally unique — so the budget follows the physical device and
 //! one chatty device can't starve another. Because `/notify` is signature-checked
-//! against the device's delegated gateway key *before* this runs, a co-tenant
-//! sharing the `remote_api_key` can't reach (and thus can't drain) another
-//! device's bucket. Over the limit, the caller returns `429`.
+//! against the device's delegated gateway key *before* this runs, a notify for a
+//! device the caller doesn't own can't reach (and thus can't drain) its bucket.
+//! Over the limit, the caller returns `429`.
 //!
-//! The rate is fixed ([`NOTIFY_RATE_PER_MIN`] sustained, [`NOTIFY_BURST`] burst),
-//! not configurable. Each device gets a [`TokenBucket`]; an over-cap soft limit
-//! evicts brim-full (idle) buckets so a churn of device ids can't grow the map
-//! without bound. Time is injectable for deterministic tests.
+//! Each device gets a [`TokenBucket`]; an over-cap soft limit evicts brim-full
+//! (idle) buckets so a churn of device ids can't grow the map without bound. The
+//! rate is configurable (defaults below); time is injectable for deterministic
+//! tests.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -33,20 +33,48 @@ pub const NOTIFY_BURST: f64 = 20.0;
 /// per-second refill.
 const SECS_PER_MIN: f64 = 60.0;
 
-/// Soft cap on tracked device buckets. When exceeded, brim-full (idle) buckets
-/// are evicted — dropping a full bucket grants no extra allowance (a re-created
-/// one also starts full), so eviction is free of fairness risk.
-const BUCKET_SOFT_CAP: usize = 16_384;
+/// The notify-limiter's bucket-map soft cap is this multiple of the **configured**
+/// device-store cap (see [`NotifyRateLimiter::for_store_cap`]). The limiter only
+/// ever mints a bucket for a *registered* device, so the live set can't exceed the
+/// store; this headroom for lingering churned-out buckets keeps the O(n) eviction
+/// scan off the hot path — a pathological-churn backstop, not a routine path.
+const BUCKET_CAP_STORE_MULTIPLE: usize = 2;
 
-/// One token-bucket per `device_id`, all at the fixed rate.
-#[derive(Default)]
+/// One token-bucket per `device_id`, all at the configured rate. `soft_cap` bounds
+/// the map; when exceeded, brim-full (idle) buckets are evicted — dropping a full
+/// bucket grants no extra allowance (a re-created one also starts full), so
+/// eviction is free of fairness risk.
 pub struct NotifyRateLimiter {
     buckets: Mutex<HashMap<String, TokenBucket>>,
+    burst: f64,
+    refill_per_sec: f64,
+    soft_cap: usize,
+}
+
+impl Default for NotifyRateLimiter {
+    /// The built-in [`NOTIFY_RATE_PER_MIN`] / [`NOTIFY_BURST`] rate, sized for the
+    /// default device-store cap.
+    fn default() -> Self {
+        Self::for_store_cap(
+            NOTIFY_RATE_PER_MIN,
+            NOTIFY_BURST,
+            crate::store::DEVICE_STORE_SOFT_CAP,
+        )
+    }
 }
 
 impl NotifyRateLimiter {
-    pub fn new() -> Self {
-        Self::default()
+    /// `rate_per_min` sustained pushes/min and `burst` back-to-back pushes per
+    /// device; the bucket-map soft cap is derived from `device_store_cap` (the
+    /// runtime-configured store size) via [`BUCKET_CAP_STORE_MULTIPLE`]. The
+    /// operator overrides the rate + store cap via env (see `PushLimits`).
+    pub fn for_store_cap(rate_per_min: f64, burst: f64, device_store_cap: usize) -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            burst,
+            refill_per_sec: rate_per_min / SECS_PER_MIN,
+            soft_cap: device_store_cap * BUCKET_CAP_STORE_MULTIPLE,
+        }
     }
 
     /// Account one push for `device_id`; returns whether it is within the rate. A
@@ -57,14 +85,12 @@ impl NotifyRateLimiter {
 
     fn check_at(&self, device_id: &str, now: Instant) -> bool {
         let mut buckets = self.buckets.lock();
-        if buckets.len() >= BUCKET_SOFT_CAP {
+        if buckets.len() >= self.soft_cap {
             buckets.retain(|_, b| !b.is_full_at(now));
         }
         buckets
             .entry(device_id.to_string())
-            .or_insert_with(|| {
-                TokenBucket::new_at(NOTIFY_BURST, NOTIFY_RATE_PER_MIN / SECS_PER_MIN, now)
-            })
+            .or_insert_with(|| TokenBucket::new_at(self.burst, self.refill_per_sec, now))
             .try_take_at(1.0, now)
     }
 }
@@ -76,7 +102,7 @@ mod tests {
 
     #[test]
     fn allows_the_burst_then_throttles_then_recovers() {
-        let limiter = NotifyRateLimiter::new();
+        let limiter = NotifyRateLimiter::default();
         let t0 = Instant::now();
         // The whole burst lands back-to-back in the same instant.
         for _ in 0..NOTIFY_BURST as usize {
@@ -91,7 +117,7 @@ mod tests {
 
     #[test]
     fn buckets_are_per_device() {
-        let limiter = NotifyRateLimiter::new();
+        let limiter = NotifyRateLimiter::default();
         let t0 = Instant::now();
         // Drain dev-1 to its burst.
         for _ in 0..NOTIFY_BURST as usize {
@@ -100,5 +126,16 @@ mod tests {
         assert!(!limiter.check_at("dev-1", t0), "dev-1 drained");
         // A different device has its own budget.
         assert!(limiter.check_at("dev-2", t0));
+    }
+
+    #[test]
+    fn a_custom_rate_is_honored() {
+        // A tighter rate (10/min, burst 3) clamps sooner than the default.
+        let limiter = NotifyRateLimiter::for_store_cap(10.0, 3.0, 1000);
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            assert!(limiter.check_at("dev-1", t0));
+        }
+        assert!(!limiter.check_at("dev-1", t0), "burst 3 exhausted");
     }
 }

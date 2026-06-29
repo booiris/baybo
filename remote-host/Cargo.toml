@@ -24,6 +24,11 @@ anyhow = "1"
 thiserror = "2"
 async-trait = "0.1"
 tracing = "0.1"
+# Wired in the `server` binary only: an `EnvFilter`-gated subscriber that fans
+# out to a rolling daily file (`tracing-appender`) and stderr. The library
+# crates just call `tracing::*`; they stay subscriber-agnostic.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 axum = "0.8"
 # In-process TLS termination (wss/https) so the relay + push can be exposed
 # directly, no reverse proxy needed. rustls is the same stack reqwest already
@@ -37,7 +42,8 @@ remote-host-admission = { path = "crates/admission" }
 # on. Pure serde, no transport/baybo deps.
 remote-host-protocol = { path = "crates/protocol" }
 # The token-bucket primitive shared by the push frequency control + relay
-# bandwidth throttle. Pure std, no deps.
+# bandwidth throttle, plus the per-source-IP request throttle (`ip_limit`) both
+# routers mount (a small axum middleware layer).
 remote-host-ratelimit = { path = "crates/ratelimit" }
 # Admission allow-list is a libsql/SQLite table, hot-reloaded by polling (it may
 # be updated out of band). `core` = embedded SQLite, no remote/replication.

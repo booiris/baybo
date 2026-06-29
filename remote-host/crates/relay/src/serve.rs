@@ -24,12 +24,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use std::net::SocketAddr;
-
 use axum::Router;
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Extension, Path, Request, State};
-use axum::http::{HeaderName, StatusCode};
+use axum::extract::{Extension, Path, Request, State};
+use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -38,12 +36,16 @@ use remote_host_protocol::relay::{
     CONTENT_HOST, CONTENT_JOIN, CONTROL, LegClass, PAIR_HOST, PAIR_JOIN, RELAY_LEG_CLASS_HEADER,
     REMOTE_API_KEY_HEADER,
 };
+use remote_host_ratelimit::ip_limit;
+// `build_router` (pub) takes an `IpLimitConfig`, so downstream callers must be
+// able to name it without depending on `remote-host-ratelimit` directly.
+pub use remote_host_ratelimit::ip_limit::IpLimitConfig;
 
 use crate::bandwidth::{BandwidthRegistry, LegClass as BwClass};
 use crate::broker::{ParkOutcome, RelayBroker};
 use crate::conns::ConnectionRegistry;
 use crate::control::{ControlHello, ControlRegisterError, ControlRegistry, SignalOpenError};
-use crate::ip_limit::IpRateLimiter;
+use crate::traffic::{Direction, LegMetering, TrafficRegistry};
 use crate::ws::pump_ws;
 
 /// Drop a gateway control connection that has gone silent for this long. The
@@ -131,51 +133,6 @@ struct PendingContentLeg {
     owner_remote_api_key: String,
 }
 
-/// How the per-IP limiter resolves the **client** address of a request.
-///
-/// `enabled` mounts the limiter at all. `trusted_headers` are header names tried
-/// **in order** to read the real client IP (e.g. `["cf-connecting-ip"]` behind
-/// Cloudflare) — the first that holds a parseable address wins, else the socket
-/// peer ([`ConnectInfo`]) is used. An empty list means socket-peer only.
-///
-/// **Trust these headers ONLY when the origin is reachable solely via the proxy
-/// that sets them** (Cloudflare IP allowlist / Tunnel / Authenticated Origin
-/// Pulls). A client header is otherwise forgeable: a direct-to-origin attacker
-/// could set any `cf-connecting-ip` to evade the limit or frame an arbitrary IP.
-#[derive(Clone, Default)]
-pub struct IpLimitConfig {
-    pub enabled: bool,
-    pub trusted_headers: Vec<HeaderName>,
-}
-
-impl IpLimitConfig {
-    /// Limiter off entirely.
-    pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            trusted_headers: Vec::new(),
-        }
-    }
-
-    /// Limiter on, keying on the socket peer (no proxy-header trust). Correct when
-    /// remote-host terminates TLS itself (the peer is the real client).
-    pub fn socket_peer() -> Self {
-        Self {
-            enabled: true,
-            trusted_headers: Vec::new(),
-        }
-    }
-
-    /// Limiter on, resolving the client IP from `headers` (tried in order) before
-    /// falling back to the socket peer. See the type docs for the trust caveat.
-    pub fn with_trusted_headers(headers: Vec<HeaderName>) -> Self {
-        Self {
-            enabled: true,
-            trusted_headers: headers,
-        }
-    }
-}
-
 #[derive(Clone)]
 struct RelayState {
     broker: Arc<RelayBroker>,
@@ -189,6 +146,10 @@ struct RelayState {
     /// per-`(key, server)` sub-cap); content legs throttle against the owning
     /// gateway's buckets (pairing legs are tiny and unthrottled).
     bandwidth: Arc<BandwidthRegistry>,
+    /// Per-`(remote_api_key, server_id)` traffic counters; content legs record the
+    /// bytes/frames they move (both directions of a session share one entry). The
+    /// server's flush task drains it to the durable traffic ledger.
+    traffic: Arc<TrafficRegistry>,
     /// `relay_key` → content leg metadata awaiting the gateway host. The phone's
     /// content-join writes it (it knows the server, class, and owning admission
     /// key); the gateway's content-host must claim it with that same key before it
@@ -197,29 +158,25 @@ struct RelayState {
     pending_content_legs: Arc<parking_lot::Mutex<HashMap<String, PendingContentLeg>>>,
     /// Per-rendezvous `/pair/join` throttle (anti-grief; see [`JoinRateLimiter`]).
     join_limiter: Arc<JoinRateLimiter>,
-    /// Per-source-IP upgrade throttle ahead of admission (flood backstop; see
-    /// [`IpRateLimiter`]). Skipped when no client IP can be resolved.
-    ip_limiter: Arc<IpRateLimiter>,
-    /// Header names tried in order to resolve the real client IP behind a trusted
-    /// proxy (see [`IpLimitConfig`]); empty = socket-peer only.
-    ip_trusted_headers: Arc<Vec<HeaderName>>,
 }
 
 /// Assemble the relay router. `admission` is the shared, hot-reloaded allow-list
 /// of admitted `remote_api_key`s; `conns` tracks live connections so a revoke (an
 /// admission reload that dropped a key) can kick them; `bandwidth` throttles each
-/// gateway's content throughput at two levels (per key ∧ per server).
+/// gateway's content throughput at two levels (per key ∧ per server); `traffic`
+/// records the bytes/frames each `(key, server)` moves for the durable ledger.
 ///
-/// `ip_limit` configures the per-source-IP upgrade throttle (see
-/// [`IpRateLimiter`] / [`IpLimitConfig`]). Enable it keying on the socket peer
-/// when remote-host terminates TLS itself (the peer is the real client); behind a
+/// `ip_limit` configures the shared per-source-IP upgrade throttle (see
+/// [`remote_host_ratelimit::ip_limit`]). Enable it keying on the socket peer when
+/// remote-host terminates TLS itself (the peer is the real client); behind a
 /// proxy, either disable it (rate-limit at the proxy) or give it the trusted
 /// client-IP header(s) the proxy sets (e.g. `cf-connecting-ip`) — see the
-/// `IpLimitConfig` trust caveat.
+/// [`IpLimitConfig`] trust caveat.
 pub fn build_router(
     admission: Arc<dyn Admission>,
     conns: Arc<ConnectionRegistry>,
     bandwidth: Arc<BandwidthRegistry>,
+    traffic: Arc<TrafficRegistry>,
     ip_limit: IpLimitConfig,
 ) -> Router {
     let state = RelayState {
@@ -228,10 +185,9 @@ pub fn build_router(
         control: Arc::new(ControlRegistry::new()),
         conns,
         bandwidth,
+        traffic,
         pending_content_legs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         join_limiter: Arc::new(JoinRateLimiter::default()),
-        ip_limiter: Arc::new(IpRateLimiter::new()),
-        ip_trusted_headers: Arc::new(ip_limit.trusted_headers),
     };
     // Every route admits via the shared `x-remote-api-key` pre-layer — including
     // `/control`, whose key now rides the dial header too (its hello carries only
@@ -247,62 +203,12 @@ pub fn build_router(
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admitted,
-        ));
-    // The per-IP limiter is added *after* admission so it wraps it as the
+        ))
+        .with_state(state);
+    // The shared per-IP limiter is added *after* admission so it wraps it as the
     // outermost layer (tower runs outer→inner), shedding a flood by client IP
     // before the admission check and any upgrade work.
-    let router = if ip_limit.enabled {
-        router.route_layer(middleware::from_fn_with_state(state.clone(), limit_per_ip))
-    } else {
-        router
-    };
-    router.with_state(state)
-}
-
-/// `429 Too Many Requests` for a source IP over its relay-upgrade rate.
-fn too_many_from_ip() -> Response {
-    (
-        StatusCode::TOO_MANY_REQUESTS,
-        "too many relay connections from this address",
-    )
-        .into_response()
-}
-
-/// Resolve the request's **client** IP for the per-IP limiter: try each trusted
-/// proxy header in order (the first parseable address wins), else the socket peer
-/// from [`ConnectInfo`]. `None` only when neither yields an address (no trusted
-/// header present *and* the server carries no client-address info, e.g. a unit
-/// test served without connect-info) — the caller then skips the limiter.
-///
-/// For a single-value header (`cf-connecting-ip`) the whole value is the IP; for a
-/// list-valued one (`x-forwarded-for`) the **left-most** token is the original
-/// client. Both are only trustworthy when the origin is locked to the proxy (see
-/// [`IpLimitConfig`]).
-fn resolve_client_ip(req: &Request, trusted_headers: &[HeaderName]) -> Option<std::net::IpAddr> {
-    for name in trusted_headers {
-        if let Some(value) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
-            let first = value.split(',').next().unwrap_or("").trim();
-            if let Ok(ip) = first.parse::<std::net::IpAddr>() {
-                return Some(ip);
-            }
-        }
-    }
-    req.extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| addr.ip())
-}
-
-/// Outermost pre-layer: throttle WS-upgrade attempts per client IP (flood
-/// backstop, ahead of admission). The client IP comes from the configured trusted
-/// proxy header(s) if present, else the socket peer; when neither is available the
-/// limiter is skipped so behaviour is unchanged there.
-async fn limit_per_ip(State(state): State<RelayState>, req: Request, next: Next) -> Response {
-    if let Some(ip) = resolve_client_ip(&req, &state.ip_trusted_headers)
-        && !state.ip_limiter.check(ip)
-    {
-        return too_many_from_ip();
-    }
-    next.run(req).await
+    ip_limit::apply(router, ip_limit)
 }
 
 /// `401 Unauthorized` for a missing or unadmitted `remote_api_key`.
@@ -635,10 +541,16 @@ async fn content_join_handler(
         state.pending_content_legs.lock().remove(&relay_key);
         return at_capacity();
     };
+    // Phone leg: its inbound is the uplink (phone → gateway). Meters against the
+    // gateway's (key, server) so up + down share one entry. Resolved after the join
+    // succeeds, so a doomed join never populates the traffic map.
+    let meter = state
+        .traffic
+        .meter_for(&remote_api_key, &relay_node_id, Direction::Up);
     let broker = Arc::clone(&state.broker);
     let pending = Arc::clone(&state.pending_content_legs);
     capped(ws).on_upgrade(move |socket| async move {
-        pump_ws(socket, leg, Some(limiter)).await;
+        pump_ws(socket, leg, Some(LegMetering { limiter, meter })).await;
         broker.cancel(&relay_key);
         // Backstop: if the gateway host never claimed this leg, drop the mapping so
         // it can't linger after the phone leg ends.
@@ -713,11 +625,15 @@ async fn content_host_handler(
         state.broker.cancel(&relay_key);
         return at_capacity();
     };
+    // Gateway leg: its inbound is the downlink (gateway → phone). Same (key, server)
+    // as the phone leg, so it accumulates into the same entry's down-counters.
+    // Resolved after the join succeeds, so a doomed join never populates the map.
+    let meter = state.traffic.meter_for(&key, &server_id, Direction::Down);
     let broker = Arc::clone(&state.broker);
     capped(ws).on_upgrade(move |socket| async move {
         let _guard = guard;
         tokio::select! {
-            _ = pump_ws(socket, leg, Some(limiter)) => {}
+            _ = pump_ws(socket, leg, Some(LegMetering { limiter, meter })) => {}
             // The gateway's remote_api_key was revoked mid-session.
             _ = kick => {}
         }
@@ -728,7 +644,9 @@ async fn content_host_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderName;
     use futures::{SinkExt, StreamExt};
+    use std::net::SocketAddr;
     use tokio::net::TcpStream;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::StatusCode as WsStatus;
@@ -745,6 +663,7 @@ mod tests {
             admission,
             Arc::new(ConnectionRegistry::new()),
             Arc::new(BandwidthRegistry::new()),
+            Arc::new(TrafficRegistry::new()),
             IpLimitConfig::socket_peer(),
         );
         tokio::spawn(async move {
@@ -772,6 +691,7 @@ mod tests {
             admission,
             Arc::new(ConnectionRegistry::new()),
             Arc::new(BandwidthRegistry::new()),
+            Arc::new(TrafficRegistry::new()),
             ip_limit,
         );
         tokio::spawn(async move {
@@ -972,7 +892,7 @@ mod tests {
         // the limiter (outermost) 429s before admission even runs.
         let mut saw_401 = false;
         let mut saw_429 = false;
-        for _ in 0..(crate::ip_limit::IP_BURST as usize + 8) {
+        for _ in 0..(remote_host_ratelimit::ip_limit::IP_BURST as usize + 8) {
             match host_attempt_status(port).await {
                 WsStatus::UNAUTHORIZED => saw_401 = true,
                 WsStatus::TOO_MANY_REQUESTS => {
@@ -1006,7 +926,7 @@ mod tests {
 
         // Flood one CF client IP until it is throttled.
         let mut saw_429 = false;
-        for _ in 0..(crate::ip_limit::IP_BURST as usize + 8) {
+        for _ in 0..(remote_host_ratelimit::ip_limit::IP_BURST as usize + 8) {
             match host_attempt_with_cf_ip(port, Some("203.0.113.1")).await {
                 WsStatus::UNAUTHORIZED => {}
                 WsStatus::TOO_MANY_REQUESTS => {
@@ -1031,46 +951,6 @@ mod tests {
             WsStatus::UNAUTHORIZED,
             "without the trusted header the limiter falls back to the socket peer",
         );
-    }
-
-    #[test]
-    fn resolve_client_ip_prefers_trusted_header_then_falls_back() {
-        use axum::body::Body;
-        let cf = HeaderName::from_static("cf-connecting-ip");
-        let xff = HeaderName::from_static("x-forwarded-for");
-        let peer = SocketAddr::from(([10, 0, 0, 9], 4000));
-        let trusted = [cf.clone(), xff.clone()];
-
-        let build = |headers: &[(&str, &str)]| {
-            let mut b = Request::builder();
-            for (k, v) in headers {
-                b = b.header(*k, *v);
-            }
-            let mut req = b.body(Body::empty()).unwrap();
-            req.extensions_mut().insert(ConnectInfo(peer));
-            req
-        };
-
-        // The trusted CF header wins over the socket peer.
-        assert_eq!(
-            resolve_client_ip(&build(&[("cf-connecting-ip", "203.0.113.7")]), &trusted),
-            Some("203.0.113.7".parse().unwrap())
-        );
-        // CF absent, XFF present → the left-most token is the original client.
-        assert_eq!(
-            resolve_client_ip(
-                &build(&[("x-forwarded-for", "203.0.113.8, 70.0.0.1")]),
-                &trusted
-            ),
-            Some("203.0.113.8".parse().unwrap())
-        );
-        // A malformed header value falls through to the socket peer.
-        assert_eq!(
-            resolve_client_ip(&build(&[("cf-connecting-ip", "not-an-ip")]), &trusted),
-            Some(peer.ip())
-        );
-        // No trusted headers configured → socket peer.
-        assert_eq!(resolve_client_ip(&build(&[]), &[]), Some(peer.ip()));
     }
 
     /// Symmetric admission: the app's join leg also needs an admitted key — a
@@ -1201,6 +1081,90 @@ mod tests {
         assert_eq!(recv_bin(&mut app).await, b"noise-down");
     }
 
+    /// The content relay records per-`(remote_api_key, server_id)` up/down traffic:
+    /// after bytes flow both ways, the shared traffic entry shows the uplink (phone
+    /// leg) and downlink (gateway leg) byte + frame counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn content_relay_records_up_and_down_traffic() {
+        let admission = Arc::new(remote_host_admission::InMemoryAdmission::with_keys([
+            "inst-A",
+        ]));
+        let traffic = Arc::new(TrafficRegistry::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = build_router(
+            admission,
+            Arc::new(ConnectionRegistry::new()),
+            Arc::new(BandwidthRegistry::new()),
+            traffic.clone(),
+            IpLimitConfig::socket_peer(),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+
+        // Gateway holds its control connection (admitted) under node-1.
+        let mut control = connect_control(port, Some("inst-A")).await.unwrap();
+        let hello = serde_json::json!({ "relay_node_id": "node-1" });
+        control
+            .send(Message::Binary(serde_json::to_vec(&hello).unwrap()))
+            .await
+            .unwrap();
+
+        // Phone dials content/join; retry until the gateway control registers.
+        let mut phone = None;
+        for _ in 0..40 {
+            match connect_content_join(port, "node-1", Some("inst-A")).await {
+                Ok(ws) => {
+                    phone = Some(ws);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+            }
+        }
+        let mut phone = phone.expect("content/join admitted once control registers");
+
+        let signal = recv_control_json(&mut control).await;
+        let relay_key = signal["relay_key"].as_str().unwrap().to_owned();
+        let mut gw = connect_content_host(port, &relay_key, "inst-A").await;
+
+        // phone -> gateway (uplink) and gateway -> phone (downlink).
+        phone
+            .send(Message::Binary(b"noise-up".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(recv_bin(&mut gw).await, b"noise-up");
+        gw.send(Message::Binary(b"down".to_vec())).await.unwrap();
+        assert_eq!(recv_bin(&mut phone).await, b"down");
+
+        // Recording happens on socket read, so poll briefly for both directions to
+        // land on the shared (inst-A, node-1) entry.
+        let mut recorded = None;
+        for _ in 0..40 {
+            let entry = traffic
+                .snapshot()
+                .into_iter()
+                .find(|e| e.remote_api_key == "inst-A" && e.server_id == "node-1");
+            if let Some(e) = entry
+                && e.counts.bytes_up > 0
+                && e.counts.bytes_down > 0
+            {
+                recorded = Some(e);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let e = recorded.expect("traffic recorded for (inst-A, node-1)");
+        assert_eq!(e.counts.bytes_up, b"noise-up".len() as u64);
+        assert_eq!(e.counts.frames_up, 1);
+        assert_eq!(e.counts.bytes_down, b"down".len() as u64);
+        assert_eq!(e.counts.frames_down, 1);
+    }
+
     /// A phone whose gateway has no live control connection is refused fast.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn content_join_without_a_connected_gateway_is_refused() {
@@ -1265,6 +1229,7 @@ mod tests {
             admission,
             conns.clone(),
             Arc::new(BandwidthRegistry::new()),
+            Arc::new(TrafficRegistry::new()),
             IpLimitConfig::socket_peer(),
         );
         tokio::spawn(async move {

@@ -18,6 +18,10 @@
 //! / [`reserve_at`](TokenBucket::reserve_at)) so the math is tested without real
 //! sleeps.
 
+pub mod ip_limit;
+
+pub use ip_limit::{IpLimitConfig, IpRateLimiter};
+
 use std::time::{Duration, Instant};
 
 /// A lazily-refilling token bucket. `tokens` may go negative under

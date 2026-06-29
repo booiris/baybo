@@ -19,8 +19,9 @@
 //!
 //! Storage reuses the per-device secret names (`device.{id}.push_key` / `.apns` /
 //! `.push_delegation`) so [`super::PushDispatcher`]'s read sites need no change; a
-//! small `web_push.{id}` meta record carries the remote-host endpoint + admission
-//! key the dispatcher targets, and `SecretVault::list_names` enumerates them.
+//! small `web_push.{id}` meta record carries the remote-host endpoint the
+//! dispatcher targets, and `SecretVault::list_names` enumerates them. Push is
+//! keyless, so no admission key is stored — the delegation chain authorizes it.
 
 use baybo_security::SecretVault;
 use device_proto::aead;
@@ -52,10 +53,8 @@ pub(crate) struct WebPushBinding {
     /// `ios-<hex(ed25519 pub)>` — the web client's self-certifying identity.
     pub device_id: String,
     /// Remote-host base WS URL (from gateway `[push]` config). The dispatcher
-    /// maps `wss→https` for the `/register` + `/notify` POSTs.
+    /// maps `wss→https` for the keyless `/register` + `/notify` POSTs.
     pub relay_url: String,
-    /// Remote-host admission key (from gateway `[push]` config).
-    pub remote_api_key: String,
     /// Unix seconds the binding was registered (for observability only).
     pub created_at: i64,
 }
@@ -162,7 +161,6 @@ mod tests {
         WebPushBinding {
             device_id: id.to_string(),
             relay_url: "wss://proxy.baybo.space".into(),
-            remote_api_key: "guest".into(),
             created_at: 1_700_000_000,
         }
     }
