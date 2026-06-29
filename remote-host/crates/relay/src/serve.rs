@@ -45,6 +45,7 @@ use crate::bandwidth::{BandwidthRegistry, LegClass as BwClass};
 use crate::broker::{ParkOutcome, RelayBroker};
 use crate::conns::ConnectionRegistry;
 use crate::control::{ControlHello, ControlRegisterError, ControlRegistry, SignalOpenError};
+use crate::traffic::{Direction, LegMetering, TrafficRegistry};
 use crate::ws::pump_ws;
 
 /// Drop a gateway control connection that has gone silent for this long. The
@@ -145,6 +146,10 @@ struct RelayState {
     /// per-`(key, server)` sub-cap); content legs throttle against the owning
     /// gateway's buckets (pairing legs are tiny and unthrottled).
     bandwidth: Arc<BandwidthRegistry>,
+    /// Per-`(remote_api_key, server_id)` traffic counters; content legs record the
+    /// bytes/frames they move (both directions of a session share one entry). The
+    /// server's flush task drains it to the durable traffic ledger.
+    traffic: Arc<TrafficRegistry>,
     /// `relay_key` → content leg metadata awaiting the gateway host. The phone's
     /// content-join writes it (it knows the server, class, and owning admission
     /// key); the gateway's content-host must claim it with that same key before it
@@ -158,7 +163,8 @@ struct RelayState {
 /// Assemble the relay router. `admission` is the shared, hot-reloaded allow-list
 /// of admitted `remote_api_key`s; `conns` tracks live connections so a revoke (an
 /// admission reload that dropped a key) can kick them; `bandwidth` throttles each
-/// gateway's content throughput at two levels (per key ∧ per server).
+/// gateway's content throughput at two levels (per key ∧ per server); `traffic`
+/// records the bytes/frames each `(key, server)` moves for the durable ledger.
 ///
 /// `ip_limit` configures the shared per-source-IP upgrade throttle (see
 /// [`remote_host_ratelimit::ip_limit`]). Enable it keying on the socket peer when
@@ -170,6 +176,7 @@ pub fn build_router(
     admission: Arc<dyn Admission>,
     conns: Arc<ConnectionRegistry>,
     bandwidth: Arc<BandwidthRegistry>,
+    traffic: Arc<TrafficRegistry>,
     ip_limit: IpLimitConfig,
 ) -> Router {
     let state = RelayState {
@@ -178,6 +185,7 @@ pub fn build_router(
         control: Arc::new(ControlRegistry::new()),
         conns,
         bandwidth,
+        traffic,
         pending_content_legs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         join_limiter: Arc::new(JoinRateLimiter::default()),
     };
@@ -533,10 +541,16 @@ async fn content_join_handler(
         state.pending_content_legs.lock().remove(&relay_key);
         return at_capacity();
     };
+    // Phone leg: its inbound is the uplink (phone → gateway). Meters against the
+    // gateway's (key, server) so up + down share one entry. Resolved after the join
+    // succeeds, so a doomed join never populates the traffic map.
+    let meter = state
+        .traffic
+        .meter_for(&remote_api_key, &relay_node_id, Direction::Up);
     let broker = Arc::clone(&state.broker);
     let pending = Arc::clone(&state.pending_content_legs);
     capped(ws).on_upgrade(move |socket| async move {
-        pump_ws(socket, leg, Some(limiter)).await;
+        pump_ws(socket, leg, Some(LegMetering { limiter, meter })).await;
         broker.cancel(&relay_key);
         // Backstop: if the gateway host never claimed this leg, drop the mapping so
         // it can't linger after the phone leg ends.
@@ -611,11 +625,15 @@ async fn content_host_handler(
         state.broker.cancel(&relay_key);
         return at_capacity();
     };
+    // Gateway leg: its inbound is the downlink (gateway → phone). Same (key, server)
+    // as the phone leg, so it accumulates into the same entry's down-counters.
+    // Resolved after the join succeeds, so a doomed join never populates the map.
+    let meter = state.traffic.meter_for(&key, &server_id, Direction::Down);
     let broker = Arc::clone(&state.broker);
     capped(ws).on_upgrade(move |socket| async move {
         let _guard = guard;
         tokio::select! {
-            _ = pump_ws(socket, leg, Some(limiter)) => {}
+            _ = pump_ws(socket, leg, Some(LegMetering { limiter, meter })) => {}
             // The gateway's remote_api_key was revoked mid-session.
             _ = kick => {}
         }
@@ -645,6 +663,7 @@ mod tests {
             admission,
             Arc::new(ConnectionRegistry::new()),
             Arc::new(BandwidthRegistry::new()),
+            Arc::new(TrafficRegistry::new()),
             IpLimitConfig::socket_peer(),
         );
         tokio::spawn(async move {
@@ -672,6 +691,7 @@ mod tests {
             admission,
             Arc::new(ConnectionRegistry::new()),
             Arc::new(BandwidthRegistry::new()),
+            Arc::new(TrafficRegistry::new()),
             ip_limit,
         );
         tokio::spawn(async move {
@@ -1061,6 +1081,90 @@ mod tests {
         assert_eq!(recv_bin(&mut app).await, b"noise-down");
     }
 
+    /// The content relay records per-`(remote_api_key, server_id)` up/down traffic:
+    /// after bytes flow both ways, the shared traffic entry shows the uplink (phone
+    /// leg) and downlink (gateway leg) byte + frame counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn content_relay_records_up_and_down_traffic() {
+        let admission = Arc::new(remote_host_admission::InMemoryAdmission::with_keys([
+            "inst-A",
+        ]));
+        let traffic = Arc::new(TrafficRegistry::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = build_router(
+            admission,
+            Arc::new(ConnectionRegistry::new()),
+            Arc::new(BandwidthRegistry::new()),
+            traffic.clone(),
+            IpLimitConfig::socket_peer(),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+
+        // Gateway holds its control connection (admitted) under node-1.
+        let mut control = connect_control(port, Some("inst-A")).await.unwrap();
+        let hello = serde_json::json!({ "relay_node_id": "node-1" });
+        control
+            .send(Message::Binary(serde_json::to_vec(&hello).unwrap()))
+            .await
+            .unwrap();
+
+        // Phone dials content/join; retry until the gateway control registers.
+        let mut phone = None;
+        for _ in 0..40 {
+            match connect_content_join(port, "node-1", Some("inst-A")).await {
+                Ok(ws) => {
+                    phone = Some(ws);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+            }
+        }
+        let mut phone = phone.expect("content/join admitted once control registers");
+
+        let signal = recv_control_json(&mut control).await;
+        let relay_key = signal["relay_key"].as_str().unwrap().to_owned();
+        let mut gw = connect_content_host(port, &relay_key, "inst-A").await;
+
+        // phone -> gateway (uplink) and gateway -> phone (downlink).
+        phone
+            .send(Message::Binary(b"noise-up".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(recv_bin(&mut gw).await, b"noise-up");
+        gw.send(Message::Binary(b"down".to_vec())).await.unwrap();
+        assert_eq!(recv_bin(&mut phone).await, b"down");
+
+        // Recording happens on socket read, so poll briefly for both directions to
+        // land on the shared (inst-A, node-1) entry.
+        let mut recorded = None;
+        for _ in 0..40 {
+            let entry = traffic
+                .snapshot()
+                .into_iter()
+                .find(|e| e.remote_api_key == "inst-A" && e.server_id == "node-1");
+            if let Some(e) = entry
+                && e.counts.bytes_up > 0
+                && e.counts.bytes_down > 0
+            {
+                recorded = Some(e);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let e = recorded.expect("traffic recorded for (inst-A, node-1)");
+        assert_eq!(e.counts.bytes_up, b"noise-up".len() as u64);
+        assert_eq!(e.counts.frames_up, 1);
+        assert_eq!(e.counts.bytes_down, b"down".len() as u64);
+        assert_eq!(e.counts.frames_down, 1);
+    }
+
     /// A phone whose gateway has no live control connection is refused fast.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn content_join_without_a_connected_gateway_is_refused() {
@@ -1125,6 +1229,7 @@ mod tests {
             admission,
             conns.clone(),
             Arc::new(BandwidthRegistry::new()),
+            Arc::new(TrafficRegistry::new()),
             IpLimitConfig::socket_peer(),
         );
         tokio::spawn(async move {

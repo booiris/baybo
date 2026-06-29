@@ -17,7 +17,9 @@ use remote_host_ratelimit::IpLimitConfig;
 use remote_host_relay::serve::build_router as relay_router;
 
 mod admission_db;
+mod logging;
 mod serve;
+mod traffic;
 
 use serve::TlsPaths;
 
@@ -29,13 +31,22 @@ const DEFAULT_BIND_ADDR: &str = "0.0.0.0:7777";
 const DEFAULT_DB_PATH: &str = "/data/admission.db";
 /// How often to re-read the admission table when `ADMISSION_POLL_SECS` is unset.
 const DEFAULT_POLL_SECS: u64 = 30;
+/// Where the durable traffic ledger lives when `TRAFFIC_DB_PATH` is unset (on the
+/// `/data` volume so it outlives container recreation). An *empty* value disables
+/// persistence — the in-memory counters still drain + evict, just to nowhere.
+const DEFAULT_TRAFFIC_DB_PATH: &str = "/data/traffic.db";
+/// Traffic flush + eviction cadence (seconds) when `TRAFFIC_FLUSH_SECS` is unset.
+const DEFAULT_TRAFFIC_FLUSH_SECS: u64 = 60;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Install the subscriber before anything logs; hold the guard so the
+    // non-blocking file writer flushes on exit (including the fatal arm below).
+    let _log_guard = logging::init();
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("remote-host: {e}");
+            tracing::error!("remote-host: {e}");
             ExitCode::FAILURE
         }
     }
@@ -55,18 +66,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // kick that gateway's connections, not just refuse new ones — and cap how many
     // connections one remote_api_key may hold. This is the *fallback* cap used when
     // a key's row leaves `max_conns` NULL; per-key values in the table override it.
-    let registry = remote_host_relay::ConnectionRegistry::new();
-    let registry = match std::env::var("MAX_CONNS_PER_REMOTE_API_KEY_FALLBACK")
+    // Fallback per-key connection cap (used when a key's row leaves `max_conns`
+    // NULL); shared by the connection registry and the traffic-cap sizing below.
+    let conns_fallback: usize = std::env::var("MAX_CONNS_PER_REMOTE_API_KEY_FALLBACK")
         .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(max) => registry.with_max_per_key(max),
-        None => registry,
-    };
-    let conns = Arc::new(registry);
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(remote_host_relay::conns::DEFAULT_MAX_CONNS_PER_KEY);
+    let conns =
+        Arc::new(remote_host_relay::ConnectionRegistry::new().with_max_per_key(conns_fallback));
     // Two-level content-bandwidth throttle: per-remote_api_key ceiling ∧ per-server
     // sub-cap (see RELAY_BYTES_PER_SEC).
     let bandwidth = Arc::new(remote_host_relay::BandwidthRegistry::new());
+    // Per-(remote_api_key, server_id) traffic counters; the relay records into them
+    // on the data path and the flush task (below) drains them to the durable ledger.
+    let relay_traffic = Arc::new(remote_host_relay::TrafficRegistry::new());
     let admission = {
         let conns = conns.clone();
         let bandwidth = bandwidth.clone();
@@ -113,7 +126,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = Router::new();
     let mut roles: Vec<&str> = Vec::new();
 
-    // Push turns on only when an APNs .p8 is configured.
+    // Push turns on only when an APNs .p8 is configured; its per-device traffic
+    // registry is created here so it can be handed to both the router and the flush
+    // task (it stays `None` while push is off).
+    let mut push_traffic: Option<Arc<remote_host_push::PushTrafficRegistry>> = None;
     let p8_configured = std::env::var("APNS_P8_PATH")
         .ok()
         .is_some_and(|p| !p.is_empty());
@@ -121,7 +137,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let (config, p8_path) = PushConfig::from_env()?;
         let p8_pem = std::fs::read(&p8_path)
             .map_err(|e| format!("read .p8 at {}: {e}", p8_path.display()))?;
-        app = app.merge(push_router(&config, &p8_pem, push_ip_limit)?);
+        let pt = Arc::new(remote_host_push::PushTrafficRegistry::new());
+        app = app.merge(push_router(&config, &p8_pem, pt.clone(), push_ip_limit)?);
+        push_traffic = Some(pt);
         roles.push("push");
     }
 
@@ -130,11 +148,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         admission.clone(),
         conns.clone(),
         bandwidth.clone(),
+        relay_traffic.clone(),
         relay_ip_limit,
     ));
     roles.push("relay");
 
     // Dashboard is intentionally not mounted in this slice.
+
+    // Drain the relay (and push, if on) traffic counters to the durable ledger every
+    // TRAFFIC_FLUSH_SECS; the same task's eviction bounds the in-memory maps.
+    let traffic_db_path =
+        std::env::var("TRAFFIC_DB_PATH").unwrap_or_else(|_| DEFAULT_TRAFFIC_DB_PATH.into());
+    let traffic_flush_secs = std::env::var("TRAFFIC_FLUSH_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_TRAFFIC_FLUSH_SECS);
+    // Size the relay traffic entry cap to 2× the live admission connection capacity
+    // (each (key, server) entry needs a content leg; entries linger ~5 min past a
+    // leg's close → ×2). The flush task re-evaluates this so the cap follows
+    // hot-reloaded admission edits instead of a fixed magic number.
+    let admission_for_cap = admission.clone();
+    let conns_fallback = u32::try_from(conns_fallback).unwrap_or(u32::MAX);
+    let relay_traffic_max_tracked = move || {
+        admission_for_cap
+            .total_max_conns(conns_fallback)
+            .saturating_mul(2) as usize
+    };
+    traffic::spawn(
+        traffic_db_path,
+        traffic_flush_secs,
+        relay_traffic,
+        push_traffic,
+        relay_traffic_max_tracked,
+    );
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into());
     let tls = TlsPaths::from_env("TLS_CERT", "TLS_KEY")?;
@@ -143,9 +189,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         "http/ws"
     };
-    eprintln!(
-        "remote-host: listening on {bind_addr} ({scheme}) — roles: {}",
-        roles.join(" + "),
+    tracing::info!(
+        %bind_addr,
+        %scheme,
+        roles = %roles.join(" + "),
+        "remote-host: listening",
     );
     serve::serve(&bind_addr, tls, app).await?;
     Ok(())
