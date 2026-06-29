@@ -39,6 +39,7 @@ mod imp {
         static kSecValueData: CFStringRef;
         static kSecAttrAccessible: CFStringRef;
         static kSecAttrAccessibleAfterFirstUnlock: CFStringRef;
+        static kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly: CFStringRef;
         static kSecReturnData: CFStringRef;
         static kSecMatchLimit: CFStringRef;
         static kSecMatchLimitOne: CFStringRef;
@@ -63,8 +64,24 @@ mod imp {
             .ok_or_else(|| MISSING_ACCESS_GROUP.to_string())
     }
 
+    /// Keychain item accessibility — controls device-binding, not just unlock.
+    enum Accessibility {
+        /// `…ThisDeviceOnly`: readable after first unlock, but bound to this
+        /// device's hardware key — never included in a backup that could restore
+        /// onto another device. Used for app-private secrets.
+        DeviceOnly,
+        /// `…AfterFirstUnlock`: readable cross-process (the NSE on the lock
+        /// screen) and migratable via backup. Used for the shared push key.
+        Shared,
+    }
+
     /// Upsert an opaque blob into the keychain under `account`.
-    fn store_blob(account: &str, bytes: &[u8], shared: bool) -> Result<(), String> {
+    fn store_blob(
+        account: &str,
+        bytes: &[u8],
+        shared: bool,
+        accessible: Accessibility,
+    ) -> Result<(), String> {
         let account = CFString::new(account).as_CFType();
         let data = CFData::from_buffer(bytes).as_CFType();
 
@@ -84,14 +101,15 @@ mod imp {
 
             let mut attrs = identity;
             attrs.push((constant(kSecValueData), data));
-            // `AfterFirstUnlock` so the NSE can read the push key on the lock
-            // screen (after the first unlock since boot). Private app records use
-            // the same accessibility class so app relaunch after reboot behaves
-            // consistently.
-            attrs.push((
-                constant(kSecAttrAccessible),
-                constant(kSecAttrAccessibleAfterFirstUnlock),
-            ));
+            // Both classes are readable after the first unlock since boot (so an
+            // app relaunch / the NSE works); they differ only in device-binding.
+            let accessible_const = match accessible {
+                Accessibility::DeviceOnly => {
+                    constant(kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
+                }
+                Accessibility::Shared => constant(kSecAttrAccessibleAfterFirstUnlock),
+            };
+            attrs.push((constant(kSecAttrAccessible), accessible_const));
             let add = CFDictionary::from_CFType_pairs(&attrs);
             let status = SecItemAdd(add.as_concrete_TypeRef(), std::ptr::null_mut());
             if status == ERR_SEC_SUCCESS {
@@ -156,7 +174,7 @@ mod imp {
     }
 
     pub(super) fn store_private_blob(account: &str, bytes: &[u8]) -> Result<(), String> {
-        store_blob(account, bytes, false)
+        store_blob(account, bytes, false, Accessibility::DeviceOnly)
     }
 
     pub(super) fn read_private_blob(account: &str) -> Result<Option<Vec<u8>>, String> {
@@ -168,7 +186,12 @@ mod imp {
     }
 
     pub(super) fn store_push_key(bid: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
-        store_blob(&format!("{ACCOUNT_PREFIX}{bid}"), &key[..], true)
+        store_blob(
+            &format!("{ACCOUNT_PREFIX}{bid}"),
+            &key[..],
+            true,
+            Accessibility::Shared,
+        )
     }
 
     pub(super) fn delete_push_key(bid: &str) -> Result<(), String> {
@@ -296,6 +319,29 @@ pub fn read_device_sign_key() -> Result<Option<[u8; KEY_LEN]>, String> {
             .map_err(|_| "stored device sign key has the wrong length".to_string()),
         None => Ok(None),
     }
+}
+
+/// Account holding the **direct-connection** credentials (a serialized
+/// `{base_url, token}`): the gateway base URL + admin Bearer token entered on the
+/// direct-login screen, the web-dashboard style of access. The admin token is a
+/// broad credential, so it lives in the app's PRIVATE keychain (not the shared
+/// App Group) and is wiped on disconnect.
+const DIRECT_CREDENTIALS_ACCOUNT: &str = "baybo.direct-credentials";
+
+/// Persist the direct-connection credentials (an opaque serialized blob).
+pub fn store_direct_credentials(bytes: &[u8]) -> Result<(), String> {
+    imp::store_private_blob(DIRECT_CREDENTIALS_ACCOUNT, bytes)
+}
+
+/// Read the persisted direct-connection credentials. `Ok(None)` = not connected.
+pub fn read_direct_credentials() -> Result<Option<Vec<u8>>, String> {
+    imp::read_private_blob(DIRECT_CREDENTIALS_ACCOUNT)
+}
+
+/// Delete the direct-connection credentials (the direct "disconnect" action).
+/// Idempotent — succeeds even if nothing was stored.
+pub fn delete_direct_credentials() -> Result<(), String> {
+    imp::delete_private_blob(DIRECT_CREDENTIALS_ACCOUNT)
 }
 
 /// Delete a device's push key from the shared keychain (the write side is

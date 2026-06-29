@@ -16,8 +16,8 @@ pub mod pairing;
 
 pub use blob::{BlobDownload, BlobRequest, BlobResponse, BlobSession, DownloadStep};
 pub use content::{
-    ContentHandshake, ContentSession, apns_token_frame, subscribe_frame, user_message_frame,
-    user_text_frame,
+    ContentHandshake, ContentSession, WEB_OPERATOR_USER_ID, apns_token_frame, register_http_frame,
+    subscribe_frame, user_message_frame, user_text_frame, web_user_message_frame,
 };
 pub use error::MobileError;
 pub use pairing::{
@@ -26,5 +26,6 @@ pub use pairing::{
 
 // Re-export the wire `Frame` (and the attachment types it carries) so the shell
 // renders threads — and builds outbound attachment refs — against the same types
-// the gateway emits.
-pub use wire::{AttachmentKind, Frame, WireAttachment};
+// the gateway emits. `encode`/`decode` drive the direct transport's raw-MessagePack
+// `/v1/channel-ws` leg (the relay leg wraps them in Noise instead).
+pub use wire::{AttachmentKind, Frame, WireAttachment, decode, encode};

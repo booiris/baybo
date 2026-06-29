@@ -400,6 +400,9 @@ async fn finish_pair(
     let bytes = serde_json::to_vec(&record).map_err(|e| format!("encode paired record: {e}"))?;
     crate::keychain::store_paired_record(&bytes)
         .map_err(|e| format!("persist paired record: {e}"))?;
+    // One app binds one Baybo: a fresh scan-pairing supersedes any direct-login
+    // credentials so the two binding modes can't both linger. Best-effort.
+    let _ = crate::keychain::delete_direct_credentials();
 
     Ok(PairedSummary::from(&paired))
 }
