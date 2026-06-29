@@ -18,6 +18,7 @@ use crate::jwt::ApnsProviderToken;
 use crate::notify::NotifyService;
 use crate::ratelimit::NotifyRateLimiter;
 use crate::store::InMemoryDeviceTokenStore;
+use crate::traffic::PushTrafficRegistry;
 
 /// Operator-tunable push limits, each overridable from the environment; an
 /// unset/unparseable/non-positive value falls back to the built-in const default.
@@ -125,9 +126,14 @@ impl PushConfig {
 /// parsing / signature verification, so a `/register` or `/notify` flood is shed
 /// with `429` by client IP before any Ed25519 work. It uses the same proxy-aware
 /// client-IP resolution as the relay (see [`remote_host_ratelimit::ip_limit`]).
+///
+/// `traffic` is the per-device send/byte ledger (created by the caller so it can
+/// also hand it to the server's flush task); every issued APNs send is recorded
+/// against it.
 pub fn build_router(
     config: &PushConfig,
     p8_pem: &[u8],
+    traffic: Arc<PushTrafficRegistry>,
     ip_limit: IpLimitConfig,
 ) -> Result<Router, PushError> {
     let signer = Arc::new(ApnsProviderToken::new(
@@ -144,6 +150,7 @@ pub fn build_router(
         store,
         sender,
         signer,
+        traffic,
         config.topic.clone(),
         NotifyRateLimiter::for_store_cap(
             config.limits.notify_rate_per_min,
@@ -176,12 +183,26 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
 
     #[test]
     fn build_router_succeeds_with_a_valid_key() {
-        assert!(build_router(&config(), TEST_P8.as_bytes(), IpLimitConfig::disabled()).is_ok());
+        assert!(
+            build_router(
+                &config(),
+                TEST_P8.as_bytes(),
+                Arc::new(PushTrafficRegistry::new()),
+                IpLimitConfig::disabled(),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn build_router_rejects_a_bad_key() {
-        let err = build_router(&config(), b"not a pem", IpLimitConfig::disabled()).unwrap_err();
+        let err = build_router(
+            &config(),
+            b"not a pem",
+            Arc::new(PushTrafficRegistry::new()),
+            IpLimitConfig::disabled(),
+        )
+        .unwrap_err();
         assert!(matches!(err, PushError::Key(_)));
     }
 
@@ -231,6 +252,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let app = build_router(
             &config(),
             TEST_P8.as_bytes(),
+            Arc::new(PushTrafficRegistry::new()),
             IpLimitConfig::with_trusted_headers(vec![HeaderName::from_static("cf-connecting-ip")]),
         )
         .unwrap();

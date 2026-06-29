@@ -184,6 +184,31 @@ impl InMemoryAdmission {
         revoked
     }
 
+    /// Sum every admitted key's **effective** `max_conns`: a guest NULL is filled
+    /// from the [`GUEST_TEMPLATE_KEY`] row's column then [`GUEST_MAX_CONNS`]; a
+    /// registered NULL is floored to `registered_fallback` (the caller's role
+    /// connection-cap default). This is the live ceiling on simultaneous relay
+    /// connections across all keys — used to size a capacity-derived cap (the
+    /// traffic ledger's per-`(key, server)` entry cap) to the current admission set
+    /// so it tracks hot-reloaded edits. O(n) over the allow-list — call off the hot
+    /// path (e.g. once per flush interval), never per request.
+    pub fn total_max_conns(&self, registered_fallback: u32) -> u64 {
+        let keys = self.keys.read();
+        let template_max_conns = keys.get(GUEST_TEMPLATE_KEY).and_then(|t| t.max_conns);
+        keys.values()
+            .map(|e| {
+                let effective = match e.tier {
+                    Tier::Guest => e
+                        .max_conns
+                        .or(template_max_conns)
+                        .unwrap_or(GUEST_MAX_CONNS),
+                    Tier::Registered => e.max_conns.unwrap_or(registered_fallback),
+                };
+                u64::from(effective)
+            })
+            .sum()
+    }
+
     /// Remove guest entries whose `expires_at` is in the past; return the removed
     /// keys so the caller can drop their live connections.
     ///
@@ -479,6 +504,45 @@ mod tests {
         // A registered row past expires_at is NOT swept (only guests are), but
         // resolve still rejects it as Expired.
         assert_eq!(a.resolve("expired-registered"), Admit::Expired);
+    }
+
+    #[test]
+    fn total_max_conns_sums_effective_caps_across_tiers() {
+        let a = InMemoryAdmission::new();
+        a.replace_all(keyset([
+            // registered, explicit cap → its own value
+            (
+                "reg",
+                AdmissionEntry {
+                    tier: Tier::Registered,
+                    max_conns: Some(8),
+                    ..Default::default()
+                },
+            ),
+            // registered, NULL → the caller's role fallback (100 here)
+            ("reg-null", entry(Tier::Registered)),
+            // guest, NULL, no template → GUEST_MAX_CONNS
+            ("g", entry(Tier::Guest)),
+        ]));
+        // 8 + 100 + GUEST_MAX_CONNS
+        assert_eq!(a.total_max_conns(100), 8 + 100 + u64::from(GUEST_MAX_CONNS));
+
+        // A guest template row supplies the guest default; an empty set is 0.
+        let b = InMemoryAdmission::new();
+        assert_eq!(b.total_max_conns(100), 0, "no keys → no capacity");
+        b.replace_all(keyset([
+            (
+                GUEST_TEMPLATE_KEY,
+                AdmissionEntry {
+                    tier: Tier::Guest,
+                    max_conns: Some(50),
+                    ..Default::default()
+                },
+            ),
+            ("g2", entry(Tier::Guest)),
+        ]));
+        // template(50) + g2 inherits the template(50)
+        assert_eq!(b.total_max_conns(100), 100);
     }
 
     #[test]

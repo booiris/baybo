@@ -18,10 +18,14 @@ pub mod conns;
 pub mod control;
 pub mod error;
 pub mod serve;
+pub mod traffic;
 pub mod ws;
 
 pub use bandwidth::{BandwidthLimiter, BandwidthRegistry};
 pub use broker::{RelayBroker, RelayLeg};
 pub use conns::ConnectionRegistry;
 pub use control::{ControlRegistry, ControlSignal};
+pub use traffic::{
+    Counts, Direction, LegMetering, RelayTrafficDelta, TrafficMeter, TrafficRegistry,
+};
 pub use ws::pump_ws;
