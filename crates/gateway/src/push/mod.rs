@@ -798,8 +798,7 @@ mod tests {
         let preview = r#"{"title":"Baybo","body":"the agent finished"}"#;
         let session = SessionId::from("sess-7");
         let signing = delegation::generate_signing_key();
-        let body =
-            build_notify_body("dev-1", &session, &key, preview, &signing, 11).unwrap();
+        let body = build_notify_body("dev-1", &session, &key, preview, &signing, 11).unwrap();
 
         assert_eq!(body.device_id, "dev-1");
         assert_eq!(body.bid, "dev-1");
