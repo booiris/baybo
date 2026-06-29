@@ -13,7 +13,8 @@ use std::time::Duration;
 use axum::Router;
 use axum::http::HeaderName;
 use remote_host_push::serve::{PushConfig, build_router as push_router};
-use remote_host_relay::serve::{IpLimitConfig, build_router as relay_router};
+use remote_host_ratelimit::IpLimitConfig;
+use remote_host_relay::serve::build_router as relay_router;
 
 mod admission_db;
 mod serve;
@@ -52,10 +53,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     // Track live relay connections so an admission reload that drops a key can
     // kick that gateway's connections, not just refuse new ones — and cap how many
-    // connections one remote_api_key may hold (override the fallback default with
-    // MAX_CONNS_PER_REMOTE_API_KEY).
+    // connections one remote_api_key may hold. This is the *fallback* cap used when
+    // a key's row leaves `max_conns` NULL; per-key values in the table override it.
     let registry = remote_host_relay::ConnectionRegistry::new();
-    let registry = match std::env::var("MAX_CONNS_PER_REMOTE_API_KEY")
+    let registry = match std::env::var("MAX_CONNS_PER_REMOTE_API_KEY_FALLBACK")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
     {
@@ -77,6 +78,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?
     };
 
+    // The per-source-IP request throttle is **always on**, keying on the socket
+    // peer (the primary path terminates TLS here, so the peer is the real client).
+    // It is mounted per role with its OWN bucket map: the relay's WS upgrades and
+    // push's `/register` + `/notify` are throttled independently. The *client-IP
+    // resolution* is shared (one proxy posture for the whole listener):
+    //   CLIENT_IP_HEADERS=h1,h2 → resolve the client IP from these headers, in
+    //     order, before the socket peer (e.g. `cf-connecting-ip` behind Cloudflare).
+    //     Trust them ONLY when the origin is reachable solely via that proxy (CF IP
+    //     allowlist / Tunnel / Authenticated Origin Pulls) — else forgeable.
+    // Each role's rate / burst / bucket-map cap is independently tunable via env:
+    //   RELAY_IP_RATE_PER_SEC / RELAY_IP_BURST / RELAY_IP_BUCKET_CAP
+    //   PUSH_IP_RATE_PER_SEC  / PUSH_IP_BURST  / PUSH_IP_BUCKET_CAP
+    let trusted_headers: Vec<HeaderName> = std::env::var("CLIENT_IP_HEADERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .filter_map(|h| HeaderName::from_bytes(h.to_ascii_lowercase().as_bytes()).ok())
+        .collect();
+    let relay_ip_limit = role_ip_limit(
+        "RELAY_IP_RATE_PER_SEC",
+        "RELAY_IP_BURST",
+        "RELAY_IP_BUCKET_CAP",
+        &trusted_headers,
+    );
+    let push_ip_limit = role_ip_limit(
+        "PUSH_IP_RATE_PER_SEC",
+        "PUSH_IP_BURST",
+        "PUSH_IP_BUCKET_CAP",
+        &trusted_headers,
+    );
+
     let mut app = Router::new();
     let mut roles: Vec<&str> = Vec::new();
 
@@ -88,40 +121,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let (config, p8_path) = PushConfig::from_env()?;
         let p8_pem = std::fs::read(&p8_path)
             .map_err(|e| format!("read .p8 at {}: {e}", p8_path.display()))?;
-        app = app.merge(push_router(&config, &p8_pem, admission.clone())?);
+        app = app.merge(push_router(&config, &p8_pem, push_ip_limit)?);
         roles.push("push");
     }
 
-    // Relay is always on. The per-source-IP upgrade throttle defaults on, keying
-    // on the socket peer (the primary path terminates TLS here, so the peer is the
-    // real client). Two env knobs adjust it for a proxied deployment:
-    //   RELAY_PER_IP_LIMIT=0          → off (rate-limit at your proxy instead).
-    //   RELAY_CLIENT_IP_HEADERS=h1,h2 → resolve the client IP from these headers,
-    //     in order, before the socket peer (e.g. `cf-connecting-ip` behind
-    //     Cloudflare). Trust them ONLY when the origin is reachable solely via that
-    //     proxy (CF IP allowlist / Tunnel / Authenticated Origin Pulls) — a client
-    //     header is otherwise forgeable.
-    let ip_limit = if std::env::var("RELAY_PER_IP_LIMIT")
-        .ok()
-        .map(|v| matches!(v.trim(), "0" | "false" | "off" | "no"))
-        .unwrap_or(false)
-    {
-        IpLimitConfig::disabled()
-    } else {
-        let trusted_headers: Vec<HeaderName> = std::env::var("RELAY_CLIENT_IP_HEADERS")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|h| !h.is_empty())
-            .filter_map(|h| HeaderName::from_bytes(h.to_ascii_lowercase().as_bytes()).ok())
-            .collect();
-        IpLimitConfig::with_trusted_headers(trusted_headers)
-    };
+    // Relay is always on.
     app = app.merge(relay_router(
         admission.clone(),
         conns.clone(),
         bandwidth.clone(),
-        ip_limit,
+        relay_ip_limit,
     ));
     roles.push("relay");
 
@@ -140,4 +149,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     serve::serve(&bind_addr, tls, app).await?;
     Ok(())
+}
+
+/// Build one role's (always-on) per-source-IP throttle config from the shared
+/// `trusted_headers` plus that role's rate / burst / bucket-map-cap env overrides
+/// (each kept at its default when unset / unparseable / non-positive). Relay and
+/// push pass different env names so each is independently sized.
+fn role_ip_limit(
+    rate_var: &str,
+    burst_var: &str,
+    cap_var: &str,
+    trusted_headers: &[HeaderName],
+) -> IpLimitConfig {
+    let mut config = IpLimitConfig::with_trusted_headers(trusted_headers.to_vec());
+    if let Some(rate) = env_f64(rate_var) {
+        config.rate_per_sec = rate;
+    }
+    if let Some(burst) = env_f64(burst_var) {
+        config.burst = burst;
+    }
+    if let Some(cap) = env_usize(cap_var) {
+        config.bucket_soft_cap = cap;
+    }
+    config
+}
+
+/// Parse a positive `f64` env override, else `None`.
+fn env_f64(key: &str) -> Option<f64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&v| v > 0.0)
+}
+
+/// Parse a positive `usize` env override, else `None`.
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v > 0)
 }

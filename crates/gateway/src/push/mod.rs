@@ -71,7 +71,7 @@ pub(crate) struct DeviceApnsRegistration {
 /// Secret-vault name for a device's push delegation — the 64-byte Ed25519
 /// signature the device made at pairing authorizing A's gateway push key to
 /// manage its APNs binding at C. Absent → push is disabled for the device (the
-/// gateway can't prove ownership to C under a shared `remote_api_key`).
+/// gateway can't prove ownership of the binding to the keyless push routes).
 pub(crate) fn device_push_delegation_secret_name(device_id: &str) -> String {
     format!("device.{device_id}.push_delegation")
 }
@@ -489,7 +489,6 @@ impl PushDispatcher {
             .await
             .map_err(NotifyError::Transient)?;
         let body = build_notify_body(
-            &device.remote_api_key,
             &device.device_id,
             session_id,
             &key,
@@ -532,8 +531,8 @@ impl PushDispatcher {
         }
         // The binding is authenticated to C by the device's pairing-time
         // delegation plus our gateway push signature. No delegation (older
-        // pairing, or it never arrived) → we can't prove ownership under a shared
-        // `remote_api_key`, so skip registration rather than send an unverifiable one.
+        // pairing, or it never arrived) → we can't prove ownership of the binding,
+        // so skip registration rather than send an unverifiable one.
         let Ok(signing_key) = self.signing_key().await else {
             return;
         };
@@ -546,7 +545,6 @@ impl PushDispatcher {
             return;
         };
         let body = build_register_body(
-            &device.remote_api_key,
             device_id,
             &reg.apns_token,
             reg.apns_env,
@@ -631,9 +629,7 @@ fn preview_json(text: Option<&str>) -> String {
 /// Pure: AEAD-seal `preview` under `key`, base64 the output, and frame the
 /// `/notify` body. Extracted so the encrypt path is unit-testable without any
 /// stores.
-#[allow(clippy::too_many_arguments)]
 fn build_notify_body(
-    remote_api_key: &str,
     device_id: &str,
     session_id: &SessionId,
     key: &[u8; aead::KEY_LEN],
@@ -646,11 +642,10 @@ fn build_notify_body(
     let b64 = base64::engine::general_purpose::STANDARD;
     let enc = b64.encode(&ciphertext);
     let n = b64.encode(&nonce);
-    // Sign the notify so C can reject a co-tenant's push to this device_id under a
-    // shared `remote_api_key` (verified against the gateway key C stored at register).
+    // Sign the notify so C can verify it against the gateway key it stored at
+    // register and reject a forged push to this device_id (the routes are keyless).
     let sig = delegation::sign_notify(signing_key, device_id, &enc, &n, device_id, counter);
     Ok(NotifyRequest {
-        remote_api_key: remote_api_key.to_string(),
         device_id: device_id.to_string(),
         collapse_id: push_collapse_id(device_id, session_id),
         bid: device_id.to_string(),
@@ -663,10 +658,8 @@ fn build_notify_body(
 
 /// Pure: build + sign a `/register` body. The gateway proves ownership of the
 /// binding to C with the device's pairing-time `delegation_sig` (device→gateway)
-/// plus its own signature over the binding, so C accepts it even under a shared
-/// `remote_api_key`.
+/// plus its own signature over the binding, so C accepts it with no caller key.
 fn build_register_body(
-    remote_api_key: &str,
     device_id: &str,
     apns_token: &str,
     env: device_proto::pairing::ApnsEnv,
@@ -681,7 +674,6 @@ fn build_register_body(
     let sig = delegation::sign_register(signing_key, device_id, apns_token, env_byte, counter);
     let b64 = base64::engine::general_purpose::STANDARD;
     RegisterRequest {
-        remote_api_key: remote_api_key.to_string(),
         device_id: device_id.to_string(),
         apns_token: apns_token.to_string(),
         env: to_wire_env(env),
@@ -806,10 +798,8 @@ mod tests {
         let preview = r#"{"title":"Baybo","body":"the agent finished"}"#;
         let session = SessionId::from("sess-7");
         let signing = delegation::generate_signing_key();
-        let body =
-            build_notify_body("inst-A", "dev-1", &session, &key, preview, &signing, 11).unwrap();
+        let body = build_notify_body("dev-1", &session, &key, preview, &signing, 11).unwrap();
 
-        assert_eq!(body.remote_api_key, "inst-A");
         assert_eq!(body.device_id, "dev-1");
         assert_eq!(body.bid, "dev-1");
         assert_eq!(body.counter, 11);
@@ -857,8 +847,8 @@ mod tests {
         let key = [1u8; aead::KEY_LEN];
         let s = SessionId::from("s");
         let signing = delegation::generate_signing_key();
-        let a = build_notify_body("i", "d", &s, &key, "same", &signing, 1).unwrap();
-        let b = build_notify_body("i", "d", &s, &key, "same", &signing, 2).unwrap();
+        let a = build_notify_body("d", &s, &key, "same", &signing, 1).unwrap();
+        let b = build_notify_body("d", &s, &key, "same", &signing, 2).unwrap();
         assert_ne!(a.n, b.n, "nonce must be random per message");
         assert_ne!(a.enc, b.enc, "ciphertext differs under a fresh nonce");
     }
@@ -867,7 +857,6 @@ mod tests {
     fn register_body_matches_remote_host_wire_shape() {
         let signing = delegation::generate_signing_key();
         let body = build_register_body(
-            "inst-A",
             "dev-1",
             "tok",
             device_proto::pairing::ApnsEnv::Sandbox,
@@ -876,7 +865,6 @@ mod tests {
             5,
         );
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
-        assert_eq!(v["remote_api_key"], "inst-A");
         assert_eq!(v["device_id"], "dev-1");
         assert_eq!(v["apns_token"], "tok");
         // Must serialize the same as the push role's RegisterRequest.env.

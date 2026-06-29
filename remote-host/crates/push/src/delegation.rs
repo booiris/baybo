@@ -14,9 +14,9 @@
 //! - the **delegation** under the device key (device authorized a gateway key);
 //! - each `/register` and `/notify` **request signature** under that gateway key.
 //!
-//! So under a *shared* `remote_api_key` (e.g. the `guest` trial key) one tenant
-//! cannot overwrite, redirect, suppress, or spam another's binding even knowing
-//! its `device_id`: it cannot forge the device's delegation or the gateway's
+//! The push routes are keyless — this chain is the sole authorization. No one can
+//! overwrite, redirect, suppress, or spam another's binding even knowing its
+//! `device_id`: they cannot forge the device's delegation or the gateway's
 //! request signature.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};

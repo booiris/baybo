@@ -1,22 +1,44 @@
-//! The push role's two registries: which gateways may use it (admission) and
-//! `device_id → { apns_token, env, gateway_pubkey, last_counter }` (the only
-//! per-device state it holds).
+//! The push role's device registry: `device_id → { apns_token, env,
+//! gateway_pubkey, last_counter }` — the only per-device state it holds.
 //!
-//! Neither carries conversation content — admission is machine-to-machine
-//! `remote_api_key`s, and the device store maps an opaque `device_id` to its APNs
-//! token plus the material to authenticate binding mutations.
+//! It carries no conversation content — just the mapping from an opaque
+//! `device_id` to its APNs token plus the material to authenticate binding
+//! mutations.
 //!
 //! The store is keyed by `device_id` alone — a 32-byte Ed25519 public key, so
-//! globally unique. Isolation of one device's binding from another's no longer
-//! comes from the `remote_api_key` partition (a shared `guest` key offers none)
-//! but from the **delegation chain**: a `/register` carries the device's
-//! delegation + the gateway's signature, and a `/notify` is verified against the
-//! `gateway_pubkey` stored at register. A `last_counter` floor rejects replays.
+//! globally unique. The routes are keyless; isolation of one device's binding
+//! from another's comes entirely from the **delegation chain**: a `/register`
+//! carries the device's delegation + the gateway's signature, and a `/notify` is
+//! verified against the `gateway_pubkey` stored at register. A `last_counter`
+//! floor rejects replays.
+//!
+//! The map is **bounded**: a `/register` is a self-signed chain an attacker can
+//! forge per request for a brand-new `device_id`, so the store mirrors the
+//! rate-limiter maps' soft-cap + eviction. Each entry tracks a `last_seen` and
+//! whether it has been **confirmed by a successful `/notify`**; over the cap, idle
+//! unconfirmed bindings (the register-only flood) are evicted while a live device
+//! is kept, and if nothing is evictable a new `/register` is refused outright.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
 
 use crate::apns::ApnsEnv;
+
+/// Soft cap on tracked device bindings before idle/unconfirmed entries are
+/// evicted, mirroring the rate-limiter maps' bounded-growth pattern
+/// (`ratelimit.rs` / `ip_limit.rs`). Bindings are longer-lived and more numerous
+/// than transient rate buckets, so this sits above the limiter caps while still
+/// bounding memory against a `/register` flood under the public `guest` key.
+pub const DEVICE_STORE_SOFT_CAP: usize = 65_536;
+
+/// How long a binding **never confirmed by a successful `/notify`** survives under
+/// cap pressure. A real device is pushed to (→ confirmed) well within it; the
+/// attacker's register-only floods age past it and are the first evicted when the
+/// store is full. Confirmed bindings are exempt — a live device is never aged out;
+/// a token that later dies is instead pruned on its next `/notify` `BadDeviceToken`.
+pub const UNCONFIRMED_TTL: Duration = Duration::from_secs(3600);
 
 /// A device's APNs binding plus the material authenticating its mutations.
 /// Registered by the device's delegated gateway (A) on the device's behalf
@@ -35,14 +57,20 @@ pub struct DeviceRegistration {
 
 /// `device_id → DeviceRegistration`. The push role's only per-device state.
 pub trait DeviceTokenStore: Send + Sync {
-    /// Bind (or replace) a device's registration. The caller verifies the
-    /// delegation chain + replay counter first.
-    fn register(&self, device_id: &str, reg: DeviceRegistration);
+    /// Bind (or replace) a device's registration; returns whether it was stored.
+    /// `false` means the store is at its hard cap with no evictable (idle,
+    /// unconfirmed) entry, so the caller refuses the `/register` with `503`. The
+    /// caller verifies the delegation chain + replay counter first.
+    fn register(&self, device_id: &str, reg: DeviceRegistration) -> bool;
     /// Resolve a device's current binding.
     fn get(&self, device_id: &str) -> Option<DeviceRegistration>;
     /// Unbind a device's token (on `400`/`410`). The device row on the gateway
     /// is never touched — only the APNs token mapping here.
     fn unbind(&self, device_id: &str);
+    /// Mark a device's binding **confirmed by a successful `/notify`** (APNs
+    /// accepted its token) and refresh its idle clock, so a live device is never
+    /// aged out under cap pressure while an unconfirmed register-only flood is.
+    fn confirm(&self, device_id: &str);
     /// Atomically advance the replay floor: stores `counter` and returns `true`
     /// iff it strictly exceeds the device's last accepted counter (else the
     /// caller rejects the request as a replay). A no-op `false` for an unknown
@@ -54,33 +82,98 @@ pub trait DeviceTokenStore: Send + Sync {
     }
 }
 
-/// In-memory device-token store, keyed by `device_id`.
-#[derive(Default)]
+/// One tracked binding plus its eviction metadata.
+struct Entry {
+    reg: DeviceRegistration,
+    /// When this binding was registered or last confirmed by a successful
+    /// `/notify`. The idle clock the TTL eviction reads.
+    last_seen: Instant,
+    /// A successful `/notify` delivery proved a real device behind this token, so
+    /// it is exempt from idle eviction.
+    confirmed: bool,
+}
+
+/// In-memory device-token store, keyed by `device_id`, bounded by a soft cap +
+/// idle/unconfirmed eviction.
 pub struct InMemoryDeviceTokenStore {
-    inner: Mutex<HashMap<String, DeviceRegistration>>,
+    inner: Mutex<HashMap<String, Entry>>,
+    soft_cap: usize,
+    unconfirmed_ttl: Duration,
+}
+
+impl Default for InMemoryDeviceTokenStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InMemoryDeviceTokenStore {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limits(DEVICE_STORE_SOFT_CAP, UNCONFIRMED_TTL)
+    }
+
+    /// Construct with explicit bounds (tests exercise eviction with a small cap).
+    pub fn with_limits(soft_cap: usize, unconfirmed_ttl: Duration) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            soft_cap,
+            unconfirmed_ttl,
+        }
+    }
+
+    fn register_at(&self, device_id: &str, reg: DeviceRegistration, now: Instant) -> bool {
+        let mut inner = self.inner.lock();
+        // Only a *new* device id can grow the map; a re-register replaces in place.
+        if !inner.contains_key(device_id) && inner.len() >= self.soft_cap {
+            let ttl = self.unconfirmed_ttl;
+            // Shed idle, unconfirmed bindings (the register-only flood); keep live
+            // devices and freshly-registered ones still inside the TTL.
+            inner.retain(|_, e| e.confirmed || now.saturating_duration_since(e.last_seen) < ttl);
+            if inner.len() >= self.soft_cap {
+                // Nothing evictable — refuse rather than grow unbounded.
+                return false;
+            }
+        }
+        // Re-registering a confirmed device keeps it confirmed (a live device that
+        // rebinds its token stays protected from eviction).
+        let confirmed = inner.get(device_id).is_some_and(|e| e.confirmed);
+        inner.insert(
+            device_id.to_string(),
+            Entry {
+                reg,
+                last_seen: now,
+                confirmed,
+            },
+        );
+        true
+    }
+
+    fn confirm_at(&self, device_id: &str, now: Instant) {
+        if let Some(e) = self.inner.lock().get_mut(device_id) {
+            e.confirmed = true;
+            e.last_seen = now;
+        }
     }
 }
 
 impl DeviceTokenStore for InMemoryDeviceTokenStore {
-    fn register(&self, device_id: &str, reg: DeviceRegistration) {
-        self.inner.lock().insert(device_id.to_string(), reg);
+    fn register(&self, device_id: &str, reg: DeviceRegistration) -> bool {
+        self.register_at(device_id, reg, Instant::now())
     }
     fn get(&self, device_id: &str) -> Option<DeviceRegistration> {
-        self.inner.lock().get(device_id).cloned()
+        self.inner.lock().get(device_id).map(|e| e.reg.clone())
     }
     fn unbind(&self, device_id: &str) {
         self.inner.lock().remove(device_id);
     }
+    fn confirm(&self, device_id: &str) {
+        self.confirm_at(device_id, Instant::now());
+    }
     fn advance_counter(&self, device_id: &str, counter: u64) -> bool {
         let mut inner = self.inner.lock();
         match inner.get_mut(device_id) {
-            Some(reg) if counter > reg.last_counter => {
-                reg.last_counter = counter;
+            Some(e) if counter > e.reg.last_counter => {
+                e.reg.last_counter = counter;
                 true
             }
             _ => false,
@@ -90,10 +183,6 @@ impl DeviceTokenStore for InMemoryDeviceTokenStore {
         self.inner.lock().len()
     }
 }
-
-/// Per-key admission (the gateway allow-list) lives in the shared crate, so the
-/// relay and push roles resolve the same live, hot-reloaded list.
-pub use remote_host_admission::{Admission, Admit, InMemoryAdmission};
 
 #[cfg(test)]
 mod tests {
@@ -112,7 +201,7 @@ mod tests {
     fn register_get_unbind() {
         let s = InMemoryDeviceTokenStore::new();
         assert!(s.is_empty());
-        s.register("dev-1", reg("tok", 5));
+        assert!(s.register("dev-1", reg("tok", 5)));
         assert_eq!(s.len(), 1);
         assert_eq!(s.get("dev-1").unwrap().apns_token, "tok");
         assert!(s.get("dev-2").is_none());
@@ -130,5 +219,65 @@ mod tests {
         assert_eq!(s.get("dev-1").unwrap().last_counter, 11);
         // Unknown device: no bucket to advance.
         assert!(!s.advance_counter("ghost", 1));
+    }
+
+    #[test]
+    fn register_flood_stays_bounded_and_evicts_idle_unconfirmed() {
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(60);
+        let s = InMemoryDeviceTokenStore::with_limits(3, ttl);
+        // Fill the cap with unconfirmed registrations at t0.
+        for i in 0..3 {
+            assert!(s.register_at(&format!("d{i}"), reg("tok", 1), t0));
+        }
+        assert_eq!(s.len(), 3);
+        // At the cap with every entry fresh (< TTL) and unconfirmed, nothing is
+        // evictable, so a new device is refused — the store stays bounded.
+        assert!(
+            !s.register_at("d-new", reg("tok", 1), t0),
+            "at cap, all fresh → refused"
+        );
+        assert_eq!(s.len(), 3);
+        // Past the TTL the idle unconfirmed entries are evictable, so a new
+        // registration sheds them and is admitted — never growing past the cap.
+        let later = t0 + ttl + Duration::from_secs(1);
+        assert!(s.register_at("d-new", reg("tok", 1), later));
+        assert!(
+            s.len() <= 3,
+            "bounded at the soft cap under sustained churn"
+        );
+    }
+
+    #[test]
+    fn confirmed_devices_survive_eviction() {
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(60);
+        let s = InMemoryDeviceTokenStore::with_limits(2, ttl);
+        assert!(s.register_at("live", reg("tok", 1), t0));
+        s.confirm_at("live", t0); // a successful /notify confirmed it
+        assert!(s.register_at("idle", reg("tok", 1), t0));
+        // Past the TTL, a new device triggers eviction: the confirmed "live" device
+        // is kept; the idle unconfirmed one is shed to make room.
+        let later = t0 + ttl + Duration::from_secs(1);
+        assert!(s.register_at("new", reg("tok", 1), later));
+        assert!(
+            s.get("live").is_some(),
+            "confirmed device survives eviction"
+        );
+        assert!(s.get("idle").is_none(), "idle unconfirmed device evicted");
+        assert!(s.len() <= 2);
+    }
+
+    #[test]
+    fn re_register_preserves_confirmed_and_does_not_grow() {
+        let t0 = Instant::now();
+        let s = InMemoryDeviceTokenStore::with_limits(4, Duration::from_secs(60));
+        assert!(s.register_at("d", reg("a", 1), t0));
+        s.confirm_at("d", t0);
+        // Re-registering the same device replaces in place (no growth) and keeps it
+        // confirmed, so it stays protected from eviction.
+        assert!(s.register_at("d", reg("b", 2), t0));
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.get("d").unwrap().apns_token, "b");
     }
 }
