@@ -21,6 +21,7 @@ device-proto = { workspace = true }
 remote-host-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 reqwest = { workspace = true }

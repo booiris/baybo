@@ -160,6 +160,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-barcode-scanner",
  "tauri-plugin-haptics",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
 ]
