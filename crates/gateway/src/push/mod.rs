@@ -106,22 +106,23 @@ pub(crate) async fn load_or_create_push_signing_key(
     Ok(key)
 }
 
-/// Strictly-increasing replay counter for signed pushes, seeded from the wall
-/// clock so it keeps rising across restarts; the atomic guarantees strict
-/// monotonicity within a process even if two pushes read the same instant. A
-/// globally-increasing value is per-device increasing too, so C can reject a
-/// `/register`/`/notify` whose counter doesn't exceed the device's last accepted.
-static PUSH_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Vault key holding the high-water mark of the push replay counter. Persisting
+/// it keeps the strictly-increasing counter rising across a restart even if the
+/// wall clock steps backward: an NTP correction straddling a restart could
+/// otherwise mint a value below what C last accepted and wedge every push at a
+/// 403 until the clock caught up. Best-effort — a vault hiccup just falls back to
+/// wall-clock seeding (the pre-existing behaviour).
+const PUSH_COUNTER_VAULT_KEY: &str = "gateway.push_counter_highwater";
 
-fn next_push_counter() -> u64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mut last = PUSH_COUNTER.load(Ordering::Relaxed);
+/// Mint the next counter from `counter`: never below `now`, never below the prior
+/// value plus one — strictly increasing within the process regardless of the
+/// wall clock. Pure (no I/O) so the monotonicity invariant is unit-testable.
+/// Returns the new value; the atomic is left holding it.
+fn mint_counter(counter: &AtomicU64, now: u64) -> u64 {
+    let mut last = counter.load(Ordering::Relaxed);
     loop {
         let next = now.max(last.wrapping_add(1));
-        match PUSH_COUNTER.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+        match counter.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return next,
             Err(observed) => last = observed,
         }
@@ -157,11 +158,28 @@ fn to_wire_env(env: device_proto::pairing::ApnsEnv) -> remote_host_protocol::pus
     }
 }
 
+/// Why a `/notify` POST to C failed. Distinguishes the one outcome the
+/// dispatcher can self-heal — C no longer knows the device (HTTP 404), e.g. its
+/// in-memory token store was reset by a remote-host restart — from every other
+/// (transient) failure, which is just retried on a later turn.
+#[derive(Debug, thiserror::Error)]
+pub enum NotifyError {
+    /// C has no binding for this `device_id` (HTTP 404). The dispatcher drops its
+    /// stale "already registered" cache, re-registers from durable pairing
+    /// material, and retries the push once.
+    #[error("remote host does not know this device (404)")]
+    DeviceUnknown,
+    /// Any other failure (transport, signing, or a non-404 status). Not specially
+    /// handled — the next completed turn retries.
+    #[error("{0}")]
+    Transient(String),
+}
+
 /// Seam over the POST to C's `/notify`. The real impl uses reqwest; tests use a
 /// mock so the whole dispatch path is host-testable.
 #[async_trait::async_trait]
 pub trait NotifySink: Send + Sync {
-    async fn post(&self, notify_url: &str, body: &NotifyRequest) -> Result<(), String>;
+    async fn post(&self, notify_url: &str, body: &NotifyRequest) -> Result<(), NotifyError>;
 }
 
 /// reqwest-backed sink POSTing to a per-device `<base>/notify`. The base is
@@ -182,18 +200,23 @@ impl HttpNotifySink {
 
 #[async_trait::async_trait]
 impl NotifySink for HttpNotifySink {
-    async fn post(&self, notify_url: &str, body: &NotifyRequest) -> Result<(), String> {
+    async fn post(&self, notify_url: &str, body: &NotifyRequest) -> Result<(), NotifyError> {
         let resp = self
             .client
             .post(notify_url)
             .json(body)
             .send()
             .await
-            .map_err(|e| format!("notify post: {e}"))?;
-        if resp.status().is_success() {
+            .map_err(|e| NotifyError::Transient(format!("notify post: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
             Ok(())
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            // C's in-memory token store has no binding for this device — the
+            // self-healable case (see [`NotifyError::DeviceUnknown`]).
+            Err(NotifyError::DeviceUnknown)
         } else {
-            Err(format!("notify status {}", resp.status()))
+            Err(NotifyError::Transient(format!("notify status {status}")))
         }
     }
 }
@@ -259,6 +282,13 @@ pub struct PushDispatcher {
     /// A's gateway Ed25519 push-signing key, lazily loaded from the vault and
     /// cached for the dispatcher's lifetime.
     push_signing_key: OnceCell<Arc<delegation::SigningKey>>,
+    /// Strictly-increasing replay counter for signed pushes; the vault high-water
+    /// (seeded once via `push_counter_seeded`) carries the floor across restarts.
+    /// See [`Self::next_counter`].
+    push_counter: AtomicU64,
+    /// One-shot guard so the vault high-water is read into `push_counter` exactly
+    /// once, on the first mint.
+    push_counter_seeded: OnceCell<()>,
 }
 
 impl PushDispatcher {
@@ -279,7 +309,44 @@ impl PushDispatcher {
             apns_registrar,
             registered: Mutex::new(HashMap::new()),
             push_signing_key: OnceCell::new(),
+            push_counter: AtomicU64::new(0),
+            push_counter_seeded: OnceCell::new(),
         }
+    }
+
+    /// The next strictly-increasing replay counter for a signed push. On first
+    /// use it lifts the floor to the persisted high-water (so a backward
+    /// wall-clock step across a restart can't regress below what C last
+    /// accepted), then advances and re-persists it. A globally-increasing value
+    /// is per-device increasing too, so C rejects a `/register`/`/notify` whose
+    /// counter doesn't exceed the device's last accepted.
+    async fn next_counter(&self) -> u64 {
+        self.push_counter_seeded
+            .get_or_init(|| async {
+                if let Ok(Some(secret)) = self.secret_vault.get_secret(PUSH_COUNTER_VAULT_KEY).await
+                    && let Ok(bytes) = <[u8; 8]>::try_from(secret.as_bytes())
+                {
+                    // Lift the floor to the stored high-water (a no-op if the
+                    // clock is already ahead of it).
+                    mint_counter(&self.push_counter, u64::from_be_bytes(bytes));
+                }
+            })
+            .await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let next = mint_counter(&self.push_counter, now);
+        // Persist the new high-water best-effort; pushes are human-paced (≤ one
+        // per completed turn per device) so a write per mint is negligible.
+        if let Err(e) = self
+            .secret_vault
+            .store_secret(PUSH_COUNTER_VAULT_KEY, next.to_be_bytes().as_slice())
+            .await
+        {
+            tracing::debug!(error = %e, "push: persist counter high-water failed");
+        }
+        next
     }
 
     /// A's gateway push-signing key, loaded from the vault and cached on first push.
@@ -372,9 +439,55 @@ impl PushDispatcher {
         if base.is_empty() {
             return Err("device row has no relay url (re-pair to populate)".into());
         }
+        let notify_url = remote_host_protocol::push::notify_url(&base);
         self.ensure_registered(device, &base).await;
-        let signing_key = self.signing_key().await?;
-        let key = self.load_push_key(&device.device_id).await?;
+        match self
+            .post_notify(device, session_id, preview, &notify_url)
+            .await
+        {
+            Ok(()) => Ok(()),
+            // C no longer knows this device — its in-memory token store was reset
+            // (typically a remote-host restart). Our "already registered" cache is
+            // stale: drop it, re-register from durable pairing material, and retry
+            // the push once so delivery self-heals on this very turn instead of
+            // 404'ing until A restarts or the APNs token rotates.
+            Err(NotifyError::DeviceUnknown) => {
+                self.registered.lock().remove(device.device_id.as_str());
+                self.ensure_registered(device, &base).await;
+                match self
+                    .post_notify(device, session_id, preview, &notify_url)
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        tracing::warn!(
+                            device = %device.device_id, error = %e,
+                            "push: device still unknown to remote host after re-register; \
+                             delivery wedged (missing delegation/apns material?)",
+                        );
+                        Err(e.to_string())
+                    }
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Build + sign the `/notify` body and POST it to `notify_url`. Split out of
+    /// [`Self::dispatch_to_device`] so the 404 self-heal path can re-send the same
+    /// push (with a fresh, strictly-larger counter) after a forced re-register.
+    async fn post_notify(
+        &self,
+        device: &DeviceRow,
+        session_id: &SessionId,
+        preview: &str,
+        notify_url: &str,
+    ) -> Result<(), NotifyError> {
+        let signing_key = self.signing_key().await.map_err(NotifyError::Transient)?;
+        let key = self
+            .load_push_key(&device.device_id)
+            .await
+            .map_err(NotifyError::Transient)?;
         let body = build_notify_body(
             &device.remote_api_key,
             &device.device_id,
@@ -382,10 +495,10 @@ impl PushDispatcher {
             &key,
             preview,
             &signing_key,
-            next_push_counter(),
-        )?;
-        let notify_url = remote_host_protocol::push::notify_url(&base);
-        self.sink.post(&notify_url, &body).await
+            self.next_counter().await,
+        )
+        .map_err(NotifyError::Transient)?;
+        self.sink.post(notify_url, &body).await
     }
 
     /// Best-effort: register an approved device with C from the material A
@@ -439,7 +552,7 @@ impl PushDispatcher {
             reg.apns_env,
             &signing_key,
             delegation_sig.as_bytes(),
-            next_push_counter(),
+            self.next_counter().await,
         );
         let register_url = remote_host_protocol::push::register_url(base_http);
         match registrar.register(&register_url, &body).await {
@@ -808,5 +921,190 @@ mod tests {
             )),
             "https://proxy.baybo.space/register"
         );
+    }
+
+    // --- 404 self-heal + durable counter (the remote-host-restart fix) ---
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// A `NotifySink` that returns `DeviceUnknown` for its first `fail_first`
+    /// calls (C lost the binding), then `Ok`. Counts every call.
+    struct ScriptedSink {
+        calls: AtomicUsize,
+        fail_first: usize,
+    }
+    #[async_trait::async_trait]
+    impl NotifySink for ScriptedSink {
+        async fn post(&self, _url: &str, _body: &NotifyRequest) -> Result<(), NotifyError> {
+            let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if n < self.fail_first {
+                Err(NotifyError::DeviceUnknown)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// An `ApnsRegistrar` that always succeeds and counts `/register` calls.
+    #[derive(Default)]
+    struct CountingRegistrar {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ApnsRegistrar for CountingRegistrar {
+        async fn register(&self, _url: &str, _body: &RegisterRequest) -> Result<(), String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A dispatcher backed by a tempdir libsql store, with the durable pairing
+    /// material `ensure_registered` reads already seeded in the vault.
+    async fn test_dispatcher(
+        sink: Arc<dyn NotifySink>,
+        registrar: Arc<dyn ApnsRegistrar>,
+    ) -> (Arc<PushDispatcher>, DeviceRow, tempfile::TempDir) {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let stores = baybo_storage::Store::open(&tempdir.path().join("push-test.db"))
+            .await
+            .expect("open store");
+        let session_manager = Arc::new(SessionManager::new(
+            stores.session.clone(),
+            stores.session_summary.clone(),
+            stores.session_folder.clone(),
+        ));
+        let vault = Arc::new(baybo_security::SecretVault::new(
+            baybo_security::EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())
+                .expect("test key"),
+            stores.secret.clone(),
+        ));
+        let device_id = "dev-1";
+        vault
+            .store_secret(
+                &device_apns_secret_name(device_id),
+                &serde_json::to_vec(&DeviceApnsRegistration {
+                    apns_token: "apns-tok".into(),
+                    apns_env: device_proto::pairing::ApnsEnv::Sandbox,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        vault
+            .store_secret(
+                &device_push_key_secret_name(device_id),
+                &[7u8; aead::KEY_LEN],
+            )
+            .await
+            .unwrap();
+        vault
+            .store_secret(&device_push_delegation_secret_name(device_id), &[9u8; 64])
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(PushDispatcher::new(
+            stores.device.clone(),
+            stores.session.clone(),
+            session_manager,
+            vault,
+            sink,
+            Some(registrar),
+        ));
+        let row = DeviceRow {
+            device_id: device_id.into(),
+            device_pubkey: vec![1u8; 32],
+            auth_token: "auth".into(),
+            status: DeviceStatus::Approved,
+            rendezvous_id: None,
+            created_at: 0,
+            approved_at: Some(0),
+            last_seen_at: None,
+            relay_url: "ws://127.0.0.1:9".into(),
+            remote_api_key: "key-A".into(),
+        };
+        (dispatcher, row, tempdir)
+    }
+
+    #[tokio::test]
+    async fn notify_404_invalidates_cache_reregisters_and_retries() {
+        let sink = Arc::new(ScriptedSink {
+            calls: AtomicUsize::new(0),
+            fail_first: 1,
+        });
+        let registrar = Arc::new(CountingRegistrar::default());
+        let (dispatcher, row, _td) = test_dispatcher(
+            Arc::clone(&sink) as Arc<dyn NotifySink>,
+            Arc::clone(&registrar) as Arc<dyn ApnsRegistrar>,
+        )
+        .await;
+
+        let res = dispatcher
+            .dispatch_to_device(&row, &SessionId::from("s1"), "preview")
+            .await;
+        assert!(res.is_ok(), "push self-heals after a 404: {res:?}");
+        // Two notify attempts (the 404 then the retry) and two registers (the
+        // initial ensure + the forced re-register after cache invalidation).
+        assert_eq!(sink.calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(registrar.calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn notify_404_persisting_after_reregister_surfaces_an_error() {
+        let sink = Arc::new(ScriptedSink {
+            calls: AtomicUsize::new(0),
+            fail_first: 99,
+        });
+        let registrar = Arc::new(CountingRegistrar::default());
+        let (dispatcher, row, _td) = test_dispatcher(
+            Arc::clone(&sink) as Arc<dyn NotifySink>,
+            Arc::clone(&registrar) as Arc<dyn ApnsRegistrar>,
+        )
+        .await;
+
+        let res = dispatcher
+            .dispatch_to_device(&row, &SessionId::from("s1"), "preview")
+            .await;
+        assert!(res.is_err(), "a persistent 404 still surfaces an error");
+        // Exactly one retry — never an unbounded loop.
+        assert_eq!(sink.calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(registrar.calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn mint_counter_is_strictly_increasing_even_when_the_clock_steps_back() {
+        let c = AtomicU64::new(0);
+        assert_eq!(mint_counter(&c, 1000), 1000);
+        // Clock jumps backward: the prior+1 floor wins, never a regression.
+        assert_eq!(mint_counter(&c, 500), 1001);
+        // Equal-to-last clock still advances.
+        assert_eq!(mint_counter(&c, 1001), 1002);
+        // Clock jumps forward past the floor: takes the clock value.
+        assert_eq!(mint_counter(&c, 5000), 5000);
+    }
+
+    #[tokio::test]
+    async fn next_counter_mints_above_the_persisted_high_water() {
+        // A prior run advanced + persisted a high counter; then the wall clock
+        // stepped back and the process restarted. The new dispatcher must mint
+        // ABOVE the stored high-water, never below it (GR-1).
+        let sink = Arc::new(ScriptedSink {
+            calls: AtomicUsize::new(0),
+            fail_first: 0,
+        });
+        let registrar = Arc::new(CountingRegistrar::default());
+        let (dispatcher, _row, _td) = test_dispatcher(
+            Arc::clone(&sink) as Arc<dyn NotifySink>,
+            Arc::clone(&registrar) as Arc<dyn ApnsRegistrar>,
+        )
+        .await;
+        // Well above any plausible current unix-nanos, so only the high-water (not
+        // the wall clock) can satisfy the floor.
+        let high = u64::MAX - 10;
+        dispatcher
+            .secret_vault
+            .store_secret(PUSH_COUNTER_VAULT_KEY, high.to_be_bytes().as_slice())
+            .await
+            .unwrap();
+        let next = dispatcher.next_counter().await;
+        assert!(next > high, "minted {next} must exceed high-water {high}");
     }
 }

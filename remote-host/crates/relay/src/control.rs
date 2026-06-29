@@ -11,6 +11,7 @@
 //! signal stream — layers on top. Host-testable over `mpsc`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -30,6 +31,11 @@ pub use remote_host_protocol::relay::{ControlHello, ControlSignal, LegClass};
 struct ControlEntry {
     tx: mpsc::Sender<ControlSignal>,
     remote_api_key: String,
+    /// Unique per accepted control connection. A stale connection's cleanup
+    /// removes its slot only when this still matches, so it can't evict the
+    /// entry a faster reconnect already installed under the same
+    /// `relay_node_id` + `remote_api_key`.
+    token: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +54,7 @@ pub enum SignalOpenError {
 #[derive(Default)]
 pub struct ControlRegistry {
     instances: Mutex<HashMap<String, ControlEntry>>,
+    next_token: AtomicU64,
 }
 
 impl ControlRegistry {
@@ -56,14 +63,16 @@ impl ControlRegistry {
     }
 
     /// A gateway registers its control connection under `relay_node_id` (with its
-    /// admitted `remote_api_key`) and gets the receiver its control loop acts on. A
+    /// admitted `remote_api_key`) and gets the receiver its control loop acts on
+    /// plus a connection token to pass to [`Self::unregister_if_owned`]. A
     /// re-register supersedes a stale connection (reconnect wins).
     pub fn register(
         &self,
         relay_node_id: &str,
         remote_api_key: &str,
-    ) -> Result<mpsc::Receiver<ControlSignal>, ControlRegisterError> {
+    ) -> Result<(mpsc::Receiver<ControlSignal>, u64), ControlRegisterError> {
         let (tx, rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let mut instances = self.instances.lock();
         if let Some(existing) = instances.get(relay_node_id)
             && existing.remote_api_key != remote_api_key
@@ -75,9 +84,10 @@ impl ControlRegistry {
             ControlEntry {
                 tx,
                 remote_api_key: remote_api_key.to_string(),
+                token,
             },
         );
-        Ok(rx)
+        Ok((rx, token))
     }
 
     /// Signal a registered gateway to open a data leg under `relay_key` of the
@@ -115,12 +125,17 @@ impl ControlRegistry {
         }
     }
 
-    /// Drop a gateway's control connection (on disconnect).
-    pub fn unregister(&self, relay_node_id: &str, remote_api_key: &str) {
+    /// Drop a gateway's control connection on disconnect — but only if `token`
+    /// still owns the slot. A stale connection's cleanup firing *after* a faster
+    /// reconnect already replaced the entry (both share the same `relay_node_id` +
+    /// `remote_api_key`, so the key can't tell them apart) must not evict the live
+    /// owner, which would leave the gateway connected but unroutable until its next
+    /// control redial. The connection token is the identity that distinguishes them.
+    pub fn unregister_if_owned(&self, relay_node_id: &str, token: u64) {
         let mut instances = self.instances.lock();
         if instances
             .get(relay_node_id)
-            .is_some_and(|entry| entry.remote_api_key == remote_api_key)
+            .is_some_and(|entry| entry.token == token)
         {
             instances.remove(relay_node_id);
         }
@@ -140,7 +155,7 @@ mod tests {
     #[tokio::test]
     async fn signals_a_registered_gateway_to_open_a_leg() {
         let reg = ControlRegistry::new();
-        let mut rx = reg.register("node-1", "inst-A").unwrap();
+        let (mut rx, _token) = reg.register("node-1", "inst-A").unwrap();
         assert_eq!(reg.connected(), 1);
 
         // The signal succeeds and reports the gateway's owning remote_api_key.
@@ -184,8 +199,8 @@ mod tests {
     #[tokio::test]
     async fn unregister_drops_the_connection() {
         let reg = ControlRegistry::new();
-        let _rx = reg.register("n", "inst-A").unwrap();
-        reg.unregister("n", "inst-A");
+        let (_rx, token) = reg.register("n", "inst-A").unwrap();
+        reg.unregister_if_owned("n", token);
         assert_eq!(reg.connected(), 0);
         assert!(matches!(
             reg.signal_open("n", "inst-A", "k", LegClass::Chat),
@@ -193,10 +208,32 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn stale_unregister_does_not_evict_a_reconnected_owner() {
+        // A fast gateway reconnect (same node + same remote_api_key) supersedes the
+        // old slot. The old connection's cleanup then fires with its stale token —
+        // it must NOT evict the live (reconnected) owner, or the gateway would be
+        // connected yet unroutable until its next control redial. This is the exact
+        // race the connection token was added to close (mirrors the gateway-side
+        // `ChannelControlRegistry::unregister_if_owned`).
+        let reg = ControlRegistry::new();
+        let (_rx_old, old_token) = reg.register("node-1", "inst-A").unwrap();
+        let (_rx_new, _new_token) = reg.register("node-1", "inst-A").unwrap();
+        assert_eq!(reg.connected(), 1, "reconnect supersedes, not duplicates");
+
+        // Stale cleanup with the old token is a no-op against the new owner.
+        reg.unregister_if_owned("node-1", old_token);
+        assert_eq!(reg.connected(), 1, "live owner survives stale cleanup");
+        assert!(matches!(
+            reg.signal_open("node-1", "inst-A", "k", LegClass::Chat),
+            Ok(key) if key == "inst-A"
+        ));
+    }
+
     #[test]
     fn different_key_cannot_replace_registered_node() {
         let reg = ControlRegistry::new();
-        let _rx = reg.register("node-1", "inst-A").unwrap();
+        let (_rx, _token) = reg.register("node-1", "inst-A").unwrap();
         assert_eq!(
             reg.register("node-1", "inst-B").unwrap_err(),
             ControlRegisterError::OwnerMismatch
@@ -215,7 +252,7 @@ mod tests {
         let broker = RelayBroker::new();
 
         // Gateway A registers its control connection.
-        let mut a_control = reg.register("node-1", "inst-A").unwrap();
+        let (mut a_control, _token) = reg.register("node-1", "inst-A").unwrap();
 
         // A phone arrives at the relay for node-1: it joins the broker and C
         // signals A to open the matching data leg.

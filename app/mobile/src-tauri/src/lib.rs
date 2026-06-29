@@ -16,7 +16,7 @@ use baybo_mobile_core::{Frame, WireAttachment};
 use content::ContentSessions;
 use pairing::{PairAborted, PairChallenge, PairedSummary, PairingSessions};
 use tauri::ipc::Channel;
-use tauri::{Emitter, State};
+use tauri::{AppHandle, Emitter, State};
 
 /// Scan-to-connect: dial the gateway, run the XXpsk0 handshake through
 /// `DeviceHello`, and return the confirmation code the UI shows the user to
@@ -77,12 +77,13 @@ fn forget_pairing() -> Result<(), String> {
 /// `null` is a fresh subscribe with no catch-up.
 #[tauri::command]
 async fn content_connect(
+    app: AppHandle,
     sessions: State<'_, ContentSessions>,
     session_id: String,
     since_ordinal: Option<i64>,
     on_frame: Channel<Frame>,
 ) -> Result<(), String> {
-    content::connect(&sessions, session_id, since_ordinal, on_frame).await
+    content::connect(app, &sessions, session_id, since_ordinal, on_frame).await
 }
 
 /// Send a user message on the live content session. `msgId` is a fresh per-send
@@ -256,10 +257,17 @@ pub fn run() {
     // relay leg the OS froze. On every foreground (`Resumed`) emit `app-resumed` so
     // the webview re-dials its content session and replays the catch-up gap.
     app.run(|app_handle, event| {
-        if matches!(event, tauri::RunEvent::Resumed)
-            && let Err(e) = app_handle.emit("app-resumed", ())
-        {
-            eprintln!("baybo: emit app-resumed failed: {e}");
+        if matches!(event, tauri::RunEvent::Resumed) {
+            if let Err(e) = app_handle.emit("app-resumed", ()) {
+                eprintln!("baybo: emit app-resumed failed: {e}");
+            }
+            // APNs registration can fail transiently at launch and iOS does not
+            // retry it on its own. If we still have no token, re-arm on foreground
+            // (idempotent — see `push_register::register`); once a token lands the
+            // content pump forwards it and the gateway re-registers the binding.
+            if push_register::apns_token().is_none() {
+                push_register::register();
+            }
         }
     });
 }

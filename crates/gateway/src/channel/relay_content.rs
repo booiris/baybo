@@ -73,6 +73,13 @@ async fn approved_relay_settings(state: &WsChannelState) -> Option<RelaySettings
         .into_iter()
         .next()?;
     if row.relay_url.is_empty() || row.remote_api_key.is_empty() {
+        // A paired device whose row predates the relay fields would otherwise idle
+        // here forever with no diagnostic — distinct from the plain "no device
+        // paired" case. Surface it so the silent un-routability is explainable.
+        tracing::debug!(
+            device = %row.device_id,
+            "relay-content: approved device has no relay_url/remote_api_key; re-pair to route + push",
+        );
         return None;
     }
     Some(RelaySettings {
@@ -96,17 +103,31 @@ pub(crate) fn spawn(state: WsChannelState, shutdown: ShutdownSignal) -> JoinHand
 }
 
 async fn run(state: WsChannelState, shutdown: ShutdownSignal) {
-    let relay_node_id = match load_or_create_relay_node_id(&state.secret_vault).await {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(error = %e, "relay-content: no relay_node_id; control disabled");
-            return;
-        }
-    };
+    // Loaded lazily inside the loop and cached once it succeeds: a transient vault
+    // failure at boot then retries on the next tick instead of permanently
+    // disabling relay control (and thus chat reachability) for the whole process.
+    let mut node_id_cache: Option<String> = None;
     loop {
         if shutdown.is_shutdown() {
             break;
         }
+        let relay_node_id = match &node_id_cache {
+            Some(id) => id.clone(),
+            None => match load_or_create_relay_node_id(&state.secret_vault).await {
+                Ok(id) => {
+                    node_id_cache = Some(id.clone());
+                    id
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "relay-content: relay_node_id load failed; retrying");
+                    tokio::select! {
+                        _ = tokio::time::sleep(DEVICE_POLL_INTERVAL) => {}
+                        _ = shutdown.wait() => break,
+                    }
+                    continue;
+                }
+            },
+        };
         // Idle until a device is paired (and has recorded its relay settings),
         // but wake immediately on shutdown rather than after the full poll tick.
         let Some(settings) = approved_relay_settings(&state).await else {

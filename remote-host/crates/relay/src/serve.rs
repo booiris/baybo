@@ -498,8 +498,8 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
     if !still_admitted(state.admitted.as_ref(), &key) {
         return;
     }
-    let mut rx = match state.control.register(&hello.relay_node_id, &key) {
-        Ok(rx) => rx,
+    let (mut rx, control_token) = match state.control.register(&hello.relay_node_id, &key) {
+        Ok(registered) => registered,
         Err(ControlRegisterError::OwnerMismatch) => {
             tracing::warn!(
                 node = %hello.relay_node_id,
@@ -508,9 +508,6 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
             return;
         }
     };
-    // `register` replaces any prior slot (reconnect wins); if our slot is
-    // superseded, `rx` closes and we must NOT unregister the new owner.
-    let mut superseded = false;
     loop {
         tokio::select! {
             // The gateway's remote_api_key was revoked (admission hot-reload).
@@ -528,10 +525,10 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
                         break;
                     }
                 }
-                None => {
-                    superseded = true;
-                    break;
-                }
+                // Our slot was superseded by a reconnect (the prior tx was
+                // dropped, closing `rx`). The token-scoped unregister below is a
+                // no-op against the new owner, so just exit.
+                None => break,
             },
             inbound = socket.recv() => match inbound {
                 // The gateway speaks only the hello; anything else (its keepalive
@@ -548,9 +545,9 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
             }
         }
     }
-    if !superseded {
-        state.control.unregister(&hello.relay_node_id, &key);
-    }
+    state
+        .control
+        .unregister_if_owned(&hello.relay_node_id, control_token);
     tracing::info!(node = %hello.relay_node_id, "control: gateway disconnected");
 }
 

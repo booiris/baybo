@@ -16,6 +16,14 @@ import { attachmentKind, imageObjectUrl, uploadBytes, type WireAttachment } from
 /// at all.
 const FOREGROUND_RECONNECT_DEBOUNCE_MS = 400;
 
+/// Backoff before retrying after an unsolicited content-session drop (the Rust
+/// shell's `content-disconnected` event) or a failed dial. Long enough to let a
+/// bounced gateway re-arm its relay control leg, short enough that chat recovers
+/// on its own without the user backgrounding/foregrounding the app. The pending
+/// retry is coalesced (one at a time) so a persistently-down gateway is polled
+/// at this cadence, not in a tight loop.
+const RECONNECT_BACKOFF_MS = 2000;
+
 /// Parse a `baybo://pair?h=<relay>&r=<rendezvous-id>&s=<secret>&k=<remote-api-key>`
 /// QR payload. Both `r` (public rendezvous id) and `s` (the 256-bit secret, the
 /// Noise PSK) are required — there is no typeable fallback, because a short
@@ -342,17 +350,46 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
       }
     };
     setStatus("Connecting…");
-    invoke("content_connect", {
+    // Returns the dial promise (rejections propagate) so the caller can back off
+    // and retry — see `attemptConnect` in the mount effect.
+    //
+    // Always send a number, never null: the gateway replays the rows ABOVE this
+    // ordinal, so `0` (the value when localStorage was evicted and we have nothing
+    // rendered) backfills the whole thread from the server instead of leaving the
+    // chat blank until the next turn. A genuinely empty session replays nothing; an
+    // over-cap history yields a `Frame::Reset` (handled in the frame switch).
+    return invoke("content_connect", {
       sessionId,
-      sinceOrdinal: lastOrdinal.current > 0 ? lastOrdinal.current : null,
+      sinceOrdinal: lastOrdinal.current,
       onFrame: channel,
-    })
-      .then(() => setStatus(null))
-      .catch((e) => setStatus(`Connect failed: ${e}`));
+    }).then(() => setStatus(null));
   }, [sessionId]);
 
   useEffect(() => {
-    connect(); // first connect is immediate — no foreground burst to coalesce yet
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let backoff: ReturnType<typeof setTimeout> | undefined;
+
+    // Dial, and on failure back off and retry. Every connect path funnels through
+    // here so a failed dial (gateway offline / mid-reconnect) self-heals instead
+    // of stranding the chat on a "Connect failed" message until the next
+    // foreground.
+    const attemptConnect = () => {
+      connect().catch((e) => {
+        setStatus(`Connect failed: ${e}`);
+        scheduleReconnect();
+      });
+    };
+    // Backoff retry, coalesced to one pending attempt so a down gateway is polled
+    // at `RECONNECT_BACKOFF_MS`, never in a tight loop.
+    function scheduleReconnect() {
+      if (backoff) return;
+      backoff = setTimeout(() => {
+        backoff = undefined;
+        attemptConnect();
+      }, RECONNECT_BACKOFF_MS);
+    }
+
+    attemptConnect(); // first connect is immediate — no foreground burst to coalesce yet
 
     // iOS suspends the app without ever marking the WKWebView page hidden, so the
     // page's own `visibilitychange` never fires on resume — the chat would keep
@@ -361,12 +398,11 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
     // `focus`, and — the reliable one on iOS — the native `app-resumed` event the
     // Rust shell emits from `RunEvent::Resumed`. A single resume fires several of
     // these, so debounce them into one reconnect.
-    let timer: ReturnType<typeof setTimeout> | undefined;
     const scheduleConnect = () => {
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         timer = undefined;
-        connect();
+        attemptConnect();
       }, FOREGROUND_RECONNECT_DEBOUNCE_MS);
     };
     const onVisible = () => {
@@ -375,6 +411,7 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", scheduleConnect);
     let unlisten: (() => void) | undefined;
+    let unlistenDropped: (() => void) | undefined;
     let cancelled = false;
     listen("app-resumed", () => scheduleConnect())
       .then((un) => {
@@ -383,12 +420,24 @@ function ChatView({ sessionId, onClose }: { sessionId: string; onClose: () => vo
         else unlisten = un;
       })
       .catch(() => {});
+    // The live content session ended on its own (socket dropped, liveness lapse,
+    // a remote-host restart) — the Rust pump emits this only on an UNsolicited
+    // exit (a deliberate reconnect/disconnect aborts the task instead). Reconnect
+    // with catch-up so chat recovers without a foreground round-trip.
+    listen("content-disconnected", () => scheduleReconnect())
+      .then((un) => {
+        if (cancelled) un();
+        else unlistenDropped = un;
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      if (backoff) clearTimeout(backoff);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", scheduleConnect);
       unlisten?.();
+      unlistenDropped?.();
       invoke("content_disconnect").catch(() => {});
     };
   }, [connect]);
