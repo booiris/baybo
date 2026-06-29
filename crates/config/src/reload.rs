@@ -74,6 +74,7 @@ pub fn hot_reload_diff(old: &BayboConfig, new: &BayboConfig) -> Result<()> {
         browser,
         external_agents,
         proxy,
+        push,
         memory,
         // Hot: the runtime reloader swaps the live `BashTool` sandbox mode (and
         // the tool description it advertises). Ignored here so a `sandbox`-only
@@ -106,6 +107,12 @@ pub fn hot_reload_diff(old: &BayboConfig, new: &BayboConfig) -> Result<()> {
     // MCP) and re-spawning sidecars with new env — not safe live.
     if &old.proxy != proxy {
         return Err(not_hot("proxy"));
+    }
+    // The push remote-host is read at registration time and captured into the
+    // dispatcher's bindings — changing it live would leave stale bindings, so a
+    // change requires a restart.
+    if &old.push != push {
+        return Err(not_hot("push"));
     }
     if &old.memory != memory {
         return Err(not_hot("memory"));

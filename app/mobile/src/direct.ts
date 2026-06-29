@@ -50,3 +50,19 @@ export async function directHistory(
 ): Promise<ChatSessionDetail> {
   return invoke<ChatSessionDetail>("direct_history", { sessionId, beforeOrdinal, limit });
 }
+
+/**
+ * Best-effort: provision (or refresh) this app's direct-mode push binding with
+ * the connected gateway, so a backgrounded direct chat can still buzz. The Rust
+ * side no-ops when iOS hasn't issued an APNs token yet, or the gateway has no
+ * `[push]` remote host configured — so this is safe to call repeatedly (on
+ * connect and on every foreground). Never throws: push is non-essential, and
+ * blocking the UI on it would be wrong.
+ */
+export async function directPushRegister(): Promise<void> {
+  try {
+    await invoke("direct_push_register");
+  } catch {
+    /* push is best-effort — swallow */
+  }
+}

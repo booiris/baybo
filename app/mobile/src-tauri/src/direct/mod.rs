@@ -13,12 +13,14 @@
 
 mod blob;
 mod chat;
+mod push;
 mod rest;
 
 pub use blob::{image_data, upload_bytes};
 pub use chat::{
     DirectSessionRef, DirectSessions, connect, disconnect, forget, send, session_create,
 };
+pub use push::register as register_push;
 
 use serde::{Deserialize, Serialize};
 

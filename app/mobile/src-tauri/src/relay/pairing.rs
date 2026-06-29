@@ -105,20 +105,6 @@ fn load_or_create_device_identity() -> Result<StaticKeypair, String> {
     Ok(keypair)
 }
 
-/// The app's long-term **Ed25519 push-delegation identity** — distinct from the
-/// X25519 Noise static above. Its public half is the `device_id`
-/// (`ios-<hex(pub)>`), so the APNs binding self-certifies to C; the secret signs
-/// the pairing-time delegation authorizing the gateway's push key. Loaded from
-/// (or minted into) the keychain so the `device_id` is stable across re-pairings.
-fn load_or_create_device_sign_key() -> Result<delegation::SigningKey, String> {
-    if let Some(seed) = crate::keychain::read_device_sign_key()? {
-        return Ok(delegation::SigningKey::from_bytes(&seed));
-    }
-    let key = delegation::generate_signing_key();
-    crate::keychain::store_device_sign_key(&key.to_bytes())?;
-    Ok(key)
-}
-
 /// The IPC DTOs ([`PairChallenge`] / [`PairedSummary`]) live in
 /// baybo-mobile-core beside [`PairedGateway`], where ts-rs generates their TS
 /// (core's `ts-export` feature). Re-exported so the commands + lib.rs keep
@@ -155,8 +141,9 @@ pub async fn pair_begin(
     let keypair = load_or_create_device_identity()?;
     // The device's Ed25519 push-delegation identity; its public half IS the
     // device_id, so C can self-certify the APNs binding. Separate from the X25519
-    // Noise static above (which authenticates content sessions).
-    let sign_key = load_or_create_device_sign_key()?;
+    // Noise static above (which authenticates content sessions). Shared with the
+    // direct push-register path so a phone keeps one stable push identity.
+    let sign_key = crate::keychain::load_or_create_device_sign_key()?;
     let device_id = delegation::device_id_for(&sign_key.verifying_key());
 
     let req = PairingRequest {

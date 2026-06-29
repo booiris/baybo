@@ -321,6 +321,22 @@ pub fn read_device_sign_key() -> Result<Option<[u8; KEY_LEN]>, String> {
     }
 }
 
+/// Load the device's Ed25519 push-delegation identity, minting + persisting one
+/// on first use. Its public half IS the `device_id` (`ios-<hex(pub)>`). Shared by
+/// the relay (scan-to-pair) and direct (push-register) paths so a phone has ONE
+/// stable push identity regardless of how it connects — both store under
+/// [`DEVICE_SIGN_KEY_ACCOUNT`], so the `device_id` and its `baybo.push-key.<id>`
+/// keychain entry line up across modes.
+pub fn load_or_create_device_sign_key() -> Result<device_proto::delegation::SigningKey, String> {
+    use device_proto::delegation;
+    if let Some(seed) = read_device_sign_key()? {
+        return Ok(delegation::SigningKey::from_bytes(&seed));
+    }
+    let key = delegation::generate_signing_key();
+    store_device_sign_key(&key.to_bytes())?;
+    Ok(key)
+}
+
 /// Account holding the **direct-connection** credentials (a serialized
 /// `{base_url, token}`): the gateway base URL + admin Bearer token entered on the
 /// direct-login screen, the web-dashboard style of access. The admin token is a

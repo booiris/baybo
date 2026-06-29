@@ -504,6 +504,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/push/params": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["push_params"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/push/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["register_push"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/skills": {
         parameters: {
             query?: never;
@@ -1306,6 +1338,49 @@ export interface components {
             path: string;
             requires_restart: boolean;
             written_to: string;
+        };
+        /** @description Response of `GET /v1/push/params`. */
+        PushParams: {
+            /**
+             * @description `true` when `[push]` is configured (a remote host the gateway can
+             *     register/notify through). `false` → direct-mode push is unavailable; the
+             *     client should not register, and chat stays foreground-only.
+             */
+            configured: boolean;
+            /**
+             * @description Lowercase hex of the gateway's 32-byte Ed25519 push verifying key. The
+             *     client signs a delegation over this key (authorizing it to manage the
+             *     binding at C) before `POST /v1/push/register`.
+             */
+            gateway_push_pubkey: string;
+        };
+        /** @description Request body for `POST /v1/push/register`. */
+        RegisterPushRequest: {
+            /** @description APNs environment: `"sandbox"` (debug / TestFlight) or `"production"`. */
+            apns_env: string;
+            /** @description The client's current APNs device token (hex). */
+            apns_token: string;
+            /**
+             * @description Lowercase hex of the 64-byte Ed25519 delegation: the client's device key
+             *     authorizing the gateway push key returned by `GET /v1/push/params`.
+             */
+            delegation: string;
+            /**
+             * @description The client's self-certifying `device_id` (`ios-<hex(ed25519 pub)>`); the
+             *     gateway recovers the public key from it and re-derives the canonical id.
+             */
+            device_id: string;
+            /**
+             * @description Lowercase hex of the 32-byte preview AEAD key the client also stored in
+             *     its App-Group keychain (so its NSE can decrypt). Generated client-side and
+             *     delivered over this TLS + admin-token channel.
+             */
+            push_key: string;
+        };
+        /** @description Response of `POST /v1/push/register`. */
+        RegisterPushResponse: {
+            /** @description The `ios-<hex(pub)>` id the binding was stored under (== the push `bid`). */
+            device_id: string;
         };
         /**
          * @description Outcome of a successful reload, surfaced to the operator (HTTP
@@ -3143,6 +3218,77 @@ export interface operations {
                 };
                 content: {
                     "text/event-stream": unknown;
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    push_params: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Gateway push key + whether direct-mode push is configured */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PushParams"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    register_push: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterPushRequest"];
+            };
+        };
+        responses: {
+            /** @description Direct-mode push binding registered */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RegisterPushResponse"];
+                };
+            };
+            /** @description Push not configured, or malformed key / delegation that does not verify */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description Unauthorized */

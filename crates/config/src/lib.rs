@@ -23,6 +23,7 @@ pub mod gateway;
 pub mod llm;
 pub mod memory;
 pub mod proxy;
+pub mod push;
 pub mod reload;
 pub mod sandbox;
 pub mod security;
@@ -47,6 +48,7 @@ pub use crate::gateway::GatewayConfig;
 pub use crate::llm::{LlmEntry, LlmPricingOverride};
 pub use crate::memory::{MemoryConfig, MemoryProvider};
 pub use crate::proxy::ProxyConfig;
+pub use crate::push::PushConfig;
 pub use crate::reload::{ConfigHandle, hot_reload_diff};
 pub use crate::sandbox::{SandboxConfig, SandboxMode};
 pub use crate::security::SecurityConfig;
@@ -83,6 +85,12 @@ pub struct BayboConfig {
     /// direct connections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyConfig>,
+    /// Optional remote host (C) for **direct-mode** (web-identity) push. Relay
+    /// devices source this from the pairing QR; the direct transport has no QR,
+    /// so an operator who wants direct/web sessions to receive push points the
+    /// gateway here. Absent → direct-mode push disabled (relay push unaffected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<PushConfig>,
     pub memory: MemoryConfig,
     /// How shell-out tools are isolated. `auto` (default) wraps every command in
     /// the OS sandbox and adds an LLM risk judge that can run a failed command

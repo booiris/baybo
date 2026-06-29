@@ -141,6 +141,22 @@ async fn direct_history(
     direct::history(session_id, before_ordinal, limit).await
 }
 
+/// Best-effort direct-mode push registration: provision (or refresh) this app's
+/// push binding with the directly-connected gateway so a backgrounded direct chat
+/// can still buzz. No-op when iOS hasn't issued an APNs token yet or the gateway
+/// has no `[push]` remote host configured. Returns the bound device id on success.
+#[tauri::command]
+async fn direct_push_register() -> Result<Option<String>, String> {
+    let token = push_register::apns_token().unwrap_or_default();
+    // Debug / TestFlight builds get a sandbox APNs token; release a production one.
+    let env = if cfg!(debug_assertions) {
+        "sandbox"
+    } else {
+        "production"
+    };
+    direct::register_push(token, env).await
+}
+
 /// Forget the current pairing (unpair): clear the keychain record + push key so
 /// the app returns to the scan screen. One app binds one gateway.
 #[tauri::command]
@@ -365,6 +381,7 @@ pub fn run() {
             direct_logout,
             direct_session_create,
             direct_history,
+            direct_push_register,
             chat_connect,
             chat_send,
             chat_disconnect,

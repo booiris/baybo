@@ -2241,6 +2241,86 @@
         }
       }
     },
+    "/v1/push/params": {
+      "get": {
+        "tags": [
+          "push"
+        ],
+        "operationId": "push_params",
+        "responses": {
+          "200": {
+            "description": "Gateway push key + whether direct-mode push is configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PushParams"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/push/register": {
+      "post": {
+        "tags": [
+          "push"
+        ],
+        "operationId": "register_push",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterPushRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Direct-mode push binding registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisterPushResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Push not configured, or malformed key / delegation that does not verify",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/skills": {
       "get": {
         "tags": [
@@ -4020,6 +4100,70 @@
           }
         }
       },
+      "PushParams": {
+        "type": "object",
+        "description": "Response of `GET /v1/push/params`.",
+        "required": [
+          "gateway_push_pubkey",
+          "configured"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean",
+            "description": "`true` when `[push]` is configured (a remote host the gateway can\nregister/notify through). `false` → direct-mode push is unavailable; the\nclient should not register, and chat stays foreground-only."
+          },
+          "gateway_push_pubkey": {
+            "type": "string",
+            "description": "Lowercase hex of the gateway's 32-byte Ed25519 push verifying key. The\nclient signs a delegation over this key (authorizing it to manage the\nbinding at C) before `POST /v1/push/register`."
+          }
+        }
+      },
+      "RegisterPushRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/push/register`.",
+        "required": [
+          "device_id",
+          "apns_token",
+          "apns_env",
+          "push_key",
+          "delegation"
+        ],
+        "properties": {
+          "apns_env": {
+            "type": "string",
+            "description": "APNs environment: `\"sandbox\"` (debug / TestFlight) or `\"production\"`."
+          },
+          "apns_token": {
+            "type": "string",
+            "description": "The client's current APNs device token (hex)."
+          },
+          "delegation": {
+            "type": "string",
+            "description": "Lowercase hex of the 64-byte Ed25519 delegation: the client's device key\nauthorizing the gateway push key returned by `GET /v1/push/params`."
+          },
+          "device_id": {
+            "type": "string",
+            "description": "The client's self-certifying `device_id` (`ios-<hex(ed25519 pub)>`); the\ngateway recovers the public key from it and re-derives the canonical id."
+          },
+          "push_key": {
+            "type": "string",
+            "description": "Lowercase hex of the 32-byte preview AEAD key the client also stored in\nits App-Group keychain (so its NSE can decrypt). Generated client-side and\ndelivered over this TLS + admin-token channel."
+          }
+        }
+      },
+      "RegisterPushResponse": {
+        "type": "object",
+        "description": "Response of `POST /v1/push/register`.",
+        "required": [
+          "device_id"
+        ],
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "description": "The `ios-<hex(pub)>` id the binding was stored under (== the push `bid`)."
+          }
+        }
+      },
       "ReloadOutcome": {
         "type": "object",
         "description": "Outcome of a successful reload, surfaced to the operator (HTTP\nresponse + logs).",
@@ -4459,6 +4603,10 @@
     {
       "name": "chat",
       "description": "Web chat sessions + channel-token mint"
+    },
+    {
+      "name": "push",
+      "description": "Direct-mode (web-identity) push registration"
     },
     {
       "name": "llm",

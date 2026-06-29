@@ -16,7 +16,7 @@ import {
   type ChatTransport,
   type WireAttachment,
 } from "./blob";
-import { directSessionCreate } from "./direct";
+import { directSessionCreate, directPushRegister } from "./direct";
 
 /// Foreground signals (page visibility, window focus, the native `app-resumed`
 /// event) can fire 2–3 times on a single iOS resume; coalesce them into one
@@ -803,6 +803,28 @@ export default function App() {
       })
       .catch(() => {});
   }, []);
+
+  // Direct-mode push: once connected, best-effort register this app's push
+  // binding so a backgrounded direct chat can buzz. Re-tried on every foreground
+  // because iOS can deliver the APNs token seconds after launch (after the first
+  // register), and a registered token also needs re-asserting after a relaunch.
+  // No-op server-side when the gateway has no `[push]` remote host configured.
+  useEffect(() => {
+    if (!directConnected) return;
+    void directPushRegister();
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listen("app-resumed", () => void directPushRegister())
+      .then((un) => {
+        if (cancelled) un();
+        else unlisten = un;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [directConnected]);
 
   // Stay transparent for the whole scan so the camera (drawn behind the webview)
   // can show through. The warm-up cover below masks the not-yet-ready feed, so
