@@ -212,15 +212,20 @@ function AttachmentImage({
   attachment,
   previewUrl,
   transport,
+  connEpoch,
 }: {
   attachment: WireAttachment;
   previewUrl?: string;
   transport: ChatTransport;
+  connEpoch: number;
 }) {
   const { t } = useTranslation();
   const [url, setUrl] = useState<string | null>(previewUrl ?? null);
   const [failed, setFailed] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  // Mirrors `failed` for the connEpoch retry effect to read without taking `failed`
+  // as a dep (which would refetch in a tight loop the instant a fetch fails).
+  const failedRef = useRef(false);
 
   useEffect(() => {
     if (previewUrl) {
@@ -229,6 +234,7 @@ function AttachmentImage({
     }
     let owned: string | null = null;
     let cancelled = false;
+    failedRef.current = false;
     setFailed(false);
     setUrl(null);
     imageObjectUrl(attachment.blob_id, attachment.mime_type, transport)
@@ -241,7 +247,10 @@ function AttachmentImage({
         setUrl(u);
       })
       .catch(() => {
-        if (!cancelled) setFailed(true);
+        if (!cancelled) {
+          failedRef.current = true;
+          setFailed(true);
+        }
       });
     // We own only URLs we downloaded; never revoke the caller's previewUrl here.
     return () => {
@@ -249,6 +258,14 @@ function AttachmentImage({
       if (owned) URL.revokeObjectURL(owned);
     };
   }, [attachment.blob_id, attachment.mime_type, previewUrl, attempt, transport]);
+
+  // A restored image can race ahead of its leg going live — a direct chat's channel
+  // token is only stashed once `chat_connect` completes, so an early fetch fails
+  // with "no active direct session". Retry the moment a (re)connect lands instead
+  // of stranding it on tap-to-load.
+  useEffect(() => {
+    if (failedRef.current) setAttempt((a) => a + 1);
+  }, [connEpoch]);
 
   if (failed) {
     return (
@@ -268,10 +285,12 @@ function AttachmentList({
   attachments,
   previews,
   transport,
+  connEpoch,
 }: {
   attachments: WireAttachment[];
   previews: Map<string, string>;
   transport: ChatTransport;
+  connEpoch: number;
 }) {
   return (
     <div className="attachments">
@@ -282,6 +301,7 @@ function AttachmentList({
             attachment={a}
             previewUrl={previews.get(a.blob_id)}
             transport={transport}
+            connEpoch={connEpoch}
           />
         ) : (
           <div key={`${a.blob_id}-${i}`} className="attachment-file">
@@ -317,6 +337,10 @@ function ChatView({
   const [turnActive, setTurnActive] = useState(false);
   const [input, setInput] = useState("");
   const [status, setStatus] = useState<string | null>(() => t("chat.connecting"));
+  // Bumped on each successful (re)connect. A restored attachment image that failed
+  // to load before its leg was live (e.g. a direct chat whose channel token isn't
+  // stashed until `chat_connect` completes) re-fetches when this changes.
+  const [connEpoch, setConnEpoch] = useState(0);
   // platform_msg_ids already rendered (our optimistic sends + anything restored),
   // so the server's echo or a catch-up replay doesn't render them twice.
   const sentIds = useRef<Set<string>>(
@@ -437,7 +461,10 @@ function ChatView({
       sessionId,
       sinceOrdinal: lastOrdinal.current,
       onFrame: channel,
-    }).then(() => setStatus(null));
+    }).then(() => {
+      setStatus(null);
+      setConnEpoch((e) => e + 1);
+    });
     // `t` is intentionally omitted from deps: re-creating `connect` on a language
     // switch would tear down + re-dial the live session. Status strings set by a
     // later reconnect simply use the language captured here.
@@ -617,6 +644,7 @@ function ChatView({
                 attachments={m.attachments}
                 previews={localPreviews.current}
                 transport={transport}
+                connEpoch={connEpoch}
               />
             )}
             {m.content}
@@ -895,6 +923,10 @@ export default function App() {
         });
         setPaired(summary);
         setChallenge(null);
+        // A finalized relay pairing supersedes any direct connection (Rust deletes
+        // the direct credentials at finalize). `directConnected` gates ahead of
+        // `paired`, so clear it or the now-defunct direct screen would keep showing.
+        setDirectConnected(null);
         setStatus(null);
       } else {
         // The decline path intentionally returns an error on the Rust side.
@@ -989,6 +1021,13 @@ export default function App() {
       setStatus(null);
       setLandingView("menu");
       setDirectConnected({ baseUrl: s.base_url });
+      // A direct login supersedes any relay pairing (Rust wipes it — see
+      // direct::login -> relay::forget_pairing), so drop the relay React state.
+      // Otherwise a later disconnect would fall through the render gates to a
+      // stale relay "remembered" screen for a pairing that no longer exists.
+      setRememberedDevice(null);
+      setPaired(null);
+      setPendingAction(null);
     } catch (e) {
       const msg = String(e);
       // `invalid_token` is a stable discriminator the Rust side returns for a 401
