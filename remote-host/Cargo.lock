@@ -1511,6 +1511,7 @@ dependencies = [
  "libsql",
  "remote-host-admission",
  "remote-host-push",
+ "remote-host-ratelimit",
  "remote-host-relay",
  "rustls",
  "thiserror 2.0.18",
@@ -1569,6 +1570,10 @@ dependencies = [
 [[package]]
 name = "remote-host-ratelimit"
 version = "0.1.0"
+dependencies = [
+ "axum",
+ "parking_lot",
+]
 
 [[package]]
 name = "remote-host-relay"

@@ -105,9 +105,9 @@ number of simultaneous relay connections, so a buggy or abusive gateway can't
 exhaust C. The limit is the row's `max_conns` column — **required on a registered
 row** (see above), inherited from the `guest` template on a guest row. A NULL that
 survives (a guest with no template default, or a legacy registered row from a
-pre-`CHECK` DB) floors to the configured `MAX_CONNS_PER_REMOTE_API_KEY` (Docker
-Compose defaults it to **64**, binary fallback **200**), hot-reloaded with the rest
-of the table. Pairing and
+pre-`CHECK` DB) floors to the configured `MAX_CONNS_PER_REMOTE_API_KEY_FALLBACK`
+(Docker Compose defaults it to **64**, binary fallback **200**), hot-reloaded with
+the rest of the table. Pairing and
 chat host legs over the cap are refused with `429`; blob host legs use
 `cap - CHAT_CONN_RESERVE` so chat can still reconnect; the gateway's one control
 channel is exempt. Raise it per key for a deployment serving many concurrent
@@ -159,20 +159,23 @@ sqlite3 ./data/admission.db \
 These set the tier *defaults*; an individual guest row with its own non-NULL limit
 still wins for that column, and registered rows are unaffected.
 
-**Push frequency control.** `POST /notify` is rate-limited per `(remote_api_key, device_id)` so a buggy or abusive gateway can't hammer APNs or spam a phone. Over the limit it returns `429` (the gateway backs off and retries). The limit is a fixed **60 pushes/min sustained, burst 20** per device; only admitted, registered devices are metered. Hardcoded, not configurable.
+**Push frequency control.** `POST /notify` is rate-limited per **`device_id`** so a buggy or abusive gateway can't hammer APNs or spam a phone: **60 pushes/min sustained, burst 20** per device (override with `PUSH_NOTIFY_RATE_PER_MIN` / `PUSH_NOTIFY_BURST`). On top of that, an aggregate **per-`remote_api_key` APNs send ceiling** (**1200 pushes/min sustained, burst 600**, fixed) bounds the total egress one key drives to the shared `.p8` *regardless of how many `device_id`s it registered* — so a holder of the public `guest` key can't forge unlimited self-owned devices to monopolize (and get Apple to penalize) the provider credential. Over either limit `/notify` returns `429`.
 
-**Per-source-IP flood backstop.** Ahead of admission, every relay WS-upgrade attempt is throttled per **client IP** (a token bucket, **10/s sustained, burst 60**), so a single host spraying upgrades across many rendezvous/node ids — or failing admission on each — is shed with `429` before any upgrade work. It also bounds the broker's pending map with a hard ceiling (`MAX_PENDING_LEGS`, **1024**): a new parked leg past the cap is refused `503` while matching an already-parked leg is exempt.
+**Push registration bounds.** The device-token store is bounded: a soft cap (**65 536** bindings, override `PUSH_DEVICE_STORE_CAP`) with eviction of idle, never-`/notify`-confirmed entries (TTL **1 h**, override `PUSH_UNCONFIRMED_TTL_SECS`), so a `/register` flood of valid self-signed chains can't grow it without bound — at the cap with nothing evictable a new `/register` is shed `503`. A `/register` whose `apns_token` exceeds a plausible length (**256 chars**) is refused `400` before it can bloat a stored binding; a bogus-but-bounded token is instead caught at `/notify` by APNs `BadDeviceToken` → prune. The notify-limiter maps themselves are bounded against an id-churn by a soft cap (**16 384**, override `PUSH_LIMITER_BUCKET_CAP`).
 
-By default the client IP is the **socket peer**, which is correct when remote-host terminates TLS itself. **Behind a proxy (e.g. Cloudflare) the socket peer is the proxy's edge IP, so every client shares one bucket — this would throttle legitimate traffic.** Two ways to handle a proxied deployment:
+> These `PUSH_*` overrides are **global** (not per-key). The per-`remote_api_key` send ceiling is intentionally fixed — relay-style per-key budgets would live as columns on the `remote_api_keys` table, not as env. Each override falls back to its default when unset / unparseable / non-positive.
+
+**Per-source-IP flood backstop.** Ahead of admission, every relay WS-upgrade attempt **and every push `POST /register` / `POST /notify`** is throttled per **client IP** (a token bucket, default **10/s sustained, burst 60**), so a single host spraying requests across many rendezvous/node/device ids — or failing admission on each — is shed with `429` before any upgrade work or signature verification. It is **always on** (no disable switch). (The relay also bounds the broker's pending map with a hard ceiling, `MAX_PENDING_LEGS`, **1024**: a new parked leg past the cap is refused `503` while matching an already-parked leg is exempt.) The **client-IP resolution** is shared across both roles (`CLIENT_IP_HEADERS`, below), but relay and push keep **separate** IP-bucket maps and are sized independently: `RELAY_IP_RATE_PER_SEC` / `RELAY_IP_BURST` / `RELAY_IP_BUCKET_CAP` and `PUSH_IP_RATE_PER_SEC` / `PUSH_IP_BURST` / `PUSH_IP_BUCKET_CAP` (defaults **10**, **60**, **16 384**).
+
+By default the client IP is the **socket peer**, which is correct when remote-host terminates TLS itself. **Behind a proxy (e.g. Cloudflare) the socket peer is the proxy's edge IP, so every client shares one bucket — this would throttle legitimate traffic.** Resolve the real client IP from the proxy's header(s):
 
 ```bash
-# (a) Turn the origin limiter off and rate-limit at the proxy (it sees the real client):
-RELAY_PER_IP_LIMIT=0
-
-# (b) Resolve the real client IP from the proxy's header(s), tried in order
-#     (e.g. behind Cloudflare; the first parseable IP wins, else the socket peer):
-RELAY_CLIENT_IP_HEADERS=cf-connecting-ip
-#     (or, with a fallback:)  RELAY_CLIENT_IP_HEADERS=cf-connecting-ip,x-forwarded-for
+# Resolve the real client IP from the proxy's header(s), tried in order — shared by
+# both roles (e.g. behind Cloudflare; first parseable IP wins, else socket peer):
+CLIENT_IP_HEADERS=cf-connecting-ip
+#     (or, with a fallback:)  CLIENT_IP_HEADERS=cf-connecting-ip,x-forwarded-for
+# The limiter has no off switch; to neuter it behind a proxy that already rate-limits,
+# set a very high RELAY_IP_RATE_PER_SEC / PUSH_IP_RATE_PER_SEC (and matching burst).
 ```
 
 > **Trust a client-IP header ONLY when the origin is reachable solely via that proxy** — a [Cloudflare IP allowlist](https://www.cloudflare.com/ips/), a `cloudflared` Tunnel (no public origin), or Authenticated Origin Pulls (CF mTLS). Otherwise a direct-to-origin attacker can forge `cf-connecting-ip` to evade the limit or frame an arbitrary IP. For `x-forwarded-for` the **left-most** entry is taken as the original client, so it too is only safe behind a proxy that overwrites/anchors it.

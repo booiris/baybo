@@ -5,3 +5,10 @@ edition.workspace = true
 
 [lib]
 doctest = false
+
+[dependencies]
+parking_lot = { workspace = true }
+# The shared per-client-IP upgrade/request throttle ([`ip_limit`]) is a small axum
+# middleware layer mounted by both the relay and push routers, so it lives here
+# alongside the `TokenBucket` it draws — the rate-limit domain both roles share.
+axum = { workspace = true }

@@ -35,22 +35,36 @@ services:
       ADMISSION_DB_PATH: /data/admission.db
       ADMISSION_POLL_SECS: ${ADMISSION_POLL_SECS:-30}
       # fallback cap on simultaneous relay connections one admitted key may hold
-      MAX_CONNS_PER_REMOTE_API_KEY: ${MAX_CONNS_PER_REMOTE_API_KEY:-64}
-      # per-source-IP relay-upgrade flood backstop. On by default, keyed on the
-      # socket peer — correct when this binary terminates TLS for the real client.
-      # Behind a proxy that terminates TLS (e.g. Cloudflare) the peer is the proxy
-      # edge, so either set RELAY_CLIENT_IP_HEADERS to the proxy's real-client-IP
-      # header (e.g. cf-connecting-ip) or set RELAY_PER_IP_LIMIT=0 and rate-limit at
-      # the proxy. Trust a client-IP header ONLY when this origin is reachable
-      # solely via that proxy (CF IP allowlist / Tunnel / mTLS) — else it's
-      # forgeable. Both blank by default → socket-peer limiter (see DEPLOY.md).
-      RELAY_PER_IP_LIMIT: ${RELAY_PER_IP_LIMIT:-}
-      RELAY_CLIENT_IP_HEADERS: ${RELAY_CLIENT_IP_HEADERS:-}
+      # (per-key value in the remote_api_keys table overrides it)
+      MAX_CONNS_PER_REMOTE_API_KEY_FALLBACK: ${MAX_CONNS_PER_REMOTE_API_KEY_FALLBACK:-64}
+      # per-source-IP flood backstop, ALWAYS ON, fronting BOTH the relay WS upgrades
+      # and the push /register + /notify routes, keyed on the socket peer — correct
+      # when this binary terminates TLS for the real client. Behind a proxy that
+      # terminates TLS (e.g. Cloudflare) the peer is the proxy edge, so set
+      # CLIENT_IP_HEADERS to the proxy's real-client-IP header (e.g. cf-connecting-ip)
+      # — else every client shares one bucket. Trust a client-IP header ONLY when
+      # this origin is reachable solely via that proxy (CF IP allowlist / Tunnel /
+      # mTLS) — else it's forgeable. See DEPLOY.md. Client-IP resolution is SHARED;
+      # rate / burst / bucket cap are per role (relay vs push), blank -> defaults.
+      CLIENT_IP_HEADERS: ${CLIENT_IP_HEADERS:-}
+      RELAY_IP_RATE_PER_SEC: ${RELAY_IP_RATE_PER_SEC:-}
+      RELAY_IP_BURST: ${RELAY_IP_BURST:-}
+      RELAY_IP_BUCKET_CAP: ${RELAY_IP_BUCKET_CAP:-}
+      PUSH_IP_RATE_PER_SEC: ${PUSH_IP_RATE_PER_SEC:-}
+      PUSH_IP_BURST: ${PUSH_IP_BURST:-}
+      PUSH_IP_BUCKET_CAP: ${PUSH_IP_BUCKET_CAP:-}
       # push — enabled automatically when APNS_P8_HOST_PATH is set in .env
       APNS_P8_PATH: ${APNS_P8_HOST_PATH:+/run/secrets/apns_p8}
       APNS_KEY_ID: ${APNS_KEY_ID:-}
       APNS_TEAM_ID: ${APNS_TEAM_ID:-}
       APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:-}
+      # optional global push-limit overrides (blank -> built-in defaults; see
+      # DEPLOY.md). Per-key send ceiling is fixed and not env-tunable.
+      PUSH_DEVICE_STORE_CAP: ${PUSH_DEVICE_STORE_CAP:-}
+      PUSH_UNCONFIRMED_TTL_SECS: ${PUSH_UNCONFIRMED_TTL_SECS:-}
+      PUSH_NOTIFY_RATE_PER_MIN: ${PUSH_NOTIFY_RATE_PER_MIN:-}
+      PUSH_NOTIFY_BURST: ${PUSH_NOTIFY_BURST:-}
+      PUSH_LIMITER_BUCKET_CAP: ${PUSH_LIMITER_BUCKET_CAP:-}
       # TLS — set only when a cert is configured (-> wss/https), else blank (-> ws/http)
       TLS_CERT: ${TLS_CERT_HOST_PATH:+/run/tls/cert.pem}
       TLS_KEY: ${TLS_KEY_HOST_PATH:+/run/tls/key.pem}

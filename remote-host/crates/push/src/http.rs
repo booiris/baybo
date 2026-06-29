@@ -34,8 +34,12 @@ async fn register(State(state): State<PushState>, Json(req): Json<RegisterReques
     match state.service.register(req) {
         RegisterOutcome::Registered => StatusCode::OK,
         RegisterOutcome::Unadmitted => StatusCode::UNAUTHORIZED,
+        // The `apns_token` isn't a plausible APNs device token.
+        RegisterOutcome::InvalidToken => StatusCode::BAD_REQUEST,
         // The delegation chain / signature / counter didn't verify.
         RegisterOutcome::Rejected => StatusCode::FORBIDDEN,
+        // The store is full with nothing evictable — shed, back off and retry.
+        RegisterOutcome::Capacity => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -118,6 +122,8 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             Arc::new(OkApns),
             Arc::new(ApnsProviderToken::new("KID", "TEAM", TEST_P8.as_bytes()).unwrap()),
             "com.baybo.app",
+            crate::ratelimit::NotifyRateLimiter::default(),
+            crate::ratelimit::PerKeySendLimiter::default(),
         ));
         router(PushState { service })
     }
@@ -157,14 +163,18 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         app().oneshot(req).await.unwrap().status()
     }
 
+    /// A plausible APNs device token (32 bytes hex) that clears the `/register`
+    /// shape check (F4).
+    const APNS_TOK: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
     fn reg_body(instance: &str, counter: u64) -> serde_json::Value {
         let did = device_id();
         let deleg = test_sign::sign_delegation(&device(), &gateway().verifying_key());
-        let sig = test_sign::sign_register(&gateway(), &did, "apns-tok-new", ENV_SANDBOX, counter);
+        let sig = test_sign::sign_register(&gateway(), &did, APNS_TOK, ENV_SANDBOX, counter);
         serde_json::json!({
             "remote_api_key": instance,
             "device_id": did,
-            "apns_token": "apns-tok-new",
+            "apns_token": APNS_TOK,
             "env": "sandbox",
             "gateway_pubkey": b64(&gateway().verifying_key().to_bytes()),
             "delegation": b64(&deleg.to_bytes()),
