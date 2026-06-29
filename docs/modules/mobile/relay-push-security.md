@@ -21,9 +21,11 @@ and derived the per-binding `push_key` from the handshake hash.
 | **C** | The operator-run `remote-host` | Untrusted forwarding and push infrastructure. It performs relay admission, rendezvous matching, rate limiting, and APNs delivery, but must not learn chat plaintext, the pairing secret, Noise private keys, or encrypted-preview plaintext. |
 | **APNs / Apple** | Apple Push Notification service | Delivery infrastructure. It sees APNs tokens, generic notification payloads, ciphertext preview fields, and delivery metadata, but does not hold the `push_key`. |
 
-C is a multi-tenant host. It has no Baybo account model; its only tenant key is
-`remote_api_key`. That key is used for admission, quotas, and APNs binding
-partitioning. It is not an end-to-end authentication secret between P and A.
+C is a multi-tenant host. It has no Baybo account model; its relay tenant key is
+`remote_api_key`. That key is used for relay admission and relay quotas. Push
+HTTP routes are keyless at the caller layer: APNs bindings and notifications are
+authorized by the device→gateway delegation chain, not by admission. The relay key
+is not an end-to-end authentication secret between P and A.
 
 ## Protected Assets
 
@@ -40,8 +42,7 @@ The design protects:
 
 C is allowed to see:
 
-- `remote_api_key`, because all relay WebSocket routes and push HTTP routes are
-  admitted by C.
+- `remote_api_key`, because the relay WebSocket routes are admitted by C.
 - Relay route identifiers: pairing `rendezvous_id`, content `relay_node_id`, and
   C-minted `relay_key`.
 - Relay connection source address, connection time, close time, byte lengths,
@@ -202,7 +203,7 @@ admission proves only that both legs may use C; the QR `s` value is what
 authenticates the pairing transcript against a hostile relay. The human
 confirmation then authorizes the resulting device binding.
 
-### 2. Relay and push admission at C
+### 2. Relay admission and keyless push authorization at C
 
 Every relay WebSocket route uses the `x-remote-api-key` header, defined by
 `remote-host-protocol` as `REMOTE_API_KEY_HEADER`:
@@ -218,19 +219,24 @@ C resolves the header through its admission layer. Unknown or expired keys get
 buckets, IP/rendezvous abuse controls, and live-connection kicks on admission
 reload.
 
-The push routes carry `remote_api_key` in the JSON body:
+The push routes carry no `remote_api_key`:
 
 - `POST /register`
 - `POST /notify`
 
-C resolves that key through the same admission seam. The push device-token store
-is keyed by `(remote_api_key, device_id)`, so a tenant cannot read, overwrite, or
-prune another tenant's APNs binding by guessing a `device_id`.
+`/register` authenticates a device's APNs binding with a device→gateway Ed25519
+delegation plus the gateway's signature over the binding. `/notify` authenticates
+against the delegated gateway public key stored at register and a strictly
+increasing replay counter. The push device-token store is keyed by `device_id`
+alone, bounded against registration churn, and both push routes sit behind the
+per-source-IP request backstop before body parsing or signature verification.
 
-Security property: this layer authenticates a tenant to C. It does not
-authenticate P to A, does not authenticate A to P, and does not encrypt content.
-A leaked `remote_api_key` lets an attacker burn quota or attempt relay joins, but
-does not reveal chat plaintext and does not enable pairing MITM.
+Security property: relay admission authenticates a relay tenant to C. Push
+authorization authenticates a device binding and each notify request to the
+delegated gateway key. Neither layer authenticates P to A, authenticates A to P,
+or encrypts content. A leaked `remote_api_key` lets an attacker burn relay quota
+or attempt relay joins, but does not reveal chat plaintext, does not enable
+pairing MITM, and does not authorize push binding or notification.
 
 ### 3. Pairing-derived endpoint identity
 
@@ -291,12 +297,13 @@ listed in A's approved device row.
 
 ### 5. Push registration and encrypted-preview authentication
 
-Push has three separate checks:
+Push has three separate protections:
 
-- C authenticates the gateway tenant with `remote_api_key` (admission only).
 - C authenticates the **binding** with a per-device Ed25519 delegation chain, so
-  one tenant cannot touch another's binding under a *shared* `remote_api_key`
+  a caller cannot touch another device's binding even without an admission key
   (see [Guest-tier tenancy](#guest-tier-tenancy-and-push-binding-authentication)).
+- C applies per-source-IP request limiting, per-device `/notify` limiting, replay
+  counters, and a bounded device-token store to keep the keyless routes bounded.
 - P authenticates preview content locally with the `push_key` AEAD tag.
 
 The binding is owned by the device's Ed25519 identity: `device_id ==
@@ -320,7 +327,6 @@ Registration:
 
 ```json
 {
-  "remote_api_key": "...",
   "device_id": "ios-<hex(ed25519 pubkey)>",
   "apns_token": "...",
   "env": "sandbox",
@@ -348,17 +354,17 @@ Notification:
    `push_key`, and signs the `/notify` with the gateway push key under a fresh
    `counter`.
 2. A sends ciphertext, nonce, signature, and counter to C's `/notify`.
-3. C admits by `remote_api_key`, resolves the binding by `device_id`, verifies
-   the notify signature against the stored `gateway_pubkey`, rejects a
-   non-advancing `counter` (replay), rate limits per `device_id`, signs the APNs
-   provider JWT, and forwards the ciphertext.
+3. C resolves the binding by `device_id`, verifies the notify signature against
+   the stored `gateway_pubkey`, rejects a non-advancing `counter` (replay), rate
+   limits per `device_id`, signs the APNs provider JWT, and forwards the
+   ciphertext.
 4. P's Notification Service Extension reads `baybo.push-key.<bid>` from the
    shared keychain access group and verifies/decrypts the ciphertext locally.
 
 Security property: C can decide whether to send a notification, but cannot read
-or generate a valid encrypted Baybo preview without `push_key`, and — crucially
-under a shared `remote_api_key` — cannot register, redirect, suppress, or notify
-a device's binding without the gateway's push signing key, which it never holds.
+or generate a valid encrypted Baybo preview without `push_key`, and cannot
+register, redirect, suppress, replay, or notify a device's binding without the
+gateway's push signing key, which it never holds.
 
 ## Relay Communication Flow After Authentication
 
@@ -490,7 +496,6 @@ Keys (all established at pairing — see
 
    ```json
    {
-     "remote_api_key": "...",
      "device_id": "ios-<hex(D_pub)>",
      "apns_token": "...",
      "env": "sandbox",
@@ -560,7 +565,6 @@ Encryption and `/notify`:
 
 ```json
 {
-  "remote_api_key": "...",
   "device_id": "ios-<hex(ed25519 pubkey)>",
   "collapse_id": "<hex(sha256(device_id || ':' || session_id))[..16]>",
   "bid": "ios-...",
@@ -573,13 +577,12 @@ Encryption and `/notify`:
 
 C to APNs:
 
-1. C validates `remote_api_key`.
-2. C resolves the binding by `device_id` and verifies `sig` against the stored
+1. C resolves the binding by `device_id` and verifies `sig` against the stored
    `gateway_pubkey`; a forged or co-tenant signature is rejected (`403`).
-3. C rejects a `counter` that does not strictly exceed the device's last accepted
+2. C rejects a `counter` that does not strictly exceed the device's last accepted
    one (replay), then applies per-`device_id` notification rate limiting.
-4. C signs or reuses an APNs provider JWT.
-5. C sends an APNs payload with a generic visible alert and the ciphertext fields:
+3. C signs or reuses an APNs provider JWT.
+4. C sends an APNs payload with a generic visible alert and the ciphertext fields:
 
 ```json
 {
@@ -681,23 +684,25 @@ Relevant code:
 - C-side verification: `remote-host/crates/push/src/delegation.rs`
 - C device-token store (keyed by `device_id`): `remote-host/crates/push/src/store.rs`
 
-C is multi-tenant and its only tenant key is `remote_api_key`. The built-in public
-proxy hands out one **shared** trial key, `guest`, so many mutually-distrusting
-devices use the *same* `remote_api_key`. The push device-token store therefore
-cannot rely on the admission key to isolate one device's APNs binding from
-another's: under `guest`, `remote_api_key` is not a tenant boundary at all.
+C is multi-tenant and its relay tenant key is `remote_api_key`. The built-in
+public proxy hands out one **shared** trial key, `guest`, so many
+mutually-distrusting devices use the same relay key. Push no longer carries any
+admission key, which makes the important invariant explicit: the push device-token
+store cannot rely on relay admission to isolate one device's APNs binding from
+another's. Under `guest`, `remote_api_key` was never a sufficient tenant boundary;
+on keyless push routes it is absent entirely.
 
 The threat, absent further defense: C's `/register` would be an unconditional
-overwrite gated only by admission, and `device_id` is visible to C and listed as
-guessable. So a co-tenant who learned a victim `device_id` could overwrite the
-binding (redirect the victim's encrypted previews to a device it controls), prune
-it (suppress the victim's pushes), or spam `/notify` (lock-screen buzz / replay).
-Previews stay encrypted throughout (no `push_key`), but delivery routing and
-metadata would be at the co-tenant's mercy.
+overwrite by `device_id`, and `device_id` is visible to C. So any caller who
+learned a victim `device_id` could overwrite the binding (redirect the victim's
+encrypted previews to a device it controls), prune it (suppress the victim's
+pushes), or spam `/notify` (lock-screen buzz / replay). Previews stay encrypted
+throughout (no `push_key`), but delivery routing and metadata would be at the
+attacker's mercy.
 
 ### Delegation chain
 
-The binding is authenticated to its **device key**, independent of the shared
+The binding is authenticated to its **device key**, independent of the relay
 admission key:
 
 - The device holds an Ed25519 identity key `D`. Its `device_id` *is* that public
@@ -717,7 +722,7 @@ last accepted. Only the holder of `D` can authorize a `G`, and only the holder o
 
 ### Properties and limits
 
-- A co-tenant under a shared `remote_api_key` cannot register over, redirect,
+- A caller, even with no admitted relay key, cannot register over, redirect,
   suppress, replay, or spam another device's binding — it can forge neither `D`'s
   delegation nor `G`'s signature.
 - `device_id` is a full 32-byte Ed25519 public key, so it is not enumerable; the
@@ -781,25 +786,25 @@ the incoming notification content.
 Therefore C can drop, delay, or replay ciphertext notifications, but cannot learn
 or newly forge encrypted preview plaintext.
 
-### Claim 4: a shared `remote_api_key` does not let one tenant touch another's push binding
+### Claim 4: no caller key authorizes another device's push binding
 
-Admission (`remote_api_key`) is *not* the binding's isolation boundary — the
-built-in `guest` trial key is shared by many mutually-distrusting tenants. Binding
-integrity instead comes from the per-device Ed25519 delegation chain C verifies
-statelessly (see
+Admission (`remote_api_key`) is *not* the binding's isolation boundary — the push
+routes carry no admission key, and the built-in `guest` trial relay key is shared
+by many mutually-distrusting tenants anyway. Binding integrity instead comes from
+the per-device Ed25519 delegation chain C verifies statelessly (see
 [Guest-tier tenancy](#guest-tier-tenancy-and-push-binding-authentication)):
 `device_id` self-certifies its device key, `/register` carries the device's
 delegation + the gateway's signature, `/notify` is verified against the
 `gateway_pubkey` stored at register, and both carry a strictly-increasing replay
 `counter`.
 
-Therefore a tenant holding the same `remote_api_key` cannot register over,
-redirect, suppress, replay, or spam another device's binding, even knowing its
-`device_id` — it can forge neither the device delegation nor the gateway
-signature. Relay quotas remain keyed by `remote_api_key` (and, for bandwidth,
-`(remote_api_key, server_id)`); the push binding store and notify rate limiter are
-keyed by the globally-unique `device_id`. End-to-end content security still comes
-from Noise and `push_key`, not from C admission.
+Therefore a caller cannot register over, redirect, suppress, replay, or spam
+another device's binding, even knowing its `device_id` — it can forge neither the
+device delegation nor the gateway signature. Relay quotas remain keyed by
+`remote_api_key` (and, for bandwidth, `(remote_api_key, server_id)`); the push
+binding store and notify rate limiter are keyed by the globally-unique
+`device_id`. End-to-end content security still comes from Noise and `push_key`,
+not from C admission.
 
 ## Security Boundaries
 
@@ -811,9 +816,10 @@ from Noise and `push_key`, not from C admission.
   whether to call APNs, and tamper with APNs payloads.
 - Network attackers can observe public traffic to C, while TLS still protects
   HTTP/WS transport to C.
-- Other tenants — including co-holders of a **shared** `remote_api_key` such as
-  the `guest` trial key — can try to spend that key's quota, guess device ids,
-  register/notify another device id, or race public rendezvous joins.
+- Other tenants — including co-holders of a **shared** relay `remote_api_key` such
+  as the `guest` trial key — can try to spend that key's relay quota, guess device
+  ids, call the keyless push routes for another device id, or race public
+  rendezvous joins.
 
 ### Out of scope
 
@@ -853,15 +859,15 @@ from Noise and `push_key`, not from C admission.
 - Generate a new encrypted preview that the NSE decrypts to attacker-chosen
   plaintext.
 - Register over, redirect, suppress, replay, or spam a device's push binding —
-  including from a co-holder of a shared `remote_api_key` — without the gateway's
-  push signing key (the per-device delegation chain + replay counter gate it).
+  including from a caller with no admitted relay key — without the gateway's push
+  signing key (the per-device delegation chain + replay counter gate it).
 
 ## Operational Notes
 
-- `remote_api_key` leakage is primarily a resource-abuse risk. It is not a
-  content decryption key, not the pairing MITM defense, and — because the push
-  binding is gated by the per-device delegation chain, not the admission key — not
-  a way to hijack, redirect, or suppress another device's push binding.
+- `remote_api_key` leakage is a relay resource-abuse risk. It is not a content
+  decryption key, not the pairing MITM defense, and — because push is keyless and
+  the binding is gated by the per-device delegation chain — not a way to hijack,
+  redirect, or suppress another device's push binding.
 - C's `.p8` is an APNs provider credential. If it leaks, an attacker can send
   notifications to known APNs tokens, but cannot generate valid encrypted
   previews.

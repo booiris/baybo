@@ -98,7 +98,7 @@ The `remote_api_keys` table is created on first start; an empty table admits no 
 
 **Registered keys must set `max_conns` + `max_bps`.** A `CHECK` constraint rejects a registered (non-guest) row that leaves either NULL — a registered key is meant to carry explicit limits, so the bare `INSERT(remote_api_key, label)` is no longer accepted. `per_server_max_bps` stays optional (NULL → falls back to the row's `max_bps`). **Guest** rows are exempt: they may omit any limit and inherit it from the `guest` template row (see *Guest tier & its defaults* below). (The `CHECK` guards freshly-created DBs only — `CREATE TABLE IF NOT EXISTS` can't add it to a DB made under an older schema.)
 
-**Revoking is enforced on live connections, not just new ones.** On each poll, any key that was dropped from the table has its live relay connections (the gateway's control channel + any in-flight pairing/content legs) closed within the poll interval — so a revoked gateway is disconnected, not left running until it happens to drop. (The push role is per-request, so a revoked key simply gets `401` on its next `/notify`.)
+**Revoking is enforced on live connections, not just new ones.** On each poll, any key that was dropped from the table has its live relay connections (the gateway's control channel + any in-flight pairing/content legs) closed within the poll interval — so a revoked gateway is disconnected, not left running until it happens to drop. Push does not consult this table; `/register` and `/notify` remain governed by the device delegation chain and push-specific abuse limits.
 
 **Per-key connection cap.** Each admitted `remote_api_key` may hold a bounded
 number of simultaneous relay connections, so a buggy or abusive gateway can't
