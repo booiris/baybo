@@ -9,6 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { workspace = true }
+tracing = { workspace = true }
+# File + stderr logging is initialised here — the binary owns the subscriber.
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 axum = { workspace = true }
 # In-process TLS termination (the `serve` module).
 axum-server = { workspace = true }

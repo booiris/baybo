@@ -76,7 +76,7 @@ where
                         on_revoke(revoked);
                     }
                 }
-                Err(e) => eprintln!("remote-host: admission poll failed: {e}"),
+                Err(e) => tracing::error!(error = %e, "remote-host: admission poll failed"),
             }
         }
     });
