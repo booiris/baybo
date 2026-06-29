@@ -12,6 +12,11 @@ import "@fontsource-variable/inter";
 // as a side effect — must run before <App> so the first render is localized.
 import "./i18n";
 import "./styles.css";
+import { installKeyboardInsetTracking } from "./viewport";
+
+// Track the keyboard (html.kb-open) so the chat composer drops its now-redundant
+// home-indicator inset and sits just above the keyboard instead of a band above it.
+installKeyboardInsetTracking();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

@@ -7,6 +7,7 @@
 //! guaranteed by construction.
 
 mod direct;
+mod keyboard;
 mod keychain;
 mod push_register;
 mod relay;
@@ -349,6 +350,9 @@ pub fn run() {
             // Request provisional notification auth + remote-notification
             // registration once the app is up (main thread). No-op off iOS.
             push_register::register();
+            // Drop the WKWebView keyboard form-assistant bar (prev/next + Done)
+            // shown above the keyboard for web inputs. No-op off iOS.
+            keyboard::hide_input_accessory_bar();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

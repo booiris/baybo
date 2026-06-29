@@ -352,6 +352,9 @@ function ChatView({
   const [staged, setStaged] = useState<StagedAttachment[]>([]);
   const stagedRef = useRef<StagedAttachment[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // The composer is a textarea (Enter inserts a newline; the Send pill sends), so
+  // it grows with its content up to the CSS max-height, then scrolls internally.
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   // blob_id -> in-session local object URL for images this client sent, so a sent
   // image renders instantly from the picked file instead of re-downloading it.
   const localPreviews = useRef<Map<string, string>>(new Map());
@@ -359,6 +362,15 @@ function ChatView({
   useEffect(() => {
     stagedRef.current = staged;
   }, [staged]);
+
+  // Auto-size the composer to its content: reset to one row, then grow to fit
+  // (capped by the CSS max-height). Runs on every keystroke and after send clears it.
+  useEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [input]);
 
   // Revoke every local/staged preview URL on unmount (leaving the chat) so object
   // URLs held for instant render or unsent composer picks don't leak.
@@ -687,13 +699,12 @@ function ChatView({
         <button className="attach" onClick={() => fileInputRef.current?.click()} aria-label={t("chat.addImage")}>
           ＋
         </button>
-        <input
+        <textarea
+          ref={composerRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") send();
-          }}
           placeholder={t("chat.placeholder")}
+          rows={1}
         />
         <button
           onClick={send}
