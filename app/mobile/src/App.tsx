@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
@@ -16,7 +16,12 @@ import {
   type ChatTransport,
   type WireAttachment,
 } from "./blob";
-import { directSessionCreate, directPushRegister, directHistory } from "./direct";
+import {
+  directSessionCreate,
+  directPushRegister,
+  directHistory,
+  type ChatSessionDetail,
+} from "./direct";
 
 /// Foreground signals (page visibility, window focus, the native `app-resumed`
 /// event) can fire 2–3 times on a single iOS resume; coalesce them into one
@@ -32,6 +37,16 @@ const FOREGROUND_RECONNECT_DEBOUNCE_MS = 400;
 /// retry is coalesced (one at a time) so a persistently-down gateway is polled
 /// at this cadence, not in a tight loop.
 const RECONNECT_BACKOFF_MS = 2000;
+
+/// Rows per transcript-history fetch — both the reset-recovery refetch (newest
+/// page) and a scroll-up older page. Matches the gateway's default page size
+/// (server-clamped to 1..200), so one fetch recovers/loads up to 50 rows.
+const HISTORY_PAGE_LIMIT = 50;
+
+/// How close to the top of the chat log (px) triggers a scroll-up fetch of the
+/// next older page. A small band so the load fires just before the user hits the
+/// very top, hiding the round-trip.
+const SCROLL_TOP_THRESHOLD_PX = 64;
 
 /// Parse a `baybo://pair?h=<relay>&r=<rendezvous-id>&s=<secret>&k=<remote-api-key>`
 /// QR payload. Both `r` (public rendezvous id) and `s` (the 256-bit secret, the
@@ -74,26 +89,40 @@ async function tapHaptic() {
   }
 }
 
+/// One durable message row's fields, shared by a live `Frame::Message` (where
+/// they sit next to `kind: "message"`) and a `Frame::HistoryPage` entry (a bare
+/// `wire::Message`, no `kind`). Same shape either way.
+type WireMessage = {
+  content: string;
+  role?: "user" | "assistant";
+  platform_msg_id?: string;
+  // The row's persisted ordinal — the catch-up cursor. Present on durable rows
+  // (live final messages + replayed history).
+  ordinal?: number;
+  // Media references on the message (images the user sent or the agent produced);
+  // the bytes are fetched lazily over a blob leg.
+  attachments?: WireAttachment[];
+};
+
 /// A decrypted wire `Frame` as it arrives over the Tauri content channel.
 /// MessagePack field names round-trip as snake_case JSON; we only model the few
 /// variants the chat view renders and tolerate the rest.
 type WireFrame =
-  | {
-      kind: "message";
-      content: string;
-      role?: "user" | "assistant";
-      platform_msg_id?: string;
-      // The reply's persisted row ordinal — the catch-up cursor on reconnect.
-      // Present on durable rows (live final messages + replayed history).
-      ordinal?: number;
-      // Media references on the message (images the user sent or the agent
-      // produced); the bytes are fetched lazily over a blob leg.
-      attachments?: WireAttachment[];
-    }
+  | ({ kind: "message" } & WireMessage)
   | { kind: "answer_delta"; text: string }
   | { kind: "turn_state"; active: boolean }
   | { kind: "notice"; level: string; text: string }
   | { kind: "reset"; reason: string }
+  // Server → client backward transcript page, in response to `chat_fetch_history`
+  // (the relay leg's REST-less recovery + scroll-up paging). `messages` are bare
+  // `wire::Message` rows (ascending), carrying real attachment refs.
+  | {
+      kind: "history_page";
+      messages: WireMessage[];
+      oldest_ordinal?: number | null;
+      newest_ordinal?: number | null;
+      has_more: boolean;
+    }
   // Server-pushed standalone media a tool produced mid-turn (its own bubble).
   | { kind: "attachment"; user_id?: string; attachments?: WireAttachment[] }
   // Frames we don't render (reasoning, tool progress, ping/pong, …) arrive with
@@ -151,10 +180,16 @@ const CHAT_STATE_KEY = "baybo.chat.state";
 // reload/relaunch restores the right one (the relay leg vs the direct WS).
 const CHAT_MODE_KEY = "baybo.chat.mode";
 
-// `lastOrdinal` is the WS catch-up cursor: a real ordinal replays the gap above
-// it, `0` backfills the whole thread, and `null` means "fresh subscribe, no
-// catch-up" — the relay reset-recovery state, which the gateway can't overflow.
-type ChatState = { sessionId: string; messages: ChatMsg[]; lastOrdinal: number | null };
+// `lastOrdinal` is the WS catch-up cursor (the NEWEST edge): a real ordinal
+// replays the gap above it, `0` backfills the whole thread, and `null` means
+// "fresh subscribe, no catch-up". `oldestOrdinal` is the scroll-up paging cursor
+// (the OLDEST loaded row); `null` = unknown / nothing older to page to.
+type ChatState = {
+  sessionId: string;
+  messages: ChatMsg[];
+  lastOrdinal: number | null;
+  oldestOrdinal: number | null;
+};
 
 function loadChatState(sessionId: string): ChatState | null {
   try {
@@ -186,6 +221,48 @@ function clearChatState() {
   } catch {
     /* ignore */
   }
+}
+
+/// Rebuild `ChatMsg[]` from a relay `HistoryPage`'s `wire::Message` rows. Mirrors
+/// the live `case "message"` mapping — and is RICHER than the direct/REST rebuild:
+/// each row carries real `attachments` (blob refs), so images render inline with
+/// no placeholder. A `wire::Message` has no `notice`/`work` distinction, so every
+/// row is a bubble. Keyed by `platform_msg_id` (the live-path key) when present,
+/// else the ordinal, so a row keeps a stable React key across a scroll-up prepend.
+function historyMessagesToChatMsgs(messages: WireMessage[]): ChatMsg[] {
+  return messages.map((m) => ({
+    id: m.platform_msg_id || (typeof m.ordinal === "number" ? `m${m.ordinal}` : crypto.randomUUID()),
+    role: m.role === "user" ? "user" : "assistant",
+    content: m.content,
+    attachments: m.attachments,
+  }));
+}
+
+/// Rebuild `ChatMsg[]` from a direct REST `ChatSessionDetail.transcript`. `work`
+/// items have no mobile concept (the live switch drops reasoning/tool progress);
+/// `notice` items render as a notice bubble; `message` items as a bubble. REST
+/// history carries only `has_attachments` (no blob refs), so media becomes a
+/// `placeholder` rather than a silently-dropped image.
+function transcriptToChatMsgs(
+  transcript: ChatSessionDetail["transcript"],
+  placeholder: string,
+): ChatMsg[] {
+  const out: ChatMsg[] = [];
+  for (const item of transcript) {
+    if (item.kind === "work") continue;
+    if (item.kind === "notice") {
+      out.push({ id: `n${item.ordinal}`, role: "notice", content: item.text });
+      continue;
+    }
+    const role = item.role === "user" ? "user" : "assistant";
+    const content = item.has_attachments
+      ? item.text
+        ? `${item.text}\n${placeholder}`
+        : placeholder
+      : item.text;
+    out.push({ id: `m${item.ordinal}`, role, content });
+  }
+  return out;
 }
 
 /// Normalize a user-typed Baybo address for the direct-login form: trim, drop a
@@ -357,9 +434,33 @@ function ChatView({
   // Highest durable ordinal rendered — the cursor a reconnect catches up from
   // (`null` after a relay reset = re-subscribe fresh with no catch-up).
   const lastOrdinal = useRef<number | null>(restored?.lastOrdinal ?? 0);
+  // Lowest durable ordinal loaded — the scroll-up paging cursor (`before_ordinal`).
+  // `null` = unknown / nothing older to page to. Set by every history load.
+  const oldestOrdinal = useRef<number | null>(restored?.oldestOrdinal ?? null);
+  // Whether older rows remain below the top — arms scroll-up. On restore we don't
+  // know for sure, so assume there may be more whenever we have a paging cursor; a
+  // fetch that returns `has_more: false` (or an empty page) disarms it.
+  const [hasMoreOlder, setHasMoreOlder] = useState<boolean>(
+    (restored?.oldestOrdinal ?? null) !== null,
+  );
+  // True while an older page is loading — one at a time, drives the top spinner.
+  const [loadingOlder, setLoadingOlder] = useState(false);
   // True while a `Frame::Reset` recovery is in flight, so a burst of Resets
   // (back-pressure) doesn't stack concurrent refetches / reconnects.
   const recovering = useRef(false);
+  // Serializes relay history requests over the live leg AND tags the streamed
+  // `history_page` reply so its handler knows whether to REPLACE (reset recovery)
+  // or PREPEND (scroll-up). `null` = no relay history request in flight.
+  const relayHistory = useRef<{ mode: "reset" | "page" } | null>(null);
+  // In-flight guard for an older-page load (both transports), so a scroll-event
+  // burst fires one fetch. `loadingOlder` (state) drives the spinner; this ref is
+  // the race-free gate.
+  const pagingRef = useRef(false);
+  // The chat-log scroll container — for scroll-to-top detection + anchor restore.
+  const logRef = useRef<HTMLDivElement>(null);
+  // Set just before a scroll-up PREPEND so the layout effect can re-anchor the
+  // viewport (prepending above the top would otherwise jump the scroll position).
+  const prependAnchor = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
   // Images picked but not yet sent (uploading or ready), shown in the composer.
   const [staged, setStaged] = useState<StagedAttachment[]>([]);
   const stagedRef = useRef<StagedAttachment[]>([]);
@@ -401,77 +502,120 @@ function ChatView({
 
   // Mirror the thread to disk on every change so a reload/relaunch restores it.
   useEffect(() => {
-    saveChatState({ sessionId, messages, lastOrdinal: lastOrdinal.current });
+    saveChatState({
+      sessionId,
+      messages,
+      lastOrdinal: lastOrdinal.current,
+      oldestOrdinal: oldestOrdinal.current,
+    });
   }, [sessionId, messages]);
+
+  // After a scroll-up PREPEND, restore the viewport so the content the user was
+  // looking at stays put (the log is `flex-direction: column`, so inserting older
+  // rows above the top would otherwise shove everything down). Runs pre-paint
+  // (layout effect) keyed on `messages`; only acts when a prepend armed the anchor.
+  useLayoutEffect(() => {
+    const anchor = prependAnchor.current;
+    const el = logRef.current;
+    if (!anchor || !el) return;
+    el.scrollTop = anchor.prevScrollTop + (el.scrollHeight - anchor.prevScrollHeight);
+    prependAnchor.current = null;
+  }, [messages]);
+
+  // Fire a relay transcript-history request over the live Noise leg. The page
+  // can't ride the command's return value (relay has no REST), so it streams back
+  // later as a `history_page` frame; `mode` tags it for that handler (REPLACE for
+  // a reset, PREPEND for scroll-up). One at a time — returns `false` if a request
+  // is already in flight (the caller then unwinds its own guards).
+  const requestRelayHistory = useCallback(
+    async (mode: "reset" | "page", beforeOrdinal: number | null): Promise<boolean> => {
+      if (relayHistory.current) return false;
+      relayHistory.current = { mode };
+      try {
+        await invoke("chat_fetch_history", {
+          leg: transport,
+          beforeOrdinal,
+          limit: HISTORY_PAGE_LIMIT,
+        });
+        return true;
+      } catch (e) {
+        relayHistory.current = null;
+        throw e;
+      }
+    },
+    [transport],
+  );
+
+  // Prepend an older page above the current top (scroll-up paging), preserving the
+  // viewport via `prependAnchor` (read by the layout effect after the DOM updates).
+  // Paged rows are strictly older than the current oldest, so they can't overlap —
+  // the id-set filter is just a safety net. Re-seeds `sentIds` so a later live echo
+  // of an own message doesn't double-render.
+  const prependOlder = useCallback(
+    (older: ChatMsg[], newOldest: number | null, more: boolean) => {
+      if (older.length > 0 && logRef.current) {
+        prependAnchor.current = {
+          prevScrollHeight: logRef.current.scrollHeight,
+          prevScrollTop: logRef.current.scrollTop,
+        };
+      }
+      for (const m of older) {
+        if (m.role === "user") sentIds.current.add(m.id);
+      }
+      setMessages((m) => {
+        const seen = new Set(m.map((x) => x.id));
+        const fresh = older.filter((x) => !seen.has(x.id));
+        return [...fresh, ...m];
+      });
+      // Only advance the cursor on a non-empty page; an empty page leaves it put.
+      if (newOldest !== null) oldestOrdinal.current = newOldest;
+      setHasMoreOlder(more);
+    },
+    [],
+  );
 
   // Recover from a gateway `Frame::Reset` (catch-up gap over the replay cap, or
   // outbound back-pressure). Left unhandled this *loops*: the stale pre-gap cursor
-  // goes back out on the next reconnect and overflows again. The two transports
-  // recover differently — direct has admin REST, relay does not:
+  // goes back out on the next reconnect and overflows again. Both transports now
+  // do a full backfill, by different routes:
   //
-  //   * direct — refetch the newest transcript page (`directHistory`), rebuild the
-  //     thread from it, and reseed the cursor to the page's tail ordinal. The
-  //     follow-up reconnect then replays only *above* that tail — nothing — so the
-  //     gap can't re-trigger the Reset.
-  //   * relay — no REST and no content-leg history frame, so we can't backfill.
-  //     Degrade to live-only: keep the pre-gap messages as a visible hole, drop the
-  //     cursor (`null`), mark the gap, and re-subscribe fresh (`since_ordinal =
-  //     null` never overflows).
+  //   * direct — refetch the newest transcript page over REST (`directHistory`),
+  //     rebuild the thread, reseed the cursors, and reconnect so the live leg
+  //     re-subscribes from the corrected tail (replays only *above* it → nothing →
+  //     loop broken).
+  //   * relay — no REST, so fire a `chat_fetch_history` over the live leg (which
+  //     stays up across a Reset); `case "history_page"` rebuilds the thread and
+  //     reseeds the cursors. No reconnect needed — the leg is already live.
   //
   // A re-entrancy guard keeps a burst of Resets (back-pressure) from stacking
-  // concurrent refetches/reconnects.
+  // concurrent refetches.
   const recoverFromReset = useCallback(async () => {
     if (recovering.current) return;
     recovering.current = true;
     try {
       if (transport === "direct") {
         const detail = await directHistory(sessionId);
-        const rebuilt: ChatMsg[] = [];
-        if (detail.has_more) {
-          // Reset fires past a >200-row gap, but the default page is 50 and mobile
-          // has no scroll-up paging yet — flag the unshown older tail honestly.
-          rebuilt.push({ id: "older-gap", role: "notice", content: t("chat.olderUnavailable") });
-        }
-        for (const item of detail.transcript) {
-          // `work` items have no mobile concept (the live switch already drops
-          // reasoning/tool progress); render `message` as a bubble and `notice`
-          // the way the live `case "notice"` path does.
-          if (item.kind === "work") continue;
-          if (item.kind === "notice") {
-            rebuilt.push({ id: `n${item.ordinal}`, role: "notice", content: item.text });
-            continue;
-          }
-          const role = item.role === "user" ? "user" : "assistant";
-          // REST history carries only `has_attachments`, no blob refs — show a
-          // placeholder rather than silently dropping the media.
-          const content = item.has_attachments
-            ? item.text
-              ? `${item.text}\n${t("chat.attachmentPlaceholder")}`
-              : t("chat.attachmentPlaceholder")
-            : item.text;
-          rebuilt.push({ id: `m${item.ordinal}`, role, content });
-        }
-        // Seed from the real tail ordinal (never the synthetic negatives on
-        // control rows); set the ref before `setMessages` so the save effect and
-        // the reconnect both read the corrected cursor.
+        const rebuilt = transcriptToChatMsgs(detail.transcript, t("chat.attachmentPlaceholder"));
+        // Seed from the real bounds (never the synthetic negatives on control
+        // rows); set the refs before `setMessages` so the save effect reads them.
         lastOrdinal.current = detail.newest_ordinal ?? 0;
+        oldestOrdinal.current = detail.oldest_ordinal ?? null;
+        setHasMoreOlder(detail.has_more);
         setMessages(rebuilt);
         setStreaming("");
-        saveChatState({ sessionId, messages: rebuilt, lastOrdinal: lastOrdinal.current });
-        setStatus(null);
-      } else {
-        lastOrdinal.current = null;
-        setStreaming("");
-        setMessages((m) => {
-          const last = m[m.length - 1];
-          // Don't stack duplicate gap markers on repeated back-pressure Resets.
-          if (last?.role === "notice" && last.content === t("chat.historyTruncated")) return m;
-          return [...m, { id: crypto.randomUUID(), role: "notice", content: t("chat.historyTruncated") }];
+        saveChatState({
+          sessionId,
+          messages: rebuilt,
+          lastOrdinal: lastOrdinal.current,
+          oldestOrdinal: oldestOrdinal.current,
         });
+        setStatus(null);
+        setReconnectNonce((n) => n + 1);
+      } else {
+        // Relay: the rebuild happens in `case "history_page"` when the page lands.
+        // If a request is already in flight (`false`), this Reset is coalesced.
+        await requestRelayHistory("reset", null);
       }
-      // Force a fresh dial carrying the corrected cursor so catch-up replays only
-      // above it (direct) or not at all (relay) — the loop is broken.
-      setReconnectNonce((n) => n + 1);
     } catch (e) {
       setStatus(t("chat.recoverFailed", { error: String(e) }));
     } finally {
@@ -481,7 +625,43 @@ function ChatView({
     // switch must not re-create this (and through it `connect`) and tear the leg
     // down. The captured language is fine for these one-shot recovery strings.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, transport]);
+  }, [sessionId, transport, requestRelayHistory]);
+
+  // Load the next older page (scroll-up). Direct pages over REST and prepends
+  // inline; relay fires a `chat_fetch_history` whose `history_page` reply prepends
+  // in the frame switch (and clears the guards there). `pagingRef` gates re-entry.
+  const loadOlder = useCallback(async () => {
+    if (pagingRef.current || !hasMoreOlder) return;
+    const before = oldestOrdinal.current;
+    if (before === null) return; // no cursor — can't page older
+    pagingRef.current = true;
+    setLoadingOlder(true);
+    try {
+      if (transport === "direct") {
+        const detail = await directHistory(sessionId, before, HISTORY_PAGE_LIMIT);
+        prependOlder(
+          transcriptToChatMsgs(detail.transcript, t("chat.attachmentPlaceholder")),
+          detail.oldest_ordinal ?? null,
+          detail.has_more,
+        );
+        pagingRef.current = false;
+        setLoadingOlder(false);
+      } else {
+        const fired = await requestRelayHistory("page", before);
+        // If a request was already in flight, unwind — the `history_page` handler
+        // clears the guards only for the request it actually serves.
+        if (!fired) {
+          pagingRef.current = false;
+          setLoadingOlder(false);
+        }
+      }
+    } catch (e) {
+      pagingRef.current = false;
+      setLoadingOlder(false);
+      setStatus(t("chat.recoverFailed", { error: String(e) }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, transport, hasMoreOlder, requestRelayHistory, prependOlder]);
 
   // (Re)open the content session, replaying only the gap above what we've already
   // rendered. Re-run on every foreground: iOS suspends the WS (and may reclaim the
@@ -553,22 +733,61 @@ function ChatView({
           // overflows again (the loop). See `recoverFromReset`.
           void recoverFromReset();
           break;
+        case "history_page": {
+          // The reply to a relay `chat_fetch_history`. `relayHistory.current.mode`
+          // (set when we fired it) says whether this is a reset rebuild (REPLACE)
+          // or a scroll-up page (PREPEND). Always clear the in-flight tag.
+          const pending = relayHistory.current;
+          relayHistory.current = null;
+          const rows = historyMessagesToChatMsgs(frame.messages);
+          if (pending?.mode === "page") {
+            prependOlder(rows, frame.oldest_ordinal ?? null, frame.has_more);
+            pagingRef.current = false;
+            setLoadingOlder(false);
+          } else {
+            // Reset rebuild: REPLACE the thread with the newest page, reseed both
+            // cursors, and clear any paging guards a coincident scroll-up left set.
+            for (const m of frame.messages) {
+              if (m.role === "user" && m.platform_msg_id) sentIds.current.add(m.platform_msg_id);
+            }
+            lastOrdinal.current = frame.newest_ordinal ?? 0;
+            oldestOrdinal.current = frame.oldest_ordinal ?? null;
+            setHasMoreOlder(frame.has_more);
+            setStreaming("");
+            setMessages(rows);
+            saveChatState({
+              sessionId,
+              messages: rows,
+              lastOrdinal: lastOrdinal.current,
+              oldestOrdinal: oldestOrdinal.current,
+            });
+            setStatus(null);
+            pagingRef.current = false;
+            setLoadingOlder(false);
+          }
+          break;
+        }
         default:
           break; // reasoning / tool progress / etc. not surfaced in mobile chat
       }
     };
+    // A reconnect re-establishes the leg, so any relay history request that was
+    // in flight on the old leg is abandoned (its `history_page` will never arrive)
+    // — clear the guards so a future fetch isn't blocked / the spinner isn't stuck.
+    relayHistory.current = null;
+    pagingRef.current = false;
+    setLoadingOlder(false);
     setStatus(t("chat.connecting"));
     // Returns the dial promise (rejections propagate) so the caller can back off
     // and retry — see `attemptConnect` in the mount effect. `leg: transport` picks
     // the active transport (relay vs direct) backend-side.
     //
     // Cursor (`sinceOrdinal`): the gateway replays rows ABOVE it, so a real ordinal
-    // catches up the gap, `0` (the value when localStorage was evicted and we have
-    // nothing rendered) backfills the whole thread instead of leaving the chat blank
-    // until the next turn, and `null` is a fresh subscribe with NO catch-up — what
-    // `recoverFromReset` leaves on the relay leg so the reconnect can't overflow
-    // again. A genuinely empty session replays nothing; an over-cap history yields a
-    // `Frame::Reset` (handled in the frame switch).
+    // catches up the gap and `0` (the value when localStorage was evicted and we
+    // have nothing rendered) backfills the whole thread instead of leaving the chat
+    // blank until the next turn. A genuinely empty session replays nothing; an
+    // over-cap history yields a `Frame::Reset` (handled by `recoverFromReset`,
+    // which backfills via REST (direct) or a `chat_fetch_history` (relay)).
     return invoke("chat_connect", {
       leg: transport,
       sessionId,
@@ -580,10 +799,11 @@ function ChatView({
     });
     // `t` is intentionally omitted from deps: re-creating `connect` on a language
     // switch would tear down + re-dial the live session. Status strings set by a
-    // later reconnect simply use the language captured here. `recoverFromReset`
-    // shares `connect`'s deps, so it's stable across all other renders.
+    // later reconnect simply use the language captured here. `recoverFromReset` /
+    // `prependOlder` share `connect`'s deps (or are stable), so it's stable across
+    // all other renders.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, transport, recoverFromReset]);
+  }, [sessionId, transport, recoverFromReset, prependOlder]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -752,7 +972,24 @@ function ChatView({
         <button onClick={onClose}>← {t("chat.back")}</button>
         <h1>{t("chat.title")}</h1>
       </div>
-      <div className="chat-log">
+      <div
+        className="chat-log"
+        ref={logRef}
+        onScroll={() => {
+          // Auto-load the next older page as the user nears the top; `loadOlder`
+          // self-guards (in-flight, no-more, no-cursor), so firing often is safe.
+          const el = logRef.current;
+          if (el && el.scrollTop <= SCROLL_TOP_THRESHOLD_PX) void loadOlder();
+        }}
+      >
+        {loadingOlder && <div className="bubble assistant muted">…</div>}
+        {hasMoreOlder && !loadingOlder && (
+          // Affordance for short threads that don't scroll (the onScroll path
+          // covers the rest). Tapping pages the next older slice.
+          <button className="load-older" onClick={() => void loadOlder()}>
+            {t("chat.loadOlder")}
+          </button>
+        )}
         {messages.map((m) => (
           <div key={m.id} className={`bubble ${m.role}`}>
             {m.attachments && m.attachments.length > 0 && (

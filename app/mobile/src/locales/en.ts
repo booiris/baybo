@@ -63,11 +63,8 @@ export const en = {
       connectFailed: "Connect failed: {{error}}",
       sendFailed: "Send failed: {{error}}",
       recoverFailed: "Couldn't reload history: {{error}}",
-      // Relay reset: no REST backfill, so live-only with the gap marked.
-      historyTruncated: "Earlier messages unavailable — showing live messages.",
-      // Direct reset: recovered the newest page, but older history exists and
-      // mobile has no scroll-up paging yet.
-      olderUnavailable: "Earlier messages aren't shown here.",
+      // Scroll-up pagination affordance for older transcript pages.
+      loadOlder: "Load earlier messages",
       // REST history reports only that a row had media, not its blob refs.
       attachmentPlaceholder: "[attachment]",
       waitingUpload: "Waiting for the image to finish uploading…",

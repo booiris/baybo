@@ -210,6 +210,27 @@ async fn chat_send(
     }
 }
 
+/// Request a backward page of the live chat session's transcript over `leg` — the
+/// relay leg's recovery/pagination primitive (no admin REST, unlike `direct_history`).
+/// `beforeOrdinal` pages older (`null` = newest page); `limit` caps the page. The
+/// reply is **not** this command's return value: the gateway answers with a
+/// `Frame::HistoryPage` that streams back through the session's `onFrame` channel
+/// (mirroring how `Subscribe` catch-up replays arrive), so the webview consumes it
+/// in its frame switch. Returns once the request is enqueued on the live leg.
+#[tauri::command]
+async fn chat_fetch_history(
+    leg: ChatLeg,
+    relay: State<'_, RelaySessions>,
+    direct: State<'_, direct::DirectSessions>,
+    before_ordinal: Option<i64>,
+    limit: Option<u32>,
+) -> Result<(), String> {
+    match leg {
+        ChatLeg::Relay => relay::fetch_history(&relay, before_ordinal, limit).await,
+        ChatLeg::Direct => direct::fetch_history(&direct, before_ordinal, limit).await,
+    }
+}
+
 /// Tear down the live chat session for `leg` (the user left the chat view). Any
 /// leg-specific durable state survives: the direct leg keeps its session id +
 /// channel token for reconnect; the relay leg reloads its pairing record on the
@@ -384,6 +405,7 @@ pub fn run() {
             direct_push_register,
             chat_connect,
             chat_send,
+            chat_fetch_history,
             chat_disconnect,
             blob_download,
             blob_upload,

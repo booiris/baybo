@@ -116,9 +116,15 @@ pub(crate) trait FrameCodec: Send {
 /// spawn. Args are `(text, msg_id, attachments)`.
 pub(crate) type UserFrameFn = Box<dyn Fn(&str, &str, Vec<WireAttachment>) -> Frame + Send>;
 
+/// Builds a leg's outbound `Frame::FetchHistory` (binds the live session id). The
+/// gateway answers with a `Frame::HistoryPage` on the same leg, which the pump
+/// streams to the webview like any inbound frame. Args are `(before_ordinal,
+/// limit)`. Identity-agnostic, so both legs use the same builder.
+pub(crate) type HistoryFrameFn = Box<dyn Fn(Option<i64>, Option<u32>) -> Frame + Send>;
+
 /// A live, handshaken leg ready to pump: the socket, its frame codec, the frames
-/// to send immediately (Subscribe [+ APNs for relay]), and the outbound
-/// user-message builder. Assembled by [`ChatTransport::establish`].
+/// to send immediately (Subscribe [+ APNs for relay]), and the outbound frame
+/// builders. Assembled by [`ChatTransport::establish`].
 pub(crate) struct Connection {
     pub ws: WsStream,
     pub codec: Box<dyn FrameCodec>,
@@ -129,6 +135,7 @@ pub(crate) struct Connection {
     /// kill an otherwise-healthy session. A send failure is still fatal (socket gone).
     pub opening_best_effort: Vec<Frame>,
     pub user_frame: UserFrameFn,
+    pub history_frame: HistoryFrameFn,
 }
 
 /// Seam 2: a chat leg. `establish` is the only divergent step (dial + handshake +
@@ -145,12 +152,19 @@ pub(crate) trait ChatTransport: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Connection, TransportError>> + Send;
 }
 
-/// A user message handed to the pump task to build + seal + send.
+/// A request handed to the pump task to build + seal + send on the live leg.
 enum OutboundCmd {
+    /// A user message to send.
     Send {
         text: String,
         msg_id: String,
         attachments: Vec<WireAttachment>,
+    },
+    /// A backward transcript-history request. The reply (`Frame::HistoryPage`)
+    /// arrives later through the normal inbound fan-out, not as a direct response.
+    FetchHistory {
+        before_ordinal: Option<i64>,
+        limit: Option<u32>,
     },
 }
 
@@ -259,6 +273,26 @@ impl SessionRegistry {
             .map_err(|_| TransportError::SessionClosed)
     }
 
+    /// Queue a transcript-history request on the live session. The reply
+    /// (`Frame::HistoryPage`) streams back through the session's `on_frame`
+    /// channel — there is no synchronous return value (the page is consumed by the
+    /// webview's frame switch, mirroring how `Subscribe` catch-up replays arrive).
+    pub(crate) async fn fetch_history(
+        &self,
+        before_ordinal: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<(), TransportError> {
+        let guard = self.handle.lock().await;
+        let handle = guard.as_ref().ok_or(TransportError::NotConnected)?;
+        handle
+            .outbound_tx
+            .send(OutboundCmd::FetchHistory {
+                before_ordinal,
+                limit,
+            })
+            .map_err(|_| TransportError::SessionClosed)
+    }
+
     /// Tear down the live pump (if any). Any leg-specific durable state (e.g. the
     /// direct leg's stashed channel token) is owned by the transport, not here.
     pub(crate) async fn disconnect(&self) {
@@ -300,6 +334,7 @@ async fn run_pump(
         opening,
         opening_best_effort,
         user_frame,
+        history_frame,
     } = conn;
     let (mut sink, mut stream) = ws.split();
 
@@ -370,22 +405,29 @@ async fn run_pump(
                     Some(Err(_)) => break 'session,
                 }
             }
-            cmd = outbound_rx.recv() => match cmd {
-                Some(OutboundCmd::Send { text, msg_id, attachments }) => {
-                    let frame = user_frame(&text, &msg_id, attachments);
-                    match codec.encode_outbound(&frame) {
-                        Ok(messages) => {
-                            for bytes in messages {
-                                if sink.send(Message::Binary(bytes)).await.is_err() {
-                                    break 'session;
-                                }
+            cmd = outbound_rx.recv() => {
+                // Both outbound commands build one frame, then share the same
+                // encode + chunk + send path (the codec hides Noise vs raw msgpack).
+                let frame = match cmd {
+                    Some(OutboundCmd::Send { text, msg_id, attachments }) => {
+                        user_frame(&text, &msg_id, attachments)
+                    }
+                    Some(OutboundCmd::FetchHistory { before_ordinal, limit }) => {
+                        history_frame(before_ordinal, limit)
+                    }
+                    None => break 'session,
+                };
+                match codec.encode_outbound(&frame) {
+                    Ok(messages) => {
+                        for bytes in messages {
+                            if sink.send(Message::Binary(bytes)).await.is_err() {
+                                break 'session;
                             }
                         }
-                        Err(_) => continue,
                     }
+                    Err(_) => continue,
                 }
-                None => break 'session,
-            },
+            }
             _ = &mut liveness => break 'session,
         }
     }

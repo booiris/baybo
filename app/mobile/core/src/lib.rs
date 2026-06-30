@@ -16,8 +16,9 @@ pub mod pairing;
 
 pub use blob::{BlobDownload, BlobRequest, BlobResponse, BlobSession, DownloadStep};
 pub use content::{
-    ContentHandshake, ContentSession, WEB_OPERATOR_USER_ID, apns_token_frame, register_http_frame,
-    subscribe_frame, user_message_frame, user_text_frame, web_user_message_frame,
+    ContentHandshake, ContentSession, WEB_OPERATOR_USER_ID, apns_token_frame, fetch_history_frame,
+    register_http_frame, subscribe_frame, user_message_frame, user_text_frame,
+    web_user_message_frame,
 };
 pub use error::MobileError;
 pub use pairing::{

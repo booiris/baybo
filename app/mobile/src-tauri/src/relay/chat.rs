@@ -13,8 +13,8 @@
 use std::time::Duration;
 
 use baybo_mobile_core::{
-    ContentHandshake, ContentSession, Frame, WireAttachment, apns_token_frame, subscribe_frame,
-    user_message_frame,
+    ContentHandshake, ContentSession, Frame, WireAttachment, apns_token_frame, fetch_history_frame,
+    subscribe_frame, user_message_frame,
 };
 use device_proto::noise::StaticKeypair;
 use futures_util::SinkExt;
@@ -25,8 +25,8 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message, http::StatusCode
 
 use super::pairing::{PairedRecord, load_paired_record};
 use crate::transport::{
-    ChatTransport, Connection, FrameCodec, SessionRegistry, TransportError, UserFrameFn, WsStream,
-    recv_binary,
+    ChatTransport, Connection, FrameCodec, HistoryFrameFn, SessionRegistry, TransportError,
+    UserFrameFn, WsStream, recv_binary,
 };
 
 /// Retry budget for the content dial while the gateway's relay control link is
@@ -117,12 +117,19 @@ impl ChatTransport for RelaySessions {
                 user_message_frame(&sid, &device_id, text, msg_id, attachments)
             });
 
+            // History requests bind only the session id (identity-agnostic).
+            let sid = session_id.clone();
+            let history_frame: HistoryFrameFn = Box::new(move |before_ordinal, limit| {
+                fetch_history_frame(&sid, before_ordinal, limit)
+            });
+
             Ok(Connection {
                 ws: established.ws,
                 codec,
                 opening,
                 opening_best_effort,
                 user_frame,
+                history_frame,
             })
         }
     }
@@ -154,6 +161,21 @@ pub async fn send(
     sessions
         .registry
         .send(text, msg_id, attachments)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Queue a backward transcript-history request on the live session. The
+/// `Frame::HistoryPage` reply streams back through `on_frame` (the webview's frame
+/// switch consumes it) — this returns once the request is enqueued, not the page.
+pub async fn fetch_history(
+    sessions: &RelaySessions,
+    before_ordinal: Option<i64>,
+    limit: Option<u32>,
+) -> Result<(), String> {
+    sessions
+        .registry
+        .fetch_history(before_ordinal, limit)
         .await
         .map_err(|e| e.to_string())
 }

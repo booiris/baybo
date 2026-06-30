@@ -447,6 +447,8 @@ fn map_frame(
         | Frame::RegisterAck { .. }
         | Frame::Subscribe { .. }
         | Frame::Unsubscribe { .. }
+        | Frame::FetchHistory { .. }
+        | Frame::HistoryPage { .. }
         | Frame::UpdateApnsToken { .. }
         | Frame::Reset { .. }
         | Frame::ResolveApproval { .. }
@@ -458,7 +460,9 @@ fn map_frame(
             // StartBot / StopBot / BotStatus are sidecar control-plane
             // frames — the TUI never participates in that flow.
             // SlashManifest is also sidecar-only: the TUI owns its
-            // slash commands client-side via TuiSlashHandler.
+            // slash commands client-side via TuiSlashHandler. FetchHistory
+            // (client→server) and HistoryPage (the TUI never requests it —
+            // it backfills via Subscribe catch-up) are likewise inert here.
             warn!("unexpected frame from gateway; dropping");
             None
         }

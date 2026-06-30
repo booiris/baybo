@@ -365,6 +365,20 @@ html.kb-open .chat { padding-bottom: 0.75rem; }
 .bubble.assistant.muted { color: var(--color-ink-soft); }
 .bubble.notice { align-self: center; background: none; border: 0; color: var(--color-ink-soft); font-size: 0.8rem; }
 
+/* Scroll-up "load earlier" affordance: a centered hairline pill, monospace chrome
+   (it's chrome, not a message body), soft like the rest of the UI. */
+.load-older {
+  align-self: center;
+  padding: 0.3rem 0.9rem;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-pill);
+  background: var(--color-paper);
+  color: var(--color-ink-soft);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+.load-older:active { opacity: 0.7; transform: scale(0.98); }
+
 /* Grows upward as the textarea wraps, so the + and Send pills stay pinned to the
    bottom line rather than floating to the vertical centre of a tall composer. */
 .composer { margin-top: 0; align-items: flex-end; }
