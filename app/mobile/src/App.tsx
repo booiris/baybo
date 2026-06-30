@@ -452,6 +452,15 @@ function ChatView({
   // `history_page` reply so its handler knows whether to REPLACE (reset recovery)
   // or PREPEND (scroll-up). `null` = no relay history request in flight.
   const relayHistory = useRef<{ mode: "reset" | "page" } | null>(null);
+  // A reset recovery that arrived while a relay request was already in flight, so
+  // it's queued to run when that request's `history_page` lands (rather than being
+  // dropped — which would leave the stale cursor and re-arm the reset loop).
+  const pendingReset = useRef(false);
+  // Monotonic dial generation, bumped on every (re)dial. The `history_page` /
+  // `reset` handlers capture the generation of the connection they belong to and
+  // ignore frames once a newer dial has superseded their leg — so a late reply on
+  // a torn-down pump can't clobber the live transcript.
+  const connGen = useRef(0);
   // In-flight guard for an older-page load (both transports), so a scroll-event
   // burst fires one fetch. `loadingOlder` (state) drives the spinner; this ref is
   // the race-free gate.
@@ -613,8 +622,12 @@ function ChatView({
         setReconnectNonce((n) => n + 1);
       } else {
         // Relay: the rebuild happens in `case "history_page"` when the page lands.
-        // If a request is already in flight (`false`), this Reset is coalesced.
-        await requestRelayHistory("reset", null);
+        // If a request is already in flight (`false`) — e.g. a scroll-up page — the
+        // reset can't ride it (that response is a PREPEND), so QUEUE it to run when
+        // that request completes. Dropping it would leave the stale cursor in place
+        // and let the next reconnect re-arm the very reset loop we're breaking.
+        const fired = await requestRelayHistory("reset", null);
+        if (!fired) pendingReset.current = true;
       }
     } catch (e) {
       setStatus(t("chat.recoverFailed", { error: String(e) }));
@@ -669,6 +682,10 @@ function ChatView({
   // again. Catch-up keys on the ordinal, so reconnecting when nothing changed
   // appends nothing — a cheap no-op.
   const connect = useCallback(() => {
+    // This dial's generation. The reset / history_page handlers capture it and
+    // ignore frames once a newer dial supersedes this leg — so a late reply from a
+    // torn-down pump can't clobber the live transcript or be mis-applied.
+    const myGen = (connGen.current += 1);
     const channel = new Channel<WireFrame>();
     channel.onmessage = (frame) => {
       switch (frame.kind) {
@@ -730,23 +747,29 @@ function ChatView({
           // The gateway gave up on catch-up (gap over cap) or hit outbound
           // back-pressure. Recover instead of just showing a status — otherwise
           // the stale pre-gap cursor goes back out on the next reconnect and
-          // overflows again (the loop). See `recoverFromReset`.
-          void recoverFromReset();
+          // overflows again (the loop). See `recoverFromReset`. Ignore a Reset
+          // from a superseded leg so it can't trigger a spurious rebuild on top of
+          // the live one.
+          if (myGen === connGen.current) void recoverFromReset();
           break;
         case "history_page": {
-          // The reply to a relay `chat_fetch_history`. `relayHistory.current.mode`
-          // (set when we fired it) says whether this is a reset rebuild (REPLACE)
-          // or a scroll-up page (PREPEND). Always clear the in-flight tag.
+          // The reply to a relay `chat_fetch_history`. Ignore it outright if a
+          // newer dial has superseded this leg — a late reply from a torn-down pump
+          // must not touch the live transcript.
+          if (myGen !== connGen.current) break;
+          // `relayHistory.current.mode` (set when we fired the request) says whether
+          // this is a reset rebuild (REPLACE) or a scroll-up page (PREPEND). A page
+          // with no matching in-flight request (`null`) is stale/duplicate — drop
+          // it; it must NOT fall through to the REPLACE path and wipe the thread.
           const pending = relayHistory.current;
           relayHistory.current = null;
+          if (pending === null) break;
           const rows = historyMessagesToChatMsgs(frame.messages);
-          if (pending?.mode === "page") {
+          if (pending.mode === "page") {
             prependOlder(rows, frame.oldest_ordinal ?? null, frame.has_more);
-            pagingRef.current = false;
-            setLoadingOlder(false);
           } else {
             // Reset rebuild: REPLACE the thread with the newest page, reseed both
-            // cursors, and clear any paging guards a coincident scroll-up left set.
+            // cursors.
             for (const m of frame.messages) {
               if (m.role === "user" && m.platform_msg_id) sentIds.current.add(m.platform_msg_id);
             }
@@ -762,8 +785,16 @@ function ChatView({
               oldestOrdinal: oldestOrdinal.current,
             });
             setStatus(null);
-            pagingRef.current = false;
-            setLoadingOlder(false);
+          }
+          // This request is done; clear any paging guards a coincident scroll-up
+          // left set.
+          pagingRef.current = false;
+          setLoadingOlder(false);
+          // A reset queued behind this request (it couldn't ride a page response)
+          // now runs — unless this WAS the reset, in which case the queue is moot.
+          if (pendingReset.current) {
+            pendingReset.current = false;
+            if (pending.mode === "page") void requestRelayHistory("reset", null);
           }
           break;
         }
@@ -772,9 +803,13 @@ function ChatView({
       }
     };
     // A reconnect re-establishes the leg, so any relay history request that was
-    // in flight on the old leg is abandoned (its `history_page` will never arrive)
-    // — clear the guards so a future fetch isn't blocked / the spinner isn't stuck.
+    // in flight on the old leg is abandoned (its `history_page` is ignored by the
+    // generation guard) — clear the guards so a future fetch isn't blocked / the
+    // spinner isn't stuck / a queued reset isn't stranded. The reconnect's own
+    // `Subscribe` re-triggers a `Reset` if the cursor is still stale, so a dropped
+    // queued reset self-heals.
     relayHistory.current = null;
+    pendingReset.current = false;
     pagingRef.current = false;
     setLoadingOlder(false);
     setStatus(t("chat.connecting"));
@@ -800,10 +835,10 @@ function ChatView({
     // `t` is intentionally omitted from deps: re-creating `connect` on a language
     // switch would tear down + re-dial the live session. Status strings set by a
     // later reconnect simply use the language captured here. `recoverFromReset` /
-    // `prependOlder` share `connect`'s deps (or are stable), so it's stable across
-    // all other renders.
+    // `prependOlder` / `requestRelayHistory` share `connect`'s deps (or are stable),
+    // so it's stable across all other renders.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, transport, recoverFromReset, prependOlder]);
+  }, [sessionId, transport, recoverFromReset, prependOlder, requestRelayHistory]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
