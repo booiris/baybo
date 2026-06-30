@@ -1136,7 +1136,7 @@ function ipDetailView(d) {
   );
 }
 
-// ---- devices & IPs ----
+// ---- devices ----
 
 async function renderDevices(view) {
   view.replaceChildren(el("div", { class: "empty", text: "Loading…" }));

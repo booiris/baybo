@@ -627,12 +627,6 @@ code {
   border-color: var(--color-ink);
 }
 
-.grid-3 {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 16px;
-}
-
 .grid-2 {
   display: grid;
   grid-template-columns: 1fr;
@@ -640,17 +634,8 @@ code {
 }
 
 @media (min-width: 880px) {
-  .grid-3 {
-    grid-template-columns: repeat(2, 1fr);
-  }
   .grid-2 {
     grid-template-columns: repeat(2, 1fr);
-  }
-}
-
-@media (min-width: 1280px) {
-  .grid-3 {
-    grid-template-columns: repeat(3, 1fr);
   }
 }
 

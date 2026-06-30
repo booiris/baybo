@@ -213,11 +213,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // conversion serves both sites).
     let conns_fallback = u32::try_from(conns_fallback).unwrap_or(u32::MAX);
 
-    // The operator dashboard runs on its OWN listener (`DASHBOARD_BIND_ADDR`),
-    // plain HTTP — NOT merged into the relay/push app, never behind Cloudflare,
-    // and given no per-IP recorder/limiter (it's a direct plain-HTTP surface, so
-    // the socket peer is the client). It stays off until `DASHBOARD_TOKEN` is set;
-    // any non-empty value enables it.
+    // The operator dashboard runs on its OWN listener (`DASHBOARD_BIND_ADDR`) —
+    // NOT merged into the relay/push app, never behind Cloudflare, and given no
+    // per-IP recorder/limiter (nothing fronts it, so the socket peer is the
+    // client). Plain HTTP by default, or its own in-process TLS via the
+    // `DASHBOARD_TLS_*` pair. It stays off until `DASHBOARD_TOKEN` is set; any
+    // non-empty value enables it.
     let dashboard: Option<Router> = if let Some(token) = dashboard_token() {
         let traffic_reader = traffic_query::TrafficReader::open(&traffic_db_path).await?;
         let backend = Arc::new(dashboard_backend::RuntimeDashboardBackend::from_config(
