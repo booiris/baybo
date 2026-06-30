@@ -18,61 +18,101 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libsql::{Builder, Connection, Database, params};
+use remote_host_edge::IpTrafficRegistry;
 use remote_host_push::PushTrafficRegistry;
 use remote_host_relay::TrafficRegistry;
 
-/// One row per `(remote_api_key, server_id)`; the PRIMARY KEY is the UPSERT
-/// conflict target. Counts are lifetime cumulative.
+// All three ledgers bucket by hour (`hour` = the UTC hour start, stamped by SQLite
+// at write time as `YYYY-MM-DD HH:00:00`), so totals are an hourly time series the
+// retention sweep can age out. The hour is part of every PRIMARY KEY (the UPSERT
+// conflict target) and indexed for the prune. Old rows past the retention window
+// are deleted (these are best-effort stats, not session data).
+
+/// One row per `(remote_api_key, server_id, hour)`.
 const RELAY_SCHEMA: &str = r#"CREATE TABLE IF NOT EXISTS relay_traffic (
     remote_api_key TEXT NOT NULL,
     server_id TEXT NOT NULL,
+    hour TEXT NOT NULL,
     bytes_up INTEGER NOT NULL DEFAULT 0,
     bytes_down INTEGER NOT NULL DEFAULT 0,
     frames_up INTEGER NOT NULL DEFAULT 0,
     frames_down INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (remote_api_key, server_id)
+    PRIMARY KEY (remote_api_key, server_id, hour)
 )"#;
 
-/// One row per `device_id`: cumulative APNs sends + payload bytes egressed.
+/// One row per `(device_id, hour)`: APNs sends + payload bytes egressed that hour.
 const PUSH_SCHEMA: &str = r#"CREATE TABLE IF NOT EXISTS push_traffic (
-    device_id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    hour TEXT NOT NULL,
     sends INTEGER NOT NULL DEFAULT 0,
     bytes INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (device_id, hour)
 )"#;
 
-/// Add an interval's relay delta onto the row's lifetime total (insert the row on
-/// first sight). `excluded.*` is the just-inserted delta.
+/// One row per `(ip, endpoint, hour)`: request count + bytes from that source IP to
+/// that endpoint that hour.
+const IP_SCHEMA: &str = r#"CREATE TABLE IF NOT EXISTS ip_traffic (
+    ip TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    hour TEXT NOT NULL,
+    requests INTEGER NOT NULL DEFAULT 0,
+    bytes INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (ip, endpoint, hour)
+)"#;
+
+/// `hour` indexes so the retention prune (`WHERE hour < …`) is a range scan, not a
+/// full table scan.
+const HOUR_INDEXES: [&str; 3] = [
+    "CREATE INDEX IF NOT EXISTS idx_relay_traffic_hour ON relay_traffic(hour)",
+    "CREATE INDEX IF NOT EXISTS idx_push_traffic_hour ON push_traffic(hour)",
+    "CREATE INDEX IF NOT EXISTS idx_ip_traffic_hour ON ip_traffic(hour)",
+];
+
+/// Add an interval's relay delta onto the current hour's row (insert it on first
+/// sight). `excluded.*` is the just-inserted delta.
 const RELAY_UPSERT: &str = r#"INSERT INTO relay_traffic
-    (remote_api_key, server_id, bytes_up, bytes_down, frames_up, frames_down, updated_at)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
-ON CONFLICT(remote_api_key, server_id) DO UPDATE SET
+    (remote_api_key, server_id, hour, bytes_up, bytes_down, frames_up, frames_down, updated_at)
+    VALUES (?1, ?2, strftime('%Y-%m-%d %H:00:00','now'), ?3, ?4, ?5, ?6, datetime('now'))
+ON CONFLICT(remote_api_key, server_id, hour) DO UPDATE SET
     bytes_up = bytes_up + excluded.bytes_up,
     bytes_down = bytes_down + excluded.bytes_down,
     frames_up = frames_up + excluded.frames_up,
     frames_down = frames_down + excluded.frames_down,
     updated_at = excluded.updated_at"#;
 
-/// Add an interval's push delta onto the device's lifetime total.
-const PUSH_UPSERT: &str = r#"INSERT INTO push_traffic (device_id, sends, bytes, updated_at)
-    VALUES (?1, ?2, ?3, datetime('now'))
-ON CONFLICT(device_id) DO UPDATE SET
+/// Add an interval's push delta onto the device's current-hour row.
+const PUSH_UPSERT: &str = r#"INSERT INTO push_traffic (device_id, hour, sends, bytes, updated_at)
+    VALUES (?1, strftime('%Y-%m-%d %H:00:00','now'), ?2, ?3, datetime('now'))
+ON CONFLICT(device_id, hour) DO UPDATE SET
     sends = sends + excluded.sends,
     bytes = bytes + excluded.bytes,
     updated_at = excluded.updated_at"#;
 
+/// Add an interval's per-IP delta onto the `(ip, endpoint)`'s current-hour row.
+const IP_UPSERT: &str = r#"INSERT INTO ip_traffic (ip, endpoint, hour, requests, bytes, updated_at)
+    VALUES (?1, ?2, strftime('%Y-%m-%d %H:00:00','now'), ?3, ?4, datetime('now'))
+ON CONFLICT(ip, endpoint, hour) DO UPDATE SET
+    requests = requests + excluded.requests,
+    bytes = bytes + excluded.bytes,
+    updated_at = excluded.updated_at"#;
+
 /// Spawn the flush task. `db_path` empty ⇒ no persistence (drain-and-discard, still
-/// evicts). `flush_secs` is clamped to ≥1. The relay registry is required (the relay
-/// is always on); the push one is `Some` only when the push role is mounted.
-/// `relay_max_tracked` recomputes the relay entry cap (sized to the live admission
-/// connection capacity) — it is applied before the first flush and re-applied each
-/// interval so the cap follows hot-reloaded admission edits.
+/// evicts). `flush_secs` is clamped to ≥1. `retention_days` ages out hourly rows
+/// older than that. The relay + ip registries are required (both always on); the
+/// push one is `Some` only when the push role is mounted. `relay_max_tracked`
+/// recomputes the relay entry cap (sized to the live admission connection capacity)
+/// — applied before the first flush and re-applied each interval so the cap follows
+/// hot-reloaded admission edits.
 pub(crate) fn spawn<F>(
     db_path: String,
     flush_secs: u64,
+    retention_days: u64,
     relay: Arc<TrafficRegistry>,
     push: Option<Arc<PushTrafficRegistry>>,
+    ip: Arc<IpTrafficRegistry>,
     relay_max_tracked: F,
 ) where
     F: Fn() -> usize + Send + 'static,
@@ -101,13 +141,18 @@ pub(crate) fn spawn<F>(
         // Size the cap to the current admission capacity before the first leg can
         // connect; the loop keeps it fresh as admission hot-reloads.
         relay.set_max_tracked(relay_max_tracked());
+        // Run the retention prune ~once an hour, not every flush — aging is in days,
+        // so a per-minute sweep is wasted work. `ticks` starts at 0, so the first
+        // flush also prunes.
+        let prune_every = (3600 / secs).max(1);
+        let mut ticks: u64 = 0;
         let mut tick = tokio::time::interval(Duration::from_secs(secs));
         tick.tick().await; // the first tick is immediate; nothing to flush yet
         loop {
             tick.tick().await;
             let cap = relay_max_tracked();
             relay.set_max_tracked(cap);
-            flush_once(conn, &relay, push.as_deref()).await;
+            flush_once(conn, &relay, push.as_deref(), &ip).await;
             // Surface saturation once per interval (never per meter_for): at the cap,
             // new (remote_api_key, server_id) pairs are recorded by an inert meter.
             if relay.tracked_len() >= cap {
@@ -116,17 +161,52 @@ pub(crate) fn spawn<F>(
                     "remote-host: relay traffic map at its capacity cap; new (remote_api_key, server_id) pairs are going unrecorded — likely relay_node_id churn or an undersized admission max_conns sum"
                 );
             }
+            if ip.tracked_len() >= ip.max_tracked() {
+                tracing::warn!(
+                    cap = ip.max_tracked(),
+                    "remote-host: ip traffic map at its capacity cap; new (ip, endpoint) pairs are going unrecorded (IP churn flood?)"
+                );
+            }
+            if let Some(c) = conn
+                && ticks.is_multiple_of(prune_every)
+                && let Err(e) = prune(c, retention_days).await
+            {
+                tracing::warn!(error = %e, "remote-host: traffic retention prune failed");
+            }
+            ticks = ticks.wrapping_add(1);
         }
     });
 }
 
-/// Open the local DB and ensure both tables.
+/// Open the local DB and ensure all three hourly tables + their hour indexes
+/// (`CREATE TABLE IF NOT EXISTS`, so a fresh DB gets the schema and an existing one
+/// is left as-is).
 async fn init_db(path: &str) -> Result<(Database, Connection), libsql::Error> {
     let db = Builder::new_local(path).build().await?;
     let conn = db.connect()?;
     conn.execute(RELAY_SCHEMA, ()).await?;
     conn.execute(PUSH_SCHEMA, ()).await?;
+    conn.execute(IP_SCHEMA, ()).await?;
+    for index in HOUR_INDEXES {
+        conn.execute(index, ()).await?;
+    }
     Ok((db, conn))
+}
+
+/// Delete hourly rows older than `retention_days` from every ledger (best-effort
+/// retention; these are metrics, so a plain `DELETE` is correct — not session data).
+async fn prune(conn: &Connection, retention_days: u64) -> Result<(), libsql::Error> {
+    // Clamp to ≥1 day: a `0` (a plausible "disable retention" mistake) would make
+    // the cutoff `now` and delete even the current hour's rows.
+    let cutoff = format!("-{} days", retention_days.max(1));
+    for table in ["relay_traffic", "push_traffic", "ip_traffic"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE hour < datetime('now', ?1)"),
+            params![cutoff.clone()],
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Collect both registries, persist the deltas, and only on a durable write advance
@@ -136,20 +216,24 @@ async fn flush_once(
     conn: Option<&Connection>,
     relay: &TrafficRegistry,
     push: Option<&PushTrafficRegistry>,
+    ip: &IpTrafficRegistry,
 ) {
     let relay_deltas = relay.collect();
     let push_deltas = push.map(|p| p.collect()).unwrap_or_default();
+    let ip_deltas = ip.collect();
     match conn {
-        Some(c) => match write_deltas(c, &relay_deltas, &push_deltas).await {
+        Some(c) => match write_deltas(c, &relay_deltas, &push_deltas, &ip_deltas).await {
             Ok(()) => {
                 relay.commit();
                 if let Some(p) = push {
                     p.commit();
                 }
-                if !relay_deltas.is_empty() || !push_deltas.is_empty() {
+                ip.commit();
+                if !relay_deltas.is_empty() || !push_deltas.is_empty() || !ip_deltas.is_empty() {
                     tracing::debug!(
                         relay = relay_deltas.len(),
                         push = push_deltas.len(),
+                        ip = ip_deltas.len(),
                         "remote-host: traffic flushed"
                     );
                 }
@@ -165,6 +249,7 @@ async fn flush_once(
             if let Some(p) = push {
                 p.commit();
             }
+            ip.commit();
         }
     }
 }
@@ -175,8 +260,9 @@ async fn write_deltas(
     conn: &Connection,
     relay: &[remote_host_relay::RelayTrafficDelta],
     push: &[remote_host_push::PushTrafficDelta],
+    ip: &[remote_host_edge::IpTrafficDelta],
 ) -> Result<(), libsql::Error> {
-    if relay.is_empty() && push.is_empty() {
+    if relay.is_empty() && push.is_empty() && ip.is_empty() {
         return Ok(());
     }
     let tx = conn.transaction().await?;
@@ -206,6 +292,18 @@ async fn write_deltas(
             )
             .await?;
         }
+        for d in ip {
+            tx.execute(
+                IP_UPSERT,
+                params![
+                    d.ip.clone(),
+                    d.endpoint.clone(),
+                    d.counts.requests as i64,
+                    d.counts.bytes as i64,
+                ],
+            )
+            .await?;
+        }
         Ok::<(), libsql::Error>(())
     }
     .await;
@@ -221,6 +319,7 @@ async fn write_deltas(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remote_host_edge::{IpCounts, IpTrafficDelta};
     use remote_host_push::{PushCounts, PushTrafficDelta};
     use remote_host_relay::{Counts, RelayTrafficDelta};
 
@@ -236,10 +335,13 @@ mod tests {
         }
     }
 
+    /// Sum a key's counts across all hour buckets (a test's writes share one hour,
+    /// but summing is robust to a write landing either side of an hour boundary).
     async fn relay_row(conn: &Connection, key: &str) -> (i64, i64, i64, i64) {
         let mut rows = conn
             .query(
-                "SELECT bytes_up, bytes_down, frames_up, frames_down FROM relay_traffic \
+                "SELECT coalesce(sum(bytes_up),0), coalesce(sum(bytes_down),0), \
+                 coalesce(sum(frames_up),0), coalesce(sum(frames_down),0) FROM relay_traffic \
                  WHERE remote_api_key = ?1 AND server_id = 'srv'",
                 params![key],
             )
@@ -266,7 +368,7 @@ mod tests {
                 frames_down: 1,
             },
         )];
-        write_deltas(&conn, &first, &[]).await.unwrap();
+        write_deltas(&conn, &first, &[], &[]).await.unwrap();
         // A second flush adds onto the same row (the restart/accumulate property),
         // it does not overwrite.
         let second = vec![relay_delta(
@@ -278,7 +380,7 @@ mod tests {
                 frames_down: 0,
             },
         )];
-        write_deltas(&conn, &second, &[]).await.unwrap();
+        write_deltas(&conn, &second, &[], &[]).await.unwrap();
         assert_eq!(relay_row(&conn, "k").await, (150, 15, 3, 1));
     }
 
@@ -301,12 +403,13 @@ mod tests {
                 bytes: 900,
             },
         }];
-        write_deltas(&conn, &relay, &push).await.unwrap();
-        write_deltas(&conn, &[], &push).await.unwrap(); // push-only second flush
+        write_deltas(&conn, &relay, &push, &[]).await.unwrap();
+        write_deltas(&conn, &[], &push, &[]).await.unwrap(); // push-only second flush
 
         let mut rows = conn
             .query(
-                "SELECT sends, bytes FROM push_traffic WHERE device_id = 'dev'",
+                "SELECT coalesce(sum(sends),0), coalesce(sum(bytes),0) FROM push_traffic \
+                 WHERE device_id = 'dev'",
                 (),
             )
             .await
@@ -319,14 +422,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ip_upsert_accumulates_requests_and_bytes() {
+        let (_db, conn) = mem_db().await;
+        let d = vec![IpTrafficDelta {
+            ip: "203.0.113.5".into(),
+            endpoint: "content/join".into(),
+            counts: IpCounts {
+                requests: 1,
+                bytes: 1000,
+            },
+        }];
+        write_deltas(&conn, &[], &[], &d).await.unwrap();
+        write_deltas(&conn, &[], &[], &d).await.unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT coalesce(sum(requests),0), coalesce(sum(bytes),0) FROM ip_traffic \
+                 WHERE ip = '203.0.113.5' AND endpoint = 'content/join'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 2, "requests accumulate");
+        assert_eq!(row.get::<i64>(1).unwrap(), 2000, "bytes accumulate");
+    }
+
+    #[tokio::test]
     async fn empty_deltas_write_nothing() {
         let (_db, conn) = mem_db().await;
-        write_deltas(&conn, &[], &[]).await.unwrap();
+        write_deltas(&conn, &[], &[], &[]).await.unwrap();
         let mut rows = conn
             .query("SELECT COUNT(*) FROM relay_traffic", ())
             .await
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();
         assert_eq!(row.get::<i64>(0).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_rows_past_retention() {
+        let (_db, conn) = mem_db().await;
+        // One ancient-hour row and one current-hour row, inserted directly.
+        conn.execute(
+            "INSERT INTO ip_traffic(ip, endpoint, hour, requests, bytes) \
+             VALUES('1.1.1.1','notify','2000-01-01 00:00:00', 5, 50)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ip_traffic(ip, endpoint, hour, requests, bytes) \
+             VALUES('1.1.1.1','notify', strftime('%Y-%m-%d %H:00:00','now'), 1, 10)",
+            (),
+        )
+        .await
+        .unwrap();
+        prune(&conn, 60).await.unwrap();
+        let mut rows = conn
+            .query("SELECT count(*) FROM ip_traffic", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            1,
+            "the >60-day-old hour is pruned; the current one is kept"
+        );
     }
 }

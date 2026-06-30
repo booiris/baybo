@@ -33,7 +33,7 @@ use device_proto::psk_pair::{PskHandshake, build_prologue};
 use futures::{SinkExt, StreamExt};
 use remote_host_admission::InMemoryAdmission;
 use remote_host_protocol::relay::REMOTE_API_KEY_HEADER;
-use remote_host_relay::serve::{IpLimitConfig, build_router};
+use remote_host_relay::serve::{IpLimitConfig, IpTrafficRegistry, RelayServices, build_router};
 use remote_host_relay::{BandwidthRegistry, ConnectionRegistry, TrafficRegistry};
 use snow::TransportState;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
@@ -61,10 +61,13 @@ async fn boot_relay() -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = build_router(
-        admission,
-        Arc::new(ConnectionRegistry::new()),
-        Arc::new(BandwidthRegistry::new()),
-        Arc::new(TrafficRegistry::new()),
+        RelayServices {
+            admission,
+            conns: Arc::new(ConnectionRegistry::new()),
+            bandwidth: Arc::new(BandwidthRegistry::new()),
+            traffic: Arc::new(TrafficRegistry::new()),
+            ip_traffic: Arc::new(IpTrafficRegistry::new()),
+        },
         IpLimitConfig::disabled(),
     );
     tokio::spawn(async move {

@@ -21,7 +21,7 @@ reqwest = { workspace = true }
 # The shared wire contract: route paths + NotifyRequest/RegisterRequest/ApnsEnv.
 remote-host-protocol = { workspace = true }
 # The token-bucket primitive backing the per-device /notify frequency control.
-remote-host-ratelimit = { workspace = true }
+remote-host-edge = { workspace = true }
 # Verify the push-binding delegation + per-request gateway signatures (the gateway
 # /app sign; C only verifies). base64/hex decode the wire-carried keys/sigs.
 ed25519-dalek = { workspace = true }
