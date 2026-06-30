@@ -53,13 +53,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      # The grep builtin shells out to ripgrep, so its tests need `rg` on
-      # PATH; the real-terminal rendering tests (via baybo-term-harness)
-      # drive tmux. Both self-skip when their backend is absent, but we
-      # install them so the suites actually run here. (Docker- and
-      # bwrap-backed tests still self-skip — their backends aren't stock.)
-      - run: sudo apt-get update -qq && sudo apt-get install -y ripgrep tmux
-      - run: cargo test --workspace --locked
+      - uses: taiki-e/install-action@nextest
+      # The grep builtin shells out to ripgrep, so its tests need `rg` on PATH.
+      # (The tmux render/smoke tests are `#[ignore]` and run in `render-tests`
+      # below; docker- and bwrap-backed tests still self-skip on stock runners.)
+      - run: sudo apt-get update -qq && sudo apt-get install -y ripgrep
+      # nextest runs every test as its own process in one shared pool, instead
+      # of cargo's serial-per-binary execution. Doctests are disabled
+      # workspace-wide, so nextest not running them changes no coverage.
+      - run: cargo nextest run --workspace --locked
+
+  # Detects whether this PR touches the render stack, so the (otherwise always-on)
+  # `render-tests` job below can be skipped entirely — a skipped job spins up no
+  # runner, so non-TUI PRs pay zero minutes for it.
+  changes:
+    name: detect changes
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request.draft == false }}
+    outputs:
+      render: ${{ steps.filter.outputs.render }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            render:
+              - 'crates/tui/**'
+              - 'crates/term-harness/**'
+
+  # The tmux-driven render/smoke tests are flaky under load, so they're
+  # `#[ignore]` and run here out of the gating `test` job. Gated on `changes`:
+  # only runs when the render stack (tui / term-harness) is actually touched.
+  # Non-blocking (`continue-on-error`): a render regression is surfaced but
+  # doesn't wedge merges on the known cursor-position race. The in-process
+  # `static SERIAL` mutex serializes the tui scenarios; `chat_render`'s 8
+  # internal retries absorb the race.
+  render-tests:
+    name: tmux render tests (non-gating)
+    needs: changes
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.render == 'true' }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: sudo apt-get update -qq && sudo apt-get install -y tmux
+      - run: cargo test -p baybo-tui --test chat_render --locked -- --include-ignored
+      - run: cargo test -p baybo-term-harness --lib --locked -- --include-ignored
 
   ts-bindings:
     name: ts-rs bindings sync

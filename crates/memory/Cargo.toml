@@ -2,9 +2,17 @@
 name = "baybo-memory"
 version.workspace = true
 edition.workspace = true
+autotests = false
 
 [lib]
 doctest = false
+
+# Single aggregated integration-test binary: each sibling file is mounted as a
+# module so the harness links once instead of per-file, with `common` shared at
+# the test-crate root. See `tests/all.rs`.
+[[test]]
+name = "all"
+path = "tests/all.rs"
 
 [features]
 test-support = []

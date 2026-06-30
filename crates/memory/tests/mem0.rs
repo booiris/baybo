@@ -4,8 +4,6 @@
 //! shape (path, auth header, body) and returns a canned JSON response, then
 //! drives the backend through the same code path the runtime uses.
 
-mod common;
-
 use std::sync::Arc;
 
 use axum::extract::{RawQuery, State};
@@ -22,7 +20,7 @@ use baybo_trace::StepKind;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use common::{base_url, memory_context, spawn, tool_context};
+use crate::common::{base_url, memory_context, spawn, tool_context};
 
 #[derive(Default, Clone)]
 struct Captured {

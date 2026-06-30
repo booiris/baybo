@@ -1,7 +1,5 @@
 //! End-to-end tests for `baybo_memory::backends::openviking` against an axum mock server.
 
-mod common;
-
 use std::sync::Arc;
 
 use axum::extract::{Path, RawQuery, State};
@@ -10,14 +8,15 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use baybo_memory::Memory;
 use baybo_memory::backends::openviking::{
-    OpenVikingConfig, OpenVikingMemory, TOOL_ARCHIVE_EXPAND, TOOL_FORGET, TOOL_RECALL, TOOL_STORE,
+    OpenVikingConfig, OpenVikingMemory, OpenVikingTimeouts, TOOL_ARCHIVE_EXPAND, TOOL_FORGET,
+    TOOL_RECALL, TOOL_STORE,
 };
 use baybo_model::{ChatMessage, ContentBlock};
 use baybo_trace::StepKind;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use common::{base_url, memory_context, spawn, tool_context};
+use crate::common::{base_url, memory_context, spawn, tool_context};
 
 #[derive(Default, Clone)]
 struct Captured {
@@ -114,44 +113,67 @@ async fn recall_returns_empty_when_query_empty() {
 
 #[tokio::test]
 async fn on_session_end_tolerates_slow_commit() {
-    // Commit can be slow when the server runs LLM-backed extraction.
-    // Verify the call waits well past `HTTP_TIMEOUT` (30s) — a 35-s
-    // server-side stall completes successfully because WRITE_TIMEOUT
-    // (10 min) is the actual budget on this code path.
+    // Commit can be slow when the server runs LLM-backed extraction. Verify the
+    // call waits past the short per-request `http` budget — the commit path is
+    // governed by the longer `write` budget, so a server stall between the two
+    // completes successfully instead of being cancelled at `http`. Budgets are
+    // injected at ms scale so the test trips the same code path without a
+    // multi-second real sleep.
     let app = Router::new().route(
         "/api/v1/sessions/{sid}/commit",
         post(|Path(_sid): Path<String>| async move {
-            tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             Json(json!({}))
         }),
     );
     let server = spawn(app).await;
-    let m = build(&base_url(&server));
+    let m = OpenVikingMemory::with_timeouts(
+        cfg(&base_url(&server)),
+        "test-key".into(),
+        None,
+        OpenVikingTimeouts {
+            http: std::time::Duration::from_millis(50),
+            write: std::time::Duration::from_secs(10),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let ctx = memory_context("alice", "slow-commit", StepKind::MemoryWrite).await;
     let transcript = vec![ChatMessage::user(vec![ContentBlock::Text("hi".into())])];
     let started = std::time::Instant::now();
     m.on_session_end(&ctx, &transcript).await.unwrap();
     let elapsed = started.elapsed();
-    // The 35-s wait must have completed (not been cancelled at 30 s).
+    // The 300ms commit must have completed (not been cancelled at the 50ms http
+    // budget) — `write` (10s) is the budget on this path.
     assert!(
-        elapsed >= std::time::Duration::from_secs(34),
+        elapsed >= std::time::Duration::from_millis(250),
         "on_session_end must wait through the slow commit; took {elapsed:?}"
     );
 }
 
 #[tokio::test]
 async fn recall_returns_empty_on_critical_path_timeout() {
-    // Handler stalls past the 5 s RECALL_TIMEOUT — recall must return empty
-    // (no recalled context) instead of blocking the agent loop.
+    // Handler stalls past the `recall` budget — recall must return empty (no
+    // recalled context) instead of blocking the agent loop. Budget injected at
+    // ms scale so the timeout fires in ~50ms instead of multiple seconds.
     let app = Router::new().route(
         "/api/v1/search/find",
         post(|Json(_b): Json<Value>| async move {
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             Json(json!({"result": {"memories": [], "resources": []}}))
         }),
     );
     let server = spawn(app).await;
-    let m = build(&base_url(&server));
+    let m = OpenVikingMemory::with_timeouts(
+        cfg(&base_url(&server)),
+        "test-key".into(),
+        None,
+        OpenVikingTimeouts {
+            recall: std::time::Duration::from_millis(50),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let ctx = memory_context("alice", "s-1", StepKind::MemoryRecall).await;
     let started = std::time::Instant::now();
     let out = m
@@ -161,8 +183,8 @@ async fn recall_returns_empty_on_critical_path_timeout() {
     let elapsed = started.elapsed();
     assert!(out.is_empty());
     assert!(
-        elapsed < std::time::Duration::from_secs(8),
-        "recall should not stall past RECALL_TIMEOUT; took {elapsed:?}"
+        elapsed < std::time::Duration::from_millis(250),
+        "recall should not stall past the recall timeout; took {elapsed:?}"
     );
 }
 
