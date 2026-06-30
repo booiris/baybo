@@ -163,8 +163,8 @@ gap).
 
 ## Related
 
-- [`mobile-direct-push.md`](mobile-direct-push.md) — the other open direct-transport
-  follow-up.
+- [`../modules/mobile/relay-push-security.md`](../modules/mobile/relay-push-security.md)
+  — "Direct-mode push" (the other direct-transport follow-up, now implemented).
 - [`../modules/mobile/companion.md`](../modules/mobile/companion.md) — companion
   architecture; app lifecycle, catch-up, and reconnect.
 - `crates/gateway/src/channel/route.rs` — `MAX_CATCHUP_REPLAY` and the Reset trigger.
