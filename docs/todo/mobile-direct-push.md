@@ -1,24 +1,26 @@
 # Mobile Direct-Mode Push Notifications
 
 > **Status: implemented.** Built per the "Proposed direction" below, with the
-> recommended choices: **Decision 0 = (A)** reuse the remote host C (new `[push]`
-> gateway config supplies its `relay_url` — the endpoint only); **Piece 3 = (3a)**
-> the `push_key` is generated on-device and delivered over the admin-token TLS
-> REST channel (encrypted previews preserved); and the web identity mints a real
-> Ed25519 key + delegation, so C and the NSE are **unchanged** and the
+> recommended choices: **Decision 0 = (A)** reuse the remote host C; **Piece 3 =
+> (3a)** the `push_key` is generated on-device and delivered over the admin-token
+> TLS REST channel (encrypted previews preserved); and the web identity mints a
+> real Ed25519 key + delegation, so C and the NSE are **unchanged** and the
 > binding-integrity guarantee (Claim 4) still holds.
 >
-> Note: push went **keyless** on master (`refactor(push,gateway): make /register
-> + /notify keyless`) — `/register` + `/notify` no longer carry a `remote_api_key`
-> and there is no admission gate; the device→gateway Ed25519 delegation chain is
-> the sole authorization. So the `[push]` config needs only `relay_url`, and the
-> "Optional — binding integrity under a shared `remote_api_key`" subsection below
-> is moot for push (it described the pre-keyless model). The delegation reuse this
-> doc recommends is exactly what now carries the whole guarantee.
+> Two deviations from the original proposal:
+> - Push went **keyless** on master (`refactor(push,gateway): make /register +
+>   /notify keyless`) — the routes no longer carry a `remote_api_key` and there is
+>   no admission gate; the device→gateway Ed25519 delegation chain is the sole
+>   authorization. So the "Optional — binding integrity under a shared
+>   `remote_api_key`" subsection below is moot for push (pre-keyless model); the
+>   delegation reuse this doc recommends is what now carries the whole guarantee.
+> - The remote-host endpoint is **not yet operator-configurable**: it is hardcoded
+>   to `DEFAULT_PUSH_RELAY_URL = wss://proxy.baybo.space` (the public proxy the app
+>   already defaults to for pairing). A `[push]` config block is a later add.
 >
 > Shipped surface: gateway `crates/gateway/src/api/admin/push.rs`
-> (`GET /v1/push/params`, `POST /v1/push/register`),
-> `crates/gateway/src/push/web.rs`, `baybo_config::PushConfig`; app
+> (`GET /v1/push/params`, `POST /v1/push/register`) + `crates/gateway/src/push/web.rs`
+> + `DEFAULT_PUSH_RELAY_URL` in `push/mod.rs`; app
 > `app/mobile/src-tauri/src/direct/push.rs` + the `direct_push_register` command.
 > Security/trust model: the **Direct-mode push** section of
 > [`../modules/mobile/relay-push-security.md`](../modules/mobile/relay-push-security.md).

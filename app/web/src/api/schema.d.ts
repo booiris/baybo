@@ -1342,9 +1342,11 @@ export interface components {
         /** @description Response of `GET /v1/push/params`. */
         PushParams: {
             /**
-             * @description `true` when `[push]` is configured (a remote host the gateway can
-             *     register/notify through). `false` → direct-mode push is unavailable; the
-             *     client should not register, and chat stays foreground-only.
+             * @description Whether direct-mode push is available on this gateway. Currently always
+             *     `true` — bindings register through the built-in default remote host
+             *     ([`DEFAULT_PUSH_RELAY_URL`]). The field stays so a future config toggle (or
+             *     a build with no push host) can report `false` without an app-side change;
+             *     the client skips registration and stays foreground-only when it is `false`.
              */
             configured: boolean;
             /**
@@ -3282,7 +3284,7 @@ export interface operations {
                     "application/json": components["schemas"]["RegisterPushResponse"];
                 };
             };
-            /** @description Push not configured, or malformed key / delegation that does not verify */
+            /** @description Malformed key / delegation that does not verify */
             400: {
                 headers: {
                     [name: string]: unknown;

@@ -50,6 +50,12 @@ const PREVIEW_MAX_CHARS: usize = 200;
 /// margin tolerates an interleaved row without a second round-trip.
 const PREVIEW_READ_LIMIT: usize = 4;
 
+/// Remote host (C) that direct-mode (web-identity) push bindings register +
+/// notify through. Hardcoded to the public proxy the app already defaults to for
+/// pairing, so direct/web sessions get push out of the box; not yet operator-
+/// configurable (a `[push]` config block can override this later).
+pub(crate) const DEFAULT_PUSH_RELAY_URL: &str = "wss://proxy.baybo.space";
+
 /// Secret-vault name for a device's per-device push key. The single source of
 /// truth shared by the write site (the device-pair route) and the read site
 /// (this dispatcher) so the two can never drift.
@@ -480,13 +486,13 @@ impl PushDispatcher {
         session_id: &SessionId,
         preview: &str,
     ) -> Result<(), String> {
-        // Relay and push share the recorded endpoint + admission key; push is
-        // plain HTTP, so swap the relay's `wss`/`ws` scheme to `https`/`http`. An
-        // empty relay URL means a device row paired before this existed, or a web
-        // binding registered while `[push].relay_url` was unset.
+        // Both relay and web targets carry a remote-host endpoint; push is plain
+        // HTTP, so swap the `wss`/`ws` scheme to `https`/`http`. An empty relay URL
+        // means a device row paired before this existed (web bindings always carry
+        // the built-in default).
         let base = relay_url_to_http_base(&target.relay_url);
         if base.is_empty() {
-            return Err("push target has no relay url (re-pair, or set [push].relay_url)".into());
+            return Err("push target has no relay url (re-pair to populate)".into());
         }
         let notify_url = remote_host_protocol::push::notify_url(&base);
         self.ensure_registered(target, &base).await;

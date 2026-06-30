@@ -27,7 +27,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::api::dto::ErrorBody;
-use crate::push::{load_or_create_push_signing_key, web};
+use crate::push::{DEFAULT_PUSH_RELAY_URL, load_or_create_push_signing_key, web};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
@@ -44,9 +44,11 @@ pub struct PushParams {
     /// client signs a delegation over this key (authorizing it to manage the
     /// binding at C) before `POST /v1/push/register`.
     pub gateway_push_pubkey: String,
-    /// `true` when `[push]` is configured (a remote host the gateway can
-    /// register/notify through). `false` → direct-mode push is unavailable; the
-    /// client should not register, and chat stays foreground-only.
+    /// Whether direct-mode push is available on this gateway. Currently always
+    /// `true` — bindings register through the built-in default remote host
+    /// ([`DEFAULT_PUSH_RELAY_URL`]). The field stays so a future config toggle (or
+    /// a build with no push host) can report `false` without an app-side change;
+    /// the client skips registration and stays foreground-only when it is `false`.
     pub configured: bool,
 }
 
@@ -65,7 +67,8 @@ async fn push_params(State(state): State<AdminState>) -> Result<Json<PushParams>
         .map_err(|e| GatewayError::Internal(format!("load push signing key: {e}")))?;
     Ok(Json(PushParams {
         gateway_push_pubkey: hex::encode(signing_key.verifying_key().to_bytes()),
-        configured: state.config.push.as_ref().is_some_and(|p| p.is_usable()),
+        // Always available today — bindings use the built-in default remote host.
+        configured: true,
     }))
 }
 
@@ -102,7 +105,7 @@ pub struct RegisterPushResponse {
     request_body = RegisterPushRequest,
     responses(
         (status = 200, description = "Direct-mode push binding registered", body = RegisterPushResponse),
-        (status = 400, description = "Push not configured, or malformed key / delegation that does not verify", body = ErrorBody),
+        (status = 400, description = "Malformed key / delegation that does not verify", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
     )
 )]
@@ -110,19 +113,6 @@ async fn register_push(
     State(state): State<AdminState>,
     Json(req): Json<RegisterPushRequest>,
 ) -> Result<Json<RegisterPushResponse>> {
-    // Direct-mode push needs a remote host to register + notify through; without
-    // one there is nowhere to deliver, so reject rather than store a dead binding.
-    // Clients gate on `GET /v1/push/params { configured }` first, so this is the
-    // belt-and-suspenders guard.
-    let push_cfg = state
-        .config
-        .push
-        .as_ref()
-        .filter(|p| p.is_usable())
-        .ok_or_else(|| {
-            GatewayError::BadRequest("direct-mode push is not configured on this gateway".into())
-        })?;
-
     // Recover the client's Ed25519 public key from its self-certifying device_id
     // (validates prefix / hex / length / point), then re-derive the canonical id.
     let device_pub = delegation::device_pubkey_from_id(req.device_id.trim()).map_err(|_| {
@@ -166,7 +156,7 @@ async fn register_push(
 
     let binding = web::WebPushBinding {
         device_id: device_id.clone(),
-        relay_url: push_cfg.relay_url.clone(),
+        relay_url: DEFAULT_PUSH_RELAY_URL.to_string(),
         created_at: chrono::Utc::now().timestamp(),
     };
     web::store_binding(

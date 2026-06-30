@@ -15,7 +15,7 @@
 //! TLS + the admin bearer token rather than a Noise handshake hash — a weaker
 //! (but still endpoint-to-endpoint) trust model, see
 //! `docs/modules/mobile/relay-push-security.md`; and (b) the remote-host endpoint
-//! comes from gateway config (`[push]`), not a pairing QR.
+//! is the built-in default ([`super::DEFAULT_PUSH_RELAY_URL`]), not a pairing QR.
 //!
 //! Storage reuses the per-device secret names (`device.{id}.push_key` / `.apns` /
 //! `.push_delegation`) so [`super::PushDispatcher`]'s read sites need no change; a
@@ -52,8 +52,8 @@ fn web_binding_secret_name(device_id: &str) -> String {
 pub(crate) struct WebPushBinding {
     /// `ios-<hex(ed25519 pub)>` — the web client's self-certifying identity.
     pub device_id: String,
-    /// Remote-host base WS URL (from gateway `[push]` config). The dispatcher
-    /// maps `wss→https` for the keyless `/register` + `/notify` POSTs.
+    /// Remote-host base WS URL (the built-in [`super::DEFAULT_PUSH_RELAY_URL`]).
+    /// The dispatcher maps `wss→https` for the keyless `/register` + `/notify` POSTs.
     pub relay_url: String,
     /// Unix seconds the binding was registered (for observability only).
     pub created_at: i64,

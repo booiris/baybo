@@ -628,7 +628,7 @@ Relevant code:
 - Gateway endpoints: `crates/gateway/src/api/admin/push.rs`
   (`GET /v1/push/params`, `POST /v1/push/register`).
 - Gateway binding store: `crates/gateway/src/push/web.rs`.
-- Gateway config: `baybo_config::PushConfig` (the `[push]` block).
+- Default remote host: `crates/gateway/src/push/mod.rs` (`DEFAULT_PUSH_RELAY_URL`).
 
 ### Flow
 
@@ -636,7 +636,8 @@ Relevant code:
    the *same* key the relay path uses, so a phone keeps one `device_id ==
    ios-<hex(pub)>` whichever way it connects).
 2. `GET /v1/push/params` (admin Bearer) returns the gateway's Ed25519 push public
-   key `G_pub` and whether `[push]` is configured.
+   key `G_pub` and whether direct-mode push is available (`configured`, today
+   always `true`).
 3. The app generates a fresh 32-byte `push_key`, stores it in the **shared App
    Group keychain** (`baybo.push-key.<device_id>`) for its NSE, and signs the
    **same delegation** authorizing `G_pub` (`device_proto::delegation::sign_delegation`).
@@ -645,17 +646,18 @@ Relevant code:
    device key from `device_id`, **verifies the delegation under it**, and persists
    the binding — the `push_key` / APNs / delegation under the same
    `device.<id>.*` vault names a paired device uses, plus a `web_push.<id>` meta
-   record holding the remote-host endpoint from `[push]`.
+   record holding the remote-host endpoint (the built-in default).
 5. The dispatcher enumerates these web bindings alongside approved device rows and
-   `/register` + `/notify`s them through the configured remote host **unchanged**.
+   `/register` + `/notify`s them through that remote host **unchanged**.
 
 So the binding is cryptographically **identical** to a paired device's: C, the
 delegation chain, the AEAD preview, and the iOS NSE are all untouched. Push is
-keyless, so the only thing the gateway needs from config is the remote-host
-**endpoint** (`[push].relay_url`) — there is no admission key on the push routes.
-It comes from the gateway `[push]` config instead of a pairing QR; absent that
-config the gateway reports `configured: false` and the app stays foreground-only
-(chat itself is unaffected).
+keyless, so the gateway needs no admission key — the binding's only routing input
+is the remote-host **endpoint**, hardcoded today to
+`DEFAULT_PUSH_RELAY_URL = wss://proxy.baybo.space` (the public proxy the app also
+defaults to for pairing). It is not yet operator-configurable; a future `[push]`
+config block can override it, at which point `GET /v1/push/params` would report
+`configured: false` when unset and the app would stay foreground-only.
 
 ### Trust-model difference (weaker than the Noise path)
 

@@ -201,9 +201,9 @@ keychain for its NSE, fetches the gateway push key via `GET /v1/push/params`,
 signs the same delegation, and `POST /v1/push/register`s it (admin Bearer). The
 gateway verifies the delegation and persists a **web push binding**
 (`crates/gateway/src/push/web.rs`), which the dispatcher fans out to alongside
-device rows — so C and the NSE are unchanged. The remote-host endpoint comes from
-the gateway `[push]` config (`baybo_config::PushConfig`), not a QR; without it the
-gateway reports push unavailable and direct chat stays foreground-only. The
+device rows — so C and the NSE are unchanged. The remote-host endpoint is the
+built-in default (`DEFAULT_PUSH_RELAY_URL` = `wss://proxy.baybo.space`, the same
+host the app defaults to for pairing) — not yet operator-configurable. The
 `push_key` rides TLS + the admin token rather than a Noise handshake — a weaker
 trust model detailed in
 [`relay-push-security.md`](relay-push-security.md#direct-mode-push-web-identity).

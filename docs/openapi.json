@@ -2299,7 +2299,7 @@
             }
           },
           "400": {
-            "description": "Push not configured, or malformed key / delegation that does not verify",
+            "description": "Malformed key / delegation that does not verify",
             "content": {
               "application/json": {
                 "schema": {
@@ -4110,7 +4110,7 @@
         "properties": {
           "configured": {
             "type": "boolean",
-            "description": "`true` when `[push]` is configured (a remote host the gateway can\nregister/notify through). `false` → direct-mode push is unavailable; the\nclient should not register, and chat stays foreground-only."
+            "description": "Whether direct-mode push is available on this gateway. Currently always\n`true` — bindings register through the built-in default remote host\n([`DEFAULT_PUSH_RELAY_URL`]). The field stays so a future config toggle (or\na build with no push host) can report `false` without an app-side change;\nthe client skips registration and stays foreground-only when it is `false`."
           },
           "gateway_push_pubkey": {
             "type": "string",
