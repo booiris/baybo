@@ -75,6 +75,11 @@ pub const EP_STATUS: &str = "status";
 /// junk paths can't blow up the label space.
 pub const EP_OTHER: &str = "other";
 
+/// Fraction of [`EP_OTHER`] requests that get a sampled `info!` of their raw path,
+/// so an operator can characterise the unclassified traffic hitting the public
+/// listener without a path-spray scan flooding the log.
+const EP_OTHER_LOG_SAMPLE_RATE: f64 = 0.01;
+
 /// Default ceiling on simultaneously-tracked `(ip, endpoint)` entries. Source IPs
 /// are unbounded (any client), so this hard cap + idle eviction bound the map
 /// against an IP-churn flood, mirroring the per-IP rate-limiter's bucket cap. Sized
@@ -371,6 +376,14 @@ async fn record_ip_traffic(State(state): State<RecordState>, req: Request, next:
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
+    if endpoint == EP_OTHER && rand::random::<f64>() < EP_OTHER_LOG_SAMPLE_RATE {
+        tracing::info!(
+            %ip,
+            method = %req.method(),
+            path = ?req.uri().path(),
+            "unclassified request bucketed as 'other' (sampled)"
+        );
+    }
     state.registry.record_request(ip, endpoint, bytes);
     next.run(req).await
 }
