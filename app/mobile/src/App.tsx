@@ -16,7 +16,7 @@ import {
   type ChatTransport,
   type WireAttachment,
 } from "./blob";
-import { directSessionCreate, directPushRegister } from "./direct";
+import { directSessionCreate, directPushRegister, directHistory } from "./direct";
 
 /// Foreground signals (page visibility, window focus, the native `app-resumed`
 /// event) can fire 2–3 times on a single iOS resume; coalesce them into one
@@ -151,7 +151,10 @@ const CHAT_STATE_KEY = "baybo.chat.state";
 // reload/relaunch restores the right one (the relay leg vs the direct WS).
 const CHAT_MODE_KEY = "baybo.chat.mode";
 
-type ChatState = { sessionId: string; messages: ChatMsg[]; lastOrdinal: number };
+// `lastOrdinal` is the WS catch-up cursor: a real ordinal replays the gap above
+// it, `0` backfills the whole thread, and `null` means "fresh subscribe, no
+// catch-up" — the relay reset-recovery state, which the gateway can't overflow.
+type ChatState = { sessionId: string; messages: ChatMsg[]; lastOrdinal: number | null };
 
 function loadChatState(sessionId: string): ChatState | null {
   try {
@@ -341,13 +344,22 @@ function ChatView({
   // to load before its leg was live (e.g. a direct chat whose channel token isn't
   // stashed until `chat_connect` completes) re-fetches when this changes.
   const [connEpoch, setConnEpoch] = useState(0);
+  // Bumped by `recoverFromReset` to force a fresh dial carrying the corrected
+  // cursor (direct: the refetched tail; relay: null). It's a dep of the connect
+  // effect, so bumping it re-runs the effect (teardown → re-dial) — distinct from
+  // `connEpoch`, which the connect *success* bumps and so must NOT trigger a dial.
+  const [reconnectNonce, setReconnectNonce] = useState(0);
   // platform_msg_ids already rendered (our optimistic sends + anything restored),
   // so the server's echo or a catch-up replay doesn't render them twice.
   const sentIds = useRef<Set<string>>(
     new Set((restored?.messages ?? []).filter((m) => m.role === "user").map((m) => m.id)),
   );
-  // Highest durable ordinal rendered — the cursor a reconnect catches up from.
-  const lastOrdinal = useRef<number>(restored?.lastOrdinal ?? 0);
+  // Highest durable ordinal rendered — the cursor a reconnect catches up from
+  // (`null` after a relay reset = re-subscribe fresh with no catch-up).
+  const lastOrdinal = useRef<number | null>(restored?.lastOrdinal ?? 0);
+  // True while a `Frame::Reset` recovery is in flight, so a burst of Resets
+  // (back-pressure) doesn't stack concurrent refetches / reconnects.
+  const recovering = useRef(false);
   // Images picked but not yet sent (uploading or ready), shown in the composer.
   const [staged, setStaged] = useState<StagedAttachment[]>([]);
   const stagedRef = useRef<StagedAttachment[]>([]);
@@ -392,6 +404,85 @@ function ChatView({
     saveChatState({ sessionId, messages, lastOrdinal: lastOrdinal.current });
   }, [sessionId, messages]);
 
+  // Recover from a gateway `Frame::Reset` (catch-up gap over the replay cap, or
+  // outbound back-pressure). Left unhandled this *loops*: the stale pre-gap cursor
+  // goes back out on the next reconnect and overflows again. The two transports
+  // recover differently — direct has admin REST, relay does not:
+  //
+  //   * direct — refetch the newest transcript page (`directHistory`), rebuild the
+  //     thread from it, and reseed the cursor to the page's tail ordinal. The
+  //     follow-up reconnect then replays only *above* that tail — nothing — so the
+  //     gap can't re-trigger the Reset.
+  //   * relay — no REST and no content-leg history frame, so we can't backfill.
+  //     Degrade to live-only: keep the pre-gap messages as a visible hole, drop the
+  //     cursor (`null`), mark the gap, and re-subscribe fresh (`since_ordinal =
+  //     null` never overflows).
+  //
+  // A re-entrancy guard keeps a burst of Resets (back-pressure) from stacking
+  // concurrent refetches/reconnects.
+  const recoverFromReset = useCallback(async () => {
+    if (recovering.current) return;
+    recovering.current = true;
+    try {
+      if (transport === "direct") {
+        const detail = await directHistory(sessionId);
+        const rebuilt: ChatMsg[] = [];
+        if (detail.has_more) {
+          // Reset fires past a >200-row gap, but the default page is 50 and mobile
+          // has no scroll-up paging yet — flag the unshown older tail honestly.
+          rebuilt.push({ id: "older-gap", role: "notice", content: t("chat.olderUnavailable") });
+        }
+        for (const item of detail.transcript) {
+          // `work` items have no mobile concept (the live switch already drops
+          // reasoning/tool progress); render `message` as a bubble and `notice`
+          // the way the live `case "notice"` path does.
+          if (item.kind === "work") continue;
+          if (item.kind === "notice") {
+            rebuilt.push({ id: `n${item.ordinal}`, role: "notice", content: item.text });
+            continue;
+          }
+          const role = item.role === "user" ? "user" : "assistant";
+          // REST history carries only `has_attachments`, no blob refs — show a
+          // placeholder rather than silently dropping the media.
+          const content = item.has_attachments
+            ? item.text
+              ? `${item.text}\n${t("chat.attachmentPlaceholder")}`
+              : t("chat.attachmentPlaceholder")
+            : item.text;
+          rebuilt.push({ id: `m${item.ordinal}`, role, content });
+        }
+        // Seed from the real tail ordinal (never the synthetic negatives on
+        // control rows); set the ref before `setMessages` so the save effect and
+        // the reconnect both read the corrected cursor.
+        lastOrdinal.current = detail.newest_ordinal ?? 0;
+        setMessages(rebuilt);
+        setStreaming("");
+        saveChatState({ sessionId, messages: rebuilt, lastOrdinal: lastOrdinal.current });
+        setStatus(null);
+      } else {
+        lastOrdinal.current = null;
+        setStreaming("");
+        setMessages((m) => {
+          const last = m[m.length - 1];
+          // Don't stack duplicate gap markers on repeated back-pressure Resets.
+          if (last?.role === "notice" && last.content === t("chat.historyTruncated")) return m;
+          return [...m, { id: crypto.randomUUID(), role: "notice", content: t("chat.historyTruncated") }];
+        });
+      }
+      // Force a fresh dial carrying the corrected cursor so catch-up replays only
+      // above it (direct) or not at all (relay) — the loop is broken.
+      setReconnectNonce((n) => n + 1);
+    } catch (e) {
+      setStatus(t("chat.recoverFailed", { error: String(e) }));
+    } finally {
+      recovering.current = false;
+    }
+    // `t` omitted from deps for the same reason as `connect` below: a language
+    // switch must not re-create this (and through it `connect`) and tear the leg
+    // down. The captured language is fine for these one-shot recovery strings.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, transport]);
+
   // (Re)open the content session, replaying only the gap above what we've already
   // rendered. Re-run on every foreground: iOS suspends the WS (and may reclaim the
   // webview) in the background, so a resume needs a fresh connection to go live
@@ -403,8 +494,12 @@ function ChatView({
       switch (frame.kind) {
         case "message": {
           // Advance the cursor first — even for our own echo we dedup below — so a
-          // later reconnect doesn't re-replay this row.
-          if (typeof frame.ordinal === "number" && frame.ordinal > lastOrdinal.current) {
+          // later reconnect doesn't re-replay this row. A `null` cursor (post relay
+          // reset) takes the first real ordinal that lands.
+          if (
+            typeof frame.ordinal === "number" &&
+            (lastOrdinal.current === null || frame.ordinal > lastOrdinal.current)
+          ) {
             lastOrdinal.current = frame.ordinal;
           }
           const role = frame.role === "user" ? "user" : "assistant";
@@ -452,7 +547,11 @@ function ChatView({
           ]);
           break;
         case "reset":
-          setStatus(t("chat.streamReset", { reason: frame.reason }));
+          // The gateway gave up on catch-up (gap over cap) or hit outbound
+          // back-pressure. Recover instead of just showing a status — otherwise
+          // the stale pre-gap cursor goes back out on the next reconnect and
+          // overflows again (the loop). See `recoverFromReset`.
+          void recoverFromReset();
           break;
         default:
           break; // reasoning / tool progress / etc. not surfaced in mobile chat
@@ -463,11 +562,13 @@ function ChatView({
     // and retry — see `attemptConnect` in the mount effect. `leg: transport` picks
     // the active transport (relay vs direct) backend-side.
     //
-    // Always send a number, never null: the gateway replays the rows ABOVE this
-    // ordinal, so `0` (the value when localStorage was evicted and we have nothing
-    // rendered) backfills the whole thread from the server instead of leaving the
-    // chat blank until the next turn. A genuinely empty session replays nothing; an
-    // over-cap history yields a `Frame::Reset` (handled in the frame switch).
+    // Cursor (`sinceOrdinal`): the gateway replays rows ABOVE it, so a real ordinal
+    // catches up the gap, `0` (the value when localStorage was evicted and we have
+    // nothing rendered) backfills the whole thread instead of leaving the chat blank
+    // until the next turn, and `null` is a fresh subscribe with NO catch-up — what
+    // `recoverFromReset` leaves on the relay leg so the reconnect can't overflow
+    // again. A genuinely empty session replays nothing; an over-cap history yields a
+    // `Frame::Reset` (handled in the frame switch).
     return invoke("chat_connect", {
       leg: transport,
       sessionId,
@@ -479,9 +580,10 @@ function ChatView({
     });
     // `t` is intentionally omitted from deps: re-creating `connect` on a language
     // switch would tear down + re-dial the live session. Status strings set by a
-    // later reconnect simply use the language captured here.
+    // later reconnect simply use the language captured here. `recoverFromReset`
+    // shares `connect`'s deps, so it's stable across all other renders.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, transport]);
+  }, [sessionId, transport, recoverFromReset]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -560,7 +662,9 @@ function ChatView({
       unlistenDropped?.();
       invoke("chat_disconnect", { leg: transport }).catch(() => {});
     };
-  }, [connect]);
+    // `reconnectNonce` is a dep so a `Frame::Reset` recovery (which bumps it after
+    // fixing the cursor) tears the leg down and re-dials with the corrected cursor.
+  }, [connect, reconnectNonce]);
 
   // Pick one or more images: stage each (instant local preview) and upload its
   // bytes over the blob leg in the background; the staged entry flips to "ready"
