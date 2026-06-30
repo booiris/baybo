@@ -129,6 +129,22 @@ impl DashboardBackend for FakeBackend {
         })
     }
 
+    async fn traffic_ip_endpoints(
+        &self,
+        ip: String,
+        _range: Range,
+    ) -> Result<IpEndpointBreakdown, DashboardError> {
+        self.record("traffic_ip_endpoints");
+        Ok(IpEndpointBreakdown {
+            ip,
+            endpoints: vec![],
+            totals: IpTotals {
+                requests: 0,
+                bytes: 0,
+            },
+        })
+    }
+
     async fn list_devices(&self) -> Result<Vec<DeviceRow>, DashboardError> {
         self.record("list_devices");
         Ok(vec![])
@@ -251,6 +267,10 @@ async fn every_api_route_401s_without_token() {
         (Method::GET, format!("{MOUNT_PREFIX}/api/traffic/relay")),
         (Method::GET, format!("{MOUNT_PREFIX}/api/traffic/push")),
         (Method::GET, format!("{MOUNT_PREFIX}/api/traffic/ip")),
+        (
+            Method::GET,
+            format!("{MOUNT_PREFIX}/api/traffic/ip/1.2.3.4/endpoints"),
+        ),
         (Method::GET, format!("{MOUNT_PREFIX}/api/devices")),
     ];
     for (method, path) in routes {
@@ -268,6 +288,19 @@ async fn traffic_route_with_token_is_ok() {
         status_of(
             Method::GET,
             &format!("{MOUNT_PREFIX}/api/traffic/relay?range=7d"),
+            Some(GOOD_TOKEN)
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn ip_endpoints_route_with_token_is_ok() {
+    assert_eq!(
+        status_of(
+            Method::GET,
+            &format!("{MOUNT_PREFIX}/api/traffic/ip/203.0.113.7/endpoints?range=24h"),
             Some(GOOD_TOKEN)
         )
         .await,

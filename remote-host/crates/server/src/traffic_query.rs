@@ -331,6 +331,35 @@ impl TrafficReader {
         Ok(out)
     }
 
+    /// One source IP's per-endpoint totals over the window. `ip` is **bound** (`?2`),
+    /// never interpolated — it arrives from the operator via the request path. The
+    /// endpoint label space is the fixed route set, so `limit` only guards corruption.
+    pub(crate) async fn ip_endpoints(
+        &self,
+        ip: &str,
+        range: Range,
+        limit: u32,
+    ) -> Result<Vec<IpEndpointRow>, TrafficQueryError> {
+        let sql = format!(
+            "SELECT endpoint, coalesce(sum(requests),0), coalesce(sum(bytes),0) AS b \
+             FROM {IP_TRAFFIC_TABLE} WHERE hour >= datetime('now', ?1) AND ip = ?2 \
+             GROUP BY endpoint ORDER BY b DESC LIMIT ?3"
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, params![window(range), ip, i64::from(limit)])
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(IpEndpointRow {
+                endpoint: row.get::<String>(0)?,
+                requests: nonneg(row.get::<i64>(1)?),
+                bytes: nonneg(row.get::<i64>(2)?),
+            });
+        }
+        Ok(out)
+    }
+
     /// All-time per-device send/byte totals (no window, no `LIMIT`), keyed by
     /// `device_id` — the dashboard's Devices page joins these onto the live
     /// bindings so each device shows its cumulative push volume.
@@ -481,6 +510,23 @@ mod tests {
         assert_eq!(by_ep[0].bytes, 500);
         let by_ip = r.ip_top_sources(Range::H24, 10).await.unwrap();
         assert_eq!(by_ip[0].ip, "1.1.1.1");
+    }
+
+    #[tokio::test]
+    async fn ip_endpoints_filters_to_one_source_and_orders_by_bytes() {
+        let r = reader().await;
+        seed_ip(&r, "1.1.1.1", "content/join", 1, 5, 500).await;
+        seed_ip(&r, "1.1.1.1", "control", 1, 9, 90).await;
+        seed_ip(&r, "2.2.2.2", "notify", 1, 2, 50).await; // a different IP, must be excluded
+        let eps = r.ip_endpoints("1.1.1.1", Range::H24, 10).await.unwrap();
+        assert_eq!(eps.len(), 2, "only 1.1.1.1's two endpoints");
+        assert_eq!(eps[0].endpoint, "content/join", "ordered by bytes desc");
+        assert_eq!(eps[0].bytes, 500);
+        assert_eq!(eps[1].endpoint, "control");
+        assert!(
+            !eps.iter().any(|e| e.endpoint == "notify"),
+            "the other IP's endpoint is filtered out"
+        );
     }
 
     /// The push ledger: a windowed series + top-devices ordering, and the all-time
