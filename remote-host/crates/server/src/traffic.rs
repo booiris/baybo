@@ -14,7 +14,7 @@
 //! table. With `TRAFFIC_DB_PATH` empty, persistence is skipped but the drain +
 //! evict still runs each tick so the in-memory maps stay bounded.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use libsql::{Builder, Connection, Database, params};
@@ -27,6 +27,17 @@ use remote_host_relay::TrafficRegistry;
 // retention sweep can age out. The hour is part of every PRIMARY KEY (the UPSERT
 // conflict target) and indexed for the prune. Old rows past the retention window
 // are deleted (these are best-effort stats, not session data).
+
+/// The three hourly ledger tables, named once so the writer (schema + UPSERTs +
+/// prune) and the read layer (`traffic_query`) share a single source of truth.
+pub(crate) const RELAY_TRAFFIC_TABLE: &str = "relay_traffic";
+pub(crate) const PUSH_TRAFFIC_TABLE: &str = "push_traffic";
+pub(crate) const IP_TRAFFIC_TABLE: &str = "ip_traffic";
+
+/// How the current UTC hour start (`YYYY-MM-DD HH:00:00`) is stamped at write
+/// time. Shared with `traffic_query` so an overview "last hour" lookup compares
+/// against the byte-identical expression the UPSERTs stamp into `hour`.
+pub(crate) const CURRENT_HOUR_EXPR: &str = "strftime('%Y-%m-%d %H:00:00','now')";
 
 /// One row per `(remote_api_key, server_id, hour)`.
 const RELAY_SCHEMA: &str = r#"CREATE TABLE IF NOT EXISTS relay_traffic (
@@ -72,32 +83,45 @@ const HOUR_INDEXES: [&str; 3] = [
 ];
 
 /// Add an interval's relay delta onto the current hour's row (insert it on first
-/// sight). `excluded.*` is the just-inserted delta.
-const RELAY_UPSERT: &str = r#"INSERT INTO relay_traffic
+/// sight). `excluded.*` is the just-inserted delta. The current-hour stamp is
+/// interpolated from [`CURRENT_HOUR_EXPR`] (a trusted const, never user input).
+static RELAY_UPSERT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"INSERT INTO relay_traffic
     (remote_api_key, server_id, hour, bytes_up, bytes_down, frames_up, frames_down, updated_at)
-    VALUES (?1, ?2, strftime('%Y-%m-%d %H:00:00','now'), ?3, ?4, ?5, ?6, datetime('now'))
+    VALUES (?1, ?2, {CURRENT_HOUR_EXPR}, ?3, ?4, ?5, ?6, datetime('now'))
 ON CONFLICT(remote_api_key, server_id, hour) DO UPDATE SET
     bytes_up = bytes_up + excluded.bytes_up,
     bytes_down = bytes_down + excluded.bytes_down,
     frames_up = frames_up + excluded.frames_up,
     frames_down = frames_down + excluded.frames_down,
-    updated_at = excluded.updated_at"#;
+    updated_at = excluded.updated_at"#
+    )
+});
 
 /// Add an interval's push delta onto the device's current-hour row.
-const PUSH_UPSERT: &str = r#"INSERT INTO push_traffic (device_id, hour, sends, bytes, updated_at)
-    VALUES (?1, strftime('%Y-%m-%d %H:00:00','now'), ?2, ?3, datetime('now'))
+static PUSH_UPSERT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"INSERT INTO push_traffic (device_id, hour, sends, bytes, updated_at)
+    VALUES (?1, {CURRENT_HOUR_EXPR}, ?2, ?3, datetime('now'))
 ON CONFLICT(device_id, hour) DO UPDATE SET
     sends = sends + excluded.sends,
     bytes = bytes + excluded.bytes,
-    updated_at = excluded.updated_at"#;
+    updated_at = excluded.updated_at"#
+    )
+});
 
 /// Add an interval's per-IP delta onto the `(ip, endpoint)`'s current-hour row.
-const IP_UPSERT: &str = r#"INSERT INTO ip_traffic (ip, endpoint, hour, requests, bytes, updated_at)
-    VALUES (?1, ?2, strftime('%Y-%m-%d %H:00:00','now'), ?3, ?4, datetime('now'))
+static IP_UPSERT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"INSERT INTO ip_traffic (ip, endpoint, hour, requests, bytes, updated_at)
+    VALUES (?1, ?2, {CURRENT_HOUR_EXPR}, ?3, ?4, datetime('now'))
 ON CONFLICT(ip, endpoint, hour) DO UPDATE SET
     requests = requests + excluded.requests,
     bytes = bytes + excluded.bytes,
-    updated_at = excluded.updated_at"#;
+    updated_at = excluded.updated_at"#
+    )
+});
 
 /// Spawn the flush task. `db_path` empty ⇒ no persistence (drain-and-discard, still
 /// evicts). `flush_secs` is clamped to ≥1. `retention_days` ages out hourly rows
@@ -178,19 +202,30 @@ pub(crate) fn spawn<F>(
     });
 }
 
-/// Open the local DB and ensure all three hourly tables + their hour indexes
-/// (`CREATE TABLE IF NOT EXISTS`, so a fresh DB gets the schema and an existing one
-/// is left as-is).
+/// Open the local DB in WAL mode and ensure the schema ([`ensure_schema`]).
 async fn init_db(path: &str) -> Result<(Database, Connection), libsql::Error> {
     let db = Builder::new_local(path).build().await?;
     let conn = db.connect()?;
+    // WAL lets the read connection (the dashboard's `traffic_query` reader) see
+    // committed rows without blocking this writer. `PRAGMA journal_mode` returns
+    // a row, so drain it rather than `execute`. WAL is a persistent file mode.
+    let mut r = conn.query("PRAGMA journal_mode=WAL", ()).await?;
+    let _ = r.next().await?;
+    ensure_schema(&conn).await?;
+    Ok((db, conn))
+}
+
+/// Create all three hourly tables + their hour indexes (`CREATE … IF NOT EXISTS`,
+/// idempotent). Shared with the read layer so a `traffic_query` reader can open a
+/// not-yet-flushed DB without hitting `no such table`.
+pub(crate) async fn ensure_schema(conn: &Connection) -> Result<(), libsql::Error> {
     conn.execute(RELAY_SCHEMA, ()).await?;
     conn.execute(PUSH_SCHEMA, ()).await?;
     conn.execute(IP_SCHEMA, ()).await?;
     for index in HOUR_INDEXES {
         conn.execute(index, ()).await?;
     }
-    Ok((db, conn))
+    Ok(())
 }
 
 /// Delete hourly rows older than `retention_days` from every ledger (best-effort
@@ -199,7 +234,7 @@ async fn prune(conn: &Connection, retention_days: u64) -> Result<(), libsql::Err
     // Clamp to ≥1 day: a `0` (a plausible "disable retention" mistake) would make
     // the cutoff `now` and delete even the current hour's rows.
     let cutoff = format!("-{} days", retention_days.max(1));
-    for table in ["relay_traffic", "push_traffic", "ip_traffic"] {
+    for table in [RELAY_TRAFFIC_TABLE, PUSH_TRAFFIC_TABLE, IP_TRAFFIC_TABLE] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE hour < datetime('now', ?1)"),
             params![cutoff.clone()],
@@ -269,7 +304,7 @@ async fn write_deltas(
     let result = async {
         for d in relay {
             tx.execute(
-                RELAY_UPSERT,
+                RELAY_UPSERT.as_str(),
                 params![
                     d.remote_api_key.clone(),
                     d.server_id.clone(),
@@ -283,7 +318,7 @@ async fn write_deltas(
         }
         for d in push {
             tx.execute(
-                PUSH_UPSERT,
+                PUSH_UPSERT.as_str(),
                 params![
                     d.device_id.clone(),
                     d.counts.sends as i64,
@@ -294,7 +329,7 @@ async fn write_deltas(
         }
         for d in ip {
             tx.execute(
-                IP_UPSERT,
+                IP_UPSERT.as_str(),
                 params![
                     d.ip.clone(),
                     d.endpoint.clone(),

@@ -23,6 +23,11 @@ pub const GUEST_MAX_CONNS: u32 = 2_000;
 pub const GUEST_MAX_BPS: u64 = 20_971_520; // 20 MiB/s
 pub const GUEST_PER_SERVER_MAX_BPS: u64 = 2_097_152; // 2 MiB/s
 
+/// The canonical `tier` column strings — the single source of truth shared by
+/// [`Tier::as_str`] (write/serialize) and [`Tier::from_str`] (parse).
+pub const TIER_GUEST: &str = "guest";
+pub const TIER_REGISTERED: &str = "registered";
+
 /// The reserved `remote_api_key` whose own row is the **guest-tier template**: a
 /// guest row's NULL limit column inherits this row's value for that column (then the
 /// `GUEST_*` const). It is an ordinary admitted row — the shared trial key — that
@@ -48,13 +53,23 @@ pub enum Tier {
     Registered,
 }
 
+impl Tier {
+    /// The canonical `tier` column string for this tier.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Guest => TIER_GUEST,
+            Self::Registered => TIER_REGISTERED,
+        }
+    }
+}
+
 impl FromStr for Tier {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "guest" => Ok(Self::Guest),
-            "registered" => Ok(Self::Registered),
+            TIER_GUEST => Ok(Self::Guest),
+            TIER_REGISTERED => Ok(Self::Registered),
             _ => Err(()),
         }
     }
@@ -209,6 +224,16 @@ impl InMemoryAdmission {
             .sum()
     }
 
+    /// Number of admitted keys currently in the in-memory allow-list. Feeds the
+    /// dashboard overview's `keys_admitted` card.
+    pub fn len(&self) -> usize {
+        self.keys.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Remove guest entries whose `expires_at` is in the past; return the removed
     /// keys so the caller can drop their live connections.
     ///
@@ -261,6 +286,21 @@ mod tests {
         keys: [(&str, AdmissionEntry); N],
     ) -> HashMap<String, AdmissionEntry> {
         keys.into_iter().map(|(k, e)| (k.to_string(), e)).collect()
+    }
+
+    #[test]
+    fn len_and_is_empty_track_the_admitted_set() {
+        let a = InMemoryAdmission::new();
+        assert!(a.is_empty());
+        assert_eq!(a.len(), 0);
+        a.replace_all(keyset([
+            ("k1", entry(Tier::Registered)),
+            ("k2", entry(Tier::Guest)),
+        ]));
+        assert!(!a.is_empty());
+        assert_eq!(a.len(), 2);
+        a.revoke("k1");
+        assert_eq!(a.len(), 1);
     }
 
     #[test]
