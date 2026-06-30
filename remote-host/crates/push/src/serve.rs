@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use remote_host_ratelimit::ip_limit::{self, IpLimitConfig};
+use remote_host_edge::ip_limit::{self, IpLimitConfig};
 
 use crate::apns_http::HttpApnsSender;
 use crate::error::PushError;
@@ -125,7 +125,7 @@ impl PushConfig {
 /// `ip_limit` mounts the shared per-source-IP request throttle ahead of body
 /// parsing / signature verification, so a `/register` or `/notify` flood is shed
 /// with `429` by client IP before any Ed25519 work. It uses the same proxy-aware
-/// client-IP resolution as the relay (see [`remote_host_ratelimit::ip_limit`]).
+/// client-IP resolution as the relay (see [`remote_host_edge::ip_limit`]).
 ///
 /// `traffic` is the per-device send/byte ledger (created by the caller so it can
 /// also hand it to the server's flush task); every issued APNs send is recorded
@@ -246,7 +246,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     async fn push_routes_are_ip_throttled_before_body_parsing() {
         use axum::body::Body;
         use axum::http::{HeaderName, StatusCode, header};
-        use remote_host_ratelimit::ip_limit::IP_BURST;
+        use remote_host_edge::ip_limit::IP_BURST;
         use tower::ServiceExt;
 
         let app = build_router(

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use parking_lot::Mutex;
-use remote_host_ratelimit::TokenBucket;
+use remote_host_edge::TokenBucket;
 
 /// Sustained `/notify` rate per device, in pushes **per minute** — the natural
 /// granularity for a notification (pushes are sparse, one per pushable turn).

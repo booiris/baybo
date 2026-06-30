@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use remote_host_ratelimit::TokenBucket;
+use remote_host_edge::TokenBucket;
 
 /// A byte bucket shared by every leg that meters against the same level.
 type SharedBucket = Arc<Mutex<TokenBucket>>;

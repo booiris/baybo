@@ -21,25 +21,30 @@
 //! [`try_match`]: RelayBroker::try_match
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Extension, Path, Request, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, Extension, FromRequestParts, Path, Request, State};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use remote_host_admission::{Admission, AdmissionEntry, Admit};
+use remote_host_edge::ip_limit::{self, resolve_client_ip_from};
+use remote_host_edge::ip_traffic::{ClientIp, EP_CONTENT_HOST, EP_CONTENT_JOIN};
 use remote_host_protocol::relay::{
     CONTENT_HOST, CONTENT_JOIN, CONTROL, LegClass, PAIR_HOST, PAIR_JOIN, RELAY_LEG_CLASS_HEADER,
     REMOTE_API_KEY_HEADER,
 };
-use remote_host_ratelimit::ip_limit;
-// `build_router` (pub) takes an `IpLimitConfig`, so downstream callers must be
-// able to name it without depending on `remote-host-ratelimit` directly.
-pub use remote_host_ratelimit::ip_limit::IpLimitConfig;
+// `build_router` (pub) takes an `IpLimitConfig` and a `RelayServices` carrying an
+// `IpTrafficRegistry`, so downstream callers must be able to name both without
+// depending on `remote-host-edge` directly.
+pub use remote_host_edge::IpTrafficRegistry;
+pub use remote_host_edge::ip_limit::IpLimitConfig;
 
 use crate::bandwidth::{BandwidthRegistry, LegClass as BwClass};
 use crate::broker::{ParkOutcome, RelayBroker};
@@ -133,6 +138,27 @@ struct PendingContentLeg {
     owner_remote_api_key: String,
 }
 
+/// An optional socket-peer extractor that **never fails**: `Some` when the service
+/// was served with `ConnectInfo<SocketAddr>` (production), `None` otherwise (e.g. a
+/// test served without connect info). Lets the content handlers resolve a client IP
+/// for byte accounting where available without rejecting the upgrade where it isn't
+/// — unlike a bare `ConnectInfo` extractor, which `ConnectInfo` only implements as a
+/// *fallible* `FromRequestParts`.
+struct OptPeer(Option<SocketAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for OptPeer {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(OptPeer(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0),
+        ))
+    }
+}
+
 #[derive(Clone)]
 struct RelayState {
     broker: Arc<RelayBroker>,
@@ -150,6 +176,12 @@ struct RelayState {
     /// bytes/frames they move (both directions of a session share one entry). The
     /// server's flush task drains it to the durable traffic ledger.
     traffic: Arc<TrafficRegistry>,
+    /// Per-`(ip, endpoint)` traffic counters; content legs also attribute their
+    /// relayed bytes to the source IP (phone IP for join, gateway IP for host).
+    ip_traffic: Arc<IpTrafficRegistry>,
+    /// Trusted proxy client-IP headers (from the IP-limit config), so the content
+    /// handlers resolve the same client IP the limiter/recorder middleware do.
+    trusted_headers: Arc<Vec<HeaderName>>,
     /// `relay_key` → content leg metadata awaiting the gateway host. The phone's
     /// content-join writes it (it knows the server, class, and owning admission
     /// key); the gateway's content-host must claim it with that same key before it
@@ -160,25 +192,39 @@ struct RelayState {
     join_limiter: Arc<JoinRateLimiter>,
 }
 
-/// Assemble the relay router. `admission` is the shared, hot-reloaded allow-list
-/// of admitted `remote_api_key`s; `conns` tracks live connections so a revoke (an
-/// admission reload that dropped a key) can kick them; `bandwidth` throttles each
-/// gateway's content throughput at two levels (per key ∧ per server); `traffic`
-/// records the bytes/frames each `(key, server)` moves for the durable ledger.
+/// The shared registries a relay router meters against, passed to [`build_router`]
+/// as a struct so every required dependency shows up by name at the call site.
+pub struct RelayServices {
+    /// Hot-reloaded allow-list of admitted `remote_api_key`s.
+    pub admission: Arc<dyn Admission>,
+    /// Live connections, so a revoke (an admission reload that dropped a key) can
+    /// kick them.
+    pub conns: Arc<ConnectionRegistry>,
+    /// Two-level content-bandwidth throttle (per key ∧ per server).
+    pub bandwidth: Arc<BandwidthRegistry>,
+    /// Per-`(remote_api_key, server_id)` traffic ledger.
+    pub traffic: Arc<TrafficRegistry>,
+    /// Per-`(ip, endpoint)` traffic ledger (content legs add relayed bytes to it).
+    pub ip_traffic: Arc<IpTrafficRegistry>,
+}
+
+/// Assemble the relay router from its shared [`RelayServices`].
 ///
 /// `ip_limit` configures the shared per-source-IP upgrade throttle (see
-/// [`remote_host_ratelimit::ip_limit`]). Enable it keying on the socket peer when
+/// [`remote_host_edge::ip_limit`]). Enable it keying on the socket peer when
 /// remote-host terminates TLS itself (the peer is the real client); behind a
 /// proxy, either disable it (rate-limit at the proxy) or give it the trusted
 /// client-IP header(s) the proxy sets (e.g. `cf-connecting-ip`) — see the
-/// [`IpLimitConfig`] trust caveat.
-pub fn build_router(
-    admission: Arc<dyn Admission>,
-    conns: Arc<ConnectionRegistry>,
-    bandwidth: Arc<BandwidthRegistry>,
-    traffic: Arc<TrafficRegistry>,
-    ip_limit: IpLimitConfig,
-) -> Router {
+/// [`IpLimitConfig`] trust caveat. The content handlers reuse those same trusted
+/// headers to resolve each leg's client IP for the per-IP byte accounting.
+pub fn build_router(services: RelayServices, ip_limit: IpLimitConfig) -> Router {
+    let RelayServices {
+        admission,
+        conns,
+        bandwidth,
+        traffic,
+        ip_traffic,
+    } = services;
     let state = RelayState {
         broker: Arc::new(RelayBroker::new()),
         admitted: admission,
@@ -186,6 +232,8 @@ pub fn build_router(
         conns,
         bandwidth,
         traffic,
+        ip_traffic,
+        trusted_headers: Arc::new(ip_limit.trusted_headers.clone()),
         pending_content_legs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         join_limiter: Arc::new(JoinRateLimiter::default()),
     };
@@ -468,7 +516,8 @@ async fn content_join_handler(
         remote_api_key: phone_key,
         ..
     }): Extension<Admitted>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
+    OptPeer(peer): OptPeer,
     ws: WebSocketUpgrade,
 ) -> Response {
     // The phone authors the leg class on its own join (the relay copies it, never
@@ -547,10 +596,29 @@ async fn content_join_handler(
     let meter = state
         .traffic
         .meter_for(&remote_api_key, &relay_node_id, Direction::Up);
+    // Attribute this leg's relayed bytes to the phone's source IP — the same client
+    // IP the recorder middleware counted the request under.
+    let ip_meter = state.ip_traffic.meter_for(
+        ClientIp::from_opt(resolve_client_ip_from(
+            &headers,
+            peer.map(|p| p.ip()),
+            &state.trusted_headers,
+        )),
+        EP_CONTENT_JOIN,
+    );
     let broker = Arc::clone(&state.broker);
     let pending = Arc::clone(&state.pending_content_legs);
     capped(ws).on_upgrade(move |socket| async move {
-        pump_ws(socket, leg, Some(LegMetering { limiter, meter })).await;
+        pump_ws(
+            socket,
+            leg,
+            Some(LegMetering {
+                limiter,
+                meter,
+                ip_meter,
+            }),
+        )
+        .await;
         broker.cancel(&relay_key);
         // Backstop: if the gateway host never claimed this leg, drop the mapping so
         // it can't linger after the phone leg ends.
@@ -569,6 +637,8 @@ async fn content_host_handler(
         remote_api_key: key,
         entry,
     }): Extension<Admitted>,
+    headers: HeaderMap,
+    OptPeer(peer): OptPeer,
     ws: WebSocketUpgrade,
 ) -> Response {
     // Recover the phone-side metadata for this relay key. This is the ownership
@@ -629,11 +699,28 @@ async fn content_host_handler(
     // as the phone leg, so it accumulates into the same entry's down-counters.
     // Resolved after the join succeeds, so a doomed join never populates the map.
     let meter = state.traffic.meter_for(&key, &server_id, Direction::Down);
+    // Attribute this leg's relayed bytes to the gateway's source IP.
+    let ip_meter = state.ip_traffic.meter_for(
+        ClientIp::from_opt(resolve_client_ip_from(
+            &headers,
+            peer.map(|p| p.ip()),
+            &state.trusted_headers,
+        )),
+        EP_CONTENT_HOST,
+    );
     let broker = Arc::clone(&state.broker);
     capped(ws).on_upgrade(move |socket| async move {
         let _guard = guard;
         tokio::select! {
-            _ = pump_ws(socket, leg, Some(LegMetering { limiter, meter })) => {}
+            _ = pump_ws(
+                socket,
+                leg,
+                Some(LegMetering {
+                    limiter,
+                    meter,
+                    ip_meter,
+                }),
+            ) => {}
             // The gateway's remote_api_key was revoked mid-session.
             _ = kick => {}
         }
@@ -660,10 +747,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let app = build_router(
-            admission,
-            Arc::new(ConnectionRegistry::new()),
-            Arc::new(BandwidthRegistry::new()),
-            Arc::new(TrafficRegistry::new()),
+            RelayServices {
+                admission,
+                conns: Arc::new(ConnectionRegistry::new()),
+                bandwidth: Arc::new(BandwidthRegistry::new()),
+                traffic: Arc::new(TrafficRegistry::new()),
+                ip_traffic: Arc::new(IpTrafficRegistry::new()),
+            },
             IpLimitConfig::socket_peer(),
         );
         tokio::spawn(async move {
@@ -688,10 +778,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let app = build_router(
-            admission,
-            Arc::new(ConnectionRegistry::new()),
-            Arc::new(BandwidthRegistry::new()),
-            Arc::new(TrafficRegistry::new()),
+            RelayServices {
+                admission,
+                conns: Arc::new(ConnectionRegistry::new()),
+                bandwidth: Arc::new(BandwidthRegistry::new()),
+                traffic: Arc::new(TrafficRegistry::new()),
+                ip_traffic: Arc::new(IpTrafficRegistry::new()),
+            },
             ip_limit,
         );
         tokio::spawn(async move {
@@ -892,7 +985,7 @@ mod tests {
         // the limiter (outermost) 429s before admission even runs.
         let mut saw_401 = false;
         let mut saw_429 = false;
-        for _ in 0..(remote_host_ratelimit::ip_limit::IP_BURST as usize + 8) {
+        for _ in 0..(remote_host_edge::ip_limit::IP_BURST as usize + 8) {
             match host_attempt_status(port).await {
                 WsStatus::UNAUTHORIZED => saw_401 = true,
                 WsStatus::TOO_MANY_REQUESTS => {
@@ -926,7 +1019,7 @@ mod tests {
 
         // Flood one CF client IP until it is throttled.
         let mut saw_429 = false;
-        for _ in 0..(remote_host_ratelimit::ip_limit::IP_BURST as usize + 8) {
+        for _ in 0..(remote_host_edge::ip_limit::IP_BURST as usize + 8) {
             match host_attempt_with_cf_ip(port, Some("203.0.113.1")).await {
                 WsStatus::UNAUTHORIZED => {}
                 WsStatus::TOO_MANY_REQUESTS => {
@@ -1090,13 +1183,17 @@ mod tests {
             "inst-A",
         ]));
         let traffic = Arc::new(TrafficRegistry::new());
+        let ip_traffic = Arc::new(IpTrafficRegistry::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let app = build_router(
-            admission,
-            Arc::new(ConnectionRegistry::new()),
-            Arc::new(BandwidthRegistry::new()),
-            traffic.clone(),
+            RelayServices {
+                admission,
+                conns: Arc::new(ConnectionRegistry::new()),
+                bandwidth: Arc::new(BandwidthRegistry::new()),
+                traffic: traffic.clone(),
+                ip_traffic: ip_traffic.clone(),
+            },
             IpLimitConfig::socket_peer(),
         );
         tokio::spawn(async move {
@@ -1163,6 +1260,22 @@ mod tests {
         assert_eq!(e.counts.frames_up, 1);
         assert_eq!(e.counts.bytes_down, b"down".len() as u64);
         assert_eq!(e.counts.frames_down, 1);
+
+        // The same relayed bytes are attributed to the loopback source IP per
+        // endpoint: the phone leg's uplink under content/join, the gateway leg's
+        // downlink under content/host. (No request count here — build_router does
+        // not mount the recorder middleware; that is main.rs's outer layer.)
+        let ip_snap = ip_traffic.snapshot();
+        let join = ip_snap
+            .iter()
+            .find(|e| e.ip == "127.0.0.1" && e.endpoint == "content/join")
+            .expect("per-IP bytes for content/join");
+        assert_eq!(join.counts.bytes, b"noise-up".len() as u64);
+        let host = ip_snap
+            .iter()
+            .find(|e| e.ip == "127.0.0.1" && e.endpoint == "content/host")
+            .expect("per-IP bytes for content/host");
+        assert_eq!(host.counts.bytes, b"down".len() as u64);
     }
 
     /// A phone whose gateway has no live control connection is refused fast.
@@ -1226,10 +1339,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let app = build_router(
-            admission,
-            conns.clone(),
-            Arc::new(BandwidthRegistry::new()),
-            Arc::new(TrafficRegistry::new()),
+            RelayServices {
+                admission,
+                conns: conns.clone(),
+                bandwidth: Arc::new(BandwidthRegistry::new()),
+                traffic: Arc::new(TrafficRegistry::new()),
+                ip_traffic: Arc::new(IpTrafficRegistry::new()),
+            },
             IpLimitConfig::socket_peer(),
         );
         tokio::spawn(async move {

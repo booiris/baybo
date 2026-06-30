@@ -24,17 +24,16 @@
 //! evicted over a soft cap so a churn of distinct source IPs can't grow the map
 //! without bound. Time is injectable so the math is tested without real sleeps.
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderName, StatusCode};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use parking_lot::Mutex;
+use dashmap::DashMap;
 
 use crate::TokenBucket;
 
@@ -57,9 +56,11 @@ pub const IP_BURST: f64 = 60.0;
 pub const IP_BUCKET_SOFT_CAP: usize = 16_384;
 
 /// One token-bucket per source IP, all at the same rate; `rate_per_sec` / `burst`
-/// set that rate and `soft_cap` bounds the map's size.
+/// set that rate and `soft_cap` bounds the map's size. The map is a sharded
+/// [`DashMap`] so a request flood from many source IPs contends per-shard rather
+/// than on one global lock.
 pub struct IpRateLimiter {
-    buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
+    buckets: DashMap<IpAddr, TokenBucket>,
     rate_per_sec: f64,
     burst: f64,
     soft_cap: usize,
@@ -68,7 +69,7 @@ pub struct IpRateLimiter {
 impl IpRateLimiter {
     pub fn new(rate_per_sec: f64, burst: f64, soft_cap: usize) -> Self {
         Self {
-            buckets: Mutex::new(HashMap::new()),
+            buckets: DashMap::new(),
             rate_per_sec,
             burst,
             soft_cap,
@@ -82,11 +83,17 @@ impl IpRateLimiter {
     }
 
     fn check_at(&self, ip: IpAddr, now: Instant) -> bool {
-        let mut buckets = self.buckets.lock();
-        if buckets.len() >= self.soft_cap {
-            buckets.retain(|_, b| !b.is_full_at(now));
+        // Fast path: an existing bucket draws under its own shard only.
+        if let Some(mut bucket) = self.buckets.get_mut(&ip) {
+            return bucket.try_take_at(1.0, now);
         }
-        buckets
+        // New IP: if at the soft cap, shed brim-full (idle) buckets to make room,
+        // then insert. `len()`/`retain` are O(shards) but run only on this new-IP
+        // path, not for an already-tracked IP.
+        if self.buckets.len() >= self.soft_cap {
+            self.buckets.retain(|_, b| !b.is_full_at(now));
+        }
+        self.buckets
             .entry(ip)
             .or_insert_with(|| TokenBucket::new_at(self.burst, self.rate_per_sec, now))
             .try_take_at(1.0, now)
@@ -210,17 +217,31 @@ fn too_many() -> Response {
 /// client. Both are only trustworthy when the origin is locked to the proxy (see
 /// [`IpLimitConfig`]).
 pub fn resolve_client_ip(req: &Request, trusted_headers: &[HeaderName]) -> Option<IpAddr> {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip());
+    resolve_client_ip_from(req.headers(), peer, trusted_headers)
+}
+
+/// [`resolve_client_ip`] from the request's parts — for a handler that holds the
+/// [`HeaderMap`] and the socket `peer` (via an `Option<ConnectInfo<SocketAddr>>`
+/// extractor) rather than the whole `Request` (e.g. the relay content handlers,
+/// which resolve the leg's client IP to attribute its bytes). Same trust caveat.
+pub fn resolve_client_ip_from(
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+    trusted_headers: &[HeaderName],
+) -> Option<IpAddr> {
     for name in trusted_headers {
-        if let Some(value) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
+        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
             let first = value.split(',').next().unwrap_or("").trim();
             if let Ok(ip) = first.parse::<IpAddr>() {
                 return Some(ip);
             }
         }
     }
-    req.extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| addr.ip())
+    peer
 }
 
 /// Outermost pre-layer: throttle requests per client IP (flood backstop, ahead of
@@ -289,7 +310,7 @@ mod tests {
         let later = t0 + Duration::from_secs(1);
         assert!(limiter.check_at(ip(3), later));
         assert!(
-            limiter.buckets.lock().len() <= 2,
+            limiter.buckets.len() <= 2,
             "idle IP buckets evicted at the cap"
         );
     }
