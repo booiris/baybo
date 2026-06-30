@@ -57,18 +57,42 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:1933";
 const DEFAULT_ACCOUNT: &str = "default";
 const DEFAULT_AGENT: &str = "baybo";
 const DEFAULT_TOP_K: usize = 5;
-/// Default per-request budget for tool calls (model is already waiting).
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
-/// Recall is on the critical path — cap it well below `HTTP_TIMEOUT` so a
-/// slow / down OpenViking server degrades the turn to "no recalled context"
-/// instead of stalling the user up to 30 s.
-const RECALL_TIMEOUT: Duration = Duration::from_secs(5);
-/// Background-write budget for `on_job_complete` / `on_session_end`.
-/// Detached on the runtime root, so the user never waits;
-/// `/sessions/{sid}/commit` triggers the 6-category server-side extraction
-/// (LLM-backed), which can be slow under load — give it a generous ceiling.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Per-request timeout budgets. Production uses [`OpenVikingTimeouts::default`];
+/// tests inject ms-scale values via [`OpenVikingMemory::with_timeouts`] to
+/// exercise the timeout code paths without real-time sleeps.
+#[derive(Debug, Clone)]
+pub struct OpenVikingTimeouts {
+    /// Default per-request budget for tool calls (model is already waiting).
+    pub http: Duration,
+    /// `GET /health` probe budget.
+    pub health: Duration,
+    /// Recall is on the critical path — cap it well below `http` so a slow /
+    /// down OpenViking server degrades the turn to "no recalled context"
+    /// instead of stalling the user up to the full `http` budget.
+    pub recall: Duration,
+    /// Background-write budget for `on_job_complete` / `on_session_end`.
+    /// Detached on the runtime root, so the user never waits;
+    /// `/sessions/{sid}/commit` triggers the 6-category server-side extraction
+    /// (LLM-backed), which can be slow under load — give it a generous ceiling.
+    pub write: Duration,
+    /// `viking_store` polls the commit's extraction task up to this ceiling.
+    pub store_poll: Duration,
+    /// `viking_store`'s declared wall-clock (`Tool::max_timeout`).
+    pub store_max: Duration,
+}
+
+impl Default for OpenVikingTimeouts {
+    fn default() -> Self {
+        Self {
+            http: Duration::from_secs(30),
+            health: Duration::from_secs(3),
+            recall: Duration::from_secs(5),
+            write: Duration::from_secs(600),
+            store_poll: Duration::from_secs(110),
+            store_max: Duration::from_secs(120),
+        }
+    }
+}
 /// Default user-secret name (managed via `baybo secret add`) holding the
 /// OpenViking API key. Doubles as the process-env var name. Optional —
 /// when nothing is set the backend runs unauthenticated (local-dev mode).
@@ -90,11 +114,9 @@ const DEFAULT_SCORE_THRESHOLD: f64 = 0.15;
 /// single-match score above which deletion happens without confirmation.
 const FORGET_DEFAULT_LIMIT: usize = 5;
 const FORGET_AUTO_DELETE_SCORE: f64 = 0.85;
-/// `viking_store` polls the commit's Phase-2 extraction task at this cadence
-/// up to this ceiling; `STORE_MAX_TIMEOUT` is the tool's declared wall-clock.
+/// `viking_store` polls the commit's Phase-2 extraction task at this cadence;
+/// the ceiling is [`OpenVikingTimeouts::store_poll`].
 const STORE_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const STORE_POLL_TIMEOUT: Duration = Duration::from_secs(110);
-const STORE_MAX_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Body preview cap shared by the tracing logs and the `HttpFetch`
 /// trace event payload. Wide enough to be useful for debugging, short
@@ -185,6 +207,7 @@ struct OpenVikingInner {
     api_key: String,
     account: String,
     top_k: usize,
+    timeouts: OpenVikingTimeouts,
 }
 
 impl OpenVikingInner {
@@ -450,7 +473,7 @@ impl OpenVikingInner {
             }
             tokio::time::sleep(interval).await;
             match self
-                .get(&task_path, user_id, &[], HTTP_TIMEOUT, events)
+                .get(&task_path, user_id, &[], self.timeouts.http, events)
                 .await
             {
                 Ok(task) => match task.get("status").and_then(|v| v.as_str()) {
@@ -535,9 +558,31 @@ impl OpenVikingMemory {
         api_key: String,
         proxy: Option<&ProxySettings>,
     ) -> Result<Self> {
+        Self::build(cfg, api_key, proxy, OpenVikingTimeouts::default())
+    }
+
+    /// Like [`Self::new`] but with caller-supplied timeout budgets. Production
+    /// uses [`Self::new`] (default budgets); callers that need non-default
+    /// timeouts — diagnostics, tests exercising the timeout paths without
+    /// real-time sleeps — go through here.
+    pub fn with_timeouts(
+        cfg: OpenVikingConfig,
+        api_key: String,
+        proxy: Option<&ProxySettings>,
+        timeouts: OpenVikingTimeouts,
+    ) -> Result<Self> {
+        Self::build(cfg, api_key, proxy, timeouts)
+    }
+
+    fn build(
+        cfg: OpenVikingConfig,
+        api_key: String,
+        proxy: Option<&ProxySettings>,
+        timeouts: OpenVikingTimeouts,
+    ) -> Result<Self> {
         let client = baybo_security::http::client_builder(proxy)
             .map_err(|e| MemoryError::Backend(format!("openviking client build failed: {e}")))?
-            .timeout(HTTP_TIMEOUT)
+            .timeout(timeouts.http)
             .build()
             .map_err(|e| MemoryError::Backend(format!("openviking client build failed: {e}")))?;
         let inner = Arc::new(OpenVikingInner {
@@ -546,6 +591,7 @@ impl OpenVikingMemory {
             api_key,
             account: cfg.account().to_string(),
             top_k: cfg.top_k(),
+            timeouts,
         });
         Ok(Self { inner })
     }
@@ -558,7 +604,7 @@ impl OpenVikingMemory {
             .client
             .get(self.inner.url("/health"))
             .headers(self.inner.base_headers("default"))
-            .timeout(HEALTH_TIMEOUT)
+            .timeout(self.inner.timeouts.health)
             .send()
             .await;
         match result {
@@ -578,7 +624,7 @@ impl OpenVikingMemory {
     /// diagnostics — commit through this and then poll [`Self::wait_commit_task`].
     pub async fn commit_session(&self, user_id: &str, session_id: &str) -> Result<CommitAck> {
         self.inner
-            .commit(user_id, session_id, WRITE_TIMEOUT, None)
+            .commit(user_id, session_id, self.inner.timeouts.write, None)
             .await
     }
 
@@ -607,7 +653,13 @@ impl OpenVikingMemory {
         let body = json!({"query": query, "top_k": self.inner.top_k});
         let resp = self
             .inner
-            .post_json("/api/v1/search/find", user_id, &body, RECALL_TIMEOUT, None)
+            .post_json(
+                "/api/v1/search/find",
+                user_id,
+                &body,
+                self.inner.timeouts.recall,
+                None,
+            )
             .await?;
         Ok(parse_search_results(&resp))
     }
@@ -625,7 +677,7 @@ impl OpenVikingMemory {
         let path = format!("/api/v1/sessions/{session_id}/messages");
         let body = json!({"role": role, "content": content});
         self.inner
-            .post_json(&path, user_id, &body, WRITE_TIMEOUT, None)
+            .post_json(&path, user_id, &body, self.inner.timeouts.write, None)
             .await?;
         Ok(())
     }
@@ -887,7 +939,7 @@ impl VikingRecallTool {
                 "/api/v1/search/find",
                 user_id,
                 &body,
-                HTTP_TIMEOUT,
+                self.inner.timeouts.http,
                 Some(events),
             )
             .await
@@ -995,7 +1047,7 @@ impl Tool for VikingStoreTool {
         TOOL_STORE
     }
     fn max_timeout(&self) -> Duration {
-        STORE_MAX_TIMEOUT
+        self.inner.timeouts.store_max
     }
     fn description(&self) -> String {
         "Store text in the OpenViking memory pipeline: write it to a session and run server-side \
@@ -1036,20 +1088,31 @@ impl Tool for VikingStoreTool {
         let msg_path = format!("/api/v1/sessions/{session_id}/messages");
         let body = json!({"role": role, "content": text});
         self.inner
-            .post_json(&msg_path, user_id, &body, HTTP_TIMEOUT, Some(&ctx.events))
+            .post_json(
+                &msg_path,
+                user_id,
+                &body,
+                self.inner.timeouts.http,
+                Some(&ctx.events),
+            )
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
 
         let ack = self
             .inner
-            .commit(user_id, &session_id, HTTP_TIMEOUT, Some(&ctx.events))
+            .commit(
+                user_id,
+                &session_id,
+                self.inner.timeouts.http,
+                Some(&ctx.events),
+            )
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         let mut status = ack.status;
         let mut memories = ack.memories_extracted;
 
         // Phase 2 (extraction) runs as a background task; poll it to completion
-        // so the model gets a real count, bounded by STORE_POLL_TIMEOUT and the
+        // so the model gets a real count, bounded by the store-poll timeout and the
         // user's cancellation.
         if let Some(task_id) = ack.task_id.as_deref()
             && status != "completed"
@@ -1061,7 +1124,7 @@ impl Tool for VikingStoreTool {
                     user_id,
                     task_id,
                     STORE_POLL_INTERVAL,
-                    STORE_POLL_TIMEOUT,
+                    self.inner.timeouts.store_poll,
                     Some(&ctx.events),
                     || ctx.cancellation_token.is_cancelled(),
                 )
@@ -1099,7 +1162,7 @@ impl VikingForgetTool {
                 "/api/v1/fs",
                 ctx.user.id.as_str(),
                 &[("uri", uri), ("recursive", "false")],
-                HTTP_TIMEOUT,
+                self.inner.timeouts.http,
                 Some(&ctx.events),
             )
             .await
@@ -1177,7 +1240,7 @@ impl Tool for VikingForgetTool {
                 "/api/v1/search/find",
                 ctx.user.id.as_str(),
                 &body,
-                HTTP_TIMEOUT,
+                self.inner.timeouts.http,
                 Some(&ctx.events),
             )
             .await
@@ -1255,7 +1318,7 @@ impl Tool for VikingArchiveExpandTool {
                 &path,
                 ctx.user.id.as_str(),
                 &[],
-                HTTP_TIMEOUT,
+                self.inner.timeouts.http,
                 Some(&ctx.events),
             )
             .await

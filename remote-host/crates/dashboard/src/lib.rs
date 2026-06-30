@@ -25,9 +25,9 @@ use axum::{Json, Router};
 pub use auth::DashboardToken;
 pub use types::{
     AdmitKeyOutcome, AdmitKeyRequest, BucketUnit, DashboardError, DeviceRow, EditKeyRequest,
-    IpBucket, IpEndpointTotal, IpTotal, IpTotals, IpTrafficSeries, KeyRow, KickOutcome,
-    OverviewSnapshot, PushBucket, PushDeviceTotal, PushTotals, PushTrafficSeries, Range,
-    RangeQuery, RelayBucket, RelayKeyTotal, RelayTotals, RelayTrafficSeries, RevealedKey,
+    IpBucket, IpEndpointBreakdown, IpEndpointTotal, IpTotal, IpTotals, IpTrafficSeries, KeyRow,
+    KickOutcome, OverviewSnapshot, PushBucket, PushDeviceTotal, PushTotals, PushTrafficSeries,
+    Range, RangeQuery, RelayBucket, RelayKeyTotal, RelayTotals, RelayTrafficSeries, RevealedKey,
 };
 
 use auth::require_token;
@@ -59,6 +59,11 @@ pub trait DashboardBackend: Send + Sync {
     async fn traffic_relay(&self, range: Range) -> Result<RelayTrafficSeries, DashboardError>;
     async fn traffic_push(&self, range: Range) -> Result<PushTrafficSeries, DashboardError>;
     async fn traffic_ip(&self, range: Range) -> Result<IpTrafficSeries, DashboardError>;
+    async fn traffic_ip_endpoints(
+        &self,
+        ip: String,
+        range: Range,
+    ) -> Result<IpEndpointBreakdown, DashboardError>;
     async fn list_devices(&self) -> Result<Vec<DeviceRow>, DashboardError>;
 }
 
@@ -96,6 +101,10 @@ pub fn router(config: DashboardConfig) -> Router {
         .route(&format!("{p}/api/traffic/relay"), get(traffic_relay))
         .route(&format!("{p}/api/traffic/push"), get(traffic_push))
         .route(&format!("{p}/api/traffic/ip"), get(traffic_ip))
+        .route(
+            &format!("{p}/api/traffic/ip/{{ip}}/endpoints"),
+            get(traffic_ip_endpoints),
+        )
         .route(&format!("{p}/api/devices"), get(list_devices))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
@@ -185,6 +194,14 @@ async fn traffic_ip(
     Query(q): Query<RangeQuery>,
 ) -> Result<impl IntoResponse, DashboardError> {
     Ok(Json(state.backend.traffic_ip(q.range).await?))
+}
+
+async fn traffic_ip_endpoints(
+    State(state): State<DashState>,
+    Path(ip): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> Result<impl IntoResponse, DashboardError> {
+    Ok(Json(state.backend.traffic_ip_endpoints(ip, q.range).await?))
 }
 
 async fn list_devices(State(state): State<DashState>) -> Result<impl IntoResponse, DashboardError> {

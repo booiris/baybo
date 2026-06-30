@@ -1,0 +1,19 @@
+# cargo-nextest configuration. Run the suite with `cargo nextest run --workspace`.
+# nextest runs every test as its own process in one shared N-core pool, instead
+# of cargo's serial-per-binary execution. Doctests are not run by nextest, which
+# is fine — they're disabled workspace-wide (`[lib] doctest = false`).
+# https://nexte.st/docs/configuration/
+
+[test-groups]
+# The tmux render/smoke tests (tui `chat_render`, term-harness lib) each spin a
+# full TUI+WS probe in a private tmux server; run concurrently they starve each
+# other's renders past the capture timeout. Under `cargo test` an in-process
+# `static SERIAL: Mutex` serializes them, but nextest runs one process per test
+# so that mutex no longer applies — the serialization must live here. These
+# tests are `#[ignore]` by default, so this group only takes effect under
+# `--run-ignored`.
+tmux-serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary_id(=baybo-tui::chat_render) | (package(baybo-term-harness) & kind(lib))'
+test-group = 'tmux-serial'

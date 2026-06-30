@@ -219,6 +219,15 @@ pub struct IpTotals {
     pub bytes: u64,
 }
 
+/// One source IP's per-endpoint breakdown over a window — the drill-down behind
+/// clicking a row on the dashboard's IPs page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpEndpointBreakdown {
+    pub ip: String,
+    pub endpoints: Vec<IpEndpointTotal>,
+    pub totals: IpTotals,
+}
+
 // --- Devices (Page 4, read-only) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

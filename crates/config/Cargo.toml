@@ -2,9 +2,16 @@
 name = "baybo-config"
 version.workspace = true
 edition.workspace = true
+autotests = false
 
 [lib]
 doctest = false
+
+# Single aggregated integration-test binary: each sibling file is mounted as a
+# module so the harness links once instead of per-file. See `tests/all.rs`.
+[[test]]
+name = "all"
+path = "tests/all.rs"
 
 [dependencies]
 baybo-model = { workspace = true }

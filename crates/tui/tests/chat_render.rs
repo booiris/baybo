@@ -182,6 +182,7 @@ fn assert_snapshot(name: &str, normalized: &str) {
 // ---- golden snapshot tests (clean, stable frames) ----
 
 #[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn snapshot_initial_frame() {
     run_chat("snapshot_initial_frame", |s| {
         let frame = settle(s)?;
@@ -191,6 +192,7 @@ fn snapshot_initial_frame() {
 }
 
 #[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn snapshot_echo_reply_frame() {
     run_chat("snapshot_echo_reply_frame", |s| {
         let reply = format!("{REPLY_PREFIX}hello there");
@@ -212,6 +214,7 @@ fn snapshot_echo_reply_frame() {
 // ---- structural smoke tests ----
 
 #[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn chat_ui_renders_banner_and_input_box() {
     run_chat("chat_ui_renders_banner_and_input_box", |s| {
         let frame = s.capture().map_err(|e| e.to_string())?;
@@ -226,6 +229,7 @@ fn chat_ui_renders_banner_and_input_box() {
 }
 
 #[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn user_message_streams_an_assistant_reply() {
     run_chat("user_message_streams_an_assistant_reply", |s| {
         let reply = format!("{REPLY_PREFIX}hello there");
@@ -245,6 +249,7 @@ fn user_message_streams_an_assistant_reply() {
 }
 
 #[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn live_region_survives_a_resize() {
     run_chat("live_region_survives_a_resize", |s| {
         let reply = format!("{REPLY_PREFIX}hi");
@@ -268,6 +273,7 @@ fn live_region_survives_a_resize() {
 }
 
 #[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn ctrl_c_on_empty_prompt_exits() {
     run_chat("ctrl_c_on_empty_prompt_exits", |s| {
         s.send_key(Key::Ctrl('c')).expect("send Ctrl+C");
@@ -278,6 +284,7 @@ fn ctrl_c_on_empty_prompt_exits() {
 // ---- scenario tests (dynamic frames) ----
 
 #[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn tool_call_renders_a_tool_line() {
     run_chat("tool_call_renders_a_tool_line", |s| {
         say(s, SAY_TOOL);
@@ -295,6 +302,7 @@ fn tool_call_renders_a_tool_line() {
 }
 
 #[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn subagent_spawn_renders_as_a_task_tool() {
     run_chat("subagent_spawn_renders_as_a_task_tool", |s| {
         say(s, SAY_SUBAGENT);
@@ -312,6 +320,7 @@ fn subagent_spawn_renders_as_a_task_tool() {
 }
 
 #[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn tool_approval_modal_renders_and_resolves() {
     run_chat("tool_approval_modal_renders_and_resolves", |s| {
         say(s, SAY_APPROVAL);
@@ -341,6 +350,7 @@ fn tool_approval_modal_renders_and_resolves() {
 }
 
 #[test]
+#[ignore = "tmux render test; flaky under load — run in CI with --ignored"]
 fn task_list_is_not_rendered_in_the_tui() {
     run_chat("task_list_is_not_rendered_in_the_tui", |s| {
         say(s, SAY_TASK);

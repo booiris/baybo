@@ -3,9 +3,18 @@ name = "baybo-sandbox"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autotests = false
 
 [lib]
 doctest = false
+
+# Single aggregated integration-test binary: each sibling file is mounted as a
+# module so the harness links once instead of per-file. The per-file
+# `#![cfg(...)]` inner attributes stay valid as module attributes, so each
+# smoke module keeps its own platform/feature gate. See `tests/all.rs`.
+[[test]]
+name = "all"
+path = "tests/all.rs"
 
 [features]
 default = ["linux", "macos", "docker"]

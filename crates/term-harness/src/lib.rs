@@ -534,6 +534,7 @@ mod tests {
     // program prints then blocks (the capture-while-alive pattern every
     // probe follows), so the frame is pristine when we read it.
     #[test]
+    #[ignore = "tmux smoke test; run in CI with --ignored"]
     fn captures_a_program_at_forced_size() {
         if !tmux_available() {
             eprintln!("skipping: tmux not available");
@@ -556,6 +557,7 @@ mod tests {
     /// runtime exceeds it must still be waited out. An absolute deadline would
     /// have failed at ~`idle` here, long before "DONE" lands.
     #[test]
+    #[ignore = "tmux smoke test; run in CI with --ignored"]
     fn wait_until_tracks_progress_not_a_fixed_deadline() {
         if !tmux_available() {
             eprintln!("skipping: tmux not available");

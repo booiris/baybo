@@ -9,7 +9,8 @@ const TOKEN_KEY = "baybo.dashboard.token";
 const API_BASE = new URL("api/", import.meta.url).pathname; // -> /dashboard/api/
 const OVERVIEW_POLL_MS = 4000;
 const RANGES = ["24h", "7d", "30d", "60d"];
-const TABS = ["overview", "keys", "traffic", "devices"];
+const TABS = ["overview", "keys", "traffic", "ips", "devices"];
+const TAB_LABELS = { overview: "Overview", keys: "Keys", traffic: "Traffic", ips: "IPs", devices: "Devices" };
 
 const REVEAL_FLASH_MS = 6000;
 const TOP_N = 10;
@@ -166,6 +167,22 @@ function numOrNull(v) {
   if (s === "") return null;
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
+}
+
+// `expires_at` round-trips through a native, minute-precision datetime-local
+// picker. The control is tz-naive; we treat the picked wall-clock as UTC — the
+// same frame every other timestamp on the dashboard is rendered in — and
+// normalise to the server's `%Y-%m-%d %H:%M:%S` shape. Blank stays "never".
+const EXP_RE = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::\d{2})?$/;
+
+function expiresToPickerValue(s) {
+  const m = EXP_RE.exec(String(s || "").trim());
+  return m ? `${m[1]}T${m[2]}` : "";
+}
+
+function pickerValueToExpires(v) {
+  const m = EXP_RE.exec((v ?? "").trim());
+  return m ? `${m[1]} ${m[2]}:00` : "";
 }
 
 // ---- toast ----
@@ -329,7 +346,7 @@ function renderShell() {
         type: "button",
         "data-tab": t,
         "aria-current": currentTab() === t ? "page" : null,
-        text: titleCase(t),
+        text: TAB_LABELS[t] || titleCase(t),
         onclick: () => goTab(t),
       }),
     ),
@@ -363,7 +380,7 @@ function route() {
   });
   const view = $("#view");
   view.replaceChildren();
-  const render = { overview: renderOverview, keys: renderKeys, traffic: renderTraffic, devices: renderDevices }[tab];
+  const render = { overview: renderOverview, keys: renderKeys, traffic: renderTraffic, ips: renderIps, devices: renderDevices }[tab];
   render(view);
 }
 
@@ -639,17 +656,17 @@ function openAdmitModal() {
   const status = el("div", { class: "status" });
   let generate = true;
 
-  const keyInput = el("input", { type: "text", autocomplete: "off", placeholder: "rh_…" });
-  const keyField = field("Existing key", keyInput, "Stored verbatim. Switch to Generate for a fresh key.");
+  const keyInput = el("input", { type: "text", autocomplete: "off", placeholder: "any non-empty string" });
+  const keyField = field("Custom key", keyInput, "Stored verbatim — no required format. Switch to Generate for a fresh key.");
   keyField.hidden = true;
 
   const genRadio = el("input", { type: "radio", name: "keymode", checked: true });
-  const pasteRadio = el("input", { type: "radio", name: "keymode" });
+  const customRadio = el("input", { type: "radio", name: "keymode" });
   genRadio.addEventListener("change", () => {
     generate = true;
     keyField.hidden = true;
   });
-  pasteRadio.addEventListener("change", () => {
+  customRadio.addEventListener("change", () => {
     generate = false;
     keyField.hidden = false;
   });
@@ -657,15 +674,15 @@ function openAdmitModal() {
     "div",
     { class: "radio-row" },
     el("label", {}, genRadio, "Generate"),
-    el("label", {}, pasteRadio, "Paste existing"),
+    el("label", {}, customRadio, "Custom key"),
   );
 
   const labelInput = el("input", { type: "text", autocomplete: "off", placeholder: "optional" });
   const mcInput = el("input", { type: "number", min: "0", placeholder: "e.g. 4" });
   const mbInput = el("input", { type: "number", min: "0", placeholder: "bytes / second" });
   const psInput = el("input", { type: "number", min: "0", placeholder: "bytes / second (optional)" });
-  const expInput = el("input", { type: "text", placeholder: "YYYY-MM-DD HH:MM:SS (UTC)" });
-  const expField = field("Expires at", expInput, "Blank = never.");
+  const expInput = el("input", { type: "datetime-local" });
+  const expField = field("Expires at", expInput, "Blank = never · UTC.");
 
   const submit = el("button", { class: "btn", type: "button" }, "Admit");
 
@@ -681,13 +698,13 @@ function openAdmitModal() {
       max_conns: numOrNull(mcInput.value),
       max_bps: numOrNull(mbInput.value),
       per_server_max_bps: numOrNull(psInput.value),
-      expires_at: expInput.value.trim() || null,
+      expires_at: pickerValueToExpires(expInput.value) || null,
     };
     if (!generate) {
       const k = keyInput.value.trim();
       if (!k) {
         status.className = "status err";
-        status.textContent = "Paste a key or switch to Generate.";
+        status.textContent = "Enter a key or switch to Generate.";
         return;
       }
       body.key = k; // Generate omits `key` entirely
@@ -738,7 +755,7 @@ function openEditModal(r) {
   const mcInput = el("input", { type: "number", min: "0", value: r.max_conns ?? "" });
   const mbInput = el("input", { type: "number", min: "0", value: r.max_bps ?? "" });
   const psInput = el("input", { type: "number", min: "0", value: r.per_server_max_bps ?? "" });
-  const expInput = el("input", { type: "text", value: r.expires_at || "", placeholder: "YYYY-MM-DD HH:MM:SS (UTC)" });
+  const expInput = el("input", { type: "datetime-local", value: expiresToPickerValue(r.expires_at) });
   const submit = el("button", { class: "btn", type: "button" }, "Save");
 
   const sync = () => {
@@ -753,7 +770,7 @@ function openEditModal(r) {
       max_conns: numOrNull(mcInput.value),
       max_bps: numOrNull(mbInput.value),
       per_server_max_bps: numOrNull(psInput.value),
-      expires_at: expInput.value.trim() || null,
+      expires_at: pickerValueToExpires(expInput.value) || null,
     };
     submit.disabled = true;
     status.className = "status";
@@ -780,7 +797,7 @@ function openEditModal(r) {
     field("Max conns", mcInput),
     field("Max rate (bytes/s)", mbInput),
     field("Per-server rate (bytes/s)", psInput),
-    field("Expires at", expInput, "Blank = never. Back-dating expires the key on reload."),
+    field("Expires at", expInput, "Blank = never · UTC. Back-dating expires the key on reload."),
     status,
     el(
       "div",
@@ -924,8 +941,9 @@ const subhead = (text) => el("div", { class: "subhead", text });
 
 let trafficRange = "24h";
 
-async function renderTraffic(view) {
-  const body = el("div", { class: "traffic-body" }, el("div", { class: "empty", text: "Loading…" }));
+// Range selector shared by the Traffic and IPs tabs; mutates `trafficRange` and
+// re-runs `onChange` so the two tabs stay on the same window.
+function rangePills(onChange) {
   const pills = el(
     "div",
     { class: "pills" },
@@ -942,13 +960,23 @@ async function renderTraffic(view) {
           pills.querySelectorAll(".pill").forEach((p) =>
             p.setAttribute("aria-pressed", p.dataset.range === trafficRange ? "true" : "false"),
           );
-          loadTraffic(body);
+          onChange();
         },
       }),
     ),
   );
+  return pills;
+}
+
+async function renderTraffic(view) {
+  const body = el("div", { class: "traffic-body" }, el("div", { class: "empty", text: "Loading…" }));
   view.replaceChildren(
-    el("div", { class: "view-head" }, el("div", { class: "section-title", text: "Traffic" }), pills),
+    el(
+      "div",
+      { class: "view-head" },
+      el("div", { class: "section-title", text: "Traffic" }),
+      rangePills(() => loadTraffic(body)),
+    ),
     body,
   );
   await loadTraffic(body);
@@ -958,20 +986,19 @@ async function loadTraffic(body) {
   body.replaceChildren(el("div", { class: "empty", text: "Loading…" }));
   const r = trafficRange;
   try {
-    const [relay, push, ip] = await Promise.all([
+    const [relay, push] = await Promise.all([
       api("traffic/relay?range=" + r),
       api("traffic/push?range=" + r),
-      api("traffic/ip?range=" + r),
     ]);
     if (currentTab() !== "traffic" || trafficRange !== r) return;
-    body.replaceChildren(trafficView(relay, push, ip));
+    body.replaceChildren(trafficView(relay, push));
   } catch (e) {
     if (e instanceof Unauthorized) return;
     body.replaceChildren(errorBox(e));
   }
 }
 
-function trafficView(relay, push, ip) {
+function trafficView(relay, push) {
   const relayCard = el(
     "div",
     { class: "card chart-card" },
@@ -999,26 +1026,124 @@ function trafficView(relay, push, ip) {
     barChart(push.by_device, { labelOf: (x) => x.device_id, valueOf: (x) => x.bytes, fmt: fmtBytes }),
   );
 
-  const ipCard = el(
-    "div",
-    { class: "card chart-card" },
-    chartHead("IP", `${fmtCount(ip.totals.requests)} requests · ${fmtBytes(ip.totals.bytes)}`),
-    areaChart(ip.buckets, { series: [{ key: "bytes", label: "bytes" }], fmt: fmtBytes }),
-    subhead("Top sources"),
-    barChart(ip.by_ip, { labelOf: (x) => x.ip, valueOf: (x) => x.bytes, fmt: fmtBytes }),
-  );
-
-  return el("div", { class: "grid-3" }, relayCard, pushCard, ipCard);
+  return el("div", { class: "grid-2" }, relayCard, pushCard);
 }
 
-// ---- devices & IPs ----
+// ---- ips ----
+
+async function renderIps(view) {
+  const body = el("div", {}, el("div", { class: "empty", text: "Loading…" }));
+  view.replaceChildren(
+    el(
+      "div",
+      { class: "view-head" },
+      el("div", { class: "section-title", text: "IPs" }),
+      rangePills(() => loadIps(body)),
+    ),
+    body,
+  );
+  await loadIps(body);
+}
+
+async function loadIps(body) {
+  body.replaceChildren(el("div", { class: "empty", text: "Loading…" }));
+  const r = trafficRange;
+  try {
+    const ip = await api("traffic/ip?range=" + r);
+    if (currentTab() !== "ips" || trafficRange !== r) return;
+    body.replaceChildren(ipsView(ip));
+  } catch (e) {
+    if (e instanceof Unauthorized) return;
+    body.replaceChildren(errorBox(e));
+  }
+}
+
+function ipsView(ip) {
+  const overTime = el(
+    "div",
+    { class: "card chart-card" },
+    chartHead("IP traffic", `${fmtCount(ip.totals.requests)} requests · ${fmtBytes(ip.totals.bytes)}`),
+    areaChart(ip.buckets, { series: [{ key: "bytes", label: "bytes" }], fmt: fmtBytes }),
+  );
+  const bySource = el(
+    "div",
+    { class: "card" },
+    subhead("By source IP"),
+    el("div", { class: "field-hint", text: "Click a row for that IP's endpoint breakdown." }),
+    barChart(ip.by_ip, { labelOf: (x) => x.ip, valueOf: (x) => x.bytes, fmt: fmtBytes }),
+    ipSourceTable(ip.by_ip),
+  );
+  const byEndpoint = el(
+    "div",
+    { class: "card" },
+    subhead("By endpoint"),
+    barChart(ip.by_endpoint, { labelOf: (x) => x.endpoint, valueOf: (x) => x.bytes, fmt: fmtBytes }),
+    ipTable(["Endpoint", "Requests", "Bytes"], ip.by_endpoint, endpointRow),
+  );
+  return el("div", {}, overTime, el("div", { class: "grid-2" }, bySource, byEndpoint));
+}
+
+const endpointRow = (r) =>
+  el(
+    "tr",
+    {},
+    el("td", {}, el("code", { text: r.endpoint })),
+    el("td", { class: "num", text: fmtCount(r.requests) }),
+    el("td", { class: "num", text: fmtBytes(r.bytes) }),
+  );
+
+function ipSourceTable(rows) {
+  return ipTable(["Source IP", "Requests", "Bytes"], rows, (r) => {
+    const tr = el(
+      "tr",
+      { class: "row-click", title: "View endpoint breakdown" },
+      el("td", {}, el("code", { text: r.ip })),
+      el("td", { class: "num", text: fmtCount(r.requests) }),
+      el("td", { class: "num", text: fmtBytes(r.bytes) }),
+    );
+    tr.addEventListener("click", () => openIpModal(r.ip));
+    return tr;
+  });
+}
+
+async function openIpModal(ipAddr) {
+  const body = el("div", {}, el("div", { class: "empty", text: "Loading…" }));
+  const modal = el(
+    "div",
+    { class: "modal modal-wide" },
+    el("div", { class: "modal-title" }, el("code", { text: ipAddr })),
+    body,
+    el("div", { class: "modal-actions" }, el("button", { class: "btn", type: "button", onclick: closeModal }, "Close")),
+  );
+  openModal(modal);
+  try {
+    const d = await api("traffic/ip/" + encodeURIComponent(ipAddr) + "/endpoints?range=" + trafficRange);
+    body.replaceChildren(ipDetailView(d));
+  } catch (e) {
+    if (e instanceof Unauthorized) return;
+    body.replaceChildren(errorBox(e));
+  }
+}
+
+function ipDetailView(d) {
+  const sub = `${trafficRange} · ${fmtCount(d.totals.requests)} requests · ${fmtBytes(d.totals.bytes)}`;
+  return el(
+    "div",
+    {},
+    el("div", { class: "modal-desc", text: sub }),
+    barChart(d.endpoints, { labelOf: (x) => x.endpoint, valueOf: (x) => x.bytes, fmt: fmtBytes }),
+    ipTable(["Endpoint", "Requests", "Bytes"], d.endpoints, endpointRow),
+  );
+}
+
+// ---- devices ----
 
 async function renderDevices(view) {
   view.replaceChildren(el("div", { class: "empty", text: "Loading…" }));
   try {
-    const [devices, ip] = await Promise.all([api("devices"), api("traffic/ip?range=" + trafficRange)]);
+    const devices = await api("devices");
     if (currentTab() !== "devices") return;
-    view.replaceChildren(devicesView(devices, ip));
+    view.replaceChildren(devicesView(devices));
   } catch (e) {
     if (e instanceof Unauthorized) return;
     view.replaceChildren(errorBox(e));
@@ -1049,7 +1174,7 @@ function ipTable(headers, rows, render) {
   );
 }
 
-function devicesView(devices, ip) {
+function devicesView(devices) {
   const devCols = ["Device", "APNs env", "Token", "Gateway pubkey", "Counter", "Sends", "Bytes"];
   const devBody = devices.length ? devices.map(deviceRow) : [emptyRow(devCols.length, "No devices bound.")];
   const devTable = el(
@@ -1063,49 +1188,11 @@ function devicesView(devices, ip) {
     el("tbody", {}, ...devBody),
   );
 
-  const byIp = ipTable(["Source IP", "Requests", "Bytes"], ip.by_ip, (r) =>
-    el(
-      "tr",
-      {},
-      el("td", {}, el("code", { text: r.ip })),
-      el("td", { class: "num", text: fmtCount(r.requests) }),
-      el("td", { class: "num", text: fmtBytes(r.bytes) }),
-    ),
-  );
-  const byEndpoint = ipTable(["Endpoint", "Requests", "Bytes"], ip.by_endpoint, (r) =>
-    el(
-      "tr",
-      {},
-      el("td", {}, el("code", { text: r.endpoint })),
-      el("td", { class: "num", text: fmtCount(r.requests) }),
-      el("td", { class: "num", text: fmtBytes(r.bytes) }),
-    ),
-  );
-
   return el(
     "div",
     {},
     el("div", { class: "section-title", text: "Devices" }),
     el("div", { class: "card table-card" }, devTable),
-    el("div", { class: "section-title", text: `IP traffic · ${trafficRange}` }),
-    el(
-      "div",
-      { class: "grid-2" },
-      el(
-        "div",
-        { class: "card" },
-        subhead("By source IP"),
-        barChart(ip.by_ip, { labelOf: (x) => x.ip, valueOf: (x) => x.bytes, fmt: fmtBytes }),
-        byIp,
-      ),
-      el(
-        "div",
-        { class: "card" },
-        subhead("By endpoint"),
-        barChart(ip.by_endpoint, { labelOf: (x) => x.endpoint, valueOf: (x) => x.bytes, fmt: fmtBytes }),
-        byEndpoint,
-      ),
-    ),
   );
 }
 
