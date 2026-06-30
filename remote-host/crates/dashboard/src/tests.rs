@@ -47,7 +47,6 @@ impl DashboardBackend for FakeBackend {
             id: 7,
             label: Some("alpha".into()),
             key_last4: "ab12".into(),
-            tier: KeyTier::Registered,
             max_conns: Some(4),
             max_bps: Some(1000),
             per_server_max_bps: None,
@@ -331,7 +330,6 @@ fn key_row_field_names() {
         id: 7,
         label: Some("alpha".into()),
         key_last4: "ab12".into(),
-        tier: KeyTier::Guest,
         max_conns: Some(4),
         max_bps: None,
         per_server_max_bps: None,
@@ -345,7 +343,6 @@ fn key_row_field_names() {
         "id",
         "label",
         "key_last4",
-        "tier",
         "max_conns",
         "max_bps",
         "per_server_max_bps",
@@ -356,7 +353,6 @@ fn key_row_field_names() {
     ] {
         assert!(v.get(field).is_some(), "missing field {field}");
     }
-    assert_eq!(v["tier"], "guest");
 }
 
 #[test]

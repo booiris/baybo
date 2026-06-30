@@ -25,7 +25,7 @@ use axum::{Json, Router};
 pub use auth::DashboardToken;
 pub use types::{
     AdmitKeyOutcome, AdmitKeyRequest, BucketUnit, DashboardError, DeviceRow, EditKeyRequest,
-    IpBucket, IpEndpointTotal, IpTotal, IpTotals, IpTrafficSeries, KeyRow, KeyTier, KickOutcome,
+    IpBucket, IpEndpointTotal, IpTotal, IpTotals, IpTrafficSeries, KeyRow, KickOutcome,
     OverviewSnapshot, PushBucket, PushDeviceTotal, PushTotals, PushTrafficSeries, Range,
     RangeQuery, RelayBucket, RelayKeyTotal, RelayTotals, RelayTrafficSeries, RevealedKey,
 };
