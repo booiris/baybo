@@ -1,5 +1,5 @@
 [package]
-name = "remote-host-ratelimit"
+name = "remote-host-edge"
 version.workspace = true
 edition.workspace = true
 
@@ -8,6 +8,9 @@ doctest = false
 
 [dependencies]
 parking_lot = { workspace = true }
+# Sharded maps for the two per-request IP paths (token buckets + traffic recorder),
+# so a request flood contends per-shard rather than on one global lock.
+dashmap = { workspace = true }
 # The shared per-client-IP upgrade/request throttle ([`ip_limit`]) is a small axum
 # middleware layer mounted by both the relay and push routers, so it lives here
 # alongside the `TokenBucket` it draws — the rate-limit domain both roles share.

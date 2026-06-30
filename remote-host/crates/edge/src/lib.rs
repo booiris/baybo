@@ -1,6 +1,12 @@
-//! A monotonic-clock token bucket — the one rate-limiting primitive shared by
-//! the push frequency control (per `(remote_api_key, device_id)`) and the relay
-//! bandwidth throttle (per `remote_api_key`, and per `(remote_api_key, server)`).
+//! **edge** — the shared per-request / per-client-IP layer both `remote-host` roles
+//! mount: the [`ip_limit`] rate limiter and the [`ip_traffic`] traffic recorder
+//! (each a small axum middleware), plus the [`TokenBucket`] rate primitive they and
+//! the relay/push throttles all draw on.
+//!
+//! [`TokenBucket`] is a monotonic-clock token bucket — the one rate-limiting
+//! primitive shared by the push frequency control (per `(remote_api_key,
+//! device_id)`), the relay bandwidth throttle (per `remote_api_key`, and per
+//! `(remote_api_key, server)`), and the per-source-IP [`ip_limit`] throttle.
 //!
 //! The bucket holds up to `capacity` tokens and refills at `refill_per_sec`.
 //! Refill is lazy — computed from the elapsed monotonic time on each access — so
@@ -19,8 +25,10 @@
 //! sleeps.
 
 pub mod ip_limit;
+pub mod ip_traffic;
 
 pub use ip_limit::{IpLimitConfig, IpRateLimiter};
+pub use ip_traffic::{ClientIp, IpByteMeter, IpCounts, IpTrafficDelta, IpTrafficRegistry};
 
 use std::time::{Duration, Instant};
 

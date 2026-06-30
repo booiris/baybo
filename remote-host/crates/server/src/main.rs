@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::http::HeaderName;
+use remote_host_edge::{IpLimitConfig, IpTrafficRegistry, ip_traffic};
 use remote_host_push::serve::{PushConfig, build_router as push_router};
-use remote_host_ratelimit::IpLimitConfig;
-use remote_host_relay::serve::build_router as relay_router;
+use remote_host_relay::serve::{RelayServices, build_router as relay_router};
 
 mod admission_db;
 mod logging;
@@ -37,6 +37,8 @@ const DEFAULT_POLL_SECS: u64 = 30;
 const DEFAULT_TRAFFIC_DB_PATH: &str = "/data/traffic.db";
 /// Traffic flush + eviction cadence (seconds) when `TRAFFIC_FLUSH_SECS` is unset.
 const DEFAULT_TRAFFIC_FLUSH_SECS: u64 = 60;
+/// Days of hourly traffic history retained when `TRAFFIC_RETENTION_DAYS` is unset.
+const DEFAULT_TRAFFIC_RETENTION_DAYS: u64 = 60;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -123,6 +125,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &trusted_headers,
     );
 
+    // Per-(ip, endpoint) traffic counters: a recorder middleware (mounted as the
+    // outermost layer below) counts every request + its body bytes, and the relay's
+    // content legs add their relayed bytes to the same entries.
+    let ip_traffic = Arc::new(IpTrafficRegistry::new());
+
     let mut app = Router::new();
     let mut roles: Vec<&str> = Vec::new();
 
@@ -145,15 +152,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Relay is always on.
     app = app.merge(relay_router(
-        admission.clone(),
-        conns.clone(),
-        bandwidth.clone(),
-        relay_traffic.clone(),
+        RelayServices {
+            admission: admission.clone(),
+            conns: conns.clone(),
+            bandwidth: bandwidth.clone(),
+            traffic: relay_traffic.clone(),
+            ip_traffic: ip_traffic.clone(),
+        },
         relay_ip_limit,
     ));
     roles.push("relay");
 
     // Dashboard is intentionally not mounted in this slice.
+
+    // Mount the per-IP request recorder as the OUTERMOST layer, so it counts every
+    // request (and its body bytes) by client IP + endpoint before either role's
+    // per-IP rate limiter can shed it. Same trusted-header client-IP resolution as
+    // the limiters.
+    app = ip_traffic::apply(app, ip_traffic.clone(), trusted_headers.clone());
 
     // Drain the relay (and push, if on) traffic counters to the durable ledger every
     // TRAFFIC_FLUSH_SECS; the same task's eviction bounds the in-memory maps.
@@ -163,6 +179,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_TRAFFIC_FLUSH_SECS);
+    let traffic_retention_days = std::env::var("TRAFFIC_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_TRAFFIC_RETENTION_DAYS);
     // Size the relay traffic entry cap to 2× the live admission connection capacity
     // (each (key, server) entry needs a content leg; entries linger ~5 min past a
     // leg's close → ×2). The flush task re-evaluates this so the cap follows
@@ -177,8 +197,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     traffic::spawn(
         traffic_db_path,
         traffic_flush_secs,
+        traffic_retention_days,
         relay_traffic,
         push_traffic,
+        ip_traffic,
         relay_traffic_max_tracked,
     );
 
