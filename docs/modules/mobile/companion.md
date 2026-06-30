@@ -292,7 +292,9 @@ UI are implemented in this branch. Real APNs delivery and App Group keychain
 reads require a provisioned, code-signed build; the simulator can exercise
 `simctl push` and the NSE path but cannot receive live APNs.
 
-**Open:** `remote-host-dashboard` is not mounted by the `remote-host` server.
+`remote-host-dashboard` mounts on its own listener (default `:7778`, plain HTTP,
+not via Cloudflare), token-gated by `DASHBOARD_TOKEN` (any non-empty value; off
+when unset).
 
 ### The signing boundary (empirical, iOS 26 simulator)
 

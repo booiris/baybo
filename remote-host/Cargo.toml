@@ -38,6 +38,7 @@ rustls = "0.23"
 remote-host-push = { path = "crates/push" }
 remote-host-relay = { path = "crates/relay" }
 remote-host-admission = { path = "crates/admission" }
+remote-host-dashboard = { path = "crates/dashboard" }
 # The shared wire contract (routes + serde types) the gateway + app also depend
 # on. Pure serde, no transport/baybo deps.
 remote-host-protocol = { path = "crates/protocol" }

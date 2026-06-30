@@ -34,7 +34,9 @@ use futures::{SinkExt, StreamExt};
 use remote_host_admission::InMemoryAdmission;
 use remote_host_protocol::relay::REMOTE_API_KEY_HEADER;
 use remote_host_relay::serve::{IpLimitConfig, IpTrafficRegistry, RelayServices, build_router};
-use remote_host_relay::{BandwidthRegistry, ConnectionRegistry, TrafficRegistry};
+use remote_host_relay::{
+    BandwidthRegistry, ConnectionRegistry, ControlRegistry, RelayBroker, TrafficRegistry,
+};
 use snow::TransportState;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -64,6 +66,8 @@ async fn boot_relay() -> u16 {
         RelayServices {
             admission,
             conns: Arc::new(ConnectionRegistry::new()),
+            control: Arc::new(ControlRegistry::new()),
+            broker: Arc::new(RelayBroker::new()),
             bandwidth: Arc::new(BandwidthRegistry::new()),
             traffic: Arc::new(TrafficRegistry::new()),
             ip_traffic: Arc::new(IpTrafficRegistry::new()),

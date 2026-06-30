@@ -17,7 +17,7 @@ use crate::http::{PushState, router};
 use crate::jwt::ApnsProviderToken;
 use crate::notify::NotifyService;
 use crate::ratelimit::NotifyRateLimiter;
-use crate::store::InMemoryDeviceTokenStore;
+use crate::store::DeviceTokenStore;
 use crate::traffic::PushTrafficRegistry;
 
 /// Operator-tunable push limits, each overridable from the environment; an
@@ -122,6 +122,10 @@ impl PushConfig {
 /// [`HttpApnsSender`] is the live APNs transport; the device store is in-memory
 /// (devices re-register on reconnect, so it survives restart by re-population).
 ///
+/// `store` is the per-device registry, created by the caller (mirroring `traffic`)
+/// so it can hand the same handle to the dashboard backend's read path; this router
+/// and the dashboard then share one live binding view.
+///
 /// `ip_limit` mounts the shared per-source-IP request throttle ahead of body
 /// parsing / signature verification, so a `/register` or `/notify` flood is shed
 /// with `429` by client IP before any Ed25519 work. It uses the same proxy-aware
@@ -133,6 +137,7 @@ impl PushConfig {
 pub fn build_router(
     config: &PushConfig,
     p8_pem: &[u8],
+    store: Arc<dyn DeviceTokenStore>,
     traffic: Arc<PushTrafficRegistry>,
     ip_limit: IpLimitConfig,
 ) -> Result<Router, PushError> {
@@ -141,10 +146,6 @@ pub fn build_router(
         config.team_id.clone(),
         p8_pem,
     )?);
-    let store = Arc::new(InMemoryDeviceTokenStore::with_limits(
-        config.limits.device_store_cap,
-        config.limits.unconfirmed_ttl,
-    ));
     let sender = Arc::new(HttpApnsSender::new());
     let service = Arc::new(NotifyService::new(
         store,
@@ -164,6 +165,7 @@ pub fn build_router(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::InMemoryDeviceTokenStore;
 
     // Throwaway P-256 key (NOT an APNs key) — same fixture style as jwt tests.
     const TEST_P8: &str = r#"-----BEGIN PRIVATE KEY-----
@@ -187,6 +189,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             build_router(
                 &config(),
                 TEST_P8.as_bytes(),
+                Arc::new(InMemoryDeviceTokenStore::new()),
                 Arc::new(PushTrafficRegistry::new()),
                 IpLimitConfig::disabled(),
             )
@@ -199,6 +202,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let err = build_router(
             &config(),
             b"not a pem",
+            Arc::new(InMemoryDeviceTokenStore::new()),
             Arc::new(PushTrafficRegistry::new()),
             IpLimitConfig::disabled(),
         )
@@ -252,6 +256,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let app = build_router(
             &config(),
             TEST_P8.as_bytes(),
+            Arc::new(InMemoryDeviceTokenStore::new()),
             Arc::new(PushTrafficRegistry::new()),
             IpLimitConfig::with_trusted_headers(vec![HeaderName::from_static("cf-connecting-ip")]),
         )

@@ -140,6 +140,21 @@ impl ConnectionRegistry {
         (self.guard(remote_api_key, id), rx)
     }
 
+    /// Test-only: register a live connection and hand back its kick channel,
+    /// exposing the crate-private registration path to another crate's integration
+    /// tests (e.g. the server's revoke → `force_reload` → kick end-to-end). The
+    /// guard is returned type-erased as `Box<dyn Send>` so callers keep the
+    /// connection alive without naming the private [`ConnGuard`]; dropping it
+    /// deregisters. Gated off in normal/release builds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn register_for_test(
+        self: &Arc<Self>,
+        remote_api_key: &str,
+    ) -> (Box<dyn Send>, oneshot::Receiver<()>) {
+        let (guard, rx) = self.register_unchecked(remote_api_key);
+        (Box::new(guard), rx)
+    }
+
     fn guard(self: &Arc<Self>, remote_api_key: &str, id: u64) -> ConnGuard {
         ConnGuard {
             registry: Arc::clone(self),
@@ -173,6 +188,30 @@ impl ConnectionRegistry {
             );
         }
         kicked
+    }
+
+    /// Total live connections across every admitted key (control + host legs).
+    /// Feeds the dashboard overview's `relay_conns_live`.
+    pub fn live_total(&self) -> usize {
+        self.conns.lock().values().map(HashMap::len).sum()
+    }
+
+    /// Live connections held by one `remote_api_key`.
+    pub fn live_for(&self, remote_api_key: &str) -> usize {
+        self.conns
+            .lock()
+            .get(remote_api_key)
+            .map_or(0, HashMap::len)
+    }
+
+    /// Snapshot of live connection counts per `remote_api_key` (per-row
+    /// `conns_live` in the dashboard keys table).
+    pub fn live_counts(&self) -> HashMap<String, usize> {
+        self.conns
+            .lock()
+            .iter()
+            .map(|(k, m)| (k.clone(), m.len()))
+            .collect()
     }
 
     fn deregister(&self, remote_api_key: &str, id: u64) {
@@ -218,6 +257,32 @@ mod tests {
             rx_b.try_recv().is_err(),
             "inst-B still pending (not resolved)"
         );
+    }
+
+    #[test]
+    fn live_counts_track_registrations_per_key() {
+        let reg = Arc::new(ConnectionRegistry::new().with_max_per_key(10));
+        assert_eq!(reg.live_total(), 0);
+        assert!(reg.live_counts().is_empty());
+        assert_eq!(reg.live_for("k1"), 0);
+
+        let _a1 = reg.register("k1", None).expect("under cap");
+        let _a2 = reg.register("k1", None).expect("under cap");
+        let _b1 = reg.register("k2", None).expect("under cap");
+
+        assert_eq!(reg.live_total(), 3, "two on k1 + one on k2");
+        assert_eq!(reg.live_for("k1"), 2);
+        assert_eq!(reg.live_for("k2"), 1);
+        assert_eq!(reg.live_for("absent"), 0);
+        let counts = reg.live_counts();
+        assert_eq!(counts.get("k1"), Some(&2));
+        assert_eq!(counts.get("k2"), Some(&1));
+        assert_eq!(counts.len(), 2);
+
+        drop(_a1);
+        drop(_a2);
+        assert_eq!(reg.live_for("k1"), 0, "dropping both guards clears the key");
+        assert_eq!(reg.live_total(), 1, "only k2 remains");
     }
 
     #[tokio::test]

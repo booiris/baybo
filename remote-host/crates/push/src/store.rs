@@ -55,6 +55,28 @@ pub struct DeviceRegistration {
     pub last_counter: u64,
 }
 
+/// Number of trailing `apns_token` characters retained when masking a device
+/// binding for the operator dashboard; the rest of the secret never leaves the
+/// push crate.
+const DEVICE_TOKEN_MASK_TAIL: usize = 4;
+
+/// Content-controlled view of a device binding for the operator dashboard. The
+/// `apns_token` secret is masked to its last [`DEVICE_TOKEN_MASK_TAIL`] chars
+/// **inside this crate**, so the raw token never crosses the crate boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceSummary {
+    pub device_id: String,
+    pub env: ApnsEnv,
+    /// Last [`DEVICE_TOKEN_MASK_TAIL`] chars of the `apns_token` only.
+    pub token_masked: String,
+    pub gateway_pubkey: [u8; 32],
+    pub last_counter: u64,
+    pub confirmed: bool,
+    /// Seconds elapsed since the binding was last seen (`Instant` can't cross the
+    /// API, so it is resolved to an elapsed count here).
+    pub idle_secs: u64,
+}
+
 /// `device_id → DeviceRegistration`. The push role's only per-device state.
 pub trait DeviceTokenStore: Send + Sync {
     /// Bind (or replace) a device's registration; returns whether it was stored.
@@ -80,6 +102,9 @@ pub trait DeviceTokenStore: Send + Sync {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Content-controlled snapshot of every binding for the operator dashboard,
+    /// with the `apns_token` masked inside this crate.
+    fn summaries(&self) -> Vec<DeviceSummary>;
 }
 
 /// One tracked binding plus its eviction metadata.
@@ -182,6 +207,31 @@ impl DeviceTokenStore for InMemoryDeviceTokenStore {
     fn len(&self) -> usize {
         self.inner.lock().len()
     }
+    fn summaries(&self) -> Vec<DeviceSummary> {
+        let now = Instant::now();
+        self.inner
+            .lock()
+            .iter()
+            .map(|(device_id, e)| {
+                let chars = e.reg.apns_token.chars().count();
+                let token_masked: String = e
+                    .reg
+                    .apns_token
+                    .chars()
+                    .skip(chars.saturating_sub(DEVICE_TOKEN_MASK_TAIL))
+                    .collect();
+                DeviceSummary {
+                    device_id: device_id.clone(),
+                    env: e.reg.env,
+                    token_masked,
+                    gateway_pubkey: e.reg.gateway_pubkey,
+                    last_counter: e.reg.last_counter,
+                    confirmed: e.confirmed,
+                    idle_secs: now.saturating_duration_since(e.last_seen).as_secs(),
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +257,32 @@ mod tests {
         assert!(s.get("dev-2").is_none());
         s.unbind("dev-1");
         assert!(s.get("dev-1").is_none());
+    }
+
+    #[test]
+    fn summaries_mask_the_apns_token_and_carry_metadata() {
+        let s = InMemoryDeviceTokenStore::new();
+        s.register("dev-1", reg("supersecrettoken", 9));
+        let sums = s.summaries();
+        assert_eq!(sums.len(), 1);
+        let sum = &sums[0];
+        assert_eq!(sum.device_id, "dev-1");
+        assert_eq!(sum.last_counter, 9);
+        assert_eq!(sum.gateway_pubkey, [7u8; 32]);
+        // Only the last 4 chars survive; the raw secret never leaves the crate.
+        assert_eq!(sum.token_masked, "oken");
+        assert!(!sum.token_masked.contains("supersecret"));
+    }
+
+    #[test]
+    fn summaries_short_token_is_not_padded() {
+        let s = InMemoryDeviceTokenStore::new();
+        s.register("dev-short", reg("ab", 1));
+        let sums = s.summaries();
+        assert_eq!(
+            sums[0].token_masked, "ab",
+            "a <4-char token masks to itself"
+        );
     }
 
     #[test]

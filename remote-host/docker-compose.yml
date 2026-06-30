@@ -85,6 +85,13 @@ services:
       TRAFFIC_DB_PATH: ${TRAFFIC_DB_PATH-/data/traffic.db}
       TRAFFIC_FLUSH_SECS: ${TRAFFIC_FLUSH_SECS:-60}
       TRAFFIC_RETENTION_DAYS: ${TRAFFIC_RETENTION_DAYS:-60}
+      # Operator dashboard — runs on its OWN listener (DASHBOARD_BIND_ADDR, default
+      # :7778), plain HTTP, NOT behind Cloudflare / no cert. Enabled by ANY non-empty
+      # DASHBOARD_TOKEN (bearer-gated; blank disables). The token travels cleartext, so
+      # reach it on a trusted network or an SSH tunnel (ssh -L 7778:localhost:7778).
+      # See DEPLOY.md.
+      DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:-}
+      DASHBOARD_BIND_ADDR: ${DASHBOARD_BIND_ADDR:-0.0.0.0:7778}
     secrets:
       - apns_p8
     volumes:
@@ -95,6 +102,9 @@ services:
       - ${TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/key.pem:ro
     ports:
       - "${PORT:-7777}:${PORT:-7777}"
+      # Operator dashboard listener (plain HTTP). Bind to 127.0.0.1 on the host if
+      # you only reach it via an SSH tunnel.
+      - "${DASHBOARD_PORT:-7778}:7778"
     # The durable log copy is the rolling file on the /data volume (./data/logs).
     # This caps the Docker-captured stderr mirror so it can't grow unbounded.
     logging:

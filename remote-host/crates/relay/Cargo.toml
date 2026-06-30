@@ -6,6 +6,11 @@ edition.workspace = true
 [lib]
 doctest = false
 
+[features]
+# Exposes connection-registration test helpers (e.g. `register_for_test`) so a
+# downstream crate's tests can drive a live kick. Off in normal/release builds.
+test-support = []
+
 [dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 parking_lot = { workspace = true }

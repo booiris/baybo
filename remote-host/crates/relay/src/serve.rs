@@ -206,6 +206,12 @@ pub struct RelayServices {
     pub traffic: Arc<TrafficRegistry>,
     /// Per-`(ip, endpoint)` traffic ledger (content legs add relayed bytes to it).
     pub ip_traffic: Arc<IpTrafficRegistry>,
+    /// Connected gateway control channels, so the dashboard overview can read
+    /// `ControlRegistry::connected()`.
+    pub control: Arc<ControlRegistry>,
+    /// The matching/piping broker, so the dashboard overview can read
+    /// `RelayBroker::pending_len()`.
+    pub broker: Arc<RelayBroker>,
 }
 
 /// Assemble the relay router from its shared [`RelayServices`].
@@ -224,11 +230,13 @@ pub fn build_router(services: RelayServices, ip_limit: IpLimitConfig) -> Router 
         bandwidth,
         traffic,
         ip_traffic,
+        control,
+        broker,
     } = services;
     let state = RelayState {
-        broker: Arc::new(RelayBroker::new()),
+        broker,
         admitted: admission,
-        control: Arc::new(ControlRegistry::new()),
+        control,
         conns,
         bandwidth,
         traffic,
@@ -753,6 +761,8 @@ mod tests {
                 bandwidth: Arc::new(BandwidthRegistry::new()),
                 traffic: Arc::new(TrafficRegistry::new()),
                 ip_traffic: Arc::new(IpTrafficRegistry::new()),
+                control: Arc::new(ControlRegistry::new()),
+                broker: Arc::new(RelayBroker::new()),
             },
             IpLimitConfig::socket_peer(),
         );
@@ -784,6 +794,8 @@ mod tests {
                 bandwidth: Arc::new(BandwidthRegistry::new()),
                 traffic: Arc::new(TrafficRegistry::new()),
                 ip_traffic: Arc::new(IpTrafficRegistry::new()),
+                control: Arc::new(ControlRegistry::new()),
+                broker: Arc::new(RelayBroker::new()),
             },
             ip_limit,
         );
@@ -1193,6 +1205,8 @@ mod tests {
                 bandwidth: Arc::new(BandwidthRegistry::new()),
                 traffic: traffic.clone(),
                 ip_traffic: ip_traffic.clone(),
+                control: Arc::new(ControlRegistry::new()),
+                broker: Arc::new(RelayBroker::new()),
             },
             IpLimitConfig::socket_peer(),
         );
@@ -1345,6 +1359,8 @@ mod tests {
                 bandwidth: Arc::new(BandwidthRegistry::new()),
                 traffic: Arc::new(TrafficRegistry::new()),
                 ip_traffic: Arc::new(IpTrafficRegistry::new()),
+                control: Arc::new(ControlRegistry::new()),
+                broker: Arc::new(RelayBroker::new()),
             },
             IpLimitConfig::socket_peer(),
         );

@@ -27,5 +27,5 @@ pub use jwt::ApnsProviderToken;
 pub use notify::{NotifyOutcome, NotifyRequest, NotifyService, RegisterOutcome, RegisterRequest};
 pub use ratelimit::NotifyRateLimiter;
 pub use serve::{PushConfig, PushLimits, build_router};
-pub use store::{DeviceRegistration, DeviceTokenStore, InMemoryDeviceTokenStore};
+pub use store::{DeviceRegistration, DeviceSummary, DeviceTokenStore, InMemoryDeviceTokenStore};
 pub use traffic::{PushCounts, PushTrafficDelta, PushTrafficRegistry};
