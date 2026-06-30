@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>remote-host · dashboard</title>
+    <link rel="stylesheet" href="/dashboard/app.css" />
+  </head>
+  <body>
+    <noscript>The remote-host dashboard requires JavaScript.</noscript>
+
+    <div id="login" class="screen">
+      <div class="card login-card">
+        <div class="wordmark">remote-host</div>
+        <p class="login-sub muted">operator dashboard</p>
+        <div class="field">
+          <label class="field-label" for="token">Access token</label>
+          <input id="token" type="password" autocomplete="off" placeholder="DASHBOARD_TOKEN" />
+        </div>
+        <button id="unlock" class="btn" type="button">
+          <svg class="icon" viewBox="0 0 18 18" width="16" height="16" fill="none"
+               stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5.6 8.2V6.2a3.4 3.4 0 0 1 6.8 0v2" />
+            <rect x="4" y="8.2" width="10" height="6.4" rx="1.4" />
+          </svg>
+          Unlock
+        </button>
+        <div id="login-status" class="status"></div>
+      </div>
+    </div>
+
+    <div id="app" hidden>
+      <header></header>
+      <nav class="tabs"></nav>
+      <main id="view"></main>
+    </div>
+
+    <div id="modal-root"></div>
+
+    <script type="module" src="/dashboard/app.js"></script>
+  </body>
+</html>

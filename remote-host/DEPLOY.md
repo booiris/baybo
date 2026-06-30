@@ -10,7 +10,9 @@ on one listener, reached by disjoint route paths.
 
 So a bare config runs relay only; fill the APNs section in `.env` to add push.
 It serves **plain `ws/http`** by default, or **`wss/https`** when you configure a
-cert. (`remote-host-dashboard` is a library, not a service.)
+cert. (`remote-host-dashboard` runs on its own separate listener
+(`DASHBOARD_BIND_ADDR`, default `:7778`, plain HTTP) when `DASHBOARD_TOKEN` is set
+— see [Operator dashboard](#operator-dashboard); off otherwise.)
 
 ## Quick start
 
@@ -219,3 +221,21 @@ That single WS URL covers both roles: the gateway dials `wss://c.example.com` fo
   Set `TRAFFIC_DB_PATH=` (blank) to keep the in-memory accounting but persist nothing. Like the relay itself the ledger is **metadata-only** — counts, routing keys, and source IPs, never message content (`server_id` is the `relay_node_id` routing handle, not the secret `remote_api_key`; the relayed bytes themselves stay Noise ciphertext). The schema is created with `CREATE TABLE IF NOT EXISTS`, so there's no in-place migration: if you're upgrading a box that already has the **pre-hourly** `relay_traffic`/`push_traffic` tables, drop those two tables (or `rm ./data/traffic.db`) once before deploying — the `hour` column is now part of the primary key, which SQLite can't add in place, and the old cumulative rows are disposable.
 - **Secrets.** `.env` and `*.p8` are gitignored. The `.p8` is mounted read-only as a Docker secret at `/run/secrets/apns_p8`; it never enters an image layer.
 - **Hardening.** Containers run as root so the process can read a `0600` host `.p8`. To run non-root, make the `.p8` readable by that uid and add a `USER` to the Dockerfile.
+- **WAL sidecars — what to back up.** Both SQLite DBs run in WAL mode, so each spawns two sidecar files next to the main `.db`: `admission.db-wal`/`admission.db-shm` and `traffic.db-wal`/`traffic.db-shm`. Recent writes live in the `-wal` until a checkpoint folds them back, so a backup that copies only the `.db` mid-write **loses un-checkpointed data**. Back up the `.db` **and** its `-wal`/`-shm` together (or stop the container first, or use `sqlite3 … ".backup"` which checkpoints).
+
+## Operator dashboard
+
+Off by default. Set `DASHBOARD_TOKEN` in `.env` to a strong secret and the server brings up a read + control dashboard on a **separate listener** — `DASHBOARD_BIND_ADDR` (default `0.0.0.0:7778`), **plain HTTP**, **not** fronted by Cloudflare and with **no TLS cert** of its own. It is a distinct listener from the relay/push `:443` one; the bare root (`/`) `302`-redirects to `/dashboard`.
+
+```bash
+openssl rand -hex 32        # generate a token; paste into DASHBOARD_TOKEN= in .env
+docker compose up -d        # restart to pick it up
+```
+
+- **Reaching it.** Because the token travels cleartext over plain HTTP, expose the dashboard only on a trusted network or via an SSH tunnel:
+  ```bash
+  ssh -L 7778:localhost:7778 <host>   # then open http://localhost:7778/
+  ```
+  Set `DASHBOARD_BIND_ADDR=127.0.0.1:7778` to bind it to the host loopback only (tunnel-required), or leave the default `0.0.0.0:7778` to reach it directly on a trusted LAN.
+- **Auth.** The token is a bearer credential: the browser stores it in `localStorage` and sends it as an `Authorization: Bearer …` header on every `/dashboard/api/*` call — never a cookie, so CSRF is structurally impossible. **Any non-empty `DASHBOARD_TOKEN` enables the dashboard** (blank disables it); there is **no length requirement** and no rate-limit knobs — the token plus a trusted network are the gate. `openssl rand -hex 32` is still a good way to pick one.
+- **What it serves.** Overview stats, the admission allow-list (view / admit / edit / revoke / kick, with one-time key reveal), per-key + per-device + per-IP traffic series from the ledger, and the device registrations — all token-gated; the static HTML/CSS/JS shell is open but leaks nothing.
