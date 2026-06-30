@@ -27,8 +27,11 @@ use baybo_channels::wire::{self, Frame, Message as WireMessage, MessageRole};
 use baybo_model::ChannelType;
 use baybo_pairing::DevicePairingService;
 use baybo_store::{DeviceRow, DeviceStatus};
+use device_proto::delegation;
 use device_proto::noise::{FrameReassembler, NOISE_MAX_MESSAGE, StaticKeypair, write_chunked};
-use device_proto::pairing::{ApnsEnv, DeviceConfirm, DeviceHello, GatewayWelcome, PairFrame};
+use device_proto::pairing::{
+    ApnsEnv, DeviceConfirm, DeviceDelegation, DeviceHello, GatewayWelcome, PairFrame,
+};
 use device_proto::psk_pair::{PskHandshake, build_prologue};
 use futures::{SinkExt, StreamExt};
 use remote_host_admission::InMemoryAdmission;
@@ -359,8 +362,11 @@ async fn real_relay_pairs_gateway_and_mock_app() {
         panic!("expected HandshakeReply");
     };
     hs.read_handshake(&msg).unwrap();
+    // The app's Ed25519 identity; its public half is the device_id.
+    let app_ed = delegation::generate_signing_key();
+    let device_id = delegation::device_id_for(&app_ed.verifying_key());
     let hello = DeviceHello {
-        device_id: "dev-e2e".into(),
+        device_id: device_id.clone(),
         apns_token: "apns-tok".into(),
         apns_env: ApnsEnv::Sandbox,
     };
@@ -387,13 +393,28 @@ async fn real_relay_pairs_gateway_and_mock_app() {
     );
     assert_eq!(welcome.rendezvous_id, rid);
 
+    // 6th message: the device delegates the gateway push key (signed under the
+    // device identity whose public half is the device_id). Without it the
+    // gateway's host leg waits out the full delegation timeout before completing.
+    let gw_push = delegation::verifying_key_from_bytes(&welcome.gateway_push_pubkey).unwrap();
+    let deleg = delegation::sign_delegation(&app_ed, &gw_push);
+    let deleg_frame = transport
+        .write(
+            &device_proto::pairing::encode(&DeviceDelegation {
+                delegation: deleg.to_bytes().to_vec(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    send_pair_frame(&mut app, &PairFrame::Sealed { msg: deleg_frame }).await;
+
     gateway
         .await
         .expect("gateway pairing task joins")
         .expect("gateway pairing leg completes");
 
     // An approved device row landed over the real relay pairing splice.
-    let row = device_store.get("dev-e2e").await.unwrap().unwrap();
+    let row = device_store.get(&device_id).await.unwrap().unwrap();
     assert_eq!(row.status, DeviceStatus::Approved);
     assert_eq!(row.auth_token, welcome.auth_token);
 }

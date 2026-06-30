@@ -16,13 +16,18 @@ Session rows and their conversation transcripts are **user-facing core data**. T
 ```bash
 cargo fmt                                                       # format
 cargo clippy --all --benches --tests --examples --all-features  # lint (zero warnings)
-cargo test                                                      # unit tests
+cargo nextest run --workspace                                   # unit tests (fast runner — CI uses this)
+cargo test --workspace                                          # unit tests (no nextest; also runs doctests, which are disabled)
 RUST_LOG=baybo=debug cargo run                                   # run with logging
 
 pnpm install                                                    # hydrate TS workspaces
 pnpm --filter @baybo/channel-sdk test                            # SDK unit + e2e tests
 scripts/check-ts-bindings.sh                                    # ts-rs regen CI gate
 ```
+
+**Test runner.** `cargo nextest run --workspace` is the canonical runner: it runs every test as its own process in one shared core pool, instead of cargo's serial-per-binary execution. Install once with `cargo install cargo-nextest` (or `curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin`). Config lives in `.config/nextest.toml` (a `tmux-serial` test-group serializes the tmux render tests). Plain `cargo test --workspace` still works. Do **not** add `--all-features` to the test run: it enables `baybo-tools/bench-bash`, which flips the bash tools into bench mode and fails the non-bench bash assertions; the clippy gate uses `--all-features` (compile-only) but the test gate must not.
+
+**Slow tests are `#[ignore]` or gated.** The tmux render/smoke tests (`crates/tui/tests/chat_render.rs`, the `baybo-term-harness` lib tmux tests) are `#[ignore]` — they're flaky under load and run in CI's non-gating `render-tests` job via `--include-ignored`. Docker- and bwrap-backed sandbox smokes self-skip when their backend is absent. Any test that must sleep on a real timeout (e.g. the OpenViking timeout paths) injects ms-scale budgets — see `OpenVikingMemory::with_timeouts` — rather than sleeping real seconds.
 
 **Python tooling uses `uv` with a persistent project venv — never bare `pip` or the system interpreter.** Project-side Python (currently the `bench/swe` SWE-bench grader + dataset export) declares its deps in a `pyproject.toml`; `uv sync` materialises a reused on-disk `.venv` **and** provisions a pinned CPython, so the env is built once, reproducible, and independent of whatever `python3` the host ships (the system one is often too new for a given stack — e.g. `swebench`). Run through it — `uv run --project <dir> python …`, or point a tool at `<dir>/.venv/bin/python`. Commit `pyproject.toml` / `uv.lock` / `.python-version`; gitignore `.venv/`. Add a new Python tool the same way (its own `pyproject.toml` + `uv sync`), not with a global `pip install`.
 
