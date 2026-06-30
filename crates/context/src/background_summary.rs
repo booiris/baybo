@@ -370,6 +370,11 @@ fn make_tool_context(workspace_paths: &WorkspacePaths, cancel: CancellationToken
         llm: None,
         secrets: None,
         virtual_reads: None,
+        // No read-before-write enforcement: this pass legitimately rewrites
+        // `summary.md` in place from the transcript it was handed, without a
+        // prior `Read`. Path scoping (only the session-notes file is served)
+        // is the boundary here, not the read contract.
+        read_tracker: None,
         background_jobs: None,
         background_control: None,
     }
@@ -447,6 +452,9 @@ async fn execute_tool_call(
     ContentBlock::ToolResult {
         tool_use_id: call.id.clone(),
         content: body,
+        // The summary pass disables read-before-write tracking, so its tool
+        // results carry no fingerprint.
+        meta: None,
     }
 }
 

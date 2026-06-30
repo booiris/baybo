@@ -9,7 +9,7 @@ doctest = false
 [features]
 # Emit ts-rs-generated TypeScript definitions for the wire-visible
 # subset of approval / message types into
-# `sdks/channel-ts/src/generated/`. Kept behind a feature so CI /
+# `sidecars/sdk/channel-ts/src/generated/`. Kept behind a feature so CI /
 # release builds don't depend on ts-rs.
 ts-export = ["dep:ts-rs"]
 

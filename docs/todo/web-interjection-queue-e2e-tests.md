@@ -3,7 +3,7 @@
 ## Context
 
 The web `user_interjection` queue (park / auto-fire / reorder / inline-edit / pause-banner,
-`web/src/pages/chat/queueStore.tsx` + `QueuePanel.tsx` + the `sendToSession` / `drainQueueOnFrame`
+`app/web/src/pages/chat/queueStore.tsx` + `QueuePanel.tsx` + the `sendToSession` / `drainQueueOnFrame`
 wiring in `ChatPage.tsx`) is **frontend-only**. Current automated coverage is **pure-function unit
 tests only** — the repo's `web` tests (`workBlock.test.ts`, `turnSync.test.ts`, `composerSend.test.ts`)
 import pure helpers from `./ChatPage` and assert on them; there is **no React-rendering or browser
@@ -20,7 +20,7 @@ Auto-fire keys on a **turn completion** (an assistant `message` frame). With a r
 is slow, variable, and costs money → flaky tests. So an "E2E" for this feature should almost never run
 against a real gateway + real LLM; it should **control when the completion frame arrives**. The seam:
 `ChatPage` builds `new ChatWs({ onFrame, onStatus, ... })` (`ChatPage.tsx` ~684) and `ChatWs`
-(`web/src/api/chatWs.ts`) exposes `onFrame` / `onStatus` callbacks + a `sendMessage` method. Mocking
+(`app/web/src/api/chatWs.ts`) exposes `onFrame` / `onStatus` callbacks + a `sendMessage` method. Mocking
 `../api/chatWs` lets a test capture `onFrame`/`onStatus` and spy `sendMessage`, i.e. drive the whole
 client flow deterministically with no backend.
 
@@ -91,14 +91,14 @@ full `ChatPage` render and Playwright for when drag / real-reload / glue fidelit
 
 ## Already done
 
-- `decideComposerAction` (pure, exported from `ChatPage.tsx`) + `web/src/pages/composerSend.test.ts`
+- `decideComposerAction` (pure, exported from `ChatPage.tsx`) + `app/web/src/pages/composerSend.test.ts`
   (6 cases incl. the non-empty-idle-queue regression).
 
 ## Related
 
-- `web/src/pages/chat/queueStore.tsx` — store + hooks + persistence
-- `web/src/pages/chat/QueuePanel.tsx` — panel / sortable rows / inline edit / banner
-- `web/src/pages/ChatPage.tsx` — `sendToSession`, `drainQueueOnFrame`, `decideComposerAction`
-- `web/src/api/chatWs.ts` — `ChatWs` mock seam (`onFrame` / `onStatus` / `sendMessage`)
-- `web/vitest.config.ts` — `environment: 'jsdom'`
+- `app/web/src/pages/chat/queueStore.tsx` — store + hooks + persistence
+- `app/web/src/pages/chat/QueuePanel.tsx` — panel / sortable rows / inline edit / banner
+- `app/web/src/pages/ChatPage.tsx` — `sendToSession`, `drainQueueOnFrame`, `decideComposerAction`
+- `app/web/src/api/chatWs.ts` — `ChatWs` mock seam (`onFrame` / `onStatus` / `sendMessage`)
+- `app/web/vitest.config.ts` — `environment: 'jsdom'`
 - `docs/testing.md` — `test-support` fakes (for a Playwright stub LLM)

@@ -81,6 +81,7 @@ impl CliSlashHandler {
             skill_assessor: self.ctx.skill_assessor.clone(),
             channel_bot_store: self.ctx.channel_bot_store.clone(),
             channel_pairing_store: self.ctx.channel_pairing_store.clone(),
+            device_pairing_service: self.ctx.device_pairing_service.clone(),
             secret_vault: self.ctx.secret_vault.clone(),
             format,
             invocation: Invocation::Slash,
@@ -107,7 +108,7 @@ impl SlashHandler for CliSlashHandler {
             // this is the cosmetic mirror so the menu stays coherent.
             if matches!(
                 name,
-                "help" | "completion" | "setup" | "tui" | "gateway" | "memory"
+                "help" | "completion" | "setup" | "tui" | "gateway" | "memory" | "device"
             ) {
                 continue;
             }
@@ -312,6 +313,12 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
         Commands::Pair { cmd } => match cmd {
             PairCmd::List { .. } | PairCmd::Approve { .. } | PairCmd::Revoke { .. } => Ok(()),
         },
+        // `device` is operator/terminal-only: `pair` is an interactive,
+        // live mutual-confirm flow; the rest manage trusted devices. CLI
+        // commands are not exposed to slash unless explicitly admitted.
+        Commands::Device { .. } => {
+            Err("`device` commands are terminal-only; run them from a shell")
+        }
         Commands::Llm {
             cmd: LlmCmd::Status | LlmCmd::Probe { .. } | LlmCmd::LiveModel { .. },
         } => Ok(()),

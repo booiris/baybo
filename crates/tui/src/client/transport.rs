@@ -447,6 +447,7 @@ fn map_frame(
         | Frame::RegisterAck { .. }
         | Frame::Subscribe { .. }
         | Frame::Unsubscribe { .. }
+        | Frame::UpdateApnsToken { .. }
         | Frame::Reset { .. }
         | Frame::ResolveApproval { .. }
         | Frame::HistoryAppend { .. }

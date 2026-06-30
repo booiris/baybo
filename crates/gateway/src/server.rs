@@ -4,8 +4,9 @@
 //!
 //! * **Admin** — TCP, bearer-token authenticated. Hosts config,
 //!   status, jobs, cron, memory, traces, skills, tools, llm, and a
-//!   read-only channel list. No chat content flows through these
-//!   endpoints.
+//!   read-only channel list. Also co-hosts the channel-token web chat
+//!   routes (`/v1/channel-ws`, `/v1/blobs/*`) so browser clients can
+//!   reach them over the public bind.
 //! * **Channel** — loopback TCP (`127.0.0.1:<ephemeral>`),
 //!   channel-token authenticated against [`ChannelTokenTable`] (see
 //!   [`crate::channel_listener`] and [`crate::auth::channel`]). Hosts
@@ -60,7 +61,7 @@ use crate::{GatewayError, Result};
 
 /// Caller-supplied managers + config needed to run the gateway.
 ///
-/// Built by the runtime (`src/runtime.rs`) and handed to
+/// Built by the runtime (`crates/baybo/src/runtime.rs`) and handed to
 /// [`GatewayServer::new`]. The gateway takes references (cloning Arcs)
 /// into [`AdminState`] / [`ChannelState`]; the caller keeps the
 /// originals so the same managers can be shared with the router / TUI
@@ -292,6 +293,22 @@ impl GatewayServer {
     }
 }
 
+/// Spawn the relay-**content** control manager and return its join handle for the
+/// caller to track under the shared shutdown drain.
+///
+/// Holds an outbound A→C control link so a phone can reach this (possibly NAT'd)
+/// gateway for chat via the relay. The manager self-gates on the approved device
+/// row (idle until one is paired), reading the relay URL + admission key from it —
+/// there is no `relay` config block. It installs its own rustls CryptoProvider (it
+/// owns the wss dial). Spawned alongside the other gateway managers so it rides the
+/// same `ShutdownSignal` + task tracker and is drained on shutdown.
+pub fn spawn_relay_content(
+    deps: &GatewayDeps,
+    shutdown: ShutdownSignal,
+) -> tokio::task::JoinHandle<()> {
+    crate::channel::relay_content::spawn(WsChannelState::from_deps(deps), shutdown)
+}
+
 fn build_admin_router(deps: GatewayDeps) -> Router {
     let state = AdminState::from_deps(&deps);
     let auth_state = AdminAuthState::new(deps.admin_token.clone());
@@ -321,7 +338,8 @@ fn build_admin_router(deps: GatewayDeps) -> Router {
     // through the bearer-protected admin surface above.
     let channel_v1 = build_channel_v1_subrouter(
         WsChannelState::from_deps(&deps),
-        channel_auth::ChannelAuthState::new(deps.channel_tokens.clone()),
+        channel_auth::ChannelAuthState::new(deps.channel_tokens.clone())
+            .with_device_store(deps.stores.device.clone()),
     );
 
     Router::new()
@@ -345,8 +363,8 @@ fn build_channel_v1_subrouter(
     let inner: Router<()> = crate::channel::routes()
         .with_state(state)
         .layer(TraceLayer::new_for_http());
-    let v1 = channel_auth::attach(inner, auth_state);
-    Router::new().nest("/v1", v1)
+    let v1_authed = channel_auth::attach(inner, auth_state);
+    Router::new().nest("/v1", v1_authed)
 }
 
 /// Build the router served on the channel TCP listener. Called by

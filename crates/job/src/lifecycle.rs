@@ -6,7 +6,9 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::JobStatus;
 use crate::cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
-use crate::{CancelReason, Job, JobError, JobInput, JobShape, JobStatusKind, JobTransition};
+use crate::{
+    CancelReason, Job, JobError, JobInput, JobInputKind, JobShape, JobStatusKind, JobTransition,
+};
 use baybo_model::{JobId, SessionId, SpanId, TriggerKind};
 use baybo_store::JobStore;
 use tokio::sync::broadcast;
@@ -29,10 +31,18 @@ const JOB_LIFECYCLE_EVENT_CAPACITY: usize = 256;
 /// terminal edges; the intermediate `stuck` / `recover` transitions are
 /// not published (rare maintenance moves; the store stays the source of
 /// truth for them).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobPhase {
     Started,
-    Completed,
+    /// `reply_ordinal` is the persisted `session_messages.ordinal` of the
+    /// completing job's reply, carried so the push dispatcher reads exactly that
+    /// row off the event (no read-after-write poll). `None` when the completed
+    /// job produced no message reply (maintenance / subagent) or ran with no
+    /// durable store — the ordinal only ever rides this edge, so the absence
+    /// lives on the variant, not as a field on every other phase.
+    Completed {
+        reply_ordinal: Option<i64>,
+    },
     Failed,
     Cancelled,
 }
@@ -41,10 +51,10 @@ impl JobPhase {
     /// The terminal job status this phase denotes, or `None` for
     /// [`JobPhase::Started`] — lets a terminal-only consumer (the
     /// subagent waiter) filter out the start edge in one match.
-    pub fn terminal_status(self) -> Option<JobStatusKind> {
+    pub fn terminal_status(&self) -> Option<JobStatusKind> {
         match self {
             JobPhase::Started => None,
-            JobPhase::Completed => Some(JobStatusKind::Completed),
+            JobPhase::Completed { .. } => Some(JobStatusKind::Completed),
             JobPhase::Failed => Some(JobStatusKind::Failed),
             JobPhase::Cancelled => Some(JobStatusKind::Cancelled),
         }
@@ -67,6 +77,14 @@ pub struct JobLifecycleEvent {
     pub session_id: SessionId,
     pub parent_job_id: Option<JobId>,
     pub phase: JobPhase,
+    /// Input class of the job (additive; the turn-state projector ignores it).
+    /// Lets the push dispatcher filter to real user turns
+    /// (`shape == Turn && kind == UserChat`) without re-fetching the Job.
+    pub kind: JobInputKind,
+    /// Execution shape of the job (additive). Pairs with `kind` so a
+    /// `/compact` — a `UserChat`-input but `Maintenance`-shape job — is
+    /// correctly excluded from push.
+    pub shape: JobShape,
 }
 
 /// Owns the job state machine + persistence orchestration. Pure
@@ -157,8 +175,15 @@ impl JobLifecycle {
 
     /// Move `InProgress → Completed` with a final output.
     pub async fn complete(&self, job_id: &JobId, output: crate::JobOutput) -> Result<()> {
+        // The reply's persisted ordinal rides the Completed edge so push reads
+        // exactly that row. `None` for a non-message output (maintenance /
+        // subagent) or an unpersisted reply.
+        let reply_ordinal = match &output {
+            crate::JobOutput::Message { ordinal, .. } => *ordinal,
+            crate::JobOutput::Structured { .. } => None,
+        };
         let (job, transition) = self.apply(job_id, |j| j.complete(output)).await?;
-        self.persist_and_publish(job, transition, JobPhase::Completed)
+        self.persist_and_publish(job, transition, JobPhase::Completed { reply_ordinal })
             .await
     }
 
@@ -407,6 +432,8 @@ impl JobLifecycle {
             session_id: job.session_id.clone(),
             parent_job_id: job.parent_job_id,
             phase,
+            kind: job.input_kind(),
+            shape: job.shape,
         };
         self.persist(job, transition).await?;
         let _ = self.lifecycle_events.send(event);
@@ -438,6 +465,7 @@ mod tests {
     fn dummy_output() -> crate::JobOutput {
         crate::JobOutput::Message {
             content: vec![ContentBlock::Text("ok".into())],
+            ordinal: None,
         }
     }
 

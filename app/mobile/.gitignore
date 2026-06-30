@@ -1,0 +1,12 @@
+# JS
+node_modules
+dist
+
+# Tauri-generated artifacts. The Xcode project itself IS committed; its build/,
+# Externals/, and xcuserdata/ are ignored by src-tauri/gen/apple/.gitignore.
+src-tauri/gen/schemas
+src-tauri/gen/apple/.tauri
+src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/Contents.json.bak
+
+app-icon.png
+app-icon.svg

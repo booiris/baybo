@@ -66,7 +66,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use baybo_llm::{BilledChat, ChatRequest};
-use baybo_model::{ChatMessage, ContentBlock};
+use baybo_model::{ChatMessage, ContentBlock, SHA256_PREFIX};
 use baybo_store::BlobStore;
 use dom_smoothie::Readability;
 use htmd::HtmlToMarkdown;
@@ -706,7 +706,7 @@ fn extract_article(raw_html: &str, host: &str) -> String {
 /// on disk — the path is still computed (so the response header has a
 /// stable shape) but the file won't exist.
 fn blob_local_path(state_dir: &Path, blob_id: &str, mime: &str) -> Option<PathBuf> {
-    let hex_all = blob_id.strip_prefix("sha256:")?;
+    let hex_all = blob_id.strip_prefix(SHA256_PREFIX)?;
     let hex = hex_all.split('.').next()?;
     if hex.len() < 2 {
         return None;
@@ -792,7 +792,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
-    use tokio_util::sync::CancellationToken;
 
     fn billed(stub: Arc<dyn LlmCompletion>) -> Arc<dyn BilledChat> {
         unbilled_chat(BillableLlm::passthrough(stub))
@@ -801,26 +800,15 @@ mod tests {
     fn ctx_with_timeout(timeout: Duration) -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: baybo_model::JobId::default(),
-            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
                 channel: ChannelType::tui(),
             },
             timeout,
-            cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
-            sandbox: None,
-            approval: None,
-            notifier: None,
-            events: crate::noop_event_sink(),
-            llm: None,
-            secrets: None,
-            virtual_reads: None,
-            background_jobs: None,
-            background_control: None,
+            ..ToolContext::for_test()
         }
     }
 

@@ -1,4 +1,4 @@
-//! Configuration for the embedded browser MCP server (`tool-src/browser`).
+//! Configuration for the embedded browser MCP server (`sidecars/tool/browser`).
 //!
 //! The data lives here because `baybo-config` is the canonical
 //! aggregator for `baybo.json` shape; the *builder* that turns this

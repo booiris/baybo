@@ -560,6 +560,7 @@ mod tests {
         ChatMessage::agent_context(vec![ContentBlock::ToolResult {
             tool_use_id: id.into(),
             content: "ok".into(),
+            meta: None,
         }])
     }
 

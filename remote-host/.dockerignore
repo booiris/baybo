@@ -1,0 +1,13 @@
+# Keep the build context lean and ensure secrets never enter an image layer.
+target/
+**/target/
+.env
+.env.*
+*.p8
+**/*.p8
+.git/
+.gitignore
+Dockerfile
+.dockerignore
+docker-compose*.yml
+DEPLOY.md

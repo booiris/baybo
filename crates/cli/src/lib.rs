@@ -32,7 +32,7 @@ pub use slash::CliSlashHandler;
 
 /// Emit a shell completion script without needing a `CommandContext`.
 ///
-/// This is a shortcut for `Commands::Completion { shell }` so that `src/main.rs`
+/// This is a shortcut for `Commands::Completion { shell }` so that `crates/baybo/src/main.rs`
 /// can handle the subcommand before booting the rest of the process.
 pub fn completion_script(shell: cli::ShellKind) -> Result<CommandOutput> {
     commands::completion::handle(shell)

@@ -1728,6 +1728,7 @@ mod tests {
                 &j2.id,
                 baybo_job::JobOutput::Message {
                     content: vec![ContentBlock::Text("ok".into())],
+                    ordinal: None,
                 },
             )
             .await
@@ -1809,6 +1810,7 @@ mod tests {
                 &j_done.id,
                 baybo_job::JobOutput::Message {
                     content: vec![ContentBlock::Text("ok".into())],
+                    ordinal: None,
                 },
             )
             .await

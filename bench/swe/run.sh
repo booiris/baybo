@@ -137,7 +137,7 @@ if [ "$want_agent" = 1 ]; then
       exit 1; }
     echo ">> building static-musl baybo (--features bench-bash)"
     CC_x86_64_unknown_linux_musl="$musl_cc" \
-      cargo build --release --target "$MUSL_TARGET" --features bench-bash
+      cargo build --release --target "$MUSL_TARGET" --features bench-bash -p baybo
     BAYBO_BIN="$REPO_ROOT/target/$MUSL_TARGET/release/baybo"
   fi
   [ -x "$BAYBO_BIN" ] || { echo "baybo binary not executable: $BAYBO_BIN" >&2; exit 1; }

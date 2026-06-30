@@ -801,6 +801,9 @@ impl LlmClient {
                             baybo_model::ContentBlock::ToolResult {
                                 tool_use_id,
                                 content,
+                                // `meta` is transcript-only side-band data,
+                                // never forwarded to the provider.
+                                ..
                             } => {
                                 parts.push(UserContent::ToolResult(
                                     completion::message::ToolResult {

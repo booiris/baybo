@@ -140,7 +140,7 @@ Owned by `storage::risk` (see [storage.md](storage.md)):
 
 - **`baybo skills check` / `/skills check`** — runs the validator, then invokes the assessor per skill. JSON output includes `scope` and `background_pending`.
 - **`Skill` builtin tool** (`baybo-skills::tools`) — calls `Arc<dyn SkillRiskCheck>::assess` per invocation. `Block` aborts the call with `ToolError::Denied`; `PassWithWarning` returns the body with a `risk_warning` field and emits a `NoticeLevel::Warn` notice; `Pass` runs silently. Risk is checked once per call, not once per turn.
-- **`src/runtime.rs`** — constructs the assessor with `with_background_worker(llm, store, mode)`, mapping `config.skills.risk_check` via `boot::to_assessment_mode`, then calls `recover_pending_jobs` once after the skill registry is populated. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
+- **`crates/baybo/src/runtime.rs`** — constructs the assessor with `with_background_worker(llm, store, mode)`, mapping `config.skills.risk_check` via `boot::to_assessment_mode`, then calls `recover_pending_jobs` once after the skill registry is populated. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
 
 ## Constraints
 

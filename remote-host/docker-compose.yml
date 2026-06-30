@@ -1,0 +1,120 @@
+# remote-host "C" role — one service, one listener. The relay is always on; the
+# push role turns on automatically when you configure an APNs .p8
+# (APNS_P8_HOST_PATH in .env). Their route paths are disjoint (/notify +
+# /register vs /pair, /content, /control).
+#
+# Admitted gateways live in a SQLite table (./data/admission.db by default),
+# hot-reloaded by polling — add/remove keys out of band (see DEPLOY.md), no
+# restart needed.
+#
+# Serves plain ws/http by default. Set TLS_CERT_HOST_PATH + TLS_KEY_HOST_PATH in
+# .env and it serves wss/https instead; set PORT=443 for port-less URLs.
+#
+# One-click:
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d --build
+
+secrets:
+  # The .p8 — falls back to a /dev/null placeholder when unset (push stays off,
+  # so it's never read). Mounted read-only; never enters an image layer.
+  apns_p8:
+    file: ${APNS_P8_HOST_PATH:-/dev/null}
+
+services:
+  remote-host:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: remote-host:latest
+    restart: unless-stopped
+    environment:
+      # The listen port, host + container the same (default 7777). The container
+      # runs as root, so a privileged PORT like 443 binds fine.
+      BIND_ADDR: 0.0.0.0:${PORT:-7777}
+      # gateway admission allow-list — a SQLite table on the /data volume
+      ADMISSION_DB_PATH: /data/admission.db
+      ADMISSION_POLL_SECS: ${ADMISSION_POLL_SECS:-30}
+      # fallback cap on simultaneous relay connections one admitted key may hold
+      # (per-key value in the remote_api_keys table overrides it)
+      MAX_CONNS_PER_REMOTE_API_KEY_FALLBACK: ${MAX_CONNS_PER_REMOTE_API_KEY_FALLBACK:-64}
+      # per-source-IP flood backstop, ALWAYS ON, fronting BOTH the relay WS upgrades
+      # and the push /register + /notify routes, keyed on the socket peer — correct
+      # when this binary terminates TLS for the real client. Behind a proxy that
+      # terminates TLS (e.g. Cloudflare) the peer is the proxy edge, so set
+      # CLIENT_IP_HEADERS to the proxy's real-client-IP header (e.g. cf-connecting-ip)
+      # — else every client shares one bucket. Trust a client-IP header ONLY when
+      # this origin is reachable solely via that proxy (CF IP allowlist / Tunnel /
+      # mTLS) — else it's forgeable. See DEPLOY.md. Client-IP resolution is SHARED;
+      # rate / burst / bucket cap are per role (relay vs push), blank -> defaults.
+      CLIENT_IP_HEADERS: ${CLIENT_IP_HEADERS:-}
+      RELAY_IP_RATE_PER_SEC: ${RELAY_IP_RATE_PER_SEC:-}
+      RELAY_IP_BURST: ${RELAY_IP_BURST:-}
+      RELAY_IP_BUCKET_CAP: ${RELAY_IP_BUCKET_CAP:-}
+      PUSH_IP_RATE_PER_SEC: ${PUSH_IP_RATE_PER_SEC:-}
+      PUSH_IP_BURST: ${PUSH_IP_BURST:-}
+      PUSH_IP_BUCKET_CAP: ${PUSH_IP_BUCKET_CAP:-}
+      # push — enabled automatically when APNS_P8_HOST_PATH is set in .env
+      APNS_P8_PATH: ${APNS_P8_HOST_PATH:+/run/secrets/apns_p8}
+      APNS_KEY_ID: ${APNS_KEY_ID:-}
+      APNS_TEAM_ID: ${APNS_TEAM_ID:-}
+      APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:-}
+      # optional global push-limit overrides (blank -> built-in defaults; see
+      # DEPLOY.md). The /register + /notify routes are keyless.
+      PUSH_DEVICE_STORE_CAP: ${PUSH_DEVICE_STORE_CAP:-}
+      PUSH_UNCONFIRMED_TTL_SECS: ${PUSH_UNCONFIRMED_TTL_SECS:-}
+      PUSH_NOTIFY_RATE_PER_MIN: ${PUSH_NOTIFY_RATE_PER_MIN:-}
+      PUSH_NOTIFY_BURST: ${PUSH_NOTIFY_BURST:-}
+      # TLS — set only when a cert is configured (-> wss/https), else blank (-> ws/http)
+      TLS_CERT: ${TLS_CERT_HOST_PATH:+/run/tls/cert.pem}
+      TLS_KEY: ${TLS_KEY_HOST_PATH:+/run/tls/key.pem}
+      # Logging — rolling daily files at LOG_DIR (on the /data volume, so they
+      # land on the host ./data/logs and survive `up --build`), 14 days retained,
+      # also mirrored to stderr/`docker compose logs`. RUST_LOG tunes verbosity;
+      # blank -> the built-in default (deps at warn, our crates at info — quiet by
+      # design for a public endpoint).
+      RUST_LOG: ${RUST_LOG:-}
+      LOG_DIR: ${LOG_DIR:-/data/logs}
+      # Traffic ledger — per-tenant relay bytes/frames (up/down) + per-device push
+      # sends/bytes + per-(ip, endpoint) request count/bytes, all bucketed by hour,
+      # accumulated into a SQLite DB on the /data volume (./data/traffic.db, separate
+      # from admission.db; inspect with sqlite3 — see DEPLOY.md). The data path is
+      # lock-free; a background task flushes every TRAFFIC_FLUSH_SECS and prunes rows
+      # past TRAFFIC_RETENTION_DAYS. A blank TRAFFIC_DB_PATH keeps in-memory accounting
+      # but persists nothing (no-colon default applies only when unset, so blank
+      # passes through to disable).
+      TRAFFIC_DB_PATH: ${TRAFFIC_DB_PATH-/data/traffic.db}
+      TRAFFIC_FLUSH_SECS: ${TRAFFIC_FLUSH_SECS:-60}
+      TRAFFIC_RETENTION_DAYS: ${TRAFFIC_RETENTION_DAYS:-60}
+      # Operator dashboard — runs on its OWN listener (DASHBOARD_BIND_ADDR, default
+      # :7778), NOT behind Cloudflare. Enabled by ANY non-empty DASHBOARD_TOKEN
+      # (bearer-gated; blank disables). Plain HTTP by default — the token travels
+      # cleartext, so reach it on a trusted network or an SSH tunnel
+      # (ssh -L 7778:localhost:7778) — or give it its own cert below. See DEPLOY.md.
+      DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:-}
+      DASHBOARD_BIND_ADDR: ${DASHBOARD_BIND_ADDR:-0.0.0.0:7778}
+      # Optional in-process TLS for the dashboard listener (its own cert, since it
+      # is not behind Cloudflare). Set BOTH host paths in .env -> https; blank -> http.
+      DASHBOARD_TLS_CERT: ${DASHBOARD_TLS_CERT_HOST_PATH:+/run/tls/dashboard-cert.pem}
+      DASHBOARD_TLS_KEY: ${DASHBOARD_TLS_KEY_HOST_PATH:+/run/tls/dashboard-key.pem}
+    secrets:
+      - apns_p8
+    volumes:
+      # The admission DB — bind-mounted so you can edit it from the host
+      # (sqlite3 ./data/admission.db ...).
+      - ${ADMISSION_DIR:-./data}:/data
+      - ${TLS_CERT_HOST_PATH:-/dev/null}:/run/tls/cert.pem:ro
+      - ${TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/key.pem:ro
+      - ${DASHBOARD_TLS_CERT_HOST_PATH:-/dev/null}:/run/tls/dashboard-cert.pem:ro
+      - ${DASHBOARD_TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/dashboard-key.pem:ro
+    ports:
+      - "${PORT:-7777}:${PORT:-7777}"
+      # Operator dashboard listener (HTTP, or HTTPS with a dashboard cert). Bind to
+      # 127.0.0.1 on the host if you only reach it via an SSH tunnel.
+      - "${DASHBOARD_PORT:-7778}:7778"
+    # The durable log copy is the rolling file on the /data volume (./data/logs).
+    # This caps the Docker-captured stderr mirror so it can't grow unbounded.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

@@ -46,7 +46,7 @@ Every sweep swallows its own errors (`tracing::warn!` then continue) so one bad 
 
 | Module | Role |
 |--------|------|
-| `gateway` | `src/gateway_cmd.rs` constructs the `Janitor`, wires `with_pairing_store(graph.stores.channel_pairing)` and (when sidecars are active) `with_sidecar_cache`, and spawns `run` against the gateway shutdown signal. (Distinct from the gateway's own `WebTokenJanitor`, which expires web-chat tokens.) |
+| `gateway` | `crates/baybo/src/gateway_cmd.rs` constructs the `Janitor`, wires `with_pairing_store(graph.stores.channel_pairing)` and (when sidecars are active) `with_sidecar_cache`, and spawns `run` against the gateway shutdown signal. (Distinct from the gateway's own `WebTokenJanitor`, which expires web-chat tokens.) |
 | `storage` | `LibsqlChannelPairingStore::purge_expired` issues the `DELETE FROM channel_pairings` the pairing sweep drives |
 | `pairing` | Owns the `channel_pairings` rows the sweep reaps; `baybo-janitor` is the cadence that enforces their retention |
 | `workspace` | `WorkspacePaths` resolves `sessions_log_dir` / `logs_dir` / `channel_logs_dir` and the sidecar cache root |

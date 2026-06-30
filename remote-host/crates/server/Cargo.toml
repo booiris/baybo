@@ -1,0 +1,45 @@
+[package]
+name = "remote-host"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "remote-host"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+# File + stderr logging is initialised here — the binary owns the subscriber.
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+axum = { workspace = true }
+# In-process TLS termination (the `serve` module).
+axum-server = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+remote-host-push = { workspace = true }
+remote-host-relay = { workspace = true }
+remote-host-admission = { workspace = true }
+# The shared per-IP request throttle config mounted on both routers.
+remote-host-edge = { workspace = true }
+# The dashboard transport crate: its `Range` drives the traffic read queries
+# and the server mounts its router + implements its `DashboardBackend` trait.
+remote-host-dashboard = { workspace = true }
+# The dashboard backend trait is `#[async_trait]`; the server's impl needs it too.
+async-trait = { workspace = true }
+# The admission allow-list table (hot-reloaded by the admission_db poller).
+libsql = { workspace = true }
+# Generated-key path: random bytes + hex encoding (`generate_remote_api_key`).
+rand = { workspace = true }
+hex = { workspace = true }
+# Wall-clock formatting for the dashboard overview (started_at / server_time) and
+# the keys-page `expired` check against an `expires_at` datetime string.
+chrono = { workspace = true }
+
+[dev-dependencies]
+# Recording RevokeHook + temp-file RAII in the admission_db inline tests.
+parking_lot = { workspace = true }
+# The revoke → force_reload → kick end-to-end test registers a live connection via
+# the relay's `test-support`-gated helper, then asserts the kick channel resolves.
+remote-host-relay = { workspace = true, features = ["test-support"] }

@@ -57,7 +57,7 @@ impl From<baybo_setup::SetupError> for CliError {
     fn from(err: baybo_setup::SetupError) -> Self {
         use baybo_setup::SetupError as S;
         match err {
-            S::NotATerminal | S::Cancelled | S::Prompt(_) => Self::Config(err.to_string()),
+            S::NotATerminal | S::Prompt(_) => Self::Config(err.to_string()),
             S::Io { .. } => Self::Io(err.to_string()),
             S::Config(_) | S::Vault(_) | S::Storage(_) | S::Browser(_) | S::Gateway(_) => {
                 Self::Config(err.to_string())

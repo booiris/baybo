@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::fingerprint::FileFingerprint;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ContentBlock {
     Text(String),
@@ -32,6 +34,12 @@ pub enum ContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        /// Side-band metadata persisted with the transcript but **never sent to
+        /// the LLM** (the provider conversion emits only `content`). `None` for
+        /// the vast majority of results and for legacy rows; see
+        /// [`ToolResultMeta`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<ToolResultMeta>,
     },
     /// Thinking/reasoning blocks emitted by the model. Must be preserved
     /// and echoed back for providers that require it (Anthropic extended
@@ -41,6 +49,21 @@ pub enum ContentBlock {
         id: Option<String>,
         content: Vec<ThinkingContent>,
     },
+}
+
+/// Side-band metadata for a [`ContentBlock::ToolResult`]: data the runtime
+/// needs to persist with the transcript but that must stay off the universal
+/// `content` string (so it never reaches the LLM). A typed extension point —
+/// new per-result metadata adds a field here rather than re-touching every
+/// `ToolResult` match site. Today it carries only a `Read`'s fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ToolResultMeta {
+    /// Fingerprint of the file a `Read` returned. On session hydration the
+    /// read-before-write tracker is rebuilt from these, so a `Read` in a
+    /// pre-restart turn still satisfies an `Edit` afterwards. `None` for every
+    /// non-`Read` tool result. See [`FileFingerprint`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_fingerprint: Option<FileFingerprint>,
 }
 
 /// Open-tag prefix of the `<tool_output name="...">` envelope the agent wraps
@@ -75,6 +98,13 @@ pub enum ThinkingContent {
 pub struct BlobRef {
     pub blob_id: String,
 }
+
+/// Algorithm prefix on every [`BlobRef::blob_id`]. The full id is
+/// `"sha256:<64 lower-hex>.<read-token>"`, so a content-addressed blob is
+/// recognizable at a glance while the suffix stays the read capability. Lives in
+/// `model` (next to [`BlobRef`]) so both the server (`baybo-store`, which mints
+/// ids) and the device client (which parses them) reference one source of truth.
+pub const SHA256_PREFIX: &str = "sha256:";
 
 /// Where a [`ChatMessage`] row came from — its provenance, independent of the
 /// LLM-facing [`Role`]. Several distinct origins all ride as a `Role::User`
@@ -281,6 +311,23 @@ impl ChatMessage {
         Self::tool(vec![ContentBlock::ToolResult {
             tool_use_id,
             content,
+            meta: None,
+        }])
+    }
+
+    /// Like [`Self::tool_result`] but carries [`ToolResultMeta`] (an empty/`None`
+    /// meta collapses to [`Self::tool_result`]). The agent loop uses this for
+    /// `Read` results so the read-before-write tracker can be rebuilt on
+    /// hydration; the metadata is persisted but not LLM-visible.
+    pub fn tool_result_with_meta(
+        tool_use_id: String,
+        content: String,
+        meta: Option<ToolResultMeta>,
+    ) -> Self {
+        Self::tool(vec![ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            meta,
         }])
     }
 
@@ -362,6 +409,46 @@ pub struct MessageMetadata {}
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn tool_result_meta_round_trips() {
+        let fp = FileFingerprint::new(SystemTime::UNIX_EPOCH + Duration::from_secs(99), 1234);
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "body".into(),
+            meta: Some(ToolResultMeta {
+                read_fingerprint: Some(fp),
+            }),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(block, back);
+    }
+
+    #[test]
+    fn tool_result_without_meta_omits_the_key() {
+        // `None` must not serialize the key, so existing rows stay byte-stable
+        // and the field is invisible wherever the block is rendered.
+        let json = serde_json::to_string(&ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "body".into(),
+            meta: None,
+        })
+        .unwrap();
+        assert!(!json.contains("meta"), "{json}");
+    }
+
+    #[test]
+    fn legacy_tool_result_without_field_deserializes_to_none() {
+        // A row persisted before the field existed must still load.
+        let legacy = r#"{"ToolResult":{"tool_use_id":"t1","content":"body"}}"#;
+        let block: ContentBlock = serde_json::from_str(legacy).unwrap();
+        match block {
+            ContentBlock::ToolResult { meta, .. } => assert!(meta.is_none()),
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
 
     /// Every `MessageSource` variant. The exhaustive `match` makes adding a
     /// variant a compile error here until it's listed below — which forces both
@@ -398,7 +485,7 @@ mod tests {
         );
     }
 
-    /// The hand-maintained TS mirror `web/src/types/trace.ts` is **not** covered
+    /// The hand-maintained TS mirror `app/web/src/types/trace.ts` is **not** covered
     /// by `scripts/check-ts-bindings.sh` (that gate only spans the ts-rs
     /// surfaces), so it has silently drifted before. This guards it directly: the
     /// `MessageSource` union there must list exactly the serialized form of every
@@ -406,7 +493,10 @@ mod tests {
     /// stale member the mirror kept.
     #[test]
     fn message_source_matches_ts_mirror() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/src/types/trace.ts");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../app/web/src/types/trace.ts"
+        );
         let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
 
         // Slice the `export type MessageSource = ...;` declaration (robust to the
@@ -432,7 +522,7 @@ mod tests {
 
         assert_eq!(
             rust_members, ts_members,
-            "MessageSource drift between baybo_model and web/src/types/trace.ts — \
+            "MessageSource drift between baybo_model and app/web/src/types/trace.ts — \
              keep the TS union in sync with the Rust enum"
         );
     }

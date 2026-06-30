@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use baybo_model::BlobRef;
@@ -20,9 +21,8 @@ use baybo_store::blob::{
 };
 
 /// In-memory `BlobStore` for tests. Bytes live in a `Mutex<HashMap>`,
-/// keyed by the same `sha256:<hex>` blob id the libsql backend uses, so
-/// downstream tests can swap between fakes and real stores without
-/// changing assertion strings.
+/// keyed by the same `sha256:<hex>.<read_token>` capability id shape the libsql
+/// backend uses, so downstream tests can swap between fakes and real stores.
 #[derive(Debug, Default)]
 pub struct MemoryBlobStore {
     blobs: Mutex<HashMap<String, MemoryBlob>>,
@@ -59,6 +59,11 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+fn next_read_token() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!("fake-token-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 #[async_trait]
 impl BlobStore for MemoryBlobStore {
     async fn put(
@@ -70,7 +75,7 @@ impl BlobStore for MemoryBlobStore {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         let hex = hex_encode(&hasher.finalize());
-        let read_token = "fake-token";
+        let read_token = next_read_token();
         let blob_id = format!("{SHA256_PREFIX}{hex}.{read_token}");
         let now = chrono::Utc::now().timestamp_micros();
         let mut guard = self.blobs.lock();
@@ -85,7 +90,7 @@ impl BlobStore for MemoryBlobStore {
                 mime_type: mime_type.to_owned(),
                 created_at: now,
                 last_accessed_at: now,
-                read_token: read_token.to_owned(),
+                read_token,
             });
         Ok(BlobRef { blob_id })
     }
@@ -160,13 +165,6 @@ impl BlobStore for MemoryBlobStore {
         self.blobs.lock().remove(blob_id);
         Ok(())
     }
-
-    async fn purge_older_than(&self, cutoff_unix: i64) -> BlobResult<u64> {
-        let mut guard = self.blobs.lock();
-        let before = guard.len();
-        guard.retain(|_, blob| blob.last_accessed_at >= cutoff_unix);
-        Ok((before - guard.len()) as u64)
-    }
 }
 
 fn split_id(blob_id: &str) -> BlobResult<(&str, &str)> {
@@ -175,4 +173,159 @@ fn split_id(blob_id: &str) -> BlobResult<(&str, &str)> {
         .ok_or_else(|| StorageError::NotFound(format!("invalid blob_id {blob_id}")))?;
     let (hex, token) = hex_all.split_once('.').unwrap_or((hex_all, ""));
     Ok((hex, token))
+}
+
+// ---------------------------------------------------------------------------
+// Device registry + pairing-slot fakes (used by `baybo-pairing` service tests)
+// ---------------------------------------------------------------------------
+
+use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result as DeviceResult};
+
+/// In-memory [`DeviceStore`] keyed by `device_id`.
+#[derive(Default)]
+pub struct MemoryDeviceStore {
+    rows: Mutex<HashMap<String, DeviceRow>>,
+}
+
+impl MemoryDeviceStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl DeviceStore for MemoryDeviceStore {
+    async fn create(&self, row: &DeviceRow) -> DeviceResult<()> {
+        let mut g = self.rows.lock();
+        if g.contains_key(&row.device_id) || g.values().any(|r| r.auth_token == row.auth_token) {
+            return Err(StorageError::Conflict("device or auth_token exists".into()));
+        }
+        // Mirror the partial unique index: at most one Approved row.
+        if row.status == DeviceStatus::Approved
+            && g.values().any(|r| r.status == DeviceStatus::Approved)
+        {
+            return Err(StorageError::Conflict(
+                "an approved device already exists".into(),
+            ));
+        }
+        g.insert(row.device_id.clone(), row.clone());
+        Ok(())
+    }
+
+    async fn create_replacing_approved(&self, row: &DeviceRow) -> DeviceResult<Vec<String>> {
+        let mut g = self.rows.lock();
+        if g.values()
+            .any(|r| r.auth_token == row.auth_token && r.device_id != row.device_id)
+        {
+            return Err(StorageError::Conflict("auth_token exists".into()));
+        }
+        let replaced: Vec<String> = g
+            .values_mut()
+            .filter(|r| r.status == DeviceStatus::Approved && r.device_id != row.device_id)
+            .map(|r| {
+                r.status = DeviceStatus::Revoked;
+                r.device_id.clone()
+            })
+            .collect();
+        g.insert(row.device_id.clone(), row.clone());
+        Ok(replaced)
+    }
+
+    async fn create_provisioning(&self, row: &DeviceRow) -> DeviceResult<()> {
+        let mut g = self.rows.lock();
+        if g.values()
+            .any(|r| r.auth_token == row.auth_token && r.device_id != row.device_id)
+        {
+            return Err(StorageError::Conflict("auth_token exists".into()));
+        }
+        g.insert(row.device_id.clone(), row.clone());
+        Ok(())
+    }
+
+    async fn approve_replacing(
+        &self,
+        device_id: &str,
+        approved_at: i64,
+    ) -> DeviceResult<Vec<String>> {
+        let mut g = self.rows.lock();
+        if !g.contains_key(device_id) {
+            return Err(StorageError::NotFound(format!("device {device_id}")));
+        }
+        let replaced: Vec<String> = g
+            .values_mut()
+            .filter(|r| r.status == DeviceStatus::Approved && r.device_id != device_id)
+            .map(|r| {
+                r.status = DeviceStatus::Revoked;
+                r.device_id.clone()
+            })
+            .collect();
+        if let Some(row) = g.get_mut(device_id) {
+            row.status = DeviceStatus::Approved;
+            row.approved_at = Some(approved_at);
+        }
+        Ok(replaced)
+    }
+
+    async fn get(&self, device_id: &str) -> DeviceResult<Option<DeviceRow>> {
+        Ok(self.rows.lock().get(device_id).cloned())
+    }
+
+    async fn lookup_approved_by_auth_token(
+        &self,
+        auth_token: &str,
+    ) -> DeviceResult<Option<DeviceRow>> {
+        Ok(self
+            .rows
+            .lock()
+            .values()
+            .find(|r| r.auth_token == auth_token && r.status == DeviceStatus::Approved)
+            .cloned())
+    }
+
+    async fn lookup_approved_by_pubkey(
+        &self,
+        device_pubkey: &[u8],
+    ) -> DeviceResult<Option<DeviceRow>> {
+        Ok(self
+            .rows
+            .lock()
+            .values()
+            .find(|r| r.device_pubkey == device_pubkey && r.status == DeviceStatus::Approved)
+            .cloned())
+    }
+
+    async fn list(&self, status: Option<DeviceStatus>) -> DeviceResult<Vec<DeviceRow>> {
+        Ok(sorted_desc(
+            self.rows
+                .lock()
+                .values()
+                .filter(|r| status.is_none_or(|s| r.status == s))
+                .cloned(),
+        ))
+    }
+
+    async fn revoke(&self, device_id: &str) -> DeviceResult<bool> {
+        let mut g = self.rows.lock();
+        let Some(row) = g.get_mut(device_id) else {
+            return Ok(false);
+        };
+        if row.status == DeviceStatus::Revoked {
+            return Ok(false);
+        }
+        row.status = DeviceStatus::Revoked;
+        Ok(true)
+    }
+
+    async fn touch_last_seen(&self, device_id: &str, now: i64) -> DeviceResult<()> {
+        if let Some(row) = self.rows.lock().get_mut(device_id) {
+            row.last_seen_at = Some(now);
+        }
+        Ok(())
+    }
+}
+
+fn sorted_desc(rows: impl Iterator<Item = DeviceRow>) -> Vec<DeviceRow> {
+    let mut v: Vec<DeviceRow> = rows.collect();
+    v.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+    v
 }

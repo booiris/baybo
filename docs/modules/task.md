@@ -112,7 +112,7 @@ work, which has no durable model yet. They remain `NotImplemented` stubs in
 | `model` | Owns `Task` / `TaskStatus` / `TaskId` + the `TASK_*_TOOL_NAME` consts |
 | `store` | Owns the `TaskStore` trait + `TaskPatch` |
 | `storage` | `LibsqlTaskStore` + the `session_tasks` DDL; `task` field on the `Store` bundle |
-| `agent` | `src/runtime.rs` registers `baybo_task::tools::agent_tools(stores.task)`; `AgentLoop` holds the `Arc<dyn TaskStore>`, refreshes the per-turn reminder, and emits `AgentEvent::TaskList` |
+| `agent` | `crates/baybo/src/runtime.rs` registers `baybo_task::tools::agent_tools(stores.task)`; `AgentLoop` holds the `Arc<dyn TaskStore>`, refreshes the per-turn reminder, and emits `AgentEvent::TaskList` |
 | `context` | `ContextManager::refresh_task_reminder` + `prompts::tasks::render_task_list` render the transient reminder |
 | `channels` | `AgentEvent::TaskList` + the `Frame::TaskList` / `TaskView` wire types |
 | `gateway` | The channel adapter maps `AgentEvent::TaskList → Frame::TaskList`; the web dashboard renders the checklist |

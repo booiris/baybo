@@ -1,5 +1,5 @@
 //! API-key resolution for LLM entries — the single source of truth
-//! for both runtime boot (`src/boot.rs::build_llm_client`) and the
+//! for both runtime boot (`crates/baybo/src/boot.rs::build_llm_client`) and the
 //! `baybo llm` CLI helpers. Taking primitive args (rather than an
 //! `LlmEntry`) avoids a circular dep on `baybo-config`.
 

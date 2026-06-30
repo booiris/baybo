@@ -34,7 +34,7 @@ Backend flags: `--root` (default `bench`), `--host` (default `127.0.0.1`),
 
 ```
 bench/bench-web/
-  build.rs              pnpm build + zstd-embed web/dist (gateway pattern, webui-only)
+  build.rs              pnpm build + zstd-embed app/web/dist (gateway pattern, webui-only)
   src/
     main.rs             clap CLI + axum serve
     api.rs              /api/* routes + state; webui fallback
@@ -101,12 +101,12 @@ the static bench registry before any file access.
 ## ts-rs bindings
 
 `model.rs` derives `ts_rs::TS` under the `ts-export` feature and exports
-to `web/src/generated/` (committed, like `sdks/channel-ts/src/generated`).
+to `app/web/src/generated/` (committed, like `sidecars/sdk/channel-ts/src/generated`).
 `scripts/check-ts-bindings.sh` regenerates and diffs against HEAD — a
 spine change must land with the regenerated `.ts`. 64-bit / `usize`
 fields carry `#[ts(type = "number")]` so the TS side is JSON-safe
 `number`, not `bigint`. The trace types stay a hand-written mirror
-(`web/src/types/trace.ts`, ported from the gateway dashboard).
+(`app/web/src/types/trace.ts`, ported from the gateway dashboard).
 
 ## Per-bench notes / gotchas
 

@@ -3,6 +3,7 @@ pub mod builtin;
 pub mod error;
 pub mod mcp;
 pub mod progress;
+pub mod read_tracker;
 pub mod registry;
 pub mod virtual_read;
 
@@ -14,6 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+#[cfg(any(test, feature = "test-support"))]
+use baybo_model::ChannelType;
 use baybo_model::{JobId, SessionId, SpanId, User};
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
@@ -25,7 +28,10 @@ pub use approval::{
     ApprovalDecision, ApprovalGate, ApprovalGateMap, ApprovalQueue, ApprovalRequest,
     ApprovedResource, AutoDenyGate, ChannelApprovalGate, HostPattern, ResourceAccess,
 };
+pub(crate) use baybo_model::FileFingerprint;
+pub use builtin::read::READ_TOOL_NAME;
 pub use error::ToolError;
+pub use read_tracker::ReadTracker;
 pub use virtual_read::{VirtualReadAccess, VirtualReadResolver};
 
 pub type Result<T> = std::result::Result<T, ToolError>;
@@ -203,6 +209,15 @@ pub struct ToolContext {
     /// the real filesystem. The resolver self-enforces access control via
     /// [`VirtualReadAccess`].
     pub virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
+    /// Read-before-write tracker enforcing the `Read`→`Edit`/`Write`
+    /// contract. `Read` records each file's fingerprint here; `Edit`
+    /// (always) and `Write` (when overwriting an existing file) refuse to
+    /// run unless the file was read and is unchanged since. `Some` **only
+    /// for the interactive agent loop** — system passes that legitimately
+    /// rewrite their own files without a prior read (the background-summary
+    /// pass over `summary.md`) and argv-mode / test call sites leave it
+    /// `None`, which disables the contract. See [`ReadTracker`].
+    pub read_tracker: Option<ReadTracker>,
     /// Runtime hook for detaching a slow command into the background.
     /// `Some` **only for user-facing sessions** (the runtime gates the
     /// injection), so its presence is the "may this command convert to
@@ -212,6 +227,46 @@ pub struct ToolContext {
     /// View + control of this session's in-flight background jobs, for the
     /// `JobList` / `JobStop` tools. Gated like [`Self::background_jobs`].
     pub background_control: Option<Arc<dyn BackgroundJobControl>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ToolContext {
+    /// Minimal context for tests: placeholder identity, a `/tmp` workspace,
+    /// and every optional capability (sandbox, approval, llm, secrets,
+    /// virtual reads, read tracker, background jobs) left unset. Override
+    /// the few fields a test actually cares about with struct-update syntax
+    /// so a new `ToolContext` field never has to be threaded through every
+    /// fixture again:
+    ///
+    /// ```ignore
+    /// ToolContext { timeout: Duration::from_secs(10), ..ToolContext::for_test() }
+    /// ```
+    pub fn for_test() -> Self {
+        Self {
+            session_id: "test".into(),
+            job_id: JobId::default(),
+            span_id: SpanId::default(),
+            user: User {
+                id: "u".into(),
+                name: None,
+                channel: ChannelType::tui(),
+            },
+            timeout: Duration::from_secs(5),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            workspace_root: PathBuf::from("/tmp"),
+            workspace_paths: WorkspacePaths::new("/tmp"),
+            sandbox: None,
+            approval: None,
+            notifier: None,
+            events: noop_event_sink(),
+            llm: None,
+            secrets: None,
+            virtual_reads: None,
+            read_tracker: None,
+            background_jobs: None,
+            background_control: None,
+        }
+    }
 }
 
 /// Severity of a [`SessionNotifier`] event. Matches

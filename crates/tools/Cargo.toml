@@ -20,7 +20,7 @@ bench-bash = []
 # `_meta.baybo.*` annotations the embedded MCP servers carry on each
 # tool descriptor. Kept behind a feature so release builds don't pull
 # in ts-rs. Generated files land under
-# `tool-src/browser/src/generated/` so the browser sidecar imports the
+# `sidecars/tool/browser/src/generated/` so the browser sidecar imports the
 # same types the Rust client deserializes — wire drift is a compile
 # error on the TS side.
 ts-export = ["dep:ts-rs"]

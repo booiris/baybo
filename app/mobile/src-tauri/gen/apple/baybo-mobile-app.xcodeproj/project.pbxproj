@@ -1,0 +1,661 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 63;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1901929CEEF708BB92AAAAF6 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 59CC467E2C8A9424844807F0 /* CoreGraphics.framework */; };
+		21D00868B7C5DED2D2E4BCE7 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FC1F617832F8F5BEDEF951A /* NotificationService.swift */; };
+		62C30544966835910ED7CCB3 /* PushKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1987CEA7034263B6FB5DDA55 /* PushKeyStore.swift */; };
+		701A5AB4F8AEB802D646D5AA /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 68C6D1D182168ED2B7ED5C41 /* LaunchScreen.storyboard */; };
+		83CD22C1A966D071F7F8DA9E /* UserNotifications.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 84471E52E545BE3BD8682D24 /* UserNotifications.framework */; };
+		86771FF5E65FB6A2348886CB /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EF9C98C1B0E80554DAFF2766 /* QuartzCore.framework */; };
+		9E068CA1118C0B97DCC5031A /* assets in Resources */ = {isa = PBXBuildFile; fileRef = C454E07F23CD4833CA21E9E1 /* assets */; };
+		A7DE0D3FEF5FB6C1B77FF4A9 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1BF6ACC26BA68855BB6BE2A7 /* UIKit.framework */; };
+		B4888E674002F5044ABBF57E /* libapp.a in Resources */ = {isa = PBXBuildFile; fileRef = B368CDD18A35BBA9DD464B4B /* libapp.a */; };
+		B67063890CCE4F9207A8EF86 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3EC3EF7F9E79C4E43A1B069A /* WebKit.framework */; };
+		C0564E537BA1C36BA1C60FCC /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1E77ABFD7305DCC73DC3C198 /* Metal.framework */; };
+		D0EFCD0D69B007D7FB64455A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B22082581F51FD31B96F3AC5 /* Assets.xcassets */; };
+		D2BAC707B196782EDF3A4968 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BE446D7D0A8007F4A35DF656 /* MetalKit.framework */; };
+		E93B53D056A9EC59FC65D232 /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 94806C3F2059EFD33D63F014 /* libapp.a */; };
+		F967AAF3732DEA10C34C7F06 /* NotificationExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 0CC7B180FD02AA8093A547EB /* NotificationExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		FD1F350C08E7DEEB37661134 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0387893BC483882E8A12AB12 /* Security.framework */; };
+		FD412AB3ED00FD187D6D2BEE /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 41BCC0B2FF0F1359971C1A0B /* main.mm */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		0D51A988BAB6F55BF56708E4 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = AB479353EF00D1CDD326C3DB /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 26ABCAE29EA5AD767B509F59;
+			remoteInfo = NotificationExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		C06FF01CC88FF67745F6053C /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				F967AAF3732DEA10C34C7F06 /* NotificationExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		0387893BC483882E8A12AB12 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		0CC7B180FD02AA8093A547EB /* NotificationExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = NotificationExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		0FC1F617832F8F5BEDEF951A /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
+		1987CEA7034263B6FB5DDA55 /* PushKeyStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushKeyStore.swift; sourceTree = "<group>"; };
+		1A1E38FCA1262F3275321A4C /* push_register.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = push_register.rs; sourceTree = "<group>"; };
+		1BF6ACC26BA68855BB6BE2A7 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		1E77ABFD7305DCC73DC3C198 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		3AC6EBC324133855FE3A07EB /* main.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = main.rs; sourceTree = "<group>"; };
+		3EC3EF7F9E79C4E43A1B069A /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		41BCC0B2FF0F1359971C1A0B /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		4D912E71D7C2819776036F5D /* keychain.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = keychain.rs; sourceTree = "<group>"; };
+		520A3721286228884068D8CB /* lib.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = lib.rs; sourceTree = "<group>"; };
+		59CC467E2C8A9424844807F0 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		68C6D1D182168ED2B7ED5C41 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		84471E52E545BE3BD8682D24 /* UserNotifications.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UserNotifications.framework; path = System/Library/Frameworks/UserNotifications.framework; sourceTree = SDKROOT; };
+		850C3771A35321F0B7BB1BB2 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
+		94806C3F2059EFD33D63F014 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
+		ABB81E535D5DA004EF09E33D /* baybo-mobile-app_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "baybo-mobile-app_iOS.entitlements"; sourceTree = "<group>"; };
+		B22082581F51FD31B96F3AC5 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B368CDD18A35BBA9DD464B4B /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
+		B4E2C7D8A9F04152B3C6D7E8 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Signing.xcconfig; sourceTree = "<group>"; };
+		BE446D7D0A8007F4A35DF656 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		BF8FEB7743DA075CF297056D /* Baybo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Baybo.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C454E07F23CD4833CA21E9E1 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
+		E26AB7416570AA97644FB269 /* pairing.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = pairing.rs; sourceTree = "<group>"; };
+		EE5E2833FB3FDB8B1C90B09C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		EF9C98C1B0E80554DAFF2766 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		8B3C50DF61B8775FF18733B5 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				83CD22C1A966D071F7F8DA9E /* UserNotifications.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DE50DF755225B84A39E75E62 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E93B53D056A9EC59FC65D232 /* libapp.a in Frameworks */,
+				1901929CEEF708BB92AAAAF6 /* CoreGraphics.framework in Frameworks */,
+				C0564E537BA1C36BA1C60FCC /* Metal.framework in Frameworks */,
+				D2BAC707B196782EDF3A4968 /* MetalKit.framework in Frameworks */,
+				86771FF5E65FB6A2348886CB /* QuartzCore.framework in Frameworks */,
+				FD1F350C08E7DEEB37661134 /* Security.framework in Frameworks */,
+				A7DE0D3FEF5FB6C1B77FF4A9 /* UIKit.framework in Frameworks */,
+				B67063890CCE4F9207A8EF86 /* WebKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		03C2ABA5902354CFD368A062 /* baybo-mobile-app_iOS */ = {
+			isa = PBXGroup;
+			children = (
+				ABB81E535D5DA004EF09E33D /* baybo-mobile-app_iOS.entitlements */,
+				EE5E2833FB3FDB8B1C90B09C /* Info.plist */,
+			);
+			path = "baybo-mobile-app_iOS";
+			sourceTree = "<group>";
+		};
+		0C2FA82E0333F289C3A2CC38 /* bindings */ = {
+			isa = PBXGroup;
+			children = (
+				850C3771A35321F0B7BB1BB2 /* bindings.h */,
+			);
+			path = bindings;
+			sourceTree = "<group>";
+		};
+		203DB574513E30268D74CB4E /* NotificationExtension */ = {
+			isa = PBXGroup;
+			children = (
+				0FC1F617832F8F5BEDEF951A /* NotificationService.swift */,
+				1987CEA7034263B6FB5DDA55 /* PushKeyStore.swift */,
+			);
+			name = NotificationExtension;
+			path = ../../../apple/NotificationExtension;
+			sourceTree = "<group>";
+		};
+		43D3506FEE29E57D6698215E /* Externals */ = {
+			isa = PBXGroup;
+			children = (
+				4F38D5AE8E0DEB5B576707B3 /* arm64 */,
+			);
+			path = Externals;
+			sourceTree = "<group>";
+		};
+		4D89325B481600165DF96C94 /* src */ = {
+			isa = PBXGroup;
+			children = (
+				4D912E71D7C2819776036F5D /* keychain.rs */,
+				520A3721286228884068D8CB /* lib.rs */,
+				3AC6EBC324133855FE3A07EB /* main.rs */,
+				E26AB7416570AA97644FB269 /* pairing.rs */,
+				1A1E38FCA1262F3275321A4C /* push_register.rs */,
+			);
+			name = src;
+			path = ../../src;
+			sourceTree = "<group>";
+		};
+		4F38D5AE8E0DEB5B576707B3 /* arm64 */ = {
+			isa = PBXGroup;
+			children = (
+				E70DA25DF50864BC9E192F58 /* debug */,
+			);
+			path = arm64;
+			sourceTree = "<group>";
+		};
+		53702386EE2EDFAF0B01588D /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				59CC467E2C8A9424844807F0 /* CoreGraphics.framework */,
+				94806C3F2059EFD33D63F014 /* libapp.a */,
+				1E77ABFD7305DCC73DC3C198 /* Metal.framework */,
+				BE446D7D0A8007F4A35DF656 /* MetalKit.framework */,
+				EF9C98C1B0E80554DAFF2766 /* QuartzCore.framework */,
+				0387893BC483882E8A12AB12 /* Security.framework */,
+				1BF6ACC26BA68855BB6BE2A7 /* UIKit.framework */,
+				84471E52E545BE3BD8682D24 /* UserNotifications.framework */,
+				3EC3EF7F9E79C4E43A1B069A /* WebKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		5802705A934F2BD70741D8AE /* baybo-mobile-app */ = {
+			isa = PBXGroup;
+			children = (
+				41BCC0B2FF0F1359971C1A0B /* main.mm */,
+				0C2FA82E0333F289C3A2CC38 /* bindings */,
+			);
+			path = "baybo-mobile-app";
+			sourceTree = "<group>";
+		};
+		7A1FCB753D213AFE2D13F8AA = {
+			isa = PBXGroup;
+			children = (
+				C454E07F23CD4833CA21E9E1 /* assets */,
+				B22082581F51FD31B96F3AC5 /* Assets.xcassets */,
+				68C6D1D182168ED2B7ED5C41 /* LaunchScreen.storyboard */,
+				03C2ABA5902354CFD368A062 /* baybo-mobile-app_iOS */,
+				43D3506FEE29E57D6698215E /* Externals */,
+				203DB574513E30268D74CB4E /* NotificationExtension */,
+				EECC5BB59B4E38B6DB58AF35 /* Sources */,
+				B4E2C7D8A9F04152B3C6D7E8 /* Signing.xcconfig */,
+				4D89325B481600165DF96C94 /* src */,
+				53702386EE2EDFAF0B01588D /* Frameworks */,
+				8522ED59BA3F7423705977F9 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		8522ED59BA3F7423705977F9 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				BF8FEB7743DA075CF297056D /* Baybo.app */,
+				0CC7B180FD02AA8093A547EB /* NotificationExtension.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		E70DA25DF50864BC9E192F58 /* debug */ = {
+			isa = PBXGroup;
+			children = (
+				B368CDD18A35BBA9DD464B4B /* libapp.a */,
+			);
+			path = debug;
+			sourceTree = "<group>";
+		};
+		EECC5BB59B4E38B6DB58AF35 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				5802705A934F2BD70741D8AE /* baybo-mobile-app */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		26ABCAE29EA5AD767B509F59 /* NotificationExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 2EC5F8FAFC0C02BB9592ADE6 /* Build configuration list for PBXNativeTarget "NotificationExtension" */;
+			buildPhases = (
+				1F7C6347AA6611EF322CE478 /* Sources */,
+				8B3C50DF61B8775FF18733B5 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = NotificationExtension;
+			packageProductDependencies = (
+			);
+			productName = NotificationExtension;
+			productReference = 0CC7B180FD02AA8093A547EB /* NotificationExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		7B9B1CA9AEC5EE9D8512ED28 /* baybo-mobile-app_iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 80DD3D5809D487A4059D386A /* Build configuration list for PBXNativeTarget "baybo-mobile-app_iOS" */;
+			buildPhases = (
+				B8C36EBD411D4EE280A88D7B /* Build Rust Code */,
+				5D0C9D8FEBE1A34D79671031 /* Sources */,
+				2D5F477A5E27D66031847910 /* Resources */,
+				DE50DF755225B84A39E75E62 /* Frameworks */,
+				C06FF01CC88FF67745F6053C /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				BD2D0317E6AB689D31EC4D18 /* PBXTargetDependency */,
+			);
+			name = "baybo-mobile-app_iOS";
+			packageProductDependencies = (
+			);
+			productName = "baybo-mobile-app_iOS";
+			productReference = BF8FEB7743DA075CF297056D /* Baybo.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AB479353EF00D1CDD326C3DB /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+			};
+			buildConfigurationList = 20C1FF8206D9BA5FBF0E835F /* Build configuration list for PBXProject "baybo-mobile-app" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 7A1FCB753D213AFE2D13F8AA;
+			minimizedProjectReferenceProxies = 1;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				26ABCAE29EA5AD767B509F59 /* NotificationExtension */,
+				7B9B1CA9AEC5EE9D8512ED28 /* baybo-mobile-app_iOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		2D5F477A5E27D66031847910 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D0EFCD0D69B007D7FB64455A /* Assets.xcassets in Resources */,
+				701A5AB4F8AEB802D646D5AA /* LaunchScreen.storyboard in Resources */,
+				9E068CA1118C0B97DCC5031A /* assets in Resources */,
+				B4888E674002F5044ABBF57E /* libapp.a in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		B8C36EBD411D4EE280A88D7B /* Build Rust Code */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Code";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a",
+				"$(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "export PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\" && cargo tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		1F7C6347AA6611EF322CE478 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				21D00868B7C5DED2D2E4BCE7 /* NotificationService.swift in Sources */,
+				62C30544966835910ED7CCB3 /* PushKeyStore.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5D0C9D8FEBE1A34D79671031 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FD412AB3ED00FD187D6D2BEE /* main.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		BD2D0317E6AB689D31EC4D18 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 26ABCAE29EA5AD767B509F59 /* NotificationExtension */;
+			targetProxy = 0D51A988BAB6F55BF56708E4 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		2B6F7C6BCF46290D20B3298B /* release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = B4E2C7D8A9F04152B3C6D7E8 /* Signing.xcconfig */;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = NO;
+				ARCHS = arm64;
+				CODE_SIGN_ENTITLEMENTS = NotificationExtension/NotificationExtension.entitlements;
+				DEVELOPMENT_TEAM = "$(BAYBO_IOS_DEVELOPMENT_TEAM)";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				INFOPLIST_FILE = NotificationExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.baybo.app.NotificationExtension;
+				PRODUCT_NAME = NotificationExtension;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = release;
+		};
+		32E944B1F7F4736AE40B5C57 /* debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = B4E2C7D8A9F04152B3C6D7E8 /* Signing.xcconfig */;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = arm64;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "baybo-mobile-app_iOS/baybo-mobile-app_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = "$(BAYBO_IOS_DEVELOPMENT_TEAM)";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "baybo-mobile-app_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION)",
+					"$(SDKROOT)/usr/lib/swift",
+					"$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME)",
+					"$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION)",
+					"$(SDKROOT)/usr/lib/swift",
+					"$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME)",
+					"$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.baybo.app;
+				PRODUCT_NAME = "Baybo";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = debug;
+		};
+		419FDCF713FB56F973A691E3 /* debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = B4E2C7D8A9F04152B3C6D7E8 /* Signing.xcconfig */;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = NO;
+				ARCHS = arm64;
+				CODE_SIGN_ENTITLEMENTS = NotificationExtension/NotificationExtension.entitlements;
+				DEVELOPMENT_TEAM = "$(BAYBO_IOS_DEVELOPMENT_TEAM)";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				INFOPLIST_FILE = NotificationExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.baybo.app.NotificationExtension;
+				PRODUCT_NAME = NotificationExtension;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = debug;
+		};
+		538CC128B36EF0FF0D0F01F9 /* debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = B4E2C7D8A9F04152B3C6D7E8 /* Signing.xcconfig */;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = debug;
+		};
+		77FD4828C4397EE5F124F651 /* release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = B4E2C7D8A9F04152B3C6D7E8 /* Signing.xcconfig */;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = arm64;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "baybo-mobile-app_iOS/baybo-mobile-app_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = "$(BAYBO_IOS_DEVELOPMENT_TEAM)";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "baybo-mobile-app_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION)",
+					"$(SDKROOT)/usr/lib/swift",
+					"$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME)",
+					"$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION)",
+					"$(SDKROOT)/usr/lib/swift",
+					"$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME)",
+					"$(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.baybo.app;
+				PRODUCT_NAME = "Baybo";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = release;
+		};
+		CE6965A383ABDFB7333B2F1A /* release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = B4E2C7D8A9F04152B3C6D7E8 /* Signing.xcconfig */;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		20C1FF8206D9BA5FBF0E835F /* Build configuration list for PBXProject "baybo-mobile-app" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				538CC128B36EF0FF0D0F01F9 /* debug */,
+				CE6965A383ABDFB7333B2F1A /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		2EC5F8FAFC0C02BB9592ADE6 /* Build configuration list for PBXNativeTarget "NotificationExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				419FDCF713FB56F973A691E3 /* debug */,
+				2B6F7C6BCF46290D20B3298B /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		80DD3D5809D487A4059D386A /* Build configuration list for PBXNativeTarget "baybo-mobile-app_iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				32E944B1F7F4736AE40B5C57 /* debug */,
+				77FD4828C4397EE5F124F651 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = AB479353EF00D1CDD326C3DB /* Project object */;
+}

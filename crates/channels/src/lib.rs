@@ -8,7 +8,12 @@ mod types;
 
 pub mod register_wire;
 pub mod registration;
-pub mod wire;
+
+/// The wire types (`Frame`, `Message`, …) + MessagePack codec, now their own
+/// crate so the iOS companion can speak the protocol without `baybo-channels`'
+/// server-only dependency chain. Re-exported here as `wire` so existing
+/// `baybo_channels::wire::*` consumers are unchanged.
+pub use wire;
 
 pub use channel::{ApprovalSurface, Channel, DispatchObserver, SubscribedView};
 pub use connection::{Connection, ConnectionId, ConnectionSink, SendOutcome};
@@ -24,8 +29,11 @@ pub use slash::{
     ViewKind,
 };
 pub use types::{
-    AgentEvent, AgentOutput, IncomingMessage, Message, MessageRole, NoticeLevel, OutgoingMessage,
-    RouterInbound, SessionEvent, ToolStatus, TurnStatus,
+    AgentEvent, AgentOutput, IncomingMessage, Message, NoticeLevel, OutgoingMessage, RouterInbound,
+    SessionEvent, ToolStatus, TurnStatus,
 };
+// `MessageRole` now lives in `wire`; keep it at the crate root so
+// `baybo_channels::MessageRole` consumers are unchanged.
+pub use wire::MessageRole;
 
 pub type Result<T> = std::result::Result<T, ChannelError>;

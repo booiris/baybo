@@ -3,7 +3,7 @@
 //!
 //! The TUI is session-scoped — it picks its own UUID and mints it into
 //! the Register frame. Third-party sidecars (the Telegram channel at
-//! `channel-src/telegram/` is the canonical example) have no natural
+//! `sidecars/channel/telegram/` is the canonical example) have no natural
 //! way to generate stable UUIDs per end-user, so they send
 //! `Frame::Message { session_id: "", user_id: "<platform_user>" }`
 //! and let the gateway resolve / allocate on their behalf. The mapping

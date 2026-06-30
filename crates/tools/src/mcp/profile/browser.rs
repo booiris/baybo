@@ -11,9 +11,9 @@
 //! gateway boot path does the trivial unpacking (`config.browser.enable`,
 //! `config.browser.chrome_path`, `config.browser.sandbox`, …).
 //!
-//! The TS sidecar at `tool-src/browser/src/server.ts` is a thin wrapper
+//! The TS sidecar at `sidecars/tool/browser/src/server.ts` is a thin wrapper
 //! around `chrome-devtools-mcp` (pinned to a fixed version under
-//! `tool-src/browser/package.json`). It reads internal IPC env vars
+//! `sidecars/tool/browser/package.json`). It reads internal IPC env vars
 //! plumbed by this builder and forces telemetry off, headless on, and
 //! `isolated=false` so the userDataDir persists across restarts.
 

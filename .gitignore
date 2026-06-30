@@ -8,10 +8,8 @@ index.scip
 baybo.json
 baybo_online.json
 **/node_modules/
-sdks/*/dist/
-channel-src/*/dist/
-tool-src/*/dist/
-web/dist/
+sidecars/*/*/dist/
+app/web/dist/
 bench/bench-web/web/dist/
 # Scratch stdout logs from running a bench / its viewer by hand.
 bench/**/logs/
@@ -28,6 +26,7 @@ origin_channel_plugin
 
 # editor / tooling
 .idea
+.zed/
 .claude/agents
 .claude/commands
 .claude/settings.json
@@ -36,3 +35,7 @@ origin_channel_plugin
 # stray submodule manifest from local sandbox
 .gitmodules
 .antigravitycli
+
+# macOS
+.DS_Store
+**/.DS_Store

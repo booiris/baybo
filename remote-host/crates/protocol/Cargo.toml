@@ -1,0 +1,10 @@
+[package]
+name = "remote-host-protocol"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde = { workspace = true }

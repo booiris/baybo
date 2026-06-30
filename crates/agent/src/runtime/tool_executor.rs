@@ -10,8 +10,8 @@ use baybo_model::{JobId, ParallelGroup, SessionId, SpanId, TrustLevel, User};
 use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use baybo_tools::{
     ApprovalDecision, ApprovalGateMap, ApprovalHandle, ApprovalRequest, ApprovedResource,
-    ExecSandbox, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
-    ToolRegistry, VirtualReadResolver, approval::preview_params,
+    ExecSandbox, ReadTracker, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest,
+    ToolOutput, ToolRegistry, VirtualReadResolver, approval::preview_params,
 };
 use baybo_trace::{
     LifecycleOutcome, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder, StepHandle,
@@ -331,6 +331,9 @@ impl ToolExecutor {
         // Whether this session may background work (user-facing session).
         // Gates whether the [`BackgroundJobSink`] reaches the tool's ctx.
         background_eligible: bool,
+        // Per-session read-before-write tracker. `Read` records into it;
+        // `Edit`/`Write` enforce against it. Cheap to clone (one `Arc`).
+        read_tracker: ReadTracker,
     ) -> anyhow::Result<ToolOutput> {
         debug!(tool = tool_name, "executing tool");
 
@@ -529,6 +532,10 @@ impl ToolExecutor {
                     // `ReadTool` consults this before the filesystem; today
                     // just the session transcript. Cheap clone (Arc bump).
                     virtual_reads: self.virtual_reads.clone(),
+                    // Read-before-write tracker is always wired for the
+                    // interactive agent loop, so `Edit`/`Write` enforce the
+                    // contract here (unlike the background-summary pass).
+                    read_tracker: Some(read_tracker),
                     // Gate: the background-job sink reaches a tool only for
                     // user-facing sessions, so a command can convert to
                     // background on timeout only there.

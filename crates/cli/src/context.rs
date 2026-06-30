@@ -7,6 +7,7 @@ use baybo_config::BayboConfig;
 use baybo_cost::CostStore;
 use baybo_job::JobLifecycle;
 use baybo_llm::BillableLlm;
+use baybo_pairing::DevicePairingService;
 use baybo_query::QueryApi;
 use baybo_security::{LeakDetector, SecretVault};
 use baybo_skills::SkillRegistry;
@@ -60,6 +61,9 @@ pub struct CommandContext {
     /// `channel_bot_store` for one-shot CLI commands that drive
     /// `baybo pair {list,approve,revoke}`.
     pub channel_pairing_store: Option<Arc<dyn ChannelPairingStore>>,
+    /// iOS-companion device pairing service. Populated for one-shot CLI
+    /// commands that drive `baybo device {pair,approve,list,revoke}`.
+    pub device_pairing_service: Option<Arc<DevicePairingService>>,
     /// Shared vault — populated for the same subset of commands as
     /// `channel_bot_store`. Used to read/write bot tokens keyed as
     /// `channel.<channel_type>.bot.<bot_id>.token`.
@@ -100,7 +104,7 @@ impl CommandContext {
 
 /// Builder for `CommandContext`.
 ///
-/// `src/main.rs` populates the builder after bootstrapping the domain graph;
+/// `crates/baybo/src/main.rs` populates the builder after bootstrapping the domain graph;
 /// each field corresponds to an `Arc` already held by the main process.
 pub struct ContextBuilder {
     config: Arc<BayboConfig>,
@@ -120,6 +124,7 @@ pub struct ContextBuilder {
     skill_assessor: Option<Arc<SkillAssessor>>,
     channel_bot_store: Option<Arc<dyn ChannelBotStore>>,
     channel_pairing_store: Option<Arc<dyn ChannelPairingStore>>,
+    device_pairing_service: Option<Arc<DevicePairingService>>,
     secret_vault: Option<Arc<SecretVault>>,
 }
 
@@ -143,6 +148,7 @@ impl ContextBuilder {
             skill_assessor: None,
             channel_bot_store: None,
             channel_pairing_store: None,
+            device_pairing_service: None,
             secret_vault: None,
         }
     }
@@ -231,6 +237,11 @@ impl ContextBuilder {
         self
     }
 
+    pub fn device_pairing_service(mut self, service: Arc<DevicePairingService>) -> Self {
+        self.device_pairing_service = Some(service);
+        self
+    }
+
     pub fn secret_vault(mut self, vault: Arc<SecretVault>) -> Self {
         self.secret_vault = Some(vault);
         self
@@ -268,6 +279,7 @@ impl ContextBuilder {
             skill_assessor: self.skill_assessor,
             channel_bot_store: self.channel_bot_store,
             channel_pairing_store: self.channel_pairing_store,
+            device_pairing_service: self.device_pairing_service,
             secret_vault: self.secret_vault,
             format: OutputFormat::Human,
             invocation: Invocation::Argv,

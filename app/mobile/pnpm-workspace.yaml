@@ -1,0 +1,3 @@
+# Marks the iOS app as its own pnpm root so `pnpm install` here resolves the
+# Tauri/React deps locally instead of walking up into the repo's web workspace.
+packages: []

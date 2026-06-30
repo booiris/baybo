@@ -15,8 +15,10 @@ use crate::auth::{AuthedClient, ChannelTokenTable, TOOL_CLIENT_LABEL_PREFIX};
 
 /// Channel type strings that subprocess sidecars may not claim — they
 /// would shadow an in-process adapter. `"tui"` is enforced separately
-/// (only the vault-token TUI auth path may claim it).
-const RESERVED_CHANNEL_TYPES: &[&str] = &[ChannelType::HTTP];
+/// (only the vault-token TUI auth path may claim it). `"ios"` joins `"http"`
+/// here: only the device-auth path ([`AuthedClient::Device`]) may claim it,
+/// just as only [`AuthedClient::Web`] may claim `"http"`.
+const RESERVED_CHANNEL_TYPES: &[&str] = &[ChannelType::HTTP, ChannelType::IOS];
 
 /// Outcome of a successful Register handshake. Only the channel type
 /// is reported; subscriptions are negotiated post-handshake.
@@ -72,6 +74,18 @@ pub(crate) fn validate_register(
                 ));
             }
             let _ = (label, token);
+        }
+        // A paired, approved device registers as the iOS channel only —
+        // fixed like the web token's `http`, so a leaked device token can't be
+        // redirected onto another channel's session stream.
+        AuthedClient::Device { device_id, .. } => {
+            if normalized != ChannelType::IOS {
+                return Err(format!(
+                    "device token must register as channel_type '{}', got '{normalized}'",
+                    ChannelType::IOS,
+                ));
+            }
+            let _ = device_id;
         }
         AuthedClient::Subprocess { pid, label, .. } => {
             if label.starts_with(TOOL_CLIENT_LABEL_PREFIX) {
@@ -292,6 +306,43 @@ mod tests {
             err.contains("tool/browser") && err.contains("reserved for tool sidecars"),
             "got: {err}",
         );
+    }
+
+    #[test]
+    fn accepts_device_auth_claiming_ios_channel() {
+        let tokens = ChannelTokenTable::new();
+        let frame = register("", ChannelType::IOS);
+        let authed = AuthedClient::Device {
+            device_id: "d1".into(),
+        };
+        let outcome = validate_register(frame, &authed, &tokens).unwrap();
+        assert_eq!(outcome.channel_type.as_str(), ChannelType::IOS);
+    }
+
+    #[test]
+    fn rejects_device_auth_claiming_other_channel() {
+        let tokens = ChannelTokenTable::new();
+        let frame = register("", "telegram");
+        let authed = AuthedClient::Device {
+            device_id: "d1".into(),
+        };
+        let err = validate_register(frame, &authed, &tokens).unwrap_err();
+        assert!(err.contains("device token must register"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_subprocess_claiming_ios() {
+        // `ios` is reserved like `http`: a sidecar can't impersonate a device.
+        let tokens = ChannelTokenTable::new();
+        let handle = tokens.mint(ClientIdentity {
+            pid: 5,
+            label: "sidecar-ios".into(),
+            bound_channel_type: Some("ios".into()),
+        });
+        let frame = register(handle.token(), "ios");
+        let authed = subprocess(5, "sidecar-ios");
+        let err = validate_register(frame, &authed, &tokens).unwrap_err();
+        assert!(err.contains("reserved"), "got: {err}");
     }
 
     #[test]

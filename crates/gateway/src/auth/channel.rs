@@ -24,6 +24,8 @@
 //! the "same-UID attacker has already won" threat model is the boundary;
 //! we don't need kernel-level peer-credential checks on top.
 
+use std::sync::Arc;
+
 use super::token::{
     CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TOOL_CLIENT_LABEL_PREFIX,
     TUI_CLIENT_LABEL, WEB_CLIENT_LABEL_PREFIX,
@@ -33,6 +35,7 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::Response;
+use baybo_store::DeviceStore;
 
 /// Tag placed on the request after auth succeeds so downstream
 /// handlers know how the caller was authenticated.
@@ -76,6 +79,16 @@ pub enum AuthedClient {
         /// close).
         token: String,
     },
+    /// A paired, operator-approved iOS companion device. Resolved by its
+    /// persisted `auth_token` against the [`DeviceStore`] (not the in-memory
+    /// [`ChannelTokenTable`]) — only `approved` rows match, so a pending or
+    /// revoked device never authenticates. Scoped to the channel surface:
+    /// registers on `/v1/channel-ws` only as [`ChannelType::IOS`]
+    /// (a `Subscribed` channel). HTTP `/v1/blobs` upload is forbidden for device
+    /// tokens; mobile attachments upload over the E2E relay blob leg instead.
+    Device {
+        device_id: String,
+    },
 }
 
 impl AuthedClient {
@@ -105,11 +118,26 @@ impl AuthedClient {
 #[derive(Clone)]
 pub struct ChannelAuthState {
     tokens: ChannelTokenTable,
+    /// Persisted device registry, consulted when a presented token misses the
+    /// in-memory table. `None` on listeners that never serve devices (the
+    /// loopback sidecar/TUI listener), so they skip the extra lookup entirely.
+    device_store: Option<Arc<dyn DeviceStore>>,
 }
 
 impl ChannelAuthState {
     pub fn new(tokens: ChannelTokenTable) -> Self {
-        Self { tokens }
+        Self {
+            tokens,
+            device_store: None,
+        }
+    }
+
+    /// Enable iOS-device auth: a token-table miss falls back to an
+    /// approved-device lookup against `device_store`. Set only on the listener
+    /// that serves `/v1/channel-ws` for paired devices.
+    pub fn with_device_store(mut self, device_store: Arc<dyn DeviceStore>) -> Self {
+        self.device_store = Some(device_store);
+        self
     }
 }
 
@@ -138,11 +166,26 @@ pub async fn require_channel_auth(
     let has_tok_hdr = req.headers().contains_key(CHANNEL_TOKEN_HEADER);
     let has_tok_query = has_query_token(req.uri().query());
 
-    match check_channel_token(&req, &state) {
+    // Extract the token synchronously (borrows `req`), then resolve it
+    // asynchronously with the *owned* token only — so no `!Sync`
+    // `&Request<Body>` is held across the device-store await and the handler
+    // future stays `Send`.
+    let resolved = match extract_token(&req) {
+        Ok(Some(token)) => resolve_token(&state, &token).await,
+        Ok(None) => Ok(None),
+        Err(status) => Err(status),
+    };
+    match resolved {
         Ok(Some(authed)) => {
             match &authed {
                 AuthedClient::Tui => {
                     tracing::debug!(%path, "channel auth: accepted via TUI token");
+                }
+                AuthedClient::Device { device_id, .. } => {
+                    tracing::debug!(
+                        %path, device_id = %device_id,
+                        "channel auth: accepted via approved device token",
+                    );
                 }
                 AuthedClient::Tool { label } => {
                     tracing::debug!(
@@ -194,42 +237,64 @@ pub async fn require_channel_auth(
     }
 }
 
-fn check_channel_token(
-    req: &Request<Body>,
-    state: &ChannelAuthState,
-) -> std::result::Result<Option<AuthedClient>, StatusCode> {
-    // Header first, then `?token=` query. The query form lets sidecar
-    // runtimes whose WebSocket client can't set custom HTTP headers
-    // (any WHATWG `WebSocket`, browser-style clients) still
-    // authenticate — a loopback-only listener's access logs stay
-    // same-UID-local, so the usual "don't put secrets in URLs"
-    // warning doesn't bite here.
-    let token_cow = match req.headers().get(CHANNEL_TOKEN_HEADER) {
+/// Synchronously pull the presented token out of the request as an owned
+/// `String` (header first, then `?token=` query). `Ok(None)` = no credential;
+/// `Err` = a malformed (non-utf8) header. Kept sync + owned so the caller can
+/// drop the `req` borrow before any await (see [`require_channel_auth`]).
+///
+/// The query form lets sidecar runtimes whose WebSocket client can't set
+/// custom HTTP headers (any WHATWG `WebSocket`) still authenticate — a
+/// loopback-only listener's access logs stay same-UID-local.
+fn extract_token(req: &Request<Body>) -> std::result::Result<Option<String>, StatusCode> {
+    match req.headers().get(CHANNEL_TOKEN_HEADER) {
         Some(value) => match value.to_str() {
-            Ok(s) => Some(std::borrow::Cow::Borrowed(s)),
+            Ok(s) => Ok(Some(s.to_owned())),
             Err(e) => {
                 tracing::debug!(error = %e, "channel auth: token header is not utf-8");
-                return Err(StatusCode::UNAUTHORIZED);
+                Err(StatusCode::UNAUTHORIZED)
             }
         },
-        None => token_from_query(req.uri().query()).map(std::borrow::Cow::Owned),
-    };
-    let Some(token) = token_cow else {
-        return Ok(None);
-    };
-    match state.tokens.lookup(token.as_ref()) {
-        Some(identity) => Ok(Some(AuthedClient::from_identity(identity, token.as_ref()))),
-        None => {
-            tracing::debug!(
-                token_prefix = %short_token(token.as_ref()),
-                token_len = token.len(),
-                live_tokens = state.tokens.len(),
-                "channel auth: token is not in live token table \
-                 (revoked, stale gateway-restart token, or never registered)",
-            );
-            Err(StatusCode::UNAUTHORIZED)
+        None => Ok(token_from_query(req.uri().query())),
+    }
+}
+
+/// Resolve a presented token to an [`AuthedClient`]: the in-memory channel
+/// token table first, then (on a miss) an approved-device lookup. Takes the
+/// owned token + `&state` only — no `req` borrow — so the future stays `Send`.
+async fn resolve_token(
+    state: &ChannelAuthState,
+    token: &str,
+) -> std::result::Result<Option<AuthedClient>, StatusCode> {
+    if let Some(identity) = state.tokens.lookup(token) {
+        return Ok(Some(AuthedClient::from_identity(identity, token)));
+    }
+    // In-memory miss: a paired iOS device presents a persisted `auth_token`,
+    // not an in-table token. Only `approved` rows resolve (the store filters
+    // status), so pending/revoked devices fall through to the 401 below.
+    if let Some(device_store) = &state.device_store {
+        match device_store.lookup_approved_by_auth_token(token).await {
+            Ok(Some(row)) => {
+                return Ok(Some(AuthedClient::Device {
+                    device_id: row.device_id,
+                }));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Fail closed on a store error — don't leak the reason or
+                // distinguish it from a genuine miss to the caller.
+                tracing::warn!(error = %e, "channel auth: device token lookup failed");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
         }
     }
+    tracing::debug!(
+        token_prefix = %short_token(token),
+        token_len = token.len(),
+        live_tokens = state.tokens.len(),
+        "channel auth: token is not in live token table or device registry \
+         (revoked, stale gateway-restart token, or never registered)",
+    );
+    Err(StatusCode::UNAUTHORIZED)
 }
 
 /// Extract `token` from a URL query string. Hand-rolled so we don't
@@ -295,6 +360,20 @@ fn sanitise_uri(uri: &Uri) -> Option<Uri> {
     Uri::from_parts(parts).ok()
 }
 
+/// Test-only convenience: the synchronous extract + async resolve the
+/// middleware does inline, behind the old single-call shape so the unit tests
+/// read straight through.
+#[cfg(test)]
+async fn check_channel_token(
+    req: &Request<Body>,
+    state: &ChannelAuthState,
+) -> std::result::Result<Option<AuthedClient>, StatusCode> {
+    match extract_token(req)? {
+        Some(token) => resolve_token(state, &token).await,
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::token::ClientIdentity;
@@ -319,50 +398,50 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tui_token_label_resolves_to_tui_authed_client() {
+    #[tokio::test]
+    async fn tui_token_label_resolves_to_tui_authed_client() {
         let (state, tokens) = mk_state();
         let handle = tokens.mint(ident(0, TUI_CLIENT_LABEL));
         let mut req = empty_req();
         req.headers_mut()
             .insert(CHANNEL_TOKEN_HEADER, handle.token().parse().unwrap());
-        let out = check_channel_token(&req, &state).unwrap();
+        let out = check_channel_token(&req, &state).await.unwrap();
         assert!(matches!(out, Some(AuthedClient::Tui)));
     }
 
-    #[test]
-    fn subprocess_token_label_resolves_to_subprocess() {
+    #[tokio::test]
+    async fn subprocess_token_label_resolves_to_subprocess() {
         let (state, tokens) = mk_state();
         let handle = tokens.mint(ident(1234, "telegram"));
         let mut req = empty_req();
         req.headers_mut()
             .insert(CHANNEL_TOKEN_HEADER, handle.token().parse().unwrap());
-        let out = check_channel_token(&req, &state).unwrap();
+        let out = check_channel_token(&req, &state).await.unwrap();
         assert!(matches!(
             out,
             Some(AuthedClient::Subprocess { pid: 1234, .. })
         ));
     }
 
-    #[test]
-    fn unknown_token_rejected() {
+    #[tokio::test]
+    async fn unknown_token_rejected() {
         let (state, _tokens) = mk_state();
         let mut req = empty_req();
         req.headers_mut()
             .insert(CHANNEL_TOKEN_HEADER, "deadbeef".parse().unwrap());
-        let err = check_channel_token(&req, &state).unwrap_err();
+        let err = check_channel_token(&req, &state).await.unwrap_err();
         assert_eq!(err, StatusCode::UNAUTHORIZED);
     }
 
-    #[test]
-    fn missing_credential_returns_none() {
+    #[tokio::test]
+    async fn missing_credential_returns_none() {
         let (state, _tokens) = mk_state();
         let req = empty_req();
-        assert!(check_channel_token(&req, &state).unwrap().is_none());
+        assert!(check_channel_token(&req, &state).await.unwrap().is_none());
     }
 
-    #[test]
-    fn token_revoked_after_handle_drop() {
+    #[tokio::test]
+    async fn token_revoked_after_handle_drop() {
         let (state, tokens) = mk_state();
         let token_str = {
             let handle = tokens.mint(ident(1234, "telegram"));
@@ -372,25 +451,25 @@ mod tests {
         let mut req = empty_req();
         req.headers_mut()
             .insert(CHANNEL_TOKEN_HEADER, token_str.parse().unwrap());
-        let err = check_channel_token(&req, &state).unwrap_err();
+        let err = check_channel_token(&req, &state).await.unwrap_err();
         assert_eq!(err, StatusCode::UNAUTHORIZED);
     }
 
-    #[test]
-    fn token_query_param_accepted() {
+    #[tokio::test]
+    async fn token_query_param_accepted() {
         let (state, tokens) = mk_state();
         let handle = tokens.mint(ident(42, "telegram"));
         let uri = format!("/v1/channel-ws?token={}", handle.token());
         let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
-        let out = check_channel_token(&req, &state).unwrap();
+        let out = check_channel_token(&req, &state).await.unwrap();
         assert!(matches!(
             out,
             Some(AuthedClient::Subprocess { pid: 42, .. })
         ));
     }
 
-    #[test]
-    fn header_beats_query_on_mismatch() {
+    #[tokio::test]
+    async fn header_beats_query_on_mismatch() {
         // Header is canonical; if both are present and the header is
         // wrong we reject regardless of a valid query token. Locks in
         // the precedence so a later change doesn't silently let a
@@ -401,7 +480,75 @@ mod tests {
         let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
         req.headers_mut()
             .insert(CHANNEL_TOKEN_HEADER, "deadbeef".parse().unwrap());
-        let err = check_channel_token(&req, &state).unwrap_err();
+        let err = check_channel_token(&req, &state).await.unwrap_err();
+        assert_eq!(err, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn approved_device_token_resolves_to_device() {
+        use baybo_storage::test_support::MemoryDeviceStore;
+        use std::sync::Arc;
+
+        let store = Arc::new(MemoryDeviceStore::new());
+        store
+            .create(&baybo_store::DeviceRow {
+                device_id: "d1".into(),
+                device_pubkey: vec![0u8; 32],
+                auth_token: "devtok".into(),
+                status: baybo_store::DeviceStatus::Approved,
+                rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
+                created_at: 1,
+                approved_at: Some(2),
+                last_seen_at: None,
+                relay_url: "wss://relay.test".into(),
+                remote_api_key: "inst-test".into(),
+            })
+            .await
+            .unwrap();
+        let (state, _tokens) = mk_state();
+        let state = state.with_device_store(store);
+
+        // The device presents its persisted token via `?token=`.
+        let req = Request::builder()
+            .uri("/v1/channel-ws?token=devtok")
+            .body(Body::empty())
+            .unwrap();
+        let out = check_channel_token(&req, &state).await.unwrap();
+        assert!(matches!(
+            out,
+            Some(AuthedClient::Device { device_id }) if device_id == "d1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoked_device_token_is_rejected() {
+        use baybo_storage::test_support::MemoryDeviceStore;
+        use std::sync::Arc;
+
+        let store = Arc::new(MemoryDeviceStore::new());
+        store
+            .create(&baybo_store::DeviceRow {
+                device_id: "d1".into(),
+                device_pubkey: vec![0u8; 32],
+                auth_token: "revtok".into(),
+                status: baybo_store::DeviceStatus::Revoked,
+                rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
+                created_at: 1,
+                approved_at: Some(1),
+                last_seen_at: None,
+                relay_url: "wss://relay.test".into(),
+                remote_api_key: "inst-test".into(),
+            })
+            .await
+            .unwrap();
+        let (state, _tokens) = mk_state();
+        let state = state.with_device_store(store);
+
+        let mut req = empty_req();
+        req.headers_mut()
+            .insert(CHANNEL_TOKEN_HEADER, "revtok".parse().unwrap());
+        // A revoked device token must 401.
+        let err = check_channel_token(&req, &state).await.unwrap_err();
         assert_eq!(err, StatusCode::UNAUTHORIZED);
     }
 

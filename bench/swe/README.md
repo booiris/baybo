@@ -47,7 +47,7 @@ musl** (a glibc build from a newer host won't run there). `run.sh` builds
 it for you:
 
 ```bash
-cargo build --release --target x86_64-unknown-linux-musl --features bench-bash
+cargo build --release --target x86_64-unknown-linux-musl --features bench-bash -p baybo
 ```
 
 That needs the musl target (`rustup target add x86_64-unknown-linux-musl`) and a

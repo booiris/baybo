@@ -13,6 +13,7 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Mcp { cmd } => commands::mcp::handle(ctx, cmd).await,
         Commands::Secret { cmd } => commands::secret::handle(ctx, cmd).await,
         Commands::Pair { cmd } => commands::pair::handle(ctx, cmd).await,
+        Commands::Device { cmd } => commands::device::handle(ctx, cmd).await,
         Commands::Llm { cmd } => commands::llm::handle(ctx, cmd).await,
         Commands::Memory { cmd } => commands::memory::handle(ctx, cmd).await,
         Commands::ExternalAgent { cmd } => commands::external_agent::handle(ctx, cmd).await,

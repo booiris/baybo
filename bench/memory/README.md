@@ -24,7 +24,7 @@ feature wraps the backend so it **recalls + exposes tools but never writes** —
 so QA stays contamination-free *by construction*, even as the real agent:
 
 ```bash
-cargo build --release --features bench-readonly-memory   # produces ./target/release/baybo
+cargo build --release -p baybo --features bench-readonly-memory   # produces ./target/release/baybo
 ```
 
 Point the bench at that binary with `--baybo-bin`. (`ingest` is the sole writer,
@@ -125,7 +125,7 @@ ARMS="noop oracle openviking" CONVERSATIONS=3 QUESTIONS=10 bench/memory/run.sh
 Or drive the bins directly (they read the process env, so build + source first):
 
 ```bash
-cargo build --release --features bench-readonly-memory   # the read-only baybo
+cargo build --release -p baybo --features bench-readonly-memory   # the read-only baybo
 set -a; . bench/memory/.env; set +a                      # export the creds
 
 # Ingest (direct to the backend), then QA through the real agent (config auto-generated):

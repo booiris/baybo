@@ -226,6 +226,7 @@ async fn turn_state_projector_brackets_a_slow_turn() {
             &job.id,
             JobOutput::Message {
                 content: vec![ContentBlock::Text("done".into())],
+                ordinal: None,
             },
         )
         .await

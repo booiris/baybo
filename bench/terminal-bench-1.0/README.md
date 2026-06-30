@@ -31,7 +31,7 @@ A **static musl** binary runs in any linux task container regardless of glibc:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl     # one-time (+ musl-tools/musl-gcc)
-cargo build --release --target x86_64-unknown-linux-musl --features bench-bash
+cargo build --release --target x86_64-unknown-linux-musl --features bench-bash -p baybo
 # -> target/x86_64-unknown-linux-musl/release/baybo
 ```
 

@@ -1,0 +1,23 @@
+[package]
+name = "remote-host-edge"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+parking_lot = { workspace = true }
+# Sharded maps for the two per-request IP paths (token buckets + traffic recorder),
+# so a request flood contends per-shard rather than on one global lock.
+dashmap = { workspace = true }
+# The shared per-client-IP upgrade/request throttle ([`ip_limit`]) is a small axum
+# middleware layer mounted by both the relay and push routers, so it lives here
+# alongside the `TokenBucket` it draws — the rate-limit domain both roles share.
+axum = { workspace = true }
+# Sampled `info!` of the raw paths that fall through to the `other` endpoint label,
+# so an operator can see what unclassified traffic is hitting the public listener.
+tracing = { workspace = true }
+# Random sampling for that log — only a small fraction of `other` hits are logged,
+# so a path-spray scan can't flood it.
+rand = { workspace = true }

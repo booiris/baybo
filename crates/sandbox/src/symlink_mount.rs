@@ -51,10 +51,16 @@ mod tests {
     #[test]
     fn returns_mount_for_symlinked_workspace_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let real = tmp.path().join("real");
+        // Canonicalize the temp root up front (as `empty_when_path_is_already_canonical`
+        // does) so the path comparisons hold where the temp dir itself sits under a
+        // symlink — on macOS `$TMPDIR` is `/var/folders/…` and `/var` → `/private/var`.
+        // `mount.source()` is the canonicalized requested path, so the expected `work`
+        // must be canonical too, or it mismatches on `/var` vs `/private/var` alone.
+        let root = tmp.path().canonicalize().expect("canonicalize tmp");
+        let real = root.join("real");
         let work = real.join("work");
         std::fs::create_dir_all(&work).expect("real/work");
-        let symlink_root = tmp.path().join("symlink");
+        let symlink_root = root.join("symlink");
         std::os::unix::fs::symlink(&real, &symlink_root).expect("symlink");
 
         let mount = workspace_symlink_mount_for(&symlink_root.join("work"), &real)

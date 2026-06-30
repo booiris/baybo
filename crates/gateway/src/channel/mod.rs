@@ -6,7 +6,7 @@
 //! authenticated subprocess sidecars can register as dynamic
 //! channels and exchange MessagePack-framed
 //! messages with the agent. The only sidecar client is the TypeScript
-//! package under `sdks/channel-ts/`; the built-in TUI has its own
+//! package under `sidecars/sdk/channel-ts/`; the built-in TUI has its own
 //! private Rust WS client. Each accepted connection spawns a
 //! per-connection [`adapter::Sidecar`] that plugs into the workspace
 //! [`baybo_channels::ChannelRegistry`] and tears itself down on
@@ -19,13 +19,20 @@
 //! the streaming frames and render the final `Message`.
 
 pub(crate) mod adapter;
+pub(crate) mod blob_content;
 pub(crate) mod blobs;
 pub mod boot;
 pub mod bot_reconciler;
 pub mod control;
 pub(crate) mod dedup;
+pub(crate) mod device_content;
+pub(crate) mod device_pair;
 pub(crate) mod handshake;
 pub(crate) mod history;
+pub(crate) mod relay_content;
+#[cfg(test)]
+mod relay_e2e;
+pub(crate) mod relay_pair;
 pub mod route;
 pub(crate) mod session_pulse;
 pub(crate) mod session_resolver;

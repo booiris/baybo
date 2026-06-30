@@ -1,0 +1,77 @@
+# Operator-run shared infrastructure ("C" in the mobile-companion design).
+#
+# A SEPARATE Cargo workspace (the root `[workspace]` excludes it) so it
+# deploys independently of the `baybo` binary and keeps the `.p8`-holding push
+# role isolatable. C is **blind**: it relays operator-encrypted preview blobs
+# and Noise ciphertext, never plaintext, so it deliberately does NOT depend on
+# any `baybo-*` crate — the `/notify` payload is agreed by its JSON contract.
+#
+# See docs/mobile-remote-host.md and docs/todo/mobile/phase1.md.
+[workspace]
+resolver = "2"
+members = ["crates/push", "crates/relay", "crates/dashboard", "crates/server", "crates/admission", "crates/protocol", "crates/edge"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+# Wired in the `server` binary only: an `EnvFilter`-gated subscriber that fans
+# out to a rolling daily file (`tracing-appender`) and stderr. The library
+# crates just call `tracing::*`; they stay subscriber-agnostic.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+axum = "0.8"
+# In-process TLS termination (wss/https) so the relay + push can be exposed
+# directly, no reverse proxy needed. rustls is the same stack reqwest already
+# pulls (aws-lc-rs); we only touch it to install the process crypto provider.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
+remote-host-push = { path = "crates/push" }
+remote-host-relay = { path = "crates/relay" }
+remote-host-admission = { path = "crates/admission" }
+remote-host-dashboard = { path = "crates/dashboard" }
+# The shared wire contract (routes + serde types) the gateway + app also depend
+# on. Pure serde, no transport/baybo deps.
+remote-host-protocol = { path = "crates/protocol" }
+# The shared per-request / per-client-IP layer: the token-bucket primitive (push
+# frequency control + relay bandwidth throttle), the per-source-IP request throttle
+# (`ip_limit`), and the per-`(ip, endpoint)` traffic recorder (`ip_traffic`) — the
+# last two small axum middleware both routers mount.
+remote-host-edge = { path = "crates/edge" }
+# Admission allow-list is a libsql/SQLite table, hot-reloaded by polling (it may
+# be updated out of band). `core` = embedded SQLite, no remote/replication.
+libsql = { version = "0.9", default-features = false, features = ["core"] }
+futures = "0.3"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+reqwest = { version = "0.13", features = ["json"] }
+# ES256 provider-token signing for APNs (the `.p8` is a PKCS#8 P-256 key).
+# v10 requires picking a crypto backend; use aws_lc_rs to share the same vetted
+# stack rustls/reqwest already pull in (one crypto provider, not two).
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+tower = { version = "0.5", features = ["util"] }
+parking_lot = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.9"
+# Verify the push-binding delegation chain (device→gateway) and the per-request
+# gateway signatures. C only verifies; the gateway/app sign (in `device-proto`).
+# The byte layout is pinned identically on both sides (no shared crate across the
+# workspace boundary).
+ed25519-dalek = "2"
+# Wall clock for the admission expiry check (`expires_at` vs `Utc::now()`),
+# formatted to match SQLite's `datetime('now')`. `clock` is the only feature used.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Sharded concurrent maps for the per-source-IP request paths (the `ip_limit` token
+# buckets + the `ip_traffic` recorder), which take a lock on *every* request — so
+# under a flood contention scales with cores instead of one global Mutex.
+dashmap = "6"

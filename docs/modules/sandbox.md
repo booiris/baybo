@@ -444,7 +444,7 @@ backend binary is absent.
 | `tools`      | Defines `ExecSandbox` trait + `SandboxedOutput` and adds `sandbox` / `workspace_root` to `ToolContext`. `BashTool` opts in to routing.   |
 | `agent`      | Builds `SandboxAdapter` per call; passes the runner into `ToolExecutor::new`; refuses ExecCommand tools when no runner is configured. |
 | `security`   | Hosts the decision-layer primitives (SSRF resolution in `WebFetch::validate_url_with`, leak detection, secret vault). The sandbox is the enforcement layer that makes those decisions real for ExecCommand tools. |
-| `bootstrap`  | `src/runtime.rs` calls `current_platform_runner()` at startup and threads the result into `ToolExecutor`.                              |
+| `bootstrap`  | `crates/baybo/src/runtime.rs` calls `current_platform_runner()` at startup and threads the result into `ToolExecutor`.                              |
 
 ## Deferred (post-v1)
 

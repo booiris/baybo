@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub enum ApprovalDecision {
     /// Allow this call only.
@@ -40,7 +40,7 @@ pub enum ApprovalDecision {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts-export",
-    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
 )]
 pub enum ResourceAccess {
     ReadFile {

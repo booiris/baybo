@@ -8,6 +8,8 @@ mod auth;
 mod channel_ws;
 #[path = "chat_api.rs"]
 mod chat_api;
+#[path = "device_channel_ws.rs"]
+mod device_channel_ws;
 #[path = "jobs_pagination.rs"]
 mod jobs_pagination;
 #[path = "llm_endpoint.rs"]

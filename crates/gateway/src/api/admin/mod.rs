@@ -11,6 +11,7 @@ pub mod goals;
 pub mod jobs;
 pub mod llm;
 pub mod logs;
+pub mod push;
 pub mod skills;
 pub mod status;
 pub mod tools;
@@ -45,6 +46,7 @@ use crate::server::AdminState;
         (name = "channels", description = "Registered channel plugins"),
         (name = "chat", description = "Web chat sessions + channel-token mint"),
         (name = "goals", description = "Autonomous session goals (/goal)"),
+        (name = "push", description = "Direct-mode (web-identity) push registration"),
         (name = "llm", description = "Configured LLM provider"),
         (name = "logs", description = "Recent tracing events (in-memory ring buffer)"),
     )
@@ -70,6 +72,7 @@ pub fn v1_router_and_spec() -> (Router<AdminState>, OpenApiDoc) {
         .merge(channels::routes())
         .merge(chat::routes())
         .merge(goals::routes())
+        .merge(push::routes())
         .merge(llm::routes())
         .merge(logs::routes());
     let (router, spec) = OpenApiRouter::with_openapi(AdminApiDoc::openapi())

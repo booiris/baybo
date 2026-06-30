@@ -17,7 +17,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use baybo_model::{LineageKind, Session, TriggerSource};
-use baybo_tools::{ToolConcurrency, ToolOutput, ToolRegistry};
+use baybo_tools::{ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
 use baybo_trace::{
     GoalSteeringAudit, LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle,
     StepKind,
@@ -443,6 +443,14 @@ pub struct AgentLoop {
     /// token can't kill an in-flight pass — mirrors
     /// [`Self::spawn_session_end_write`].
     bg_compression: Option<tokio::task::JoinHandle<()>>,
+    /// Read-before-write tracker for this session's `Edit`/`Write` tools.
+    /// Lives for the actor's lifetime so a `Read` in one turn satisfies an
+    /// `Edit` in a later turn, and is threaded into every tool call via
+    /// [`ToolExecutor::execute`]. On hydration it is rebuilt from the restored
+    /// transcript ([`ReadTracker::rebuild_from_messages`]) — each `Read` result
+    /// row persists the fingerprint it observed — so a read survives actor
+    /// eviction / process restart. Any gap fails closed (forces a re-read).
+    read_tracker: ReadTracker,
 }
 
 /// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
@@ -532,6 +540,7 @@ impl AgentLoop {
             last_task_management_turn: 0,
             last_reminder_turn: 0,
             bg_compression: None,
+            read_tracker: ReadTracker::default(),
         }
     }
 
@@ -541,6 +550,12 @@ impl AgentLoop {
     /// have to reach inside the loop's private state.
     pub async fn restore_transcript_from_store(&mut self) {
         self.context_manager.restore_from_store().await;
+        // Recover the read-before-write tracker from the restored transcript:
+        // each `Read` result row carries the fingerprint it observed, so a read
+        // that happened before this actor was evicted/restarted still satisfies
+        // a later `Edit` without forcing a redundant re-read.
+        self.read_tracker
+            .rebuild_from_messages(self.context_manager.messages());
     }
 
     /// Snapshot the in-memory transcript so a fallible turn can be rolled
@@ -720,6 +735,10 @@ impl AgentLoop {
                     .await?;
                 let output = JobOutput::Message {
                     content: outgoing.content.clone(),
+                    // The reply's persisted ordinal (captured from the store
+                    // append) rides the Completed event so push reads exactly
+                    // this row without a read-after-write poll.
+                    ordinal: outgoing.ordinal,
                 };
                 let pending_with_id = pending.map(|p| (job_id, p));
                 Ok((output, (outgoing, pending_with_id)))
@@ -1151,6 +1170,12 @@ impl AgentLoop {
         let notifier_for_calls = notifier.clone();
         let llm_for_calls = Arc::clone(&self.llm_client);
         let registry_for_calls = Arc::clone(&self.tool_registry);
+        // Promote the previous response's staged reads before this batch runs,
+        // so a `Read` and an `Edit`/`Write` of the same file in THIS response
+        // can't authorize each other: the read stays staged until the next
+        // response boundary (by when the model has actually seen its result).
+        self.read_tracker.begin_response();
+        let read_tracker_for_calls = self.read_tracker.clone();
         let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
         let exec_futures = response.tool_calls.iter().map(|tc| {
             let executor = Arc::clone(&executor);
@@ -1167,6 +1192,7 @@ impl AgentLoop {
             let tool_use_id = tc.id.clone();
             let triggering_llm_span = Some(llm_span_id);
             let limiter = Arc::clone(&concurrency_limiter);
+            let read_tracker = read_tracker_for_calls.clone();
             // `Concurrent` → one permit (up to the cap run together);
             // `Exclusive` → every permit, so the call runs alone among
             // pool calls; `Independent` → no permit (self-bounded, e.g.
@@ -1204,6 +1230,7 @@ impl AgentLoop {
                         notifier,
                         Some(&bind_source),
                         background_eligible,
+                        read_tracker,
                     )
                     .await
             }
@@ -1292,8 +1319,25 @@ impl AgentLoop {
             );
 
             // Append tool result to context with the tool_use_id so the
-            // LLM can correlate results with their originating calls.
-            let tool_msg = ChatMessage::tool_result(tool_call.id.clone(), wrapped);
+            // LLM can correlate results with their originating calls. For a
+            // `Read`, stamp the fingerprint it recorded onto the row so the
+            // read-before-write tracker can be rebuilt on hydration (the
+            // fingerprint persists with the transcript but is never sent to
+            // the LLM). `get` returns `None` for a failed/virtual read, which
+            // collapses to a plain `tool_result`.
+            let tool_msg = if tool_call.name == baybo_tools::READ_TOOL_NAME {
+                let meta = tool_call
+                    .arguments
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
+                    .map(|fp| baybo_model::ToolResultMeta {
+                        read_fingerprint: Some(fp),
+                    });
+                ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, meta)
+            } else {
+                ChatMessage::tool_result(tool_call.id.clone(), wrapped)
+            };
             self.context_manager.append(&tool_msg).await;
         }
 
@@ -2518,6 +2562,8 @@ impl AgentLoop {
                 };
                 let output = JobOutput::Message {
                     content: vec![ContentBlock::Text(text.clone())],
+                    // `/compact` is a Maintenance job — never pushed.
+                    ordinal: None,
                 };
                 Ok((output, text))
             },

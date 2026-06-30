@@ -57,11 +57,7 @@ fn select_and_apply<P: Prompter>(
         .map(|d| format!("{} — {}", d.kind.display_name(), d.binary_path))
         .collect();
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let picked = prompter.multi_select(
-        "Enable external agents (↑/↓ move, space toggles, enter confirms):",
-        &label_refs,
-        &initial,
-    )?;
+    let picked = prompter.multi_select("Enable external agents:", &label_refs, &initial)?;
 
     let mut outcome = ExternalAgentsStepOutcome::default();
     for (i, d) in detected.iter().enumerate() {

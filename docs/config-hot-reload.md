@@ -68,7 +68,7 @@ Every reload runs the full set of steps — the LLM pool is **always** rebuilt, 
 
 ### Pool handle + per-turn swap
 
-`LlmClientPool` is held as `Arc<parking_lot::RwLock<Arc<LlmClientPool>>>` (alias `LlmPoolHandle`). This changes the `AgentLoopConfig.llm_pool` field type, which ripples to every construction site (the single `wire_router` spawn closure in `src/runtime.rs` — used for top-level, cron, subagent, and background-compression actors alike — plus the integration-test harness and `AgentLoop` unit tests).
+`LlmClientPool` is held as `Arc<parking_lot::RwLock<Arc<LlmClientPool>>>` (alias `LlmPoolHandle`). This changes the `AgentLoopConfig.llm_pool` field type, which ripples to every construction site (the single `wire_router` spawn closure in `crates/baybo/src/runtime.rs` — used for top-level, cron, subagent, and background-compression actors alike — plus the integration-test harness and `AgentLoop` unit tests).
 
 `AgentLoop` resolves at **turn start** (not construction): `pool_handle.read().resolve(self.initial_llm)`, pinned for the whole turn (a turn may issue many LLM calls; they all use one model). When the resolved client differs from the current one **by pointer** (`Arc::ptr_eq`, *not* by model id — a reload always builds fresh `Arc<BillableLlm>`s, so this also catches a `base_url` / credential / `reasoning_effort` / `context_window` edit that kept the same model id; an unchanged pool returns the same `Arc`, so the common path stays a no-op), the loop:
 
@@ -92,7 +92,7 @@ The cost lookup keys by the active client's `model_info.id` (`crates/agent/src/r
 
 ### Refresh loop
 
-The OpenRouter live-pricing loop (`src/runtime.rs`, currently a detached `tokio::spawn` over `fetch_overlay_for` with a 24h `REFRESH_INTERVAL` and no handle) gets a `CancellationToken` owned by `LlmReloader`. Commit cancels the old task and respawns with the new pairs, doing an immediate first fetch so a newly-added model gets a live overlay promptly. (With no configured `(provider, model)` pairs the loop isn't spawned at all — a detached token is returned instead of a task that fetches an empty overlay and then sleeps.) (The budget gate is already correct from the commit-time snapshot re-seed regardless; this only refreshes the live overlay.)
+The OpenRouter live-pricing loop (`crates/baybo/src/runtime.rs`, currently a detached `tokio::spawn` over `fetch_overlay_for` with a 24h `REFRESH_INTERVAL` and no handle) gets a `CancellationToken` owned by `LlmReloader`. Commit cancels the old task and respawns with the new pairs, doing an immediate first fetch so a newly-added model gets a live overlay promptly. (With no configured `(provider, model)` pairs the loop isn't spawned at all — a detached token is returned instead of a task that fetches an empty overlay and then sleeps.) (The budget gate is already correct from the commit-time snapshot re-seed regardless; this only refreshes the live overlay.)
 
 ### Credential rotation
 
@@ -157,7 +157,7 @@ Deferred (the orchestrator is bin-only, so these need bin-crate or end-to-end fi
 ## Related
 
 - [`docs/modules/config.md`](modules/config.md) §"Reload semantics" — the contract this honors; firmed up + linked here.
-- `src/runtime.rs` — pool build (`with_tier_map`), boot CostManager seed (`merge_pricings`), the `fetch_overlay_for` refresh loop, the `wire_router` spawn closure. All re-run / re-wired on reload.
+- `crates/baybo/src/runtime.rs` — pool build (`with_tier_map`), boot CostManager seed (`merge_pricings`), the `fetch_overlay_for` refresh loop, the `wire_router` spawn closure. All re-run / re-wired on reload.
 - `crates/gateway/src/api/admin/llm.rs` — `update_model` / `set_default`; "restart required" → inline reload.
 - `crates/agent/src/runtime/billed_chat.rs` — cost lookup keyed by `model_info.id`, the reason the pricing re-seed is mandatory.
 - `crates/agent/src/runtime/llm_pool.rs` — `LlmClientPool::resolve` fallback behavior relied on for pinned-entry removal.
