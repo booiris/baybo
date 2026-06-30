@@ -125,25 +125,6 @@ pub(crate) async fn list_bindings(vault: &SecretVault) -> Vec<WebPushBinding> {
     out
 }
 
-/// Drop a web binding and its push material (the direct "disconnect"/unregister
-/// path). Idempotent. Currently unused by a live caller — kept so the binding has
-/// a clean teardown and a future `direct_logout` can purge the gateway side too.
-#[allow(dead_code)]
-pub(crate) async fn delete_binding(vault: &SecretVault, device_id: &str) -> anyhow::Result<()> {
-    for name in [
-        web_binding_secret_name(device_id),
-        device_push_key_secret_name(device_id),
-        device_apns_secret_name(device_id),
-        device_push_delegation_secret_name(device_id),
-    ] {
-        vault
-            .delete_secret(&name)
-            .await
-            .map_err(|e| anyhow::anyhow!("delete {name}: {e}"))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,30 +179,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(apns.apns_token, "tok");
-    }
-
-    #[tokio::test]
-    async fn delete_purges_binding_and_material() {
-        let vault = vault();
-        store_binding(
-            &vault,
-            &binding("ios-bb"),
-            &[1u8; aead::KEY_LEN],
-            "tok",
-            ApnsEnv::Production,
-            &[2u8; 64],
-        )
-        .await
-        .unwrap();
-        delete_binding(&vault, "ios-bb").await.unwrap();
-        assert!(list_bindings(&vault).await.is_empty());
-        assert!(
-            vault
-                .get_secret(&device_push_key_secret_name("ios-bb"))
-                .await
-                .unwrap()
-                .is_none()
-        );
     }
 
     #[tokio::test]
