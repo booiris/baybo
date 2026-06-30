@@ -73,14 +73,20 @@ jobs:
     outputs:
       render: ${{ steps.filter.outputs.render }}
     steps:
+      # Full history so the merge-base diff against the PR base resolves.
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
-        id: filter
         with:
-          filters: |
-            render:
-              - 'crates/tui/**'
-              - 'crates/term-harness/**'
+          fetch-depth: 0
+      # Plain git (needs only `contents: read`) — true when this PR touches the
+      # render stack (tui / term-harness).
+      - id: filter
+        run: |
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
+              | grep -qE '^crates/(tui|term-harness)/'; then
+            echo "render=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "render=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # The tmux-driven render/smoke tests are flaky under load, so they're
   # `#[ignore]` and run here out of the gating `test` job. Gated on `changes`:
