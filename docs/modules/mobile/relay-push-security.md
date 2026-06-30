@@ -301,7 +301,7 @@ Push has three separate protections:
 
 - C authenticates the **binding** with a per-device Ed25519 delegation chain, so
   a caller cannot touch another device's binding even without an admission key
-  (see [Guest-tier tenancy](#guest-tier-tenancy-and-push-binding-authentication)).
+  (see [Shared relay key tenancy](#shared-relay-key-tenancy-and-push-binding-authentication)).
 - C applies per-source-IP request limiting, per-device `/notify` limiting, replay
   counters, and a bounded device-token store to keep the keyless routes bounded.
 - P authenticates preview content locally with the `push_key` AEAD tag.
@@ -470,7 +470,7 @@ Registration is gateway-mediated and signed end to end; the app never POSTs C's
 `/register` itself.
 
 Keys (all established at pairing — see
-[Guest-tier tenancy](#guest-tier-tenancy-and-push-binding-authentication)):
+[Shared relay key tenancy](#shared-relay-key-tenancy-and-push-binding-authentication)):
 
 - Device Ed25519 identity `D` — `device_id == ios-<hex(D_pub)>` — in P's private
   keychain.
@@ -676,7 +676,7 @@ malicious APNs provider can never display any text; a `.p8` holder can send an
 ordinary APNs alert. It only cannot produce a valid encrypted Baybo preview
 without the `push_key`.
 
-## Guest-tier tenancy and push-binding authentication
+## Shared relay key tenancy and push-binding authentication
 
 Relevant code:
 
@@ -792,7 +792,7 @@ Admission (`remote_api_key`) is *not* the binding's isolation boundary — the p
 routes carry no admission key, and the built-in `guest` trial relay key is shared
 by many mutually-distrusting tenants anyway. Binding integrity instead comes from
 the per-device Ed25519 delegation chain C verifies statelessly (see
-[Guest-tier tenancy](#guest-tier-tenancy-and-push-binding-authentication)):
+[Shared relay key tenancy](#shared-relay-key-tenancy-and-push-binding-authentication)):
 `device_id` self-certifies its device key, `/register` carries the device's
 delegation + the gateway's signature, `/notify` is verified against the
 `gateway_pubkey` stored at register, and both carry a strictly-increasing replay

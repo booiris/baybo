@@ -16,10 +16,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use remote_host_admission::Tier;
 use remote_host_dashboard::{
     AdmitKeyOutcome, AdmitKeyRequest, BucketUnit, DashboardBackend, DashboardError, DeviceRow,
-    EditKeyRequest, IpBucket, IpEndpointTotal, IpTotal, IpTotals, IpTrafficSeries, KeyRow, KeyTier,
+    EditKeyRequest, IpBucket, IpEndpointTotal, IpTotal, IpTotals, IpTrafficSeries, KeyRow,
     KickOutcome, OverviewSnapshot, PushBucket, PushDeviceTotal, PushTotals, PushTrafficSeries,
     Range, RelayBucket, RelayKeyTotal, RelayTotals, RelayTrafficSeries, RevealedKey,
 };
@@ -150,7 +149,6 @@ impl DashboardBackend for RuntimeDashboardBackend {
                     id: r.rowid,
                     label: r.label,
                     key_last4: key_last4(&r.remote_api_key),
-                    tier: tier_to_dto(r.tier),
                     max_conns: r.max_conns,
                     max_bps: r.max_bps,
                     per_server_max_bps: r.per_server_max_bps,
@@ -178,7 +176,6 @@ impl DashboardBackend for RuntimeDashboardBackend {
         let new = NewKey {
             remote_api_key: remote_api_key.clone(),
             label: req.label,
-            tier: tier_from_dto(req.tier),
             max_conns: req.max_conns,
             max_bps: req.max_bps,
             per_server_max_bps: req.per_server_max_bps,
@@ -205,7 +202,6 @@ impl DashboardBackend for RuntimeDashboardBackend {
         let key = self.resolve_key(id).await?;
         let limits = KeyLimits {
             label: req.label,
-            tier: tier_from_dto(req.tier),
             max_conns: req.max_conns,
             max_bps: req.max_bps,
             per_server_max_bps: req.per_server_max_bps,
@@ -512,20 +508,6 @@ fn warn_traffic(which: &str, e: &TrafficQueryError) {
 
 // --- Mapping + masking helpers ---
 
-fn tier_to_dto(tier: Tier) -> KeyTier {
-    match tier {
-        Tier::Guest => KeyTier::Guest,
-        Tier::Registered => KeyTier::Registered,
-    }
-}
-
-fn tier_from_dto(tier: KeyTier) -> Tier {
-    match tier {
-        KeyTier::Guest => Tier::Guest,
-        KeyTier::Registered => Tier::Registered,
-    }
-}
-
 fn apns_env_str(env: ApnsEnv) -> &'static str {
     match env {
         ApnsEnv::Sandbox => "sandbox",
@@ -544,10 +526,10 @@ fn key_last4(key: &str) -> String {
 
 /// Map an [`AdmissionDbError`] from an *admit* into the dashboard error: a PK
 /// collision (the only realistic write failure here) is a 409 conflict; a missing
-/// registered limit / out-of-range value is a 400.
+/// limit / out-of-range value is a 400.
 fn admit_err(e: AdmissionDbError) -> DashboardError {
     match e {
-        AdmissionDbError::MissingRegisteredLimits | AdmissionDbError::LimitOutOfRange { .. } => {
+        AdmissionDbError::MissingLimits | AdmissionDbError::LimitOutOfRange { .. } => {
             DashboardError::BadRequest(e.to_string())
         }
         AdmissionDbError::Db(_) => DashboardError::Conflict(e.to_string()),
@@ -560,7 +542,7 @@ fn admit_err(e: AdmissionDbError) -> DashboardError {
 fn db_err(e: AdmissionDbError) -> DashboardError {
     match e {
         AdmissionDbError::NotFound => DashboardError::NotFound,
-        AdmissionDbError::MissingRegisteredLimits | AdmissionDbError::LimitOutOfRange { .. } => {
+        AdmissionDbError::MissingLimits | AdmissionDbError::LimitOutOfRange { .. } => {
             DashboardError::BadRequest(e.to_string())
         }
         AdmissionDbError::Db(_) => DashboardError::Backend(e.to_string()),

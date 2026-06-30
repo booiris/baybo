@@ -98,7 +98,7 @@ struct JoinWindow {
 
 /// Per-rendezvous-id rate limiter for `/pair/join`. Availability hardening only:
 /// the PSK already defeats a hostile relay's MITM, but the *public* rendezvous id
-/// lets any holder of it (or the shared admission key) grief pairing by stealing
+/// lets any holder of it (or a shared relay key) grief pairing by stealing
 /// the parked host leg, so we throttle joins per id.
 #[derive(Default)]
 struct JoinRateLimiter {
@@ -408,7 +408,7 @@ async fn join_handler(
     ws: WebSocketUpgrade,
 ) -> Response {
     // The rendezvous id is public (the relay routes on it), so anyone who learns
-    // it — including a non-relay holder of the shared admission key — could
+    // it — including someone else holding the same relay key — could
     // repeatedly steal the gateway's parked host leg and fail the PSK handshake
     // to grief pairing. Rate-limit joins per rendezvous id so a griefer can't
     // hammer one rendezvous. (Availability only; the PSK already blocks MITM.)

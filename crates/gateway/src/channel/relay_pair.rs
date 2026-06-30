@@ -11,7 +11,7 @@
 //! A host leg whose app never arrives times out and is re-opened, so a live
 //! rendezvous is continuously hosted until it pairs or the operator's command
 //! exits. Because the rendezvous id is **public**, anyone who learns it (the
-//! relay, a QR photographer, any holder of the shared admission key) can join and
+//! relay, a QR photographer, anyone holding the same relay key) can join and
 //! fail the PSK handshake to grief pairing — so on a handshake abort (as opposed
 //! to a transport/connect error) we **re-park immediately**, with no backoff, so
 //! a leg-stealer can't impose latency on the real app's retry.

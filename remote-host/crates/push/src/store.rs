@@ -30,7 +30,7 @@ use crate::apns::ApnsEnv;
 /// evicted, mirroring the rate-limiter maps' bounded-growth pattern
 /// (`ratelimit.rs` / `ip_limit.rs`). Bindings are longer-lived and more numerous
 /// than transient rate buckets, so this sits above the limiter caps while still
-/// bounding memory against a `/register` flood under the public `guest` key.
+/// bounding memory against a `/register` flood from a shared relay key.
 pub const DEVICE_STORE_SOFT_CAP: usize = 65_536;
 
 /// How long a binding **never confirmed by a successful `/notify`** survives under

@@ -473,7 +473,7 @@ function keysView(rows) {
     el("div", { class: "section-title", text: "Keys" }),
     el("button", { class: "btn", type: "button", onclick: openAdmitModal }, icon("plus"), "Admit key"),
   );
-  const cols = ["Key", "Tier", "Live", "Limits", "Expires", "Created", ""];
+  const cols = ["Key", "Live", "Limits", "Expires", "Created", ""];
   const body = rows.length ? rows.map(keyRow) : [emptyRow(cols.length, "No keys admitted yet.")];
   const table = el(
     "table",
@@ -542,7 +542,6 @@ function keyRow(r) {
     "tr",
     {},
     keyCell,
-    el("td", {}, el("span", { class: "tag", text: r.tier })),
     el("td", { text: fmtCount(r.conns_live) }),
     limitsCell(r),
     el("td", { text: r.expires_at || "—" }),
@@ -662,38 +661,27 @@ function openAdmitModal() {
   );
 
   const labelInput = el("input", { type: "text", autocomplete: "off", placeholder: "optional" });
-  const tierSel = el(
-    "select",
-    {},
-    el("option", { value: "registered", text: "registered", selected: true }),
-    el("option", { value: "guest", text: "guest" }),
-  );
   const mcInput = el("input", { type: "number", min: "0", placeholder: "e.g. 4" });
   const mbInput = el("input", { type: "number", min: "0", placeholder: "bytes / second" });
   const psInput = el("input", { type: "number", min: "0", placeholder: "bytes / second (optional)" });
   const expInput = el("input", { type: "text", placeholder: "YYYY-MM-DD HH:MM:SS (UTC)" });
-  const expField = field("Expires at", expInput, "Guest keys only. Blank = never.");
+  const expField = field("Expires at", expInput, "Blank = never.");
 
   const submit = el("button", { class: "btn", type: "button" }, "Admit");
 
   const sync = () => {
-    const registered = tierSel.value === "registered";
-    expField.hidden = registered;
-    const needLimits = registered && (!String(mcInput.value).trim() || !String(mbInput.value).trim());
-    submit.disabled = needLimits;
+    submit.disabled = !String(mcInput.value).trim() || !String(mbInput.value).trim();
   };
-  tierSel.addEventListener("change", sync);
   mcInput.addEventListener("input", sync);
   mbInput.addEventListener("input", sync);
 
   submit.addEventListener("click", async () => {
     const body = {
       label: labelInput.value.trim() || null,
-      tier: tierSel.value,
       max_conns: numOrNull(mcInput.value),
       max_bps: numOrNull(mbInput.value),
       per_server_max_bps: numOrNull(psInput.value),
-      expires_at: tierSel.value === "guest" ? expInput.value.trim() || null : null,
+      expires_at: expInput.value.trim() || null,
     };
     if (!generate) {
       const k = keyInput.value.trim();
@@ -728,7 +716,6 @@ function openAdmitModal() {
     radios,
     keyField,
     field("Label", labelInput),
-    field("Tier", tierSel),
     field("Max conns", mcInput),
     field("Max rate (bytes/s)", mbInput),
     field("Per-server rate (bytes/s)", psInput),
@@ -748,12 +735,6 @@ function openAdmitModal() {
 function openEditModal(r) {
   const status = el("div", { class: "status" });
   const labelInput = el("input", { type: "text", autocomplete: "off", value: r.label || "" });
-  const tierSel = el(
-    "select",
-    {},
-    el("option", { value: "guest", text: "guest", selected: r.tier === "guest" }),
-    el("option", { value: "registered", text: "registered", selected: r.tier !== "guest" }),
-  );
   const mcInput = el("input", { type: "number", min: "0", value: r.max_conns ?? "" });
   const mbInput = el("input", { type: "number", min: "0", value: r.max_bps ?? "" });
   const psInput = el("input", { type: "number", min: "0", value: r.per_server_max_bps ?? "" });
@@ -761,17 +742,14 @@ function openEditModal(r) {
   const submit = el("button", { class: "btn", type: "button" }, "Save");
 
   const sync = () => {
-    const registered = tierSel.value === "registered";
-    submit.disabled = registered && (!String(mcInput.value).trim() || !String(mbInput.value).trim());
+    submit.disabled = !String(mcInput.value).trim() || !String(mbInput.value).trim();
   };
-  tierSel.addEventListener("change", sync);
   mcInput.addEventListener("input", sync);
   mbInput.addEventListener("input", sync);
 
   submit.addEventListener("click", async () => {
     const body = {
       label: labelInput.value.trim() || null,
-      tier: tierSel.value,
       max_conns: numOrNull(mcInput.value),
       max_bps: numOrNull(mbInput.value),
       per_server_max_bps: numOrNull(psInput.value),
@@ -799,11 +777,10 @@ function openEditModal(r) {
     el("div", { class: "modal-title", text: "Edit key" }),
     el("div", { class: "modal-desc" }, el("code", { text: mask(r.key_last4) })),
     field("Label", labelInput),
-    field("Tier", tierSel),
     field("Max conns", mcInput),
     field("Max rate (bytes/s)", mbInput),
     field("Per-server rate (bytes/s)", psInput),
-    field("Expires at", expInput, "Blank = never. Back-dating revokes a guest on reload."),
+    field("Expires at", expInput, "Blank = never. Back-dating expires the key on reload."),
     status,
     el(
       "div",
