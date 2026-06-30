@@ -4,7 +4,9 @@
 //! always on**; **push turns on automatically when an APNs `.p8` is configured**
 //! (`APNS_P8_PATH` is set). The gateway admission allow-list is a SQLite (libsql)
 //! table polled for external edits (`admission_db`). Bind + TLS are configured
-//! here (`BIND_ADDR`, and optional `TLS_CERT` + `TLS_KEY` to serve wss/https).
+//! here (`BIND_ADDR`, and optional `TLS_CERT` + `TLS_KEY` to serve wss/https); the
+//! operator dashboard's separate listener takes its own optional `DASHBOARD_TLS_CERT`
+//! + `DASHBOARD_TLS_KEY`, defaulting to plain HTTP.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -30,8 +32,9 @@ use serve::TlsPaths;
 /// in docker) for a port-less wss/https URL.
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:7777";
 /// Listener address for the operator dashboard when `DASHBOARD_BIND_ADDR` is
-/// unset. A SEPARATE listener from the relay/push one, served plain HTTP (no
-/// Cloudflare, no cert) — front it with a trusted network or an SSH tunnel.
+/// unset. A SEPARATE listener from the relay/push one (never behind Cloudflare):
+/// plain HTTP by default — front it with a trusted network or an SSH tunnel — or
+/// its own in-process TLS via `DASHBOARD_TLS_CERT` + `DASHBOARD_TLS_KEY`.
 const DEFAULT_DASHBOARD_BIND_ADDR: &str = "0.0.0.0:7778";
 /// Admission-table location when `ADMISSION_DB_PATH` is unset (a mounted volume
 /// in docker so an external admin can edit it).
@@ -284,23 +287,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         "http/ws"
     };
-    // The dashboard listener is ALWAYS plain HTTP (no cert) — it is not fronted
-    // by Cloudflare and the token travels cleartext, so it belongs on a trusted
-    // network or behind an SSH tunnel.
+    // The dashboard runs on its own listener (never fronted by Cloudflare). It
+    // defaults to plain HTTP — the token travels cleartext, so it belongs on a
+    // trusted network or behind an SSH tunnel — but can terminate its own TLS
+    // in-process when DASHBOARD_TLS_CERT + DASHBOARD_TLS_KEY are both set.
     let dash_addr =
         std::env::var("DASHBOARD_BIND_ADDR").unwrap_or_else(|_| DEFAULT_DASHBOARD_BIND_ADDR.into());
     match dashboard {
         Some(dash) => {
+            let dashboard_tls = TlsPaths::from_env("DASHBOARD_TLS_CERT", "DASHBOARD_TLS_KEY")?;
+            let dash_scheme = if dashboard_tls.is_some() {
+                "https"
+            } else {
+                "http"
+            };
             tracing::info!(
                 %bind_addr,
                 dashboard = %dash_addr,
                 %scheme,
+                dashboard_scheme = %dash_scheme,
                 roles = %roles.join(" + "),
                 "remote-host: listening",
             );
             tokio::try_join!(
                 serve::serve(&bind_addr, tls.clone(), app),
-                serve::serve(&dash_addr, None, dash),
+                serve::serve(&dash_addr, dashboard_tls, dash),
             )?;
         }
         None => {

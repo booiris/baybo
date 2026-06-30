@@ -86,12 +86,16 @@ services:
       TRAFFIC_FLUSH_SECS: ${TRAFFIC_FLUSH_SECS:-60}
       TRAFFIC_RETENTION_DAYS: ${TRAFFIC_RETENTION_DAYS:-60}
       # Operator dashboard — runs on its OWN listener (DASHBOARD_BIND_ADDR, default
-      # :7778), plain HTTP, NOT behind Cloudflare / no cert. Enabled by ANY non-empty
-      # DASHBOARD_TOKEN (bearer-gated; blank disables). The token travels cleartext, so
-      # reach it on a trusted network or an SSH tunnel (ssh -L 7778:localhost:7778).
-      # See DEPLOY.md.
+      # :7778), NOT behind Cloudflare. Enabled by ANY non-empty DASHBOARD_TOKEN
+      # (bearer-gated; blank disables). Plain HTTP by default — the token travels
+      # cleartext, so reach it on a trusted network or an SSH tunnel
+      # (ssh -L 7778:localhost:7778) — or give it its own cert below. See DEPLOY.md.
       DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:-}
       DASHBOARD_BIND_ADDR: ${DASHBOARD_BIND_ADDR:-0.0.0.0:7778}
+      # Optional in-process TLS for the dashboard listener (its own cert, since it
+      # is not behind Cloudflare). Set BOTH host paths in .env -> https; blank -> http.
+      DASHBOARD_TLS_CERT: ${DASHBOARD_TLS_CERT_HOST_PATH:+/run/tls/dashboard-cert.pem}
+      DASHBOARD_TLS_KEY: ${DASHBOARD_TLS_KEY_HOST_PATH:+/run/tls/dashboard-key.pem}
     secrets:
       - apns_p8
     volumes:
@@ -100,10 +104,12 @@ services:
       - ${ADMISSION_DIR:-./data}:/data
       - ${TLS_CERT_HOST_PATH:-/dev/null}:/run/tls/cert.pem:ro
       - ${TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/key.pem:ro
+      - ${DASHBOARD_TLS_CERT_HOST_PATH:-/dev/null}:/run/tls/dashboard-cert.pem:ro
+      - ${DASHBOARD_TLS_KEY_HOST_PATH:-/dev/null}:/run/tls/dashboard-key.pem:ro
     ports:
       - "${PORT:-7777}:${PORT:-7777}"
-      # Operator dashboard listener (plain HTTP). Bind to 127.0.0.1 on the host if
-      # you only reach it via an SSH tunnel.
+      # Operator dashboard listener (HTTP, or HTTPS with a dashboard cert). Bind to
+      # 127.0.0.1 on the host if you only reach it via an SSH tunnel.
       - "${DASHBOARD_PORT:-7778}:7778"
     # The durable log copy is the rolling file on the /data volume (./data/logs).
     # This caps the Docker-captured stderr mirror so it can't grow unbounded.
