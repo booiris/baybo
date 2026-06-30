@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use parking_lot::Mutex;
+use remote_host_edge::IpByteMeter;
 
 use crate::bandwidth::BandwidthLimiter;
 
@@ -336,6 +337,11 @@ impl TrafficMeter {
 pub struct LegMetering {
     pub limiter: BandwidthLimiter,
     pub meter: TrafficMeter,
+    /// Per-source-IP byte meter for this leg (the phone IP for a content-join leg,
+    /// the gateway IP for a content-host leg, or the `"unknown"` bucket when the
+    /// client IP can't be resolved). Accrues the same relayed bytes onto the
+    /// per-`(ip, endpoint)` ledger.
+    pub ip_meter: IpByteMeter,
 }
 
 #[cfg(test)]

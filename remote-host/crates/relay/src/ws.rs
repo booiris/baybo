@@ -48,8 +48,10 @@ pub async fn pump_ws(socket: WebSocket, leg: RelayLeg, metering: Option<LegMeter
                 Ok(Message::Binary(b)) => {
                     if let Some(m) = &metering {
                         // Account the ingressed bytes (before forwarding, mirroring
-                        // the throttle debit), then pace to the gateway's rate.
+                        // the throttle debit) — against both the (key, server) and the
+                        // (ip, endpoint) ledgers — then pace to the rate.
                         m.meter.record(b.len());
+                        m.ip_meter.record(b.len());
                         m.limiter.throttle(b.len()).await;
                     }
                     if to_peer.send(b.to_vec()).await.is_err() {

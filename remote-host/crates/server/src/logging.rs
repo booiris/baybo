@@ -38,9 +38,18 @@ const DEFAULT_LOG_FILTER: &str =
 #[must_use]
 pub(crate) fn init() -> Option<WorkerGuard> {
     // A fresh `EnvFilter` per layer — `EnvFilter` isn't `Clone`, and re-reading
-    // the env each time is harmless.
-    let filter =
-        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    // the env each time is harmless. A blank `RUST_LOG` (Docker Compose passes
+    // `${RUST_LOG:-}` as the empty string, which is a *valid* empty filter that
+    // would silence every event) is treated as unset so the documented default
+    // applies; an unparseable value falls back too.
+    let filter = || {
+        let directives = std::env::var("RUST_LOG").unwrap_or_default();
+        if directives.trim().is_empty() {
+            EnvFilter::new(DEFAULT_LOG_FILTER)
+        } else {
+            EnvFilter::try_new(&directives).unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER))
+        }
+    };
 
     let log_dir = std::env::var("LOG_DIR").unwrap_or_else(|_| DEFAULT_LOG_DIR.to_string());
 

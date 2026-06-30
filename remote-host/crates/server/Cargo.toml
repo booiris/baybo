@@ -22,6 +22,6 @@ remote-host-push = { workspace = true }
 remote-host-relay = { workspace = true }
 remote-host-admission = { workspace = true }
 # The shared per-IP request throttle config mounted on both routers.
-remote-host-ratelimit = { workspace = true }
+remote-host-edge = { workspace = true }
 # The admission allow-list table (hot-reloaded by the admission_db poller).
 libsql = { workspace = true }

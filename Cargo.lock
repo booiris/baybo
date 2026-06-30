@@ -3924,18 +3924,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "remote-host-edge"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "dashmap",
+ "parking_lot",
+]
+
+[[package]]
 name = "remote-host-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "remote-host-ratelimit"
-version = "0.1.0"
-dependencies = [
- "axum",
- "parking_lot",
 ]
 
 [[package]]
@@ -3948,8 +3949,8 @@ dependencies = [
  "parking_lot",
  "rand 0.9.4",
  "remote-host-admission",
+ "remote-host-edge",
  "remote-host-protocol",
- "remote-host-ratelimit",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
