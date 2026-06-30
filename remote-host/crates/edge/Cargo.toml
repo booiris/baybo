@@ -15,3 +15,9 @@ dashmap = { workspace = true }
 # middleware layer mounted by both the relay and push routers, so it lives here
 # alongside the `TokenBucket` it draws — the rate-limit domain both roles share.
 axum = { workspace = true }
+# Sampled `info!` of the raw paths that fall through to the `other` endpoint label,
+# so an operator can see what unclassified traffic is hitting the public listener.
+tracing = { workspace = true }
+# Random sampling for that log — only a small fraction of `other` hits are logged,
+# so a path-spray scan can't flood it.
+rand = { workspace = true }

@@ -18,9 +18,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use remote_host_dashboard::{
     AdmitKeyOutcome, AdmitKeyRequest, BucketUnit, DashboardBackend, DashboardError, DeviceRow,
-    EditKeyRequest, IpBucket, IpEndpointTotal, IpTotal, IpTotals, IpTrafficSeries, KeyRow,
-    KickOutcome, OverviewSnapshot, PushBucket, PushDeviceTotal, PushTotals, PushTrafficSeries,
-    Range, RelayBucket, RelayKeyTotal, RelayTotals, RelayTrafficSeries, RevealedKey,
+    EditKeyRequest, IpBucket, IpEndpointBreakdown, IpEndpointTotal, IpTotal, IpTotals,
+    IpTrafficSeries, KeyRow, KickOutcome, OverviewSnapshot, PushBucket, PushDeviceTotal,
+    PushTotals, PushTrafficSeries, Range, RelayBucket, RelayKeyTotal, RelayTotals,
+    RelayTrafficSeries, RevealedKey,
 };
 use remote_host_push::{ApnsEnv, DeviceTokenStore};
 
@@ -277,6 +278,24 @@ impl DashboardBackend for RuntimeDashboardBackend {
         }
     }
 
+    async fn traffic_ip_endpoints(
+        &self,
+        ip: String,
+        range: Range,
+    ) -> Result<IpEndpointBreakdown, DashboardError> {
+        let reader = match self.traffic_reader.as_ref() {
+            Some(r) => r,
+            None => return Ok(empty_ip_breakdown(ip)),
+        };
+        match collect_ip_endpoints(reader, &ip, range).await {
+            Ok(breakdown) => Ok(breakdown),
+            Err(e) => {
+                warn_traffic("ip endpoints", &e);
+                Ok(empty_ip_breakdown(ip))
+            }
+        }
+    }
+
     async fn list_devices(&self) -> Result<Vec<DeviceRow>, DashboardError> {
         let devices = match self.devices.as_ref() {
             Some(d) => d,
@@ -455,6 +474,36 @@ async fn collect_ip(
     })
 }
 
+async fn collect_ip_endpoints(
+    reader: &TrafficReader,
+    ip: &str,
+    range: Range,
+) -> Result<IpEndpointBreakdown, TrafficQueryError> {
+    let endpoints: Vec<IpEndpointTotal> = reader
+        .ip_endpoints(ip, range, TRAFFIC_TOP_N)
+        .await?
+        .into_iter()
+        .map(|e| IpEndpointTotal {
+            endpoint: e.endpoint,
+            requests: e.requests,
+            bytes: e.bytes,
+        })
+        .collect();
+    let mut totals = IpTotals {
+        requests: 0,
+        bytes: 0,
+    };
+    for e in &endpoints {
+        totals.requests = totals.requests.saturating_add(e.requests);
+        totals.bytes = totals.bytes.saturating_add(e.bytes);
+    }
+    Ok(IpEndpointBreakdown {
+        ip: ip.to_owned(),
+        endpoints,
+        totals,
+    })
+}
+
 fn empty_relay(range: Range) -> RelayTrafficSeries {
     RelayTrafficSeries {
         range,
@@ -487,6 +536,17 @@ fn empty_ip(range: Range) -> IpTrafficSeries {
         buckets: Vec::new(),
         by_endpoint: Vec::new(),
         by_ip: Vec::new(),
+        totals: IpTotals {
+            requests: 0,
+            bytes: 0,
+        },
+    }
+}
+
+fn empty_ip_breakdown(ip: String) -> IpEndpointBreakdown {
+    IpEndpointBreakdown {
+        ip,
+        endpoints: Vec::new(),
         totals: IpTotals {
             requests: 0,
             bytes: 0,

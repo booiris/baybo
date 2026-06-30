@@ -11,8 +11,9 @@ on one listener, reached by disjoint route paths.
 So a bare config runs relay only; fill the APNs section in `.env` to add push.
 It serves **plain `ws/http`** by default, or **`wss/https`** when you configure a
 cert. (`remote-host-dashboard` runs on its own separate listener
-(`DASHBOARD_BIND_ADDR`, default `:7778`, plain HTTP) when `DASHBOARD_TOKEN` is set
-— see [Operator dashboard](#operator-dashboard); off otherwise.)
+(`DASHBOARD_BIND_ADDR`, default `:7778`, plain HTTP by default or HTTPS with its
+own cert) when `DASHBOARD_TOKEN` is set — see [Operator dashboard](#operator-dashboard);
+off otherwise.)
 
 ## Quick start
 
@@ -212,7 +213,7 @@ That single WS URL covers both roles: the gateway dials `wss://c.example.com` fo
 
 ## Operator dashboard
 
-Off by default. Set `DASHBOARD_TOKEN` in `.env` to a strong secret and the server brings up a read + control dashboard on a **separate listener** — `DASHBOARD_BIND_ADDR` (default `0.0.0.0:7778`), **plain HTTP**, **not** fronted by Cloudflare and with **no TLS cert** of its own. It is a distinct listener from the relay/push `:443` one; the bare root (`/`) `302`-redirects to `/dashboard`.
+Off by default. Set `DASHBOARD_TOKEN` in `.env` to a strong secret and the server brings up a read + control dashboard on a **separate listener** — `DASHBOARD_BIND_ADDR` (default `0.0.0.0:7778`), **not** fronted by Cloudflare. It is a distinct listener from the relay/push `:443` one; the bare root (`/`) `302`-redirects to `/dashboard`. It serves **plain HTTP** by default, or **HTTPS** when you give it its own cert (see **TLS** below).
 
 ```bash
 openssl rand -hex 32        # generate a token; paste into DASHBOARD_TOKEN= in .env
@@ -224,5 +225,6 @@ docker compose up -d        # restart to pick it up
   ssh -L 7778:localhost:7778 <host>   # then open http://localhost:7778/
   ```
   Set `DASHBOARD_BIND_ADDR=127.0.0.1:7778` to bind it to the host loopback only (tunnel-required), or leave the default `0.0.0.0:7778` to reach it directly on a trusted LAN.
+- **HTTPS (optional).** The dashboard isn't behind Cloudflare, so it gets no cert by default. To serve it over `https://` instead of cleartext, give it **its own** cert — point both `DASHBOARD_TLS_CERT_HOST_PATH` and `DASHBOARD_TLS_KEY_HOST_PATH` (in `.env`) at a PEM cert + key (e.g. a Let's Encrypt cert for the dashboard's hostname, or a self-signed pair for a LAN address) and the listener terminates TLS in-process with rustls. Independent of the relay/push `TLS_CERT`; leave both blank for plain HTTP. The startup log's `dashboard_scheme` field shows `https` once configured (`http` otherwise).
 - **Auth.** The token is a bearer credential: the browser stores it in `localStorage` and sends it as an `Authorization: Bearer …` header on every `/dashboard/api/*` call — never a cookie, so CSRF is structurally impossible. **Any non-empty `DASHBOARD_TOKEN` enables the dashboard** (blank disables it); there is **no length requirement** and no rate-limit knobs — the token plus a trusted network are the gate. `openssl rand -hex 32` is still a good way to pick one.
 - **What it serves.** Overview stats, the admission allow-list (view / admit / edit / revoke / kick, with one-time key reveal), per-key + per-device + per-IP traffic series from the ledger, and the device registrations — all token-gated; the static HTML/CSS/JS shell is open but leaks nothing.
