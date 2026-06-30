@@ -199,8 +199,8 @@ mod imp {
     }
 
     /// Read the push key back — the same lookup the NSE's `PushKeyStore` does.
-    /// Used by the debug self-check to prove the access-group round-trip.
-    #[cfg(debug_assertions)]
+    /// Backs `load_or_create_push_key` (so a re-register reuses the existing key)
+    /// and the debug access-group self-check.
     pub(super) fn read_push_key(bid: &str) -> Result<Option<[u8; KEY_LEN]>, String> {
         match read_blob(&format!("{ACCOUNT_PREFIX}{bid}"), true)? {
             Some(b) => b
@@ -218,6 +218,9 @@ mod imp {
     use super::KEY_LEN;
     pub(super) fn store_push_key(_bid: &str, _key: &[u8; KEY_LEN]) -> Result<(), String> {
         Ok(())
+    }
+    pub(super) fn read_push_key(_bid: &str) -> Result<Option<[u8; KEY_LEN]>, String> {
+        Ok(None)
     }
     pub(super) fn store_private_blob(_account: &str, _bytes: &[u8]) -> Result<(), String> {
         Ok(())
@@ -238,6 +241,22 @@ mod imp {
 /// push payload, so the NSE can look the key back up.
 pub fn store_push_key(bid: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
     imp::store_push_key(bid, key)
+}
+
+/// Load the device's push key from the shared App-Group keychain, minting +
+/// persisting a fresh random one on first use. Read back rather than regenerated,
+/// so it is **stable** across re-registers — the NSE never holds a key that
+/// mismatches an in-flight push, and re-registering on each foreground is a no-op.
+/// Mirrors [`load_or_create_device_sign_key`]. (On the non-iOS dev build there is
+/// no keychain, so the read is always empty and a fresh ephemeral key is minted
+/// per call — fine off-device, where push never fires.)
+pub fn load_or_create_push_key(bid: &str) -> Result<[u8; KEY_LEN], String> {
+    if let Some(key) = imp::read_push_key(bid)? {
+        return Ok(key);
+    }
+    let key = device_proto::delegation::generate_signing_key().to_bytes();
+    imp::store_push_key(bid, &key)?;
+    Ok(key)
 }
 
 /// Account holding the serialized paired-gateway record — the content-session
@@ -319,6 +338,22 @@ pub fn read_device_sign_key() -> Result<Option<[u8; KEY_LEN]>, String> {
             .map_err(|_| "stored device sign key has the wrong length".to_string()),
         None => Ok(None),
     }
+}
+
+/// Load the device's Ed25519 push-delegation identity, minting + persisting one
+/// on first use. Its public half IS the `device_id` (`ios-<hex(pub)>`). Shared by
+/// the relay (scan-to-pair) and direct (push-register) paths so a phone has ONE
+/// stable push identity regardless of how it connects — both store under
+/// [`DEVICE_SIGN_KEY_ACCOUNT`], so the `device_id` and its `baybo.push-key.<id>`
+/// keychain entry line up across modes.
+pub fn load_or_create_device_sign_key() -> Result<device_proto::delegation::SigningKey, String> {
+    use device_proto::delegation;
+    if let Some(seed) = read_device_sign_key()? {
+        return Ok(delegation::SigningKey::from_bytes(&seed));
+    }
+    let key = delegation::generate_signing_key();
+    store_device_sign_key(&key.to_bytes())?;
+    Ok(key)
 }
 
 /// Account holding the **direct-connection** credentials (a serialized

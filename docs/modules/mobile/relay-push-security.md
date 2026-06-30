@@ -613,6 +613,85 @@ bypass `/notify` and send an arbitrary ordinary APNs alert. That does not let it
 produce a valid encrypted Baybo preview, but it is outside the preview-integrity
 guarantee.
 
+## Direct-mode push (web identity)
+
+The sections above describe the **scan-to-pair** (Noise device) path. The
+**direct** transport — connect by typing a gateway URL + admin token, no pairing
+(see [`companion.md`](companion.md) and `app/mobile/src-tauri/src/direct/`) — has
+no Noise handshake to bootstrap push from, yet can still deliver lock-screen
+pushes by provisioning the *same* binding over the admin-token TLS REST surface.
+
+Relevant code:
+
+- App registration: `app/mobile/src-tauri/src/direct/push.rs` (Tauri command
+  `direct_push_register`).
+- Gateway endpoints: `crates/gateway/src/api/admin/push.rs`
+  (`GET /v1/push/params`, `POST /v1/push/register`).
+- Gateway binding store: `crates/gateway/src/push/web.rs`.
+- Default remote host: `crates/gateway/src/push/mod.rs` (`DEFAULT_PUSH_RELAY_URL`).
+
+### Flow
+
+1. The app reuses its long-term **Ed25519 push identity** (`baybo.device-sign-key`,
+   the *same* key the relay path uses, so a phone keeps one `device_id ==
+   ios-<hex(pub)>` whichever way it connects).
+2. `GET /v1/push/params` (admin Bearer) returns the gateway's Ed25519 push public
+   key `G_pub`.
+3. The app **load-or-creates** a stable 32-byte `push_key` in the **shared App
+   Group keychain** (`baybo.push-key.<device_id>`, minted once and reused) for its
+   NSE, and signs the **same delegation** authorizing `G_pub`
+   (`device_proto::delegation::sign_delegation`). Reusing the key (rather than
+   regenerating per register) means the NSE never holds a key that mismatches an
+   in-flight push.
+4. `POST /v1/push/register` (admin Bearer) carries `device_id`, the APNs token +
+   env, the `push_key` (hex), and the delegation (hex). The gateway recovers the
+   device key from `device_id`, **verifies the delegation under it**, and persists
+   the binding — the `push_key` / APNs / delegation under the same
+   `device.<id>.*` vault names a paired device uses, plus a `web_push.<id>` meta
+   record holding the remote-host endpoint (the built-in default).
+5. The dispatcher enumerates these web bindings alongside approved device rows and
+   `/register` + `/notify`s them through that remote host **unchanged**.
+
+So the binding is cryptographically **identical** to a paired device's: C, the
+delegation chain, the AEAD preview, and the iOS NSE are all untouched. Push is
+keyless, so the gateway needs no admission key — the binding's only routing input
+is the remote-host **endpoint**, hardcoded today to
+`DEFAULT_PUSH_RELAY_URL = wss://proxy.baybo.space` (the public proxy the app also
+defaults to for pairing). It is not yet operator-configurable; a future `[push]`
+config block can override it.
+
+### Trust-model difference (weaker than the Noise path)
+
+One thing changes, and it is load-bearing: the `push_key` is **generated on the
+device and delivered over TLS under the admin Bearer token**, not derived from a
+mutually-authenticated, forward-secret Noise handshake hash `h`. So for
+direct-mode previews:
+
+- **Preview confidentiality rests on the admin token + TLS + the App-Group
+  keychain**, not on Noise. There is **no forward secrecy** for the `push_key`,
+  and no device-static attestation that the app is talking to the *right* gateway
+  beyond TLS server-auth. An attacker who holds the gateway's **admin token** can
+  register a binding (or read one it registered) and would receive the encrypted
+  previews — but an admin-token holder is already a fully-trusted principal on the
+  direct path (it is the gateway's master REST credential, and direct mode hands
+  it to the app deliberately), so this does **not** widen the trust boundary
+  beyond what direct mode already assumes. Relay's Claim 3 (Noise-derived,
+  forward-secret `push_key`) does **not** hold here.
+- **Binding integrity at C (Claim 4) is preserved.** The web identity still mints
+  a real Ed25519 key and signs the delegation, so the per-binding delegation chain
+  C verifies is exactly the same — and since push is keyless, that chain is the
+  *sole* authorization for the binding (just as for a paired device). Any caller,
+  even on the same blind remote host, still cannot register over, redirect,
+  suppress, or spam the binding — it can forge neither the device delegation nor
+  the gateway signature.
+- C and APNs see the **same** metadata and **only ciphertext** previews as on the
+  relay path (the `push_key` never leaves the two endpoints).
+
+Net: direct-mode push trades the Noise path's forward-secret, device-attested
+`push_key` for "type a URL + token and go", while keeping preview ciphertext
+opaque to C and the binding un-hijackable (the keyless delegation chain gates it).
+An operator who wants the stronger guarantee uses scan-to-pair.
+
 ## Forwarding Host Transparency
 
 Here, transparency has two concrete meanings.

@@ -19,10 +19,13 @@
 //! `select!` loop over the bus with `Lagged`/`Closed` handling (push is
 //! best-effort, so a lag just drops that buzz).
 
+pub(crate) mod web;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use base64::Engine;
 use baybo_job::{JobInputKind, JobLifecycle, JobLifecycleEvent, JobPhase, JobShape};
@@ -46,6 +49,12 @@ const PREVIEW_MAX_CHARS: usize = 200;
 /// preview — 1 is enough (the reply sits exactly at `reply_ordinal`); a small
 /// margin tolerates an interleaved row without a second round-trip.
 const PREVIEW_READ_LIMIT: usize = 4;
+
+/// Remote host (C) that direct-mode (web-identity) push bindings register +
+/// notify through. Hardcoded to the public proxy the app already defaults to for
+/// pairing, so direct/web sessions get push out of the box; not yet operator-
+/// configurable (a `[push]` config block can override this later).
+pub(crate) const DEFAULT_PUSH_RELAY_URL: &str = "wss://proxy.baybo.space";
 
 /// Secret-vault name for a device's per-device push key. The single source of
 /// truth shared by the write site (the device-pair route) and the read site
@@ -264,6 +273,35 @@ impl ApnsRegistrar for HttpApnsRegistrar {
     }
 }
 
+/// A single push destination: the binding `device_id` plus the remote host (C)
+/// base URL to POST `/register` + `/notify` to. Built from a paired [`DeviceRow`]
+/// (relay path) or a [`web::WebPushBinding`] (direct path) — the builders below
+/// are identical for both, since the push material is keyed by `device_id` in the
+/// vault the same way (see [`web`]). Push is keyless, so no admission key rides
+/// here; the binding is authorized entirely by the Ed25519 delegation chain.
+struct PushTarget {
+    device_id: String,
+    relay_url: String,
+}
+
+impl From<&DeviceRow> for PushTarget {
+    fn from(d: &DeviceRow) -> Self {
+        Self {
+            device_id: d.device_id.clone(),
+            relay_url: d.relay_url.clone(),
+        }
+    }
+}
+
+impl From<web::WebPushBinding> for PushTarget {
+    fn from(b: web::WebPushBinding) -> Self {
+        Self {
+            device_id: b.device_id,
+            relay_url: b.relay_url,
+        }
+    }
+}
+
 /// Composes the stores, vault, and sink into the per-turn dispatch.
 pub struct PushDispatcher {
     device_store: Arc<dyn DeviceStore>,
@@ -403,66 +441,83 @@ impl PushDispatcher {
         {
             return;
         }
-        let devices = self
+        // Fan out to every approved paired device AND every direct-mode (web)
+        // push binding — one gateway = one user, so there is no per-user scoping.
+        // A web binding is cryptographically identical to a device binding, so
+        // both ride the same dispatch path (see [`web`]).
+        let mut targets: Vec<PushTarget> = self
             .device_store
             .list(Some(DeviceStatus::Approved))
             .await
-            .unwrap_or_default();
-        if devices.is_empty() {
+            .unwrap_or_default()
+            .iter()
+            .map(PushTarget::from)
+            .collect();
+        let mut seen: HashSet<String> = targets.iter().map(|t| t.device_id.clone()).collect();
+        for binding in web::list_bindings(&self.secret_vault).await {
+            // The same phone, paired then switched to direct, can hold both a
+            // device row and a web binding for one device_id — push once. The
+            // device row (enumerated first) wins.
+            if seen.insert(binding.device_id.clone()) {
+                targets.push(binding.into());
+            }
+        }
+        if targets.is_empty() {
             return;
         }
         let preview = self.build_preview(&ev.session_id, reply_ordinal).await;
-        for d in &devices {
-            match self.dispatch_to_device(d, &ev.session_id, &preview).await {
+        for t in &targets {
+            match self.dispatch_to_target(t, &ev.session_id, &preview).await {
                 // A 2xx from C's `/notify` — the encrypted preview is on its way to
                 // APNs. Logged so the push path is observable end to end.
                 Ok(()) => {
-                    tracing::debug!(device = %d.device_id, "push: preview posted to remote host")
+                    tracing::debug!(device = %t.device_id, "push: preview posted to remote host")
                 }
                 Err(e) => {
-                    tracing::debug!(error = %e, device = %d.device_id, "push: skipped a device")
+                    tracing::debug!(error = %e, device = %t.device_id, "push: skipped a target")
                 }
             }
         }
     }
 
-    async fn dispatch_to_device(
+    async fn dispatch_to_target(
         &self,
-        device: &DeviceRow,
+        target: &PushTarget,
         session_id: &SessionId,
         preview: &str,
     ) -> Result<(), String> {
-        // Relay and push share the device's recorded endpoint + admission key;
-        // push is plain HTTP, so swap the relay's `wss`/`ws` scheme to `https`/
-        // `http`. An empty relay URL means a row paired before this existed.
-        let base = relay_url_to_http_base(&device.relay_url);
+        // Both relay and web targets carry a remote-host endpoint; push is plain
+        // HTTP, so swap the `wss`/`ws` scheme to `https`/`http`. An empty relay URL
+        // means a device row paired before this existed (web bindings always carry
+        // the built-in default).
+        let base = relay_url_to_http_base(&target.relay_url);
         if base.is_empty() {
-            return Err("device row has no relay url (re-pair to populate)".into());
+            return Err("push target has no relay url (re-pair to populate)".into());
         }
         let notify_url = remote_host_protocol::push::notify_url(&base);
-        self.ensure_registered(device, &base).await;
+        self.ensure_registered(target, &base).await;
         match self
-            .post_notify(device, session_id, preview, &notify_url)
+            .post_notify(target, session_id, preview, &notify_url)
             .await
         {
             Ok(()) => Ok(()),
             // C no longer knows this device — its in-memory token store was reset
             // (typically a remote-host restart). Our "already registered" cache is
-            // stale: drop it, re-register from durable pairing material, and retry
-            // the push once so delivery self-heals on this very turn instead of
+            // stale: drop it, re-register from durable material, and retry the
+            // push once so delivery self-heals on this very turn instead of
             // 404'ing until A restarts or the APNs token rotates.
             Err(NotifyError::DeviceUnknown) => {
-                self.registered.lock().remove(device.device_id.as_str());
-                self.ensure_registered(device, &base).await;
+                self.registered.lock().remove(target.device_id.as_str());
+                self.ensure_registered(target, &base).await;
                 match self
-                    .post_notify(device, session_id, preview, &notify_url)
+                    .post_notify(target, session_id, preview, &notify_url)
                     .await
                 {
                     Ok(()) => Ok(()),
                     Err(e) => {
                         tracing::warn!(
-                            device = %device.device_id, error = %e,
-                            "push: device still unknown to remote host after re-register; \
+                            device = %target.device_id, error = %e,
+                            "push: target still unknown to remote host after re-register; \
                              delivery wedged (missing delegation/apns material?)",
                         );
                         Err(e.to_string())
@@ -478,18 +533,18 @@ impl PushDispatcher {
     /// push (with a fresh, strictly-larger counter) after a forced re-register.
     async fn post_notify(
         &self,
-        device: &DeviceRow,
+        target: &PushTarget,
         session_id: &SessionId,
         preview: &str,
         notify_url: &str,
     ) -> Result<(), NotifyError> {
         let signing_key = self.signing_key().await.map_err(NotifyError::Transient)?;
         let key = self
-            .load_push_key(&device.device_id)
+            .load_push_key(&target.device_id)
             .await
             .map_err(NotifyError::Transient)?;
         let body = build_notify_body(
-            &device.device_id,
+            &target.device_id,
             session_id,
             &key,
             preview,
@@ -505,11 +560,11 @@ impl PushDispatcher {
     /// a restarted or pruned remote-host token store leaves C unaware of the
     /// device, so `/notify` would be rejected as unknown until the app registers
     /// again. Cached so it costs at most one `/register` per device per run.
-    async fn ensure_registered(&self, device: &DeviceRow, base_http: &str) {
+    async fn ensure_registered(&self, target: &PushTarget, base_http: &str) {
         let Some(registrar) = &self.apns_registrar else {
             return;
         };
-        let device_id = device.device_id.as_str();
+        let device_id = target.device_id.as_str();
         let Ok(Some(secret)) = self
             .secret_vault
             .get_secret(&device_apns_secret_name(device_id))
@@ -1026,7 +1081,7 @@ mod tests {
         .await;
 
         let res = dispatcher
-            .dispatch_to_device(&row, &SessionId::from("s1"), "preview")
+            .dispatch_to_target(&PushTarget::from(&row), &SessionId::from("s1"), "preview")
             .await;
         assert!(res.is_ok(), "push self-heals after a 404: {res:?}");
         // Two notify attempts (the 404 then the retry) and two registers (the
@@ -1049,12 +1104,80 @@ mod tests {
         .await;
 
         let res = dispatcher
-            .dispatch_to_device(&row, &SessionId::from("s1"), "preview")
+            .dispatch_to_target(&PushTarget::from(&row), &SessionId::from("s1"), "preview")
             .await;
         assert!(res.is_err(), "a persistent 404 still surfaces an error");
         // Exactly one retry — never an unbounded loop.
         assert_eq!(sink.calls.load(AtomicOrdering::SeqCst), 2);
         assert_eq!(registrar.calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    /// A `NotifySink` that records the last body it was posted, so a test can
+    /// assert the dispatched ciphertext decrypts under the binding's push key.
+    struct CapturingSink(parking_lot::Mutex<Option<NotifyRequest>>);
+    #[async_trait::async_trait]
+    impl NotifySink for CapturingSink {
+        async fn post(&self, _url: &str, body: &NotifyRequest) -> Result<(), NotifyError> {
+            *self.0.lock() = Some(body.clone());
+            Ok(())
+        }
+    }
+
+    /// End-to-end for the direct-mode path: a registered web push binding is a
+    /// valid [`PushTarget`] whose dispatched `/notify` decrypts under the
+    /// client's push key — proving the web binding reuses the device notify
+    /// pipeline byte-for-byte.
+    #[tokio::test]
+    async fn web_binding_dispatch_yields_decryptable_notify() {
+        let sink = Arc::new(CapturingSink(parking_lot::Mutex::new(None)));
+        let registrar = Arc::new(CountingRegistrar::default());
+        let (dispatcher, _row, _td) = test_dispatcher(
+            Arc::clone(&sink) as Arc<dyn NotifySink>,
+            Arc::clone(&registrar) as Arc<dyn ApnsRegistrar>,
+        )
+        .await;
+
+        // Register a web binding (mirrors what POST /v1/push/register persists):
+        // a client Ed25519 identity, a random push key, APNs token, delegation.
+        let push_key = [5u8; aead::KEY_LEN];
+        let device = delegation::generate_signing_key();
+        let device_id = delegation::device_id_for(&device.verifying_key());
+        let binding = web::WebPushBinding {
+            device_id: device_id.clone(),
+            relay_url: "ws://127.0.0.1:9".into(),
+            created_at: 0,
+        };
+        web::store_binding(
+            &dispatcher.secret_vault,
+            &binding,
+            &push_key,
+            "apns-tok",
+            device_proto::pairing::ApnsEnv::Sandbox,
+            &[7u8; 64],
+        )
+        .await
+        .unwrap();
+
+        // The binding is enumerable and dispatches like any device target.
+        assert_eq!(web::list_bindings(&dispatcher.secret_vault).await.len(), 1);
+        let preview = r#"{"title":"Baybo","body":"hi"}"#;
+        dispatcher
+            .dispatch_to_target(&PushTarget::from(binding), &SessionId::from("s1"), preview)
+            .await
+            .unwrap();
+
+        // The captured notify is addressed to the web bid and decrypts under the
+        // client's push key — exactly what the NSE does on-device.
+        let body = sink.0.lock().clone().expect("a notify was posted");
+        assert_eq!(body.device_id, device_id);
+        assert_eq!(body.bid, device_id);
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let nonce = b64.decode(&body.n).unwrap();
+        let ct = b64.decode(&body.enc).unwrap();
+        assert_eq!(
+            aead::open(&push_key, &nonce, &ct).unwrap(),
+            preview.as_bytes()
+        );
     }
 
     #[test]

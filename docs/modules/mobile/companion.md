@@ -193,6 +193,21 @@ captured at launch by hooking the Tauri/wry-owned `UIApplicationDelegate`
 (`push_register.rs`, `class_addMethod` on
 `didRegisterForRemoteNotificationsWithDeviceToken`).
 
+**Direct-mode push (no pairing):** the direct transport has no pairing handshake,
+so it provisions the *same* binding over the admin-token REST surface instead.
+`direct_push_register` (`src-tauri/src/direct/push.rs`) reuses the phone's stable
+Ed25519 identity, load-or-creates a stable `push_key` in the shared App Group
+keychain for its NSE (minted once, reused), fetches the gateway push key via `GET /v1/push/params`,
+signs the same delegation, and `POST /v1/push/register`s it (admin Bearer). The
+gateway verifies the delegation and persists a **web push binding**
+(`crates/gateway/src/push/web.rs`), which the dispatcher fans out to alongside
+device rows — so C and the NSE are unchanged. The remote-host endpoint is the
+built-in default (`DEFAULT_PUSH_RELAY_URL` = `wss://proxy.baybo.space`, the same
+host the app defaults to for pairing) — not yet operator-configurable. The
+`push_key` rides TLS + the admin token rather than a Noise handshake — a weaker
+trust model detailed in
+[`relay-push-security.md`](relay-push-security.md#direct-mode-push-web-identity).
+
 ## Reaching a NAT'd gateway (the relay)
 
 A NAT'd gateway can't be dialed, so both pairing and post-pairing content ride

@@ -100,7 +100,8 @@ code {
   background: var(--color-surface);
 }
 
-input {
+input,
+.composer textarea {
   padding: 0.65rem 0.85rem;
   font-size: 1rem;
   font-family: var(--font-mono);
@@ -109,7 +110,8 @@ input {
   border: 1px solid var(--color-line);
   border-radius: var(--radius);
 }
-input:focus { outline: none; border-color: var(--color-ink); }
+input:focus,
+.composer textarea:focus { outline: none; border-color: var(--color-ink); }
 
 .row { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
 
@@ -316,6 +318,11 @@ button.danger {
 
 /* Chat view */
 .chat { height: 100vh; }
+/* Keyboard up: iOS keeps reporting the home-indicator safe-area inset even though
+   the keyboard now covers that strip, so the bottom-pinned composer floats a
+   ~34px band above the keyboard. While html.kb-open is set (see viewport.ts) drop
+   that now-redundant inset, leaving just a small fixed gap above the keyboard. */
+html.kb-open .chat { padding-bottom: 0.75rem; }
 .chat-header { display: flex; align-items: center; gap: 0.75rem; }
 .chat-header h1 { margin: 0; }
 /* The back affordance is a text link, not a pill button — strip the base
@@ -358,9 +365,21 @@ button.danger {
 .bubble.assistant.muted { color: var(--color-ink-soft); }
 .bubble.notice { align-self: center; background: none; border: 0; color: var(--color-ink-soft); font-size: 0.8rem; }
 
-.composer { margin-top: 0; align-items: center; }
-.composer input { flex: 1; }
+/* Grows upward as the textarea wraps, so the + and Send pills stay pinned to the
+   bottom line rather than floating to the vertical centre of a tall composer. */
+.composer { margin-top: 0; align-items: flex-end; }
+.composer input,
+.composer textarea { flex: 1; }
 .composer button { flex: 0 0 auto; }
+/* The composer textarea carries the shared input box (above); these are the
+   textarea-only bits: no manual resize handle, a comfortable line box, and a
+   ~5-line ceiling past which it scrolls internally instead of shoving the chat. */
+.composer textarea {
+  resize: none;
+  line-height: 1.35;
+  max-height: 8.5rem;
+  overflow-y: auto;
+}
 /* Round outline "+" to open the image picker, set apart from the ink Send pill. */
 .composer .attach {
   flex: 0 0 auto;

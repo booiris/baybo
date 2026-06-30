@@ -16,7 +16,7 @@ import {
   type ChatTransport,
   type WireAttachment,
 } from "./blob";
-import { directSessionCreate } from "./direct";
+import { directSessionCreate, directPushRegister } from "./direct";
 
 /// Foreground signals (page visibility, window focus, the native `app-resumed`
 /// event) can fire 2–3 times on a single iOS resume; coalesce them into one
@@ -352,6 +352,9 @@ function ChatView({
   const [staged, setStaged] = useState<StagedAttachment[]>([]);
   const stagedRef = useRef<StagedAttachment[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // The composer is a textarea (Enter inserts a newline; the Send pill sends), so
+  // it grows with its content up to the CSS max-height, then scrolls internally.
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   // blob_id -> in-session local object URL for images this client sent, so a sent
   // image renders instantly from the picked file instead of re-downloading it.
   const localPreviews = useRef<Map<string, string>>(new Map());
@@ -359,6 +362,15 @@ function ChatView({
   useEffect(() => {
     stagedRef.current = staged;
   }, [staged]);
+
+  // Auto-size the composer to its content: reset to one row, then grow to fit
+  // (capped by the CSS max-height). Runs on every keystroke and after send clears it.
+  useEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [input]);
 
   // Revoke every local/staged preview URL on unmount (leaving the chat) so object
   // URLs held for instant render or unsent composer picks don't leak.
@@ -687,13 +699,12 @@ function ChatView({
         <button className="attach" onClick={() => fileInputRef.current?.click()} aria-label={t("chat.addImage")}>
           ＋
         </button>
-        <input
+        <textarea
+          ref={composerRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") send();
-          }}
           placeholder={t("chat.placeholder")}
+          rows={1}
         />
         <button
           onClick={send}
@@ -792,6 +803,28 @@ export default function App() {
       })
       .catch(() => {});
   }, []);
+
+  // Direct-mode push: once connected, best-effort register this app's push
+  // binding so a backgrounded direct chat can buzz. Re-tried on every foreground
+  // because iOS can deliver the APNs token seconds after launch (after the first
+  // register), and a registered token also needs re-asserting after a relaunch.
+  // No-op server-side when the gateway has no `[push]` remote host configured.
+  useEffect(() => {
+    if (!directConnected) return;
+    void directPushRegister();
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listen("app-resumed", () => void directPushRegister())
+      .then((un) => {
+        if (cancelled) un();
+        else unlisten = un;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [directConnected]);
 
   // Stay transparent for the whole scan so the camera (drawn behind the webview)
   // can show through. The warm-up cover below masks the not-yet-ready feed, so

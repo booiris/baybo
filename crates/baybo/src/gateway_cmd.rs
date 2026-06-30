@@ -463,9 +463,10 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     }
 
     // Blind remote-host push: on every completed real user turn, encrypt a
-    // per-device preview and POST it to the remote host (C). Always wired — the
-    // dispatcher self-gates on the approved device row, reading the remote-host
-    // URL + admission key recorded on it at pairing (no `push` config block).
+    // per-target preview and POST it to the remote host (C). Always wired — the
+    // dispatcher self-gates on its targets: approved device rows (relay path,
+    // endpoint recorded at pairing) plus direct-mode web push bindings (the
+    // endpoint from the `[push]` config, recorded at `POST /v1/push/register`).
     {
         // Proxy-aware client: /notify + /register POST to the remote host (C), a
         // non-loopback egress target subject to the operator's egress proxy.
