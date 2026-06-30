@@ -1342,14 +1342,6 @@ export interface components {
         /** @description Response of `GET /v1/push/params`. */
         PushParams: {
             /**
-             * @description Whether direct-mode push is available on this gateway. Currently always
-             *     `true` — bindings register through the built-in default remote host
-             *     ([`DEFAULT_PUSH_RELAY_URL`]). The field stays so a future config toggle (or
-             *     a build with no push host) can report `false` without an app-side change;
-             *     the client skips registration and stays foreground-only when it is `false`.
-             */
-            configured: boolean;
-            /**
              * @description Lowercase hex of the gateway's 32-byte Ed25519 push verifying key. The
              *     client signs a delegation over this key (authorizing it to manage the
              *     binding at C) before `POST /v1/push/register`.

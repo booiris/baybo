@@ -24,7 +24,6 @@ use crate::keychain;
 #[derive(Deserialize)]
 struct PushParams {
     gateway_push_pubkey: String,
-    configured: bool,
 }
 
 #[derive(Serialize)]
@@ -42,8 +41,8 @@ struct RegisterResp {
 }
 
 /// Register (or refresh) this app's direct-mode push binding with the connected
-/// gateway. `Ok(None)` when there is nothing to do yet — no APNs token, or the
-/// gateway has no `[push]` remote host; `Ok(Some(device_id))` on success.
+/// gateway. `Ok(None)` when there is no APNs token yet (the caller retries on the
+/// next foreground); `Ok(Some(device_id))` on success.
 pub async fn register(apns_token: String, apns_env: &str) -> Result<Option<String>, String> {
     // No token yet (iOS hasn't delivered it) → nothing to register; the caller
     // retries on the next foreground once it lands.
@@ -54,7 +53,7 @@ pub async fn register(apns_token: String, apns_env: &str) -> Result<Option<Strin
     let creds = super::credentials()?.ok_or("not connected; sign in first")?;
     let client = reqwest::Client::new();
 
-    // 1. Fetch the gateway push key (to delegate to) + whether push is configured.
+    // 1. Fetch the gateway push key to sign the delegation over.
     let params: PushParams = client
         .get(format!("{}/v1/push/params", creds.base_url))
         .bearer_auth(&creds.token)
@@ -66,10 +65,6 @@ pub async fn register(apns_token: String, apns_env: &str) -> Result<Option<Strin
         .json()
         .await
         .map_err(|e| format!("decode push params: {e}"))?;
-    if !params.configured {
-        // This gateway can't deliver direct-mode push; stay foreground-only.
-        return Ok(None);
-    }
     let gw_pub_bytes = hex::decode(params.gateway_push_pubkey.trim())
         .map_err(|_| "gateway push key is not valid hex".to_string())?;
     let gw_pub = delegation::verifying_key_from_bytes(&gw_pub_bytes)
@@ -80,12 +75,12 @@ pub async fn register(apns_token: String, apns_env: &str) -> Result<Option<Strin
     let sign_key = keychain::load_or_create_device_sign_key()?;
     let device_id = delegation::device_id_for(&sign_key.verifying_key());
 
-    // 3. A fresh 32-byte preview key, stored in the SHARED App-Group keychain so
-    //    this app's NSE can decrypt previews addressed to `bid = device_id`.
-    //    `generate_signing_key().to_bytes()` is 32 OS-CSPRNG bytes.
-    let push_key: [u8; KEY_LEN] = delegation::generate_signing_key().to_bytes();
-    keychain::store_push_key(&device_id, &push_key)
-        .map_err(|e| format!("persist push key: {e}"))?;
+    // 3. The preview key in the SHARED App-Group keychain so this app's NSE can
+    //    decrypt previews addressed to `bid = device_id`. Load-or-create: minted
+    //    once and reused, so every re-register sends the SAME key — the NSE never
+    //    holds a key that mismatches an in-flight push.
+    let push_key: [u8; KEY_LEN] =
+        keychain::load_or_create_push_key(&device_id).map_err(|e| format!("push key: {e}"))?;
 
     // 4. Authorize the gateway push key to manage our binding at C.
     let deleg = delegation::sign_delegation(&sign_key, &gw_pub);

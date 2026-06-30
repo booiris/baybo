@@ -44,12 +44,6 @@ pub struct PushParams {
     /// client signs a delegation over this key (authorizing it to manage the
     /// binding at C) before `POST /v1/push/register`.
     pub gateway_push_pubkey: String,
-    /// Whether direct-mode push is available on this gateway. Currently always
-    /// `true` — bindings register through the built-in default remote host
-    /// ([`DEFAULT_PUSH_RELAY_URL`]). The field stays so a future config toggle (or
-    /// a build with no push host) can report `false` without an app-side change;
-    /// the client skips registration and stays foreground-only when it is `false`.
-    pub configured: bool,
 }
 
 #[utoipa::path(
@@ -67,8 +61,6 @@ async fn push_params(State(state): State<AdminState>) -> Result<Json<PushParams>
         .map_err(|e| GatewayError::Internal(format!("load push signing key: {e}")))?;
     Ok(Json(PushParams {
         gateway_push_pubkey: hex::encode(signing_key.verifying_key().to_bytes()),
-        // Always available today — bindings use the built-in default remote host.
-        configured: true,
     }))
 }
 

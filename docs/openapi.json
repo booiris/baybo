@@ -4104,14 +4104,9 @@
         "type": "object",
         "description": "Response of `GET /v1/push/params`.",
         "required": [
-          "gateway_push_pubkey",
-          "configured"
+          "gateway_push_pubkey"
         ],
         "properties": {
-          "configured": {
-            "type": "boolean",
-            "description": "Whether direct-mode push is available on this gateway. Currently always\n`true` — bindings register through the built-in default remote host\n([`DEFAULT_PUSH_RELAY_URL`]). The field stays so a future config toggle (or\na build with no push host) can report `false` without an app-side change;\nthe client skips registration and stays foreground-only when it is `false`."
-          },
           "gateway_push_pubkey": {
             "type": "string",
             "description": "Lowercase hex of the gateway's 32-byte Ed25519 push verifying key. The\nclient signs a delegation over this key (authorizing it to manage the\nbinding at C) before `POST /v1/push/register`."

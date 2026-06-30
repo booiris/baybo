@@ -196,8 +196,8 @@ captured at launch by hooking the Tauri/wry-owned `UIApplicationDelegate`
 **Direct-mode push (no pairing):** the direct transport has no pairing handshake,
 so it provisions the *same* binding over the admin-token REST surface instead.
 `direct_push_register` (`src-tauri/src/direct/push.rs`) reuses the phone's stable
-Ed25519 identity, generates a `push_key` it stores in the shared App Group
-keychain for its NSE, fetches the gateway push key via `GET /v1/push/params`,
+Ed25519 identity, load-or-creates a stable `push_key` in the shared App Group
+keychain for its NSE (minted once, reused), fetches the gateway push key via `GET /v1/push/params`,
 signs the same delegation, and `POST /v1/push/register`s it (admin Bearer). The
 gateway verifies the delegation and persists a **web push binding**
 (`crates/gateway/src/push/web.rs`), which the dispatcher fans out to alongside

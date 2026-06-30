@@ -636,11 +636,13 @@ Relevant code:
    the *same* key the relay path uses, so a phone keeps one `device_id ==
    ios-<hex(pub)>` whichever way it connects).
 2. `GET /v1/push/params` (admin Bearer) returns the gateway's Ed25519 push public
-   key `G_pub` and whether direct-mode push is available (`configured`, today
-   always `true`).
-3. The app generates a fresh 32-byte `push_key`, stores it in the **shared App
-   Group keychain** (`baybo.push-key.<device_id>`) for its NSE, and signs the
-   **same delegation** authorizing `G_pub` (`device_proto::delegation::sign_delegation`).
+   key `G_pub`.
+3. The app **load-or-creates** a stable 32-byte `push_key` in the **shared App
+   Group keychain** (`baybo.push-key.<device_id>`, minted once and reused) for its
+   NSE, and signs the **same delegation** authorizing `G_pub`
+   (`device_proto::delegation::sign_delegation`). Reusing the key (rather than
+   regenerating per register) means the NSE never holds a key that mismatches an
+   in-flight push.
 4. `POST /v1/push/register` (admin Bearer) carries `device_id`, the APNs token +
    env, the `push_key` (hex), and the delegation (hex). The gateway recovers the
    device key from `device_id`, **verifies the delegation under it**, and persists
@@ -656,8 +658,7 @@ keyless, so the gateway needs no admission key — the binding's only routing in
 is the remote-host **endpoint**, hardcoded today to
 `DEFAULT_PUSH_RELAY_URL = wss://proxy.baybo.space` (the public proxy the app also
 defaults to for pairing). It is not yet operator-configurable; a future `[push]`
-config block can override it, at which point `GET /v1/push/params` would report
-`configured: false` when unset and the app would stay foreground-only.
+config block can override it.
 
 ### Trust-model difference (weaker than the Noise path)
 
