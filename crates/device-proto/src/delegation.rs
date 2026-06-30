@@ -1,13 +1,12 @@
-//! Ed25519 delegation that authenticates push `/register` and `/notify` to the
-//! operator host (**C**) under a *shared* `remote_api_key` — most importantly the
-//! built-in `guest` trial key, which many mutually-distrusting tenants use.
+//! Ed25519 delegation that authenticates keyless push `/register` and `/notify`
+//! calls to the operator host (**C**).
 //!
-//! C's device-token store is keyed by `(remote_api_key, device_id)` and its
-//! `/register` is an unconditional overwrite gated only by admission. Under a
-//! shared key that is **no isolation at all**: once a tenant learns a victim
-//! `device_id` it can overwrite, redirect, or suppress the victim's APNs binding,
-//! and spam `/notify`. Key-partitioning cannot fix this because C cannot
-//! authenticate *which* tenant a request came from beyond the shared key.
+//! Relay admission is keyed by `remote_api_key`, and the built-in public proxy's
+//! `guest` key may be shared by mutually-distrusting tenants. Push routes carry no
+//! admission key at all, so C's device-token store cannot use relay admission as a
+//! binding boundary: once a caller learns a victim `device_id`, an unauthenticated
+//! overwrite would let it redirect or suppress the victim's APNs binding and spam
+//! `/notify`.
 //!
 //! This module binds every binding mutation and notification to a signature chain
 //! C verifies with **no stored secret and no trust-on-first-use**:
@@ -23,7 +22,7 @@
 //! C checks: `device_id == ios-<hex(D_pub)>`, the delegation under `D_pub`, and
 //! the request signature under `G_pub`. Only the holder of `D` can authorize a
 //! `G`, and only the holder of `G` can mutate/notify the binding — independent of
-//! the shared admission key. C (a separate Cargo workspace that cannot link this
+//! relay admission. C (a separate Cargo workspace that cannot link this
 //! crate) re-implements verification against this byte layout. The domain-
 //! separation context strings are a single source of truth in the shared
 //! `remote-host-protocol` crate both workspaces link; the `env` byte mapping and

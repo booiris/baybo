@@ -41,10 +41,10 @@ quotas. Push is deliberately **keyless** at the HTTP caller layer; `/register` a
 C has **no "account" abstraction** and no `account_id`; it knows only relay
 `remote_api_key`s and their limits. Who owns or bills a key is a **control-plane**
 concern C never sees (`billing_account → {remote_api_key…}`, N:1); a leaked key is
-rotated by re-issuing under the same billing account, relay-agnostic. A key is one
-of two **tiers**: `guest` (auto-issued, shared trial key, low default limits,
-GC-able) or `registered` (control-plane-provisioned, explicit per-row limits, no
-TTL).
+rotated by re-issuing under the same billing account, relay-agnostic. Relay keys
+are ordinary admitted rows with explicit per-row limits and an optional expiry;
+the built-in public proxy's `guest` key is just a shared default key, not a
+separate admission class.
 
 ## 1:1 binding
 
@@ -236,7 +236,7 @@ C's blind relay, which only matches two legs by key and copies opaque frames
 - **Remote-host hardening** (C side) — relay abuse controls are keyed on
   `remote_api_key`, resolved through one shared seam
   (`Admission::resolve(remote_api_key) -> Admit{Ok|Unknown|Expired}`, which applies
-  the guest-tier defaults and the expiry check). Push does not call admission:
+  the expiry check). Push does not call admission:
   `/register` + `/notify` are keyless and rely on the device delegation chain,
   per-device notify rate limits, a bounded device-token store, and the shared
   per-source-IP request backstop:
@@ -249,20 +249,18 @@ C's blind relay, which only matches two legs by key and copies opaque frames
     ceiling (`max_bps`, the cross-tenant wall) **and** a per-`(remote_api_key,
     server)` sub-cap (`per_server_max_bps`, so one of a tenant's own gateways can't
     starve the others). Every byte debits **both** buckets and owes the larger debt;
-    enforcement is *throttle, not drop* (TCP backpressure paces the sender). Per-row
-    overrides are in `DEPLOY.md`; the guest-tier defaults are the columns on the
-    reserved `guest` template row (`GUEST_TEMPLATE_KEY`) — a guest row's NULL column
-    inherits it — falling back per-column to the `GUEST_*` consts in
-    `remote-host/crates/admission/src/lib.rs` when that row is absent or also NULL.
+    enforcement is *throttle, not drop* (TCP backpressure paces the sender). New
+    admitted rows must set `max_conns` and `max_bps`; legacy NULLs fall back to the
+    relay role defaults documented in `DEPLOY.md`.
   - a per-rendezvous `/pair/join` limiter, parked-leg TTL cleanup + a hard
     `MAX_PENDING_LEGS` ceiling, and an always-on per-client-IP request limiter
     ahead of relay admission and push body parsing. Client-IP resolution is shared
     (`CLIENT_IP_HEADERS`), while relay and push each have their own rate / burst /
     bucket-map knobs (`RELAY_IP_*`, `PUSH_IP_*` — see `DEPLOY.md`).
   - an admission reload that drops a key **kicks that key's live connections and
-    forgets all its bandwidth buckets**, not just refusing future dials. Guest rows
-    may carry an `expires_at`; expired guests are filtered on load, and the durable
-    `gc_expired_guests` sweep is not mounted today.
+    forgets all its bandwidth buckets**, not just refusing future dials. Any row
+    may carry an `expires_at`; expired rows are filtered out of the live allow-list
+    on reload, while the durable row stays visible until the operator revokes it.
 
 ## App lifecycle & persistence
 

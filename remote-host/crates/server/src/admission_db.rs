@@ -10,41 +10,34 @@
 //! `on_revoke` hook for any key that just lost admission.
 
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use libsql::{Builder, params};
-use remote_host_admission::{AdmissionEntry, InMemoryAdmission, Tier};
+use remote_host_admission::{AdmissionEntry, InMemoryAdmission};
 
 /// Source-of-truth table: one row per admitted `remote_api_key`. `label` +
-/// `created_at` are for whoever administers it. `tier` is `'guest'` (auto-issued,
-/// carries the guest default limits, GC-eligible) or `'registered'` (control-plane
-/// provisioned, explicit per-row limits). `max_conns` / `max_bps` are **required on
-/// a registered row** (a registered key must declare its own limits) but stay
-/// optional on a guest row, which inherits a NULL column from the `'guest'` template
-/// row (else the `GUEST_*` const) — enforced by the `CHECK`. `per_server_max_bps` is
-/// always optional (NULL → falls back to the row's `max_bps`). `expires_at` is the
-/// guest-TTL wall clock (NULL → never expires).
+/// `created_at` are for whoever administers it. `max_conns` + `max_bps` are
+/// **required** (a key must declare its own limits) — enforced by the `CHECK`;
+/// `per_server_max_bps` is optional (NULL → falls back to the row's `max_bps`).
+/// `expires_at` is an optional wall-clock expiry (NULL → never expires).
 ///
 /// The `CHECK` only guards a freshly-created table; `CREATE TABLE IF NOT EXISTS`
 /// can't retrofit it onto a DB made under an older schema.
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS remote_api_keys (\
     remote_api_key TEXT PRIMARY KEY, \
     label TEXT, \
-    tier TEXT NOT NULL DEFAULT 'registered', \
     max_conns INTEGER, \
     max_bps INTEGER, \
     per_server_max_bps INTEGER, \
     expires_at TEXT, \
     created_at TEXT NOT NULL DEFAULT (datetime('now')), \
-    CHECK (tier = 'guest' OR (max_conns IS NOT NULL AND max_bps IS NOT NULL)))";
+    CHECK (max_conns IS NOT NULL AND max_bps IS NOT NULL))";
 
-/// Keep an admitted-but-expired guest out of the in-memory view: drop a row only
-/// when it is a guest, carries an `expires_at`, and that instant has passed. NULL
-/// expiry and registered rows are always kept.
-const NOT_EXPIRED_GUEST: &str =
-    "NOT (tier = 'guest' AND expires_at IS NOT NULL AND expires_at < datetime('now'))";
+/// Keep an admitted-but-expired key out of the in-memory view: drop a row only
+/// when it carries an `expires_at` and that instant has passed. NULL expiry is
+/// always kept.
+const NOT_EXPIRED: &str = "NOT (expires_at IS NOT NULL AND expires_at < datetime('now'))";
 
 /// Generated-key shape (per the dashboard contract): `"rh_" + hex(32 random bytes)`.
 const GENERATED_KEY_BYTES: usize = 32;
@@ -59,8 +52,8 @@ pub(crate) enum AdmissionDbError {
     Db(#[from] libsql::Error),
     #[error("remote_api_key not found")]
     NotFound,
-    #[error("a registered key requires both max_conns and max_bps")]
-    MissingRegisteredLimits,
+    #[error("a key requires both max_conns and max_bps")]
+    MissingLimits,
     #[error("limit {field} value out of range")]
     LimitOutOfRange { field: &'static str },
 }
@@ -139,7 +132,7 @@ pub(crate) async fn open(
 }
 
 impl AdmissionDb {
-    /// The live admission view shared by both roles (relay + push resolve against it).
+    /// The live relay admission view.
     pub(crate) fn admission(&self) -> Arc<InMemoryAdmission> {
         self.admission.clone()
     }
@@ -157,18 +150,17 @@ impl AdmissionDb {
 
     /// Insert a new admitted key. Plain `INSERT` — a PK collision surfaces as
     /// [`AdmissionDbError::Db`] (the backend maps it to 409), never a silent upsert
-    /// that would relax an existing key's limits. `tier` + `expires_at` are honored.
+    /// that would relax an existing key's limits. `expires_at` is honored.
     pub(crate) async fn admit_key(&self, new: &NewKey) -> Result<(), AdmissionDbError> {
-        require_registered_limits(new.tier, new.max_conns, new.max_bps)?;
+        require_limits(new.max_conns, new.max_bps)?;
         self.write_conn
             .execute(
                 "INSERT INTO remote_api_keys \
-                 (remote_api_key, label, tier, max_conns, max_bps, per_server_max_bps, expires_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (remote_api_key, label, max_conns, max_bps, per_server_max_bps, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     new.remote_api_key.clone(),
                     new.label.clone(),
-                    new.tier.as_str(),
                     to_i64(new.max_conns, "max_conns")?,
                     to_i64(new.max_bps, "max_bps")?,
                     to_i64(new.per_server_max_bps, "per_server_max_bps")?,
@@ -179,7 +171,7 @@ impl AdmissionDb {
         Ok(())
     }
 
-    /// Update an existing key's full editable state (label + tier + limits + expiry).
+    /// Update an existing key's full editable state (label + limits + expiry).
     /// `None` fields become SQL NULL. Returns [`AdmissionDbError::NotFound`] when no
     /// row matched. Lowering limits does not kick live legs — only a revoke does;
     /// the new limits bind on the next `register`/`limiter_for`.
@@ -188,18 +180,17 @@ impl AdmissionDb {
         remote_api_key: &str,
         limits: &KeyLimits,
     ) -> Result<(), AdmissionDbError> {
-        require_registered_limits(limits.tier, limits.max_conns, limits.max_bps)?;
+        require_limits(limits.max_conns, limits.max_bps)?;
         let changed = self
             .write_conn
             .execute(
                 "UPDATE remote_api_keys \
-                 SET label = ?2, tier = ?3, max_conns = ?4, max_bps = ?5, \
-                     per_server_max_bps = ?6, expires_at = ?7 \
+                 SET label = ?2, max_conns = ?3, max_bps = ?4, \
+                     per_server_max_bps = ?5, expires_at = ?6 \
                  WHERE remote_api_key = ?1",
                 params![
                     remote_api_key,
                     limits.label.clone(),
-                    limits.tier.as_str(),
                     to_i64(limits.max_conns, "max_conns")?,
                     to_i64(limits.max_bps, "max_bps")?,
                     to_i64(limits.per_server_max_bps, "per_server_max_bps")?,
@@ -227,14 +218,14 @@ impl AdmissionDb {
         Ok(deleted > 0)
     }
 
-    /// Every admitted row with its full columns, newest first. NO expired-guest
-    /// filter — the operator must see expired/guest rows. Carries the full secret;
-    /// the API layer masks it to `key_last4` before serializing.
+    /// Every admitted row with its full columns, newest first. NO expiry filter —
+    /// the operator must see expired rows. Carries the full secret; the API layer
+    /// masks it to `key_last4` before serializing.
     pub(crate) async fn list_keys(&self) -> Result<Vec<KeyRecord>, AdmissionDbError> {
         let mut rows = self
             .write_conn
             .query(
-                "SELECT rowid, remote_api_key, label, tier, max_conns, max_bps, \
+                "SELECT rowid, remote_api_key, label, max_conns, max_bps, \
                         per_server_max_bps, expires_at, created_at \
                  FROM remote_api_keys ORDER BY created_at DESC",
                 (),
@@ -246,18 +237,17 @@ impl AdmissionDb {
                 rowid: row.get::<i64>(0)?,
                 remote_api_key: row.get::<String>(1)?,
                 label: row.get::<Option<String>>(2)?,
-                tier: Tier::from_str(&row.get::<String>(3)?).unwrap_or_default(),
                 max_conns: row
-                    .get::<Option<i64>>(4)?
+                    .get::<Option<i64>>(3)?
                     .and_then(|v| u32::try_from(v).ok()),
                 max_bps: row
-                    .get::<Option<i64>>(5)?
+                    .get::<Option<i64>>(4)?
                     .and_then(|v| u64::try_from(v).ok()),
                 per_server_max_bps: row
-                    .get::<Option<i64>>(6)?
+                    .get::<Option<i64>>(5)?
                     .and_then(|v| u64::try_from(v).ok()),
-                expires_at: row.get::<Option<String>>(7)?,
-                created_at: row.get::<String>(8)?,
+                expires_at: row.get::<Option<String>>(6)?,
+                created_at: row.get::<String>(7)?,
             });
         }
         Ok(out)
@@ -285,7 +275,6 @@ impl AdmissionDb {
 pub(crate) struct NewKey {
     pub remote_api_key: String,
     pub label: Option<String>,
-    pub tier: Tier,
     pub max_conns: Option<u32>,
     pub max_bps: Option<u64>,
     pub per_server_max_bps: Option<u64>,
@@ -295,22 +284,17 @@ pub(crate) struct NewKey {
 /// The editable state of an existing key — `NewKey` minus the immutable PK.
 pub(crate) struct KeyLimits {
     pub label: Option<String>,
-    pub tier: Tier,
     pub max_conns: Option<u32>,
     pub max_bps: Option<u64>,
     pub per_server_max_bps: Option<u64>,
     pub expires_at: Option<String>,
 }
 
-/// A registered key must declare both `max_conns` and `max_bps` (mirrors the table
+/// Every key must declare both `max_conns` and `max_bps` (mirrors the table
 /// `CHECK`, but caught before the INSERT so the dashboard returns a clean 400).
-fn require_registered_limits(
-    tier: Tier,
-    max_conns: Option<u32>,
-    max_bps: Option<u64>,
-) -> Result<(), AdmissionDbError> {
-    if tier == Tier::Registered && (max_conns.is_none() || max_bps.is_none()) {
-        return Err(AdmissionDbError::MissingRegisteredLimits);
+fn require_limits(max_conns: Option<u32>, max_bps: Option<u64>) -> Result<(), AdmissionDbError> {
+    if max_conns.is_none() || max_bps.is_none() {
+        return Err(AdmissionDbError::MissingLimits);
     }
     Ok(())
 }
@@ -334,7 +318,6 @@ pub(crate) struct KeyRecord {
     pub rowid: i64,
     pub remote_api_key: String,
     pub label: Option<String>,
-    pub tier: Tier,
     pub max_conns: Option<u32>,
     pub max_bps: Option<u64>,
     pub per_server_max_bps: Option<u64>,
@@ -354,8 +337,8 @@ async fn load(conn: &libsql::Connection) -> Result<HashMap<String, AdmissionEntr
     let mut rows = conn
         .query(
             &format!(
-                "SELECT remote_api_key, tier, max_conns, max_bps, per_server_max_bps, expires_at \
-                 FROM remote_api_keys WHERE {NOT_EXPIRED_GUEST}"
+                "SELECT remote_api_key, max_conns, max_bps, per_server_max_bps, expires_at \
+                 FROM remote_api_keys WHERE {NOT_EXPIRED}"
             ),
             (),
         )
@@ -363,25 +346,21 @@ async fn load(conn: &libsql::Connection) -> Result<HashMap<String, AdmissionEntr
     let mut keys = HashMap::new();
     while let Some(row) = rows.next().await? {
         let key = row.get::<String>(0)?;
-        // `tier` is NOT NULL DEFAULT 'registered'; an unknown string falls back to
-        // the conservative registered tier (caller floors NULL limits).
-        let tier = Tier::from_str(&row.get::<String>(1)?).unwrap_or_default();
         // Nullable INTEGERs -> per-key overrides; NULL or out-of-range -> None
-        // (the guest default or the caller's floor applies).
+        // (the caller's role floor applies).
         let max_conns = row
-            .get::<Option<i64>>(2)?
+            .get::<Option<i64>>(1)?
             .and_then(|v| u32::try_from(v).ok());
         let max_bps = row
-            .get::<Option<i64>>(3)?
+            .get::<Option<i64>>(2)?
             .and_then(|v| u64::try_from(v).ok());
         let per_server_max_bps = row
-            .get::<Option<i64>>(4)?
+            .get::<Option<i64>>(3)?
             .and_then(|v| u64::try_from(v).ok());
-        let expires_at = row.get::<Option<String>>(5)?;
+        let expires_at = row.get::<Option<String>>(4)?;
         keys.insert(
             key,
             AdmissionEntry {
-                tier,
                 max_conns,
                 max_bps,
                 per_server_max_bps,
@@ -460,11 +439,10 @@ mod tests {
         }
     }
 
-    fn registered(key: &str, max_conns: Option<u32>, max_bps: Option<u64>) -> NewKey {
+    fn new_key(key: &str, max_conns: Option<u32>, max_bps: Option<u64>) -> NewKey {
         NewKey {
             remote_api_key: key.to_string(),
             label: None,
-            tier: Tier::Registered,
             max_conns,
             max_bps,
             per_server_max_bps: None,
@@ -472,19 +450,13 @@ mod tests {
         }
     }
 
-    /// `load` reads every column: tier, all three limits, and `expires_at`.
+    /// `load` reads every limit column and `expires_at`.
     #[tokio::test]
-    async fn load_reads_tier_and_every_limit_column() {
+    async fn load_reads_every_limit_column() {
         let conn = mem_conn().await;
         conn.execute(
-            "INSERT INTO remote_api_keys(remote_api_key, tier, max_conns, max_bps, per_server_max_bps) \
-             VALUES('tuned', 'registered', 8, 4194304, 1048576)",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO remote_api_keys(remote_api_key, tier) VALUES('bare-guest', 'guest')",
+            "INSERT INTO remote_api_keys(remote_api_key, max_conns, max_bps, per_server_max_bps) \
+             VALUES('tuned', 8, 4194304, 1048576)",
             (),
         )
         .await
@@ -492,136 +464,114 @@ mod tests {
 
         let loaded = load(&conn).await.unwrap();
 
-        let tuned = loaded.get("tuned").expect("registered row admitted");
-        assert_eq!(tuned.tier, Tier::Registered);
+        let tuned = loaded.get("tuned").expect("row admitted");
         assert_eq!(tuned.max_conns, Some(8));
         assert_eq!(tuned.max_bps, Some(4_194_304));
         assert_eq!(tuned.per_server_max_bps, Some(1_048_576));
         assert_eq!(tuned.expires_at, None);
-
-        let guest = loaded.get("bare-guest").expect("guest row admitted");
-        assert_eq!(guest.tier, Tier::Guest);
-        assert_eq!(
-            guest.max_conns, None,
-            "NULL stays None; resolve() defaults it"
-        );
     }
 
-    /// An expired guest row is filtered out of the in-memory view; a registered
-    /// row past its (unusual) `expires_at` and a far-future guest both survive.
+    /// An expired row is filtered out of the in-memory view; a row with no expiry
+    /// and a far-future one both survive.
     #[tokio::test]
-    async fn load_filters_only_expired_guests() {
+    async fn load_filters_expired() {
         let conn = mem_conn().await;
         conn.execute(
-            "INSERT INTO remote_api_keys(remote_api_key, tier, expires_at) \
-             VALUES('stale', 'guest', '2000-01-01 00:00:00')",
+            "INSERT INTO remote_api_keys(remote_api_key, max_conns, max_bps, expires_at) \
+             VALUES('stale', 8, 4194304, '2000-01-01 00:00:00')",
             (),
         )
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO remote_api_keys(remote_api_key, tier, expires_at) \
-             VALUES('fresh', 'guest', '2999-01-01 00:00:00')",
+            "INSERT INTO remote_api_keys(remote_api_key, max_conns, max_bps, expires_at) \
+             VALUES('fresh', 8, 4194304, '2999-01-01 00:00:00')",
             (),
         )
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO remote_api_keys(remote_api_key, tier, max_conns, max_bps, expires_at) \
-             VALUES('reg-stale', 'registered', 8, 4194304, '2000-01-01 00:00:00')",
+            "INSERT INTO remote_api_keys(remote_api_key, max_conns, max_bps) \
+             VALUES('never', 8, 4194304)",
             (),
         )
         .await
         .unwrap();
 
         let loaded = load(&conn).await.unwrap();
-        assert!(!loaded.contains_key("stale"), "expired guest is filtered");
-        assert!(loaded.contains_key("fresh"), "future guest kept");
-        assert!(
-            loaded.contains_key("reg-stale"),
-            "the load filter only drops guests"
-        );
+        assert!(!loaded.contains_key("stale"), "expired row is filtered");
+        assert!(loaded.contains_key("fresh"), "future expiry kept");
+        assert!(loaded.contains_key("never"), "no-expiry row kept");
     }
 
-    /// The `CHECK` requires `max_conns` + `max_bps` on a registered row but exempts
-    /// guests; `per_server_max_bps` is never required.
+    /// The `CHECK` requires `max_conns` + `max_bps` on every row;
+    /// `per_server_max_bps` is never required.
     #[tokio::test]
-    async fn registered_row_requires_max_conns_and_max_bps() {
+    async fn row_requires_max_conns_and_max_bps() {
         let conn = mem_conn().await;
 
-        // Registered, both limits set + per_server NULL → accepted.
+        // Both limits set + per_server NULL → accepted.
         conn.execute(
-            "INSERT INTO remote_api_keys(remote_api_key, tier, max_conns, max_bps) \
-             VALUES('ok', 'registered', 8, 4194304)",
+            "INSERT INTO remote_api_keys(remote_api_key, max_conns, max_bps) \
+             VALUES('ok', 8, 4194304)",
             (),
         )
         .await
         .unwrap();
 
-        // Registered missing max_bps → rejected.
+        // Missing max_bps → rejected.
         let missing_bps = conn
             .execute(
-                "INSERT INTO remote_api_keys(remote_api_key, tier, max_conns) \
-                 VALUES('no-bps', 'registered', 8)",
+                "INSERT INTO remote_api_keys(remote_api_key, max_conns) VALUES('no-bps', 8)",
                 (),
             )
             .await;
-        assert!(missing_bps.is_err(), "registered must set max_bps");
+        assert!(missing_bps.is_err(), "a row must set max_bps");
 
-        // Registered missing both (the old bare admit) → rejected.
+        // Missing both (the old bare admit) → rejected.
         let bare = conn
             .execute(
                 "INSERT INTO remote_api_keys(remote_api_key, label) VALUES('bare', 'gw')",
                 (),
             )
             .await;
-        assert!(bare.is_err(), "a registered row can't omit both limits");
-
-        // Guest with no limits → accepted (it inherits the template / consts).
-        conn.execute(
-            "INSERT INTO remote_api_keys(remote_api_key, tier) VALUES('g', 'guest')",
-            (),
-        )
-        .await
-        .unwrap();
+        assert!(bare.is_err(), "a row can't omit both limits");
     }
 
-    /// A registered admit with both limits lands and surfaces in `list_keys`.
+    /// An admit with both limits lands and surfaces in `list_keys`.
     #[tokio::test]
-    async fn registered_admit_with_both_limits_ok() {
+    async fn admit_with_both_limits_ok() {
         let db = mem_db(noop_hook()).await;
-        db.admit_key(&registered("reg", Some(8), Some(4_194_304)))
+        db.admit_key(&new_key("reg", Some(8), Some(4_194_304)))
             .await
             .unwrap();
         let keys = db.list_keys().await.unwrap();
         let row = keys.iter().find(|k| k.remote_api_key == "reg").unwrap();
-        assert_eq!(row.tier, Tier::Registered);
         assert_eq!(row.max_conns, Some(8));
         assert_eq!(row.max_bps, Some(4_194_304));
     }
 
-    /// A registered admit with a NULL limit is rejected before the INSERT.
+    /// An admit with a NULL limit is rejected before the INSERT.
     #[tokio::test]
-    async fn registered_admit_missing_limit_is_rejected() {
+    async fn admit_missing_limit_is_rejected() {
         let db = mem_db(noop_hook()).await;
         let err = db
-            .admit_key(&registered("reg", Some(8), None))
+            .admit_key(&new_key("reg", Some(8), None))
             .await
             .unwrap_err();
-        assert!(matches!(err, AdmissionDbError::MissingRegisteredLimits));
+        assert!(matches!(err, AdmissionDbError::MissingLimits));
         assert!(db.list_keys().await.unwrap().is_empty());
     }
 
-    /// A guest admit with NULL limits and a TTL is accepted.
+    /// An admit with a label + expiry round-trips through `list_keys`.
     #[tokio::test]
-    async fn guest_admit_with_null_limits_ok() {
+    async fn admit_with_label_and_expiry_ok() {
         let db = mem_db(noop_hook()).await;
         db.admit_key(&NewKey {
             remote_api_key: "g".into(),
             label: Some("trial".into()),
-            tier: Tier::Guest,
-            max_conns: None,
-            max_bps: None,
+            max_conns: Some(8),
+            max_bps: Some(4_194_304),
             per_server_max_bps: None,
             expires_at: Some("2999-01-01 00:00:00".into()),
         })
@@ -629,7 +579,6 @@ mod tests {
         .unwrap();
         let keys = db.list_keys().await.unwrap();
         let row = keys.iter().find(|k| k.remote_api_key == "g").unwrap();
-        assert_eq!(row.tier, Tier::Guest);
         assert_eq!(row.label.as_deref(), Some("trial"));
         assert_eq!(row.expires_at.as_deref(), Some("2999-01-01 00:00:00"));
     }
@@ -638,11 +587,11 @@ mod tests {
     #[tokio::test]
     async fn duplicate_admit_is_a_db_error() {
         let db = mem_db(noop_hook()).await;
-        db.admit_key(&registered("dup", Some(4), Some(1024)))
+        db.admit_key(&new_key("dup", Some(4), Some(1024)))
             .await
             .unwrap();
         let err = db
-            .admit_key(&registered("dup", Some(99), Some(9_999)))
+            .admit_key(&new_key("dup", Some(99), Some(9_999)))
             .await
             .unwrap_err();
         assert!(matches!(err, AdmissionDbError::Db(_)));
@@ -667,7 +616,6 @@ mod tests {
                 "nope",
                 &KeyLimits {
                     label: None,
-                    tier: Tier::Registered,
                     max_conns: Some(1),
                     max_bps: Some(1),
                     per_server_max_bps: None,
@@ -678,14 +626,13 @@ mod tests {
             .unwrap_err();
         assert!(matches!(missing, AdmissionDbError::NotFound));
 
-        db.admit_key(&registered("e", Some(2), Some(2048)))
+        db.admit_key(&new_key("e", Some(2), Some(2048)))
             .await
             .unwrap();
         db.edit_key(
             "e",
             &KeyLimits {
                 label: Some("renamed".into()),
-                tier: Tier::Registered,
                 max_conns: Some(16),
                 max_bps: Some(8_388_608),
                 per_server_max_bps: Some(1_048_576),
@@ -711,9 +658,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_key_is_idempotent() {
         let db = mem_db(noop_hook()).await;
-        db.admit_key(&registered("r", Some(1), Some(1)))
-            .await
-            .unwrap();
+        db.admit_key(&new_key("r", Some(1), Some(1))).await.unwrap();
         assert!(db.revoke_key("r").await.unwrap(), "first delete removes it");
         assert!(!db.revoke_key("r").await.unwrap(), "second is a no-op");
     }
@@ -724,10 +669,10 @@ mod tests {
     async fn force_reload_after_revoke_fires_hook() {
         let (hook, sink) = recording_hook();
         let db = mem_db(hook).await;
-        db.admit_key(&registered("k1", Some(1), Some(1)))
+        db.admit_key(&new_key("k1", Some(1), Some(1)))
             .await
             .unwrap();
-        db.admit_key(&registered("k2", Some(1), Some(1)))
+        db.admit_key(&new_key("k2", Some(1), Some(1)))
             .await
             .unwrap();
         // Seed the in-memory view so the next reload can diff a removal.
@@ -760,7 +705,7 @@ mod tests {
         };
 
         let db = mem_db(hook).await;
-        db.admit_key(&registered("k1", Some(1), Some(1)))
+        db.admit_key(&new_key("k1", Some(1), Some(1)))
             .await
             .unwrap();
         // Seed the in-memory view so the post-revoke reload can diff the removal.
@@ -784,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn reveal_key_round_trips() {
         let db = mem_db(noop_hook()).await;
-        db.admit_key(&registered("secret-key", Some(1), Some(1)))
+        db.admit_key(&new_key("secret-key", Some(1), Some(1)))
             .await
             .unwrap();
         let rowid = db
@@ -809,7 +754,6 @@ mod tests {
         db.admit_key(&NewKey {
             remote_api_key: "labeled".into(),
             label: Some("gw-1".into()),
-            tier: Tier::Registered,
             max_conns: Some(1),
             max_bps: Some(1),
             per_server_max_bps: None,
@@ -861,7 +805,7 @@ mod tests {
         let mut r = reader.query("PRAGMA journal_mode=WAL", ()).await.unwrap();
         let _ = r.next().await.unwrap();
 
-        db.admit_key(&registered("wal-key", Some(2), Some(2048)))
+        db.admit_key(&new_key("wal-key", Some(2), Some(2048)))
             .await
             .unwrap();
 

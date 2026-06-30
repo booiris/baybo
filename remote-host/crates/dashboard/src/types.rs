@@ -41,13 +41,6 @@ pub struct RangeQuery {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum KeyTier {
-    Guest,
-    Registered,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BucketUnit {
     Hour,
@@ -79,7 +72,6 @@ pub struct KeyRow {
     pub id: i64,
     pub label: Option<String>,
     pub key_last4: String,
-    pub tier: KeyTier,
     pub max_conns: Option<u32>,
     pub max_bps: Option<u64>,
     pub per_server_max_bps: Option<u64>,
@@ -98,7 +90,6 @@ pub struct RevealedKey {
 pub struct AdmitKeyRequest {
     pub key: Option<String>,
     pub label: Option<String>,
-    pub tier: KeyTier,
     pub max_conns: Option<u32>,
     pub max_bps: Option<u64>,
     pub per_server_max_bps: Option<u64>,
@@ -114,7 +105,6 @@ pub struct AdmitKeyOutcome {
 #[derive(Debug, Clone, Deserialize)]
 pub struct EditKeyRequest {
     pub label: Option<String>,
-    pub tier: KeyTier,
     pub max_conns: Option<u32>,
     pub max_bps: Option<u64>,
     pub per_server_max_bps: Option<u64>,
