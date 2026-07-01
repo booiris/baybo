@@ -11,12 +11,10 @@
 //! token problem (the token is checked at the upgrade) — its reason is surfaced.
 
 use baybo_mobile_core::{
-    Frame, MobileError, WireAttachment, decode, encode, register_http_frame, subscribe_frame,
+    Frame, MobileError, decode, encode, register_http_frame, subscribe_frame,
     web_user_message_frame,
 };
 use futures_util::SinkExt;
-use tauri::AppHandle;
-use tauri::ipc::Channel;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -25,8 +23,8 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use super::rest;
 use crate::transport::{
-    ChatTransport, Connection, FrameCodec, SessionRegistry, TransportError, UserFrameFn, WsStream,
-    recv_binary,
+    ChatTransport, Connection, FrameCodec, SessionLeg, SessionRegistry, TransportError,
+    UserFrameFn, WsStream, recv_binary, session_history_frame,
 };
 
 /// The direct leg's Tauri-managed state: the shared session registry plus the
@@ -96,12 +94,17 @@ impl ChatTransport for DirectSessions {
                 web_user_message_frame(&sid, text, msg_id, attachments)
             });
 
+            // History requests bind only the session id (identity-agnostic). The
+            // direct path normally recovers via REST (`direct_history`), but the
+            // same `/v1/channel-ws` leg also answers `FetchHistory`, so the command
+            // stays transport-agnostic.
             Ok(Connection {
                 ws,
                 codec,
                 opening,
                 opening_best_effort: Vec::new(),
                 user_frame,
+                history_frame: session_history_frame(session_id),
             })
         }
     }
@@ -183,45 +186,16 @@ pub async fn session_create(sessions: &DirectSessions) -> Result<DirectSessionRe
     })
 }
 
-/// Open the direct (raw-MessagePack) `/v1/channel-ws` leg for `session_id` and
-/// stream frames to `on_frame`.
-pub async fn connect(
-    app: AppHandle,
-    sessions: &DirectSessions,
-    session_id: String,
-    since_ordinal: Option<i64>,
-    on_frame: Channel<Frame>,
-) -> Result<(), String> {
-    sessions
-        .registry
-        .connect(sessions, app, &session_id, since_ordinal, on_frame)
-        .await
-        .map_err(|e| e.to_string())
+impl SessionLeg for DirectSessions {
+    fn registry(&self) -> &SessionRegistry {
+        &self.registry
+    }
 }
 
-/// Queue a user message on the live direct session.
-pub async fn send(
-    sessions: &DirectSessions,
-    text: String,
-    msg_id: String,
-    attachments: Vec<WireAttachment>,
-) -> Result<(), String> {
-    sessions
-        .registry
-        .send(text, msg_id, attachments)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Tear down the live pump (the stashed session id + token survive for reconnect).
-pub async fn disconnect(sessions: &DirectSessions) {
-    sessions.registry.disconnect().await;
-}
-
-/// Like [`disconnect`] but also drops the stashed session id + channel token. The
-/// logout path uses this so a later reconnect can't resurrect the (now
-/// keychain-creds-less) session, and the broad channel token doesn't linger in
-/// memory after the user disconnects.
+/// Like [`transport::disconnect`](crate::transport::disconnect) but also drops the
+/// stashed session id + channel token. The logout path uses this so a later
+/// reconnect can't resurrect the (now keychain-creds-less) session, and the broad
+/// channel token doesn't linger in memory after the user disconnects.
 pub async fn forget(sessions: &DirectSessions) {
     sessions.registry.disconnect().await;
     *sessions.session.lock().await = None;

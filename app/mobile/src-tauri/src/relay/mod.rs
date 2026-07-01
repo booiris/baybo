@@ -9,10 +9,11 @@
 
 mod blob;
 mod chat;
+mod dial;
 mod pairing;
 
 pub use blob::{download, image_data, upload, upload_bytes};
-pub use chat::{RelaySessions, connect, disconnect, send};
+pub use chat::RelaySessions;
 pub use pairing::{
     PairAborted, PairChallenge, PairedSummary, PairingSessions, forget_pairing, pair_begin,
     pair_confirm, paired_device,

@@ -10,33 +10,19 @@
 //! relay-only — the app reaches the (possibly NAT'd) gateway through C's blind
 //! content-join leg.
 
-use std::time::Duration;
-
 use baybo_mobile_core::{
-    ContentHandshake, ContentSession, Frame, WireAttachment, apns_token_frame, subscribe_frame,
-    user_message_frame,
+    ContentHandshake, ContentSession, Frame, apns_token_frame, subscribe_frame, user_message_frame,
 };
 use device_proto::noise::StaticKeypair;
 use futures_util::SinkExt;
-use tauri::AppHandle;
-use tauri::ipc::Channel;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::{Error as WsError, Message, http::StatusCode};
+use tokio_tungstenite::tungstenite::Message;
 
+use super::dial::dial_content_join;
 use super::pairing::{PairedRecord, load_paired_record};
 use crate::transport::{
-    ChatTransport, Connection, FrameCodec, SessionRegistry, TransportError, UserFrameFn, WsStream,
-    recv_binary,
+    ChatTransport, Connection, FrameCodec, SessionLeg, SessionRegistry, TransportError,
+    UserFrameFn, WsStream, recv_binary, session_history_frame,
 };
-
-/// Retry budget for the content dial while the gateway's relay control link is
-/// briefly absent. The gateway re-dials the relay on a fixed backoff after any
-/// drop (5s `RECONNECT_BACKOFF` in the gateway's `relay_content`), so a phone that
-/// opens chat inside that window would otherwise get a hard error; this budget
-/// outlasts it. Only a `503 gateway not connected` is retried — a permanent
-/// refusal (e.g. `401` for an unadmitted key) surfaces at once.
-const CONTENT_DIAL_RETRIES: usize = 14;
-const CONTENT_DIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// The relay leg's Tauri-managed state: just the shared session registry. The
 /// durable pairing record is reloaded from the keychain on each connect, so the
@@ -87,7 +73,7 @@ impl ChatTransport for RelaySessions {
                 ));
             }
 
-            let established = dial_relay(&record.relay_node_id, &record, &local).await?;
+            let established = dial_relay(&record, &local).await?;
             let codec: Box<dyn FrameCodec> = Box::new(RelayCodec {
                 session: established.session,
             });
@@ -123,44 +109,16 @@ impl ChatTransport for RelaySessions {
                 opening,
                 opening_best_effort,
                 user_frame,
+                history_frame: session_history_frame(session_id),
             })
         }
     }
 }
 
-/// Open the relay content session for `session_id`, streaming decrypted gateway
-/// frames to `on_frame`.
-pub async fn connect(
-    app: AppHandle,
-    sessions: &RelaySessions,
-    session_id: String,
-    since_ordinal: Option<i64>,
-    on_frame: Channel<Frame>,
-) -> Result<(), String> {
-    sessions
-        .registry
-        .connect(sessions, app, &session_id, since_ordinal, on_frame)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Queue a user message (with any uploaded `attachments`) on the live session.
-pub async fn send(
-    sessions: &RelaySessions,
-    text: String,
-    msg_id: String,
-    attachments: Vec<WireAttachment>,
-) -> Result<(), String> {
-    sessions
-        .registry
-        .send(text, msg_id, attachments)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Tear down the live session (if any).
-pub async fn disconnect(sessions: &RelaySessions) {
-    sessions.registry.disconnect().await;
+impl SessionLeg for RelaySessions {
+    fn registry(&self) -> &SessionRegistry {
+        &self.registry
+    }
 }
 
 /// An established, handshaken relay leg ready to wrap as a [`Connection`].
@@ -169,65 +127,18 @@ struct Established {
     session: ContentSession,
 }
 
-/// Dial the blind relay's content-join leg for the gateway's `relay_node_id`. The
-/// relay admits this leg by the instance key (symmetric with the gateway's host
-/// leg); end-to-end, the gateway authenticates this device by matching the Noise
-/// IK initiator's static against an approved device row.
-///
-/// Retries a `503 gateway not connected` (the gateway is offline or mid-reconnect
-/// to the relay) for a bounded window; every other failure surfaces at once.
+/// Dial the blind relay's content-join leg (shared [`dial_content_join`]) and run
+/// the Noise IK handshake over it. The relay admits this leg by the instance key
+/// (symmetric with the gateway's host leg); end-to-end, the gateway authenticates
+/// this device by matching the Noise IK initiator's static against an approved
+/// device row.
 async fn dial_relay(
-    node_id: &str,
     record: &PairedRecord,
     local: &StaticKeypair,
 ) -> Result<Established, TransportError> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-
-    if record.relay_url.is_empty() {
-        return Err(TransportError::Other(
-            "no relay url for this pairing".into(),
-        ));
-    }
-    let base = record.relay_url.trim_end_matches('/');
-    let url = remote_host_protocol::relay::content_join_url(base, node_id);
-
-    let mut attempt = 0usize;
-    let ws = loop {
-        // Rebuilt per attempt (`into_client_request` yields an owned request).
-        // Present the admission key the QR carried at pairing — the relay admits
-        // the phone leg too.
-        let mut req = url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| TransportError::Other(format!("bad relay url {base}: {e}")))?;
-        if !record.remote_api_key.is_empty() {
-            let value = record
-                .remote_api_key
-                .parse()
-                .map_err(|e| TransportError::Other(format!("bad instance key header: {e}")))?;
-            req.headers_mut()
-                .insert(remote_host_protocol::relay::REMOTE_API_KEY_HEADER, value);
-        }
-        match connect_async(req).await {
-            Ok((ws, _)) => break ws,
-            // The relay's `content_join` returns 503 while no gateway holds a live
-            // control connection for this node; it re-dials the relay on a fixed
-            // backoff, so retry briefly rather than failing the open.
-            Err(WsError::Http(resp))
-                if resp.status() == StatusCode::SERVICE_UNAVAILABLE
-                    && attempt < CONTENT_DIAL_RETRIES =>
-            {
-                attempt += 1;
-                tokio::time::sleep(CONTENT_DIAL_RETRY_DELAY).await;
-            }
-            Err(WsError::Http(resp)) if resp.status() == StatusCode::SERVICE_UNAVAILABLE => {
-                return Err(TransportError::Other(format!(
-                    "gateway offline: {base} has no relay control connection; ensure the paired gateway is running with relay enabled"
-                )));
-            }
-            Err(e) => return Err(TransportError::Other(format!("relay connect {base}: {e}"))),
-        }
-    };
+    let ws = dial_content_join(record, None)
+        .await
+        .map_err(TransportError::Other)?;
     handshake_over(ws, record, local).await
 }
 

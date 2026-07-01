@@ -62,7 +62,11 @@ export const en = {
       connecting: "Connecting…",
       connectFailed: "Connect failed: {{error}}",
       sendFailed: "Send failed: {{error}}",
-      streamReset: "Stream reset: {{reason}}",
+      recoverFailed: "Couldn't reload history: {{error}}",
+      // Scroll-up pagination affordance for older transcript pages.
+      loadOlder: "Load earlier messages",
+      // REST history reports only that a row had media, not its blob refs.
+      attachmentPlaceholder: "[attachment]",
       waitingUpload: "Waiting for the image to finish uploading…",
       loadingImage: "Loading image…",
       tapToLoad: "Tap to load image",

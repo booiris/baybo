@@ -13,7 +13,6 @@ fn emit_ios_keychain_access_group() {
         "BAYBO_IOS_KEYCHAIN_GROUP_SUFFIX",
         "APP_IDENTIFIER_PREFIX",
         "AppIdentifierPrefix",
-        "BAYBO_IOS_DEVELOPMENT_TEAM",
         "DEVELOPMENT_TEAM",
         "BAYBO_IOS_TEAM_ID",
     ] {
@@ -33,9 +32,11 @@ fn ios_keychain_access_group() -> Option<String> {
     let suffix = non_empty_env("BAYBO_IOS_KEYCHAIN_GROUP_SUFFIX")
         .unwrap_or_else(|| KEYCHAIN_ACCESS_GROUP_SUFFIX.to_string());
 
+    // The App-Identifier prefix is the signing team; during an iOS build xcodebuild
+    // exposes it as `DEVELOPMENT_TEAM` / `AppIdentifierPrefix` (the team is hardcoded
+    // in the Xcode project). `BAYBO_IOS_TEAM_ID` stays as a manual override.
     non_empty_env("APP_IDENTIFIER_PREFIX")
         .or_else(|| non_empty_env("AppIdentifierPrefix"))
-        .or_else(|| non_empty_env("BAYBO_IOS_DEVELOPMENT_TEAM"))
         .or_else(|| non_empty_env("DEVELOPMENT_TEAM"))
         .or_else(|| non_empty_env("BAYBO_IOS_TEAM_ID"))
         .map(|prefix| join_identifier_prefix(&prefix, &suffix))

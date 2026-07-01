@@ -1180,6 +1180,139 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
     let _ = server_handle.await;
 }
 
+/// `Frame::FetchHistory` is the relay leg's REST-less backfill: a subscribed
+/// connection asks for a backward page and the gateway replies, on that
+/// connection only, with one `Frame::HistoryPage` of UI-visible bubbles (the same
+/// projection `Subscribe` catch-up uses — agent-internal rows filtered out), plus
+/// the raw `oldest`/`newest_ordinal` bounds and `has_more`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_history_returns_backward_page_of_visible_rows() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let port_file =
+        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let cfg = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+
+    let session_manager = Arc::clone(&tg.deps.session_manager);
+    let user = User {
+        id: WEB_OPERATOR_USER_ID.into(),
+        name: None,
+        channel: ChannelType::http(),
+    };
+    let session = session_manager
+        .create_session(user, ChannelType::http())
+        .await
+        .expect("create session");
+
+    // Same mix as the catch-up test: visible bubbles interleaved with
+    // agent-internal rows the history page must filter out.
+    let rows: &[ChatMessage] = &[
+        ChatMessage::user(vec![ContentBlock::Text("hi".into())]),
+        ChatMessage::agent_context(vec![ContentBlock::Text("[skill reminder]".into())]),
+        ChatMessage::assistant(vec![ContentBlock::Text("hello there".into())]),
+        ChatMessage::user(vec![ContentBlock::Text("how are you".into())]),
+        ChatMessage::tool_result("t1".into(), "ok".into()),
+        ChatMessage::assistant(vec![ContentBlock::Text("doing well".into())]),
+    ];
+    for msg in rows {
+        session_manager
+            .append_session_message(&session.id, msg)
+            .await
+            .expect("append");
+    }
+
+    let channel_tokens = tg.channel_tokens.clone();
+    let shutdown = tg.shutdown.clone();
+    let server =
+        ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone()).expect("bind server");
+    let port = server.port();
+    let server_shutdown = shutdown.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run(server_shutdown).await;
+    });
+
+    let (token, _handle) = mint_web_token(&channel_tokens, "history");
+    let mut client = connect_register(port, &token, ChannelType::http())
+        .await
+        .expect("handshake");
+
+    // FetchHistory requires the connection to be subscribed to the session
+    // (parity with the inbound Message path), so Subscribe first (no catch-up).
+    send_frame(
+        &mut client,
+        Frame::Subscribe {
+            session_id: session.id.clone(),
+            since_ordinal: None,
+        },
+    )
+    .await
+    .expect("send Subscribe");
+    expect_empty_pending_snapshot(&mut client, session.id.as_str()).await;
+
+    // Request the newest page (before_ordinal = None).
+    send_frame(
+        &mut client,
+        Frame::FetchHistory {
+            session_id: session.id.clone(),
+            before_ordinal: None,
+            limit: Some(50),
+        },
+    )
+    .await
+    .expect("send FetchHistory");
+
+    // Skip the post-Subscribe snapshots (TaskList / TurnState) until the page.
+    let page = loop {
+        let frame = recv_frame(&mut client, Duration::from_secs(2))
+            .await
+            .expect("recv frame");
+        if matches!(frame, Frame::HistoryPage { .. }) {
+            break frame;
+        }
+    };
+    let Frame::HistoryPage {
+        messages,
+        oldest_ordinal,
+        newest_ordinal,
+        has_more,
+        ..
+    } = page
+    else {
+        unreachable!()
+    };
+
+    let visible: Vec<(i64, String, MessageRole)> = messages
+        .into_iter()
+        .map(|m| {
+            (
+                m.ordinal.expect("history rows carry ordinal"),
+                m.content,
+                m.role,
+            )
+        })
+        .collect();
+    assert_eq!(
+        visible,
+        vec![
+            (0, "hi".to_string(), MessageRole::User),
+            (2, "hello there".to_string(), MessageRole::Assistant),
+            (3, "how are you".to_string(), MessageRole::User),
+            (5, "doing well".to_string(), MessageRole::Assistant),
+        ],
+        "history page carries UI-visible bubbles in ascending ordinal order",
+    );
+    // Raw page bounds span every row (incl. the filtered ones); 6 rows < limit,
+    // so nothing older remains.
+    assert_eq!(oldest_ordinal, Some(0));
+    assert_eq!(newest_ordinal, Some(5));
+    assert!(!has_more);
+
+    drop(client);
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
 /// The web mint endpoint stashes a `TokenHandle` in `web_chat_tokens`;
 /// the channel-WS upgrade claims it (removes it from the stash) for the
 /// connection's lifetime, and on close RE-STASHES it (fresh `minted_at`)
