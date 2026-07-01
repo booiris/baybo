@@ -312,6 +312,66 @@ automates build + sign + seed + push and prints this path when the App Group
 isn't provisioned. PASS = a notification reading *"Baybo / The agent finished
 replying."*
 
+## Build & install on a device
+
+`tauri ios dev` installs a *development* app whose frontend is served live from the
+Vite dev server (`build.devUrl`). Stop that session — or delete the dev app — and the
+phone has nothing to load. For an app that survives with no Mac attached, build a
+**standalone** bundle (`tauri ios build` embeds `build.frontendDist` into the binary)
+and install it over USB:
+
+```bash
+cd app/mobile
+pnpm ios:install                 # build (release, signed) + install + launch
+pnpm ios:install --debug         # faster debug build
+pnpm ios:install --skip-build    # install the last-built IPA as-is
+pnpm ios:install --no-launch     # install only
+pnpm ios:install --device <id>   # disambiguate when several devices are attached
+```
+
+`pnpm ios:build` runs just the signed build. The signing team is **hardcoded**
+(`DEVELOPMENT_TEAM` in `src-tauri/gen/apple/project.yml` and the generated
+`.xcodeproj`), so `xcodebuild` picks it up directly while building/archiving. Both
+scripts still go through `scripts/tauri-env.mjs`, whose only remaining job is to set
+`APPLE_DEVELOPMENT_TEAM` in the environment — Tauri reads it to fill `teamID` in the
+`ExportOptions.plist` it generates for the `-exportArchive` step, which does **not**
+consult the Xcode build settings. It exports with method `debugging`
+(development-signed, installable on the team's **registered** devices — not App Store /
+ad-hoc). `scripts/ios-install.mjs` unpacks the IPA's `Payload/*.app` and installs it
+with `xcrun devicectl device install app`.
+
+To change the team, edit `DEVELOPMENT_TEAM` in `project.yml` (regen the `.xcodeproj`)
+and the `IOS_DEVELOPMENT_TEAM` constant in `tauri-env.mjs` — keep the two in sync.
+
+Prerequisites: the target iPhone is registered with the signing team (running
+`pnpm tauri ios dev` or Xcode against it once registers it), Developer Mode is on
+(Settings ▸ Privacy & Security ▸ Developer Mode), and the phone is unlocked when it
+launches. App Group + Push (the NSE decrypt path) additionally need a **paid** team —
+see the signing boundary above.
+
+### Troubleshooting
+
+- **`exportArchive: No Account for Team "…"` / `No profiles for 'com.baybo.app…' were
+  found`** — the *export* step didn't get a team. Build/archive reads it from the Xcode
+  build settings, but Tauri's generated `ExportOptions.plist` needs
+  `APPLE_DEVELOPMENT_TEAM` in the environment. `tauri-env.mjs` sets it; if you invoke
+  `tauri ios build` directly (bypassing that script), set `APPLE_DEVELOPMENT_TEAM`
+  yourself.
+- **`CodeSign … errSecInternalComponent` (often with `security: … User interaction is
+  not allowed`)** — `codesign` can't reach the signing key's private key. Almost always
+  because the build runs in a **non-GUI session** (SSH; `launchctl managername` prints
+  `Background`), so the "allow key access" prompt has nowhere to appear. `scripts/
+  tauri-env.mjs` **handles this automatically** for every `ios build` / `ios dev` — i.e.
+  `pnpm tauri ios dev`, `pnpm ios:build`, and `pnpm ios:install` (all route through it):
+  when it detects a non-GUI session it runs `security unlock-keychain` + `security
+  set-key-partition-list -S apple-tool:,apple: -s` before building, so `codesign` gets
+  non-interactive key access. `security` prompts for your login/keychain password on the
+  terminal itself (hidden — never on the command line); it may ask twice (unlock, then
+  grant). Set `BAYBO_SKIP_KEYCHAIN_PREP=1` to skip (e.g. you manage signing access
+  yourself). If you invoke `tauri ios build` **without** `pnpm` (bypassing `tauri-env.mjs`),
+  run those two `security` commands yourself first, or build from a Terminal **on the
+  Mac itself** (GUI session).
+
 ## Testing
 
 Each side is unit/integration-tested, and the spliced relay path is exercised
