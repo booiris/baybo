@@ -40,13 +40,6 @@ export const zh: typeof en = {
       failed: "配对失败：{{error}}",
     },
     connected: {
-      title: "已连接",
-      ready: "已配对，准备就绪。",
-      remembered: "已配对（来自上次会话的记忆）。",
-      directReady: "已直接连接到 {{url}}。",
-      rendezvous: "会合点",
-      relayNode: "中继节点",
-      openChat: "打开聊天",
       replace: "更换配对",
       forget: "忘记",
       forgetConfirm: "忘记此 Baybo？在重新连接前，通知和聊天将停止。",
@@ -55,8 +48,8 @@ export const zh: typeof en = {
       disconnect: "断开连接",
     },
     chat: {
-      back: "返回",
       title: "聊天",
+      manage: "管理连接",
       placeholder: "输入消息…",
       send: "发送",
       connecting: "连接中…",

@@ -400,11 +400,18 @@ function AttachmentList({
 function ChatView({
   sessionId,
   transport,
-  onClose,
+  onDisconnect,
+  onReplace,
+  onForget,
 }: {
   sessionId: string;
   transport: ChatTransport;
-  onClose: () => void;
+  // Manage the underlying connection from the header ⋯ menu (the connected "home"
+  // screen is gone): direct shows Disconnect; relay shows Replace / Forget. Each
+  // tears the chat down and drops back to the landing/scanner.
+  onDisconnect: () => void;
+  onReplace: () => void;
+  onForget: () => void;
 }) {
   const { t } = useTranslation();
   // The chat commands are transport-agnostic: relay (Noise content leg) vs direct
@@ -417,6 +424,22 @@ function ChatView({
   const [turnActive, setTurnActive] = useState(false);
   const [input, setInput] = useState("");
   const [status, setStatus] = useState<string | null>(() => t("chat.connecting"));
+  // Header ⋯ menu. `confirm` gates the two destructive relay actions behind a
+  // second tap; direct's Disconnect fires immediately (it only drops local creds).
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [confirm, setConfirm] = useState<null | "replace" | "forget">(null);
+  // Escape closes the menu (the backdrop tap covers pointer dismissal).
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setMenuOpen(false);
+        setConfirm(null);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [menuOpen]);
   // Bumped on each successful (re)connect. A restored attachment image that failed
   // to load before its leg was live (e.g. a direct chat whose channel token isn't
   // stashed until `chat_connect` completes) re-fetches when this changes.
@@ -1004,9 +1027,74 @@ function ChatView({
   return (
     <main className="screen chat">
       <div className="chat-header">
-        <button onClick={onClose}>← {t("chat.back")}</button>
         <h1>{t("chat.title")}</h1>
+        <button
+          className="chat-menu-btn"
+          aria-label={t("chat.manage")}
+          aria-haspopup="true"
+          aria-expanded={menuOpen}
+          onClick={() => {
+            setConfirm(null);
+            setMenuOpen((o) => !o);
+          }}
+        >
+          ⋯
+        </button>
       </div>
+      {menuOpen && (
+        <>
+          <div
+            className="chat-menu-backdrop"
+            onClick={() => {
+              setMenuOpen(false);
+              setConfirm(null);
+            }}
+          />
+          <div className="chat-menu-panel">
+            {confirm ? (
+              <div className="chat-menu-confirm">
+                <p className="muted">
+                  {t(confirm === "forget" ? "connected.forgetConfirm" : "connected.replaceConfirm")}
+                </p>
+                <button
+                  className={confirm === "forget" ? "chat-menu-item danger" : "chat-menu-item"}
+                  onClick={() => {
+                    // Close the menu synchronously so a fast double-tap can't
+                    // re-fire the (idempotent but redundant) teardown IPC.
+                    setMenuOpen(false);
+                    if (confirm === "forget") onForget();
+                    else onReplace();
+                  }}
+                >
+                  {t(confirm === "forget" ? "connected.forget" : "connected.replace")}
+                </button>
+                <button className="chat-menu-item" onClick={() => setConfirm(null)}>
+                  {t("pair.cancel")}
+                </button>
+              </div>
+            ) : transport === "direct" ? (
+              <button
+                className="chat-menu-item danger"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onDisconnect();
+                }}
+              >
+                {t("connected.disconnect")}
+              </button>
+            ) : (
+              <>
+                <button className="chat-menu-item" onClick={() => setConfirm("replace")}>
+                  {t("connected.replace")}
+                </button>
+                <button className="chat-menu-item danger" onClick={() => setConfirm("forget")}>
+                  {t("connected.forget")}
+                </button>
+              </>
+            )}
+          </div>
+        </>
+      )}
       <div
         className="chat-log"
         ref={logRef}
@@ -1135,9 +1223,6 @@ export default function App() {
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [challenge, setChallenge] = useState<PairChallenge | null>(null);
-  const [paired, setPaired] = useState<PairedSummary | null>(null);
-  // On launch, a persisted pairing means we can skip straight to "connected".
-  const [rememberedDevice, setRememberedDevice] = useState<string | null>(null);
   // Direct (non-relay) connection: the gateway base URL once connected (null =
   // not in direct mode), the landing's method view, and the login form fields.
   const [directConnected, setDirectConnected] = useState<{ baseUrl: string } | null>(null);
@@ -1163,21 +1248,29 @@ export default function App() {
   // and mounts the reticle, revealing the already-transparent live feed.
   const [cameraUp, setCameraUp] = useState(false);
   const scanCancelled = useRef(false);
-  // One app binds one gateway, so re-pairing or unpairing is an explicit,
-  // confirmed action. `null` = showing the normal connected actions; otherwise
-  // the in-progress confirm for replacing or forgetting the current gateway.
-  const [pendingAction, setPendingAction] = useState<null | "replace" | "forget">(null);
 
+  // Restore any live connection on launch. The connected "home" screen is gone —
+  // chat is the home — so with a connection but no chat already open (a persisted
+  // chat restores itself via the ChatView gate below), drop straight into a fresh
+  // chat: direct takes precedence, else a remembered relay pairing.
   useEffect(() => {
-    invoke<string | null>("paired_device")
-      .then((d) => setRememberedDevice(d))
-      .catch(() => {});
-    // A persisted direct connection skips straight to the direct "connected" view.
-    invoke<{ base_url: string } | null>("direct_status")
-      .then((d) => {
-        if (d) setDirectConnected({ baseUrl: d.base_url });
-      })
-      .catch(() => {});
+    let cancelled = false;
+    void (async () => {
+      const [device, direct] = await Promise.all([
+        invoke<string | null>("paired_device").catch(() => null),
+        invoke<{ base_url: string } | null>("direct_status").catch(() => null),
+      ]);
+      if (cancelled) return;
+      // Keep the direct base URL live for the push-register effect regardless of
+      // whether a chat is already open.
+      if (direct) setDirectConnected({ baseUrl: direct.base_url });
+      if (localStorage.getItem(CHAT_ACTIVE_KEY) === "1") return;
+      if (direct) await openChat("direct");
+      else if (device) await openChat("relay");
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Direct-mode push: once connected, best-effort register this app's push
@@ -1326,17 +1419,17 @@ export default function App() {
     setStatus(accepted ? t("pair.confirming") : t("pair.cancelling"));
     try {
       if (accepted) {
-        const summary = await invoke<PairedSummary>("pair_confirm", {
+        await invoke<PairedSummary>("pair_confirm", {
           deviceId: challenge.deviceId,
           accepted: true,
         });
-        setPaired(summary);
         setChallenge(null);
         // A finalized relay pairing supersedes any direct connection (Rust deletes
-        // the direct credentials at finalize). `directConnected` gates ahead of
-        // `paired`, so clear it or the now-defunct direct screen would keep showing.
+        // the direct credentials at finalize), so clear the direct state too.
         setDirectConnected(null);
         setStatus(null);
+        // The connected "home" screen is gone: drop straight into a relay chat.
+        await openChat("relay");
       } else {
         // The decline path intentionally returns an error on the Rust side.
         await invoke("pair_confirm", { deviceId: challenge.deviceId, accepted: false }).catch(
@@ -1364,9 +1457,6 @@ export default function App() {
       setStatus(t("connected.forgetFailed", { error: String(e) }));
     } finally {
       setBusy(false);
-      setPendingAction(null);
-      setPaired(null);
-      setRememberedDevice(null);
       // No gateway → no chat: drop any persisted session so it can't resurrect.
       clearChatState();
       setSessionId("");
@@ -1402,16 +1492,8 @@ export default function App() {
     setChatting(true);
   }
 
-  // Leave the chat (explicit Back): forget the persisted session so the next open
-  // starts clean and a later reload won't resurrect a chat the user closed.
-  function closeChat() {
-    clearChatState();
-    setSessionId("");
-    setChatting(false);
-  }
-
   // Direct (web-style) login: validate the gateway URL + admin token against
-  // `/v1/status` (Rust), persist them, and drop into the direct "connected" view.
+  // `/v1/status` (Rust), persist them, and drop straight into a direct chat.
   async function directConnect() {
     const token = directToken.trim();
     if (!directUrl.trim() || !token || busy) return;
@@ -1430,13 +1512,10 @@ export default function App() {
       setStatus(null);
       setLandingView("menu");
       setDirectConnected({ baseUrl: s.base_url });
-      // A direct login supersedes any relay pairing (Rust wipes it — see
-      // direct::login -> relay::forget_pairing), so drop the relay React state.
-      // Otherwise a later disconnect would fall through the render gates to a
-      // stale relay "remembered" screen for a pairing that no longer exists.
-      setRememberedDevice(null);
-      setPaired(null);
-      setPendingAction(null);
+      // The connected "home" screen is gone: drop straight into a direct chat. (A
+      // direct login supersedes any relay pairing — Rust wipes it in
+      // direct::login -> relay::forget_pairing.)
+      await openChat("direct");
     } catch (e) {
       const msg = String(e);
       // `invalid_token` is a stable discriminator the Rust side returns for a 401
@@ -1468,99 +1547,26 @@ export default function App() {
     setChatting(false);
   }
 
-  // Re-pair: go to the scan screen to bind a different gateway. The current
-  // pairing stays in the keychain until the new one finishes (replace-on-
-  // success), so backing out of the scan leaves the existing binding intact.
+  // Re-pair: leave the current chat for the scan screen to bind a different
+  // gateway. The current pairing stays in the keychain until the new one finishes
+  // (replace-on-success), so backing out of the scan leaves the existing binding
+  // intact.
   function startReplace() {
-    setPendingAction(null);
-    setPaired(null);
-    setRememberedDevice(null);
-  }
-
-  // The actions on a "connected" screen (shared by the just-paired and the
-  // remembered-on-launch views). One app binds one gateway, so the only ways
-  // forward are: open the chat, replace this gateway, or forget it.
-  function connectedActions() {
-    if (pendingAction === "forget") {
-      return (
-        <div className="confirm-inline">
-          <p className="muted">{t("connected.forgetConfirm")}</p>
-          <div className="row">
-            <button onClick={() => setPendingAction(null)} disabled={busy}>
-              {t("pair.cancel")}
-            </button>
-            <button className="danger" onClick={forgetPairing} disabled={busy}>
-              {t("connected.forget")}
-            </button>
-          </div>
-        </div>
-      );
-    }
-    if (pendingAction === "replace") {
-      return (
-        <div className="confirm-inline">
-          <p className="muted">{t("connected.replaceConfirm")}</p>
-          <div className="row">
-            <button onClick={() => setPendingAction(null)} disabled={busy}>
-              {t("pair.cancel")}
-            </button>
-            <button onClick={startReplace} disabled={busy}>
-              {t("connected.replace")}
-            </button>
-          </div>
-        </div>
-      );
-    }
-    return (
-      <div className="row">
-        <button onClick={() => openChat("relay")}>{t("connected.openChat")}</button>
-        <button onClick={() => setPendingAction("replace")}>{t("connected.replace")}</button>
-        <button className="danger" onClick={() => setPendingAction("forget")}>
-          {t("connected.forget")}
-        </button>
-      </div>
-    );
+    // Tear the chat down so we land on the scanner, not back in the old chat.
+    clearChatState();
+    setSessionId("");
+    setChatting(false);
   }
 
   if (chatting && sessionId) {
-    return <ChatView sessionId={sessionId} transport={chatTransport} onClose={closeChat} />;
-  }
-
-  // Direct (non-relay) connection.
-  if (directConnected) {
     return (
-      <main className="screen screen-center">
-        <LangSwitcher />
-        <h1>{t("connected.title")}</h1>
-        <p className="muted">{t("connected.directReady", { url: directConnected.baseUrl })}</p>
-        <div className="row">
-          <button onClick={() => openChat("direct")} disabled={busy}>
-            {t("connected.openChat")}
-          </button>
-          <button className="danger" onClick={directDisconnect} disabled={busy}>
-            {t("connected.disconnect")}
-          </button>
-        </div>
-        {status && <p className="status">{status}</p>}
-      </main>
-    );
-  }
-
-  if (paired) {
-    return (
-      <main className="screen screen-center">
-        <LangSwitcher />
-        <h1>{t("connected.title")}</h1>
-        <p className="muted">{t("connected.ready")}</p>
-        <dl className="kv">
-          <dt>{t("connected.rendezvous")}</dt>
-          <dd>{paired.rendezvousId}</dd>
-          <dt>{t("connected.relayNode")}</dt>
-          <dd>{paired.relayNodeId || "—"}</dd>
-        </dl>
-        {connectedActions()}
-        {status && <p className="status">{status}</p>}
-      </main>
+      <ChatView
+        sessionId={sessionId}
+        transport={chatTransport}
+        onDisconnect={directDisconnect}
+        onReplace={startReplace}
+        onForget={forgetPairing}
+      />
     );
   }
 
@@ -1579,18 +1585,6 @@ export default function App() {
             {t("pair.pair")}
           </button>
         </div>
-        {status && <p className="status">{status}</p>}
-      </main>
-    );
-  }
-
-  if (rememberedDevice) {
-    return (
-      <main className="screen screen-center">
-        <LangSwitcher />
-        <h1>{t("connected.title")}</h1>
-        <p className="muted">{t("connected.remembered")}</p>
-        {connectedActions()}
         {status && <p className="status">{status}</p>}
       </main>
     );

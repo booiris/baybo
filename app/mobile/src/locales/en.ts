@@ -39,13 +39,6 @@ export const en = {
       failed: "Pairing failed: {{error}}",
     },
     connected: {
-      title: "Connected",
-      ready: "Paired and ready.",
-      remembered: "Paired (remembered from a previous session).",
-      directReady: "Connected directly to {{url}}.",
-      rendezvous: "Rendezvous",
-      relayNode: "Relay node",
-      openChat: "Open chat",
       replace: "Replace pairing",
       forget: "Forget",
       forgetConfirm: "Forget this Baybo? Notifications and chat stop until you connect again.",
@@ -55,8 +48,8 @@ export const en = {
       disconnect: "Disconnect",
     },
     chat: {
-      back: "Back",
       title: "Chat",
+      manage: "Manage connection",
       placeholder: "Message…",
       send: "Send",
       connecting: "Connecting…",
