@@ -567,6 +567,16 @@ async fn revoke(ctx: &CommandContext, device_id: String, yes: bool) -> Result<Co
         .revoke(&device_id)
         .await
         .map_err(|e| CliError::Manager(format!("revoke device: {e}")))?;
+    // Revoking the row drops the device from the push fan-out's device leg; also
+    // reclaim any direct-mode web binding (+ material) so it leaves the web leg
+    // too — otherwise a device that had used direct mode keeps receiving pushes
+    // after a revoke. Best-effort: the revoke itself already succeeded.
+    if changed
+        && let Some(vault) = ctx.secret_vault.as_ref()
+        && let Err(e) = baybo_gateway::push::reclaim_push_binding(vault, &device_id).await
+    {
+        tracing::warn!(error = %e, "device revoke: reclaim push binding failed");
+    }
     let human = if changed {
         format!("Revoked device {device_id} (row retained for audit).")
     } else {

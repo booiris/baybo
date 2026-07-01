@@ -85,6 +85,16 @@ pub(crate) fn device_push_delegation_secret_name(device_id: &str) -> String {
     format!("device.{device_id}.push_delegation")
 }
 
+/// Reclaim a device's direct-mode push binding — its `web_push.{id}` meta record
+/// and the `device.{id}.*` push material — from the vault, so the dispatcher
+/// stops fanning previews to it. Called when a device is superseded or revoked
+/// (relay re-pairing, `baybo device revoke`) so the "one active device"
+/// invariant covers push too, not just the device row's chat auth. Idempotent; a
+/// no-op for an id that never had a binding.
+pub async fn reclaim_push_binding(vault: &SecretVault, device_id: &str) -> anyhow::Result<()> {
+    web::remove_binding(vault, device_id).await
+}
+
 /// `SecretVault` key holding A's gateway Ed25519 push-signing key (32-byte seed).
 /// One per gateway, stable across restarts — a paired device delegated to its
 /// public half, so rotating it forces re-pairing to re-delegate.

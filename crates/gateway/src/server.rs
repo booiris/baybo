@@ -160,6 +160,12 @@ pub struct AdminState {
     pub channel_bot_store: Arc<dyn ChannelBotStore>,
     pub channel_control: Arc<crate::channel::ChannelControlRegistry>,
     pub secret_vault: Arc<SecretVault>,
+    /// The iOS-companion device registry. The direct-mode push-register route
+    /// supersedes any prior approved device here (revoke + reclaim its push
+    /// material), so a switched-away phone stops receiving pushes — the relay
+    /// pairing path already supersedes transactionally, but the direct path had
+    /// no equivalent.
+    pub device_store: Arc<dyn baybo_store::DeviceStore>,
     /// Shared with the channel listener so `POST /v1/chat/session`
     /// can mint short-lived web channel-tokens that the same
     /// `require_channel_auth` middleware accepts on `/v1/channel-ws`.
@@ -219,6 +225,7 @@ impl AdminState {
             channel_bot_store: Arc::clone(&deps.stores.channel_bot),
             channel_control: Arc::clone(&deps.channel_control),
             secret_vault: Arc::clone(&deps.secret_vault),
+            device_store: Arc::clone(&deps.stores.device),
             channel_tokens: deps.channel_tokens.clone(),
             web_chat_tokens: Arc::clone(&deps.web_chat_tokens),
             bind_display: deps.runtime_config.admin_bind.to_string(),
