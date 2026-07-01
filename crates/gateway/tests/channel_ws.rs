@@ -1284,7 +1284,13 @@ async fn fetch_history_returns_backward_page_of_visible_rows() {
 
     let visible: Vec<(i64, String, MessageRole)> = messages
         .into_iter()
-        .map(|m| (m.ordinal.expect("history rows carry ordinal"), m.content, m.role))
+        .map(|m| {
+            (
+                m.ordinal.expect("history rows carry ordinal"),
+                m.content,
+                m.role,
+            )
+        })
         .collect();
     assert_eq!(
         visible,
