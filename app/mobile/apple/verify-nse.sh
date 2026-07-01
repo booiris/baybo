@@ -54,10 +54,8 @@ case "$PROJECT_TEAM_ID" in
     PROJECT_TEAM_ID=""
     ;;
 esac
-LOCAL_TEAM_ID="$(awk -F'= *' '/BAYBO_IOS_DEVELOPMENT_TEAM/ {print $2; exit}' "$GEN/Signing.local.xcconfig" 2>/dev/null || true)"
-TEAM_ID="${BAYBO_TEAM_ID:-${BAYBO_IOS_DEVELOPMENT_TEAM:-$PROJECT_TEAM_ID}}"
-[ -n "$TEAM_ID" ] || TEAM_ID="$LOCAL_TEAM_ID"
-[ -n "$TEAM_ID" ] || { echo "✗ could not infer Team ID; set BAYBO_IOS_DEVELOPMENT_TEAM or BAYBO_TEAM_ID"; exit 1; }
+TEAM_ID="${BAYBO_TEAM_ID:-$PROJECT_TEAM_ID}"
+[ -n "$TEAM_ID" ] || { echo "✗ could not read DEVELOPMENT_TEAM from project.yml; set BAYBO_TEAM_ID"; exit 1; }
 KEYCHAIN_GROUP="${BAYBO_KEYCHAIN_GROUP:-$TEAM_ID.com.baybo.app}"
 echo "▸ keychain access group: $KEYCHAIN_GROUP"
 
