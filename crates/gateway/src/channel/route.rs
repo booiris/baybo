@@ -30,6 +30,7 @@ use super::adapter::Sidecar;
 use super::handshake::validate_register;
 use super::state::WsChannelState;
 use super::web_token_janitor::StashedTokenHandle;
+use crate::api::admin::chat::{DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT};
 use crate::auth::{AuthedClient, TokenHandle};
 
 /// Maximum time to wait for the client's `Register` frame after the WS
@@ -487,6 +488,39 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                 };
                 sub.unsubscribe(sidecar.connection_id(), &session_id);
             }
+            Frame::FetchHistory {
+                session_id,
+                before_ordinal,
+                limit,
+            } => {
+                // Backward transcript paging over the live (Noise-sealed) leg —
+                // the relay equivalent of REST GET /v1/chat/sessions/:id, for
+                // clients (the iOS relay leg) with no admin REST surface.
+                // Subscribed-kind only, and the connection must already be
+                // subscribed to the session — parity with the `Message` path
+                // below, not true per-device isolation (since `subscribe` itself
+                // is unchecked, a device can subscribe to any session first).
+                let Some(_sub) = sidecar.channel.as_subscribed() else {
+                    continue;
+                };
+                if !sidecar.connection.is_subscribed_to(&session_id) {
+                    tracing::warn!(
+                        %channel_type,
+                        %session_id,
+                        "FetchHistory for session not subscribed by this connection; dropping",
+                    );
+                    continue;
+                }
+                send_history_page(
+                    state,
+                    sidecar,
+                    channel_type,
+                    &session_id,
+                    before_ordinal,
+                    limit,
+                )
+                .await;
+            }
             Frame::Message(wire_msg) => {
                 let Some(incoming) =
                     build_inbound_message(state, sidecar, channel_type, kind, wire_msg).await
@@ -755,6 +789,83 @@ async fn replay_catch_up(
             );
             return;
         }
+    }
+}
+
+/// Serve one **backward** page of `session_id`'s persisted transcript to
+/// this connection only, in response to a [`Frame::FetchHistory`] — the
+/// Noise-sealed relay equivalent of REST `GET /v1/chat/sessions/:id` for
+/// clients (the iOS relay leg) that have no admin REST surface. Where
+/// [`replay_catch_up`] pages *forward* (rows above the cursor, streamed as
+/// individual [`Frame::Message`]s) this pages *backward* (rows below
+/// `before_ordinal`, or the newest page when `None`) and replies with a
+/// single [`Frame::HistoryPage`]. Reuses [`chat_to_visible_wire_message`]
+/// so the page carries the exact same UI-visible projection catch-up does.
+async fn send_history_page(
+    state: &WsChannelState,
+    sidecar: &Sidecar,
+    channel_type: &ChannelType,
+    session_id: &SessionId,
+    before_ordinal: Option<i64>,
+    limit: Option<u32>,
+) {
+    // Clamp to the same bounds as the REST endpoint; over-fetch by one so
+    // `has_more` is known without a separate COUNT (mirrors `get_session`).
+    let want = (limit.unwrap_or(DEFAULT_HISTORY_LIMIT as u32) as usize).clamp(1, MAX_HISTORY_LIMIT);
+    let mut rows = match state
+        .session_manager
+        .history_tail(session_id, before_ordinal, want + 1)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            // A bad/nonexistent session id is a client error, not a reason to
+            // tear the connection down — warn and drop the request.
+            tracing::warn!(
+                error = %e,
+                %channel_type,
+                %session_id,
+                ?before_ordinal,
+                "FetchHistory store read failed; dropping request",
+            );
+            return;
+        }
+    };
+    let has_more = rows.len() > want;
+    if has_more {
+        // Rows are ascending, so the over-fetch overflow row is the oldest.
+        rows.remove(0);
+    }
+    // Page bounds come from the RAW rows (not the filtered visible set) so the
+    // client's paging cursor stays monotonic even across a page whose rows are
+    // all internal — matching the REST `oldest`/`newest_ordinal`.
+    let oldest_ordinal = rows.first().map(|(o, _, _)| *o);
+    let newest_ordinal = rows.last().map(|(o, _, _)| *o);
+    let mut messages = Vec::with_capacity(rows.len());
+    for (ordinal, _created_at, msg) in rows {
+        if let Some(wire) =
+            chat_to_visible_wire_message(channel_type, session_id, ordinal, msg, &*state.blob_store)
+                .await
+        {
+            messages.push(wire);
+        }
+    }
+    if let Err(e) = sidecar
+        .send_frame(Frame::HistoryPage {
+            session_id: session_id.clone(),
+            messages,
+            oldest_ordinal,
+            newest_ordinal,
+            has_more,
+        })
+        .await
+    {
+        tracing::debug!(
+            error = %e,
+            %channel_type,
+            %session_id,
+            "send HistoryPage failed",
+        );
     }
 }
 

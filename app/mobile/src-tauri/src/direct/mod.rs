@@ -18,7 +18,8 @@ mod rest;
 
 pub use blob::{image_data, upload_bytes};
 pub use chat::{
-    DirectSessionRef, DirectSessions, connect, disconnect, forget, send, session_create,
+    DirectSessionRef, DirectSessions, connect, disconnect, fetch_history, forget, send,
+    session_create,
 };
 pub use push::register as register_push;
 

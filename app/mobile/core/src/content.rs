@@ -98,6 +98,23 @@ pub fn subscribe_frame(session_id: &str, since_ordinal: Option<i64>) -> Frame {
     }
 }
 
+/// A backward-paging [`Frame::FetchHistory`] for `session_id` — the relay
+/// equivalent of the direct path's REST history refetch. `before_ordinal` pages
+/// older (rows below it; `None` is the newest page); `limit` caps the page
+/// (server-clamped). The gateway replies with a single [`Frame::HistoryPage`]
+/// on this same leg, which the pump streams to the webview like any other frame.
+pub fn fetch_history_frame(
+    session_id: &str,
+    before_ordinal: Option<i64>,
+    limit: Option<u32>,
+) -> Frame {
+    Frame::FetchHistory {
+        session_id: SessionId::from(session_id),
+        before_ordinal,
+        limit,
+    }
+}
+
 /// An [`Frame::UpdateApnsToken`] telling the gateway the device's current APNs
 /// token (and env, `"sandbox"`/`"production"`). Sent on every content connect so
 /// the gateway keeps C's push binding fresh across APNs token rotation.
@@ -249,6 +266,45 @@ mod tests {
             decoded.extend(session.open(m).unwrap());
         }
         assert_eq!(decoded, vec![reply]);
+    }
+
+    /// The relay history backfill round-trips over Noise: the app seals a
+    /// `FetchHistory` (built by [`fetch_history_frame`]), the gateway decodes it
+    /// and replays a `HistoryPage`, and the app decodes that back.
+    #[test]
+    fn fetch_history_round_trips_over_noise() {
+        let (mut session, mut gw_t) = established_pair();
+        let mut gw_reasm = FrameReassembler::new();
+
+        // App → gateway: request the newest page (before_ordinal = None).
+        let req = fetch_history_frame("sess-1", None, Some(50));
+        let sealed = session.seal(&req).unwrap();
+        assert_eq!(drain(&mut gw_reasm, &mut gw_t, &sealed), vec![req]);
+
+        // Gateway → app: one backward page of wire::Messages.
+        let page = Frame::HistoryPage {
+            session_id: SessionId::from("sess-1"),
+            messages: vec![Message {
+                content: "older prompt".into(),
+                session_id: SessionId::from("sess-1"),
+                user_id: String::new(),
+                channel_type: ChannelType::ios(),
+                bot_id: String::new(),
+                attachments: Vec::new(),
+                platform_msg_id: String::new(),
+                role: MessageRole::User,
+                ordinal: Some(7),
+            }],
+            oldest_ordinal: Some(7),
+            newest_ordinal: Some(7),
+            has_more: true,
+        };
+        let page_msgs = write_chunked(&mut gw_t, &encode(&page).unwrap()).unwrap();
+        let mut decoded = Vec::new();
+        for m in &page_msgs {
+            decoded.extend(session.open(m).unwrap());
+        }
+        assert_eq!(decoded, vec![page]);
     }
 
     /// A `Frame` far larger than the Noise per-message ceiling chunks on send and
