@@ -14,6 +14,7 @@ mod pairing;
 
 pub use blob::{download, image_data, upload, upload_bytes};
 pub use chat::RelaySessions;
+pub(crate) use pairing::has_pairing;
 pub use pairing::{
     PairAborted, PairChallenge, PairedSummary, PairingSessions, forget_pairing, pair_begin,
     pair_confirm, paired_device,

@@ -379,6 +379,25 @@ pub fn delete_direct_credentials() -> Result<(), String> {
     imp::delete_private_blob(DIRECT_CREDENTIALS_ACCOUNT)
 }
 
+/// Account holding the **active-binding marker** (`"direct"` / `"relay"`): which
+/// bind happened most recently. "One app binds one Baybo", so the two credential
+/// sets are mutually exclusive — but the losing side's cleanup is best-effort, so a
+/// keychain hiccup can transiently leave both present. This marker records the
+/// intended binding so the resolver ([`crate::binding`]) breaks that tie correctly
+/// instead of guessing by static precedence (which could pick the stale one).
+const ACTIVE_BINDING_ACCOUNT: &str = "baybo.active-binding";
+
+/// Record the most-recently-bound leg (written by `direct::login` / `finish_pair`).
+pub fn store_active_binding(kind: &str) -> Result<(), String> {
+    imp::store_private_blob(ACTIVE_BINDING_ACCOUNT, kind.as_bytes())
+}
+
+/// Read the active-binding marker, if one was ever written. `Ok(None)` on a legacy
+/// install that bound before the marker existed — the resolver then falls back.
+pub fn read_active_binding() -> Result<Option<String>, String> {
+    Ok(imp::read_private_blob(ACTIVE_BINDING_ACCOUNT)?.map(|b| String::from_utf8_lossy(&b).into()))
+}
+
 /// Delete a device's push key from the shared keychain (the write side is
 /// [`store_push_key`]). Called on unpair so a stale per-device key can't linger.
 pub fn delete_push_key(bid: &str) -> Result<(), String> {

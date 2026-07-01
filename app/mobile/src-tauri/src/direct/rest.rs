@@ -50,47 +50,6 @@ pub(super) async fn rotate_token(
     parse_credential(resp).await
 }
 
-/// Refetch a transcript slice (`GET /v1/chat/sessions/{id}`) after a WS `Reset`.
-/// Returns the gateway's `ChatSessionDetail` JSON verbatim for the webview to
-/// rebuild the thread.
-pub(super) async fn history(
-    base: &str,
-    admin_token: &str,
-    session_id: &str,
-    before_ordinal: Option<i64>,
-    limit: Option<u32>,
-) -> Result<serde_json::Value, String> {
-    // Build the query manually — both params are plain integers (URL-safe), so no
-    // encoding is needed.
-    let mut url = format!("{base}/v1/chat/sessions/{session_id}");
-    let mut params: Vec<String> = Vec::new();
-    if let Some(b) = before_ordinal {
-        params.push(format!("before_ordinal={b}"));
-    }
-    if let Some(l) = limit {
-        params.push(format!("limit={l}"));
-    }
-    if !params.is_empty() {
-        url.push('?');
-        url.push_str(&params.join("&"));
-    }
-    let resp = reqwest::Client::new()
-        .get(url)
-        .bearer_auth(admin_token)
-        .send()
-        .await
-        .map_err(|e| format!("could not reach Baybo: {e}"))?;
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(INVALID_TOKEN_CODE.into());
-    }
-    if !resp.status().is_success() {
-        return Err(format!("Baybo returned HTTP {}", resp.status().as_u16()));
-    }
-    resp.json()
-        .await
-        .map_err(|e| format!("decode transcript: {e}"))
-}
-
 async fn parse_credential(resp: reqwest::Response) -> Result<ChatSessionCredential, String> {
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Err(INVALID_TOKEN_CODE.into());

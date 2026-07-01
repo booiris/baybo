@@ -9,19 +9,8 @@ import { SUPPORTED_LANGUAGES } from "./i18n";
 import type { PairAborted } from "./generated/PairAborted";
 import type { PairChallenge } from "./generated/PairChallenge";
 import type { PairedSummary } from "./generated/PairedSummary";
-import {
-  attachmentKind,
-  imageObjectUrl,
-  uploadBytes,
-  type ChatTransport,
-  type WireAttachment,
-} from "./blob";
-import {
-  directSessionCreate,
-  directPushRegister,
-  directHistory,
-  type ChatSessionDetail,
-} from "./direct";
+import { attachmentKind, imageObjectUrl, uploadBytes, type WireAttachment } from "./blob";
+import { directPushRegister } from "./direct";
 
 /// Foreground signals (page visibility, window focus, the native `app-resumed`
 /// event) can fire 2–3 times on a single iOS resume; coalesce them into one
@@ -176,9 +165,6 @@ const CAMERA_WARMUP_MS = 300;
 const CHAT_ACTIVE_KEY = "baybo.chat.active";
 const CHAT_SESSION_KEY = "baybo.chat.session";
 const CHAT_STATE_KEY = "baybo.chat.state";
-// Which transport the active chat uses ("relay" | "direct") — persisted so a
-// reload/relaunch restores the right one (the relay leg vs the direct WS).
-const CHAT_MODE_KEY = "baybo.chat.mode";
 
 // `lastOrdinal` is the WS catch-up cursor (the NEWEST edge): a real ordinal
 // replays the gap above it, `0` backfills the whole thread, and `null` means
@@ -217,7 +203,6 @@ function clearChatState() {
     localStorage.removeItem(CHAT_ACTIVE_KEY);
     localStorage.removeItem(CHAT_SESSION_KEY);
     localStorage.removeItem(CHAT_STATE_KEY);
-    localStorage.removeItem(CHAT_MODE_KEY);
   } catch {
     /* ignore */
   }
@@ -236,33 +221,6 @@ function historyMessagesToChatMsgs(messages: WireMessage[]): ChatMsg[] {
     content: m.content,
     attachments: m.attachments,
   }));
-}
-
-/// Rebuild `ChatMsg[]` from a direct REST `ChatSessionDetail.transcript`. `work`
-/// items have no mobile concept (the live switch drops reasoning/tool progress);
-/// `notice` items render as a notice bubble; `message` items as a bubble. REST
-/// history carries only `has_attachments` (no blob refs), so media becomes a
-/// `placeholder` rather than a silently-dropped image.
-function transcriptToChatMsgs(
-  transcript: ChatSessionDetail["transcript"],
-  placeholder: string,
-): ChatMsg[] {
-  const out: ChatMsg[] = [];
-  for (const item of transcript) {
-    if (item.kind === "work") continue;
-    if (item.kind === "notice") {
-      out.push({ id: `n${item.ordinal}`, role: "notice", content: item.text });
-      continue;
-    }
-    const role = item.role === "user" ? "user" : "assistant";
-    const content = item.has_attachments
-      ? item.text
-        ? `${item.text}\n${placeholder}`
-        : placeholder
-      : item.text;
-    out.push({ id: `m${item.ordinal}`, role, content });
-  }
-  return out;
 }
 
 /// Normalize a user-typed Baybo address for the direct-login form: trim, drop a
@@ -291,12 +249,10 @@ function normalizeBayboAddress(raw: string): string | null {
 function AttachmentImage({
   attachment,
   previewUrl,
-  transport,
   connEpoch,
 }: {
   attachment: WireAttachment;
   previewUrl?: string;
-  transport: ChatTransport;
   connEpoch: number;
 }) {
   const { t } = useTranslation();
@@ -317,7 +273,7 @@ function AttachmentImage({
     failedRef.current = false;
     setFailed(false);
     setUrl(null);
-    imageObjectUrl(attachment.blob_id, attachment.mime_type, transport)
+    imageObjectUrl(attachment.blob_id, attachment.mime_type)
       .then((u) => {
         if (cancelled) {
           URL.revokeObjectURL(u);
@@ -337,7 +293,7 @@ function AttachmentImage({
       cancelled = true;
       if (owned) URL.revokeObjectURL(owned);
     };
-  }, [attachment.blob_id, attachment.mime_type, previewUrl, attempt, transport]);
+  }, [attachment.blob_id, attachment.mime_type, previewUrl, attempt]);
 
   // A restored image can race ahead of its leg going live — a direct chat's channel
   // token is only stashed once `chat_connect` completes, so an early fetch fails
@@ -364,12 +320,10 @@ function AttachmentImage({
 function AttachmentList({
   attachments,
   previews,
-  transport,
   connEpoch,
 }: {
   attachments: WireAttachment[];
   previews: Map<string, string>;
-  transport: ChatTransport;
   connEpoch: number;
 }) {
   return (
@@ -380,7 +334,6 @@ function AttachmentList({
             key={`${a.blob_id}-${i}`}
             attachment={a}
             previewUrl={previews.get(a.blob_id)}
-            transport={transport}
             connEpoch={connEpoch}
           />
         ) : (
@@ -399,24 +352,19 @@ function AttachmentList({
 /// gap whenever the app returns to the foreground.
 function ChatView({
   sessionId,
-  transport,
-  onDisconnect,
-  onReplace,
-  onForget,
+  onLogout,
 }: {
   sessionId: string;
-  transport: ChatTransport;
-  // Manage the underlying connection from the header ⋯ menu (the connected "home"
-  // screen is gone): direct shows Disconnect; relay shows Replace / Forget. Each
-  // tears the chat down and drops back to the landing/scanner.
-  onDisconnect: () => void;
-  onReplace: () => void;
-  onForget: () => void;
+  // Log out of the current binding from the header ⋯ menu (the connected "home"
+  // screen is gone). Backend-routed (direct vs relay), so the webview doesn't know or
+  // care which — it just tears the chat down and drops back to the landing.
+  onLogout: () => void;
 }) {
   const { t } = useTranslation();
-  // The chat commands are transport-agnostic: relay (Noise content leg) vs direct
-  // (raw-MessagePack /v1/channel-ws) is selected by passing `leg: transport` to a
-  // single backend command, which routes to the right session registry.
+  // The chat/blob commands are transport-agnostic: the backend resolves the leg
+  // (relay Noise content leg vs direct raw-MessagePack /v1/channel-ws) from the
+  // active binding, so these calls carry no leg tag — and neither does the history
+  // recovery, which fires the same live-leg `chat_fetch_history` on either leg.
   // Parsed once on mount (lazy initializer), then reused for the initial state.
   const [restored] = useState(() => loadChatState(sessionId));
   const [messages, setMessages] = useState<ChatMsg[]>(restored?.messages ?? []);
@@ -424,31 +372,23 @@ function ChatView({
   const [turnActive, setTurnActive] = useState(false);
   const [input, setInput] = useState("");
   const [status, setStatus] = useState<string | null>(() => t("chat.connecting"));
-  // Header ⋯ menu. `confirm` gates the two destructive relay actions behind a
-  // second tap; direct's Disconnect fires immediately (it only drops local creds).
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [confirm, setConfirm] = useState<null | "replace" | "forget">(null);
-  // Escape closes the menu (the backdrop tap covers pointer dismissal).
+  // The header logout button confirms before firing (relay logout forgets the
+  // pairing, which needs a fresh QR to recover), so `confirm` gates it behind a
+  // second tap in a small popover.
+  const [confirm, setConfirm] = useState(false);
+  // Escape dismisses the confirm popover (the backdrop tap covers pointer dismissal).
   useEffect(() => {
-    if (!menuOpen) return;
+    if (!confirm) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setMenuOpen(false);
-        setConfirm(null);
-      }
+      if (e.key === "Escape") setConfirm(false);
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [menuOpen]);
+  }, [confirm]);
   // Bumped on each successful (re)connect. A restored attachment image that failed
   // to load before its leg was live (e.g. a direct chat whose channel token isn't
   // stashed until `chat_connect` completes) re-fetches when this changes.
   const [connEpoch, setConnEpoch] = useState(0);
-  // Bumped by `recoverFromReset` to force a fresh dial carrying the corrected
-  // cursor (direct: the refetched tail; relay: null). It's a dep of the connect
-  // effect, so bumping it re-runs the effect (teardown → re-dial) — distinct from
-  // `connEpoch`, which the connect *success* bumps and so must NOT trigger a dial.
-  const [reconnectNonce, setReconnectNonce] = useState(0);
   // platform_msg_ids already rendered (our optimistic sends + anything restored),
   // so the server's echo or a catch-up replay doesn't render them twice.
   const sentIds = useRef<Set<string>>(
@@ -565,7 +505,6 @@ function ChatView({
       relayHistory.current = { mode };
       try {
         await invoke("chat_fetch_history", {
-          leg: transport,
           beforeOrdinal,
           limit: HISTORY_PAGE_LIMIT,
         });
@@ -575,7 +514,7 @@ function ChatView({
         throw e;
       }
     },
-    [transport],
+    [],
   );
 
   // Prepend an older page above the current top (scroll-up paging), preserving the
@@ -608,64 +547,35 @@ function ChatView({
 
   // Recover from a gateway `Frame::Reset` (catch-up gap over the replay cap, or
   // outbound back-pressure). Left unhandled this *loops*: the stale pre-gap cursor
-  // goes back out on the next reconnect and overflows again. Both transports now
-  // do a full backfill, by different routes:
-  //
-  //   * direct — refetch the newest transcript page over REST (`directHistory`),
-  //     rebuild the thread, reseed the cursors, and reconnect so the live leg
-  //     re-subscribes from the corrected tail (replays only *above* it → nothing →
-  //     loop broken).
-  //   * relay — no REST, so fire a `chat_fetch_history` over the live leg (which
-  //     stays up across a Reset); `case "history_page"` rebuilds the thread and
-  //     reseeds the cursors. No reconnect needed — the leg is already live.
-  //
-  // A re-entrancy guard keeps a burst of Resets (back-pressure) from stacking
-  // concurrent refetches.
+  // goes back out on the next reconnect and overflows again. Both legs recover the
+  // same way — the backend answers `chat_fetch_history` on either socket, so we fire
+  // one over the live leg (which stays up across a Reset); `case "history_page"`
+  // rebuilds the thread and reseeds the cursors. No reconnect needed — the leg is
+  // already live. If a request is already in flight (`false`) — e.g. a scroll-up
+  // page — the reset can't ride it (that response is a PREPEND), so QUEUE it to run
+  // when that request completes; dropping it would leave the stale cursor in place
+  // and re-arm the very reset loop we're breaking. A re-entrancy guard keeps a burst
+  // of Resets (back-pressure) from stacking concurrent refetches.
   const recoverFromReset = useCallback(async () => {
     if (recovering.current) return;
     recovering.current = true;
     try {
-      if (transport === "direct") {
-        const detail = await directHistory(sessionId);
-        const rebuilt = transcriptToChatMsgs(detail.transcript, t("chat.attachmentPlaceholder"));
-        // Seed from the real bounds (never the synthetic negatives on control
-        // rows); set the refs before `setMessages` so the save effect reads them.
-        lastOrdinal.current = detail.newest_ordinal ?? 0;
-        oldestOrdinal.current = detail.oldest_ordinal ?? null;
-        setHasMoreOlder(detail.has_more);
-        setMessages(rebuilt);
-        setStreaming("");
-        saveChatState({
-          sessionId,
-          messages: rebuilt,
-          lastOrdinal: lastOrdinal.current,
-          oldestOrdinal: oldestOrdinal.current,
-        });
-        setStatus(null);
-        setReconnectNonce((n) => n + 1);
-      } else {
-        // Relay: the rebuild happens in `case "history_page"` when the page lands.
-        // If a request is already in flight (`false`) — e.g. a scroll-up page — the
-        // reset can't ride it (that response is a PREPEND), so QUEUE it to run when
-        // that request completes. Dropping it would leave the stale cursor in place
-        // and let the next reconnect re-arm the very reset loop we're breaking.
-        const fired = await requestRelayHistory("reset", null);
-        if (!fired) pendingReset.current = true;
-      }
+      const fired = await requestRelayHistory("reset", null);
+      if (!fired) pendingReset.current = true;
     } catch (e) {
       setStatus(t("chat.recoverFailed", { error: String(e) }));
     } finally {
       recovering.current = false;
     }
-    // `t` omitted from deps for the same reason as `connect` below: a language
+    // `t` is omitted from deps for the same reason as `connect` below: a language
     // switch must not re-create this (and through it `connect`) and tear the leg
     // down. The captured language is fine for these one-shot recovery strings.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, transport, requestRelayHistory]);
+  }, [requestRelayHistory]);
 
-  // Load the next older page (scroll-up). Direct pages over REST and prepends
-  // inline; relay fires a `chat_fetch_history` whose `history_page` reply prepends
-  // in the frame switch (and clears the guards there). `pagingRef` gates re-entry.
+  // Load the next older page (scroll-up): fire a `chat_fetch_history` whose
+  // `history_page` reply prepends in the frame switch (and clears the guards there).
+  // `pagingRef` gates re-entry.
   const loadOlder = useCallback(async () => {
     if (pagingRef.current || !hasMoreOlder) return;
     const before = oldestOrdinal.current;
@@ -673,23 +583,12 @@ function ChatView({
     pagingRef.current = true;
     setLoadingOlder(true);
     try {
-      if (transport === "direct") {
-        const detail = await directHistory(sessionId, before, HISTORY_PAGE_LIMIT);
-        prependOlder(
-          transcriptToChatMsgs(detail.transcript, t("chat.attachmentPlaceholder")),
-          detail.oldest_ordinal ?? null,
-          detail.has_more,
-        );
+      const fired = await requestRelayHistory("page", before);
+      // If a request was already in flight, unwind — the `history_page` handler
+      // clears the guards only for the request it actually serves.
+      if (!fired) {
         pagingRef.current = false;
         setLoadingOlder(false);
-      } else {
-        const fired = await requestRelayHistory("page", before);
-        // If a request was already in flight, unwind — the `history_page` handler
-        // clears the guards only for the request it actually serves.
-        if (!fired) {
-          pagingRef.current = false;
-          setLoadingOlder(false);
-        }
       }
     } catch (e) {
       pagingRef.current = false;
@@ -697,7 +596,7 @@ function ChatView({
       setStatus(t("chat.recoverFailed", { error: String(e) }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, transport, hasMoreOlder, requestRelayHistory, prependOlder]);
+  }, [hasMoreOlder, requestRelayHistory]);
 
   // (Re)open the content session, replaying only the gap above what we've already
   // rendered. Re-run on every foreground: iOS suspends the WS (and may reclaim the
@@ -837,17 +736,16 @@ function ChatView({
     setLoadingOlder(false);
     setStatus(t("chat.connecting"));
     // Returns the dial promise (rejections propagate) so the caller can back off
-    // and retry — see `attemptConnect` in the mount effect. `leg: transport` picks
-    // the active transport (relay vs direct) backend-side.
+    // and retry — see `attemptConnect` in the mount effect. The backend resolves the
+    // leg (relay vs direct) from the active binding, so no leg tag rides the call.
     //
     // Cursor (`sinceOrdinal`): the gateway replays rows ABOVE it, so a real ordinal
     // catches up the gap and `0` (the value when localStorage was evicted and we
     // have nothing rendered) backfills the whole thread instead of leaving the chat
     // blank until the next turn. A genuinely empty session replays nothing; an
-    // over-cap history yields a `Frame::Reset` (handled by `recoverFromReset`,
-    // which backfills via REST (direct) or a `chat_fetch_history` (relay)).
+    // over-cap history yields a `Frame::Reset` (handled by `recoverFromReset`, which
+    // backfills over the live leg with a `chat_fetch_history` on either transport).
     return invoke("chat_connect", {
-      leg: transport,
       sessionId,
       sinceOrdinal: lastOrdinal.current,
       onFrame: channel,
@@ -858,10 +756,10 @@ function ChatView({
     // `t` is intentionally omitted from deps: re-creating `connect` on a language
     // switch would tear down + re-dial the live session. Status strings set by a
     // later reconnect simply use the language captured here. `recoverFromReset` /
-    // `prependOlder` / `requestRelayHistory` share `connect`'s deps (or are stable),
-    // so it's stable across all other renders.
+    // `prependOlder` / `requestRelayHistory` are all stable, so `connect` is stable
+    // across every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, transport, recoverFromReset, prependOlder, requestRelayHistory]);
+  }, [sessionId, recoverFromReset, prependOlder, requestRelayHistory]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -938,11 +836,9 @@ function ChatView({
       window.removeEventListener("focus", scheduleConnect);
       unlisten?.();
       unlistenDropped?.();
-      invoke("chat_disconnect", { leg: transport }).catch(() => {});
+      invoke("chat_disconnect").catch(() => {});
     };
-    // `reconnectNonce` is a dep so a `Frame::Reset` recovery (which bumps it after
-    // fixing the cursor) tears the leg down and re-dials with the corrected cursor.
-  }, [connect, reconnectNonce]);
+  }, [connect]);
 
   // Pick one or more images: stage each (instant local preview) and upload its
   // bytes over the blob leg in the background; the staged entry flips to "ready"
@@ -966,7 +862,7 @@ function ChatView({
         { localId, filename: file.name, mime, size: file.size, previewUrl, status: "uploading" },
       ]);
       try {
-        const blobId = await uploadBytes(await file.arrayBuffer(), mime, transport);
+        const blobId = await uploadBytes(await file.arrayBuffer(), mime);
         if (previewUrl) localPreviews.current.set(blobId, previewUrl);
         setStaged((s) =>
           s.map((a) => (a.localId === localId ? { ...a, blobId, status: "ready" } : a)),
@@ -1018,7 +914,7 @@ function ChatView({
     }
     setStaged([]);
     try {
-      await invoke("chat_send", { leg: transport, text, msgId, attachments });
+      await invoke("chat_send", { text, msgId, attachments });
     } catch (e) {
       setStatus(t("chat.sendFailed", { error: String(e) }));
     }
@@ -1029,69 +925,49 @@ function ChatView({
       <div className="chat-header">
         <h1>{t("chat.title")}</h1>
         <button
-          className="chat-menu-btn"
-          aria-label={t("chat.manage")}
+          className="chat-logout-btn"
+          aria-label={t("connected.logout")}
           aria-haspopup="true"
-          aria-expanded={menuOpen}
-          onClick={() => {
-            setConfirm(null);
-            setMenuOpen((o) => !o);
-          }}
+          aria-expanded={confirm}
+          onClick={() => setConfirm(true)}
         >
-          ⋯
+          {/* Line-art "log out": a door with an arrow leaving it. */}
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M9 21H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3" />
+            <path d="M16 17l5-5-5-5" />
+            <path d="M21 12H9" />
+          </svg>
         </button>
       </div>
-      {menuOpen && (
+      {confirm && (
         <>
-          <div
-            className="chat-menu-backdrop"
-            onClick={() => {
-              setMenuOpen(false);
-              setConfirm(null);
-            }}
-          />
+          <div className="chat-menu-backdrop" onClick={() => setConfirm(false)} />
           <div className="chat-menu-panel">
-            {confirm ? (
-              <div className="chat-menu-confirm">
-                <p className="muted">
-                  {t(confirm === "forget" ? "connected.forgetConfirm" : "connected.replaceConfirm")}
-                </p>
-                <button
-                  className={confirm === "forget" ? "chat-menu-item danger" : "chat-menu-item"}
-                  onClick={() => {
-                    // Close the menu synchronously so a fast double-tap can't
-                    // re-fire the (idempotent but redundant) teardown IPC.
-                    setMenuOpen(false);
-                    if (confirm === "forget") onForget();
-                    else onReplace();
-                  }}
-                >
-                  {t(confirm === "forget" ? "connected.forget" : "connected.replace")}
-                </button>
-                <button className="chat-menu-item" onClick={() => setConfirm(null)}>
-                  {t("pair.cancel")}
-                </button>
-              </div>
-            ) : transport === "direct" ? (
+            <div className="chat-menu-confirm">
+              <p className="muted">{t("connected.logoutConfirm")}</p>
               <button
                 className="chat-menu-item danger"
                 onClick={() => {
-                  setMenuOpen(false);
-                  onDisconnect();
+                  // Close the popover synchronously so a fast double-tap can't
+                  // re-fire the (idempotent but redundant) teardown IPC.
+                  setConfirm(false);
+                  onLogout();
                 }}
               >
-                {t("connected.disconnect")}
+                {t("connected.logout")}
               </button>
-            ) : (
-              <>
-                <button className="chat-menu-item" onClick={() => setConfirm("replace")}>
-                  {t("connected.replace")}
-                </button>
-                <button className="chat-menu-item danger" onClick={() => setConfirm("forget")}>
-                  {t("connected.forget")}
-                </button>
-              </>
-            )}
+              <button className="chat-menu-item" onClick={() => setConfirm(false)}>
+                {t("pair.cancel")}
+              </button>
+            </div>
           </div>
         </>
       )}
@@ -1119,7 +995,6 @@ function ChatView({
               <AttachmentList
                 attachments={m.attachments}
                 previews={localPreviews.current}
-                transport={transport}
                 connEpoch={connEpoch}
               />
             )}
@@ -1234,10 +1109,6 @@ export default function App() {
   // user straight back into the live chat rather than the landing screen.
   const [chatting, setChatting] = useState(() => localStorage.getItem(CHAT_ACTIVE_KEY) === "1");
   const [sessionId, setSessionId] = useState(() => localStorage.getItem(CHAT_SESSION_KEY) ?? "");
-  // Transport of the active/last chat, restored so a reload re-dials the right leg.
-  const [chatTransport, setChatTransport] = useState<ChatTransport>(() =>
-    localStorage.getItem(CHAT_MODE_KEY) === "direct" ? "direct" : "relay",
-  );
   // QR scan flow. "scanning" makes the page transparent so the native camera
   // (drawn behind the webview) shows through; "success" plays a brief
   // confirmation beat on the app background, covering the camera teardown so the
@@ -1265,8 +1136,9 @@ export default function App() {
       // whether a chat is already open.
       if (direct) setDirectConnected({ baseUrl: direct.base_url });
       if (localStorage.getItem(CHAT_ACTIVE_KEY) === "1") return;
-      if (direct) await openChat("direct");
-      else if (device) await openChat("relay");
+      // Bound (either way) and no chat open yet → drop straight into a fresh one. The
+      // leg is resolved backend-side, so the webview doesn't pick which.
+      if (direct || device) await openChat();
     })();
     return () => {
       cancelled = true;
@@ -1428,8 +1300,8 @@ export default function App() {
         // the direct credentials at finalize), so clear the direct state too.
         setDirectConnected(null);
         setStatus(null);
-        // The connected "home" screen is gone: drop straight into a relay chat.
-        await openChat("relay");
+        // The connected "home" screen is gone: drop straight into the chat.
+        await openChat();
       } else {
         // The decline path intentionally returns an error on the Rust side.
         await invoke("pair_confirm", { deviceId: challenge.deviceId, accepted: false }).catch(
@@ -1446,48 +1318,25 @@ export default function App() {
     }
   }
 
-  // Unpair: clear the keychain record + push key, then drop back to the scan
-  // screen fully unpaired.
-  async function forgetPairing() {
+  // Open a fresh chat (the previous thread is dropped), persisted with the active
+  // flag + session id so a mid-chat reload restores *this* conversation. The leg is
+  // resolved backend-side, so the webview no longer branches on the binding — it just
+  // asks `chat_create_session` for an id (direct mints a gateway session; relay picks
+  // a fresh client id).
+  async function openChat() {
     setBusy(true);
+    let id: string;
     try {
-      await invoke("forget_pairing");
-      setStatus(null);
+      id = await invoke<string>("chat_create_session");
     } catch (e) {
-      setStatus(t("connected.forgetFailed", { error: String(e) }));
+      setStatus(t("chat.startFailed", { error: String(e) }));
+      return;
     } finally {
       setBusy(false);
-      // No gateway → no chat: drop any persisted session so it can't resurrect.
-      clearChatState();
-      setSessionId("");
-      setChatting(false);
-    }
-  }
-
-  // Open a fresh chat (the previous thread is dropped), persisted with the active
-  // flag + transport so a mid-chat reload restores *this* conversation on the
-  // right leg. The relay path mints a client UUID; the direct path must use the
-  // gateway-assigned session id from `direct_session_create`.
-  async function openChat(transport: ChatTransport) {
-    let id: string;
-    if (transport === "direct") {
-      setBusy(true);
-      try {
-        id = await directSessionCreate();
-      } catch (e) {
-        setStatus(t("direct.failed", { error: String(e) }));
-        return;
-      } finally {
-        setBusy(false);
-      }
-    } else {
-      id = crypto.randomUUID();
     }
     clearChatState();
     localStorage.setItem(CHAT_SESSION_KEY, id);
     localStorage.setItem(CHAT_ACTIVE_KEY, "1");
-    localStorage.setItem(CHAT_MODE_KEY, transport);
-    setChatTransport(transport);
     setSessionId(id);
     setChatting(true);
   }
@@ -1512,10 +1361,10 @@ export default function App() {
       setStatus(null);
       setLandingView("menu");
       setDirectConnected({ baseUrl: s.base_url });
-      // The connected "home" screen is gone: drop straight into a direct chat. (A
-      // direct login supersedes any relay pairing — Rust wipes it in
-      // direct::login -> relay::forget_pairing.)
-      await openChat("direct");
+      // The connected "home" screen is gone: drop straight into the chat. (A direct
+      // login supersedes any relay pairing — Rust wipes it in direct::login ->
+      // relay::forget_pairing.)
+      await openChat();
     } catch (e) {
       const msg = String(e);
       // `invalid_token` is a stable discriminator the Rust side returns for a 401
@@ -1527,12 +1376,13 @@ export default function App() {
     }
   }
 
-  // Direct "disconnect": tear down any live chat, wipe the stored credentials,
-  // and return to the landing.
-  async function directDisconnect() {
+  // Log out of the current binding (the unified ⋯-menu action): the backend routes
+  // it (direct drops its creds, relay forgets the pairing + push key), tearing down
+  // the live leg. Then wipe the local UI + persisted chat and return to the landing.
+  async function logout() {
     setBusy(true);
     try {
-      await invoke("direct_logout");
+      await invoke("logout");
     } catch {
       /* best-effort — clear the UI regardless */
     }
@@ -1541,18 +1391,7 @@ export default function App() {
     setDirectToken("");
     setStatus(null);
     setBusy(false);
-    // No connection → no chat: drop any persisted session so it can't resurrect.
-    clearChatState();
-    setSessionId("");
-    setChatting(false);
-  }
-
-  // Re-pair: leave the current chat for the scan screen to bind a different
-  // gateway. The current pairing stays in the keychain until the new one finishes
-  // (replace-on-success), so backing out of the scan leaves the existing binding
-  // intact.
-  function startReplace() {
-    // Tear the chat down so we land on the scanner, not back in the old chat.
+    // No binding → no chat: drop any persisted session so it can't resurrect.
     clearChatState();
     setSessionId("");
     setChatting(false);
@@ -1562,10 +1401,7 @@ export default function App() {
     return (
       <ChatView
         sessionId={sessionId}
-        transport={chatTransport}
-        onDisconnect={directDisconnect}
-        onReplace={startReplace}
-        onForget={forgetPairing}
+        onLogout={logout}
       />
     );
   }

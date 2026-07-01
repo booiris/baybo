@@ -39,27 +39,20 @@ export const en = {
       failed: "Pairing failed: {{error}}",
     },
     connected: {
-      replace: "Replace pairing",
-      forget: "Forget",
-      forgetConfirm: "Forget this Baybo? Notifications and chat stop until you connect again.",
-      replaceConfirm:
-        "Reconnect to a different Baybo? You'll scan a new one; the current connection stays until the new one finishes.",
-      forgetFailed: "Couldn't forget the pairing: {{error}}",
-      disconnect: "Disconnect",
+      logout: "Log out",
+      logoutConfirm: "Log out of this Baybo? Notifications and chat stop until you connect again.",
     },
     chat: {
       title: "Chat",
-      manage: "Manage connection",
       placeholder: "Message…",
       send: "Send",
       connecting: "Connecting…",
       connectFailed: "Connect failed: {{error}}",
+      startFailed: "Couldn't start the chat: {{error}}",
       sendFailed: "Send failed: {{error}}",
       recoverFailed: "Couldn't reload history: {{error}}",
       // Scroll-up pagination affordance for older transcript pages.
       loadOlder: "Load earlier messages",
-      // REST history reports only that a row had media, not its blob refs.
-      attachmentPlaceholder: "[attachment]",
       waitingUpload: "Waiting for the image to finish uploading…",
       loadingImage: "Loading image…",
       tapToLoad: "Tap to load image",

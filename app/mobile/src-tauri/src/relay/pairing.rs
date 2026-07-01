@@ -82,6 +82,13 @@ pub(crate) struct PairedRecord {
     pub(crate) noise_public: [u8; 32],
 }
 
+/// Whether a scan-to-pair record is persisted — the `relay` arm of the
+/// active-binding resolver ([`crate::binding`]). Doesn't decode the record, just
+/// checks the keychain slot is populated.
+pub(crate) fn has_pairing() -> Result<bool, String> {
+    Ok(crate::keychain::read_paired_record()?.is_some())
+}
+
 /// Load and decode the persisted pairing record, if the app is paired.
 pub(crate) fn load_paired_record() -> Result<Option<PairedRecord>, String> {
     let Some(bytes) = crate::keychain::read_paired_record()? else {
@@ -385,10 +392,19 @@ async fn finish_pair(
         noise_public: keypair.public(),
     };
     let bytes = serde_json::to_vec(&record).map_err(|e| format!("encode paired record: {e}"))?;
+    // Record which bind happened last BEFORE committing the pairing record, so the
+    // resolver breaks a transient both-present tie toward relay — the binding just
+    // made. Ordered first on purpose: a failed marker write must not leave the record
+    // committed under a stale marker (which would resolve the tie to the superseded
+    // leg). A marker with the record absent is harmless — active_leg only consults it
+    // when both credentials exist.
+    crate::keychain::store_active_binding(crate::binding::RELAY_MARKER)
+        .map_err(|e| format!("persist active binding: {e}"))?;
     crate::keychain::store_paired_record(&bytes)
         .map_err(|e| format!("persist paired record: {e}"))?;
     // One app binds one Baybo: a fresh scan-pairing supersedes any direct-login
-    // credentials so the two binding modes can't both linger. Best-effort.
+    // credentials so the two binding modes can't both linger. Best-effort — the
+    // marker above keeps resolution correct even if this leaves the direct creds.
     let _ = crate::keychain::delete_direct_credentials();
 
     Ok(PairedSummary::from(&paired))

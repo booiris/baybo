@@ -318,7 +318,7 @@ button.danger {
 html.kb-open .chat { padding-bottom: 0.75rem; }
 .chat-header { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
 .chat-header h1 { margin: 0; }
-/* The ⋯ menu trigger is a plain glyph, not a pill button — strip the base
+/* The logout button is a plain line-art icon, not a pill — strip the base
    fill/border/radius/press. */
 .chat-header button {
   flex: 0 0 auto;
@@ -329,12 +329,12 @@ html.kb-open .chat { padding-bottom: 0.75rem; }
   padding: 0.4rem 0.2rem;
 }
 .chat-header button:active { opacity: 0.6; transform: none; }
-.chat-menu-btn { font-size: 1.5rem; line-height: 1; }
+.chat-logout-btn svg { display: block; width: 1.35rem; height: 1.35rem; }
 
-/* Header ⋯ menu — manage the underlying connection (the connected "home" screen
-   is gone, so Replace / Forget / Disconnect live here). The panel sits OUTSIDE
-   `.chat-header` so its buttons keep the base pill/list styling instead of the
-   header's text-link reset. */
+/* Header logout confirm — a small popover gating the destructive log-out (the
+   connected "home" screen is gone, so managing the connection lives here). It sits
+   OUTSIDE `.chat-header` so its buttons keep the base pill/list styling instead of
+   the header's text-link reset. */
 .chat-menu-backdrop { position: fixed; inset: 0; z-index: 10; }
 .chat-menu-panel {
   position: absolute;

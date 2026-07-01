@@ -27,10 +27,6 @@ export function attachmentKind(mime: string): WireAttachment["kind"] {
   return "file";
 }
 
-/** Which chat transport a blob op rides: the relay's E2E blob leg, or the direct
- * (web-identity) `/v1/blobs` HTTP endpoint. */
-export type ChatTransport = "relay" | "direct";
-
 /** Cumulative bytes transferred so far (for a progress bar). */
 export type BlobProgress = (bytesSoFar: number) => void;
 
@@ -73,20 +69,15 @@ export async function uploadBlob(
  * Upload raw image `bytes` the webview read from a user-picked `File` (iOS hands
  * the webview a `File`, not a path), returning the content-addressed `blob_id` to
  * reference in the next message. The bytes ride the IPC bridge as a raw body
- * (efficient — not a JSON number array); the mime travels in a header. No progress
- * channel on this path — picked images upload near-instantly.
+ * (efficient — not a JSON number array); the mime travels in a header. The blob leg
+ * (relay vs direct) is resolved backend-side from the active binding, not tagged
+ * here. No progress channel on this path — picked images upload near-instantly.
  */
-export async function uploadBytes(
-  bytes: ArrayBuffer,
-  mimeType: string,
-  transport: ChatTransport = "relay",
-): Promise<string> {
-  // The raw bytes occupy the JSON arg slot, so the mime and the chat leg both ride
-  // headers (the backend reads `x-baybo-leg` to route relay vs direct).
+export async function uploadBytes(bytes: ArrayBuffer, mimeType: string): Promise<string> {
+  // The raw bytes occupy the JSON arg slot, so the mime rides a header.
   return invoke<string>("blob_upload_bytes", bytes, {
     headers: {
       "x-baybo-mime": mimeType || "application/octet-stream",
-      "x-baybo-leg": transport,
     },
   });
 }
@@ -94,13 +85,10 @@ export async function uploadBytes(
 /**
  * Fetch attachment `blobId` over a blob leg (cached on device by content hash, and
  * digest-verified during download) and return an object URL to use as an `<img>`
- * src. The caller owns the URL and must `URL.revokeObjectURL` it when done.
+ * src. The blob leg is resolved backend-side from the active binding. The caller owns
+ * the URL and must `URL.revokeObjectURL` it when done.
  */
-export async function imageObjectUrl(
-  blobId: string,
-  mimeType: string,
-  transport: ChatTransport = "relay",
-): Promise<string> {
-  const buf = await invoke<ArrayBuffer>("blob_image", { leg: transport, blobId });
+export async function imageObjectUrl(blobId: string, mimeType: string): Promise<string> {
+  const buf = await invoke<ArrayBuffer>("blob_image", { blobId });
   return URL.createObjectURL(new Blob([buf], { type: mimeType || "application/octet-stream" }));
 }
