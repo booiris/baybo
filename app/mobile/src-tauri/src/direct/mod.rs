@@ -17,7 +17,7 @@ mod push;
 mod rest;
 
 pub use blob::{image_data, upload_bytes};
-pub use chat::{DirectSessionRef, DirectSessions, forget, session_create};
+pub use chat::{DirectSessions, forget, session_create};
 pub use push::register as register_push;
 
 use serde::{Deserialize, Serialize};
@@ -101,10 +101,18 @@ pub async fn login(base_url: String, token: String) -> Result<DirectStatus, Stri
         token,
     })
     .map_err(|e| e.to_string())?;
+    // Record which bind happened last BEFORE committing the credential record, so
+    // the resolver breaks a transient both-present tie (a hiccuped supersede below)
+    // toward direct — the binding just made. Ordered first on purpose: a failed
+    // marker write must not leave the record committed under a stale marker (which
+    // would resolve the tie to the superseded leg). A marker with the record absent
+    // is harmless — active_leg only consults it when both credentials exist.
+    keychain::store_active_binding(crate::binding::DIRECT_MARKER)?;
     keychain::store_direct_credentials(&bytes)?;
     // One app binds one Baybo: a fresh direct login supersedes any relay pairing
     // so a later disconnect can't resurrect a stale binding. Best-effort —
-    // don't fail the successful login if the (idempotent) cleanup hiccups.
+    // don't fail the successful login if the (idempotent) cleanup hiccups; the
+    // marker above keeps resolution correct even if this leaves the relay record.
     let _ = crate::relay::forget_pairing();
 
     Ok(DirectStatus { base_url: base })
@@ -122,22 +130,11 @@ pub fn logout() -> Result<(), String> {
     keychain::delete_direct_credentials()
 }
 
-/// Refetch a transcript slice (admin Bearer `GET /v1/chat/sessions/{id}`) — used
-/// by the webview after a WS `Reset` to rebuild the thread.
-pub async fn history(
-    session_id: String,
-    before_ordinal: Option<i64>,
-    limit: Option<u32>,
-) -> Result<serde_json::Value, String> {
-    let creds = credentials()?.ok_or("not connected; sign in first")?;
-    rest::history(
-        &creds.base_url,
-        &creds.token,
-        &session_id,
-        before_ordinal,
-        limit,
-    )
-    .await
+/// Whether a direct login is persisted — the `direct` arm of the active-binding
+/// resolver ([`crate::binding`]). Cheaper than [`credentials`]: it never decodes
+/// the record, just checks the keychain slot is populated.
+pub(crate) fn has_credentials() -> Result<bool, String> {
+    Ok(keychain::read_direct_credentials()?.is_some())
 }
 
 /// Read the stored direct credentials (base URL + admin token). `Ok(None)` = not

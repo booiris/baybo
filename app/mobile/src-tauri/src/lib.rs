@@ -6,6 +6,7 @@
 //! The protocol/crypto live in the shared crates, so interop with the gateway is
 //! guaranteed by construction.
 
+mod binding;
 mod direct;
 mod keyboard;
 mod keychain;
@@ -14,44 +15,16 @@ mod relay;
 mod transport;
 
 use baybo_mobile_core::{Frame, WireAttachment};
+use binding::{ActiveLeg, active_leg};
 use relay::RelaySessions;
 use relay::{PairAborted, PairChallenge, PairedSummary, PairingSessions};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, State};
 
-/// Which chat leg an IPC command routes to: the relay (Noise E2E) leg or the
-/// direct (raw-MessagePack `/v1/channel-ws`) leg. Threaded from the webview as a
-/// typed value so the chat/blob commands dispatch with a Rust `match` instead of
-/// the caller picking a per-leg command name by string. The wire values
-/// (`"relay"` / `"direct"`) match the webview's `ChatTransport` type.
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum ChatLeg {
-    Relay,
-    Direct,
-}
-
 /// Header the raw-body blob upload reads its mime from — the JSON arg slot carries
-/// the bytes, so mime + leg ride headers instead.
+/// the bytes, so the mime rides a header instead. The leg is no longer threaded from
+/// the webview: it's resolved from the active binding (see [`binding`]).
 const BLOB_MIME_HEADER: &str = "x-baybo-mime";
-/// Header the raw-body blob upload reads its [`ChatLeg`] from (see [`BLOB_MIME_HEADER`]).
-const BLOB_LEG_HEADER: &str = "x-baybo-leg";
-
-impl ChatLeg {
-    /// Resolve the leg from a raw-body upload's `x-baybo-leg` header — relay when
-    /// absent or unrecognized (the safe default; matches the webview's default).
-    /// The value mirrors the `#[serde(rename_all = "lowercase")]` wire form.
-    fn from_request(request: &tauri::ipc::Request<'_>) -> Self {
-        match request
-            .headers()
-            .get(BLOB_LEG_HEADER)
-            .and_then(|v| v.to_str().ok())
-        {
-            Some("direct") => ChatLeg::Direct,
-            _ => ChatLeg::Relay,
-        }
-    }
-}
 
 /// Scan-to-connect: dial the gateway, run the XXpsk0 handshake through
 /// `DeviceHello`, and return the confirmation code the UI shows the user to
@@ -112,35 +85,6 @@ fn direct_status() -> Result<Option<direct::DirectStatus>, String> {
     direct::status()
 }
 
-/// Forget the direct-connection credentials (direct "disconnect"): tear down any
-/// live chat WS AND drop the in-memory session/channel token, then wipe the stored
-/// credentials. (`forget`, not `disconnect`, so the broad channel token doesn't
-/// linger in memory and a later reconnect can't resurrect the session.)
-#[tauri::command]
-async fn direct_logout(sessions: State<'_, direct::DirectSessions>) -> Result<(), String> {
-    direct::forget(&sessions).await;
-    direct::logout()
-}
-
-/// Mint a fresh direct chat session over REST (admin Bearer) and return its
-/// gateway-assigned id; the channel token is stashed for the WS + blob legs.
-#[tauri::command]
-async fn direct_session_create(
-    sessions: State<'_, direct::DirectSessions>,
-) -> Result<direct::DirectSessionRef, String> {
-    direct::session_create(&sessions).await
-}
-
-/// REST refetch of a transcript slice after a `Frame::Reset` (admin Bearer).
-#[tauri::command]
-async fn direct_history(
-    session_id: String,
-    before_ordinal: Option<i64>,
-    limit: Option<u32>,
-) -> Result<serde_json::Value, String> {
-    direct::history(session_id, before_ordinal, limit).await
-}
-
 /// Best-effort direct-mode push registration: provision (or refresh) this app's
 /// push binding with the directly-connected gateway so a backgrounded direct chat
 /// can still buzz. No-op when iOS hasn't issued an APNs token yet or the gateway
@@ -157,50 +101,76 @@ async fn direct_push_register() -> Result<Option<String>, String> {
     direct::register_push(token, env).await
 }
 
-/// Forget the current pairing (unpair): clear the keychain record + push key so
-/// the app returns to the scan screen. One app binds one gateway.
+/// Mint a fresh chat session for the active binding and return its id. Direct mints
+/// a gateway session over REST (the id is server-assigned + a channel token is stashed
+/// for the WS/blob legs); relay picks a fresh client id (the relay leg needs no
+/// gateway pre-registration). The webview no longer branches on the binding — it just
+/// asks for an id.
 #[tauri::command]
-fn forget_pairing() -> Result<(), String> {
-    relay::forget_pairing()
+async fn chat_create_session(direct: State<'_, direct::DirectSessions>) -> Result<String, String> {
+    match active_leg()? {
+        ActiveLeg::Direct => Ok(direct::session_create(&direct).await?.session_id),
+        ActiveLeg::Relay => Ok(uuid::Uuid::new_v4().to_string()),
+    }
 }
 
-/// Open the chat session for `sessionId` on `leg` and stream frames to `onFrame`.
-/// Relay runs the Noise E2E content leg (connect to the paired gateway, run the
-/// handshake, subscribe, decrypt); direct runs the raw-MessagePack
-/// `/v1/channel-ws` web-identity leg. `sinceOrdinal` is the highest ordinal the
-/// webview has already rendered — the gateway replays only the gap above it (so a
-/// reconnect after a background/reload catches up without re-sending the whole
-/// thread); `null` is a fresh subscribe with no catch-up. Both legs share one pump
-/// (see `transport.rs`); only the establish/codec seam differs, so this command
-/// just routes to the leg's session registry.
+/// Log out (the unified "disconnect"): tear down the live leg and wipe the app's
+/// durable credentials, returning it to unbound. Wipes BOTH legs unconditionally —
+/// "one app binds one Baybo", but a hiccuped best-effort supersede can transiently
+/// leave both credential sets, so routing by the active leg (and dropping only it)
+/// could leave the app silently bound to the superseded gateway. Deleting an absent
+/// credential is a no-op, so the unconditional both-wipe is safe (mirrors how
+/// `chat_disconnect` tears down both registries). Idempotent — an already-unbound app
+/// is fine.
+#[tauri::command]
+async fn logout(
+    relay: State<'_, RelaySessions>,
+    direct: State<'_, direct::DirectSessions>,
+) -> Result<(), String> {
+    direct::forget(&direct).await;
+    transport::disconnect(&*relay).await;
+    // Run both wipes regardless of which errored, then surface the first failure.
+    let direct_wiped = direct::logout();
+    let relay_wiped = relay::forget_pairing();
+    direct_wiped.and(relay_wiped)
+}
+
+/// Open the chat session for `sessionId` on the active binding's leg and stream
+/// frames to `onFrame`. Relay runs the Noise E2E content leg (connect to the paired
+/// gateway, run the handshake, subscribe, decrypt); direct runs the raw-MessagePack
+/// `/v1/channel-ws` web-identity leg. Which one is resolved from durable identity
+/// (see [`binding::active_leg`]) — the webview no longer tags the call. `sinceOrdinal`
+/// is the highest ordinal the webview has already rendered — the gateway replays only
+/// the gap above it (so a reconnect after a background/reload catches up without
+/// re-sending the whole thread); `null` is a fresh subscribe with no catch-up. Both
+/// legs share one pump (see `transport.rs`); only the establish/codec seam differs, so
+/// this command just routes to the leg's session registry.
 #[tauri::command]
 async fn chat_connect(
     app: AppHandle,
-    leg: ChatLeg,
     relay: State<'_, RelaySessions>,
     direct: State<'_, direct::DirectSessions>,
     session_id: String,
     since_ordinal: Option<i64>,
     on_frame: Channel<Frame>,
 ) -> Result<(), String> {
-    match leg {
-        ChatLeg::Relay => {
+    match active_leg()? {
+        ActiveLeg::Relay => {
             transport::connect(&*relay, app, session_id, since_ordinal, on_frame).await
         }
-        ChatLeg::Direct => {
+        ActiveLeg::Direct => {
             transport::connect(&*direct, app, session_id, since_ordinal, on_frame).await
         }
     }
 }
 
-/// Send a user message on the live chat session for `leg`. `msgId` is a fresh
-/// per-send idempotency key so a retry doesn't double-fire the agent.
-/// `attachments` are content-addressed blobs already uploaded over a blob leg
+/// Send a user message on the live chat session for the active binding's leg.
+/// `msgId` is a fresh per-send idempotency key so a retry doesn't double-fire the
+/// agent. `attachments` are content-addressed blobs already uploaded over a blob leg
 /// (omitted/empty for a text-only send). Relay sends as device/ios, direct as
 /// web-operator/http.
 #[tauri::command]
 async fn chat_send(
-    leg: ChatLeg,
     relay: State<'_, RelaySessions>,
     direct: State<'_, direct::DirectSessions>,
     text: String,
@@ -208,47 +178,47 @@ async fn chat_send(
     attachments: Option<Vec<WireAttachment>>,
 ) -> Result<(), String> {
     let attachments = attachments.unwrap_or_default();
-    match leg {
-        ChatLeg::Relay => transport::send(&*relay, text, msg_id, attachments).await,
-        ChatLeg::Direct => transport::send(&*direct, text, msg_id, attachments).await,
+    match active_leg()? {
+        ActiveLeg::Relay => transport::send(&*relay, text, msg_id, attachments).await,
+        ActiveLeg::Direct => transport::send(&*direct, text, msg_id, attachments).await,
     }
 }
 
-/// Request a backward page of the live chat session's transcript over `leg` — the
-/// relay leg's recovery/pagination primitive (no admin REST, unlike `direct_history`).
-/// `beforeOrdinal` pages older (`null` = newest page); `limit` caps the page. The
-/// reply is **not** this command's return value: the gateway answers with a
-/// `Frame::HistoryPage` that streams back through the session's `onFrame` channel
-/// (mirroring how `Subscribe` catch-up replays arrive), so the webview consumes it
-/// in its frame switch. Returns once the request is enqueued on the live leg.
+/// Request a backward page of the live chat session's transcript over the active
+/// binding's leg — the live-leg recovery/pagination primitive (no admin REST, unlike
+/// `direct_history`). `beforeOrdinal` pages older (`null` = newest page); `limit` caps
+/// the page. The reply is **not** this command's return value: the gateway answers
+/// with a `Frame::HistoryPage` that streams back through the session's `onFrame`
+/// channel (mirroring how `Subscribe` catch-up replays arrive), so the webview
+/// consumes it in its frame switch. Returns once the request is enqueued on the live
+/// leg.
 #[tauri::command]
 async fn chat_fetch_history(
-    leg: ChatLeg,
     relay: State<'_, RelaySessions>,
     direct: State<'_, direct::DirectSessions>,
     before_ordinal: Option<i64>,
     limit: Option<u32>,
 ) -> Result<(), String> {
-    match leg {
-        ChatLeg::Relay => transport::fetch_history(&*relay, before_ordinal, limit).await,
-        ChatLeg::Direct => transport::fetch_history(&*direct, before_ordinal, limit).await,
+    match active_leg()? {
+        ActiveLeg::Relay => transport::fetch_history(&*relay, before_ordinal, limit).await,
+        ActiveLeg::Direct => transport::fetch_history(&*direct, before_ordinal, limit).await,
     }
 }
 
-/// Tear down the live chat session for `leg` (the user left the chat view). Any
-/// leg-specific durable state survives: the direct leg keeps its session id +
-/// channel token for reconnect; the relay leg reloads its pairing record on the
-/// next connect.
+/// Tear down the live chat session (the user left the chat view). Any leg-specific
+/// durable state survives: the direct leg keeps its session id + channel token for
+/// reconnect; the relay leg reloads its pairing record on the next connect. At most
+/// one leg is ever live (one binding), but the binding may already be gone — a
+/// disconnect/unpair deletes the credentials *before* this fires — so we can't resolve
+/// which leg to stop. Tear both down unconditionally; a disconnect on an idle registry
+/// is a no-op, so no pump ever lingers regardless of binding state.
 #[tauri::command]
 async fn chat_disconnect(
-    leg: ChatLeg,
     relay: State<'_, RelaySessions>,
     direct: State<'_, direct::DirectSessions>,
 ) -> Result<(), String> {
-    match leg {
-        ChatLeg::Relay => transport::disconnect(&*relay).await,
-        ChatLeg::Direct => transport::disconnect(&*direct).await,
-    }
+    transport::disconnect(&*relay).await;
+    transport::disconnect(&*direct).await;
     Ok(())
 }
 
@@ -274,19 +244,18 @@ async fn blob_upload(
     relay::upload(src_path, mime_type, on_progress).await
 }
 
-/// Upload a webview-picked image over `leg`'s blob transport. The raw bytes ride
-/// the IPC bridge as the request body (efficient — not a JSON number array); the
-/// mime rides `x-baybo-mime` and the leg rides `x-baybo-leg` (the JSON arg slot is
-/// taken by the raw body). iOS gives the webview a `File` (bytes), not a path, so
-/// this is the entry point an image pick uses. Relay seals + chunks over a
-/// dedicated E2E blob leg; direct POSTs to plain `/v1/blobs` (channel token).
-/// Returns the content-addressed `blob_id`.
+/// Upload a webview-picked image over the active binding's blob transport. The raw
+/// bytes ride the IPC bridge as the request body (efficient — not a JSON number
+/// array); the mime rides `x-baybo-mime` (the JSON arg slot is taken by the raw body).
+/// The leg is resolved from the active binding (see [`binding`]), not tagged by the
+/// caller. iOS gives the webview a `File` (bytes), not a path, so this is the entry
+/// point an image pick uses. Relay seals + chunks over a dedicated E2E blob leg; direct
+/// POSTs to plain `/v1/blobs` (channel token). Returns the content-addressed `blob_id`.
 #[tauri::command]
 async fn blob_upload_bytes(
     direct: State<'_, direct::DirectSessions>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<String, String> {
-    let leg = ChatLeg::from_request(&request);
     let bytes = match request.body() {
         tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
         tauri::ipc::InvokeBody::Json(_) => {
@@ -299,26 +268,25 @@ async fn blob_upload_bytes(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_owned();
-    match leg {
-        ChatLeg::Relay => relay::upload_bytes(bytes, mime_type).await,
-        ChatLeg::Direct => direct::upload_bytes(&direct, bytes, mime_type).await,
+    match active_leg()? {
+        ActiveLeg::Relay => relay::upload_bytes(bytes, mime_type).await,
+        ActiveLeg::Direct => direct::upload_bytes(&direct, bytes, mime_type).await,
     }
 }
 
-/// Fetch an attachment `blobId` for display over `leg`'s blob transport, returning
-/// the verified bytes to the webview as a raw `ArrayBuffer` to wrap in an object
-/// URL. Relay downloads over a dedicated E2E blob leg into a content-addressed
-/// on-device cache (reused on the next render); direct GETs plain
-/// `/v1/blobs/{id}` (channel token).
+/// Fetch an attachment `blobId` for display over the active binding's blob transport,
+/// returning the verified bytes to the webview as a raw `ArrayBuffer` to wrap in an
+/// object URL. Relay downloads over a dedicated E2E blob leg into a content-addressed
+/// on-device cache (reused on the next render); direct GETs plain `/v1/blobs/{id}`
+/// (channel token). The leg is resolved from the active binding (see [`binding`]).
 #[tauri::command]
 async fn blob_image(
-    leg: ChatLeg,
     direct: State<'_, direct::DirectSessions>,
     blob_id: String,
 ) -> Result<tauri::ipc::Response, String> {
-    let bytes = match leg {
-        ChatLeg::Relay => relay::image_data(blob_id).await,
-        ChatLeg::Direct => direct::image_data(&direct, blob_id).await,
+    let bytes = match active_leg()? {
+        ActiveLeg::Relay => relay::image_data(blob_id).await,
+        ActiveLeg::Direct => direct::image_data(&direct, blob_id).await,
     }?;
     Ok(tauri::ipc::Response::new(bytes))
 }
@@ -400,13 +368,11 @@ pub fn run() {
             pair_begin,
             pair_confirm,
             paired_device,
-            forget_pairing,
             direct_login,
             direct_status,
-            direct_logout,
-            direct_session_create,
-            direct_history,
             direct_push_register,
+            logout,
+            chat_create_session,
             chat_connect,
             chat_send,
             chat_fetch_history,
