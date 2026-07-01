@@ -184,8 +184,12 @@ async fn chat_connect(
     on_frame: Channel<Frame>,
 ) -> Result<(), String> {
     match leg {
-        ChatLeg::Relay => relay::connect(app, &relay, session_id, since_ordinal, on_frame).await,
-        ChatLeg::Direct => direct::connect(app, &direct, session_id, since_ordinal, on_frame).await,
+        ChatLeg::Relay => {
+            transport::connect(&*relay, app, session_id, since_ordinal, on_frame).await
+        }
+        ChatLeg::Direct => {
+            transport::connect(&*direct, app, session_id, since_ordinal, on_frame).await
+        }
     }
 }
 
@@ -205,8 +209,8 @@ async fn chat_send(
 ) -> Result<(), String> {
     let attachments = attachments.unwrap_or_default();
     match leg {
-        ChatLeg::Relay => relay::send(&relay, text, msg_id, attachments).await,
-        ChatLeg::Direct => direct::send(&direct, text, msg_id, attachments).await,
+        ChatLeg::Relay => transport::send(&*relay, text, msg_id, attachments).await,
+        ChatLeg::Direct => transport::send(&*direct, text, msg_id, attachments).await,
     }
 }
 
@@ -226,8 +230,8 @@ async fn chat_fetch_history(
     limit: Option<u32>,
 ) -> Result<(), String> {
     match leg {
-        ChatLeg::Relay => relay::fetch_history(&relay, before_ordinal, limit).await,
-        ChatLeg::Direct => direct::fetch_history(&direct, before_ordinal, limit).await,
+        ChatLeg::Relay => transport::fetch_history(&*relay, before_ordinal, limit).await,
+        ChatLeg::Direct => transport::fetch_history(&*direct, before_ordinal, limit).await,
     }
 }
 
@@ -242,8 +246,8 @@ async fn chat_disconnect(
     direct: State<'_, direct::DirectSessions>,
 ) -> Result<(), String> {
     match leg {
-        ChatLeg::Relay => relay::disconnect(&relay).await,
-        ChatLeg::Direct => direct::disconnect(&direct).await,
+        ChatLeg::Relay => transport::disconnect(&*relay).await,
+        ChatLeg::Direct => transport::disconnect(&*direct).await,
     }
     Ok(())
 }
