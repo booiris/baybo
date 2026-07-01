@@ -60,6 +60,7 @@ async fn admin_router() -> axum::Router {
         channel_bot_store: tg.deps.stores.channel_bot.clone(),
         channel_control: std::sync::Arc::clone(&tg.deps.channel_control),
         secret_vault: std::sync::Arc::clone(&tg.deps.secret_vault),
+        device_store: tg.deps.stores.device.clone(),
         channel_tokens: tg.deps.channel_tokens.clone(),
         web_chat_tokens: std::sync::Arc::new(dashmap::DashMap::new()),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
