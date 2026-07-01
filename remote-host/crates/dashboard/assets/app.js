@@ -498,7 +498,7 @@ function keysView(rows) {
     el("thead", {}, el("tr", {}, ...cols.map((h) => el("th", { text: h })))),
     el("tbody", {}, ...body),
   );
-  return el("div", {}, head, el("div", { class: "card table-card" }, table));
+  return el("div", {}, head, el("div", { class: "card table-card" }, el("div", { class: "table-scroll" }, table)));
 }
 
 function limitsCell(r) {
@@ -1166,12 +1166,13 @@ function deviceRow(d) {
 
 function ipTable(headers, rows, render) {
   const body = rows.length ? rows.map(render) : [emptyRow(headers.length, "No traffic in range.")];
-  return el(
+  const table = el(
     "table",
     { class: "table" },
     el("thead", {}, el("tr", {}, ...headers.map((h, i) => el("th", { class: i ? "num" : null, text: h })))),
     el("tbody", {}, ...body),
   );
+  return el("div", { class: "table-scroll" }, table);
 }
 
 function devicesView(devices) {
@@ -1192,7 +1193,7 @@ function devicesView(devices) {
     "div",
     {},
     el("div", { class: "section-title", text: "Devices" }),
-    el("div", { class: "card table-card" }, devTable),
+    el("div", { class: "card table-card" }, el("div", { class: "table-scroll" }, devTable)),
   );
 }
 
