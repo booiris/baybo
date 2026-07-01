@@ -21,7 +21,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use baybo_mobile_core::{Frame, MobileError, WireAttachment};
+use baybo_mobile_core::{Frame, MobileError, WireAttachment, fetch_history_frame};
 use futures_util::{SinkExt, StreamExt};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter};
@@ -300,6 +300,73 @@ impl SessionRegistry {
             prev.task.abort();
         }
     }
+}
+
+/// A chat leg's Tauri-managed state, seen as "the thing that owns a
+/// [`SessionRegistry`]". Exposing the registry through one trait lets the generic
+/// session commands below ([`connect`]/[`send`]/[`fetch_history`]/[`disconnect`])
+/// drive either leg, so neither `RelaySessions` nor `DirectSessions` re-declares the
+/// same four delegating wrappers. Each leg is already a [`ChatTransport`], so the
+/// bound carries the `establish` seam the registry needs to open a session.
+pub(crate) trait SessionLeg: ChatTransport {
+    fn registry(&self) -> &SessionRegistry;
+}
+
+/// The `FetchHistory` frame builder both legs use. It binds only the session id
+/// (identity-agnostic — unlike the user-message builder, which encodes the leg's
+/// device/web identity), so relay and direct share this verbatim.
+pub(crate) fn session_history_frame(session_id: String) -> HistoryFrameFn {
+    Box::new(move |before_ordinal, limit| fetch_history_frame(&session_id, before_ordinal, limit))
+}
+
+/// Open `leg`'s chat session for `session_id`, streaming frames to `on_frame`.
+/// Stringifies the error for the Tauri command boundary (the leg-specific establish
+/// prose, including the `invalid_token` code, rides through verbatim).
+pub(crate) async fn connect<L: SessionLeg>(
+    leg: &L,
+    app: AppHandle,
+    session_id: String,
+    since_ordinal: Option<i64>,
+    on_frame: Channel<Frame>,
+) -> Result<(), String> {
+    leg.registry()
+        .connect(leg, app, &session_id, since_ordinal, on_frame)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Queue a user message on `leg`'s live session.
+pub(crate) async fn send<L: SessionLeg>(
+    leg: &L,
+    text: String,
+    msg_id: String,
+    attachments: Vec<WireAttachment>,
+) -> Result<(), String> {
+    leg.registry()
+        .send(text, msg_id, attachments)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Queue a backward transcript-history request on `leg`'s live session. The
+/// `Frame::HistoryPage` reply streams back through `on_frame`, so this returns once
+/// the request is enqueued, not the page.
+pub(crate) async fn fetch_history<L: SessionLeg>(
+    leg: &L,
+    before_ordinal: Option<i64>,
+    limit: Option<u32>,
+) -> Result<(), String> {
+    leg.registry()
+        .fetch_history(before_ordinal, limit)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Tear down `leg`'s live pump (if any). Any leg-specific durable state (e.g. the
+/// direct leg's stashed channel token) is owned by the leg, not the registry, so it
+/// survives.
+pub(crate) async fn disconnect<L: SessionLeg>(leg: &L) {
+    leg.registry().disconnect().await;
 }
 
 /// Own the socket for the session's lifetime: send the opening frames, then fan

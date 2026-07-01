@@ -16,23 +16,16 @@ use baybo_mobile_core::blob::{
     self, BlobDownload, BlobResponse, BlobSession, DownloadStep, MAX_BLOB_CHUNK,
 };
 use device_proto::noise::StaticKeypair;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use sha2::{Digest, Sha256};
 use tauri::ipc::Channel;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::{Error as WsError, Message, http::StatusCode};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::tungstenite::Message;
 
+use super::dial::dial_content_join;
 use super::pairing::{PairedRecord, load_paired_record};
+use crate::transport::WsStream;
 
-type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-/// Mirrors `content`'s dial retry budget: a `503 gateway not connected` is the
-/// gateway being briefly absent from the relay (it re-dials on a fixed backoff),
-/// so retry that for a bounded window; every other failure surfaces at once.
-const DIAL_RETRIES: usize = 14;
-const DIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 const BLOB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One transfer per leg, so a fixed request id is enough.
@@ -87,62 +80,16 @@ impl ProgressThrottle {
     }
 }
 
-/// Dial a dedicated blob leg (content-join carrying the blob class header) and run
-/// the Noise IK handshake, returning the socket + blob session.
+/// Dial a dedicated blob leg (content-join carrying the blob class header, so the
+/// relay meters it as background bandwidth and the gateway runs the blob
+/// sub-protocol) and run the Noise IK handshake, returning the socket + blob
+/// session.
 async fn dial_blob_leg(
     record: &PairedRecord,
     local: &StaticKeypair,
-) -> Result<(Ws, BlobSession), String> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-
-    if record.relay_url.is_empty() {
-        return Err("no relay url for this pairing".into());
-    }
-    if record.relay_node_id.is_empty() {
-        return Err("paired gateway has no relay route; re-pair".into());
-    }
-    let base = record.relay_url.trim_end_matches('/');
-    let url = remote_host_protocol::relay::content_join_url(base, &record.relay_node_id);
-
-    let mut attempt = 0usize;
-    let mut ws = loop {
-        let mut req = url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| format!("bad relay url {base}: {e}"))?;
-        if !record.remote_api_key.is_empty() {
-            let v = record
-                .remote_api_key
-                .parse()
-                .map_err(|e| format!("bad instance key header: {e}"))?;
-            req.headers_mut()
-                .insert(remote_host_protocol::relay::REMOTE_API_KEY_HEADER, v);
-        }
-        // Declare the leg's class so the relay meters it as background bandwidth
-        // (yields the chat headroom) and the gateway runs the blob sub-protocol.
-        let class = remote_host_protocol::relay::LegClass::Blob
-            .as_str()
-            .parse()
-            .map_err(|e| format!("bad class header: {e}"))?;
-        req.headers_mut()
-            .insert(remote_host_protocol::relay::RELAY_LEG_CLASS_HEADER, class);
-        match connect_async(req).await {
-            Ok((ws, _)) => break ws,
-            Err(WsError::Http(resp))
-                if resp.status() == StatusCode::SERVICE_UNAVAILABLE && attempt < DIAL_RETRIES =>
-            {
-                attempt += 1;
-                tokio::time::sleep(DIAL_RETRY_DELAY).await;
-            }
-            Err(WsError::Http(resp)) if resp.status() == StatusCode::SERVICE_UNAVAILABLE => {
-                return Err(format!(
-                    "gateway offline: {base} has no relay control connection"
-                ));
-            }
-            Err(e) => return Err(format!("relay connect {base}: {e}")),
-        }
-    };
-
+) -> Result<(WsStream, BlobSession), String> {
+    let mut ws =
+        dial_content_join(record, Some(remote_host_protocol::relay::LegClass::Blob)).await?;
     let (handshake, msg1) = ContentHandshake::start(local, &record.gateway_static_pubkey)
         .map_err(|e| format!("start handshake: {e}"))?;
     ws.send(Message::Binary(msg1))
@@ -155,23 +102,18 @@ async fn dial_blob_leg(
     Ok((ws, session))
 }
 
-async fn recv_binary_with_timeout(ws: &mut Ws, timeout: Duration) -> Result<Vec<u8>, String> {
+async fn recv_binary_with_timeout(ws: &mut WsStream, timeout: Duration) -> Result<Vec<u8>, String> {
     tokio::time::timeout(timeout, recv_binary(ws))
         .await
         .map_err(|_| "handshake timed out".to_string())?
 }
 
-/// Read the next binary WS message (skipping ping/pong).
-async fn recv_binary(ws: &mut Ws) -> Result<Vec<u8>, String> {
-    loop {
-        match ws.next().await {
-            Some(Ok(Message::Binary(b))) => return Ok(b),
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-            Some(Ok(Message::Close(_))) | None => return Err("connection closed".into()),
-            Some(Ok(_)) => continue,
-            Some(Err(e)) => return Err(format!("ws: {e}")),
-        }
-    }
+/// Read the next binary WS message (skipping ping/pong), adapting the shared
+/// [`crate::transport::recv_binary`] to this file's `String` error surface.
+async fn recv_binary(ws: &mut WsStream) -> Result<Vec<u8>, String> {
+    crate::transport::recv_binary(ws)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Download `blob_id` to `dest_path`. Bytes stream to a sibling `<dest_path>.part`
