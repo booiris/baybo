@@ -651,12 +651,6 @@ Relevant code:
    record holding the remote-host endpoint (the built-in default).
 5. The dispatcher enumerates these web bindings alongside approved device rows and
    `/register` + `/notify`s them through that remote host **unchanged**.
-6. **Supersede.** After storing the new binding, `/register` removes every *other*
-   `web_push.<id>` record (+ its `device.<id>.*` material) and revokes any *other*
-   approved device row, so a switched-to phone silences the previous one — the
-   direct-path equivalent of the relay pairing's in-tx revoke. The "one active
-   device" invariant this upholds (and how a future one-to-many would relax it)
-   lives in [`companion.md`](companion.md) under **1:1 binding**.
 
 So the binding is cryptographically **identical** to a paired device's: C, the
 delegation chain, the AEAD preview, and the iOS NSE are all untouched. Push is

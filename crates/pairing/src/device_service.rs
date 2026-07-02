@@ -213,15 +213,8 @@ impl DevicePairingService {
     }
 
     /// Promote a staged device row to `Approved` and supersede any prior approved
-    /// binding in one transaction. Returns the promoted row plus the `device_id`s
-    /// of any *other* approved bindings this superseded (empty on a first pairing
-    /// or a same-device re-pair) so the caller can reclaim their push material —
-    /// the row revoke alone drops them from the push fan-out's device leg, but a
-    /// lingering direct-mode web binding would keep them in the web leg.
-    pub async fn approve_staged(
-        &self,
-        device_id: &str,
-    ) -> Result<(DeviceRow, Vec<String>), DevicePairingError> {
+    /// binding in one transaction.
+    pub async fn approve_staged(&self, device_id: &str) -> Result<DeviceRow, DevicePairingError> {
         let approved_at = Utc::now().timestamp();
         let replaced = self
             .devices
@@ -234,12 +227,9 @@ impl DevicePairingService {
                 "device pairing superseded the prior binding (one gateway = one app)",
             );
         }
-        let row = self.devices.get(device_id).await?.ok_or_else(|| {
-            DevicePairingError::from(baybo_store::StorageError::NotFound(format!(
-                "device {device_id}"
-            )))
-        })?;
-        Ok((row, replaced))
+        self.devices.get(device_id).await?.ok_or_else(|| {
+            baybo_store::StorageError::NotFound(format!("device {device_id}")).into()
+        })
     }
 
     /// Compatibility helper for tests and non-transport callers: stage and
@@ -255,8 +245,7 @@ impl DevicePairingService {
         let row = self
             .stage(slot, device_id, device_pubkey, relay_url, remote_api_key)
             .await?;
-        let (row, _replaced) = self.approve_staged(&row.device_id).await?;
-        Ok(row)
+        self.approve_staged(&row.device_id).await
     }
 
     /// Revoke a device (keeps the row + token slot; the token stops
@@ -463,41 +452,6 @@ mod tests {
         // The superseded device is retained as revoked (audit), not deleted.
         let all = svc.list(None).await.unwrap();
         assert_eq!(all.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn approve_staged_reports_superseded_ids() {
-        let svc = service();
-        // First device: its approval supersedes nothing.
-        let (r1, _) = svc.mint().await.unwrap();
-        let slot1 = svc.claim_slot(&r1).await.unwrap().unwrap();
-        svc.stage(
-            &slot1,
-            "dev-a",
-            vec![1u8; 32],
-            "wss://relay.test",
-            "inst-test",
-        )
-        .await
-        .unwrap();
-        let (_row, replaced) = svc.approve_staged("dev-a").await.unwrap();
-        assert!(replaced.is_empty(), "first approval supersedes nothing");
-
-        // Second device: approving it reports dev-a as superseded so the gateway
-        // caller can reclaim dev-a's direct-mode push binding.
-        let (r2, _) = svc.mint().await.unwrap();
-        let slot2 = svc.claim_slot(&r2).await.unwrap().unwrap();
-        svc.stage(
-            &slot2,
-            "dev-b",
-            vec![2u8; 32],
-            "wss://relay.test",
-            "inst-test",
-        )
-        .await
-        .unwrap();
-        let (_row, replaced) = svc.approve_staged("dev-b").await.unwrap();
-        assert_eq!(replaced, vec!["dev-a".to_string()]);
     }
 
     #[tokio::test]

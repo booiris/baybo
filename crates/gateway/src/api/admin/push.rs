@@ -18,7 +18,6 @@
 
 use axum::Json;
 use axum::extract::State;
-use baybo_store::DeviceStatus;
 use device_proto::aead;
 use device_proto::delegation;
 use device_proto::pairing::ApnsEnv;
@@ -175,47 +174,6 @@ async fn register_push(
     )
     .await
     .map_err(|e| GatewayError::Internal(format!("store push binding: {e}")))?;
-
-    // Enforce "one active device" on the direct path too. The relay pairing
-    // registry supersedes the prior approved binding transactionally, but a
-    // direct re-register — the phone a user just switched TO — must likewise stop
-    // previews to every OTHER target, else the previous device keeps buzzing.
-    // Store first (above) so a mid-supersede failure never leaves zero bindings.
-    let removed_bindings = web::supersede_other_bindings(&state.secret_vault, &device_id).await;
-    let mut revoked_rows: Vec<String> = Vec::new();
-    if let Ok(rows) = state.device_store.list(Some(DeviceStatus::Approved)).await {
-        for row in rows {
-            if row.device_id == device_id {
-                continue;
-            }
-            if let Err(e) = state.device_store.revoke(&row.device_id).await {
-                tracing::warn!(
-                    device = %row.device_id,
-                    error = %e,
-                    "push: failed to revoke superseded device row during direct registration"
-                );
-                continue;
-            }
-            // The revoked row leaves the push fan-out's Leg 1; drop any matching
-            // web binding + material so it also leaves Leg 2.
-            if let Err(e) = web::remove_binding(&state.secret_vault, &row.device_id).await {
-                tracing::warn!(
-                    device = %row.device_id,
-                    error = %e,
-                    "push: failed to remove revoked device's web binding during supersede"
-                );
-            }
-            revoked_rows.push(row.device_id);
-        }
-    }
-    if !removed_bindings.is_empty() || !revoked_rows.is_empty() {
-        tracing::info!(
-            new_device = %device_id,
-            web_bindings = ?removed_bindings,
-            device_rows = ?revoked_rows,
-            "push: direct registration superseded prior devices (one gateway = one app)",
-        );
-    }
 
     tracing::info!(device = %device_id, "push: registered a direct-mode binding");
     Ok(Json(RegisterPushResponse { device_id }))

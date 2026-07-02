@@ -72,41 +72,6 @@ shared blind relay and is **not** bound 1:1.
   Noise static identity lives under its own account (`baybo.device-identity`) and
   is **stable** across re-pairings, so the derived `device_id` (`ios-<pubkey[..8]>`)
   is stable; *Forget* deliberately keeps it.
-- **Direct path (no pairing):** a URL+admin-token login has no device row; its push
-  binding is a `web_push.<id>` record instead (see
-  [`relay-push-security.md`](relay-push-security.md)). `POST /v1/push/register`
-  enforces the same 1:1 on that side — `web::supersede_other_bindings` drops every
-  other web binding and it revokes every other approved device row
-  (`crates/gateway/src/api/admin/push.rs`). Relay re-pairing
-  (`channel/device_pair.rs`) and `baybo device revoke` reclaim a
-  superseded/revoked device's web binding + material via
-  `crate::push::reclaim_push_binding`, so a removed device leaves **both** legs of
-  the push fan-out, not just the device-row leg.
-
-**Toward one-to-many (future).** The 1:1 rule is enforced only at these
-**write/supersede sites**, never at the read side: `PushDispatcher` already fans a
-preview to **every** approved row **and every** web binding, deduped by
-`device_id`, with per-device `push_key` / `collapse_id` / replay `counter`
-(`crates/gateway/src/push/mod.rs`). So letting several of a user's devices receive
-push at once needs **no** dispatcher change — only relaxing the write sites:
-
-- **Relay:** the `idx_devices_one_approved` partial-unique index
-  (`crates/storage/src/libsql/mod.rs`) **and** the `create_replacing_approved` /
-  `approve_replacing` revoke-others SQL both have to change; `current_device()`
-  becomes a list, and the operator consent copy stops implying a single slot.
-- **Direct:** drop the `supersede_other_bindings` + revoke-other-rows calls in
-  `register_push` (keep `reclaim_push_binding` for a genuine single-device
-  removal).
-
-Caveats before doing it: (1) the model flips from an implicit **switch** (replace
-the old device) to an explicit **add**, so it needs a device list + per-device
-revoke surface, not last-writer-wins; (2) the direct client re-registers on
-**every foreground** (`App.tsx` `directPushRegister` on `app-resumed`) — today a
-harmless no-op re-supersede, but under N devices it must not silently churn other
-devices' bindings; (3) keep reclaim-on-revoke, or a revoked device keeps buzzing
-(the exact bug the supersede logic fixed); (4) `device_id` is stable-per-install
-(keychain-pinned seed), so "same phone re-registering" vs "a new device" stays a
-plain id comparison — don't key multi-device policy on anything softer.
 
 ## Components
 
