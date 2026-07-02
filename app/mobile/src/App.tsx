@@ -27,6 +27,14 @@ const FOREGROUND_RECONNECT_DEBOUNCE_MS = 400;
 /// at this cadence, not in a tight loop.
 const RECONNECT_BACKOFF_MS = 2000;
 
+/// Presenting the image picker from a focused composer: after blur, wait for the
+/// keyboard-retract signal (`html.kb-open` clearing, see viewport.ts) plus this
+/// settle beat, so the sheet comes up over the composer at its resting position.
+const PICKER_KEYBOARD_SETTLE_MS = 80;
+/// Cap on that wait: if the retract signal never lands (hardware keyboard, dev
+/// browser), the tap still opens the picker instead of being swallowed.
+const PICKER_KEYBOARD_WAIT_CAP_MS = 700;
+
 /// Rows per transcript-history fetch — both the reset-recovery refetch (newest
 /// page) and a scroll-up older page. Matches the gateway's default page size
 /// (server-clamped to 1..200), so one fetch recovers/loads up to 50 rows.
@@ -36,6 +44,18 @@ const HISTORY_PAGE_LIMIT = 50;
 /// next older page. A small band so the load fires just before the user hits the
 /// very top, hiding the round-trip.
 const SCROLL_TOP_THRESHOLD_PX = 64;
+
+/// How close to the bottom of the chat log (px) still counts as "following" the
+/// newest edge. Within this band incoming rows / stream deltas keep the log
+/// pinned to the bottom; above it (reading history) they leave the viewport
+/// alone. Roughly one short bubble, so only genuinely-at-the-edge follows.
+const FOLLOW_BOTTOM_THRESHOLD_PX = 96;
+
+/// Cap on the jump-to-latest smooth glide. Browsers finish a smooth scroll well
+/// inside this, so hitting the cap means the glide was cancelled (a finger
+/// planted mid-flight) — at which point the true scroll position decides the
+/// follow/button state again instead of staying pinned by the in-flight flag.
+const GLIDE_SETTLE_CAP_MS = 1200;
 
 /// Parse a `baybo://pair?h=<relay>&r=<rendezvous-id>&s=<secret>&k=<remote-api-key>`
 /// QR payload. Both `r` (public rendezvous id) and `s` (the 256-bit secret, the
@@ -346,6 +366,10 @@ function AttachmentList({
   );
 }
 
+/// Connection lifecycle surfaced by the header dot. "offline" means the last
+/// dial failed — the backoff loop keeps retrying, so it's transient.
+type ConnState = "connecting" | "connected" | "offline";
+
 /// The post-pairing chat: opens a Noise content session for `sessionId`, renders
 /// the agent's streamed reply, and sends user messages. Survives a background
 /// round-trip: the thread is persisted, and the session reconnects + replays the
@@ -371,7 +395,11 @@ function ChatView({
   const [streaming, setStreaming] = useState("");
   const [turnActive, setTurnActive] = useState(false);
   const [input, setInput] = useState("");
-  const [status, setStatus] = useState<string | null>(() => t("chat.connecting"));
+  // Connection lifecycle drives the header dot only — connect info never renders
+  // near the composer. `notice` carries transient NON-connect errors (send /
+  // upload / history-reload), shown in the strip above the composer.
+  const [connState, setConnState] = useState<ConnState>("connecting");
+  const [notice, setNotice] = useState<string | null>(null);
   // The header logout button confirms before firing (relay logout forgets the
   // pairing, which needs a fresh QR to recover), so `confirm` gates it behind a
   // second tap in a small popover.
@@ -433,6 +461,21 @@ function ChatView({
   // Set just before a scroll-up PREPEND so the layout effect can re-anchor the
   // viewport (prepending above the top would otherwise jump the scroll position).
   const prependAnchor = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
+  // Whether the viewport is pinned to the newest edge (bottom). Maintained by the
+  // log's onScroll; new content auto-scrolls only while pinned, so a reader who
+  // scrolled up into history isn't yanked back down. Starts true — the mount
+  // effect below opens the thread at its newest edge.
+  const followRef = useRef(true);
+  // Drives the jump-to-latest button — a render concern, unlike followRef (which
+  // is a ref precisely so scrolling doesn't re-render). React bails on
+  // same-value sets, so updating it per scroll event is cheap.
+  const [showJump, setShowJump] = useState(false);
+  // True while the jump-to-latest smooth glide is in flight. The glide fires
+  // scroll events that still read as "off the edge"; onScroll holds the
+  // follow/button state while this is set so the button doesn't flicker back.
+  const glidingRef = useRef(false);
+  const glideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(glideTimer.current), []);
   // Images picked but not yet sent (uploading or ready), shown in the composer.
   const [staged, setStaged] = useState<StagedAttachment[]>([]);
   const stagedRef = useRef<StagedAttachment[]>([]);
@@ -449,13 +492,19 @@ function ChatView({
   }, [staged]);
 
   // Auto-size the composer to its content: reset to one row, then grow to fit
-  // (capped by the CSS max-height). Runs on every keystroke and after send clears it.
-  useEffect(() => {
+  // (capped by the CSS max-height). Runs on every keystroke and after send clears
+  // it — and again when the mic's collapse transition settles, because the
+  // keystroke that flips `hasDraft` measures against the pre-collapse (narrower)
+  // field, which over-counts wraps on a paste into an empty composer.
+  const autosizeComposer = useCallback(() => {
     const el = composerRef.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight}px`;
-  }, [input]);
+  }, []);
+  useEffect(() => {
+    autosizeComposer();
+  }, [input, autosizeComposer]);
 
   // Revoke every local/staged preview URL on unmount (leaving the chat) so object
   // URLs held for instant render or unsent composer picks don't leak.
@@ -481,6 +530,38 @@ function ChatView({
       oldestOrdinal: oldestOrdinal.current,
     });
   }, [sessionId, messages]);
+
+  // Open the thread at its newest edge — a restored thread would otherwise mount
+  // showing its OLDEST rows. Pre-paint, so the top never flashes by.
+  useLayoutEffect(() => {
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, []);
+
+  // While pinned to the newest edge, keep it in view as content lands (rows,
+  // stream deltas, the turn indicator) — pre-paint, so a bubble never paints
+  // off-screen first. A scroll-up PREPEND is exempt even while pinned (a short
+  // thread's "load earlier" tap): the anchor effect below owns that viewport
+  // change — this effect is declared first so the armed anchor is still visible.
+  useLayoutEffect(() => {
+    const el = logRef.current;
+    if (el && followRef.current && !prependAnchor.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [messages, streaming, turnActive]);
+
+  // The log's box shrinks/grows as the iOS keyboard comes and goes (the webview
+  // resizes — see viewport.ts) and on rotation; while pinned, hold the newest
+  // edge through those size changes instead of letting the keyboard cover it.
+  useEffect(() => {
+    const el = logRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      if (followRef.current) el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // After a scroll-up PREPEND, restore the viewport so the content the user was
   // looking at stays put (the log is `flex-direction: column`, so inserting older
@@ -563,7 +644,7 @@ function ChatView({
       const fired = await requestRelayHistory("reset", null);
       if (!fired) pendingReset.current = true;
     } catch (e) {
-      setStatus(t("chat.recoverFailed", { error: String(e) }));
+      setNotice(t("chat.recoverFailed", { error: String(e) }));
     } finally {
       recovering.current = false;
     }
@@ -593,7 +674,7 @@ function ChatView({
     } catch (e) {
       pagingRef.current = false;
       setLoadingOlder(false);
-      setStatus(t("chat.recoverFailed", { error: String(e) }));
+      setNotice(t("chat.recoverFailed", { error: String(e) }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasMoreOlder, requestRelayHistory]);
@@ -699,6 +780,9 @@ function ChatView({
             oldestOrdinal.current = frame.oldest_ordinal ?? null;
             setHasMoreOlder(frame.has_more);
             setStreaming("");
+            // The rebuilt thread IS the newest page — the pre-reset scroll
+            // position is meaningless, so snap to the newest edge.
+            followRef.current = true;
             setMessages(rows);
             saveChatState({
               sessionId,
@@ -706,7 +790,8 @@ function ChatView({
               lastOrdinal: lastOrdinal.current,
               oldestOrdinal: oldestOrdinal.current,
             });
-            setStatus(null);
+            // A successful rebuild supersedes any lingering recover-failed notice.
+            setNotice(null);
           }
           // This request is done; clear any paging guards a coincident scroll-up
           // left set.
@@ -734,7 +819,10 @@ function ChatView({
     pendingReset.current = false;
     pagingRef.current = false;
     setLoadingOlder(false);
-    setStatus(t("chat.connecting"));
+    setConnState("connecting");
+    // A redial supersedes any lingering transient notice (send/history errors),
+    // matching the pre-split behavior where every (re)connect wiped the strip.
+    setNotice(null);
     // Returns the dial promise (rejections propagate) so the caller can back off
     // and retry — see `attemptConnect` in the mount effect. The backend resolves the
     // leg (relay vs direct) from the active binding, so no leg tag rides the call.
@@ -750,14 +838,12 @@ function ChatView({
       sinceOrdinal: lastOrdinal.current,
       onFrame: channel,
     }).then(() => {
-      setStatus(null);
+      setConnState("connected");
       setConnEpoch((e) => e + 1);
     });
-    // `t` is intentionally omitted from deps: re-creating `connect` on a language
-    // switch would tear down + re-dial the live session. Status strings set by a
-    // later reconnect simply use the language captured here. `recoverFromReset` /
-    // `prependOlder` / `requestRelayHistory` are all stable, so `connect` is stable
-    // across every render.
+    // The header state label is translated at render time, so `connect` no longer
+    // captures `t`. `recoverFromReset` / `prependOlder` / `requestRelayHistory`
+    // are all stable, so `connect` is stable across every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, recoverFromReset, prependOlder, requestRelayHistory]);
 
@@ -767,11 +853,10 @@ function ChatView({
 
     // Dial, and on failure back off and retry. Every connect path funnels through
     // here so a failed dial (gateway offline / mid-reconnect) self-heals instead
-    // of stranding the chat on a "Connect failed" message until the next
-    // foreground.
+    // of stranding the header on "offline" until the next foreground.
     const attemptConnect = () => {
-      connect().catch((e) => {
-        setStatus(t("chat.connectFailed", { error: String(e) }));
+      connect().catch(() => {
+        setConnState("offline");
         scheduleReconnect();
       });
     };
@@ -821,7 +906,12 @@ function ChatView({
     // exit (a deliberate reconnect/disconnect aborts the task instead). Reconnect
     // with catch-up so chat recovers without a foreground round-trip.
     listen<string>("content-disconnected", (event) => {
-      if (event.payload === sessionId) scheduleReconnect();
+      if (event.payload === sessionId) {
+        // Flip the header off "connected" right away — the redial that proves
+        // the state only fires after the backoff.
+        setConnState("connecting");
+        scheduleReconnect();
+      }
     })
       .then((un) => {
         if (cancelled) un();
@@ -890,7 +980,7 @@ function ChatView({
     const ready = staged.filter((a) => a.status === "ready" && a.blobId);
     if (!text && ready.length === 0) return;
     if (staged.some((a) => a.status === "uploading")) {
-      setStatus(t("chat.waitingUpload"));
+      setNotice(t("chat.waitingUpload"));
       return;
     }
     const msgId = crypto.randomUUID();
@@ -902,6 +992,7 @@ function ChatView({
       filename: a.filename,
     }));
     sentIds.current.add(msgId);
+    followRef.current = true; // an own send always snaps back to the newest edge
     setMessages((m) => [
       ...m,
       { id: msgId, role: "user", content: text, attachments: attachments.length ? attachments : undefined },
@@ -915,15 +1006,80 @@ function ChatView({
     setStaged([]);
     try {
       await invoke("chat_send", { text, msgId, attachments });
+      // A landed send clears a stale "Send failed" from an earlier attempt.
+      setNotice(null);
     } catch (e) {
-      setStatus(t("chat.sendFailed", { error: String(e) }));
+      setNotice(t("chat.sendFailed", { error: String(e) }));
     }
+  }
+
+  // A draft exists (text or a staged pick, sendable or not): the field expands
+  // over the mic slot and the in-field send button appears. Staged picks count so
+  // an attachment-only message stays sendable with an empty textarea.
+  const hasDraft = input.trim().length > 0 || staged.length > 0;
+
+  // Jump-to-latest: glide (not teleport) back to the newest edge, re-arming
+  // following and hiding the button up front — onScroll holds both while the
+  // glide flag is set. Landing normally settles via onScroll entering the follow
+  // band; the cap timer settles a cancelled glide (see GLIDE_SETTLE_CAP_MS).
+  function jumpToLatest() {
+    const el = logRef.current;
+    if (!el) return;
+    glidingRef.current = true;
+    followRef.current = true;
+    setShowJump(false);
+    clearTimeout(glideTimer.current);
+    glideTimer.current = setTimeout(() => {
+      glidingRef.current = false;
+      const log = logRef.current;
+      if (!log) return;
+      const follow =
+        log.scrollHeight - log.scrollTop - log.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX;
+      followRef.current = follow;
+      setShowJump(!follow);
+    }, GLIDE_SETTLE_CAP_MS);
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  }
+
+  // Open the image picker only once the composer has slid back to its resting
+  // (unfocused) position: blur, then wait for the keyboard to fully retract
+  // (html.kb-open clears) plus a settle beat. WebKit's transient user activation
+  // outlives this sub-second wait, so the deferred click still counts as
+  // user-initiated and the sheet presents.
+  function openPickerAfterKeyboardSettles() {
+    const root = document.documentElement;
+    composerRef.current?.blur();
+    if (!root.classList.contains("kb-open")) {
+      fileInputRef.current?.click();
+      return;
+    }
+    const start = Date.now();
+    const tick = () => {
+      if (
+        !root.classList.contains("kb-open") ||
+        Date.now() - start > PICKER_KEYBOARD_WAIT_CAP_MS
+      ) {
+        setTimeout(() => fileInputRef.current?.click(), PICKER_KEYBOARD_SETTLE_MS);
+      } else {
+        requestAnimationFrame(tick);
+      }
+    };
+    requestAnimationFrame(tick);
   }
 
   return (
     <main className="screen chat">
       <div className="chat-header">
-        <h1>{t("chat.title")}</h1>
+        {/* Top-left connection state in place of a title — the dot is the only
+            colored element in the app besides errors (offline = red). */}
+        <div className={`conn-state ${connState}`} role="status">
+          <span className="conn-dot" aria-hidden="true" />
+          {connState === "connected"
+            ? t("chat.connected")
+            : connState === "offline"
+              ? t("chat.offline")
+              : t("chat.connecting")}
+        </div>
         <button
           className="chat-logout-btn"
           aria-label={t("connected.logout")}
@@ -975,10 +1131,26 @@ function ChatView({
         className="chat-log"
         ref={logRef}
         onScroll={() => {
-          // Auto-load the next older page as the user nears the top; `loadOlder`
-          // self-guards (in-flight, no-more, no-cursor), so firing often is safe.
+          // Track whether the user sits at the newest edge (drives auto-follow +
+          // the jump-to-latest button), and auto-load the next older page as they
+          // near the top; `loadOlder` self-guards (in-flight, no-more, no-cursor),
+          // so firing often is safe.
           const el = logRef.current;
-          if (el && el.scrollTop <= SCROLL_TOP_THRESHOLD_PX) void loadOlder();
+          if (!el) return;
+          const follow =
+            el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX;
+          if (glidingRef.current) {
+            // Mid-glide positions still read "off the edge" — hold the state
+            // jumpToLatest pinned until the glide lands in the follow band.
+            if (follow) {
+              glidingRef.current = false;
+              clearTimeout(glideTimer.current);
+            }
+          } else {
+            followRef.current = follow;
+            setShowJump(!follow);
+          }
+          if (el.scrollTop <= SCROLL_TOP_THRESHOLD_PX) void loadOlder();
         }}
       >
         {loadingOlder && <div className="bubble assistant muted">…</div>}
@@ -1004,7 +1176,35 @@ function ChatView({
         {streaming && <div className="bubble assistant streaming">{streaming}</div>}
         {turnActive && !streaming && <div className="bubble assistant muted">…</div>}
       </div>
-      {status && <p className="status">{status}</p>}
+      <div className="composer-dock">
+      {showJump && (
+        <button
+          type="button"
+          className="jump-latest"
+          // Cancelling pointerdown (and the mousedown WebKit still synthesizes)
+          // keeps the tap from stealing focus, so a focused composer keeps its
+          // keyboard up while the log glides; click itself still fires.
+          onPointerDown={(e) => e.preventDefault()}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={jumpToLatest}
+          aria-label={t("chat.jumpToLatest")}
+        >
+          {/* Line-art down arrow — the send arrow's mirror. */}
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M12 5v14" />
+            <path d="M19 12l-7 7-7-7" />
+          </svg>
+        </button>
+      )}
+      {notice && <p className="status">{notice}</p>}
       {staged.length > 0 && (
         <div className="staged">
           {staged.map((a) => (
@@ -1028,32 +1228,98 @@ function ChatView({
         </div>
       )}
       <div className="row composer">
+        {/* Note: iOS anchors the file-picker menu to the TOUCH POINT — element
+            geometry has no influence on its placement (verified in the
+            simulator), so the input stays plainly hidden. */}
         <input
           ref={fileInputRef}
           type="file"
           accept="image/*"
           className="hidden"
+          tabIndex={-1}
+          aria-hidden="true"
           onChange={onPickFiles}
         />
-        <button className="attach" onClick={() => fileInputRef.current?.click()} aria-label={t("chat.addImage")}>
-          ＋
-        </button>
-        <textarea
-          ref={composerRef}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder={t("chat.placeholder")}
-          rows={1}
-        />
         <button
-          onClick={send}
-          disabled={
-            staged.some((a) => a.status === "uploading") ||
-            (!input.trim() && !staged.some((a) => a.status === "ready" && a.blobId))
-          }
+          type="button"
+          className="icon-btn"
+          onClick={openPickerAfterKeyboardSettles}
+          aria-label={t("chat.addImage")}
         >
-          {t("chat.send")}
+          {/* Line-art paperclip — same attach glyph family as the web composer. */}
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+          </svg>
         </button>
+        <div className={`composer-field${hasDraft ? " has-send" : ""}`}>
+          <textarea
+            ref={composerRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder={t("chat.placeholder")}
+            rows={1}
+          />
+          {hasDraft && (
+            <button
+              type="button"
+              className="composer-send"
+              onClick={send}
+              disabled={
+                staged.some((a) => a.status === "uploading") ||
+                (!input.trim() && !staged.some((a) => a.status === "ready" && a.blobId))
+              }
+              aria-label={t("chat.send")}
+            >
+              {/* Line-art up-arrow on the wide ink send button. */}
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M12 19V5" />
+                <path d="M5 12l7-7 7 7" />
+              </svg>
+            </button>
+          )}
+        </div>
+        {/* Voice input placeholder (no capture wired up yet). While a draft
+            exists it collapses so the field expands over its slot. */}
+        <button
+          type="button"
+          className={`icon-btn mic${hasDraft ? " collapsed" : ""}`}
+          aria-label={t("chat.voice")}
+          aria-hidden={hasDraft}
+          tabIndex={hasDraft ? -1 : undefined}
+          onTransitionEnd={autosizeComposer}
+        >
+          {/* Line-art microphone. */}
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <rect x="9" y="2" width="6" height="12" rx="3" />
+            <path d="M19 10v1a7 7 0 0 1-14 0v-1" />
+            <path d="M12 18v4" />
+          </svg>
+        </button>
+      </div>
       </div>
     </main>
   );

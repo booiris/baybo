@@ -16,6 +16,9 @@
   /* Incidental hairlines (inputs, bubbles, chips) stay light so the UI reads as
      airy as the icon; ink is reserved for text + deliberate line elements. */
   --color-line: #e4e4e4;
+  /* A step darker, for hairlines that must hold up over busy/frosted backdrops
+     (the chat composer's unfocused border). */
+  --color-line-strong: #bcbcbc;
 
   /* The one non-monochrome hue: destructive / error state only (never chrome). */
   --color-err: #d40000;
@@ -85,8 +88,8 @@ img {
 }
 
 /* Tailwind's Preflight resets heading size/weight to inherit; restore an
-   explicit heading style for the un-classed <h1>s on the Confirm / Chat screens.
-   `.wordmark` and `.chat-header h1` override below. */
+   explicit heading style for the un-classed <h1> on the Confirm screen.
+   `.wordmark` overrides below. */
 h1 { margin: 0.5rem 0 0; font-size: 1.4rem; font-weight: 700; }
 .muted { color: var(--color-ink-soft); margin: 0 0 0.5rem; }
 
@@ -309,15 +312,150 @@ button.danger {
 
 .status { color: var(--color-ink-soft); font-size: 0.85rem; margin: 0.25rem 0 0; }
 
-/* Chat view */
-.chat { height: 100vh; position: relative; }
+/* Chat view. No top/bottom padding: the log runs edge to edge and both the
+   header and the input module float OVER it (see .chat-header / .composer-dock). */
+.chat { height: 100vh; position: relative; padding-top: 0; padding-bottom: 0; }
+
+/* The floating input module (notice + staged strip + composer): pinned to the
+   very bottom of the chat screen, full-bleed. Mirrors the web chat's composer
+   backdrop: a to-top gradient opaque through the module's lower zone and fading
+   over the tall top padding, so bubbles dissolve GRADUALLY as they slide in and
+   are fully gone by roughly the composer's middle — while the area below stays
+   solid paper. The dock itself is pointer-transparent (the ramp zone must not
+   swallow scroll gestures aimed at the thread); children re-enable hits. The
+   bottom padding rides lower than the folded safe-area inset so the unfocused
+   composer hugs the home-indicator zone. */
+.composer-dock {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem 1.25rem max(0.5rem, calc(env(safe-area-inset-bottom, 0px) - 0.5rem));
+  /* Lighter-than-opaque veil: the ::before blur (not solid paper) is what hides
+     the thread here, so the frosted textarea below has live content to blur. */
+  background: linear-gradient(
+    to top,
+    color-mix(in srgb, var(--color-paper) 78%, transparent) 45%,
+    transparent
+  );
+  pointer-events: none;
+}
+.composer-dock > * { pointer-events: auto; }
+/* Frosted glass under the module: a backdrop blur masked along the same ramp as
+   the paper gradient, so the thread blurs progressively as it slides under the
+   composer rather than hitting a hard blur edge. Sits behind the dock's own
+   background/children (z-index -1 inside the dock's stacking context). */
+.composer-dock::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  -webkit-mask-image: linear-gradient(to top, black 45%, transparent);
+  mask-image: linear-gradient(to top, black 45%, transparent);
+  pointer-events: none;
+}
 /* Keyboard up: iOS keeps reporting the home-indicator safe-area inset even though
-   the keyboard now covers that strip, so the bottom-pinned composer floats a
-   ~34px band above the keyboard. While html.kb-open is set (see viewport.ts) drop
-   that now-redundant inset, leaving just a small fixed gap above the keyboard. */
-html.kb-open .chat { padding-bottom: 0.75rem; }
-.chat-header { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
-.chat-header h1 { margin: 0; }
+   the keyboard covers that strip; while html.kb-open is set (see viewport.ts)
+   drop the inset compensation, leaving a slim fixed gap above the keyboard. */
+html.kb-open .composer-dock { padding-bottom: 0.5rem; }
+/* Jump-to-latest: floats centered just above the input module while the user is
+   off the newest edge (scrolled up); tapping glides back to the bottom. The
+   composer icon buttons' ink-circle finish a size step down (it's a shortcut,
+   not a peer action); the ::after hit-slop below lifts the 36px circle to the
+   44px tap floor. Anchored to the dock's top edge, it rides the composer as it
+   grows / the keyboard lifts it. Reuses the send button's appear pop. */
+.jump-latest {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 0.25rem);
+  margin: 0 auto;
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-paper);
+  background: var(--color-ink);
+  border: 0;
+  border-radius: var(--radius-pill);
+  animation: send-pop 160ms ease;
+}
+.jump-latest svg { width: 1.1rem; height: 1.1rem; }
+/* Invisible hit-slop lifting the 40px circle to the 44px tap-target floor. */
+.jump-latest::after {
+  content: "";
+  position: absolute;
+  inset: -0.25rem;
+  border-radius: var(--radius-pill);
+}
+/* The floating header (connection state + logout): pinned over the top of the
+   chat screen, full-bleed, the composer dock's mirror — a to-bottom paper veil
+   solid through the status-bar + bar zone and fading out over the 2rem bottom
+   ramp (length-based stops, so the ramp stays put whatever the device's
+   safe-area inset), with a backdrop blur masked along the same ramp. Bubbles
+   thus dissolve gradually as they slide under it, and the iOS status bar stays
+   legible over the blurred veil. Pointer-transparent like the dock (the ramp
+   must not swallow scroll gestures aimed at the thread); children re-enable
+   hits. */
+.chat-header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: calc(env(safe-area-inset-top, 0px) + 0.5rem) 1.25rem 2rem;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--color-paper) 30%, transparent) calc(100% - 2rem),
+    transparent
+  );
+  pointer-events: none;
+}
+.chat-header > * { pointer-events: auto; }
+.chat-header::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  -webkit-backdrop-filter: blur(1.5px);
+  backdrop-filter: blur(1.5px);
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 2rem), transparent);
+  mask-image: linear-gradient(to bottom, black calc(100% - 2rem), transparent);
+  pointer-events: none;
+}
+/* Top-left connection state: a dot + mono label in place of a title. Ink dot =
+   connected, hollow = connecting, red (the app's only hue, error-only) = offline. */
+.conn-state {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  padding: 0.4rem 0;
+  font-size: 0.9rem;
+  color: var(--color-ink-soft);
+}
+.conn-dot {
+  flex: none;
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: var(--radius-pill);
+  background: var(--color-ink);
+}
+.conn-state.connecting .conn-dot { background: none; border: 1px solid var(--color-ink-soft); }
+.conn-state.offline { color: var(--color-err); }
+.conn-state.offline .conn-dot { background: var(--color-err); }
 /* The logout button is a plain line-art icon, not a pill — strip the base
    fill/border/radius/press. */
 .chat-header button {
@@ -373,8 +511,19 @@ html.kb-open .chat { padding-bottom: 0.75rem; }
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  padding: 0.5rem 0;
+  /* Top padding clears the pinned header (safe area + bar + fade ramp) so the
+     oldest loaded row rests below it; bottom padding clears the floating
+     composer dock (bottom offset + composer + fade ramp) so the newest message
+     can rest fully above the fade. */
+  padding: calc(env(safe-area-inset-top, 0px) + 4.75rem) 0 6.75rem;
+  /* Native-app feel: no visible scrollbar on the thread. */
+  scrollbar-width: none;
 }
+.chat-log::-webkit-scrollbar { display: none; }
+/* Short threads hug the composer: the first row's auto top margin absorbs the
+   leftover flex space, so there's no void above the input box. Once content
+   overflows the margin resolves to 0 and scrolling behaves as normal. */
+.chat-log > :first-child { margin-top: auto; }
 
 /* Chat MESSAGE bodies read as Inter sans (comfortable long-read); the rest of
    the app stays monospace. Soft uniform rounded bubbles, hairline outlined. */
@@ -398,6 +547,7 @@ html.kb-open .chat { padding-bottom: 0.75rem; }
 /* Scroll-up "load earlier" affordance: a centered hairline pill, monospace chrome
    (it's chrome, not a message body), soft like the rest of the UI. */
 .load-older {
+  flex: 0 0 auto; /* the base button's flex:1 would balloon it in a short thread */
   align-self: center;
   padding: 0.3rem 0.9rem;
   border: 1px solid var(--color-line);
@@ -409,33 +559,103 @@ html.kb-open .chat { padding-bottom: 0.75rem; }
 }
 .load-older:active { opacity: 0.7; transform: scale(0.98); }
 
-/* Grows upward as the textarea wraps, so the + and Send pills stay pinned to the
+/* Grows upward as the textarea wraps, so the flanking icons stay pinned to the
    bottom line rather than floating to the vertical centre of a tall composer. */
 .composer { margin-top: 0; align-items: flex-end; }
-.composer input,
-.composer textarea { flex: 1; }
 .composer button { flex: 0 0 auto; }
+/* The field wrapper owns flex-grow (the textarea fills it) and anchors the
+   in-field send button. */
+.composer-field { position: relative; flex: 1; min-width: 0; display: flex; }
 /* The composer textarea carries the shared input box (above); these are the
    textarea-only bits: no manual resize handle, a comfortable line box, and a
    ~5-line ceiling past which it scrolls internally instead of shoving the chat. */
 .composer textarea {
+  flex: 1;
+  min-width: 0;
   resize: none;
   line-height: 1.35;
   max-height: 8.5rem;
   overflow-y: auto;
+  /* Frosted glass: the field is translucent and blurs the thread scrolling
+     behind it (overrides the shared input rule's opaque paper). */
+  background: color-mix(in srgb, var(--color-paper) 55%, transparent);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+  /* Unfocused border a step darker than the shared hairline so the field edge
+     holds up over the frosted backdrop (focus still flips it to ink). */
+  border-color: var(--color-line-strong);
 }
-/* Round outline "+" to open the image picker, set apart from the ink Send pill. */
-.composer .attach {
+/* Draft present: reserve room so text never runs under the in-field send. */
+.composer-field.has-send textarea { padding-right: 3rem; }
+/* Ink-filled circular icon buttons flanking the field (paperclip left, mic
+   right), paper glyphs. 2.625rem = the single-line field's 42px, so their top
+   and bottom edges sit flush with the input box; the ::after hit-slop keeps the
+   tap target at the 44px iOS floor. */
+.composer .icon-btn {
+  position: relative;
   flex: 0 0 auto;
-  width: 2.6rem;
-  height: 2.6rem;
+  width: 2.625rem;
+  height: 2.625rem;
   padding: 0;
-  font-size: 1.4rem;
-  line-height: 1;
-  background: var(--color-paper);
-  color: var(--color-ink);
-  border: 1px solid var(--color-line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-paper);
+  background: var(--color-ink);
+  border: 0;
   border-radius: var(--radius-pill);
+}
+.composer .icon-btn svg { width: 1.3rem; height: 1.3rem; }
+.composer .icon-btn::after {
+  content: "";
+  position: absolute;
+  inset: -0.25rem;
+  border-radius: var(--radius-pill);
+}
+/* The mic is a placeholder (no capture yet). While a draft exists it collapses —
+   width, the flex gap (via negative margin), and opacity — so the field visibly
+   expands over its slot. overflow-hidden only while collapsed, so the idle
+   hit-slop ::after isn't clipped but the shrinking circle still clips its glyph. */
+.composer .mic {
+  transition: width 180ms ease, margin-left 180ms ease, opacity 180ms ease;
+}
+.composer .mic.collapsed { overflow: hidden; }
+.composer .mic.collapsed {
+  width: 0;
+  margin-left: -0.5rem; /* swallow the .row flex gap too */
+  opacity: 0;
+  pointer-events: none;
+}
+/* In-field send: a WIDE ink button (Telegram-style) with an up-arrow, its
+   corner radius matching the field's, hugging the field's edges with a 3px gap
+   top/bottom/right on a single line (42px field − 36px button = 3px + 3px),
+   pinned to the bottom-right corner once the draft wraps. */
+.composer-send {
+  position: absolute;
+  right: 0.1875rem;
+  bottom: 0.1875rem;
+  width: 2.5rem;
+  height: 2.25rem;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-paper);
+  background: var(--color-ink);
+  border: 1px solid var(--color-ink);
+  border-radius: var(--radius);
+  animation: send-pop 160ms ease;
+}
+.composer-send svg { width: 1.3rem; height: 1.3rem; }
+/* Invisible hit-slop lifting the 40x36px button to the 44px tap-target floor. */
+.composer-send::after {
+  content: "";
+  position: absolute;
+  inset: -0.25rem -0.125rem;
+  border-radius: var(--radius);
+}
+@keyframes send-pop {
+  from { opacity: 0; transform: scale(0.7); }
 }
 
 /* The file <input> is opened programmatically by the + button. */

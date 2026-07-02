@@ -43,16 +43,20 @@ export const en = {
       logoutConfirm: "Log out of this Baybo? Notifications and chat stop until you connect again.",
     },
     chat: {
-      title: "Chat",
       placeholder: "Message…",
       send: "Send",
+      voice: "Voice input",
+      // Header connection dot labels (connect state never shows near the composer).
       connecting: "Connecting…",
-      connectFailed: "Connect failed: {{error}}",
+      connected: "Connected",
+      offline: "Offline",
       startFailed: "Couldn't start the chat: {{error}}",
       sendFailed: "Send failed: {{error}}",
       recoverFailed: "Couldn't reload history: {{error}}",
       // Scroll-up pagination affordance for older transcript pages.
       loadOlder: "Load earlier messages",
+      // a11y label for the floating down-arrow above the composer.
+      jumpToLatest: "Jump to the latest message",
       waitingUpload: "Waiting for the image to finish uploading…",
       loadingImage: "Loading image…",
       tapToLoad: "Tap to load image",
