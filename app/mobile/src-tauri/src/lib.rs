@@ -10,6 +10,7 @@ mod binding;
 mod direct;
 mod keyboard;
 mod keychain;
+mod native_header;
 mod push_register;
 mod relay;
 mod transport;
@@ -222,6 +223,15 @@ async fn chat_disconnect(
     Ok(())
 }
 
+/// Drive the native chat header bar (iOS): visibility, connection state, and
+/// the localized label (see `native_header.rs`). Returns whether a native bar
+/// exists — when it doesn't (desktop/dev browser), the webview keeps its DOM
+/// header instead.
+#[tauri::command]
+fn native_header_set(app: AppHandle, visible: bool, state: String, label: String) -> bool {
+    native_header::set(&app, visible, state, label)
+}
+
 /// Download an attachment `blob_id` to `dest_path` over a dedicated blob leg,
 /// resuming from a partial file if present. `on_progress` streams cumulative bytes.
 #[tauri::command]
@@ -355,13 +365,25 @@ pub fn run() {
         .manage(PairingSessions::default())
         .manage(RelaySessions::default())
         .manage(direct::DirectSessions::default())
-        .setup(|_app| {
+        .setup(|app| {
             // Request provisional notification auth + remote-notification
             // registration once the app is up (main thread). No-op off iOS.
             push_register::register();
             // Drop the WKWebView keyboard form-assistant bar (prev/next + Done)
             // shown above the keyboard for web inputs. No-op off iOS.
             keyboard::hide_input_accessory_bar();
+            // Build the native chat header bar over the webview, hidden until
+            // the chat screen asks for it via `native_header_set` (see
+            // native_header.rs — a native sibling is the only top chrome the
+            // keyboard's viewport pan can't move). The config window already
+            // exists here — tauri creates config windows before setup runs.
+            // No-op off iOS.
+            {
+                use tauri::Manager;
+                if let Some(window) = app.get_webview_window("main") {
+                    native_header::install(&window);
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -377,6 +399,7 @@ pub fn run() {
             chat_send,
             chat_fetch_history,
             chat_disconnect,
+            native_header_set,
             blob_download,
             blob_upload,
             blob_upload_bytes,
@@ -407,6 +430,15 @@ pub fn run() {
             // content pump forwards it and the gateway re-registers the binding.
             if push_register::apns_token().is_none() {
                 push_register::register();
+            }
+            // The native header needs the webview attached to the view
+            // hierarchy; if launch-time setup ran too early, retry on
+            // foreground (idempotent — see `native_header::install`).
+            {
+                use tauri::Manager;
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    native_header::install(&window);
+                }
             }
         }
     });

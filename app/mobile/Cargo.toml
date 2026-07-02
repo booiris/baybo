@@ -58,9 +58,38 @@ tauri-plugin-haptics = "2"
 # iOS-only: writing the push key to the shared App Group keychain (SecItemAdd).
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
-# iOS-only: provisional notification auth + remote-notification registration.
+# iOS-only: provisional notification auth + remote-notification registration,
+# and the native chat header bar (native_header.rs — a UIKit blur bar over the
+# webview that the keyboard pan can't move).
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSData", "NSError"] }
-objc2-ui-kit = { version = "0.3", features = ["UIApplication"] }
+# NSArray/NSNumber feed the native header's CAGradientLayer stops.
+objc2-foundation = { version = "0.3", features = [
+    "NSData",
+    "NSError",
+    "NSString",
+    "NSArray",
+    "NSValue",
+] }
+objc2-ui-kit = { version = "0.3", features = [
+    "UIApplication",
+    # native_header.rs: gradient-veil bar + dot/label/logout-button chrome.
+    "UIView",
+    "UIGeometry",
+    "UILabel",
+    "UIButton",
+    "UIControl",
+    "UIColor",
+    "UIFont",
+    "UIFontDescriptor",
+    "UIAction",
+    "UIMenuElement",
+    "UIImage",
+    "block2",
+    "objc2-core-foundation",
+] }
+# CGRect/CGPoint/CGSize for the native header's frame math.
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+# MainThreadBound (the native header's view stash) lives here in objc2 0.6.
+dispatch2 = "0.3"
 objc2-user-notifications = { version = "0.3", features = ["UNUserNotificationCenter", "UNNotificationSettings"] }
 block2 = "0.6"

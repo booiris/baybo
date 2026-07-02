@@ -6,7 +6,7 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "sh -c 'nc -z 127.0.0.1 1420 || exec pnpm dev'",
     "beforeBuildCommand": "pnpm build"
   },
   "app": {

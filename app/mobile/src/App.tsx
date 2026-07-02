@@ -413,6 +413,59 @@ function ChatView({
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [confirm]);
+  // Whether a NATIVE header bar is drawn over the webview (iOS — see
+  // native_header.rs). The keyboard pans the whole web layout viewport, so any
+  // web-pinned top chrome rides off-screen with it; the native bar doesn't.
+  // While it's up, the DOM header below isn't rendered.
+  const [nativeHeader, setNativeHeader] = useState(false);
+  // Keep the native bar in sync: visible while the chat is mounted, restyled on
+  // every connection-state change, relabelled on language change. The command
+  // returns whether a native bar exists at all (false on desktop/dev browsers).
+  useEffect(() => {
+    let cancelled = false;
+    const push = () => {
+      const label =
+        connState === "connected"
+          ? t("chat.connected")
+          : connState === "offline"
+            ? t("chat.offline")
+            : t("chat.connecting");
+      invoke<boolean>("native_header_set", { visible: true, state: connState, label })
+        .then((supported) => {
+          if (!cancelled) setNativeHeader(supported);
+        })
+        .catch(() => {});
+    };
+    push();
+    return () => {
+      cancelled = true;
+    };
+  }, [connState, t]);
+  // Leaving the chat (logout unmounts ChatView) hides the native bar again.
+  useEffect(
+    () => () => {
+      invoke("native_header_set", { visible: false, state: "connecting", label: "" }).catch(
+        () => {},
+      );
+    },
+    [],
+  );
+  // The native bar's logout button round-trips here so the confirm flow (and
+  // its copy) stays web-side.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listen("native-logout", () => setConfirm(true))
+      .then((un) => {
+        if (cancelled) un();
+        else unlisten = un;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
   // Bumped on each successful (re)connect. A restored attachment image that failed
   // to load before its leg was live (e.g. a direct chat whose channel token isn't
   // stashed until `chat_connect` completes) re-fetches when this changes.
@@ -1069,6 +1122,10 @@ function ChatView({
 
   return (
     <main className="screen chat">
+      {/* On iOS the header is NATIVE (a blur bar over the webview — see
+          native_header.rs) because the keyboard pans all web-pinned chrome off
+          the visual top; this DOM header is the desktop/dev fallback. */}
+      {!nativeHeader && (
       <div className="chat-header">
         {/* Top-left connection state in place of a title — the dot is the only
             colored element in the app besides errors (offline = red). */}
@@ -1103,6 +1160,7 @@ function ChatView({
           </svg>
         </button>
       </div>
+      )}
       {confirm && (
         <>
           <div className="chat-menu-backdrop" onClick={() => setConfirm(false)} />
