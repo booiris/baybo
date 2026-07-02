@@ -100,16 +100,6 @@ fn reject_register(device_id: &str, reason: &str) -> GatewayError {
     GatewayError::BadRequest(reason.to_string())
 }
 
-/// Max chars of an unvalidated `device_id` echoed into a log line — a
-/// well-formed id is 68 chars (`ios-` + 64 hex); a pre-validation reject carries
-/// an arbitrary attacker-controlled string, so bound it.
-const DEVICE_ID_LOG_MAX_CHARS: usize = 72;
-
-/// Bounded, char-boundary-safe prefix of an unvalidated `device_id` for logging.
-fn device_id_log(device_id: &str) -> String {
-    device_id.chars().take(DEVICE_ID_LOG_MAX_CHARS).collect()
-}
-
 #[utoipa::path(
     post,
     path = "/push/register",
@@ -129,7 +119,7 @@ async fn register_push(
     // (validates prefix / hex / length / point), then re-derive the canonical id.
     let device_pub = delegation::device_pubkey_from_id(req.device_id.trim()).map_err(|_| {
         reject_register(
-            &device_id_log(req.device_id.trim()),
+            &remote_host_protocol::device_id_log(req.device_id.trim()),
             "device_id is not a valid ios-<hex> identity",
         )
     })?;

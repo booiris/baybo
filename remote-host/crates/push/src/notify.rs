@@ -20,6 +20,7 @@ use crate::jwt::ApnsProviderToken;
 use crate::ratelimit::NotifyRateLimiter;
 use crate::store::{DeviceRegistration, DeviceTokenStore};
 use crate::traffic::PushTrafficRegistry;
+use remote_host_protocol::device_id_log;
 
 /// The `/notify` + `/register` request bodies live in the shared protocol crate,
 /// so the gateway POSTs the exact same shapes (re-exported here for the rest of
@@ -381,16 +382,6 @@ impl NotifyService {
 /// rejecting a future longer token. Token *validity* isn't checked here — a bogus
 /// token is caught at `/notify` by APNs `BadDeviceToken` → prune.
 const APNS_TOKEN_MAX_LEN: usize = 256;
-
-/// Max chars of an unvalidated `device_id` echoed into a log line — a
-/// well-formed id is 68 chars (`ios-` + 64 hex); a pre-validation reject carries
-/// an arbitrary attacker-controlled string, so bound it.
-const DEVICE_ID_LOG_MAX_CHARS: usize = 72;
-
-/// Bounded, char-boundary-safe prefix of an unvalidated `device_id` for logging.
-fn device_id_log(device_id: &str) -> String {
-    device_id.chars().take(DEVICE_ID_LOG_MAX_CHARS).collect()
-}
 
 /// First 8 hex chars of a 32-byte pubkey — enough to tell keys apart in logs.
 fn pubkey_prefix(key: &[u8; 32]) -> String {

@@ -401,16 +401,25 @@ fn is_relay_route(path: &str) -> bool {
     path.starts_with("/pair/") || path.starts_with("/content/") || path == CONTROL
 }
 
-/// The literal prefix of the [`CONTENT_HOST`] route, whose trailing segment is the
-/// raw `dl-…` relay_key — a live capability that must never be logged.
-const CONTENT_HOST_PATH_PREFIX: &str = "/content/host/";
+/// The static leading portion of the [`CONTENT_HOST`] route — everything before
+/// its `{relay_key}` parameter, whose value is the raw `dl-…` relay_key: a live
+/// capability that must never be logged. Derived from the route template (not a
+/// re-typed literal) so a rename in the protocol crate can't leave this stripping
+/// a stale prefix and silently stop redacting the credential.
+fn content_host_path_prefix() -> &'static str {
+    match CONTENT_HOST.find('{') {
+        Some(i) => &CONTENT_HOST[..i],
+        None => CONTENT_HOST,
+    }
+}
 
 /// A request path safe to log: the content-host relay_key segment is reduced to
 /// its [`key_tag`]; every other path is returned unchanged (the pair/join and
 /// content/join segments — rendezvous_id / relay_node_id — are safe raw).
 fn loggable_route(path: &str) -> String {
-    match path.strip_prefix(CONTENT_HOST_PATH_PREFIX) {
-        Some(relay_key) => format!("{CONTENT_HOST_PATH_PREFIX}{}", key_tag(relay_key)),
+    let prefix = content_host_path_prefix();
+    match path.strip_prefix(prefix) {
+        Some(relay_key) => format!("{prefix}{}", key_tag(relay_key)),
         None => path.to_string(),
     }
 }
@@ -428,6 +437,53 @@ fn refused_client_ip(req: &Request, state: &RelayState) -> Option<IpAddr> {
     )
 }
 
+/// Log one admission refusal, gated + debounced. Scanner probes on non-relay
+/// routes are dropped; otherwise the refusal logs at `warn` (carrying how many
+/// identical refusals were demoted since the last emit) at most once per
+/// [`REFUSAL_LOG_INTERVAL`] per `(reason, key/ip)`, else at `debug`. `reason`
+/// discriminates the debounce bucket; `key` is the presented `remote_api_key`
+/// (already-tagged in the log, `None` for the missing-header case, and the IP
+/// stands in as the debounce discriminator there).
+fn log_admission_refusal(
+    state: &RelayState,
+    req: &Request,
+    reason: &str,
+    key: Option<&str>,
+    message: &str,
+) {
+    if !is_relay_route(req.uri().path()) {
+        return;
+    }
+    let route = loggable_route(req.uri().path());
+    let client_ip = refused_client_ip(req, state);
+    let debounce_key = match key {
+        Some(key) => format!("{reason}:{}", key_tag(key)),
+        None => format!("{reason}:{client_ip:?}"),
+    };
+    match (state.refusal_debounce.should_emit(&debounce_key), key) {
+        (Some(suppressed), Some(key)) => tracing::warn!(
+            route = %route,
+            key_tag = %key_tag(key),
+            client_ip = ?client_ip,
+            suppressed,
+            "{message}"
+        ),
+        (Some(suppressed), None) => tracing::warn!(
+            route = %route,
+            client_ip = ?client_ip,
+            suppressed,
+            "{message}"
+        ),
+        (None, Some(key)) => tracing::debug!(
+            route = %route,
+            key_tag = %key_tag(key),
+            client_ip = ?client_ip,
+            "{message}"
+        ),
+        (None, None) => tracing::debug!(route = %route, client_ip = ?client_ip, "{message}"),
+    }
+}
+
 /// Admission pre-layer for the header-gated routes: `401` unless `x-remote-api-key`
 /// resolves to an admitted, unexpired key, then stash the key + its limits as an
 /// [`Admitted`] extension. `/control` admits via this same layer (its key rides the
@@ -443,25 +499,13 @@ async fn require_admitted(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned())
     else {
-        if is_relay_route(req.uri().path()) {
-            let client_ip = refused_client_ip(&req, &state);
-            match state
-                .refusal_debounce
-                .should_emit(&format!("missing-header:{client_ip:?}"))
-            {
-                Some(suppressed) => tracing::warn!(
-                    route = %loggable_route(req.uri().path()),
-                    client_ip = ?client_ip,
-                    suppressed,
-                    "relay: upgrade refused — no x-remote-api-key header"
-                ),
-                None => tracing::debug!(
-                    route = %loggable_route(req.uri().path()),
-                    client_ip = ?client_ip,
-                    "relay: upgrade refused — no x-remote-api-key header"
-                ),
-            }
-        }
+        log_admission_refusal(
+            &state,
+            &req,
+            "missing-header",
+            None,
+            "relay: upgrade refused — no x-remote-api-key header",
+        );
         return unadmitted();
     };
     match state.admitted.resolve(&key) {
@@ -473,49 +517,23 @@ async fn require_admitted(
             next.run(req).await
         }
         Admit::Unknown => {
-            if is_relay_route(req.uri().path()) {
-                match state
-                    .refusal_debounce
-                    .should_emit(&format!("unknown:{}", key_tag(&key)))
-                {
-                    Some(suppressed) => tracing::warn!(
-                        route = %loggable_route(req.uri().path()),
-                        key_tag = %key_tag(&key),
-                        client_ip = ?refused_client_ip(&req, &state),
-                        suppressed,
-                        "relay: upgrade refused — remote_api_key not admitted (unknown)"
-                    ),
-                    None => tracing::debug!(
-                        route = %loggable_route(req.uri().path()),
-                        key_tag = %key_tag(&key),
-                        client_ip = ?refused_client_ip(&req, &state),
-                        "relay: upgrade refused — remote_api_key not admitted (unknown)"
-                    ),
-                }
-            }
+            log_admission_refusal(
+                &state,
+                &req,
+                "unknown",
+                Some(&key),
+                "relay: upgrade refused — remote_api_key not admitted (unknown)",
+            );
             unadmitted()
         }
         Admit::Expired => {
-            if is_relay_route(req.uri().path()) {
-                match state
-                    .refusal_debounce
-                    .should_emit(&format!("expired:{}", key_tag(&key)))
-                {
-                    Some(suppressed) => tracing::warn!(
-                        route = %loggable_route(req.uri().path()),
-                        key_tag = %key_tag(&key),
-                        client_ip = ?refused_client_ip(&req, &state),
-                        suppressed,
-                        "relay: upgrade refused — remote_api_key not admitted (expired)"
-                    ),
-                    None => tracing::debug!(
-                        route = %loggable_route(req.uri().path()),
-                        key_tag = %key_tag(&key),
-                        client_ip = ?refused_client_ip(&req, &state),
-                        "relay: upgrade refused — remote_api_key not admitted (expired)"
-                    ),
-                }
-            }
+            log_admission_refusal(
+                &state,
+                &req,
+                "expired",
+                Some(&key),
+                "relay: upgrade refused — remote_api_key not admitted (expired)",
+            );
             unadmitted()
         }
     }

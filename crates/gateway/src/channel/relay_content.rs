@@ -72,6 +72,51 @@ enum ControlEnd {
     TornDown,
 }
 
+/// How a disconnect should be logged, after [`note_connection_ended`] folds it
+/// into the reconnect failure cycle.
+enum DisconnectKind {
+    /// The connection had been healthy (up ≥ [`HEALTHY_CONNECTION_MIN`]); the
+    /// failure cycle is reset so the next connect logs at info.
+    Healthy,
+    /// The first failure of a fresh cycle.
+    FirstFailure,
+    /// A back-to-back redial within an ongoing failure cycle.
+    RepeatFailure,
+}
+
+/// Fold an ended control connection into the reconnect failure-cycle counter and
+/// report how to log the disconnect. A connection that stayed up at least
+/// [`HEALTHY_CONNECTION_MIN`] resets the cycle (emitting a one-line recovery when
+/// it followed failures) and does NOT advance it, so the reconnect after a healthy
+/// drop is visible at info; a shorter-lived one advances the cycle so a
+/// connect-then-die loop goes quiet after its first visible line. Both disconnect
+/// arms route through here so the reset-vs-advance accounting lives in one place.
+fn note_connection_ended(
+    attempt_started: std::time::Instant,
+    consecutive_failures: &mut u32,
+    relay_url: &str,
+    relay_node_id: &str,
+) -> DisconnectKind {
+    if attempt_started.elapsed() >= HEALTHY_CONNECTION_MIN {
+        if *consecutive_failures > 0 {
+            tracing::info!(
+                relay = %relay_url,
+                relay_node_id = %relay_node_id,
+                "relay-content: control connection recovered"
+            );
+        }
+        *consecutive_failures = 0;
+        return DisconnectKind::Healthy;
+    }
+    let first = *consecutive_failures == 0;
+    *consecutive_failures = consecutive_failures.saturating_add(1);
+    if first {
+        DisconnectKind::FirstFailure
+    } else {
+        DisconnectKind::RepeatFailure
+    }
+}
+
 /// The relay endpoint + admission key the gateway dials, resolved from the single
 /// approved device row.
 struct RelaySettings {
@@ -79,30 +124,47 @@ struct RelaySettings {
     remote_api_key: String,
 }
 
+/// The outcome of resolving the approved device row. The three states are
+/// distinct on purpose: a transient store read failure ([`Unavailable`]) must not
+/// be mistaken for an authoritative "no usable device" ([`Absent`]), or a single
+/// DB hiccup on a poll tick would tear down a live, healthy control connection
+/// (and its in-flight content legs) instead of being retried.
+///
+/// [`Unavailable`]: RelayResolution::Unavailable
+/// [`Absent`]: RelayResolution::Absent
+enum RelayResolution {
+    /// An approved device with recorded relay settings — dial / keep the link.
+    Ready(RelaySettings),
+    /// Authoritatively no usable device: none paired, revoked, or the row predates
+    /// the relay fields (re-pair to populate).
+    Absent,
+    /// The device store read failed transiently — the device's state is unknown,
+    /// so keep whatever connection is already up and retry on the next tick.
+    Unavailable,
+}
+
 /// Resolve the relay settings from the approved device row (one gateway = one
-/// app). `None` when no device is paired, or its row predates the recorded relay
-/// fields (empty — re-pair to populate). `no_relay_diagnosed` remembers which
-/// device the missing-fields condition was already reported for, so the
-/// permanent un-routability is surfaced once per device rather than every poll
-/// tick.
+/// app). `no_relay_diagnosed` remembers which device the missing-fields condition
+/// was already reported for, so the permanent un-routability is surfaced once per
+/// device rather than every poll tick.
 async fn approved_relay_settings(
     state: &WsChannelState,
     no_relay_diagnosed: &mut Option<String>,
-) -> Option<RelaySettings> {
+) -> RelayResolution {
     let rows = match state.device_store.list(Some(DeviceStatus::Approved)).await {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "relay-content: device store read failed; treating as no approved device"
+                "relay-content: device store read failed; keeping any live control connection and retrying"
             );
             *no_relay_diagnosed = None;
-            return None;
+            return RelayResolution::Unavailable;
         }
     };
     let Some(row) = rows.into_iter().next() else {
         *no_relay_diagnosed = None;
-        return None;
+        return RelayResolution::Absent;
     };
     if row.relay_url.is_empty() || row.remote_api_key.is_empty() {
         // A paired device whose row predates the relay fields would otherwise idle
@@ -116,10 +178,10 @@ async fn approved_relay_settings(
             );
             *no_relay_diagnosed = Some(row.device_id.clone());
         }
-        return None;
+        return RelayResolution::Absent;
     }
     *no_relay_diagnosed = None;
-    Some(RelaySettings {
+    RelayResolution::Ready(RelaySettings {
         relay_url: row.relay_url,
         remote_api_key: row.remote_api_key,
     })
@@ -172,7 +234,11 @@ async fn run(state: WsChannelState, shutdown: ShutdownSignal) {
         };
         // Idle until a device is paired (and has recorded its relay settings),
         // but wake immediately on shutdown rather than after the full poll tick.
-        let Some(settings) = approved_relay_settings(&state, &mut no_relay_diagnosed).await else {
+        // Absent and Unavailable both idle here — there's no live connection to
+        // preserve between attempts, so a transient store error just retries.
+        let RelayResolution::Ready(settings) =
+            approved_relay_settings(&state, &mut no_relay_diagnosed).await
+        else {
             was_paired = false;
             tokio::select! {
                 _ = tokio::time::sleep(DEVICE_POLL_INTERVAL) => {}
@@ -207,90 +273,74 @@ async fn run(state: WsChannelState, shutdown: ShutdownSignal) {
         .await
         {
             Ok(ControlEnd::ClosedByRelay(close)) => {
-                // A connection that died before HEALTHY_CONNECTION_MIN counts
-                // toward the failure cycle even though the relay closed it
-                // "cleanly" — a connect-then-die loop must go quiet after its
-                // first visible line, not repeat at info every redial.
-                let was_healthy = attempt_started.elapsed() >= HEALTHY_CONNECTION_MIN;
-                if was_healthy {
-                    if consecutive_failures > 0 {
-                        tracing::info!(
-                            relay = %settings.relay_url,
-                            relay_node_id = %relay_node_id,
-                            "relay-content: control connection recovered"
-                        );
-                    }
-                    consecutive_failures = 0;
-                }
+                let kind = note_connection_ended(
+                    attempt_started,
+                    &mut consecutive_failures,
+                    &settings.relay_url,
+                    &relay_node_id,
+                );
                 let close_code = close.as_ref().map(|f| f.code);
                 let close_reason = close
                     .as_ref()
                     .map(|f| f.reason.as_str())
                     .unwrap_or_default();
-                if was_healthy {
-                    tracing::info!(
+                // A clean close of a healthy link is routine (info); a
+                // connect-then-die loop warns on its first line then goes quiet.
+                match kind {
+                    DisconnectKind::Healthy => tracing::info!(
                         relay = %settings.relay_url,
                         relay_node_id = %relay_node_id,
                         close_code = ?close_code,
                         close_reason = %close_reason,
                         "relay-content: control connection closed by relay; redialing"
-                    );
-                } else if consecutive_failures == 0 {
-                    tracing::warn!(
+                    ),
+                    DisconnectKind::FirstFailure => tracing::warn!(
                         relay = %settings.relay_url,
                         relay_node_id = %relay_node_id,
                         close_code = ?close_code,
                         close_reason = %close_reason,
                         "relay-content: control connection closed by relay; redialing"
-                    );
-                } else {
-                    tracing::debug!(
+                    ),
+                    DisconnectKind::RepeatFailure => tracing::debug!(
                         relay = %settings.relay_url,
                         relay_node_id = %relay_node_id,
                         close_code = ?close_code,
                         close_reason = %close_reason,
                         "relay-content: control connection closed by relay; redialing"
-                    );
-                }
-                if !was_healthy {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    ),
                 }
             }
             Ok(ControlEnd::TornDown) => {
                 consecutive_failures = 0;
             }
             Err(e) => {
-                let was_healthy = attempt_started.elapsed() >= HEALTHY_CONNECTION_MIN;
-                if was_healthy {
-                    if consecutive_failures > 0 {
-                        tracing::info!(
-                            relay = %settings.relay_url,
-                            relay_node_id = %relay_node_id,
-                            "relay-content: control connection recovered"
-                        );
-                    }
-                    consecutive_failures = 0;
-                }
-                if consecutive_failures == 0 {
-                    tracing::warn!(
+                let kind = note_connection_ended(
+                    attempt_started,
+                    &mut consecutive_failures,
+                    &settings.relay_url,
+                    &relay_node_id,
+                );
+                // An unexpected drop (error) is worth a warn even after a healthy
+                // run — more notable than a clean close — but the healthy reset in
+                // note_connection_ended still makes the reconnect log at info.
+                match kind {
+                    DisconnectKind::RepeatFailure => tracing::debug!(
                         relay = %settings.relay_url,
                         key_tag = %key_tag(&settings.remote_api_key),
                         relay_node_id = %relay_node_id,
                         error = %e,
                         retry_in = ?retry_in,
                         "relay-content: control connection failed; redialing"
-                    );
-                } else {
-                    tracing::debug!(
+                    ),
+                    DisconnectKind::Healthy | DisconnectKind::FirstFailure => tracing::warn!(
                         relay = %settings.relay_url,
                         key_tag = %key_tag(&settings.remote_api_key),
                         relay_node_id = %relay_node_id,
                         error = %e,
                         retry_in = ?retry_in,
                         "relay-content: control connection failed; redialing"
-                    );
+                    ),
                 }
-                consecutive_failures = consecutive_failures.saturating_add(1);
             }
         }
         if shutdown.is_shutdown() {
@@ -378,11 +428,16 @@ async fn run_once(
                 None => break,
             },
             _ = poll.tick() => {
-                if approved_relay_settings(state, no_relay_diagnosed).await.is_none() {
+                // Tear down only on an authoritative Absent (revoked/superseded);
+                // a transient Unavailable keeps the live connection (its warn is
+                // already logged) and retries on the next tick.
+                if let RelayResolution::Absent =
+                    approved_relay_settings(state, no_relay_diagnosed).await
+                {
                     tracing::info!(
                         relay = %settings.relay_url,
-                        "relay-content: no approved relay device (revoked, superseded, or store \
-                         read failed); tearing down control connection"
+                        "relay-content: approved relay device gone (revoked or superseded); \
+                         tearing down control connection"
                     );
                     pump.abort();
                     pump_aborted = true;
