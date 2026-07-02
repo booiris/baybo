@@ -210,6 +210,7 @@ impl SessionRegistry {
         // Coalesce concurrent dials: each foreground reconnect drives the same UI
         // state, so a second in-flight dial is pure waste. `swap` claims the slot.
         if self.connecting.swap(true, Ordering::AcqRel) {
+            log::debug!("chat connect coalesced with in-flight dial (session={session_id})");
             return Ok(());
         }
         let _connecting = ConnectingGuard(&self.connecting);
@@ -226,12 +227,20 @@ impl SessionRegistry {
                 // pump can't keep accepting sends after the leg went down. A
                 // precondition failure (e.g. a transient keychain read on reconnect)
                 // leaves a healthy session alone.
-                if e.should_reset_session() {
+                let reset = e.should_reset_session();
+                log::warn!(
+                    "chat connect failed: {e} (session={session_id} reset_prior_session={reset})"
+                );
+                if reset {
                     self.disconnect().await;
                 }
                 return Err(e);
             }
             Err(_) => {
+                log::warn!(
+                    "chat connect timed out after {}s (session={session_id})",
+                    CONNECT_TIMEOUT.as_secs()
+                );
                 self.disconnect().await;
                 return Err(TransportError::Timeout);
             }
@@ -384,14 +393,17 @@ async fn pump(
     on_frame: Channel<Frame>,
     outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
 ) {
-    run_pump(conn, on_frame, outbound_rx).await;
+    run_pump(conn, &session_id, on_frame, outbound_rx).await;
     let _ = app.emit(CONTENT_DISCONNECTED_EVENT, &session_id);
 }
 
 /// The pump body: send the opening frames, then fan inbound frames to the webview
 /// and seal outbound user messages until the session ends for any reason.
+/// `session_id` is log context only — every exit path records its cause here,
+/// because the disconnected event above carries only the session id.
 async fn run_pump(
     conn: Connection,
+    session_id: &str,
     on_frame: Channel<Frame>,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
 ) {
@@ -411,12 +423,20 @@ async fn run_pump(
         match codec.encode_outbound(frame) {
             Ok(messages) => {
                 for bytes in messages {
-                    if sink.send(Message::Binary(bytes)).await.is_err() {
+                    if let Err(e) = sink.send(Message::Binary(bytes)).await {
+                        log::warn!(
+                            "chat session start failed: opening frame send failed (subscribe, session={session_id}): {e}"
+                        );
                         return;
                     }
                 }
             }
-            Err(_) => return,
+            Err(e) => {
+                log::warn!(
+                    "chat session start failed: opening frame encode failed (subscribe, session={session_id}): {e}"
+                );
+                return;
+            }
         }
     }
 
@@ -424,11 +444,21 @@ async fn run_pump(
     // failure rather than kill an otherwise-healthy session. A send failure is still
     // the socket dying, so it stays fatal.
     for frame in &opening_best_effort {
-        if let Ok(messages) = codec.encode_outbound(frame) {
-            for bytes in messages {
-                if sink.send(Message::Binary(bytes)).await.is_err() {
-                    return;
+        match codec.encode_outbound(frame) {
+            Ok(messages) => {
+                for bytes in messages {
+                    if let Err(e) = sink.send(Message::Binary(bytes)).await {
+                        log::warn!(
+                            "chat session start failed: opening frame send failed (apns_refresh, session={session_id}): {e}"
+                        );
+                        return;
+                    }
                 }
+            }
+            Err(e) => {
+                log::warn!(
+                    "opening frame skipped: encode failed (apns_refresh, session={session_id}; push binding may go stale): {e}"
+                );
             }
         }
     }
@@ -448,7 +478,12 @@ async fn run_pump(
                         // unknown future variant decodes to Ok(vec![]) and is skipped.
                         let frames = match codec.decode_inbound(&bytes) {
                             Ok(frames) => frames,
-                            Err(_) => break 'session,
+                            Err(e) => {
+                                log::warn!(
+                                    "chat session ended: inbound frame decode failed (session={session_id}; a relay noise desync is unrecoverable): {e}"
+                                );
+                                break 'session;
+                            }
                         };
                         for frame in frames {
                             // Answer the gateway's keepalive locally; never forward it.
@@ -462,40 +497,87 @@ async fn run_pump(
                             }
                             if on_frame.send(frame).is_err() {
                                 // The webview dropped the channel (navigated away).
+                                log::info!(
+                                    "chat session ended: webview dropped the frame channel (session={session_id})"
+                                );
                                 break 'session;
                             }
                         }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) | None => break 'session,
+                    Some(Ok(Message::Close(frame))) => {
+                        match frame {
+                            Some(cf) => log::info!(
+                                "chat session ended: socket closed by peer (code={} reason={:?}, session={session_id})",
+                                u16::from(cf.code),
+                                cf.reason
+                            ),
+                            None => log::info!(
+                                "chat session ended: socket closed by peer (no close frame body, session={session_id})"
+                            ),
+                        }
+                        break 'session;
+                    }
+                    None => {
+                        log::info!(
+                            "chat session ended: socket stream ended (session={session_id})"
+                        );
+                        break 'session;
+                    }
                     Some(Ok(_)) => {}
-                    Some(Err(_)) => break 'session,
+                    Some(Err(e)) => {
+                        log::info!(
+                            "chat session ended: socket read error (session={session_id}): {e}"
+                        );
+                        break 'session;
+                    }
                 }
             }
             cmd = outbound_rx.recv() => {
                 // Both outbound commands build one frame, then share the same
                 // encode + chunk + send path (the codec hides Noise vs raw msgpack).
-                let frame = match cmd {
+                // `cmd_kind` survives for the log lines below (never the text).
+                let (frame, cmd_kind) = match cmd {
                     Some(OutboundCmd::Send { text, msg_id, attachments }) => {
-                        user_frame(&text, &msg_id, attachments)
+                        let frame = user_frame(&text, &msg_id, attachments);
+                        (frame, format!("send msg_id={msg_id}"))
                     }
                     Some(OutboundCmd::FetchHistory { before_ordinal, limit }) => {
-                        history_frame(before_ordinal, limit)
+                        (history_frame(before_ordinal, limit), "fetch_history".to_string())
                     }
-                    None => break 'session,
+                    None => {
+                        log::debug!(
+                            "chat session ended: outbound command channel closed (session={session_id})"
+                        );
+                        break 'session;
+                    }
                 };
                 match codec.encode_outbound(&frame) {
                     Ok(messages) => {
                         for bytes in messages {
-                            if sink.send(Message::Binary(bytes)).await.is_err() {
+                            if let Err(e) = sink.send(Message::Binary(bytes)).await {
+                                log::warn!(
+                                    "chat session ended: outbound send failed ({cmd_kind}, session={session_id}): {e}"
+                                );
                                 break 'session;
                             }
                         }
                     }
-                    Err(_) => continue,
+                    Err(e) => {
+                        log::warn!(
+                            "outbound frame seal failed; {cmd_kind} dropped, session stays up (session={session_id}): {e}"
+                        );
+                        continue;
+                    }
                 }
             }
-            _ = &mut liveness => break 'session,
+            _ = &mut liveness => {
+                log::info!(
+                    "chat session ended: inbound liveness timeout after {}s (socket presumed dead, e.g. iOS background freeze; session={session_id})",
+                    INBOUND_LIVENESS_TIMEOUT.as_secs()
+                );
+                break 'session;
+            }
         }
     }
     let _ = sink.close().await;

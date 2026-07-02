@@ -489,6 +489,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
             Arc::clone(&graph.job_lifecycle),
             async move { push_shutdown.wait().await },
         ));
+        tracing::info!("push: dispatcher started (subscribed to job lifecycle bus)");
     }
 
     // Build the axum server from the assembled graph.

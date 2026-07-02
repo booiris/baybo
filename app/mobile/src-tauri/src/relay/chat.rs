@@ -94,6 +94,11 @@ impl ChatTransport for RelaySessions {
                     "production"
                 };
                 opening_best_effort.push(apns_token_frame(&token, env));
+            } else {
+                log::info!(
+                    "connecting without an APNs token (not yet issued); push binding not refreshed this session (session={session_id} device={})",
+                    record.device_id
+                );
             }
 
             // Relay user messages carry the device id + `channel_type=ios`.

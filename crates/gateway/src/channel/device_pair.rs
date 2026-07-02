@@ -307,10 +307,11 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     // phone would keep buzzing.
     for old in &superseded {
         if let Err(e) = crate::push::reclaim_push_binding(&state.secret_vault, old).await {
-            tracing::debug!(
-                device = %super::short_hash(old),
+            tracing::warn!(
+                device = %old,
                 error = %e,
-                "push: reclaim superseded binding failed",
+                "push: failed to reclaim superseded device's push binding; it may keep \
+                 receiving pushes",
             );
         }
     }

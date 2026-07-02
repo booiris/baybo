@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::rejection::JsonRejection;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 
@@ -30,7 +32,34 @@ pub fn router(state: PushState) -> Router {
         .with_state(state)
 }
 
-async fn register(State(state): State<PushState>, Json(req): Json<RegisterRequest>) -> StatusCode {
+/// Log a body rejected before the handler body ran (malformed / oversized /
+/// non-JSON) and answer with the status + explanatory body axum's bare
+/// extractor would have used.
+fn body_rejected(route: &str, headers: &HeaderMap, rejection: &JsonRejection) -> Response {
+    let content_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<absent>");
+    tracing::warn!(
+        route,
+        content_length,
+        rejection = %rejection,
+        "push: request body rejected before handler"
+    );
+    (rejection.status(), rejection.body_text()).into_response()
+}
+
+async fn register(
+    State(state): State<PushState>,
+    headers: HeaderMap,
+    payload: Result<Json<RegisterRequest>, JsonRejection>,
+) -> Response {
+    let req = match payload {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            return body_rejected(remote_host_protocol::push::REGISTER, &headers, &rejection);
+        }
+    };
     match state.service.register(req) {
         RegisterOutcome::Registered => StatusCode::OK,
         // The `apns_token` isn't a plausible APNs device token.
@@ -40,9 +69,20 @@ async fn register(State(state): State<PushState>, Json(req): Json<RegisterReques
         // The store is full with nothing evictable — shed, back off and retry.
         RegisterOutcome::Capacity => StatusCode::SERVICE_UNAVAILABLE,
     }
+    .into_response()
 }
 
-async fn notify(State(state): State<PushState>, Json(req): Json<NotifyRequest>) -> StatusCode {
+async fn notify(
+    State(state): State<PushState>,
+    headers: HeaderMap,
+    payload: Result<Json<NotifyRequest>, JsonRejection>,
+) -> Response {
+    let req = match payload {
+        Ok(Json(req)) => req,
+        Err(rejection) => {
+            return body_rejected(remote_host_protocol::push::NOTIFY, &headers, &rejection);
+        }
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -56,6 +96,7 @@ async fn notify(State(state): State<PushState>, Json(req): Json<NotifyRequest>) 
         NotifyOutcome::Rejected => StatusCode::FORBIDDEN,
         NotifyOutcome::Failed(_) => StatusCode::BAD_GATEWAY,
     }
+    .into_response()
 }
 
 #[cfg(test)]
@@ -82,7 +123,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     #[async_trait]
     impl ApnsSender for OkApns {
         async fn send(&self, _req: ApnsRequest) -> ApnsOutcome {
-            ApnsOutcome::Delivered
+            ApnsOutcome::Delivered { apns_id: None }
         }
     }
 

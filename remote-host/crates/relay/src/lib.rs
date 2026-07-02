@@ -28,4 +28,3 @@ pub use control::{ControlRegistry, ControlSignal};
 pub use traffic::{
     Counts, Direction, LegMetering, RelayTrafficDelta, TrafficMeter, TrafficRegistry,
 };
-pub use ws::pump_ws;

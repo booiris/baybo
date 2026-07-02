@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use remote_host_protocol::key_tag;
 use tokio::sync::mpsc;
 
 /// Per-leg channel capacity (opaque frames buffered toward the peer before
@@ -141,6 +142,8 @@ impl RelayBroker {
             if pending.len() >= self.max_pending {
                 tracing::warn!(
                     cap = self.max_pending,
+                    pending = pending.len(),
+                    key_tag = %key_tag(key),
                     "relay: parked-leg ceiling reached; refusing new park"
                 );
                 return None;
@@ -210,9 +213,30 @@ impl RelayBroker {
 
     fn sweep_pending(pending: &mut HashMap<String, PendingHalf>, ttl: Duration) -> usize {
         let now = Instant::now();
-        let before = pending.len();
-        pending.retain(|_, half| now.duration_since(half.parked_at) < ttl);
-        before - pending.len()
+        let mut swept: Vec<String> = Vec::new();
+        pending.retain(|key, half| {
+            let age = now.duration_since(half.parked_at);
+            if age < ttl {
+                return true;
+            }
+            swept.push(format!("{} ({}s)", key_tag(key), age.as_secs()));
+            false
+        });
+        if !swept.is_empty() {
+            tracing::info!(
+                reaped = swept.len(),
+                keys = ?swept,
+                ttl_secs = ttl.as_secs(),
+                "relay: swept expired parked legs (partner never arrived)"
+            );
+        }
+        swept.len()
+    }
+
+    /// The parked-leg ceiling (so a refusal at [`ParkOutcome::AtCapacity`] can
+    /// name the cap it hit).
+    pub(crate) fn max_pending(&self) -> usize {
+        self.max_pending
     }
 
     /// Match an already-parked leg for `key` **without** parking a new one.

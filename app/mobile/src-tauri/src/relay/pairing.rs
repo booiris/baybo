@@ -43,6 +43,12 @@ const DECLINE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// reply (a `msg2` that never arrives).
 const HANDSHAKE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The one warn every missed push-delegation step shares (see [`finish_pair`]) —
+/// pairing reports success, so this line is the only trace that pushes for the
+/// device were never provisioned.
+const PUSH_DELEGATION_MISS: &str =
+    "pairing succeeded but push delegation was not sent; pushes for this device will not work";
+
 /// In-flight pairing sessions, parked between `pair_begin` and `pair_confirm`
 /// (keyed by device id). The map lock is held only to insert/remove; the live WS
 /// is owned by the background [`run_pair_pump`] task, reached through this handle.
@@ -180,8 +186,26 @@ pub async fn pair_begin(
     let (mut client, hello) = PairingClient::start(req).map_err(|e| e.to_string())?;
     send(&mut ws, &hello).await?;
 
-    let PairFrame::HandshakeReply { msg } = recv_timeout(&mut ws, HANDSHAKE_REPLY_TIMEOUT).await?
-    else {
+    // Bounded wait, so a stalled / hostile relay can't pin the app open on a
+    // `msg2` that never arrives.
+    let reply = match tokio::time::timeout(HANDSHAKE_REPLY_TIMEOUT, recv(&mut ws)).await {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(e)) => {
+            log::warn!("pairing: failed reading HandshakeReply (rendezvous={rendezvous_id}): {e}");
+            return Err(e);
+        }
+        Err(_) => {
+            log::warn!(
+                "pairing: no HandshakeReply from gateway within {}s (rendezvous={rendezvous_id}; operator leg absent or relay dropped the forward)",
+                HANDSHAKE_REPLY_TIMEOUT.as_secs()
+            );
+            return Err("timed out waiting for the gateway".into());
+        }
+    };
+    let PairFrame::HandshakeReply { msg } = reply else {
+        log::warn!(
+            "pairing: expected HandshakeReply, got another frame (rendezvous={rendezvous_id})"
+        );
         return Err("expected HandshakeReply".into());
     };
     let final_frame = client.on_handshake_reply(&msg).map_err(|e| e.to_string())?;
@@ -270,6 +294,10 @@ async fn run_pair_pump(
     // Phase A: parked on the confirm screen. Wait for the user's decision, but
     // keep reading the WS so a gateway abort cancels the screen rather than
     // stranding it until the user taps.
+    // Once-per-pump latches: the relay leg is unauthenticated beyond admission,
+    // so an unintelligible stream must not produce a log line per frame.
+    let mut logged_unexpected = false;
+    let mut logged_undecodable = false;
     let accepted = loop {
         tokio::select! {
             biased;
@@ -287,7 +315,25 @@ async fn run_pair_pump(
                         return;
                     }
                     // Any other frame here is unexpected this early; keep waiting.
-                    Ok(_) | Err(_) => continue,
+                    Ok(_) => {
+                        if !logged_unexpected {
+                            logged_unexpected = true;
+                            log::debug!(
+                                "pairing: ignoring unexpected frame(s) while awaiting user decision (device={device_id}; logged once)"
+                            );
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        if !logged_undecodable {
+                            logged_undecodable = true;
+                            log::debug!(
+                                "pairing: ignoring undecodable frame(s) while awaiting user decision (device={device_id}, {} bytes; logged once): {e}",
+                                bytes.len()
+                            );
+                        }
+                        continue;
+                    }
                 },
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                 Some(Ok(_)) => continue,
@@ -362,14 +408,32 @@ async fn finish_pair(
     // 6th message: authorize the gateway's push key to manage our APNs binding at
     // C, signed under our Ed25519 device identity (whose public half is the
     // device_id). Best-effort — if the gateway advertised no push key (relay off)
-    // or the send fails, the pairing still stands; only push is affected.
-    if let Some(gw_push) = paired.gateway_push_pubkey
-        && let Ok(gw_push_key) = delegation::verifying_key_from_bytes(&gw_push)
-    {
-        let sig = delegation::sign_delegation(sign_key, &gw_push_key);
-        if let Ok(frame) = client.seal_delegation(sig.to_bytes().to_vec()) {
-            let _ = send(ws, &frame).await;
+    // or the send fails, the pairing still stands; only push is affected, so each
+    // miss is a warn rather than a pairing failure.
+    match paired.gateway_push_pubkey {
+        None => {
+            log::warn!("{PUSH_DELEGATION_MISS} (device={device_id} reason=no_gateway_push_key)")
         }
+        Some(gw_push) => match delegation::verifying_key_from_bytes(&gw_push) {
+            Err(e) => {
+                log::warn!("{PUSH_DELEGATION_MISS} (device={device_id} reason=bad_push_key): {e}")
+            }
+            Ok(gw_push_key) => {
+                let sig = delegation::sign_delegation(sign_key, &gw_push_key);
+                match client.seal_delegation(sig.to_bytes().to_vec()) {
+                    Err(e) => log::warn!(
+                        "{PUSH_DELEGATION_MISS} (device={device_id} reason=seal_failed): {e}"
+                    ),
+                    Ok(frame) => {
+                        if let Err(e) = send(ws, &frame).await {
+                            log::warn!(
+                                "{PUSH_DELEGATION_MISS} (device={device_id} reason=send_failed): {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        },
     }
 
     // Persist the push key to the shared App Group keychain so the NSE can
@@ -457,15 +521,26 @@ async fn connect_pair(url: &str, remote_api_key: Option<&str>) -> Result<Ws, Str
             }
         }
         match connect_async(req).await {
-            Ok((ws, _)) => return Ok(ws),
+            Ok((ws, _)) => {
+                if i > 0 {
+                    log::info!("pairing rendezvous connected after {i} failed attempts ({url})");
+                }
+                return Ok(ws);
+            }
             Err(e) => {
                 last = format!("connect {url}: {e}");
                 if i + 1 < attempts {
+                    log::debug!(
+                        "pairing rendezvous dial failed; retrying (attempt {}/{attempts}, url={url}): {}",
+                        i + 1,
+                        super::dial::ws_error_detail(&e)
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
         }
     }
+    log::warn!("pairing dial failed after {attempts} attempts: {last}");
     Err(last)
 }
 
@@ -487,15 +562,6 @@ async fn recv(ws: &mut Ws) -> Result<PairFrame, String> {
             Some(Ok(_)) => continue,
             Some(Err(e)) => return Err(format!("ws: {e}")),
         }
-    }
-}
-
-/// [`recv`] with a deadline, so a stalled / hostile relay can't pin the app open
-/// waiting on a frame that never arrives.
-async fn recv_timeout(ws: &mut Ws, timeout: Duration) -> Result<PairFrame, String> {
-    match tokio::time::timeout(timeout, recv(ws)).await {
-        Ok(result) => result,
-        Err(_) => Err("timed out waiting for the gateway".into()),
     }
 }
 

@@ -24,9 +24,11 @@
 //! evicted over a soft cap so a churn of distinct source IPs can't grow the map
 //! without bound. Time is injectable so the math is tested without real sleeps.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{ConnectInfo, Request, State};
@@ -64,6 +66,27 @@ pub struct IpRateLimiter {
     rate_per_sec: f64,
     burst: f64,
     soft_cap: usize,
+    /// Latches the over-cap warn to one line per breach episode: set on the
+    /// first cap breach that eviction couldn't relieve (fires on the new-IP path,
+    /// i.e. during an active many-IP flood), re-armed once the map is back under
+    /// the cap.
+    over_cap_warned: AtomicBool,
+    /// Debounces the per-IP shed warn to one line per [`SHED_WARN_INTERVAL`] per
+    /// IP (with a suppressed count), so a single over-rate client is visible at
+    /// the default filter without a flood being able to spam warns through it.
+    shed_warned: parking_lot::Mutex<HashMap<IpAddr, ShedWarnEntry>>,
+}
+
+/// How often the per-IP shed emits at warn (per IP); sheds in between log at
+/// debug and are counted into the next warn's `suppressed` field.
+const SHED_WARN_INTERVAL: Duration = Duration::from_secs(60);
+/// Bound on the shed-warn debounce map; cleared wholesale when a new IP would
+/// exceed it (an occasional early re-warn beats unbounded growth).
+const SHED_WARN_MAX_KEYS: usize = 4096;
+
+struct ShedWarnEntry {
+    last_warn: Instant,
+    suppressed: u64,
 }
 
 impl IpRateLimiter {
@@ -73,6 +96,40 @@ impl IpRateLimiter {
             rate_per_sec,
             burst,
             soft_cap,
+            over_cap_warned: AtomicBool::new(false),
+            shed_warned: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether this shed for `ip` should log at warn: `Some(suppressed)` at most
+    /// once per [`SHED_WARN_INTERVAL`] per IP (with the count debounced since the
+    /// last warn), `None` in between (callers log at debug).
+    fn shed_should_warn(&self, ip: IpAddr, now: Instant) -> Option<u64> {
+        let mut warned = self.shed_warned.lock();
+        if warned.len() >= SHED_WARN_MAX_KEYS && !warned.contains_key(&ip) {
+            warned.clear();
+        }
+        match warned.get_mut(&ip) {
+            Some(entry) if now.duration_since(entry.last_warn) < SHED_WARN_INTERVAL => {
+                entry.suppressed += 1;
+                None
+            }
+            Some(entry) => {
+                let suppressed = entry.suppressed;
+                entry.last_warn = now;
+                entry.suppressed = 0;
+                Some(suppressed)
+            }
+            None => {
+                warned.insert(
+                    ip,
+                    ShedWarnEntry {
+                        last_warn: now,
+                        suppressed: 0,
+                    },
+                );
+                Some(0)
+            }
         }
     }
 
@@ -92,6 +149,20 @@ impl IpRateLimiter {
         // path, not for an already-tracked IP.
         if self.buckets.len() >= self.soft_cap {
             self.buckets.retain(|_, b| !b.is_full_at(now));
+            let tracked_ips = self.buckets.len();
+            if tracked_ips >= self.soft_cap {
+                if !self.over_cap_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        tracked_ips,
+                        soft_cap = self.soft_cap,
+                        "per-IP limiter bucket map exceeds its soft cap with no idle buckets to evict — sustained many-IP flood?"
+                    );
+                }
+            } else if self.over_cap_warned.load(Ordering::Relaxed) {
+                self.over_cap_warned.store(false, Ordering::Relaxed);
+            }
+        } else if self.over_cap_warned.load(Ordering::Relaxed) {
+            self.over_cap_warned.store(false, Ordering::Relaxed);
         }
         self.buckets
             .entry(ip)
@@ -234,15 +305,30 @@ pub fn resolve_client_ip_from(
     trusted_headers: &[HeaderName],
 ) -> Option<IpAddr> {
     for name in trusted_headers {
-        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
-            let first = value.split(',').next().unwrap_or("").trim();
-            if let Ok(ip) = first.parse::<IpAddr>() {
-                return Some(ip);
-            }
+        let Some(value) = headers.get(name) else {
+            continue;
+        };
+        let text = value.to_str().ok();
+        if let Some(first) = text.map(|s| s.split(',').next().unwrap_or("").trim())
+            && let Ok(ip) = first.parse::<IpAddr>()
+        {
+            return Some(ip);
         }
+        // The value is attacker-controllable — truncate before echoing it.
+        // `to_str` guarantees visible ASCII, so byte slicing can't split a char.
+        let shown = text.unwrap_or("<not ascii>");
+        tracing::debug!(
+            header = %name,
+            value_prefix = &shown[..shown.len().min(TRUSTED_HEADER_VALUE_LOG_MAX)],
+            "trusted client-IP header present but unparseable; falling back"
+        );
     }
     peer
 }
+
+/// Cap on how much of an unparseable trusted-header value the fallback debug log
+/// echoes — the value is attacker-controllable.
+const TRUSTED_HEADER_VALUE_LOG_MAX: usize = 64;
 
 /// Outermost pre-layer: throttle requests per client IP (flood backstop, ahead of
 /// admission). The client IP comes from the configured trusted proxy header(s) if
@@ -252,6 +338,27 @@ async fn limit_per_ip(State(state): State<IpLimitState>, req: Request, next: Nex
     if let Some(ip) = resolve_client_ip(&req, &state.trusted_headers)
         && !state.limiter.check(ip)
     {
+        // One warn per IP per interval (a single over-rate client stays visible
+        // at the default filter); the sheds in between log at debug so a flood
+        // can't spam the default-level log through this line.
+        let endpoint = crate::ip_traffic::endpoint_label(req.uri().path());
+        match state.limiter.shed_should_warn(ip, Instant::now()) {
+            Some(suppressed) => tracing::warn!(
+                %ip,
+                endpoint,
+                rate_per_sec = state.limiter.rate_per_sec,
+                burst = state.limiter.burst,
+                suppressed,
+                "per-IP rate limit exceeded; refusing with 429"
+            ),
+            None => tracing::debug!(
+                %ip,
+                endpoint,
+                rate_per_sec = state.limiter.rate_per_sec,
+                burst = state.limiter.burst,
+                "per-IP rate limit exceeded; refusing with 429"
+            ),
+        }
         return too_many();
     }
     next.run(req).await

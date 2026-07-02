@@ -91,6 +91,25 @@ pub struct RegisterPushResponse {
     pub device_id: String,
 }
 
+/// Refuse a `POST /v1/push/register` with a 400, leaving a gateway-side record:
+/// the app only shows a generic error, so this warn is the operator's sole
+/// evidence the register reached the gateway and why it was refused. Never log
+/// the delegation / push_key / apns_token values themselves.
+fn reject_register(device_id: &str, reason: &str) -> GatewayError {
+    tracing::warn!(device = %device_id, reason = %reason, "push: direct-mode register rejected");
+    GatewayError::BadRequest(reason.to_string())
+}
+
+/// Max chars of an unvalidated `device_id` echoed into a log line — a
+/// well-formed id is 68 chars (`ios-` + 64 hex); a pre-validation reject carries
+/// an arbitrary attacker-controlled string, so bound it.
+const DEVICE_ID_LOG_MAX_CHARS: usize = 72;
+
+/// Bounded, char-boundary-safe prefix of an unvalidated `device_id` for logging.
+fn device_id_log(device_id: &str) -> String {
+    device_id.chars().take(DEVICE_ID_LOG_MAX_CHARS).collect()
+}
+
 #[utoipa::path(
     post,
     path = "/push/register",
@@ -109,7 +128,10 @@ async fn register_push(
     // Recover the client's Ed25519 public key from its self-certifying device_id
     // (validates prefix / hex / length / point), then re-derive the canonical id.
     let device_pub = delegation::device_pubkey_from_id(req.device_id.trim()).map_err(|_| {
-        GatewayError::BadRequest("device_id is not a valid ios-<hex> identity".into())
+        reject_register(
+            &device_id_log(req.device_id.trim()),
+            "device_id is not a valid ios-<hex> identity",
+        )
     })?;
     let device_id = delegation::device_id_for(&device_pub);
 
@@ -120,26 +142,27 @@ async fn register_push(
         .await
         .map_err(|e| GatewayError::Internal(format!("load push signing key: {e}")))?;
     let deleg_bytes = hex::decode(req.delegation.trim())
-        .map_err(|_| GatewayError::BadRequest("delegation is not valid hex".into()))?;
+        .map_err(|_| reject_register(&device_id, "delegation is not valid hex"))?;
     let deleg_sig = delegation::signature_from_bytes(&deleg_bytes)
-        .map_err(|_| GatewayError::BadRequest("delegation is not a 64-byte signature".into()))?;
+        .map_err(|_| reject_register(&device_id, "delegation is not a 64-byte signature"))?;
     if !delegation::verify_delegation(&device_pub, &signing_key.verifying_key(), &deleg_sig) {
-        return Err(GatewayError::BadRequest(
-            "delegation does not authorize this gateway's push key".into(),
+        return Err(reject_register(
+            &device_id,
+            "delegation does not authorize this gateway's push key",
         ));
     }
     let deleg_arr: [u8; delegation::SIGNATURE_LEN] = deleg_bytes
         .as_slice()
         .try_into()
-        .map_err(|_| GatewayError::BadRequest("delegation is not a 64-byte signature".into()))?;
+        .map_err(|_| reject_register(&device_id, "delegation is not a 64-byte signature"))?;
 
     // Decode the preview AEAD key + APNs env.
     let push_key_bytes = hex::decode(req.push_key.trim())
-        .map_err(|_| GatewayError::BadRequest("push_key is not valid hex".into()))?;
+        .map_err(|_| reject_register(&device_id, "push_key is not valid hex"))?;
     let push_key: [u8; aead::KEY_LEN] = push_key_bytes
         .as_slice()
         .try_into()
-        .map_err(|_| GatewayError::BadRequest("push_key must be 32 bytes".into()))?;
+        .map_err(|_| reject_register(&device_id, "push_key must be 32 bytes"))?;
     let apns_env = match req.apns_env.trim() {
         "production" => ApnsEnv::Production,
         // Default unknown/empty to sandbox — the conservative pick (a sandbox
@@ -176,12 +199,22 @@ async fn register_push(
                 continue;
             }
             if let Err(e) = state.device_store.revoke(&row.device_id).await {
-                tracing::debug!(error = %e, device = %row.device_id, "push: revoke superseded device row failed");
+                tracing::warn!(
+                    device = %row.device_id,
+                    error = %e,
+                    "push: failed to revoke superseded device row during direct registration"
+                );
                 continue;
             }
             // The revoked row leaves the push fan-out's Leg 1; drop any matching
             // web binding + material so it also leaves Leg 2.
-            let _ = web::remove_binding(&state.secret_vault, &row.device_id).await;
+            if let Err(e) = web::remove_binding(&state.secret_vault, &row.device_id).await {
+                tracing::warn!(
+                    device = %row.device_id,
+                    error = %e,
+                    "push: failed to remove revoked device's web binding during supersede"
+                );
+            }
             revoked_rows.push(row.device_id);
         }
     }

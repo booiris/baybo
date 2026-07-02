@@ -28,9 +28,13 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use super::blob_content::run_blob_over_relay;
 use super::device_content::run_content_over_relay;
 use super::state::{LegDedup, WsChannelState};
+use remote_host_protocol::key_tag;
 use remote_host_protocol::relay::{LegClass, REMOTE_API_KEY_HEADER};
 
-use crate::relay::{ControlHello, ControlSignal, connect_control, load_or_create_relay_node_id};
+use crate::relay::{
+    ControlCloseFrame, ControlHello, ControlSignal, connect_control, control_error_detail,
+    load_or_create_relay_node_id, ws_error_detail,
+};
 
 /// Mean backoff between control-connection (re)dials. The actual wait is
 /// jittered around this (see [`reconnect_delay`]).
@@ -54,6 +58,20 @@ fn reconnect_delay() -> Duration {
 /// Cheap: one tiny libsql read per tick against a ≤1-row table.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// A control connection that stayed up at least this long before failing counts
+/// as having been healthy: the next failure opens a new warn cycle instead of
+/// being debounced as another back-to-back redial attempt.
+const HEALTHY_CONNECTION_MIN: Duration = Duration::from_secs(30);
+
+/// How one control connection ended, for the caller's disconnect log.
+enum ControlEnd {
+    /// The relay closed an established connection; the Close frame (when it
+    /// sent one) carries the relay's stated reason.
+    ClosedByRelay(Option<ControlCloseFrame>),
+    /// Torn down locally — device revoked/superseded or gateway shutdown.
+    TornDown,
+}
+
 /// The relay endpoint + admission key the gateway dials, resolved from the single
 /// approved device row.
 struct RelaySettings {
@@ -63,25 +81,44 @@ struct RelaySettings {
 
 /// Resolve the relay settings from the approved device row (one gateway = one
 /// app). `None` when no device is paired, or its row predates the recorded relay
-/// fields (empty — re-pair to populate).
-async fn approved_relay_settings(state: &WsChannelState) -> Option<RelaySettings> {
-    let row = state
-        .device_store
-        .list(Some(DeviceStatus::Approved))
-        .await
-        .ok()?
-        .into_iter()
-        .next()?;
+/// fields (empty — re-pair to populate). `no_relay_diagnosed` remembers which
+/// device the missing-fields condition was already reported for, so the
+/// permanent un-routability is surfaced once per device rather than every poll
+/// tick.
+async fn approved_relay_settings(
+    state: &WsChannelState,
+    no_relay_diagnosed: &mut Option<String>,
+) -> Option<RelaySettings> {
+    let rows = match state.device_store.list(Some(DeviceStatus::Approved)).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "relay-content: device store read failed; treating as no approved device"
+            );
+            *no_relay_diagnosed = None;
+            return None;
+        }
+    };
+    let Some(row) = rows.into_iter().next() else {
+        *no_relay_diagnosed = None;
+        return None;
+    };
     if row.relay_url.is_empty() || row.remote_api_key.is_empty() {
         // A paired device whose row predates the relay fields would otherwise idle
         // here forever with no diagnostic — distinct from the plain "no device
         // paired" case. Surface it so the silent un-routability is explainable.
-        tracing::debug!(
-            device = %row.device_id,
-            "relay-content: approved device has no relay_url/remote_api_key; re-pair to route + push",
-        );
+        if no_relay_diagnosed.as_deref() != Some(row.device_id.as_str()) {
+            tracing::info!(
+                device = %row.device_id,
+                "relay-content: approved device row lacks relay_url/remote_api_key; \
+                 relay + push disabled until re-pair",
+            );
+            *no_relay_diagnosed = Some(row.device_id.clone());
+        }
         return None;
     }
+    *no_relay_diagnosed = None;
     Some(RelaySettings {
         relay_url: row.relay_url,
         remote_api_key: row.remote_api_key,
@@ -107,6 +144,11 @@ async fn run(state: WsChannelState, shutdown: ShutdownSignal) {
     // failure at boot then retries on the next tick instead of permanently
     // disabling relay control (and thus chat reachability) for the whole process.
     let mut node_id_cache: Option<String> = None;
+    let mut no_relay_diagnosed: Option<String> = None;
+    let mut was_paired = false;
+    // Failures since the connection was last healthy: the first one of a cycle
+    // warns, the rest of the redial cycle stays at debug.
+    let mut consecutive_failures: u32 = 0;
     loop {
         if shutdown.is_shutdown() {
             break;
@@ -130,7 +172,8 @@ async fn run(state: WsChannelState, shutdown: ShutdownSignal) {
         };
         // Idle until a device is paired (and has recorded its relay settings),
         // but wake immediately on shutdown rather than after the full poll tick.
-        let Some(settings) = approved_relay_settings(&state).await else {
+        let Some(settings) = approved_relay_settings(&state, &mut no_relay_diagnosed).await else {
+            was_paired = false;
             tokio::select! {
                 _ = tokio::time::sleep(DEVICE_POLL_INTERVAL) => {}
                 _ = shutdown.wait() => break,
@@ -138,21 +181,123 @@ async fn run(state: WsChannelState, shutdown: ShutdownSignal) {
             continue;
         };
         let control_url = remote_host_protocol::relay::control_url(&settings.relay_url);
-        tracing::info!(
-            relay = %settings.relay_url,
-            "relay-content: device paired; holding control connection"
-        );
+        if !was_paired {
+            tracing::info!(
+                relay = %settings.relay_url,
+                "relay-content: device paired; holding control connection"
+            );
+            was_paired = true;
+            consecutive_failures = 0;
+        }
+        let healthy_cycle = consecutive_failures == 0;
+        let retry_in = reconnect_delay();
+        let attempt_started = std::time::Instant::now();
         // `run_once` owns its child tasks (the control pump + per-signal data
         // legs) and drains them on return, so it is *not* wrapped in a cancelling
         // select! here — it handles `shutdown` internally and returns cleanly.
-        if let Err(e) = run_once(&state, &settings, &control_url, &relay_node_id, &shutdown).await {
-            tracing::debug!(error = %e, "relay-content: control connection ended");
+        match run_once(
+            &state,
+            &settings,
+            &control_url,
+            &relay_node_id,
+            &shutdown,
+            &mut no_relay_diagnosed,
+            healthy_cycle,
+        )
+        .await
+        {
+            Ok(ControlEnd::ClosedByRelay(close)) => {
+                // A connection that died before HEALTHY_CONNECTION_MIN counts
+                // toward the failure cycle even though the relay closed it
+                // "cleanly" — a connect-then-die loop must go quiet after its
+                // first visible line, not repeat at info every redial.
+                let was_healthy = attempt_started.elapsed() >= HEALTHY_CONNECTION_MIN;
+                if was_healthy {
+                    if consecutive_failures > 0 {
+                        tracing::info!(
+                            relay = %settings.relay_url,
+                            relay_node_id = %relay_node_id,
+                            "relay-content: control connection recovered"
+                        );
+                    }
+                    consecutive_failures = 0;
+                }
+                let close_code = close.as_ref().map(|f| f.code);
+                let close_reason = close
+                    .as_ref()
+                    .map(|f| f.reason.as_str())
+                    .unwrap_or_default();
+                if was_healthy {
+                    tracing::info!(
+                        relay = %settings.relay_url,
+                        relay_node_id = %relay_node_id,
+                        close_code = ?close_code,
+                        close_reason = %close_reason,
+                        "relay-content: control connection closed by relay; redialing"
+                    );
+                } else if consecutive_failures == 0 {
+                    tracing::warn!(
+                        relay = %settings.relay_url,
+                        relay_node_id = %relay_node_id,
+                        close_code = ?close_code,
+                        close_reason = %close_reason,
+                        "relay-content: control connection closed by relay; redialing"
+                    );
+                } else {
+                    tracing::debug!(
+                        relay = %settings.relay_url,
+                        relay_node_id = %relay_node_id,
+                        close_code = ?close_code,
+                        close_reason = %close_reason,
+                        "relay-content: control connection closed by relay; redialing"
+                    );
+                }
+                if !was_healthy {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                }
+            }
+            Ok(ControlEnd::TornDown) => {
+                consecutive_failures = 0;
+            }
+            Err(e) => {
+                let was_healthy = attempt_started.elapsed() >= HEALTHY_CONNECTION_MIN;
+                if was_healthy {
+                    if consecutive_failures > 0 {
+                        tracing::info!(
+                            relay = %settings.relay_url,
+                            relay_node_id = %relay_node_id,
+                            "relay-content: control connection recovered"
+                        );
+                    }
+                    consecutive_failures = 0;
+                }
+                if consecutive_failures == 0 {
+                    tracing::warn!(
+                        relay = %settings.relay_url,
+                        key_tag = %key_tag(&settings.remote_api_key),
+                        relay_node_id = %relay_node_id,
+                        error = %e,
+                        retry_in = ?retry_in,
+                        "relay-content: control connection failed; redialing"
+                    );
+                } else {
+                    tracing::debug!(
+                        relay = %settings.relay_url,
+                        key_tag = %key_tag(&settings.remote_api_key),
+                        relay_node_id = %relay_node_id,
+                        error = %e,
+                        retry_in = ?retry_in,
+                        "relay-content: control connection failed; redialing"
+                    );
+                }
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
         }
         if shutdown.is_shutdown() {
             break;
         }
         tokio::select! {
-            _ = tokio::time::sleep(reconnect_delay()) => {}
+            _ = tokio::time::sleep(retry_in) => {}
             _ = shutdown.wait() => break,
         }
     }
@@ -174,7 +319,9 @@ async fn run_once(
     control_url: &str,
     relay_node_id: &str,
     shutdown: &ShutdownSignal,
-) -> Result<(), String> {
+    no_relay_diagnosed: &mut Option<String>,
+    healthy_cycle: bool,
+) -> Result<ControlEnd, String> {
     let (tx, mut rx) = mpsc::channel::<ControlSignal>(32);
     let pump = tokio::spawn({
         let hello = ControlHello {
@@ -182,7 +329,7 @@ async fn run_once(
         };
         let control_url = control_url.to_owned();
         let remote_api_key = settings.remote_api_key.clone();
-        async move { connect_control(&control_url, &remote_api_key, &hello, tx).await }
+        async move { connect_control(&control_url, &remote_api_key, &hello, tx, healthy_cycle).await }
     });
 
     // In-flight content data legs. Tracked (not detached) so they're aborted when
@@ -202,6 +349,11 @@ async fn run_once(
         tokio::select! {
             signal = rx.recv() => match signal {
                 Some(ControlSignal::OpenDataLeg { relay_key, class }) => {
+                    tracing::info!(
+                        class = ?class,
+                        relay_key = %key_tag(&relay_key),
+                        "relay-content: OpenDataLeg received; dialing content host leg"
+                    );
                     let state = state.clone();
                     let relay_url = settings.relay_url.clone();
                     let remote_api_key = settings.remote_api_key.clone();
@@ -226,7 +378,12 @@ async fn run_once(
                 None => break,
             },
             _ = poll.tick() => {
-                if approved_relay_settings(state).await.is_none() {
+                if approved_relay_settings(state, no_relay_diagnosed).await.is_none() {
+                    tracing::info!(
+                        relay = %settings.relay_url,
+                        "relay-content: no approved relay device (revoked, superseded, or store \
+                         read failed); tearing down control connection"
+                    );
                     pump.abort();
                     pump_aborted = true;
                     break;
@@ -249,10 +406,19 @@ async fn run_once(
     // fine; awaiting it keeps the drain bounded and leaves nothing detached.
     legs.shutdown().await;
 
-    match pump.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(e) if pump_aborted && e.is_cancelled() => Ok(()),
+    let outcome = pump.await;
+    if pump_aborted {
+        // Even if the pump ended on its own right as we tore it down, this was a
+        // local teardown from the caller's perspective.
+        return match outcome {
+            Ok(_) => Ok(ControlEnd::TornDown),
+            Err(e) if e.is_cancelled() => Ok(ControlEnd::TornDown),
+            Err(e) => Err(format!("control task panicked: {e}")),
+        };
+    }
+    match outcome {
+        Ok(Ok(close)) => Ok(ControlEnd::ClosedByRelay(close)),
+        Ok(Err(e)) => Err(control_error_detail(&e)),
         Err(e) => Err(format!("control task panicked: {e}")),
     }
 }
@@ -272,6 +438,7 @@ async fn open_data_leg(
     class: LegClass,
     ah_rx: tokio::sync::oneshot::Receiver<tokio::task::AbortHandle>,
 ) {
+    let started = std::time::Instant::now();
     let url = remote_host_protocol::relay::content_host_url(relay_url, relay_key);
     let mut req = match url.into_client_request() {
         Ok(r) => r,
@@ -292,10 +459,21 @@ async fn open_data_leg(
     let ws = match connect_async(req).await {
         Ok((ws, _)) => ws,
         Err(e) => {
-            tracing::debug!(error = %e, "relay-content: data-leg connect failed");
+            tracing::warn!(
+                class = ?class,
+                relay_key = %key_tag(relay_key),
+                relay = %relay_url,
+                error = %ws_error_detail(&e),
+                "relay-content: data-leg connect failed; phone waiting at relay will not be served"
+            );
             return;
         }
     };
+    tracing::info!(
+        class = ?class,
+        relay_key = %key_tag(relay_key),
+        "relay-content: data leg established"
+    );
     match class {
         // Blob legs run **concurrently** — one per transfer — so they are NOT
         // deduped: a second blob transfer for the same device must not abort the
@@ -316,6 +494,12 @@ async fn open_data_leg(
             run_content_over_relay(ws, state, dedup).await;
         }
     }
+    tracing::info!(
+        class = ?class,
+        relay_key = %key_tag(relay_key),
+        duration = ?started.elapsed(),
+        "relay-content: data leg ended"
+    );
 }
 
 #[cfg(test)]

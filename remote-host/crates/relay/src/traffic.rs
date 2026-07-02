@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use parking_lot::Mutex;
 use remote_host_edge::IpByteMeter;
+use remote_host_protocol::key_tag;
 
 use crate::bandwidth::BandwidthLimiter;
 
@@ -217,6 +218,14 @@ impl TrafficRegistry {
             );
             Some(counters)
         } else {
+            // Fires once per refused leg (`meter_for` runs at leg setup, never
+            // per frame), so it can't flood the log.
+            tracing::warn!(
+                key_tag = %key_tag(remote_api_key),
+                server_id = %server_id,
+                cap,
+                "relay: traffic registry at capacity; issuing inert meter (bytes for this pair will be unaccounted)"
+            );
             None
         };
         TrafficMeter {

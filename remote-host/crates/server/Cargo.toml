@@ -21,6 +21,9 @@ thiserror = { workspace = true }
 remote-host-push = { workspace = true }
 remote-host-relay = { workspace = true }
 remote-host-admission = { workspace = true }
+# `key_tag`, the shared redacted log form of a `remote_api_key` — logs carry the
+# tag, never the raw key.
+remote-host-protocol = { workspace = true }
 # The shared per-IP request throttle config mounted on both routers.
 remote-host-edge = { workspace = true }
 # The dashboard transport crate: its `Range` drives the traffic read queries

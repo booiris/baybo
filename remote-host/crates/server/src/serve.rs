@@ -35,14 +35,20 @@ impl TlsPaths {
     }
 }
 
+/// Each variant names the listener (`addr`) it failed on — with the relay and
+/// dashboard listeners running under one `try_join!`, either one's failure kills
+/// both, and the fatal log line must say which address died.
 #[derive(Debug, Error)]
 pub(crate) enum ServeError {
     #[error("invalid bind address {addr}: {reason}")]
     BindAddr { addr: String, reason: String },
-    #[error("load TLS cert/key: {0}")]
-    Tls(String),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+    #[error("listener {addr}: load TLS cert/key: {reason}")]
+    Tls { addr: String, reason: String },
+    #[error("listener {addr}: {source}")]
+    Io {
+        addr: String,
+        source: std::io::Error,
+    },
 }
 
 /// Bind `bind_addr` and serve `router` — over rustls when `tls` is `Some`, else
@@ -52,6 +58,10 @@ pub(crate) async fn serve(
     tls: Option<TlsPaths>,
     router: Router,
 ) -> Result<(), ServeError> {
+    let io_err = |e: std::io::Error| ServeError::Io {
+        addr: bind_addr.to_owned(),
+        source: e,
+    };
     let addr: SocketAddr =
         bind_addr
             .parse()
@@ -71,18 +81,23 @@ pub(crate) async fn serve(
             let config =
                 axum_server::tls_rustls::RustlsConfig::from_pem_file(&paths.cert, &paths.key)
                     .await
-                    .map_err(|e| ServeError::Tls(e.to_string()))?;
+                    .map_err(|e| ServeError::Tls {
+                        addr: bind_addr.to_owned(),
+                        reason: e.to_string(),
+                    })?;
             axum_server::bind_rustls(addr, config)
                 .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                .await?;
+                .await
+                .map_err(io_err)?;
         }
         None => {
-            let listener = tokio::net::TcpListener::bind(addr).await?;
+            let listener = tokio::net::TcpListener::bind(addr).await.map_err(io_err)?;
             axum::serve(
                 listener,
                 router.into_make_service_with_connect_info::<SocketAddr>(),
             )
-            .await?;
+            .await
+            .map_err(io_err)?;
         }
     }
     Ok(())
