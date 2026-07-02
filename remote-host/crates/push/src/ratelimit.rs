@@ -86,7 +86,13 @@ impl NotifyRateLimiter {
     fn check_at(&self, device_id: &str, now: Instant) -> bool {
         let mut buckets = self.buckets.lock();
         if buckets.len() >= self.soft_cap {
+            let before = buckets.len();
             buckets.retain(|_, b| !b.is_full_at(now));
+            tracing::debug!(
+                evicted = before - buckets.len(),
+                soft_cap = self.soft_cap,
+                "push: notify rate-limiter bucket map swept at soft cap"
+            );
         }
         buckets
             .entry(device_id.to_string())

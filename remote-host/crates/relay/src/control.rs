@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
+use remote_host_protocol::key_tag;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -38,9 +39,11 @@ struct ControlEntry {
     token: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlRegisterError {
-    OwnerMismatch,
+    /// The `relay_node_id` is already registered to a different key; `owner` is
+    /// the registered entry's `remote_api_key` (log it only via [`key_tag`]).
+    OwnerMismatch { owner: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,10 +77,17 @@ impl ControlRegistry {
         let (tx, rx) = mpsc::channel(CONTROL_CHANNEL_CAP);
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let mut instances = self.instances.lock();
-        if let Some(existing) = instances.get(relay_node_id)
-            && existing.remote_api_key != remote_api_key
-        {
-            return Err(ControlRegisterError::OwnerMismatch);
+        if let Some(existing) = instances.get(relay_node_id) {
+            if existing.remote_api_key != remote_api_key {
+                return Err(ControlRegisterError::OwnerMismatch {
+                    owner: existing.remote_api_key.clone(),
+                });
+            }
+            tracing::debug!(
+                relay_node_id = %relay_node_id,
+                key_tag = %key_tag(remote_api_key),
+                "control: new registration superseded a live control connection for this relay_node_id"
+            );
         }
         instances.insert(
             relay_node_id.to_string(),
@@ -234,10 +244,10 @@ mod tests {
     fn different_key_cannot_replace_registered_node() {
         let reg = ControlRegistry::new();
         let (_rx, _token) = reg.register("node-1", "inst-A").unwrap();
-        assert_eq!(
-            reg.register("node-1", "inst-B").unwrap_err(),
-            ControlRegisterError::OwnerMismatch
-        );
+        assert!(matches!(
+            reg.register("node-1", "inst-B"),
+            Err(ControlRegisterError::OwnerMismatch { owner }) if owner == "inst-A"
+        ));
         assert_eq!(
             reg.signal_open("node-1", "inst-B", "leg-abc", LegClass::Chat),
             Err(SignalOpenError::OwnerMismatch)

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use libsql::{Builder, params};
 use remote_host_admission::{AdmissionEntry, InMemoryAdmission};
+use remote_host_protocol::key_tag;
 
 /// Source-of-truth table: one row per admitted `remote_api_key`. `label` +
 /// `created_at` are for whoever administers it. `max_conns` + `max_bps` are
@@ -97,11 +98,26 @@ pub(crate) async fn open(
 
     let admission = Arc::new(InMemoryAdmission::new());
     // Initial load: nothing was admitted before, so nothing to revoke.
-    let _ = admission.replace_all(load(&write_conn).await?);
+    let initial = load(&write_conn).await?;
+    let keys_admitted = initial.len();
+    let _ = admission.replace_all(initial);
+    tracing::info!(
+        keys_admitted,
+        path,
+        poll_secs = poll.as_secs(),
+        "remote-host: admission allow-list loaded"
+    );
+    if keys_admitted == 0 {
+        tracing::warn!(
+            path,
+            "remote-host: admission allow-list is EMPTY — every relay connection will be refused; admit keys via the dashboard"
+        );
+    }
 
     let read_conn = db.connect()?;
     let admission_poll = admission.clone();
     let on_revoke_poll = on_revoke.clone();
+    let poll_path = path.to_owned();
     tokio::spawn(async move {
         // Hold `_db` for the task's life: it keeps BOTH the moved `read_conn` here
         // AND the `write_conn` returned to the caller valid (a libsql `Connection`
@@ -110,16 +126,36 @@ pub(crate) async fn open(
         let _db = db;
         let mut tick = tokio::time::interval(poll);
         tick.tick().await; // the first tick is immediate; we already loaded once
+        let mut consecutive_failures: u32 = 0;
         loop {
             tick.tick().await;
             match load(&read_conn).await {
                 Ok(keys) => {
+                    if consecutive_failures > 0 {
+                        tracing::info!(
+                            path = %poll_path,
+                            consecutive_failures,
+                            "remote-host: admission poll recovered"
+                        );
+                        consecutive_failures = 0;
+                    }
+                    let loaded = keys.len();
+                    let before = admission_poll.len();
                     let revoked = admission_poll.replace_all(keys);
+                    log_reload_diff("poll", loaded, before, &revoked);
                     if !revoked.is_empty() {
                         on_revoke_poll(revoked);
                     }
                 }
-                Err(e) => tracing::error!(error = %e, "remote-host: admission poll failed"),
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    tracing::error!(
+                        error = %e,
+                        path = %poll_path,
+                        consecutive_failures,
+                        "remote-host: admission poll failed; serving the last successfully loaded allow-list"
+                    );
+                }
             }
         }
     });
@@ -141,7 +177,11 @@ impl AdmissionDb {
     /// connection, no poll-interval wait), firing `on_revoke` for any key the reload
     /// dropped — used right after a dashboard mutation so revokes take effect at once.
     pub(crate) async fn force_reload(&self) -> Result<(), AdmissionDbError> {
-        let revoked = self.admission.replace_all(load(&self.write_conn).await?);
+        let keys = load(&self.write_conn).await?;
+        let loaded = keys.len();
+        let before = self.admission.len();
+        let revoked = self.admission.replace_all(keys);
+        log_reload_diff("force_reload", loaded, before, &revoked);
         if !revoked.is_empty() {
             (self.on_revoke)(revoked);
         }
@@ -331,6 +371,33 @@ pub(crate) fn generate_remote_api_key() -> String {
         "{GENERATED_KEY_PREFIX}{}",
         hex::encode(rand::random::<[u8; GENERATED_KEY_BYTES]>())
     )
+}
+
+/// Log what one reload (poll tick or dashboard `force_reload`) changed; quiet
+/// when the admitted set is unchanged. A key absent from the new set was deleted
+/// out-of-band OR just crossed its `expires_at` (the load query filters expired
+/// rows, so runtime expiry surfaces here as revocation). The revoked keys' live
+/// connections are kicked by the caller's `on_revoke` hook right after this.
+fn log_reload_diff(trigger: &str, keys_admitted: usize, before: usize, revoked: &HashSet<String>) {
+    let added = (keys_admitted + revoked.len()).saturating_sub(before);
+    if !revoked.is_empty() {
+        let revoked_key_tags: Vec<String> = revoked.iter().map(|k| key_tag(k)).collect();
+        tracing::info!(
+            trigger,
+            keys_admitted,
+            added,
+            revoked = revoked.len(),
+            revoked_key_tags = ?revoked_key_tags,
+            "remote-host: admission reload — keys lost admission (deleted or expired); kicking their live relay connections"
+        );
+    } else if added > 0 {
+        tracing::info!(
+            trigger,
+            keys_admitted,
+            added,
+            "remote-host: admission reload — new keys admitted"
+        );
+    }
 }
 
 async fn load(conn: &libsql::Connection) -> Result<HashMap<String, AdmissionEntry>, libsql::Error> {

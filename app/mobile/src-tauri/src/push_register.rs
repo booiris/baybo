@@ -97,18 +97,30 @@ extern "C-unwind" fn did_register(
     set_apns_token(hex::encode(data.to_vec()));
 }
 
-/// iOS reports APNs registration failure here; log and leave the token unset.
-/// There is no in-callback retry, but the app re-arms `register` on the next
-/// foreground while no token is held (see the `Resumed` handler), so a transient
-/// launch-time failure recovers without a relaunch.
+/// iOS reports APNs registration failure here; log the NSError's reason and leave
+/// the token unset. There is no in-callback retry, but the app re-arms `register`
+/// on the next foreground while no token is held (see the `Resumed` handler), so a
+/// transient launch-time failure recovers without a relaunch.
 #[cfg(target_os = "ios")]
 extern "C-unwind" fn did_fail(
     _this: *mut objc2::runtime::AnyObject,
     _cmd: objc2::runtime::Sel,
     _app: *mut objc2::runtime::AnyObject,
-    _error: *mut objc2_foundation::NSError,
+    error: *mut objc2_foundation::NSError,
 ) {
-    eprintln!("baybo: APNs registration failed");
+    if error.is_null() {
+        log::warn!(
+            "APNs registration failed (no error detail; token stays unset, re-armed on next foreground)"
+        );
+        return;
+    }
+    let error: &objc2_foundation::NSError = unsafe { &*error };
+    log::warn!(
+        "APNs registration failed: {}#{} {} (token stays unset; re-armed on next foreground)",
+        error.domain(),
+        error.code(),
+        error.localizedDescription()
+    );
 }
 
 /// Add the two APNs delegate callbacks to the live app-delegate's class.
@@ -124,7 +136,7 @@ fn install_token_capture(app: &objc2_ui_kit::UIApplication) {
 
     let delegate: *mut AnyObject = unsafe { msg_send![app, delegate] };
     if delegate.is_null() {
-        eprintln!("baybo: no app delegate; APNs token capture not installed");
+        log::warn!("no app delegate; APNs token capture not installed");
         return;
     }
     let cls = unsafe { ffi::object_getClass(delegate) } as *mut AnyClass;
@@ -165,8 +177,8 @@ fn install_token_capture(app: &objc2_ui_kit::UIApplication) {
             TYPES.as_ptr(),
         );
         if !added.as_bool() {
-            eprintln!(
-                "baybo: APNs token capture not installed (delegate already implements the callback)"
+            log::warn!(
+                "APNs token capture not installed (delegate already implements the callback)"
             );
         }
         let _ = ffi::class_addMethod(

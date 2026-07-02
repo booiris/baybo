@@ -16,7 +16,7 @@
 //! drained entries — re-creating an entry on a later send keeps accumulating into
 //! the same durable row.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use parking_lot::Mutex;
 
@@ -71,12 +71,19 @@ struct Entry {
     idle_epochs: u32,
 }
 
+/// Bound on the dropped-at-cap warn dedup set; past it the set is cleared (an
+/// occasional repeat warn beats unbounded growth).
+const REFUSED_WARN_DEDUP_CAP: usize = 1024;
+
 /// Per-device push send/byte counters, bounded by [`DEFAULT_PUSH_MAX_TRACKED`] and
 /// reclaimed by the flush task's idle eviction.
 pub struct PushTrafficRegistry {
     map: Mutex<HashMap<String, Entry>>,
     max_tracked: usize,
     idle_evict_epochs: u32,
+    /// Devices whose dropped-at-cap warn already fired, so a refused device warns
+    /// once instead of once per send.
+    refused_warned: Mutex<HashSet<String>>,
 }
 
 impl Default for PushTrafficRegistry {
@@ -87,11 +94,7 @@ impl Default for PushTrafficRegistry {
 
 impl PushTrafficRegistry {
     pub fn new() -> Self {
-        Self {
-            map: Mutex::new(HashMap::new()),
-            max_tracked: DEFAULT_PUSH_MAX_TRACKED,
-            idle_evict_epochs: DEFAULT_PUSH_IDLE_EVICT_EPOCHS,
-        }
+        Self::with_limits(DEFAULT_PUSH_MAX_TRACKED, DEFAULT_PUSH_IDLE_EVICT_EPOCHS)
     }
 
     /// Construct with explicit bounds (tests exercise the cap + eviction cheaply).
@@ -100,6 +103,7 @@ impl PushTrafficRegistry {
             map: Mutex::new(HashMap::new()),
             max_tracked: max_tracked.max(1),
             idle_evict_epochs,
+            refused_warned: Mutex::new(HashSet::new()),
         }
     }
 
@@ -113,6 +117,17 @@ impl PushTrafficRegistry {
         } else if map.len() < self.max_tracked {
             map.entry(device_id.to_string()).or_default()
         } else {
+            let mut warned = self.refused_warned.lock();
+            if warned.len() >= REFUSED_WARN_DEDUP_CAP {
+                warned.clear();
+            }
+            if warned.insert(device_id.to_string()) {
+                tracing::warn!(
+                    device_id,
+                    max_tracked = self.max_tracked,
+                    "push: traffic ledger at cap — send not recorded for new device"
+                );
+            }
             return;
         };
         entry.live.sends = entry.live.sends.saturating_add(1);

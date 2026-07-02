@@ -107,7 +107,10 @@ pub(crate) async fn list_bindings(vault: &SecretVault) -> Vec<WebPushBinding> {
     let names = match vault.list_names().await {
         Ok(names) => names,
         Err(e) => {
-            tracing::debug!(error = %e, "push: list web bindings failed");
+            tracing::warn!(
+                error = %e,
+                "push: enumerating web push bindings failed; web targets skipped this turn"
+            );
             return Vec::new();
         }
     };
@@ -119,7 +122,11 @@ pub(crate) async fn list_bindings(vault: &SecretVault) -> Vec<WebPushBinding> {
         match vault.get_typed::<WebPushBinding>(&name).await {
             Ok(Some(b)) => out.push(b),
             Ok(None) => {}
-            Err(e) => tracing::debug!(error = %e, name = %name, "push: skip malformed web binding"),
+            Err(e) => tracing::warn!(
+                name = %name,
+                error = %e,
+                "push: web push binding record is malformed; device excluded from push fan-out"
+            ),
         }
     }
     out
@@ -166,7 +173,13 @@ pub(crate) async fn supersede_other_bindings(vault: &SecretVault, keep: &str) ->
         match remove_binding(vault, &binding.device_id).await {
             Ok(()) => removed.push(binding.device_id),
             Err(e) => {
-                tracing::debug!(error = %e, device = %binding.device_id, "push: supersede remove failed")
+                tracing::warn!(
+                    device = %binding.device_id,
+                    kept = %keep,
+                    error = %e,
+                    "push: failed to remove superseded web binding; previous device may keep \
+                     receiving pushes"
+                )
             }
         }
     }

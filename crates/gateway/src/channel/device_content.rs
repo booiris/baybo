@@ -308,7 +308,12 @@ impl DeviceControl {
         else {
             return false;
         };
+        let device = self.device_id.as_str();
         if apns_token.is_empty() {
+            tracing::debug!(
+                device = %device,
+                "push: device sent empty APNs token; registration unchanged"
+            );
             return true;
         }
         let apns_env = match apns_env.as_str() {
@@ -329,10 +334,27 @@ impl DeviceControl {
                     )
                     .await
                 {
-                    tracing::debug!(error = %e, "push: persist updated apns token failed");
+                    tracing::warn!(
+                        device = %device,
+                        error = %e,
+                        "push: failed to persist rotated APNs token; pushes will target the \
+                         stale token"
+                    );
+                } else {
+                    tracing::info!(
+                        device = %device,
+                        apns_env = ?apns_env,
+                        token_len = apns_token.len(),
+                        "push: device APNs token updated from content leg"
+                    );
                 }
             }
-            Err(e) => tracing::debug!(error = %e, "push: encode updated apns registration failed"),
+            Err(e) => tracing::warn!(
+                device = %device,
+                error = %e,
+                "push: failed to encode rotated APNs registration; pushes will target the \
+                 stale token"
+            ),
         }
         true
     }

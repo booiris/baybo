@@ -35,12 +35,20 @@ fn apns_url(env: ApnsEnv, device_token: &str) -> String {
     format!("https://{}/3/device/{}", host(env), device_token)
 }
 
+/// APNs "accepted" HTTP status.
+const APNS_STATUS_OK: u16 = 200;
+
 /// Map an APNs HTTP response to a normalized [`ApnsOutcome`]. APNs returns `200`
 /// on accept; `410 Unregistered` (body carries a `timestamp` ms honored before
 /// deleting) and `400 BadDeviceToken` mean prune; everything else is retryable.
-fn classify(status: u16, reason: Option<&str>, timestamp_ms: Option<u64>) -> ApnsOutcome {
+fn classify(
+    status: u16,
+    reason: Option<&str>,
+    timestamp_ms: Option<u64>,
+    apns_id: Option<String>,
+) -> ApnsOutcome {
     match status {
-        200 => ApnsOutcome::Delivered,
+        APNS_STATUS_OK => ApnsOutcome::Delivered { apns_id },
         410 => ApnsOutcome::Unregistered {
             timestamp_ms: timestamp_ms.unwrap_or(0),
         },
@@ -67,6 +75,7 @@ fn parse_error_body(body: &[u8]) -> (Option<String>, Option<u64>) {
 impl ApnsSender for HttpApnsSender {
     async fn send(&self, req: ApnsRequest) -> ApnsOutcome {
         let url = apns_url(req.env, &req.device_token);
+        let token_len = req.device_token.len();
         let resp = self
             .client
             .post(&url)
@@ -81,13 +90,45 @@ impl ApnsSender for HttpApnsSender {
         match resp {
             Ok(r) => {
                 let status = r.status().as_u16();
-                let (reason, timestamp_ms) = match r.bytes().await {
-                    Ok(b) => parse_error_body(&b),
-                    Err(_) => (None, None),
+                // `apns-id` is Apple's per-notification trace id — the only handle
+                // for escalating a delivery question to Apple.
+                let apns_id = r
+                    .headers()
+                    .get("apns-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let (reason, timestamp_ms, body_read) = match r.bytes().await {
+                    Ok(b) => {
+                        let (reason, ts) = parse_error_body(&b);
+                        (reason, ts, true)
+                    }
+                    Err(_) => (None, None, false),
                 };
-                classify(status, reason.as_deref(), timestamp_ms)
+                if status != APNS_STATUS_OK {
+                    tracing::debug!(
+                        status,
+                        reason = reason
+                            .as_deref()
+                            .unwrap_or(if body_read { "<none>" } else { "<unreadable body>" }),
+                        apns_id = apns_id.as_deref().unwrap_or("<none>"),
+                        env = ?req.env,
+                        token_len,
+                        "push: APNs response"
+                    );
+                }
+                classify(status, reason.as_deref(), timestamp_ms, apns_id)
             }
-            Err(e) => ApnsOutcome::TransientError(e.to_string()),
+            Err(e) => {
+                // reqwest's Display embeds the request URL, whose path carries the
+                // device token — strip it before the string is logged or bubbled.
+                let e = e.without_url();
+                tracing::warn!(
+                    host = host(req.env),
+                    error = %e,
+                    "push: APNs HTTP request failed (transport)"
+                );
+                ApnsOutcome::TransientError(e.to_string())
+            }
         }
     }
 }
@@ -110,29 +151,38 @@ mod tests {
 
     #[test]
     fn classify_maps_each_apns_status() {
-        assert_eq!(classify(200, None, None), ApnsOutcome::Delivered);
         assert_eq!(
-            classify(400, Some("BadDeviceToken"), None),
+            classify(APNS_STATUS_OK, None, None, Some("apns-id-1".into())),
+            ApnsOutcome::Delivered {
+                apns_id: Some("apns-id-1".into()),
+            },
+        );
+        assert_eq!(
+            classify(APNS_STATUS_OK, None, None, None),
+            ApnsOutcome::Delivered { apns_id: None },
+        );
+        assert_eq!(
+            classify(400, Some("BadDeviceToken"), None, None),
             ApnsOutcome::BadDeviceToken,
         );
         assert_eq!(
-            classify(410, Some("Unregistered"), Some(1_700_000_000_000)),
+            classify(410, Some("Unregistered"), Some(1_700_000_000_000), None),
             ApnsOutcome::Unregistered {
                 timestamp_ms: 1_700_000_000_000,
             },
         );
         // A 410 with no body timestamp still prunes (epoch 0).
         assert_eq!(
-            classify(410, None, None),
+            classify(410, None, None, None),
             ApnsOutcome::Unregistered { timestamp_ms: 0 },
         );
         // A non-BadDeviceToken 400 and a 5xx are both transient (don't prune).
         assert!(matches!(
-            classify(400, Some("PayloadTooLarge"), None),
+            classify(400, Some("PayloadTooLarge"), None, None),
             ApnsOutcome::TransientError(_),
         ));
         assert!(matches!(
-            classify(503, None, None),
+            classify(503, None, None, None),
             ApnsOutcome::TransientError(_),
         ));
     }

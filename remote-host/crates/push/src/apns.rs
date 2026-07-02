@@ -44,8 +44,10 @@ pub struct ApnsRequest {
 /// Normalized outcome of an APNs send across transports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApnsOutcome {
-    /// 200 — accepted by APNs.
-    Delivered,
+    /// 200 — accepted by APNs. `apns_id` is Apple's per-notification trace id
+    /// (the `apns-id` response header) — the only handle for escalating a
+    /// delivery question to Apple.
+    Delivered { apns_id: Option<String> },
     /// 400 `BadDeviceToken` — unbind the token. (P3 distinguishes a genuine
     /// dead token from an env-mismatch 400; here both prune.)
     BadDeviceToken,

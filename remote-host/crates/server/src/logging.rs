@@ -26,10 +26,13 @@ const LOG_FILE_SUFFIX: &str = "log";
 /// disk use without an external logrotate.
 const LOG_RETENTION_DAYS: usize = 14;
 /// Default `RUST_LOG` when the env var is unset: dependencies silenced to `warn`,
-/// our own crates at `info`. Keep these targets in sync with the crate names
-/// (`remote-host` → `remote_host`, etc.).
-const DEFAULT_LOG_FILTER: &str =
-    "warn,remote_host=info,remote_host_relay=info,remote_host_push=info";
+/// our own crates at `info`. Every workspace crate's target is listed explicitly
+/// (crate `remote-host-edge` → target `remote_host_edge`, etc.) — when a crate is
+/// added or renamed, add/update its directive here rather than relying on
+/// `remote_host=info` prefix-matching the rest.
+const DEFAULT_LOG_FILTER: &str = "warn,remote_host=info,remote_host_relay=info,\
+     remote_host_push=info,remote_host_edge=info,remote_host_admission=info,\
+     remote_host_dashboard=info";
 
 /// Install the global subscriber. Returns a [`WorkerGuard`] that the caller MUST
 /// keep alive for the process lifetime — dropping it flushes and stops the
@@ -37,13 +40,16 @@ const DEFAULT_LOG_FILTER: &str =
 /// opened: logging then falls back to stderr only, and the service still runs.
 #[must_use]
 pub(crate) fn init() -> Option<WorkerGuard> {
-    // A fresh `EnvFilter` per layer — `EnvFilter` isn't `Clone`, and re-reading
-    // the env each time is harmless. A blank `RUST_LOG` (Docker Compose passes
-    // `${RUST_LOG:-}` as the empty string, which is a *valid* empty filter that
-    // would silence every event) is treated as unset so the documented default
-    // applies; an unparseable value falls back too.
+    // A fresh `EnvFilter` per layer — `EnvFilter` isn't `Clone`. A blank
+    // `RUST_LOG` (Docker Compose passes `${RUST_LOG:-}` as the empty string,
+    // which is a *valid* empty filter that would silence every event) is treated
+    // as unset so the documented default applies; an unparseable value falls
+    // back too, remembered here and warned about after `.init()` (nothing can
+    // log before the subscriber exists).
+    let directives = std::env::var("RUST_LOG").unwrap_or_default();
+    let invalid_rust_log =
+        !directives.trim().is_empty() && EnvFilter::try_new(&directives).is_err();
     let filter = || {
-        let directives = std::env::var("RUST_LOG").unwrap_or_default();
         if directives.trim().is_empty() {
             EnvFilter::new(DEFAULT_LOG_FILTER)
         } else {
@@ -53,7 +59,7 @@ pub(crate) fn init() -> Option<WorkerGuard> {
 
     let log_dir = std::env::var("LOG_DIR").unwrap_or_else(|_| DEFAULT_LOG_DIR.to_string());
 
-    match build_appender(&log_dir) {
+    let guard = match build_appender(&log_dir) {
         Ok(appender) => {
             let (file_writer, guard) = tracing_appender::non_blocking(appender);
             tracing_subscriber::registry()
@@ -76,7 +82,15 @@ pub(crate) fn init() -> Option<WorkerGuard> {
             );
             None
         }
+    };
+    if invalid_rust_log {
+        tracing::warn!(
+            rust_log = %directives,
+            fallback_filter = DEFAULT_LOG_FILTER,
+            "remote-host: RUST_LOG is set but unparseable; falling back to the default filter"
+        );
     }
+    guard
 }
 
 /// Build the daily-rolling, retention-capped file appender, creating `dir` first.

@@ -16,6 +16,8 @@ tauri-build = { workspace = true }
 
 [dependencies]
 tauri = { workspace = true }
+log = { workspace = true }
+tauri-plugin-log = { workspace = true }
 baybo-mobile-core = { workspace = true }
 device-proto = { workspace = true }
 remote-host-protocol = { workspace = true }

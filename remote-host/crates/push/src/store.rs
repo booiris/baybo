@@ -151,9 +151,29 @@ impl InMemoryDeviceTokenStore {
         // Only a *new* device id can grow the map; a re-register replaces in place.
         if !inner.contains_key(device_id) && inner.len() >= self.soft_cap {
             let ttl = self.unconfirmed_ttl;
+            let before = inner.len();
+            let collect_ids = tracing::enabled!(tracing::Level::DEBUG);
+            let mut evicted_ids = Vec::new();
             // Shed idle, unconfirmed bindings (the register-only flood); keep live
             // devices and freshly-registered ones still inside the TTL.
-            inner.retain(|_, e| e.confirmed || now.saturating_duration_since(e.last_seen) < ttl);
+            inner.retain(|id, e| {
+                let keep = e.confirmed || now.saturating_duration_since(e.last_seen) < ttl;
+                if !keep && collect_ids {
+                    evicted_ids.push(id.clone());
+                }
+                keep
+            });
+            let evicted_count = before - inner.len();
+            if evicted_count > 0 {
+                tracing::info!(
+                    evicted_count,
+                    store_len = inner.len(),
+                    cap = self.soft_cap,
+                    ttl_secs = ttl.as_secs(),
+                    "push: evicted idle unconfirmed device bindings under cap pressure"
+                );
+                tracing::debug!(device_ids = ?evicted_ids, "push: evicted device bindings");
+            }
             if inner.len() >= self.soft_cap {
                 // Nothing evictable — refuse rather than grow unbounded.
                 return false;
@@ -175,6 +195,12 @@ impl InMemoryDeviceTokenStore {
 
     fn confirm_at(&self, device_id: &str, now: Instant) {
         if let Some(e) = self.inner.lock().get_mut(device_id) {
+            if !e.confirmed {
+                tracing::debug!(
+                    device_id,
+                    "push: device binding confirmed by delivered notify"
+                );
+            }
             e.confirmed = true;
             e.last_seen = now;
         }

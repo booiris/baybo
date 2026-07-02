@@ -59,3 +59,12 @@ pub use crate::sidecar::{
     collect_profiles, node_binary,
 };
 pub use crate::spawn::{ChannelSpawner, ChildHandle, SIDECAR_ENV_ALLOWLIST};
+
+/// Longest remote-host response-body excerpt carried into a log/error string —
+/// enough to state a reject reason without dumping an arbitrary payload.
+const HTTP_BODY_SNIPPET_MAX: usize = 256;
+
+/// Trimmed, length-capped excerpt of a remote-host response body for logs.
+pub(crate) fn http_body_snippet(body: &str) -> String {
+    body.trim().chars().take(HTTP_BODY_SNIPPET_MAX).collect()
+}

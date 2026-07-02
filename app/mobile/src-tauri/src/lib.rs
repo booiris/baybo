@@ -26,6 +26,44 @@ use tauri::{AppHandle, Emitter, State};
 /// the webview: it's resolved from the active binding (see [`binding`]).
 const BLOB_MIME_HEADER: &str = "x-baybo-mime";
 
+/// Rotating on-device log file (`<app log dir>/baybo.log`): size cap per file and
+/// how many rotated files to keep, so an exported sysdiagnose/log bundle stays small.
+const LOG_FILE_NAME: &str = "baybo";
+const LOG_FILE_MAX_BYTES: u128 = 2 * 1024 * 1024;
+const LOG_FILES_KEPT: usize = 3;
+
+/// The logging facade: stdout (which tauri-plugin-log forwards to `os_log` on iOS,
+/// so lines surface in Console.app / sysdiagnose) plus a rotating file in the app's
+/// log dir a user can export. Warn globally, debug for our own crates.
+fn log_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
+    tauri_plugin_log::Builder::new()
+        .targets([
+            Target::new(TargetKind::Stdout),
+            Target::new(TargetKind::LogDir {
+                file_name: Some(LOG_FILE_NAME.into()),
+            }),
+        ])
+        .max_file_size(LOG_FILE_MAX_BYTES)
+        .rotation_strategy(RotationStrategy::KeepSome(LOG_FILES_KEPT))
+        // The plugin's mobile default format is bare `[target] message`; the
+        // exported file needs a timestamp + level to sequence a session against
+        // gateway/relay logs.
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{} [{}][{}] {}",
+                tauri_plugin_log::TimezoneStrategy::UseUtc.get_now(),
+                record.level(),
+                record.target(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Warn)
+        .level_for("baybo_mobile_app_lib", log::LevelFilter::Debug)
+        .level_for("baybo_mobile_core", log::LevelFilter::Debug)
+        .build()
+}
+
 /// Scan-to-connect: dial the gateway, run the XXpsk0 handshake through
 /// `DeviceHello`, and return the confirmation code the UI shows the user to
 /// compare against the operator's terminal. `rendezvous_id` + `secret` come from
@@ -313,7 +351,7 @@ fn debug_seed_push_key() {
     };
     // Store, then read back (the same lookup the NSE does) and report the
     // round-trip to a file in the app container so the host test harness can
-    // read it (the eprintln does not reach simctl's console on iOS). No secret
+    // read it (the log line does not reach simctl's console on iOS). No secret
     // or bid is written — only the round-trip verdict.
     let result = match keychain::store_push_key(bid, &key) {
         Ok(()) => match keychain::read_push_key(bid) {
@@ -325,7 +363,7 @@ fn debug_seed_push_key() {
         Err(e) => format!("store_err={e}"),
     };
     let _ = std::fs::write(std::env::temp_dir().join("baybo-seed-result.txt"), &result);
-    eprintln!("baybo(debug): keychain self-check: {result}");
+    log::debug!("keychain self-check: {result}");
 }
 
 /// Select the rustls crypto provider for the process. `tokio-tungstenite` pulls
@@ -341,10 +379,7 @@ fn install_crypto_provider() {
 pub fn run() {
     install_crypto_provider();
 
-    #[cfg(all(debug_assertions, target_os = "ios"))]
-    debug_seed_push_key();
-
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().plugin(log_plugin());
     // The barcode/camera + haptics plugins are mobile-only (the QR
     // scan-to-connect path and the scan-success buzz).
     #[cfg(mobile)]
@@ -386,10 +421,19 @@ pub fn run() {
     {
         Ok(app) => app,
         Err(e) => {
+            // The log plugin attaches its logger during `build` — but if the
+            // failure WAS the log plugin (e.g. unwritable log dir), log::error!
+            // is a no-op, so mirror the message on stderr unconditionally.
             eprintln!("baybo: fatal error while building the app: {e}");
+            log::error!("fatal error while building the app: {e}");
             return;
         }
     };
+
+    // Runs after `build` so the logger is attached; the seed itself only needs to
+    // happen before the event loop.
+    #[cfg(all(debug_assertions, target_os = "ios"))]
+    debug_seed_push_key();
 
     // Bridge the iOS app lifecycle into the webview. iOS suspends the whole app
     // without ever marking the WKWebView page hidden, so the page's own
@@ -399,7 +443,7 @@ pub fn run() {
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Resumed) {
             if let Err(e) = app_handle.emit("app-resumed", ()) {
-                eprintln!("baybo: emit app-resumed failed: {e}");
+                log::warn!("emit app-resumed failed: {e}");
             }
             // APNs registration can fail transiently at launch and iOS does not
             // retry it on its own. If we still have no token, re-arm on foreground

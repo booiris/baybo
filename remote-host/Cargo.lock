@@ -1570,6 +1570,7 @@ dependencies = [
  "remote-host-admission",
  "remote-host-dashboard",
  "remote-host-edge",
+ "remote-host-protocol",
  "remote-host-push",
  "remote-host-relay",
  "rustls",
