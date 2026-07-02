@@ -15,6 +15,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::http::HeaderName;
 use remote_host_edge::{IpLimitConfig, IpTrafficRegistry, ip_traffic};
+use remote_host_protocol::key_tag;
 use remote_host_push::serve::{PushConfig, build_router as push_router};
 use remote_host_push::{DeviceTokenStore, InMemoryDeviceTokenStore};
 use remote_host_relay::serve::{RelayServices, build_router as relay_router};
@@ -73,10 +74,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // polling for external edits. Push routes are keyless at this layer.
     let db_path = std::env::var("ADMISSION_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.into());
     let poll = Duration::from_secs(
-        std::env::var("ADMISSION_POLL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_POLL_SECS),
+        env_override("ADMISSION_POLL_SECS", |_: &u64| true).unwrap_or(DEFAULT_POLL_SECS),
     );
     // Track live relay connections so an admission reload that drops a key can
     // kick that gateway's connections, not just refuse new ones — and cap how many
@@ -84,10 +82,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // a key's row leaves `max_conns` NULL; per-key values in the table override it.
     // Fallback per-key connection cap (used when a key's row leaves `max_conns`
     // NULL); shared by the connection registry and the traffic-cap sizing below.
-    let conns_fallback: usize = std::env::var("MAX_CONNS_PER_REMOTE_API_KEY_FALLBACK")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(remote_host_relay::conns::DEFAULT_MAX_CONNS_PER_KEY);
+    let conns_fallback: usize =
+        env_override("MAX_CONNS_PER_REMOTE_API_KEY_FALLBACK", |_: &usize| true)
+            .unwrap_or(remote_host_relay::conns::DEFAULT_MAX_CONNS_PER_KEY);
     let conns =
         Arc::new(remote_host_relay::ConnectionRegistry::new().with_max_per_key(conns_fallback));
     // Two-level content-bandwidth throttle: per-remote_api_key ceiling ∧ per-server
@@ -108,8 +105,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let conns = conns.clone();
         let bandwidth = bandwidth.clone();
         Arc::new(move |revoked: std::collections::HashSet<String>| {
-            conns.kick(&revoked);
+            let kicked_conns = conns.kick(&revoked);
             bandwidth.forget(&revoked);
+            let revoked_key_tags: Vec<String> = revoked.iter().map(|k| key_tag(k)).collect();
+            tracing::debug!(
+                revoked = revoked.len(),
+                kicked_conns,
+                revoked_key_tags = ?revoked_key_tags,
+                "remote-host: revoked keys — kicked their live relay connections and dropped their bandwidth buckets"
+            );
         })
     };
     let admission_db = Arc::new(admission_db::open(&db_path, poll, revoke_hook).await?);
@@ -132,8 +136,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .split(',')
         .map(str::trim)
         .filter(|h| !h.is_empty())
-        .filter_map(|h| HeaderName::from_bytes(h.to_ascii_lowercase().as_bytes()).ok())
+        .filter_map(|h| {
+            HeaderName::from_bytes(h.to_ascii_lowercase().as_bytes())
+                .inspect_err(|_| {
+                    tracing::warn!(
+                        entry = %h,
+                        env_var = "CLIENT_IP_HEADERS",
+                        "remote-host: CLIENT_IP_HEADERS entry is not a valid header name; ignoring it (client-IP resolution will not consult it)"
+                    );
+                })
+                .ok()
+        })
         .collect();
+    // The effective client-IP posture for the boot log: the trusted header list,
+    // or the socket peer when none are configured.
+    let trusted_ip_headers = if trusted_headers.is_empty() {
+        "socket-peer".to_string()
+    } else {
+        trusted_headers
+            .iter()
+            .map(HeaderName::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     let relay_ip_limit = role_ip_limit(
         "RELAY_IP_RATE_PER_SEC",
         "RELAY_IP_BURST",
@@ -146,6 +171,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "PUSH_IP_BUCKET_CAP",
         &trusted_headers,
     );
+    // Captured for the boot log — the configs themselves move into the routers.
+    let (relay_ip_rate_per_sec, relay_ip_burst) =
+        (relay_ip_limit.rate_per_sec, relay_ip_limit.burst);
+    let (push_ip_rate_per_sec, push_ip_burst) = (push_ip_limit.rate_per_sec, push_ip_limit.burst);
 
     // Per-(ip, endpoint) traffic counters: a recorder middleware (mounted as the
     // outermost layer below) counts every request + its body bytes, and the relay's
@@ -185,6 +214,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         push_traffic = Some(pt);
         device_store = Some(store);
         roles.push("push");
+    } else {
+        tracing::info!(
+            "remote-host: push role disabled — APNS_P8_PATH not configured; /notify and /register will return 404"
+        );
     }
 
     // Relay is always on.
@@ -253,13 +286,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Drain the relay (and push, if on) traffic counters to the durable ledger every
     // TRAFFIC_FLUSH_SECS; the same task's eviction bounds the in-memory maps. The
     // ledger path was read above (shared with the dashboard reader).
-    let traffic_flush_secs = std::env::var("TRAFFIC_FLUSH_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_TRAFFIC_FLUSH_SECS);
-    let traffic_retention_days = std::env::var("TRAFFIC_RETENTION_DAYS")
-        .ok()
-        .and_then(|s| s.parse().ok())
+    let traffic_flush_secs =
+        env_override("TRAFFIC_FLUSH_SECS", |_: &u64| true).unwrap_or(DEFAULT_TRAFFIC_FLUSH_SECS);
+    let traffic_retention_days = env_override("TRAFFIC_RETENTION_DAYS", |_: &u64| true)
         .unwrap_or(DEFAULT_TRAFFIC_RETENTION_DAYS);
     // Size the relay traffic entry cap to 2× the live admission connection capacity
     // (each (key, server) entry needs a content leg; entries linger ~5 min past a
@@ -308,6 +337,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 %scheme,
                 dashboard_scheme = %dash_scheme,
                 roles = %roles.join(" + "),
+                %trusted_ip_headers,
+                relay_ip_rate_per_sec,
+                relay_ip_burst,
+                push_ip_rate_per_sec,
+                push_ip_burst,
+                admission_db_path = %db_path,
+                admission_poll_secs = poll.as_secs(),
+                keys_admitted = admission.len(),
                 "remote-host: listening",
             );
             tokio::try_join!(
@@ -320,6 +357,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 %bind_addr,
                 %scheme,
                 roles = %roles.join(" + "),
+                %trusted_ip_headers,
+                relay_ip_rate_per_sec,
+                relay_ip_burst,
+                push_ip_rate_per_sec,
+                push_ip_burst,
+                admission_db_path = %db_path,
+                admission_poll_secs = poll.as_secs(),
+                keys_admitted = admission.len(),
                 "remote-host: listening",
             );
             serve::serve(&bind_addr, tls, app).await?;
@@ -361,20 +406,37 @@ fn dashboard_token() -> Option<remote_host_dashboard::DashboardToken> {
         .map(remote_host_dashboard::DashboardToken::new)
 }
 
-/// Parse a positive `f64` env override, else `None`.
-fn env_f64(key: &str) -> Option<f64> {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|&v| v > 0.0)
+/// Parse an env override, accepting only values `is_valid` passes. `None` (the
+/// caller's default applies) when the var is unset or blank — Compose passes
+/// `${VAR:-}` as the empty string — and, with a **warn**, when it is set to
+/// something unparseable or rejected, so a typo'd knob is self-diagnosing
+/// instead of silently falling back.
+fn env_override<T: std::str::FromStr>(key: &str, is_valid: impl Fn(&T) -> bool) -> Option<T> {
+    let raw = std::env::var(key).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    match raw.parse::<T>() {
+        Ok(v) if is_valid(&v) => Some(v),
+        _ => {
+            tracing::warn!(
+                env_var = key,
+                raw_value = %raw,
+                "remote-host: env override is set but invalid (unparseable or out of range); using the default"
+            );
+            None
+        }
+    }
 }
 
-/// Parse a positive `usize` env override, else `None`.
+/// Parse a positive `f64` env override, else `None` (warning when set but invalid).
+fn env_f64(key: &str) -> Option<f64> {
+    env_override(key, |v: &f64| *v > 0.0)
+}
+
+/// Parse a positive `usize` env override, else `None` (warning when set but invalid).
 fn env_usize(key: &str) -> Option<usize> {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&v| v > 0)
+    env_override(key, |v: &usize| *v > 0)
 }
 
 #[cfg(test)]

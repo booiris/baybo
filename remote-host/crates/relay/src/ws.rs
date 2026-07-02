@@ -22,10 +22,47 @@ use futures::{SinkExt, StreamExt};
 use crate::broker::RelayLeg;
 use crate::traffic::LegMetering;
 
+/// Why [`pump_ws`] ended — returned to the leg-owning handler so it can log the
+/// close cause (the per-frame loop itself stays unlogged).
+#[derive(Debug)]
+pub(crate) enum PumpEnd {
+    /// The partner leg went away (its channel closed): the peer side ended first.
+    PeerGone,
+    /// This socket closed cleanly — carries the client's WS close code/reason
+    /// when it sent a close frame.
+    ClientClosed {
+        code: Option<u16>,
+        reason: Option<String>,
+    },
+    /// This socket failed on read or write (WS protocol violation — e.g. an
+    /// oversized frame — or an I/O error).
+    ClientError(String),
+}
+
+impl std::fmt::Display for PumpEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PumpEnd::PeerGone => f.write_str("peer_gone"),
+            PumpEnd::ClientClosed { code: None, .. } => {
+                f.write_str("client_closed (no close frame)")
+            }
+            PumpEnd::ClientClosed {
+                code: Some(code),
+                reason,
+            } => match reason.as_deref() {
+                Some(r) if !r.is_empty() => write!(f, "client_closed (code {code}, reason {r:?})"),
+                _ => write!(f, "client_closed (code {code})"),
+            },
+            PumpEnd::ClientError(e) => write!(f, "client_error ({e})"),
+        }
+    }
+}
+
 /// Pump one WebSocket against its matched [`RelayLeg`] until either side closes:
 /// binary frames the client sends go to the partner leg; frames from the
 /// partner go back to the client. Non-binary control frames (ping/pong/text)
-/// are ignored — the relay only carries opaque binary.
+/// are ignored — the relay only carries opaque binary. Returns why the pump
+/// ended ([`PumpEnd`]).
 ///
 /// `metering` (present for content legs, `None` for pairing/control) both throttles
 /// and accounts the bytes **read from this socket**: each frame is recorded against
@@ -33,7 +70,11 @@ use crate::traffic::LegMetering;
 /// reserves its bytes and sleeps off any debt before forwarding, so an unread socket
 /// backpressures its sender over TCP. Both legs of a session share one limiter +
 /// counter pair, so the throttle cap and the traffic total are the gateway's aggregate.
-pub async fn pump_ws(socket: WebSocket, leg: RelayLeg, metering: Option<LegMetering>) {
+pub(crate) async fn pump_ws(
+    socket: WebSocket,
+    leg: RelayLeg,
+    metering: Option<LegMetering>,
+) -> PumpEnd {
     let (mut sink, mut source) = socket.split();
     let RelayLeg {
         to_peer,
@@ -43,9 +84,9 @@ pub async fn pump_ws(socket: WebSocket, leg: RelayLeg, metering: Option<LegMeter
     // Inbound: this socket → partner leg (throttled). A throttle sleep parks only
     // this future, not the outbound one below.
     let inbound = async move {
-        while let Some(msg) = source.next().await {
-            match msg {
-                Ok(Message::Binary(b)) => {
+        loop {
+            match source.next().await {
+                Some(Ok(Message::Binary(b))) => {
                     if let Some(m) = &metering {
                         // Account the ingressed bytes (before forwarding, mirroring
                         // the throttle debit) — against both the (key, server) and the
@@ -55,27 +96,44 @@ pub async fn pump_ws(socket: WebSocket, leg: RelayLeg, metering: Option<LegMeter
                         m.limiter.throttle(b.len()).await;
                     }
                     if to_peer.send(b.to_vec()).await.is_err() {
-                        break; // partner leg gone
+                        break PumpEnd::PeerGone;
                     }
                 }
-                Ok(Message::Close(_)) | Err(_) => break,
-                Ok(_) => {} // ping/pong/text: not relayed
+                Some(Ok(Message::Close(frame))) => {
+                    break PumpEnd::ClientClosed {
+                        code: frame.as_ref().map(|f| f.code),
+                        reason: frame.map(|f| f.reason.to_string()),
+                    };
+                }
+                Some(Err(e)) => break PumpEnd::ClientError(e.to_string()),
+                Some(Ok(_)) => {} // ping/pong/text: not relayed
+                None => {
+                    break PumpEnd::ClientClosed {
+                        code: None,
+                        reason: None,
+                    };
+                }
             }
         }
     };
 
     // Outbound: partner leg → this socket.
     let outbound = async move {
-        while let Some(bytes) = from_peer.recv().await {
-            if sink.send(Message::Binary(bytes.into())).await.is_err() {
-                break; // client socket gone
+        loop {
+            match from_peer.recv().await {
+                Some(bytes) => {
+                    if let Err(e) = sink.send(Message::Binary(bytes.into())).await {
+                        break PumpEnd::ClientError(e.to_string());
+                    }
+                }
+                None => break PumpEnd::PeerGone,
             }
         }
     };
 
     tokio::select! {
-        _ = inbound => {}
-        _ = outbound => {}
+        end = inbound => end,
+        end = outbound => end,
     }
 }
 
@@ -101,7 +159,9 @@ mod tests {
         State(broker): State<Arc<RelayBroker>>,
     ) -> impl IntoResponse {
         let leg = broker.join(&key).expect("test leg parks under the cap");
-        ws.on_upgrade(move |socket| pump_ws(socket, leg, None))
+        ws.on_upgrade(move |socket| async move {
+            pump_ws(socket, leg, None).await;
+        })
     }
 
     async fn connect(port: u16, key: &str) -> WebSocketStream<TcpStream> {

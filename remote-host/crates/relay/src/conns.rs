@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
+use remote_host_protocol::key_tag;
 use tokio::sync::oneshot;
 
 /// Fallback cap on simultaneous relay connections one admitted `remote_api_key`
@@ -111,10 +112,16 @@ impl ConnectionRegistry {
         let mut conns = self.conns.lock();
         let entry = conns.entry(remote_api_key.to_string()).or_default();
         if entry.len() >= cap {
+            let live = entry.len();
             // `or_default` only inserts an empty map for a brand-new key, which is
             // never at the cap; an at-cap key already existed, so nothing leaks.
             drop(conns);
-            tracing::warn!(cap, "relay: remote_api_key at its connection cap; refusing");
+            tracing::warn!(
+                cap,
+                live,
+                key_tag = %key_tag(remote_api_key),
+                "relay: remote_api_key at its connection cap; refusing"
+            );
             return None;
         }
         let (tx, rx) = oneshot::channel();
@@ -172,18 +179,21 @@ impl ConnectionRegistry {
             return 0;
         }
         let mut kicked = 0;
+        let mut kicked_tags: Vec<String> = Vec::new();
         {
             let mut conns = self.conns.lock();
             for key in revoked {
                 if let Some(map) = conns.remove(key) {
                     // The senders drop here as `map` does, resolving the receivers.
                     kicked += map.len();
+                    kicked_tags.push(key_tag(key));
                 }
             }
         }
         if kicked > 0 {
             tracing::info!(
                 connections = kicked,
+                key_tags = ?kicked_tags,
                 "relay: remote_api_key revoked; dropping live connections"
             );
         }

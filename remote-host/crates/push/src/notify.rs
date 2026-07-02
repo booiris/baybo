@@ -20,6 +20,7 @@ use crate::jwt::ApnsProviderToken;
 use crate::ratelimit::NotifyRateLimiter;
 use crate::store::{DeviceRegistration, DeviceTokenStore};
 use crate::traffic::PushTrafficRegistry;
+use remote_host_protocol::device_id_log;
 
 /// The `/notify` + `/register` request bodies live in the shared protocol crate,
 /// so the gateway POSTs the exact same shapes (re-exported here for the rest of
@@ -112,6 +113,7 @@ impl NotifyService {
             return Ok(jwt.clone());
         }
         let jwt = self.signer.sign(now)?;
+        tracing::debug!(iat = now, "push: provider JWT re-signed");
         *self.cached_jwt.lock() = Some((jwt.clone(), now));
         Ok(jwt)
     }
@@ -124,6 +126,12 @@ impl NotifyService {
         // binding can hold. A bogus-but-bounded token is caught later at /notify by
         // APNs (`BadDeviceToken` → prune).
         if req.apns_token.len() > APNS_TOKEN_MAX_LEN {
+            tracing::warn!(
+                device_id = %device_id_log(&req.device_id),
+                token_len = req.apns_token.len(),
+                cap = APNS_TOKEN_MAX_LEN,
+                "push: register rejected — apns_token exceeds length cap"
+            );
             return RegisterOutcome::InvalidToken;
         }
         // Verify the device→gateway delegation and the gateway's signature over
@@ -131,16 +139,40 @@ impl NotifyService {
         // stored secret and no trust-on-first-use; without the device's key no one
         // can forge either signature.
         let Some(device_pub) = delegation::device_pubkey_from_id(&req.device_id) else {
+            tracing::warn!(
+                device_id = %device_id_log(&req.device_id),
+                device_id_len = req.device_id.len(),
+                "push: register rejected — device_id does not parse to a device pubkey"
+            );
             return RegisterOutcome::Rejected;
         };
-        let (Some(gateway_pub), Some(deleg_sig), Some(reg_sig)) = (
-            b64_decode(&req.gateway_pubkey).and_then(|b| delegation::verifying_key_from_bytes(&b)),
-            b64_decode(&req.delegation).and_then(|b| delegation::signature_from_bytes(&b)),
-            b64_decode(&req.sig).and_then(|b| delegation::signature_from_bytes(&b)),
-        ) else {
+        let gateway_pub =
+            b64_decode(&req.gateway_pubkey).and_then(|b| delegation::verifying_key_from_bytes(&b));
+        let deleg_sig =
+            b64_decode(&req.delegation).and_then(|b| delegation::signature_from_bytes(&b));
+        let reg_sig = b64_decode(&req.sig).and_then(|b| delegation::signature_from_bytes(&b));
+        let (gateway_pubkey_ok, delegation_ok, sig_ok) = (
+            gateway_pub.is_some(),
+            deleg_sig.is_some(),
+            reg_sig.is_some(),
+        );
+        let (Some(gateway_pub), Some(deleg_sig), Some(reg_sig)) = (gateway_pub, deleg_sig, reg_sig)
+        else {
+            tracing::warn!(
+                device_id = %device_id_log(&req.device_id),
+                gateway_pubkey_ok,
+                delegation_ok,
+                sig_ok,
+                "push: register rejected — malformed key/signature wire field(s)"
+            );
             return RegisterOutcome::Rejected;
         };
         if !delegation::verify_delegation(&device_pub, &gateway_pub, &deleg_sig) {
+            tracing::warn!(
+                device_id = %req.device_id,
+                gateway_pubkey_prefix = %pubkey_prefix(&gateway_pub.to_bytes()),
+                "push: register rejected — device→gateway delegation verify failed"
+            );
             return RegisterOutcome::Rejected;
         }
         if !delegation::verify_register(
@@ -151,14 +183,28 @@ impl NotifyService {
             req.counter,
             &reg_sig,
         ) {
+            tracing::warn!(
+                device_id = %req.device_id,
+                env = ?req.env,
+                counter = req.counter,
+                token_len = req.apns_token.len(),
+                "push: register rejected — register signature verify failed"
+            );
             return RegisterOutcome::Rejected;
         }
         // Replay floor: a re-register must strictly advance the counter.
         if let Some(existing) = self.store.get(&req.device_id)
             && req.counter <= existing.last_counter
         {
+            tracing::warn!(
+                device_id = %req.device_id,
+                got = req.counter,
+                floor = existing.last_counter,
+                "push: register rejected — replay counter not above stored floor"
+            );
             return RegisterOutcome::Rejected;
         }
+        let token_len = req.apns_token.len();
         if !self.store.register(
             &req.device_id,
             DeviceRegistration {
@@ -168,8 +214,20 @@ impl NotifyService {
                 last_counter: req.counter,
             },
         ) {
+            tracing::warn!(
+                device_id = %req.device_id,
+                store_len = self.store.len(),
+                "push: register shed — device store at cap with nothing evictable"
+            );
             return RegisterOutcome::Capacity;
         }
+        tracing::info!(
+            device_id = %req.device_id,
+            env = ?req.env,
+            token_len,
+            counter = req.counter,
+            "push: device APNs binding registered"
+        );
         RegisterOutcome::Registered
     }
 
@@ -179,16 +237,31 @@ impl NotifyService {
         // bucket): an unknown `device_id` is refused here, so the bucket map is
         // bounded by the registered set, not by attacker-supplied ids.
         let Some(reg) = self.store.get(&req.device_id) else {
+            tracing::info!(
+                device_id = %device_id_log(&req.device_id),
+                store_len = self.store.len(),
+                "push: notify for unknown device (no APNs binding)"
+            );
             return NotifyOutcome::UnknownDevice;
         };
         // Authenticate the notify under the gateway key the device delegated
         // (stored at register) — without that key no one can spam or redirect this
         // device, even knowing the `device_id`.
         let Some(gateway_pub) = delegation::verifying_key_from_bytes(&reg.gateway_pubkey) else {
+            tracing::error!(
+                device_id = %req.device_id,
+                stored_gateway_pubkey_prefix = %pubkey_prefix(&reg.gateway_pubkey),
+                "push: invariant — stored gateway pubkey no longer parses; notify rejected"
+            );
             return NotifyOutcome::Rejected;
         };
         let Some(sig) = b64_decode(&req.sig).and_then(|b| delegation::signature_from_bytes(&b))
         else {
+            tracing::warn!(
+                device_id = %req.device_id,
+                sig_len = req.sig.len(),
+                "push: notify rejected — signature field not parseable"
+            );
             return NotifyOutcome::Rejected;
         };
         if !delegation::verify_notify(
@@ -200,23 +273,47 @@ impl NotifyService {
             req.counter,
             &sig,
         ) {
+            tracing::warn!(
+                device_id = %req.device_id,
+                counter = req.counter,
+                stored_gateway_pubkey_prefix = %pubkey_prefix(&reg.gateway_pubkey),
+                "push: notify rejected — signature verify failed under stored gateway key"
+            );
             return NotifyOutcome::Rejected;
         }
         // Replay floor (atomic check-and-advance): reject a counter that doesn't
         // strictly exceed the last accepted one.
         if !self.store.advance_counter(&req.device_id, req.counter) {
+            tracing::warn!(
+                device_id = %req.device_id,
+                got = req.counter,
+                floor = reg.last_counter,
+                "push: notify rejected — replay counter not above stored floor"
+            );
             return NotifyOutcome::Rejected;
         }
         // Per-device frequency control gates before signing / egress.
         if !self.rate.check(&req.device_id) {
+            tracing::debug!(
+                device_id = %req.device_id,
+                "push: notify rate-limited for device (dropped, 429)"
+            );
             return NotifyOutcome::RateLimited;
         }
         let jwt = match self.provider_jwt(now) {
             Ok(j) => j,
-            Err(e) => return NotifyOutcome::Failed(e.to_string()),
+            Err(e) => {
+                tracing::error!(
+                    device_id = %req.device_id,
+                    error = %e,
+                    "push: APNs provider JWT signing failed — no push can be sent"
+                );
+                return NotifyOutcome::Failed(e.to_string());
+            }
         };
+        let env = reg.env;
         let apns_req = ApnsRequest {
-            env: reg.env,
+            env,
             device_token: reg.apns_token,
             topic: self.topic.clone(),
             collapse_id: req.collapse_id.clone(),
@@ -231,19 +328,50 @@ impl NotifyService {
         let outcome = self.sender.send(apns_req).await;
         self.traffic.record(&req.device_id, payload_len);
         match outcome {
-            ApnsOutcome::Delivered => {
+            ApnsOutcome::Delivered { apns_id } => {
                 // APNs accepted the token → a real device is behind this binding.
                 // Confirm it so it is exempt from idle eviction and refresh its
                 // idle clock; a register-only flood is never confirmed and ages out.
                 self.store.confirm(&req.device_id);
+                tracing::debug!(
+                    device_id = %req.device_id,
+                    env = ?env,
+                    collapse_id = %req.collapse_id,
+                    payload_len,
+                    apns_id = %apns_id.as_deref().unwrap_or("<none>"),
+                    "push: delivered to APNs"
+                );
                 NotifyOutcome::Delivered
             }
-            ApnsOutcome::BadDeviceToken | ApnsOutcome::Unregistered { .. } => {
+            ApnsOutcome::BadDeviceToken => {
                 // Unbind the APNs token only — never the gateway's device row.
                 self.store.unbind(&req.device_id);
+                tracing::info!(
+                    device_id = %req.device_id,
+                    env = ?env,
+                    "push: APNs rejected device token (BadDeviceToken); binding pruned"
+                );
                 NotifyOutcome::Pruned
             }
-            ApnsOutcome::TransientError(e) => NotifyOutcome::Failed(e),
+            ApnsOutcome::Unregistered { timestamp_ms } => {
+                self.store.unbind(&req.device_id);
+                tracing::info!(
+                    device_id = %req.device_id,
+                    env = ?env,
+                    timestamp_ms,
+                    "push: APNs reports device token unregistered; binding pruned"
+                );
+                NotifyOutcome::Pruned
+            }
+            ApnsOutcome::TransientError(e) => {
+                tracing::warn!(
+                    device_id = %req.device_id,
+                    env = ?env,
+                    error = %e,
+                    "push: APNs send failed (binding kept, gateway told 502)"
+                );
+                NotifyOutcome::Failed(e)
+            }
         }
     }
 }
@@ -254,6 +382,11 @@ impl NotifyService {
 /// rejecting a future longer token. Token *validity* isn't checked here — a bogus
 /// token is caught at `/notify` by APNs `BadDeviceToken` → prune.
 const APNS_TOKEN_MAX_LEN: usize = 256;
+
+/// First 8 hex chars of a 32-byte pubkey — enough to tell keys apart in logs.
+fn pubkey_prefix(key: &[u8; 32]) -> String {
+    hex::encode(&key[..4])
+}
 
 /// Decode a base64-standard wire field; `None` on malformed input (→ reject).
 fn b64_decode(s: &str) -> Option<Vec<u8>> {
@@ -284,7 +417,14 @@ fn build_payload(req: &NotifyRequest) -> Vec<u8> {
     });
     // `json!` always serializes; the impossible error degrades to an empty body
     // rather than panicking.
-    serde_json::to_vec(&body).unwrap_or_default()
+    serde_json::to_vec(&body).unwrap_or_else(|e| {
+        tracing::error!(
+            device_id = %req.device_id,
+            error = %e,
+            "push: invariant — APNs payload serialization failed; sending empty body"
+        );
+        Vec::new()
+    })
 }
 
 #[cfg(test)]
@@ -424,7 +564,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let (device, gateway, device_id) = keys();
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         let svc = service(
-            Arc::new(MockApns::new(ApnsOutcome::Delivered)),
+            Arc::new(MockApns::new(ApnsOutcome::Delivered { apns_id: None })),
             Arc::clone(&store),
         );
 
@@ -446,7 +586,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let impostor = test_sign::signing_key(9);
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         let svc = service(
-            Arc::new(MockApns::new(ApnsOutcome::Delivered)),
+            Arc::new(MockApns::new(ApnsOutcome::Delivered { apns_id: None })),
             store.clone(),
         );
         assert_eq!(
@@ -465,7 +605,10 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     fn register_rejects_replayed_counter() {
         let (device, gateway, device_id) = keys();
         let store = Arc::new(InMemoryDeviceTokenStore::new());
-        let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), store);
+        let svc = service(
+            Arc::new(MockApns::new(ApnsOutcome::Delivered { apns_id: None })),
+            store,
+        );
         assert_eq!(
             svc.register(register_req(&device, &gateway, &device_id, APNS_TOK, 5)),
             RegisterOutcome::Registered,
@@ -484,7 +627,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let (device, gateway, device_id) = keys();
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         let svc = service(
-            Arc::new(MockApns::new(ApnsOutcome::Delivered)),
+            Arc::new(MockApns::new(ApnsOutcome::Delivered { apns_id: None })),
             Arc::clone(&store),
         );
         let oversized = "a".repeat(APNS_TOKEN_MAX_LEN + 1);
@@ -513,7 +656,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             std::time::Duration::from_secs(60),
         ));
         let svc = service(
-            Arc::new(MockApns::new(ApnsOutcome::Delivered)),
+            Arc::new(MockApns::new(ApnsOutcome::Delivered { apns_id: None })),
             Arc::clone(&store),
         );
         let (device, gateway, device_id) = keys();
@@ -538,7 +681,10 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let (_d, gateway, device_id) = keys();
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         seed(&store, &gateway, &device_id, "tok");
-        let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), store);
+        let svc = service(
+            Arc::new(MockApns::new(ApnsOutcome::Delivered { apns_id: None })),
+            store,
+        );
         // The whole burst delivers (each with a fresh, increasing counter); the
         // next push over the burst is rate-limited.
         for i in 1..=crate::ratelimit::NOTIFY_BURST as u64 {
@@ -565,7 +711,10 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     async fn unknown_device_rejected() {
         let (_d, gateway, device_id) = keys();
         let store = Arc::new(InMemoryDeviceTokenStore::new());
-        let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), store);
+        let svc = service(
+            Arc::new(MockApns::new(ApnsOutcome::Delivered { apns_id: None })),
+            store,
+        );
         assert_eq!(
             svc.notify(notify_req(&gateway, &device_id, 1), 1000).await,
             NotifyOutcome::UnknownDevice,
@@ -581,7 +730,10 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let impostor_gateway = test_sign::signing_key(9);
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         seed(&store, &gateway, &device_id, "tok");
-        let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), store);
+        let svc = service(
+            Arc::new(MockApns::new(ApnsOutcome::Delivered { apns_id: None })),
+            store,
+        );
         // Signed with a gateway key the device never delegated → rejected.
         assert_eq!(
             svc.notify(notify_req(&impostor_gateway, &device_id, 1), 1000)
@@ -605,7 +757,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let (_d, gateway, device_id) = keys();
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         seed(&store, &gateway, &device_id, "apns-tok-xyz");
-        let sender = Arc::new(MockApns::new(ApnsOutcome::Delivered));
+        let sender = Arc::new(MockApns::new(ApnsOutcome::Delivered { apns_id: None }));
         let svc = service(Arc::clone(&sender), store);
         assert_eq!(
             svc.notify(notify_req(&gateway, &device_id, 1), 1000).await,
@@ -633,7 +785,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         seed(&store, &gateway, &device_id, "tok");
         let traffic = Arc::new(PushTrafficRegistry::new());
-        let sender = Arc::new(MockApns::new(ApnsOutcome::Delivered));
+        let sender = Arc::new(MockApns::new(ApnsOutcome::Delivered { apns_id: None }));
         let svc = service_with_traffic(Arc::clone(&sender), store, Arc::clone(&traffic));
 
         assert_eq!(
@@ -680,7 +832,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let store = Arc::new(InMemoryDeviceTokenStore::new()); // empty
         let traffic = Arc::new(PushTrafficRegistry::new());
         let svc = service_with_traffic(
-            Arc::new(MockApns::new(ApnsOutcome::Delivered)),
+            Arc::new(MockApns::new(ApnsOutcome::Delivered { apns_id: None })),
             store,
             Arc::clone(&traffic),
         );
@@ -752,7 +904,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let (_d, gateway, device_id) = keys();
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         seed(&store, &gateway, &device_id, "t");
-        let sender = Arc::new(MockApns::new(ApnsOutcome::Delivered));
+        let sender = Arc::new(MockApns::new(ApnsOutcome::Delivered { apns_id: None }));
         let svc = service(Arc::clone(&sender), store);
 
         svc.notify(notify_req(&gateway, &device_id, 1), 1000).await;

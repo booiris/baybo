@@ -58,32 +58,70 @@ impl PushLimits {
     }
 }
 
-/// Parse a positive `usize` env override, else `default`.
+fn invalid_env(key: &str, raw: &str, default_used: impl std::fmt::Display) {
+    tracing::warn!(
+        key,
+        raw,
+        default_used = %default_used,
+        "push: ignoring invalid env override; using built-in default"
+    );
+}
+
+/// Parse a positive `usize` env override, else `default` (warning when the var
+/// is set but invalid).
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(default)
+    let Ok(raw) = std::env::var(key) else {
+        return default;
+    };
+    // Compose passes `${VAR:-}` as the empty string — blank means unset.
+    if raw.trim().is_empty() {
+        return default;
+    }
+    match raw.parse::<usize>() {
+        Ok(v) if v > 0 => v,
+        _ => {
+            invalid_env(key, &raw, default);
+            default
+        }
+    }
 }
 
-/// Parse a positive `f64` env override, else `default`.
+/// Parse a positive `f64` env override, else `default` (warning when the var is
+/// set but invalid).
 fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|&v| v > 0.0)
-        .unwrap_or(default)
+    let Ok(raw) = std::env::var(key) else {
+        return default;
+    };
+    // Compose passes `${VAR:-}` as the empty string — blank means unset.
+    if raw.trim().is_empty() {
+        return default;
+    }
+    match raw.parse::<f64>() {
+        Ok(v) if v > 0.0 => v,
+        _ => {
+            invalid_env(key, &raw, default);
+            default
+        }
+    }
 }
 
-/// Parse a positive whole-seconds env override into a `Duration`, else `default`.
+/// Parse a positive whole-seconds env override into a `Duration`, else `default`
+/// (warning when the var is set but invalid).
 fn env_secs(key: &str, default: Duration) -> Duration {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(default)
+    let Ok(raw) = std::env::var(key) else {
+        return default;
+    };
+    // Compose passes `${VAR:-}` as the empty string — blank means unset.
+    if raw.trim().is_empty() {
+        return default;
+    }
+    match raw.parse::<u64>() {
+        Ok(v) if v > 0 => Duration::from_secs(v),
+        _ => {
+            invalid_env(key, &raw, default.as_secs());
+            default
+        }
+    }
 }
 
 /// Router config for the push role.
@@ -159,6 +197,16 @@ pub fn build_router(
             config.limits.device_store_cap,
         ),
     ));
+    tracing::info!(
+        topic = %config.topic,
+        key_id = %config.key_id,
+        team_id = %config.team_id,
+        device_store_cap = config.limits.device_store_cap,
+        unconfirmed_ttl_secs = config.limits.unconfirmed_ttl.as_secs(),
+        notify_rate_per_min = config.limits.notify_rate_per_min,
+        notify_burst = config.limits.notify_burst,
+        "push: role enabled"
+    );
     Ok(ip_limit::apply(router(PushState { service }), ip_limit))
 }
 

@@ -53,6 +53,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 futures-util = "0.3"
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
+log = "0.4"
+tauri-plugin-log = "2"
 tauri-plugin-barcode-scanner = "2"
 tauri-plugin-haptics = "2"
 # iOS-only: writing the push key to the shared App Group keychain (SecItemAdd).

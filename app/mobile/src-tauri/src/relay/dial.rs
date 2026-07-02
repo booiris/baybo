@@ -24,6 +24,36 @@ use crate::transport::WsStream;
 const DIAL_RETRIES: usize = 14;
 const DIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// Longest relay response-body excerpt carried into a log/error string — enough to
+/// state the reject reason without dumping an arbitrary payload.
+const HTTP_BODY_SNIPPET_MAX: usize = 120;
+
+/// Log-friendly detail for a WS dial error: an HTTP upgrade reject surfaces its
+/// status + response body (the relay's stated reason — the only way to tell a
+/// 401 unadmitted-key reject from a 404 unknown-node from DNS/TLS noise);
+/// everything else renders via `Display`.
+pub(super) fn ws_error_detail(e: &WsError) -> String {
+    let WsError::Http(resp) = e else {
+        return e.to_string();
+    };
+    let status = resp.status();
+    match resp
+        .body()
+        .as_deref()
+        .map(|b| {
+            String::from_utf8_lossy(b)
+                .trim()
+                .chars()
+                .take(HTTP_BODY_SNIPPET_MAX)
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+    {
+        Some(body) => format!("http {status}: {body}"),
+        None => format!("http {status}"),
+    }
+}
+
 /// Dial the blind relay's content-join leg for this pairing's `relay_node_id`,
 /// retrying a transient `503` for a bounded window. `leg_class` tags the leg's class
 /// header — `Some(LegClass::Blob)` meters it as background bandwidth and steers the
@@ -42,6 +72,7 @@ pub(super) async fn dial_content_join(
     }
     let base = record.relay_url.trim_end_matches('/');
     let url = remote_host_protocol::relay::content_join_url(base, &record.relay_node_id);
+    let leg = leg_class.unwrap_or_default().as_str();
 
     let mut attempt = 0usize;
     loop {
@@ -69,7 +100,15 @@ pub(super) async fn dial_content_join(
                 .insert(remote_host_protocol::relay::RELAY_LEG_CLASS_HEADER, value);
         }
         match connect_async(req).await {
-            Ok((ws, _)) => return Ok(ws),
+            Ok((ws, _)) => {
+                if attempt > 0 {
+                    log::info!(
+                        "relay content-join connected after {attempt} retries (node={} url={base} leg={leg})",
+                        record.relay_node_id
+                    );
+                }
+                return Ok(ws);
+            }
             // The relay's `content_join` returns 503 while no gateway holds a live
             // control connection for this node; it re-dials the relay on a fixed
             // backoff, so retry briefly rather than failing the open.
@@ -77,14 +116,31 @@ pub(super) async fn dial_content_join(
                 if resp.status() == StatusCode::SERVICE_UNAVAILABLE && attempt < DIAL_RETRIES =>
             {
                 attempt += 1;
+                log::debug!(
+                    "relay content-join 503, gateway control link absent; retrying (attempt {attempt}/{DIAL_RETRIES}, node={} url={base} leg={leg})",
+                    record.relay_node_id
+                );
                 tokio::time::sleep(DIAL_RETRY_DELAY).await;
             }
             Err(WsError::Http(resp)) if resp.status() == StatusCode::SERVICE_UNAVAILABLE => {
+                log::warn!(
+                    "relay content-join failed: gateway offline after {DIAL_RETRIES} retries (node={} url={base} key_tag={} leg={leg})",
+                    record.relay_node_id,
+                    remote_host_protocol::key_tag(&record.remote_api_key)
+                );
                 return Err(format!(
                     "gateway offline: {base} has no relay control connection; ensure the paired gateway is running with relay enabled"
                 ));
             }
-            Err(e) => return Err(format!("relay connect {base}: {e}")),
+            Err(e) => {
+                log::warn!(
+                    "relay content-join refused/failed: {} (node={} url={base} key_tag={} leg={leg} attempt={attempt})",
+                    ws_error_detail(&e),
+                    record.relay_node_id,
+                    remote_host_protocol::key_tag(&record.remote_api_key)
+                );
+                return Err(format!("relay connect {base}: {e}"));
+            }
         }
     }
 }

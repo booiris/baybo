@@ -107,7 +107,10 @@ pub(crate) async fn list_bindings(vault: &SecretVault) -> Vec<WebPushBinding> {
     let names = match vault.list_names().await {
         Ok(names) => names,
         Err(e) => {
-            tracing::debug!(error = %e, "push: list web bindings failed");
+            tracing::warn!(
+                error = %e,
+                "push: enumerating web push bindings failed; web targets skipped this turn"
+            );
             return Vec::new();
         }
     };
@@ -119,58 +122,14 @@ pub(crate) async fn list_bindings(vault: &SecretVault) -> Vec<WebPushBinding> {
         match vault.get_typed::<WebPushBinding>(&name).await {
             Ok(Some(b)) => out.push(b),
             Ok(None) => {}
-            Err(e) => tracing::debug!(error = %e, name = %name, "push: skip malformed web binding"),
+            Err(e) => tracing::warn!(
+                name = %name,
+                error = %e,
+                "push: web push binding record is malformed; device excluded from push fan-out"
+            ),
         }
     }
     out
-}
-
-/// Remove a web push binding: the `web_push.{id}` meta record plus the shared
-/// `device.{id}.*` push material the dispatcher reads. Idempotent —
-/// `delete_secret` is a no-op on a missing name — so re-running it (or removing
-/// an id that only ever had material, no meta) is safe. The meta record is
-/// deleted FIRST (the mirror image of [`store_binding`], which writes it last):
-/// a mid-cleanup failure then can't leave an enumerable binding pointing at
-/// already-deleted material — [`list_bindings`] simply stops seeing it.
-pub(crate) async fn remove_binding(vault: &SecretVault, device_id: &str) -> anyhow::Result<()> {
-    vault
-        .delete_secret(&web_binding_secret_name(device_id))
-        .await
-        .map_err(|e| anyhow::anyhow!("delete web binding: {e}"))?;
-    vault
-        .delete_secret(&device_push_key_secret_name(device_id))
-        .await
-        .map_err(|e| anyhow::anyhow!("delete push_key: {e}"))?;
-    vault
-        .delete_secret(&device_apns_secret_name(device_id))
-        .await
-        .map_err(|e| anyhow::anyhow!("delete apns: {e}"))?;
-    vault
-        .delete_secret(&device_push_delegation_secret_name(device_id))
-        .await
-        .map_err(|e| anyhow::anyhow!("delete delegation: {e}"))?;
-    Ok(())
-}
-
-/// Remove every web binding whose `device_id` differs from `keep`, enforcing the
-/// "one active push target" invariant on the direct path (the mirror of the
-/// relay device registry's `create_replacing_approved`, which revokes the prior
-/// approved row). Returns the ids removed, for the caller to log. Best-effort per
-/// id: a delete failure is logged and skipped rather than aborting the supersede.
-pub(crate) async fn supersede_other_bindings(vault: &SecretVault, keep: &str) -> Vec<String> {
-    let mut removed = Vec::new();
-    for binding in list_bindings(vault).await {
-        if binding.device_id == keep {
-            continue;
-        }
-        match remove_binding(vault, &binding.device_id).await {
-            Ok(()) => removed.push(binding.device_id),
-            Err(e) => {
-                tracing::debug!(error = %e, device = %binding.device_id, "push: supersede remove failed")
-            }
-        }
-    }
-    removed
 }
 
 #[cfg(test)]
@@ -227,81 +186,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(apns.apns_token, "tok");
-    }
-
-    #[tokio::test]
-    async fn remove_binding_deletes_meta_and_material() {
-        let vault = vault();
-        store_binding(
-            &vault,
-            &binding("ios-aa"),
-            &[3u8; aead::KEY_LEN],
-            "tok",
-            ApnsEnv::Sandbox,
-            &[4u8; 64],
-        )
-        .await
-        .unwrap();
-        // Sanity: it's enumerable and its material is present.
-        assert_eq!(list_bindings(&vault).await.len(), 1);
-
-        remove_binding(&vault, "ios-aa").await.unwrap();
-
-        // Gone from the enumeration and every shared material key cleared.
-        assert!(list_bindings(&vault).await.is_empty());
-        for name in [
-            web_binding_secret_name("ios-aa"),
-            device_push_key_secret_name("ios-aa"),
-            device_apns_secret_name("ios-aa"),
-            device_push_delegation_secret_name("ios-aa"),
-        ] {
-            assert!(
-                vault.get_secret(&name).await.unwrap().is_none(),
-                "{name} lingered"
-            );
-        }
-        // Idempotent — a second remove is a no-op, not an error.
-        remove_binding(&vault, "ios-aa").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn supersede_keeps_only_the_new_binding() {
-        let vault = vault();
-        for id in ["ios-aa", "ios-bb", "ios-cc"] {
-            store_binding(
-                &vault,
-                &binding(id),
-                &[1u8; aead::KEY_LEN],
-                "tok",
-                ApnsEnv::Sandbox,
-                &[2u8; 64],
-            )
-            .await
-            .unwrap();
-        }
-
-        let mut removed = supersede_other_bindings(&vault, "ios-bb").await;
-        removed.sort();
-        assert_eq!(removed, vec!["ios-aa".to_string(), "ios-cc".to_string()]);
-
-        // Only the kept binding remains, and the superseded ones' material is gone.
-        let listed = list_bindings(&vault).await;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].device_id, "ios-bb");
-        assert!(
-            vault
-                .get_secret(&device_push_key_secret_name("ios-aa"))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            vault
-                .get_secret(&device_push_key_secret_name("ios-bb"))
-                .await
-                .unwrap()
-                .is_some()
-        );
     }
 
     #[tokio::test]

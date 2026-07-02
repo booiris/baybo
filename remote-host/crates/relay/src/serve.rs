@@ -21,7 +21,7 @@
 //! [`try_match`]: RelayBroker::try_match
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,7 @@ use axum::routing::get;
 use remote_host_admission::{Admission, AdmissionEntry, Admit};
 use remote_host_edge::ip_limit::{self, resolve_client_ip_from};
 use remote_host_edge::ip_traffic::{ClientIp, EP_CONTENT_HOST, EP_CONTENT_JOIN};
+use remote_host_protocol::key_tag;
 use remote_host_protocol::relay::{
     CONTENT_HOST, CONTENT_JOIN, CONTROL, LegClass, PAIR_HOST, PAIR_JOIN, RELAY_LEG_CLASS_HEADER,
     REMOTE_API_KEY_HEADER,
@@ -94,6 +95,9 @@ const MAX_PENDING_CONTENT_LEGS: usize = 1024;
 struct JoinWindow {
     count: usize,
     started: Instant,
+    /// Whether this window's limit trip has been warned already, so a shed storm
+    /// logs one warn per window (per-event detail stays at debug).
+    warned: bool,
 }
 
 /// Per-rendezvous-id rate limiter for `/pair/join`. Availability hardening only:
@@ -118,16 +122,89 @@ impl JoinRateLimiter {
             .or_insert(JoinWindow {
                 count: 0,
                 started: now,
+                warned: false,
             });
         if now.duration_since(window.started) >= JOIN_WINDOW {
             window.count = 0;
             window.started = now;
+            window.warned = false;
         }
         if window.count >= JOIN_MAX_PER_WINDOW {
+            if window.warned {
+                tracing::debug!(
+                    rendezvous_id,
+                    "relay: pair-join shed by the per-rendezvous rate limit"
+                );
+            } else {
+                window.warned = true;
+                tracing::warn!(
+                    rendezvous_id,
+                    limit = JOIN_MAX_PER_WINDOW,
+                    "relay: pair-join rate limit tripped for this rendezvous"
+                );
+            }
             return false;
         }
         window.count += 1;
         true
+    }
+}
+
+/// Minimum interval between repeated refusal logs at their normal level for one
+/// (reason, key/ip/node) pair; repeats inside it log at debug.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Soft cap on tracked refusal keys — the map is cleared wholesale when over,
+/// bounding memory against an attacker spraying distinct keys (same pattern as
+/// [`JOIN_LIMITER_MAX_KEYS`]).
+const REFUSAL_DEBOUNCE_MAX_KEYS: usize = 4096;
+
+/// Last-emit time + debug-demoted repeat count for one refusal key.
+struct RefusalEntry {
+    last_emit: Instant,
+    suppressed: u64,
+}
+
+/// Debounces repeated refusal logs keyed by (reason, key/ip/node): a revoked
+/// gateway redialing `/control` every few seconds, or a phone retrying an
+/// offline gateway every 500ms, would otherwise emit a sustained line stream.
+/// Log volume only — the refusal response itself is untouched.
+#[derive(Default)]
+struct RefusalDebounce {
+    entries: parking_lot::Mutex<HashMap<String, RefusalEntry>>,
+}
+
+impl RefusalDebounce {
+    /// `Some(suppressed)` when this refusal should log at its normal level (with
+    /// how many identical refusals were demoted to debug since the last emit),
+    /// `None` when it should log at debug.
+    fn should_emit(&self, key: &str) -> Option<u64> {
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        if entries.len() >= REFUSAL_DEBOUNCE_MAX_KEYS && !entries.contains_key(key) {
+            entries.clear();
+        }
+        match entries.get_mut(key) {
+            Some(entry) if now.duration_since(entry.last_emit) < REFUSAL_LOG_INTERVAL => {
+                entry.suppressed += 1;
+                None
+            }
+            Some(entry) => {
+                let suppressed = entry.suppressed;
+                entry.last_emit = now;
+                entry.suppressed = 0;
+                Some(suppressed)
+            }
+            None => {
+                entries.insert(
+                    key.to_string(),
+                    RefusalEntry {
+                        last_emit: now,
+                        suppressed: 0,
+                    },
+                );
+                Some(0)
+            }
+        }
     }
 }
 
@@ -190,6 +267,8 @@ struct RelayState {
     pending_content_legs: Arc<parking_lot::Mutex<HashMap<String, PendingContentLeg>>>,
     /// Per-rendezvous `/pair/join` throttle (anti-grief; see [`JoinRateLimiter`]).
     join_limiter: Arc<JoinRateLimiter>,
+    /// Refusal-log debounce (see [`RefusalDebounce`]).
+    refusal_debounce: Arc<RefusalDebounce>,
 }
 
 /// The shared registries a relay router meters against, passed to [`build_router`]
@@ -244,6 +323,7 @@ pub fn build_router(services: RelayServices, ip_limit: IpLimitConfig) -> Router 
         trusted_headers: Arc::new(ip_limit.trusted_headers.clone()),
         pending_content_legs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         join_limiter: Arc::new(JoinRateLimiter::default()),
+        refusal_debounce: Arc::new(RefusalDebounce::default()),
     };
     // Every route admits via the shared `x-remote-api-key` pre-layer — including
     // `/control`, whose key now rides the dial header too (its hello carries only
@@ -315,6 +395,95 @@ struct Admitted {
     entry: AdmissionEntry,
 }
 
+/// Scanner-noise gate: internet scanners probing random paths must not produce a
+/// warn per probe, so admission refusals are logged only for real relay routes.
+fn is_relay_route(path: &str) -> bool {
+    path.starts_with("/pair/") || path.starts_with("/content/") || path == CONTROL
+}
+
+/// The static leading portion of the [`CONTENT_HOST`] route — everything before
+/// its `{relay_key}` parameter, whose value is the raw `dl-…` relay_key: a live
+/// capability that must never be logged. Derived from the route template (not a
+/// re-typed literal) so a rename in the protocol crate can't leave this stripping
+/// a stale prefix and silently stop redacting the credential.
+fn content_host_path_prefix() -> &'static str {
+    match CONTENT_HOST.find('{') {
+        Some(i) => &CONTENT_HOST[..i],
+        None => CONTENT_HOST,
+    }
+}
+
+/// A request path safe to log: the content-host relay_key segment is reduced to
+/// its [`key_tag`]; every other path is returned unchanged (the pair/join and
+/// content/join segments — rendezvous_id / relay_node_id — are safe raw).
+fn loggable_route(path: &str) -> String {
+    let prefix = content_host_path_prefix();
+    match path.strip_prefix(prefix) {
+        Some(relay_key) => format!("{prefix}{}", key_tag(relay_key)),
+        None => path.to_string(),
+    }
+}
+
+/// The refused request's client IP for abuse attribution — resolved the same way
+/// the handlers do (trusted proxy headers, then the socket peer when served with
+/// connect info).
+fn refused_client_ip(req: &Request, state: &RelayState) -> Option<IpAddr> {
+    resolve_client_ip_from(
+        req.headers(),
+        req.extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip()),
+        &state.trusted_headers,
+    )
+}
+
+/// Log one admission refusal, gated + debounced. Scanner probes on non-relay
+/// routes are dropped; otherwise the refusal logs at `warn` (carrying how many
+/// identical refusals were demoted since the last emit) at most once per
+/// [`REFUSAL_LOG_INTERVAL`] per `(reason, key/ip)`, else at `debug`. `reason`
+/// discriminates the debounce bucket; `key` is the presented `remote_api_key`
+/// (already-tagged in the log, `None` for the missing-header case, and the IP
+/// stands in as the debounce discriminator there).
+fn log_admission_refusal(
+    state: &RelayState,
+    req: &Request,
+    reason: &str,
+    key: Option<&str>,
+    message: &str,
+) {
+    if !is_relay_route(req.uri().path()) {
+        return;
+    }
+    let route = loggable_route(req.uri().path());
+    let client_ip = refused_client_ip(req, state);
+    let debounce_key = match key {
+        Some(key) => format!("{reason}:{}", key_tag(key)),
+        None => format!("{reason}:{client_ip:?}"),
+    };
+    match (state.refusal_debounce.should_emit(&debounce_key), key) {
+        (Some(suppressed), Some(key)) => tracing::warn!(
+            route = %route,
+            key_tag = %key_tag(key),
+            client_ip = ?client_ip,
+            suppressed,
+            "{message}"
+        ),
+        (Some(suppressed), None) => tracing::warn!(
+            route = %route,
+            client_ip = ?client_ip,
+            suppressed,
+            "{message}"
+        ),
+        (None, Some(key)) => tracing::debug!(
+            route = %route,
+            key_tag = %key_tag(key),
+            client_ip = ?client_ip,
+            "{message}"
+        ),
+        (None, None) => tracing::debug!(route = %route, client_ip = ?client_ip, "{message}"),
+    }
+}
+
 /// Admission pre-layer for the header-gated routes: `401` unless `x-remote-api-key`
 /// resolves to an admitted, unexpired key, then stash the key + its limits as an
 /// [`Admitted`] extension. `/control` admits via this same layer (its key rides the
@@ -330,6 +499,13 @@ async fn require_admitted(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned())
     else {
+        log_admission_refusal(
+            &state,
+            &req,
+            "missing-header",
+            None,
+            "relay: upgrade refused — no x-remote-api-key header",
+        );
         return unadmitted();
     };
     match state.admitted.resolve(&key) {
@@ -340,7 +516,26 @@ async fn require_admitted(
             });
             next.run(req).await
         }
-        Admit::Unknown | Admit::Expired => unadmitted(),
+        Admit::Unknown => {
+            log_admission_refusal(
+                &state,
+                &req,
+                "unknown",
+                Some(&key),
+                "relay: upgrade refused — remote_api_key not admitted (unknown)",
+            );
+            unadmitted()
+        }
+        Admit::Expired => {
+            log_admission_refusal(
+                &state,
+                &req,
+                "expired",
+                Some(&key),
+                "relay: upgrade refused — remote_api_key not admitted (expired)",
+            );
+            unadmitted()
+        }
     }
 }
 
@@ -360,6 +555,11 @@ async fn host_handler(
         .conns
         .register(&key, entry.max_conns.map(|c| c as usize))
     else {
+        tracing::warn!(
+            rendezvous_id = %rendezvous_id,
+            key_tag = %key_tag(&key),
+            "relay: pair-host refused — remote_api_key at its connection cap"
+        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "connection limit reached for this remote_api_key",
@@ -371,6 +571,11 @@ async fn host_handler(
     // future polls won't re-target an already-removed key — so re-check and abort
     // rather than linger un-kicked. (`guard` drops here, deregistering.)
     if !still_admitted(state.admitted.as_ref(), &key) {
+        tracing::warn!(
+            rendezvous_id = %rendezvous_id,
+            key_tag = %key_tag(&key),
+            "relay: remote_api_key revoked during upgrade; refusing pair-host leg"
+        );
         return unadmitted();
     }
     // Park-only: the host never matches an existing half, so two host legs on the
@@ -378,23 +583,51 @@ async fn host_handler(
     // refused `409` and its `guard` drops here, freeing the per-key slot.
     let leg = match state.broker.park(&rendezvous_id) {
         ParkOutcome::Parked(leg) => leg,
-        ParkOutcome::Occupied => return host_occupied(),
-        ParkOutcome::AtCapacity => return at_capacity(),
+        ParkOutcome::Occupied => {
+            tracing::warn!(
+                rendezvous_id = %rendezvous_id,
+                key_tag = %key_tag(&key),
+                "relay: pair-host refused — rendezvous already hosted by a live leg"
+            );
+            return host_occupied();
+        }
+        ParkOutcome::AtCapacity => {
+            tracing::warn!(
+                rendezvous_id = %rendezvous_id,
+                cap = state.broker.max_pending(),
+                key_tag = %key_tag(&key),
+                "relay: pair-host refused — parked-leg ceiling reached"
+            );
+            return at_capacity();
+        }
     };
+    tracing::debug!(
+        rendezvous_id = %rendezvous_id,
+        key_tag = %key_tag(&key),
+        "relay: pair-host parked; waiting for the app to join"
+    );
     let broker = Arc::clone(&state.broker);
     capped(ws).on_upgrade(move |socket| async move {
         let _guard = guard;
-        tokio::select! {
+        let (reason, cause) = tokio::select! {
             // Pairing frames are tiny opaque Noise blobs — not bandwidth-throttled.
-            _ = pump_ws(socket, leg, None) => {}
+            end = pump_ws(socket, leg, None) => ("closed", Some(end.to_string())),
             // The gateway's remote_api_key was revoked mid-connection.
-            _ = kick => {}
-        }
+            _ = kick => ("revoked", None),
+        };
         // If the app never matched (the host disconnected first), drop the
         // still-parked leg so a stale rendezvous can't linger. Only one host half
         // ever exists under a rendezvous id (`park` refuses a second), so this
         // removes our own half, never a newer host's.
-        broker.cancel(&rendezvous_id);
+        let unmatched = broker.cancel(&rendezvous_id);
+        tracing::debug!(
+            rendezvous_id = %rendezvous_id,
+            key_tag = %key_tag(&key),
+            reason,
+            cause = ?cause,
+            unmatched,
+            "relay: pair-host leg closed"
+        );
     })
 }
 
@@ -405,6 +638,10 @@ async fn host_handler(
 async fn join_handler(
     Path(rendezvous_id): Path<String>,
     State(state): State<RelayState>,
+    Extension(Admitted {
+        remote_api_key: phone_key,
+        ..
+    }): Extension<Admitted>,
     ws: WebSocketUpgrade,
 ) -> Response {
     // The rendezvous id is public (the relay routes on it), so anyone who learns
@@ -420,8 +657,28 @@ async fn join_handler(
             .into_response();
     }
     match state.broker.try_match(&rendezvous_id) {
-        Some(leg) => capped(ws).on_upgrade(move |socket| pump_ws(socket, leg, None)),
-        None => (StatusCode::NOT_FOUND, "no pairing host for this rendezvous").into_response(),
+        Some(leg) => {
+            tracing::debug!(
+                rendezvous_id = %rendezvous_id,
+                "relay: pair rendezvous matched (host + join legs spliced)"
+            );
+            capped(ws).on_upgrade(move |socket| async move {
+                let end = pump_ws(socket, leg, None).await;
+                tracing::debug!(
+                    rendezvous_id = %rendezvous_id,
+                    cause = %end,
+                    "relay: pair-join leg closed"
+                );
+            })
+        }
+        None => {
+            tracing::info!(
+                rendezvous_id = %rendezvous_id,
+                key_tag = %key_tag(&phone_key),
+                "relay: pair-join found no parked host for this rendezvous"
+            );
+            (StatusCode::NOT_FOUND, "no pairing host for this rendezvous").into_response()
+        }
     }
 }
 
@@ -445,72 +702,131 @@ async fn run_control(mut socket: WebSocket, state: RelayState, key: String) {
         Some(Ok(AxumMessage::Binary(b))) => match serde_json::from_slice::<ControlHello>(&b) {
             Ok(h) => h,
             Err(e) => {
-                tracing::debug!(error = %e, "control: unparseable hello; closing");
+                // Only the serde error + byte length — never the raw hello bytes.
+                tracing::warn!(
+                    error = %e,
+                    len = b.len(),
+                    key_tag = %key_tag(&key),
+                    "control: unparseable hello; closing"
+                );
                 return;
             }
         },
-        _ => return,
+        Some(Ok(_)) => {
+            tracing::warn!(
+                key_tag = %key_tag(&key),
+                got = "non-binary frame",
+                "control: connection closed before a valid hello; dropping"
+            );
+            return;
+        }
+        Some(Err(e)) => {
+            tracing::warn!(
+                key_tag = %key_tag(&key),
+                got = "error",
+                error = %e,
+                "control: connection closed before a valid hello; dropping"
+            );
+            return;
+        }
+        None => {
+            tracing::warn!(
+                key_tag = %key_tag(&key),
+                got = "eof",
+                "control: connection closed before a valid hello; dropping"
+            );
+            return;
+        }
     };
-    tracing::info!(node = %hello.relay_node_id, "control: gateway connected");
+    tracing::info!(
+        node = %hello.relay_node_id,
+        key_tag = %key_tag(&key),
+        "control: gateway connected"
+    );
     // The control connection is exempt from the per-key cap (essential, ~one per
     // gateway) so a gateway at its leg limit can still (re)establish control.
     let (_kick_guard, mut kick) = state.conns.register_unchecked(&key);
     // Close the TOCTOU window (see the host handlers): the pre-layer admitted the
     // key, but a concurrent revoke's kick may have run before we registered.
     if !still_admitted(state.admitted.as_ref(), &key) {
+        tracing::warn!(
+            node = %hello.relay_node_id,
+            key_tag = %key_tag(&key),
+            "control: remote_api_key revoked during connect; closing"
+        );
         return;
     }
     let (mut rx, control_token) = match state.control.register(&hello.relay_node_id, &key) {
         Ok(registered) => registered,
-        Err(ControlRegisterError::OwnerMismatch) => {
+        Err(ControlRegisterError::OwnerMismatch { owner }) => {
             tracing::warn!(
                 node = %hello.relay_node_id,
+                attempt_key_tag = %key_tag(&key),
+                owner_key_tag = %key_tag(&owner),
                 "control: relay_node_id already registered to a different remote_api_key"
             );
             return;
         }
     };
-    loop {
+    let reason = loop {
         tokio::select! {
             // The gateway's remote_api_key was revoked (admission hot-reload).
             _ = &mut kick => {
-                tracing::info!(node = %hello.relay_node_id, "control: remote_api_key revoked; closing");
-                break;
+                break "revoked";
             }
             sig = rx.recv() => match sig {
                 Some(signal) => {
                     let json = match serde_json::to_vec(&signal) {
                         Ok(j) => j,
-                        Err(_) => continue,
+                        Err(e) => {
+                            // Serializing our own enum must never fail; a drop here
+                            // strands the phone's parked leg until its TTL.
+                            tracing::error!(
+                                node = %hello.relay_node_id,
+                                error = %e,
+                                "control: failed to serialize ControlSignal; signal dropped (invariant break)"
+                            );
+                            continue;
+                        }
                     };
                     if socket.send(AxumMessage::Binary(json.into())).await.is_err() {
-                        break;
+                        break "send_failed";
                     }
                 }
                 // Our slot was superseded by a reconnect (the prior tx was
                 // dropped, closing `rx`). The token-scoped unregister below is a
                 // no-op against the new owner, so just exit.
-                None => break,
+                None => break "superseded",
             },
             inbound = socket.recv() => match inbound {
                 // The gateway speaks only the hello; anything else (its keepalive
                 // Pings, auto-Ponged by axum) just proves liveness.
                 Some(Ok(_)) => {}
-                Some(Err(_)) | None => break,
+                Some(Err(_)) => break "recv_error",
+                None => break "peer_closed",
             },
             // The gateway pings well within this window; silence past it means a
             // half-open connection, so drop it (and unregister) rather than pin a
             // dead slot until the OS TCP timeout.
             _ = tokio::time::sleep(CONTROL_IDLE_TIMEOUT) => {
-                tracing::debug!(node = %hello.relay_node_id, "control: idle timeout; closing");
-                break;
+                tracing::info!(
+                    node = %hello.relay_node_id,
+                    idle_secs = CONTROL_IDLE_TIMEOUT.as_secs(),
+                    "control: idle timeout (half-open); closing"
+                );
+                break "idle_timeout";
             }
         }
-    }
+    };
     state
         .control
         .unregister_if_owned(&hello.relay_node_id, control_token);
-    tracing::info!(node = %hello.relay_node_id, "control: gateway disconnected");
+    tracing::info!(
+        node = %hello.relay_node_id,
+        key_tag = %key_tag(&key),
+        reason,
+        "control: gateway disconnected"
+    );
 }
 
 /// App side of a content session: the phone names the gateway by `relay_node_id`.
@@ -539,6 +855,13 @@ async fn content_join_handler(
         let candidate = new_content_relay_key();
         let mut pending = state.pending_content_legs.lock();
         if pending.len() >= MAX_PENDING_CONTENT_LEGS {
+            drop(pending);
+            tracing::warn!(
+                cap = MAX_PENDING_CONTENT_LEGS,
+                relay_node_id = %relay_node_id,
+                class = class.as_str(),
+                "relay: content-join refused — pending content-leg table at capacity"
+            );
             return at_capacity();
         }
         if !pending.contains_key(&candidate) {
@@ -561,34 +884,75 @@ async fn content_join_handler(
     // The phone leg is admitted by the pre-layer like every other route, but
     // metering keys on the *gateway's* remote_api_key (resolved by signaling) and
     // its server, so both legs of a content session share one bucket pair.
-    let remote_api_key =
-        match state
-            .control
-            .signal_open(&relay_node_id, &phone_key, &relay_key, class)
-        {
-            Ok(key) => key,
-            Err(SignalOpenError::NotConnected) => {
-                state.pending_content_legs.lock().remove(&relay_key);
-                return (StatusCode::SERVICE_UNAVAILABLE, "gateway not connected").into_response();
+    let remote_api_key = match state.control.signal_open(
+        &relay_node_id,
+        &phone_key,
+        &relay_key,
+        class,
+    ) {
+        Ok(key) => key,
+        Err(SignalOpenError::NotConnected) => {
+            state.pending_content_legs.lock().remove(&relay_key);
+            // Routine while a gateway is offline (the phone retries the 503
+            // every 500ms), so debounce per node: one info per interval with
+            // the suppressed count, repeats at debug.
+            match state
+                .refusal_debounce
+                .should_emit(&format!("gateway-not-connected:{relay_node_id}"))
+            {
+                Some(suppressed) => tracing::info!(
+                    relay_node_id = %relay_node_id,
+                    class = class.as_str(),
+                    key_tag = %key_tag(&phone_key),
+                    suppressed,
+                    "relay: content-join refused — no gateway control connection for this relay_node_id"
+                ),
+                None => tracing::debug!(
+                    relay_node_id = %relay_node_id,
+                    class = class.as_str(),
+                    key_tag = %key_tag(&phone_key),
+                    "relay: content-join refused — no gateway control connection for this relay_node_id"
+                ),
             }
-            Err(SignalOpenError::OwnerMismatch) => {
-                state.pending_content_legs.lock().remove(&relay_key);
-                return (
-                    StatusCode::FORBIDDEN,
-                    "relay node belongs to a different remote_api_key",
-                )
-                    .into_response();
-            }
-            Err(SignalOpenError::Backpressure) => {
-                state.pending_content_legs.lock().remove(&relay_key);
-                return (StatusCode::SERVICE_UNAVAILABLE, "gateway control busy").into_response();
-            }
-        };
+            return (StatusCode::SERVICE_UNAVAILABLE, "gateway not connected").into_response();
+        }
+        Err(SignalOpenError::OwnerMismatch) => {
+            state.pending_content_legs.lock().remove(&relay_key);
+            tracing::warn!(
+                relay_node_id = %relay_node_id,
+                class = class.as_str(),
+                key_tag = %key_tag(&phone_key),
+                "relay: content-join refused — relay_node_id owned by a different remote_api_key"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                "relay node belongs to a different remote_api_key",
+            )
+                .into_response();
+        }
+        Err(SignalOpenError::Backpressure) => {
+            state.pending_content_legs.lock().remove(&relay_key);
+            tracing::warn!(
+                relay_node_id = %relay_node_id,
+                class = class.as_str(),
+                key_tag = %key_tag(&phone_key),
+                "relay: content-join refused — gateway control channel full (gateway not draining signals)"
+            );
+            return (StatusCode::SERVICE_UNAVAILABLE, "gateway control busy").into_response();
+        }
+    };
     // Pull the gateway key's limits; if it was revoked since it registered control,
     // fall back to the role floor (the conn kick tears the session down anyway).
     let (max_bps, per_server_max_bps) = match state.admitted.resolve(&remote_api_key) {
         Admit::Ok(e) => (e.max_bps, e.per_server_max_bps),
-        Admit::Unknown | Admit::Expired => (None, None),
+        Admit::Unknown | Admit::Expired => {
+            tracing::debug!(
+                relay_node_id = %relay_node_id,
+                key_tag = %key_tag(&remote_api_key),
+                "relay: gateway key no longer admitted while resolving limits; using role-floor defaults (kick will follow)"
+            );
+            (None, None)
+        }
     };
     let limiter = state
         .bandwidth
@@ -614,10 +978,18 @@ async fn content_join_handler(
         )),
         EP_CONTENT_JOIN,
     );
+    tracing::debug!(
+        relay_key = %key_tag(&relay_key),
+        relay_node_id = %relay_node_id,
+        class = class.as_str(),
+        key_tag = %key_tag(&remote_api_key),
+        "relay: content-join parked; gateway signaled to open data leg"
+    );
     let broker = Arc::clone(&state.broker);
     let pending = Arc::clone(&state.pending_content_legs);
     capped(ws).on_upgrade(move |socket| async move {
-        pump_ws(
+        let started = Instant::now();
+        let end = pump_ws(
             socket,
             leg,
             Some(LegMetering {
@@ -629,8 +1001,28 @@ async fn content_join_handler(
         .await;
         broker.cancel(&relay_key);
         // Backstop: if the gateway host never claimed this leg, drop the mapping so
-        // it can't linger after the phone leg ends.
-        pending.lock().remove(&relay_key);
+        // it can't linger after the phone leg ends. A mapping still present here is
+        // the smoking gun for "gateway signaled but never dialed content-host".
+        if pending.lock().remove(&relay_key).is_some() {
+            tracing::warn!(
+                relay_key = %key_tag(&relay_key),
+                relay_node_id = %relay_node_id,
+                class = class.as_str(),
+                key_tag = %key_tag(&remote_api_key),
+                cause = %end,
+                "relay: content-join leg closed before the gateway claimed it (gateway signaled but never dialed content-host)"
+            );
+        } else {
+            tracing::debug!(
+                relay_key = %key_tag(&relay_key),
+                relay_node_id = %relay_node_id,
+                class = class.as_str(),
+                key_tag = %key_tag(&remote_api_key),
+                duration = ?started.elapsed(),
+                cause = %end,
+                "relay: content-join leg closed"
+            );
+        }
     })
 }
 
@@ -656,9 +1048,23 @@ async fn content_host_handler(
     let pending_leg = {
         let mut pending = state.pending_content_legs.lock();
         let Some(existing) = pending.get(&relay_key) else {
+            drop(pending);
+            tracing::warn!(
+                relay_key = %key_tag(&relay_key),
+                key_tag = %key_tag(&key),
+                "relay: content-host refused — no pending content leg for this relay_key (expired, already claimed, or never issued)"
+            );
             return (StatusCode::NOT_FOUND, "no pending content leg").into_response();
         };
         if existing.owner_remote_api_key != key {
+            let owner_key_tag = key_tag(&existing.owner_remote_api_key);
+            drop(pending);
+            tracing::warn!(
+                relay_key = %key_tag(&relay_key),
+                attempt_key_tag = %key_tag(&key),
+                owner_key_tag = %owner_key_tag,
+                "relay: content-host refused — wrong remote_api_key for this pending content leg"
+            );
             return (
                 StatusCode::FORBIDDEN,
                 "wrong remote_api_key for content leg",
@@ -666,6 +1072,11 @@ async fn content_host_handler(
                 .into_response();
         }
         let Some(pending_leg) = pending.remove(&relay_key) else {
+            drop(pending);
+            tracing::error!(
+                relay_key = %key_tag(&relay_key),
+                "relay: pending content leg vanished between get and remove under one lock (invariant break)"
+            );
             return (StatusCode::NOT_FOUND, "no pending content leg").into_response();
         };
         pending_leg
@@ -681,6 +1092,12 @@ async fn content_host_handler(
     };
     let Some((guard, kick)) = registered else {
         state.broker.cancel(&relay_key);
+        tracing::warn!(
+            relay_key = %key_tag(&relay_key),
+            class = class.as_str(),
+            key_tag = %key_tag(&key),
+            "relay: content-host refused — remote_api_key at its connection cap"
+        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "connection limit reached for this remote_api_key",
@@ -693,6 +1110,11 @@ async fn content_host_handler(
     // rather than linger un-kicked. (`guard` drops here, deregistering.)
     if !still_admitted(state.admitted.as_ref(), &key) {
         state.broker.cancel(&relay_key);
+        tracing::warn!(
+            relay_key = %key_tag(&relay_key),
+            key_tag = %key_tag(&key),
+            "relay: remote_api_key revoked during upgrade; refusing content-host leg"
+        );
         return unadmitted();
     }
     let limiter = state
@@ -703,6 +1125,14 @@ async fn content_host_handler(
         state.broker.cancel(&relay_key);
         return at_capacity();
     };
+    let spliced_at = Instant::now();
+    tracing::debug!(
+        relay_key = %key_tag(&relay_key),
+        relay_node_id = %server_id,
+        class = class.as_str(),
+        key_tag = %key_tag(&key),
+        "relay: content session spliced (gateway host leg matched the phone leg)"
+    );
     // Gateway leg: its inbound is the downlink (gateway → phone). Same (key, server)
     // as the phone leg, so it accumulates into the same entry's down-counters.
     // Resolved after the join succeeds, so a doomed join never populates the map.
@@ -719,8 +1149,8 @@ async fn content_host_handler(
     let broker = Arc::clone(&state.broker);
     capped(ws).on_upgrade(move |socket| async move {
         let _guard = guard;
-        tokio::select! {
-            _ = pump_ws(
+        let (reason, cause) = tokio::select! {
+            end = pump_ws(
                 socket,
                 leg,
                 Some(LegMetering {
@@ -728,11 +1158,21 @@ async fn content_host_handler(
                     meter,
                     ip_meter,
                 }),
-            ) => {}
+            ) => ("closed", Some(end.to_string())),
             // The gateway's remote_api_key was revoked mid-session.
-            _ = kick => {}
-        }
+            _ = kick => ("revoked", None),
+        };
         broker.cancel(&relay_key);
+        tracing::debug!(
+            relay_key = %key_tag(&relay_key),
+            relay_node_id = %server_id,
+            class = class.as_str(),
+            key_tag = %key_tag(&key),
+            reason,
+            cause = ?cause,
+            duration = ?spliced_at.elapsed(),
+            "relay: content-host leg closed"
+        );
     })
 }
 

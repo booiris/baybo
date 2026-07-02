@@ -293,26 +293,9 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         return Err(e);
     }
 
-    let superseded = match state.device_pairing.approve_staged(&row.device_id).await {
-        Ok((_row, replaced)) => replaced,
-        Err(e) => {
-            revoke_staged_device(state, &hello.device_id).await;
-            return Err(format!("approve pairing: {e}"));
-        }
-    };
-    // A newly-paired device supersedes any prior approved one (revoked in-tx by
-    // `approve_staged`, which drops it from the push fan-out's device leg). Also
-    // reclaim each superseded device's direct-mode push binding, else a lingering
-    // `web_push.{id}` record would keep it in the fan-out's web leg and the old
-    // phone would keep buzzing.
-    for old in &superseded {
-        if let Err(e) = crate::push::reclaim_push_binding(&state.secret_vault, old).await {
-            tracing::debug!(
-                device = %super::short_hash(old),
-                error = %e,
-                "push: reclaim superseded binding failed",
-            );
-        }
+    if let Err(e) = state.device_pairing.approve_staged(&row.device_id).await {
+        revoke_staged_device(state, &hello.device_id).await;
+        return Err(format!("approve pairing: {e}"));
     }
 
     // 8. DeviceDelegation — the device authorizes our push key to manage its APNs
