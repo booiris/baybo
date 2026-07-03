@@ -64,6 +64,17 @@ const FOLLOW_BOTTOM_THRESHOLD_PX = 96;
 /// follow/button state again instead of staying pinned by the in-flight flag.
 const GLIDE_SETTLE_CAP_MS = 1200;
 
+/// The transcript scrolls the WKWebView's MAIN FRAME (the document), not an
+/// inner `overflow:auto` div. A nested overflow scroller inside WKWebView owns
+/// an async scroll node that stays asleep until the first touch — a cold-start
+/// drag then reads as dead ("tap once to scroll") and an uncaptured drag
+/// rubber-bands the whole webview instead of moving history. The main-frame
+/// scroller is always live. `.chat-log` is `min-height:100dvh` with no overflow,
+/// so every scroll-position op targets `document.scrollingElement`.
+function scrollEl(): HTMLElement | null {
+  return document.scrollingElement as HTMLElement | null;
+}
+
 /// Rebuild `ChatMsg[]` from a `HistoryPage`'s `wire::Message` rows. Mirrors the
 /// live `case "message"` mapping; each row carries real `attachments` (blob
 /// refs), so images render inline. Keyed by `platform_msg_id` (the live-path
@@ -267,16 +278,19 @@ export function Transcript({
   // position).
   const prependAnchor = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
   // Whether the viewport is pinned to the newest edge (bottom). Maintained by
-  // the log's onScroll; new content auto-scrolls only while pinned, so a reader
-  // who scrolled up into history isn't yanked back down.
+  // the window scroll listener; new content auto-scrolls only while pinned, so a
+  // reader who scrolled up into history isn't yanked back down.
   const followRef = useRef(true);
   // True while a finger is down on the transcript. The programmatic pin-to-
   // newest writes below (stream deltas, ResizeObserver, the keyboard-slide rAF
-  // loop) are the actual scroller inside the WKWebView, so a write landing
-  // mid-drag slams scrollTop back to the bottom every frame — the first drag
-  // then reads as DEAD until the finger lifts. Suspend them while touching;
-  // re-pin on lift so a hold-at-bottom during streaming still catches up.
+  // loop) fight the drag on the main-frame scroller — a write landing mid-drag
+  // slams scrollTop back to the bottom every frame. Suspend them while touching.
   const userTouchingRef = useRef(false);
+  // Document scrollTop captured at touchstart, so touchend can tell a deliberate
+  // upward DRAG (must stay put) from a pure HOLD at the bottom during streaming
+  // (content grew below with pins suspended → catch up on lift). Without this,
+  // any sub-threshold drag sprang back on release.
+  const touchStartScrollTop = useRef(0);
   // Drives the jump-to-latest button — a render concern, unlike followRef
   // (a ref precisely so scrolling doesn't re-render).
   const [showJump, setShowJump] = useState(false);
@@ -301,7 +315,7 @@ export function Transcript({
   // Open the thread at its newest edge — a restored thread would otherwise
   // mount showing its OLDEST rows. Pre-paint, so the top never flashes by.
   useLayoutEffect(() => {
-    const el = logRef.current;
+    const el = scrollEl();
     if (el) el.scrollTop = el.scrollHeight;
   }, []);
 
@@ -312,44 +326,54 @@ export function Transcript({
   // change — this effect is declared first so the armed anchor is still
   // visible.
   useLayoutEffect(() => {
-    const el = logRef.current;
+    const el = scrollEl();
     if (el && followRef.current && !prependAnchor.current && !userTouchingRef.current) {
       el.scrollTop = el.scrollHeight;
     }
   }, [messages, streaming, turnActive]);
 
-  // The log's box shrinks/grows when SwiftUI resizes the webview (keyboard,
-  // rotation); while pinned, hold the newest edge through those size changes
-  // instead of letting the resize cover it.
+  // `.chat-log` now grows with its content (min-height, no inner scroll), so a
+  // ResizeObserver on it fires on the late async growth the one-shot mount pin
+  // races — webfont swap (font-display:swap reflow) and bridge-loaded images —
+  // as well as the keyboard padding slide. While pinned, hold the newest edge
+  // through all of it (this is what keeps the first keyboard raise from snapping
+  // up an un-repinned drift). Pin the DOCUMENT, not the observed box.
   useEffect(() => {
-    const el = logRef.current;
-    if (!el) return;
+    const box = logRef.current;
+    if (!box) return;
     const ro = new ResizeObserver(() => {
-      if (followRef.current && !userTouchingRef.current) el.scrollTop = el.scrollHeight;
+      const el = scrollEl();
+      if (el && followRef.current && !userTouchingRef.current) el.scrollTop = el.scrollHeight;
     });
-    ro.observe(el);
+    ro.observe(box);
     return () => ro.disconnect();
   }, []);
 
-  // Track finger-down so the pin-to-newest writes yield to a drag (see
-  // userTouchingRef). Passive — the listeners never block the scroll itself.
+  // Track finger-down (on the document — the whole page is the scroller now) so
+  // the pin-to-newest writes yield to a drag. Passive — never blocks the scroll.
   useEffect(() => {
-    const el = logRef.current;
-    if (!el) return;
     const down = () => {
       userTouchingRef.current = true;
+      touchStartScrollTop.current = scrollEl()?.scrollTop ?? 0;
     };
     const up = () => {
       userTouchingRef.current = false;
-      if (followRef.current) el.scrollTop = el.scrollHeight;
+      const el = scrollEl();
+      if (!el) return;
+      // Catch up to the newest edge on lift ONLY for a hold at the bottom
+      // (content grew while pins were suspended) — NOT for a deliberate upward
+      // drag, which must stay where the finger left it (the old unconditional
+      // re-pin sprang every sub-threshold drag back to the bottom).
+      const draggedUp = el.scrollTop < touchStartScrollTop.current - 2;
+      if (followRef.current && !draggedUp) el.scrollTop = el.scrollHeight;
     };
-    el.addEventListener("touchstart", down, { passive: true });
-    el.addEventListener("touchend", up, { passive: true });
-    el.addEventListener("touchcancel", up, { passive: true });
+    window.addEventListener("touchstart", down, { passive: true });
+    window.addEventListener("touchend", up, { passive: true });
+    window.addEventListener("touchcancel", up, { passive: true });
     return () => {
-      el.removeEventListener("touchstart", down);
-      el.removeEventListener("touchend", up);
-      el.removeEventListener("touchcancel", up);
+      window.removeEventListener("touchstart", down);
+      window.removeEventListener("touchend", up);
+      window.removeEventListener("touchcancel", up);
     };
   }, []);
 
@@ -359,7 +383,7 @@ export function Transcript({
   // pre-paint keyed on `messages`; only acts when a prepend armed the anchor.
   useLayoutEffect(() => {
     const anchor = prependAnchor.current;
-    const el = logRef.current;
+    const el = scrollEl();
     if (!anchor || !el) return;
     el.scrollTop = anchor.prevScrollTop + (el.scrollHeight - anchor.prevScrollHeight);
     prependAnchor.current = null;
@@ -508,10 +532,11 @@ export function Transcript({
   // can't overlap — the id-set filter is just a safety net. Re-seeds `sentIds`
   // so a later live echo of an own message doesn't double-render.
   const prependOlder = useCallback((older: ChatMsg[], newOldest: number | null, more: boolean) => {
-    if (older.length > 0 && logRef.current) {
+    const anchorEl = scrollEl();
+    if (older.length > 0 && anchorEl) {
       prependAnchor.current = {
-        prevScrollHeight: logRef.current.scrollHeight,
-        prevScrollTop: logRef.current.scrollTop,
+        prevScrollHeight: anchorEl.scrollHeight,
+        prevScrollTop: anchorEl.scrollTop,
       };
     }
     for (const m of older) {
@@ -808,13 +833,14 @@ export function Transcript({
   const pinDeadline = useRef(0);
   const handleBottomInset = (px: number) => {
     document.documentElement.style.setProperty("--thread-bottom-inset", `${px}px`);
-    const el = logRef.current;
-    if (!el) return;
+    const box = logRef.current; // carries the .inset-animated padding transition
+    const el = scrollEl(); // the actual (document) scroller
+    if (!box || !el) return;
     if (!insetAnimated.current) {
       // First (launch) inset: apply without sliding, then arm the transition.
       insetAnimated.current = true;
       if (followRef.current) el.scrollTop = el.scrollHeight;
-      requestAnimationFrame(() => el.classList.add("inset-animated"));
+      requestAnimationFrame(() => box.classList.add("inset-animated"));
       return;
     }
     const already = pinDeadline.current > performance.now();
@@ -840,6 +866,31 @@ export function Transcript({
     setLoadingOlder(false);
     setConnEpoch(epoch);
   };
+
+  // The document (main frame) is the scroller, so follow/jump/paging state is
+  // driven by the window scroll event, not a div's onScroll. Passive; fires on
+  // user scrolls and on the programmatic pins alike (idempotent there).
+  useEffect(() => {
+    const onScroll = () => {
+      const el = scrollEl();
+      if (!el) return;
+      const follow = el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX;
+      if (glidingRef.current) {
+        // Mid-glide positions still read "off the edge" — hold the state
+        // jumpToLatest pinned until the glide lands in the follow band.
+        if (follow) {
+          glidingRef.current = false;
+          clearTimeout(glideTimer.current);
+        }
+      } else {
+        followRef.current = follow;
+        setShowJump(!follow);
+      }
+      if (el.scrollTop <= SCROLL_TOP_THRESHOLD_PX) loadOlder();
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, [loadOlder]);
 
   // Bridge events call the LATEST handlers through this ref (assigned each
   // render), so the subscription registers once without re-subscribing per
@@ -876,7 +927,7 @@ export function Transcript({
   // follow band; the cap timer settles a cancelled glide (see
   // GLIDE_SETTLE_CAP_MS).
   function jumpToLatest() {
-    const el = logRef.current;
+    const el = scrollEl();
     if (!el) return;
     glidingRef.current = true;
     followRef.current = true;
@@ -884,7 +935,7 @@ export function Transcript({
     clearTimeout(glideTimer.current);
     glideTimer.current = setTimeout(() => {
       glidingRef.current = false;
-      const logEl = logRef.current;
+      const logEl = scrollEl();
       if (!logEl) return;
       const follow =
         logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX;
@@ -908,32 +959,7 @@ export function Transcript({
 
   return (
     <>
-      <div
-        className="chat-log"
-        ref={logRef}
-        onScroll={() => {
-          // Track whether the user sits at the newest edge (drives auto-follow
-          // + the jump-to-latest button), and auto-load the next older page as
-          // they near the top; `loadOlder` self-guards (in-flight, no-more,
-          // no-cursor), so firing often is safe.
-          const el = logRef.current;
-          if (!el) return;
-          const follow =
-            el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX;
-          if (glidingRef.current) {
-            // Mid-glide positions still read "off the edge" — hold the state
-            // jumpToLatest pinned until the glide lands in the follow band.
-            if (follow) {
-              glidingRef.current = false;
-              clearTimeout(glideTimer.current);
-            }
-          } else {
-            followRef.current = follow;
-            setShowJump(!follow);
-          }
-          if (el.scrollTop <= SCROLL_TOP_THRESHOLD_PX) loadOlder();
-        }}
-      >
+      <div className="chat-log" ref={logRef}>
         {loadingOlder && <div className="bubble assistant muted">…</div>}
         {hasMoreOlder && !loadingOlder && (
           // Affordance for short threads that don't scroll (the onScroll path

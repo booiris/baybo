@@ -104,17 +104,18 @@ final class TranscriptBridge: NSObject, ObservableObject {
     }
 
     #if DEBUG
-        /// `-baybo-demo-jump`: 4s in, shove the log off the newest edge from
-        /// inside the page — the REAL onScroll → showJump → `jumpVisible`
+        /// `-baybo-demo-jump`: 4s in, shove the document off the newest edge from
+        /// inside the page — the REAL window scroll → showJump → `jumpVisible`
         /// mirror fires — then 3s later run the native jump path. The glass
         /// button's full round trip, screenshot-verifiable headlessly (pair
-        /// with -baybo-open-chat -baybo-demo-frames).
+        /// with -baybo-open-chat -baybo-demo-frames). Scrolls the MAIN FRAME
+        /// (the single scroller); `.chat-log` no longer scrolls.
         func startDemoJumpIfRequested() {
             guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-jump") else { return }
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(4))
                 evaluate(
-                    "document.querySelector('.chat-log').scrollBy({top: -1400, behavior: 'instant'});"
+                    "window.scrollBy({top: -1400, behavior: 'instant'});"
                 )
                 try? await Task.sleep(for: .seconds(3))
                 jumpToLatest()
