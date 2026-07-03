@@ -39,5 +39,9 @@ if [[ "$SKIP_RUST" != 1 ]]; then
 fi
 
 xcodegen generate
+# Pin products inside the repo (build/DerivedData) — the default DerivedData
+# lives outside it, and "install the .app xcodebuild just wrote" then grabs a
+# stale bundle from whichever path happened to exist.
 xcodebuild -project Baybo.xcodeproj -scheme Baybo -configuration "$CONFIGURATION" \
-  -sdk "$SDK" -destination "$DEST" build | grep -E 'error|warning: |BUILD' || true
+  -sdk "$SDK" -destination "$DEST" -derivedDataPath build/DerivedData build \
+  | grep -E 'error|warning: |BUILD' || true

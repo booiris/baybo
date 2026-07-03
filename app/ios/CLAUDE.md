@@ -77,9 +77,24 @@ matters: web bundle → `App/Resources/transcript/` → xcodegen → xcodebuild.
   400ms; the core coalesces concurrent dials.
 - **Bridge** (`App/Web/TranscriptBridge.swift` ⇄ `web/src/bridge.ts`):
   native→web `init/pushFrame/setConnEpoch/userSent/imageResult/setLanguage`;
-  web→native `ready/ordinal/persist/fetchHistory/requestImage/log`. Transcript
-  persistence lives in UserDefaults (`ChatDefaults.*`), NOT webview
+  web→native `ready/ordinal/persist/fetchHistory/requestImage/openUrl/log`.
+  Transcript persistence lives in UserDefaults (`ChatDefaults.*`), NOT webview
   localStorage (file:// storage is unreliable and upgrade-fragile).
+- **Transcript rendering** (web-chat parity, mobile-restyled): user messages
+  keep the black bubble; assistant replies are bubble-less full-width
+  react-markdown + remark-gfm prose, rendered live WHILE streaming
+  (rAF-coalesced; the web app only applies markdown on finalize). `reasoning`
+  / `tool_started` / `tool_completed` / transient-notice frames fold into a
+  per-turn collapsible work block ("思考中" card → "思考了 Xs ›"); answer text
+  interrupted by more work settles into the block as a prose step. Markdown
+  links post `openUrl` to native (system browser) — an in-webview navigation
+  would replace the thread.
+- **Headless UI verification**: launch with `-baybo-open-chat
+  -baybo-demo-frames` (DEBUG) to feed one canned turn (thinking → tool →
+  streamed markdown → finalize) through the real bridge — screenshot the sim
+  at ~3s/~6s/~12s. `scripts/build.sh` pins products at
+  `build/DerivedData/Build/Products/<config>-<sdk>/Baybo.app` for
+  `simctl install`.
 - **Send path**: native mints the msgId, seeds the webview's optimistic bubble
   + echo-dedup FIRST, then enqueues on the leg.
 

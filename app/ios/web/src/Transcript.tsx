@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   fetchHistory,
@@ -9,7 +9,19 @@ import {
   subscribeTranscript,
   type UserSentPayload,
 } from "./bridge";
-import { uid, type ChatMsg, type PersistedState, type WireAttachment, type WireFrame, type WireMessage } from "./types";
+import { MarkdownBody } from "./Markdown";
+import { WorkBlockView } from "./WorkBlock";
+import {
+  uid,
+  type ChatMsg,
+  type PersistedState,
+  type Row,
+  type WireAttachment,
+  type WireFrame,
+  type WireMessage,
+  type WorkRow,
+  type WorkStep,
+} from "./types";
 
 /// Rows per transcript-history fetch — both the reset-recovery refetch (newest
 /// page) and a scroll-up older page. Matches the gateway's default page size
@@ -45,6 +57,21 @@ function historyMessagesToChatMsgs(messages: WireMessage[]): ChatMsg[] {
     content: m.content,
     attachments: m.attachments,
   }));
+}
+
+/// Restored rows re-enter with any live-turn state stripped: an "active" work
+/// block can't still be running after a relaunch, and an empty one has nothing
+/// to show. Unknown roles from a future persist format are dropped.
+function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
+  const out: Row[] = [];
+  for (const r of rows ?? []) {
+    if (r.role === "work") {
+      if (Array.isArray(r.steps) && r.steps.length > 0) out.push({ ...r, active: false });
+    } else if (r.role === "user" || r.role === "assistant" || r.role === "notice") {
+      out.push(r);
+    }
+  }
+  return out;
 }
 
 /// One image attachment in a bubble: downloads the blob via the bridge (cached
@@ -135,6 +162,31 @@ function AttachmentList({
   );
 }
 
+/// One finalized transcript row. User messages and notices keep their bubbles;
+/// assistant replies render bubble-less at full thread width as markdown (the
+/// web chat's reading-band layout). Memoized so streaming ticks don't re-parse
+/// every settled message's markdown.
+const MessageRow = memo(function MessageRow({ m, connEpoch }: { m: ChatMsg; connEpoch: number }) {
+  if (m.role === "assistant") {
+    return (
+      <div className="msg assistant">
+        {m.attachments && m.attachments.length > 0 && (
+          <AttachmentList attachments={m.attachments} connEpoch={connEpoch} />
+        )}
+        {m.content && <MarkdownBody text={m.content} />}
+      </div>
+    );
+  }
+  return (
+    <div className={`bubble ${m.role}`}>
+      {m.attachments && m.attachments.length > 0 && (
+        <AttachmentList attachments={m.attachments} connEpoch={connEpoch} />
+      )}
+      {m.content}
+    </div>
+  );
+});
+
 /// The transcript-only chat thread. All chrome (header, composer, connection
 /// state) is native SwiftUI; this renders the message log and keeps the
 /// hardest-won behaviors: frame handling, reset recovery, history paging, and
@@ -147,9 +199,14 @@ export function Transcript({
   initialConnEpoch: number;
 }) {
   const { t } = useTranslation();
-  const [messages, setMessages] = useState<ChatMsg[]>(restored?.messages ?? []);
+  const [messages, setMessages] = useState<Row[]>(() => sanitizeRestoredRows(restored?.messages));
   const [streaming, setStreaming] = useState("");
   const [turnActive, setTurnActive] = useState(false);
+  // The full streamed answer so far. State updates are coalesced through one
+  // rAF per frame burst — every push crosses the bridge as its own JS task, so
+  // without this each delta would re-render (and re-parse markdown) alone.
+  const streamText = useRef("");
+  const streamRaf = useRef<number | undefined>(undefined);
   // Bumped by native on each successful (re)connect (setConnEpoch). Drives the
   // attachment auto-retry and replaces the old per-dial connGen guard.
   const [connEpoch, setConnEpoch] = useState(initialConnEpoch);
@@ -262,6 +319,78 @@ export function Transcript({
 
   const appendNotice = useCallback((text: string) => {
     setMessages((m) => [...m, { id: uid(), role: "notice", content: text }]);
+  }, []);
+
+  // ---- streaming answer (rAF-coalesced) ------------------------------------
+
+  const appendStreaming = useCallback((text: string) => {
+    streamText.current += text;
+    if (streamRaf.current === undefined) {
+      streamRaf.current = requestAnimationFrame(() => {
+        streamRaf.current = undefined;
+        setStreaming(streamText.current);
+      });
+    }
+  }, []);
+
+  const clearStreaming = useCallback(() => {
+    streamText.current = "";
+    if (streamRaf.current !== undefined) {
+      cancelAnimationFrame(streamRaf.current);
+      streamRaf.current = undefined;
+    }
+    setStreaming("");
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (streamRaf.current !== undefined) cancelAnimationFrame(streamRaf.current);
+    },
+    [],
+  );
+
+  // ---- work block (the turn's thinking / tool process) ---------------------
+
+  // Apply `mutate` to the tail work block, opening one if the turn doesn't
+  // have an open block yet (the web chat's ensureWork).
+  const withOpenWork = useCallback((mutate: (row: WorkRow) => WorkRow) => {
+    setMessages((rows) => {
+      const last = rows[rows.length - 1];
+      if (last && last.role === "work" && last.active) {
+        return [...rows.slice(0, -1), mutate(last)];
+      }
+      const fresh: WorkRow = { id: uid(), role: "work", steps: [], active: true, startedAt: Date.now() };
+      return [...rows, mutate(fresh)];
+    });
+  }, []);
+
+  const pushWorkStep = useCallback(
+    (step: WorkStep) => {
+      withOpenWork((w) => ({ ...w, steps: [...w.steps, step] }));
+    },
+    [withOpenWork],
+  );
+
+  // Answer text followed by more work was intermediate: settle it into the
+  // block as a prose step so reasoning and answer interleave cleanly (the web
+  // chat's flush-and-fold on any non-delta work frame).
+  const foldStreamingIntoProse = useCallback(() => {
+    const text = streamText.current;
+    if (!text) return;
+    clearStreaming();
+    pushWorkStep({ kind: "prose", text });
+  }, [clearStreaming, pushWorkStep]);
+
+  // Close the tail work block: freeze the elapsed label, or drop the block
+  // entirely when the turn produced no steps (a plain direct answer).
+  const closeWork = useCallback(() => {
+    setMessages((rows) => {
+      const last = rows[rows.length - 1];
+      if (!last || last.role !== "work" || !last.active) return rows;
+      if (last.steps.length === 0) return rows.slice(0, -1);
+      const elapsedMs = last.startedAt !== undefined ? Date.now() - last.startedAt : undefined;
+      return [...rows.slice(0, -1), { ...last, active: false, elapsedMs }];
+    });
   }, []);
 
   // Fire a transcript-history request through native. The page streams back
@@ -388,7 +517,12 @@ export function Transcript({
         if (role === "user" && frame.platform_msg_id) {
           sentIds.current.add(frame.platform_msg_id);
         }
-        setStreaming("");
+        if (role === "assistant") {
+          // The terminal message is authoritative: it replaces the streamed
+          // text and ends the turn's work block.
+          closeWork();
+          clearStreaming();
+        }
         setMessages((m) => [
           ...m,
           {
@@ -403,18 +537,72 @@ export function Transcript({
       case "attachment":
         if (frame.attachments && frame.attachments.length > 0) {
           const attachments = frame.attachments;
-          setStreaming("");
+          foldStreamingIntoProse();
           setMessages((m) => [...m, { id: uid(), role: "assistant", content: "", attachments }]);
         }
         break;
       case "answer_delta":
-        setStreaming((s) => s + frame.text);
+        appendStreaming(frame.text);
+        break;
+      case "reasoning":
+        // Thinking chunk: fold any streamed answer back into the block, then
+        // merge into the trailing reasoning step so a streamed trace reads as
+        // one paragraph.
+        foldStreamingIntoProse();
+        withOpenWork((w) => {
+          const steps = [...w.steps];
+          const last = steps[steps.length - 1];
+          if (last && last.kind === "reasoning") {
+            steps[steps.length - 1] = { ...last, text: last.text + frame.text };
+          } else {
+            steps.push({ kind: "reasoning", text: frame.text });
+          }
+          return { ...w, steps };
+        });
+        break;
+      case "tool_started":
+        foldStreamingIntoProse();
+        pushWorkStep({
+          kind: "tool",
+          callId: frame.call_id,
+          label: frame.label || frame.tool,
+          status: "running",
+        });
+        break;
+      case "tool_completed":
+        foldStreamingIntoProse();
+        withOpenWork((w) => {
+          const steps = [...w.steps];
+          for (let i = steps.length - 1; i >= 0; i -= 1) {
+            const s = steps[i];
+            if (s.kind === "tool" && s.callId === frame.call_id && s.status === "running") {
+              steps[i] = { ...s, status: frame.status, summary: frame.summary || undefined };
+              return { ...w, steps };
+            }
+          }
+          // No matching start (e.g. it opened before this page loaded) —
+          // record the completion on its own.
+          steps.push({
+            kind: "tool",
+            callId: frame.call_id,
+            label: frame.summary || frame.call_id,
+            status: frame.status,
+          });
+          return { ...w, steps };
+        });
         break;
       case "turn_state":
         setTurnActive(frame.active);
+        if (!frame.active) closeWork();
         break;
       case "notice":
-        appendNotice(frame.text);
+        if (frame.transient) {
+          // Mid-turn progress narration belongs to the work block, not the log.
+          foldStreamingIntoProse();
+          pushWorkStep({ kind: "status", text: frame.text });
+        } else {
+          appendNotice(frame.text);
+        }
         break;
       case "reset":
         // Native only forwards frames from its live leg, so unlike the old
@@ -444,7 +632,7 @@ export function Transcript({
           setNewestOrdinal(frame.newest_ordinal ?? 0);
           oldestOrdinal.current = frame.oldest_ordinal ?? null;
           setHasMoreOlder(frame.has_more);
-          setStreaming("");
+          clearStreaming();
           // The rebuilt thread IS the newest page — the pre-reset scroll
           // position is meaningless, so snap to the newest edge.
           followRef.current = true;
@@ -480,7 +668,7 @@ export function Transcript({
         break;
       }
       default:
-        break; // reasoning / tool progress / etc. not surfaced in the transcript
+        break; // task_list / approvals / ping etc. not surfaced in the transcript
     }
   };
 
@@ -553,6 +741,11 @@ export function Transcript({
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }
 
+  // While the turn's work block is live it already signals activity; the bare
+  // "Working" pending line only covers the gap before the first frame lands.
+  const lastRow = messages[messages.length - 1];
+  const workLive = lastRow !== undefined && lastRow.role === "work" && lastRow.active;
+
   return (
     <>
       <div
@@ -589,16 +782,24 @@ export function Transcript({
             {t("chat.loadOlder")}
           </button>
         )}
-        {messages.map((m) => (
-          <div key={m.id} className={`bubble ${m.role}`}>
-            {m.attachments && m.attachments.length > 0 && (
-              <AttachmentList attachments={m.attachments} connEpoch={connEpoch} />
-            )}
-            {m.content}
+        {messages.map((m) =>
+          m.role === "work" ? (
+            <WorkBlockView key={m.id} row={m} />
+          ) : (
+            <MessageRow key={m.id} m={m} connEpoch={connEpoch} />
+          ),
+        )}
+        {streaming && (
+          <div className="msg assistant streaming">
+            <MarkdownBody text={streaming} />
           </div>
-        ))}
-        {streaming && <div className="bubble assistant streaming">{streaming}</div>}
-        {turnActive && !streaming && <div className="bubble assistant muted">…</div>}
+        )}
+        {turnActive && !streaming && !workLive && (
+          <div className="work-pending">
+            <span className="work-spin">✻</span>
+            {t("chat.working")}
+          </div>
+        )}
       </div>
       {showJump && (
         <button

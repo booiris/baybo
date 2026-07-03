@@ -10,6 +10,9 @@ export const zh: typeof en = {
       tapToLoad: "点按加载图片",
       imageAlt: "图片",
       recoverFailed: "无法重新加载历史记录：{{error}}",
+      working: "思考中",
+      worked: "思考了片刻",
+      workedFor: "思考了 {{s}} 秒",
     },
   },
 };

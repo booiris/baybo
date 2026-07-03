@@ -36,8 +36,15 @@ export type WireMessage = {
 export type WireFrame =
   | ({ kind: "message" } & WireMessage)
   | { kind: "answer_delta"; text: string }
+  // The model's thinking trace, streamed like answer_delta but folded into the
+  // turn's work block instead of the reply body.
+  | { kind: "reasoning"; text: string }
+  | { kind: "tool_started"; call_id: string; tool: string; label?: string | null }
+  | { kind: "tool_completed"; call_id: string; status: string; summary: string }
   | { kind: "turn_state"; active: boolean }
-  | { kind: "notice"; level: string; text: string }
+  // `transient: true` marks mid-turn progress narration (folded into the work
+  // block); absent/false is a terminal notice (its own centered row).
+  | { kind: "notice"; level: string; text: string; transient?: boolean }
   | { kind: "reset"; reason: string }
   | {
       kind: "history_page";
@@ -63,11 +70,37 @@ export type ChatMsg = {
   attachments?: WireAttachment[];
 };
 
+/// One entry in a turn's work block — the agent's process (thinking, tool
+/// calls, provisional prose the agent superseded, transient progress notices),
+/// mirroring the web chat's WorkStep.
+export type WorkStep =
+  | { kind: "reasoning"; text: string }
+  // Answer text that streamed mid-turn but was followed by more work — the
+  // agent "went back to thinking", so the text so far was intermediate.
+  | { kind: "prose"; text: string }
+  | { kind: "status"; text: string }
+  | { kind: "tool"; callId: string; label: string; status: string; summary?: string };
+
+/// A turn's collapsible work block, kept as its own transcript row (the web
+/// chat's model: the final answer renders BELOW the block, never inside it).
+export type WorkRow = {
+  id: string;
+  role: "work";
+  steps: WorkStep[];
+  active: boolean;
+  /// Epoch ms when the block opened — drives the live elapsed counter.
+  startedAt?: number;
+  /// Total run, set when the block closes ("Worked Xs").
+  elapsedMs?: number;
+};
+
+export type Row = ChatMsg | WorkRow;
+
 /// The transcript state mirrored to native over `{type:"persist"}` and handed
 /// back on the next launch as `init.restoredState`. `lastOrdinal` is the
 /// newest-edge catch-up cursor; `oldestOrdinal` the scroll-up paging cursor.
 export type PersistedState = {
-  messages: ChatMsg[];
+  messages: Row[];
   lastOrdinal: number | null;
   oldestOrdinal: number | null;
   hasMoreOlder: boolean;

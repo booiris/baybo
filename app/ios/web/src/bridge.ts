@@ -83,6 +83,13 @@ export function postOrdinal(lastOrdinal: number | null): void {
   postSafe({ type: "ordinal", lastOrdinal });
 }
 
+/// Markdown links must not navigate the transcript webview away — native opens
+/// them in the system browser instead. Dev browser: plain window.open.
+export function openUrl(url: string): void {
+  if (native) postSafe({ type: "openUrl", url });
+  else window.open(url, "_blank", "noopener");
+}
+
 // Fetches are fire-and-forget too, but throwing is useful to the caller: the
 // transcript's recover/paging paths surface a failed post as a notice bubble
 // (the old invoke() rejection path).

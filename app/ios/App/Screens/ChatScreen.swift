@@ -33,6 +33,9 @@ struct ChatScreen: View {
         .background(Theme.paper)
         .onAppear {
             store.connect()
+            #if DEBUG
+                store.startDemoFramesIfRequested()
+            #endif
         }
         .onDisappear {
             store.teardown()

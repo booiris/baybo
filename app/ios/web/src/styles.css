@@ -89,9 +89,169 @@ button {
 }
 .bubble.user { align-self: flex-end; background: var(--color-ink); color: var(--color-paper); border-color: var(--color-ink); }
 .bubble.assistant { align-self: flex-start; background: var(--color-paper); color: var(--color-ink); }
-.bubble.assistant.streaming { opacity: 0.85; }
 .bubble.assistant.muted { color: var(--color-ink-soft); }
 .bubble.notice { align-self: center; background: none; border: 0; color: var(--color-ink-soft); font-size: 0.8rem; }
+
+/* Assistant replies: NO bubble — full-thread-width markdown prose (the web
+   chat's reading band), Inter for the long read. */
+.msg.assistant {
+  width: 100%;
+  font-family: var(--font-sans);
+  font-size: 0.95rem;
+  line-height: 1.6;
+  color: var(--color-ink);
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+/* Streaming caret: a pulsing block riding the last rendered markdown element
+   (skipped on boxes where an inline caret would look detached). */
+.msg.assistant.streaming .md > :last-child:not(pre):not(table)::after {
+  content: "";
+  display: inline-block;
+  width: 0.45em;
+  height: 1em;
+  margin-left: 0.15em;
+  vertical-align: -0.15em;
+  background: var(--color-ink);
+  animation: caret-pulse 1s steps(2, start) infinite;
+}
+@keyframes caret-pulse { 50% { opacity: 0; } }
+
+/* Markdown body — monochrome soft-line rendering of the web chat's element
+   set (GFM: code, tables, quotes, lists, links). */
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md pre, .md blockquote, .md table { margin: 0.5rem 0; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 0.9rem 0 0.4rem; line-height: 1.3; }
+.md h1 { font-size: 1.25rem; }
+.md h2 { font-size: 1.15rem; }
+.md h3 { font-size: 1.05rem; }
+.md h4, .md h5, .md h6 { font-size: 0.95rem; }
+.md code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: 5px;
+  padding: 0 0.25em;
+}
+.md pre {
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  padding: 0.6rem 0.7rem;
+  overflow-x: auto;
+}
+.md pre code {
+  display: block;
+  border: 0;
+  background: none;
+  padding: 0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+.md a { color: var(--color-ink); text-decoration: underline; text-underline-offset: 2px; }
+.md blockquote {
+  border-left: 2px solid var(--color-line-strong);
+  padding-left: 0.75rem;
+  color: var(--color-ink-soft);
+  font-style: italic;
+}
+.md hr { border: 0; border-top: 1px solid var(--color-line); margin: 0.75rem 0; }
+.md ul, .md ol { padding-left: 1.25rem; }
+.md li { margin: 0.15rem 0; }
+.md img { max-width: 100%; border-radius: 10px; }
+/* Wide tables scroll inside their own box instead of stretching the thread. */
+.md table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+.md th, .md td { border: 1px solid var(--color-line); padding: 0.25rem 0.5rem; text-align: left; }
+.md th { background: var(--color-surface); font-weight: 700; }
+
+/* The turn's work block (thinking trace + tool progress). Active: a soft card
+   with a spinner header; closed: a dim tappable "Worked Xs ›" summary. */
+.work { width: 100%; font-family: var(--font-mono); }
+.work.active {
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  padding: 0.6rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.work-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-ink);
+}
+.work-elapsed { color: var(--color-ink-soft); letter-spacing: 0; text-transform: none; }
+.work-spin {
+  display: inline-block;
+  color: var(--color-ink-soft);
+  animation: work-spin 1.2s linear infinite;
+}
+@keyframes work-spin { to { transform: rotate(360deg); } }
+.work.closed { display: flex; flex-direction: column; gap: 0.45rem; }
+.work-summary {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--color-ink-soft);
+}
+.work-summary:active { opacity: 0.7; }
+.work-chevron { display: inline-block; transition: transform 120ms ease; }
+.work-chevron.open { transform: rotate(90deg); }
+.work-divider { border-top: 1px solid var(--color-line); }
+.work-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  max-height: 45dvh;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+.work-steps::-webkit-scrollbar { display: none; }
+.step {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--color-ink-soft);
+}
+.step .step-glyph { flex: 0 0 auto; }
+.step .step-text { white-space: pre-wrap; word-break: break-word; min-width: 0; }
+.step.reasoning .step-text { font-style: italic; }
+.step.tool { color: var(--color-ink); }
+.step.tool.failed { color: var(--color-err); }
+.work.active .step.tool.running .step-glyph { animation: glyph-pulse 1s ease-in-out infinite; }
+@keyframes glyph-pulse { 50% { opacity: 0.25; } }
+.step.prose { display: block; font-family: var(--font-sans); font-size: 0.85rem; color: var(--color-ink); }
+.step.status { white-space: pre-wrap; }
+
+/* Pre-first-frame turn indicator (the web chat's "Working…" card, as a line). */
+.work-pending {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--color-ink-soft);
+}
 
 /* Scroll-up "load earlier" affordance: a centered hairline pill, monospace
    chrome (it's chrome, not a message body), soft like the rest of the UI. */

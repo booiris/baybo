@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import WebKit
 
 /// The Swift half of the transcript bridge (the JS half lives in
@@ -91,15 +92,25 @@ final class TranscriptBridge: NSObject, ObservableObject {
             pending.append(js)
             return
         }
-        webView.evaluateJavaScript(js)
+        evaluate(js)
     }
 
     private func flushPending() {
-        guard let webView else { return }
         for js in pending {
-            webView.evaluateJavaScript(js)
+            evaluate(js)
         }
         pending.removeAll()
+    }
+
+    /// A thrown exception inside an evaluated call surfaces ONLY through the
+    /// completion handler (window.onerror never sees it) — log it, or bridge
+    /// failures are invisible.
+    private func evaluate(_ js: String) {
+        webView?.evaluateJavaScript(js) { _, error in
+            if let error {
+                NSLog("baybo: bridge eval failed: %@", error.localizedDescription)
+            }
+        }
     }
 
     private func kindString(_ kind: AttachmentKind) -> String {
@@ -175,6 +186,16 @@ extension TranscriptBridge: WKScriptMessageHandler {
                 let blobId = body["blobId"] as? String
             {
                 store?.requestImage(id: id, blobId: blobId)
+            }
+        case "openUrl":
+            // Markdown links leave the app for the system browser — navigating
+            // the transcript webview itself would replace the thread.
+            if let raw = body["url"] as? String,
+                let url = URL(string: raw),
+                let scheme = url.scheme?.lowercased(),
+                scheme == "http" || scheme == "https"
+            {
+                UIApplication.shared.open(url)
             }
         case "log":
             let level = body["level"] as? String ?? "info"
