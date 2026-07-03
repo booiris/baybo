@@ -1,0 +1,16 @@
+// English strings (the source locale; `zh.ts` mirrors this shape). Only the
+// transcript's own strings live here — all other chrome is native SwiftUI.
+export const en = {
+  translation: {
+    chat: {
+      loadOlder: "Load earlier messages",
+      jumpToLatest: "Jump to the latest message",
+      loadingImage: "Loading image…",
+      tapToLoad: "Tap to load image",
+      imageAlt: "image",
+      recoverFailed: "Couldn't reload history: {{error}}",
+    },
+  },
+};
+
+export default en;

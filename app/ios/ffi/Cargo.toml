@@ -1,0 +1,38 @@
+[package]
+name = "baybo-ios-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Baybo iOS core: transport + pairing + keychain behind a UniFFI surface"
+publish = false
+
+# `staticlib` is what the Xcode target links; `lib` keeps the crate
+# host-unit-testable; `cdylib` lets `uniffi-bindgen generate --library` extract
+# the interface metadata from a host build.
+[lib]
+name = "baybo_ffi"
+crate-type = ["staticlib", "cdylib", "lib"]
+doctest = false
+
+[dependencies]
+baybo-mobile-core = { workspace = true }
+device-proto = { workspace = true }
+remote-host-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+rustls = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+uniffi = { workspace = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+core-foundation = { workspace = true }
+core-foundation-sys = { workspace = true }

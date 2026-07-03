@@ -1,0 +1,52 @@
+# iOS companion, SwiftUI generation — a SEPARATE Cargo workspace (the root
+# `[workspace]` excludes `app/ios` just like `app/mobile`) so the host
+# `cargo clippy --all` gate never builds an iOS-configured crate.
+#
+# `ffi/` is the UniFFI core the SwiftUI app links as a static library: the
+# transport legs (relay Noise E2E + direct raw-msgpack), pairing, keychain, and
+# blob transfer, lifted from `app/mobile/src-tauri` with the Tauri shell
+# replaced by UniFFI callback interfaces. The protocol/crypto stay in the shared
+# crates (`wire`, `device-proto`, `baybo-mobile-core`), so interop with the
+# gateway is guaranteed by construction. `bindgen/` is the uniffi-bindgen CLI
+# kept as its own member so the `cli` feature never unifies into the lib build.
+[workspace]
+resolver = "2"
+members = ["bindgen", "ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+baybo-mobile-core = { path = "../mobile/core" }
+wire = { path = "../../crates/wire" }
+device-proto = { path = "../../crates/device-proto" }
+# The remote-host (C) wire contract: relay route/URL builders + header names.
+remote-host-protocol = { path = "../../remote-host/crates/protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+hex = "0.4"
+# Client-minted relay chat-session ids (the relay leg needs no gateway pre-registration).
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "rustls-no-provider",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "fs", "io-util"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# tokio-tungstenite pins rustls with default-features off, so NO crypto provider
+# is selected — the first wss dial would panic building its ClientConfig. Pull
+# rustls directly with exactly one provider (ring: light, and cross-compiles
+# cleanly for iOS device + simulator) and install it in `BayboClient::new`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+futures-util = "0.3"
+# `std` for `set_boxed_logger` (the file/stderr log bridge in ffi/src/logging.rs).
+log = { version = "0.4", features = ["std"] }
+parking_lot = "0.12"
+uniffi = "0.29"
+# iOS keychain (SecItemAdd/Delete/CopyMatching over CFDictionary).
+core-foundation = "0.10"
+core-foundation-sys = "0.8"

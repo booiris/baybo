@@ -1,0 +1,3 @@
+# Standalone project: an explicit empty package set stops pnpm from walking up
+# and adopting the repo-root workspace.
+packages: []

@@ -1,0 +1,247 @@
+import SwiftUI
+
+/// The chat screen's connection state machine + send path — the native owner of
+/// everything the webview's reconnect effect used to do (App.tsx 903-984).
+///
+/// Contract preserved from the web implementation:
+/// * `offline` has exactly one trigger: a failed dial. An unsolicited pump
+///   death (`onDisconnected`) flips back to `connecting` and schedules a
+///   backoff redial; deliberate teardown never fires the callback.
+/// * Foreground reconnects are debounced (400ms) and coalesce with the dial
+///   already in flight (the core's registry also coalesces).
+/// * A dial generation guards late callbacks from a superseded sink.
+@MainActor
+final class ChatStore: ObservableObject {
+    enum ConnState {
+        case connecting
+        case connected
+        case offline
+    }
+
+    static let reconnectBackoff: Duration = .milliseconds(2000)
+    static let foregroundDebounce: Duration = .milliseconds(400)
+    /// Matches the gateway's 100 MiB blob cap (`MAX_BLOB_BYTES`) so an
+    /// over-size pick is rejected up front instead of failing after upload.
+    static let maxAttachmentBytes = 100 * 1024 * 1024
+
+    let sessionId: String
+    @Published private(set) var connState: ConnState = .connecting
+    /// Transient composer notice (send failed / waiting for upload / too large).
+    @Published var notice: String?
+
+    /// Increments on every successful dial; the webview uses it to retry
+    /// attachments that raced ahead of the leg going live, and to drop late
+    /// history frames from a superseded connection.
+    private(set) var connEpoch = 0
+    /// Newest-edge ordinal reported by the webview — the reconnect catch-up
+    /// cursor (`sinceOrdinal`). In-memory only: the DURABLE cursor lives inside
+    /// the persisted transcript blob (written atomically with the messages it
+    /// matches), so a kill can never leave the cursor durably ahead of the
+    /// transcript — the old localStorage blob had the same one-write property.
+    private(set) var lastOrdinal: Int64?
+
+    /// Accepted floor: sinks below this are muted. Advanced when a dial
+    /// actually REPLACES the pump (success) or on teardown — NOT at dial start,
+    /// so the still-live prior pump keeps rendering through the redial window
+    /// (streamed deltas aren't durable rows; dropping them leaves holes).
+    private var generation = 0
+    /// Last generation handed to a dial's sink.
+    private var issuedGeneration = 0
+    private var retryTask: Task<Void, Never>?
+    private var debounceTask: Task<Void, Never>?
+    private var connectInFlight = false
+    weak var bridge: TranscriptBridge?
+
+    init(sessionId: String) {
+        self.sessionId = sessionId
+        if let blob = UserDefaults.standard.string(forKey: ChatDefaults.transcriptState),
+            let data = blob.data(using: .utf8),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            lastOrdinal = (obj["lastOrdinal"] as? NSNumber)?.int64Value
+        }
+    }
+
+    // MARK: - Connection lifecycle
+
+    func connect() {
+        guard !connectInFlight else { return }
+        connectInFlight = true
+        connState = .connecting
+        // A redial supersedes any lingering transient notice (old contract).
+        notice = nil
+        issuedGeneration += 1
+        let gen = issuedGeneration
+        Task {
+            defer { connectInFlight = false }
+            do {
+                try await Baybo.client.chatConnect(
+                    sessionId: sessionId,
+                    sinceOrdinal: lastOrdinal,
+                    sink: Sink(store: self, generation: gen)
+                )
+                guard gen >= generation else { return }  // superseded by teardown
+                // The registry swapped pumps; only NOW mute the old sink.
+                generation = gen
+                connEpoch += 1
+                connState = .connected
+                bridge?.setConnEpoch(connEpoch)
+            } catch {
+                guard gen >= generation else { return }
+                // The one place `offline` is set — a failed dial.
+                connState = .offline
+                scheduleRetry()
+            }
+        }
+    }
+
+    /// Foreground / visibility signal: debounce, then redial (a no-op when the
+    /// live session is healthy — the gateway replays only the gap).
+    func scheduleReconnect() {
+        debounceTask?.cancel()
+        debounceTask = Task {
+            try? await Task.sleep(for: Self.foregroundDebounce)
+            guard !Task.isCancelled else { return }
+            connect()
+        }
+    }
+
+    private func scheduleRetry() {
+        retryTask?.cancel()
+        retryTask = Task {
+            try? await Task.sleep(for: Self.reconnectBackoff)
+            guard !Task.isCancelled else { return }
+            connect()
+        }
+    }
+
+    /// The pump died on its own (peer closed / liveness lapse / Noise desync).
+    private func pumpDisconnected(sessionId: String, generation: Int) {
+        guard sessionId == self.sessionId, generation >= self.generation else { return }
+        connState = .connecting
+        scheduleRetry()
+    }
+
+    /// Leaving the chat screen: cancel timers and tear the live pump down
+    /// (deliberate teardown — the disconnected callback must NOT fire; the
+    /// registry's epoch fence also discards any dial still in flight).
+    func teardown() {
+        retryTask?.cancel()
+        debounceTask?.cancel()
+        // Mute every sink, including one handed to a dial still in flight.
+        issuedGeneration += 1
+        generation = issuedGeneration
+        Task {
+            await Baybo.client.chatDisconnect()
+        }
+    }
+
+    // MARK: - Sending
+
+    /// Optimistic send: mint the idempotency key, seed the webview's bubble +
+    /// echo-dedup FIRST, then enqueue on the live leg.
+    func send(text: String, attachments: [AttachmentRef]) {
+        let msgId = UUID().uuidString
+        bridge?.userSent(msgId: msgId, text: text, attachments: attachments)
+        Task {
+            do {
+                try await Baybo.client.chatSend(
+                    text: text, msgId: msgId, attachments: attachments)
+            } catch {
+                notice = String(
+                    format: String(localized: "chat.sendFailed"), bayboErrorText(error))
+            }
+        }
+    }
+
+    // MARK: - Bridge callbacks (webview → native)
+
+    func ordinalAdvanced(_ ordinal: Int64?) {
+        lastOrdinal = ordinal
+    }
+
+    func fetchHistory(beforeOrdinal: Int64?, limit: UInt32) {
+        Task {
+            do {
+                try await Baybo.client.chatFetchHistory(
+                    beforeOrdinal: beforeOrdinal, limit: limit)
+            } catch {
+                NSLog("baybo: fetchHistory: %@", bayboErrorText(error))
+                // The web bundle's paging/reset guards armed for this request
+                // must unwind; a synthesized frame rides the ordered frame path
+                // (the old invoke() rejection played this role).
+                let payload: [String: Any] = [
+                    "kind": "history_failed",
+                    "error": bayboErrorText(error),
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: payload),
+                    let json = String(data: data, encoding: .utf8)
+                {
+                    bridge?.pushFrame(json)
+                }
+            }
+        }
+    }
+
+    func requestImage(id: Int, blobId: String) {
+        Task {
+            do {
+                let bytes = try await Baybo.client.blobImage(blobId: blobId)
+                bridge?.imageResult(
+                    id: id, dataBase64: bytes.base64EncodedString(),
+                    mimeType: mimeTypeForImage(bytes), error: nil)
+            } catch {
+                bridge?.imageResult(
+                    id: id, dataBase64: nil, mimeType: "", error: bayboErrorText(error))
+            }
+        }
+    }
+
+    /// Cheap magic-byte sniff so the webview can build a typed Blob; the exact
+    /// subtype only matters for the object URL, so `image/*` fallbacks are fine.
+    private func mimeTypeForImage(_ data: Data) -> String {
+        if data.starts(with: [0xFF, 0xD8, 0xFF]) { return "image/jpeg" }
+        if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "image/png" }
+        if data.starts(with: [0x47, 0x49, 0x46]) { return "image/gif" }
+        if data.count > 11, data[8...11] == Data([0x57, 0x45, 0x42, 0x50]) {
+            return "image/webp"
+        }
+        return "application/octet-stream"
+    }
+
+    /// The per-dial frame sink. Callbacks arrive on the core's tokio workers;
+    /// hop to the main queue before touching state. GCD (not `Task`) on purpose:
+    /// the main queue is FIFO, so streamed frames can't reorder — an
+    /// `answer_delta` arriving before its predecessor would corrupt the
+    /// transcript. Late callbacks from a superseded dial are dropped by the
+    /// generation guard.
+    ///
+    /// `@unchecked Sendable`: the only mutable state is the auto-nilling weak
+    /// ref (atomic), and all real work hops to the main queue.
+    private final class Sink: FrameSink, @unchecked Sendable {
+        private weak var store: ChatStore?
+        private let generation: Int
+
+        init(store: ChatStore, generation: Int) {
+            self.store = store
+            self.generation = generation
+        }
+
+        func onFrame(frameJson: String) {
+            DispatchQueue.main.async { [weak store, generation] in
+                MainActor.assumeIsolated {
+                    guard let store, generation == store.generation else { return }
+                    store.bridge?.pushFrame(frameJson)
+                }
+            }
+        }
+
+        func onDisconnected(sessionId: String) {
+            DispatchQueue.main.async { [weak store, generation] in
+                MainActor.assumeIsolated {
+                    store?.pumpDisconnected(sessionId: sessionId, generation: generation)
+                }
+            }
+        }
+    }
+}

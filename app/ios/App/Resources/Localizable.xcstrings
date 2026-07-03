@@ -1,0 +1,258 @@
+{
+  "sourceLanguage": "en",
+  "version": "1.0",
+  "strings": {
+    "landing.subtitle": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Connect to your Baybo" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "连接到你的 Baybo" } }
+      }
+    },
+    "landing.scan": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Scan QR" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "扫码连接" } }
+      }
+    },
+    "landing.direct": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Connect with URL & token" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "使用 URL 与令牌连接" } }
+      }
+    },
+    "direct.hint": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Use your Baybo's address and access token." } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "输入 Baybo 的地址和访问令牌。" } }
+      }
+    },
+    "direct.urlLabel": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Baybo address" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "Baybo 地址" } }
+      }
+    },
+    "direct.tokenLabel": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Access token" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "访问令牌" } }
+      }
+    },
+    "direct.tokenPlaceholder": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Paste the access token" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "粘贴访问令牌" } }
+      }
+    },
+    "direct.tokenHint": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Get this from the computer running Baybo." } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "在运行 Baybo 的电脑上获取。" } }
+      }
+    },
+    "direct.connect": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Connect" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "连接" } }
+      }
+    },
+    "direct.connecting": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Connecting…" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "连接中…" } }
+      }
+    },
+    "direct.invalidUrl": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Enter a valid http:// or https:// address." } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "请输入有效的 http:// 或 https:// 地址。" } }
+      }
+    },
+    "direct.invalidToken": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Invalid token — check it and try again." } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "令牌无效——请检查后重试。" } }
+      }
+    },
+    "direct.failed": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Connection failed: %@" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "连接失败：%@" } }
+      }
+    },
+    "direct.back": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Back" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "返回" } }
+      }
+    },
+    "scan.cancel": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Cancel" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "取消" } }
+      }
+    },
+    "scan.permissionOff": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Camera access is off — enable it for Baybo in Settings, then try again." } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "相机权限已关闭——请在「设置」中为 Baybo 开启后重试。" } }
+      }
+    },
+    "scan.notBaybo": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "That QR isn't a Baybo pairing QR. Scan the one shown by `baybo device pair`." } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "这不是 Baybo 的配对二维码。请扫描 `baybo device pair` 显示的那个。" } }
+      }
+    },
+    "pair.connecting": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Connecting…" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "连接中…" } }
+      }
+    },
+    "pair.confirmTitle": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Confirm pairing" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "确认配对" } }
+      }
+    },
+    "pair.confirmHint": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Check this code matches the one shown on the computer running `baybo device pair`, then pair on both." } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "请核对此代码与运行 `baybo device pair` 的电脑上显示的一致，然后在两端确认配对。" } }
+      }
+    },
+    "pair.pair": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Pair" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "配对" } }
+      }
+    },
+    "pair.cancel": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Cancel" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "取消" } }
+      }
+    },
+    "pair.confirming": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Confirming…" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "确认中…" } }
+      }
+    },
+    "pair.cancelling": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Cancelling…" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "取消中…" } }
+      }
+    },
+    "pair.cancelled": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Pairing cancelled." } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "配对已取消。" } }
+      }
+    },
+    "pair.cancelledReason": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Pairing cancelled: %@" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "配对已取消：%@" } }
+      }
+    },
+    "pair.failed": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Pairing failed: %@" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "配对失败：%@" } }
+      }
+    },
+    "connected.logout": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Log out" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "退出登录" } }
+      }
+    },
+    "connected.logoutConfirm": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Log out of this Baybo? Notifications and chat stop until you connect again." } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "退出此 Baybo？在重新连接前，通知和聊天将停止。" } }
+      }
+    },
+    "chat.placeholder": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Message…" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "输入消息…" } }
+      }
+    },
+    "chat.send": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Send" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "发送" } }
+      }
+    },
+    "chat.voice": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Voice input" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "语音输入" } }
+      }
+    },
+    "chat.connecting": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Connecting…" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "连接中…" } }
+      }
+    },
+    "chat.connected": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Connected" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "已连接" } }
+      }
+    },
+    "chat.offline": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Offline" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "离线" } }
+      }
+    },
+    "chat.startFailed": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Couldn't start the chat: %@" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "无法开始聊天：%@" } }
+      }
+    },
+    "chat.sendFailed": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Send failed: %@" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "发送失败：%@" } }
+      }
+    },
+    "chat.waitingUpload": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Waiting for the image to finish uploading…" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "正在等待图片上传完成…" } }
+      }
+    },
+    "chat.tooLarge": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Too large (max 100 MB)" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "文件过大（最大 100 MB）" } }
+      }
+    },
+    "chat.attachFailed": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Couldn't load image" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "无法加载图片" } }
+      }
+    },
+    "chat.addImage": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Add image" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "添加图片" } }
+      }
+    },
+    "chat.remove": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Remove" } },
+        "zh-Hans": { "stringUnit": { "state": "translated", "value": "移除" } }
+      }
+    }
+  }
+}

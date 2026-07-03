@@ -1,0 +1,179 @@
+/* Monochrome, light-only — SOFT LINE MINIMALISM (see app/mobile/CLAUDE.md; this
+   bundle inherits that system). Plain CSS: no Tailwind — only the transcript
+   renders here, everything else is native SwiftUI. Token names mirror app/web's
+   so the palettes read as one system. */
+:root {
+  --color-paper: #ffffff;
+  --color-surface: #fafafa;
+  --color-ink: #111111;
+  --color-ink-soft: #6b6b6b;
+  /* Incidental hairlines (bubbles, chips) stay light so the UI reads airy; ink
+     is reserved for text + deliberate line elements. */
+  --color-line: #e4e4e4;
+  --color-line-strong: #bcbcbc;
+
+  /* The one non-monochrome hue: destructive / error state only (never chrome). */
+  --color-err: #d40000;
+
+  --font-mono: "Space Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+
+  --radius: 14px;
+  --radius-pill: 9999px;
+
+  /* Top inset so the thread's oldest visible row starts below the native
+     header's overlay gradient. Native may retune it (it owns the header). */
+  --thread-top-inset: 90px;
+
+  /* Light-only: pin the scheme so iOS scrollbars/controls never render a dark
+     variant the design doesn't define. */
+  color-scheme: light;
+  font-family: var(--font-mono);
+  color: var(--color-ink);
+  background: var(--color-paper);
+  -webkit-font-smoothing: antialiased;
+  /* Native-app feel: no web-style text selection or iOS long-press callout
+     anywhere (user-select + touch-callout inherit, so :root covers the tree). */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+
+/* Don't let images be drag-ghosted out of the (otherwise native-feeling) app. */
+img {
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+button {
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+
+/* The transcript IS the page: a full-viewport scroller. The top inset clears
+   the native header overlay; the bottom padding keeps the newest bubble off the
+   webview's bottom edge (the native composer sits BELOW the webview, not over
+   it). */
+.chat-log {
+  height: 100dvh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: var(--thread-top-inset) 1.25rem calc(env(safe-area-inset-bottom, 0px) + 1rem);
+  /* Native-app feel: no visible scrollbar on the thread. */
+  scrollbar-width: none;
+}
+.chat-log::-webkit-scrollbar { display: none; }
+/* Short threads hug the bottom edge: the first row's auto top margin absorbs
+   the leftover flex space, so there's no void below the last bubble. Once
+   content overflows the margin resolves to 0 and scrolling behaves as normal. */
+.chat-log > :first-child { margin-top: auto; }
+
+/* Chat MESSAGE bodies read as Inter sans (comfortable long-read); the chrome
+   stays monospace. Soft uniform rounded bubbles, hairline outlined. */
+.bubble {
+  max-width: 80%;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius);
+  font-family: var(--font-sans);
+  font-size: 0.95rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.bubble.user { align-self: flex-end; background: var(--color-ink); color: var(--color-paper); border-color: var(--color-ink); }
+.bubble.assistant { align-self: flex-start; background: var(--color-paper); color: var(--color-ink); }
+.bubble.assistant.streaming { opacity: 0.85; }
+.bubble.assistant.muted { color: var(--color-ink-soft); }
+.bubble.notice { align-self: center; background: none; border: 0; color: var(--color-ink-soft); font-size: 0.8rem; }
+
+/* Scroll-up "load earlier" affordance: a centered hairline pill, monospace
+   chrome (it's chrome, not a message body), soft like the rest of the UI. */
+.load-older {
+  flex: 0 0 auto;
+  align-self: center;
+  padding: 0.3rem 0.9rem;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-pill);
+  background: var(--color-paper);
+  color: var(--color-ink-soft);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+.load-older:active { opacity: 0.7; transform: scale(0.98); }
+
+/* Image attachments rendered inside a chat bubble. */
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.35rem;
+}
+.attachment-img {
+  display: block;
+  max-width: 100%;
+  max-height: 16rem;
+  border-radius: var(--radius);
+  object-fit: contain;
+}
+.attachment-loading { font-size: 0.85rem; color: inherit; opacity: 0.85; }
+.attachment-retry {
+  flex: 0 0 auto;
+  padding: 0.4rem 0.8rem;
+  font-size: 0.85rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--color-ink);
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-pill);
+}
+.attachment-retry:active { opacity: 0.7; transform: none; }
+.attachment-file {
+  font-size: 0.85rem;
+  padding: 0.35rem 0.6rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius);
+}
+
+/* Jump-to-latest: floats centered just above the webview's bottom edge (the
+   native composer sits right below it) while the user is off the newest edge;
+   tapping glides back to the bottom. The ::after hit-slop lifts the 36px circle
+   to the 44px tap floor. */
+.jump-latest {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 1rem);
+  margin: 0 auto;
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-paper);
+  background: var(--color-ink);
+  border: 0;
+  border-radius: var(--radius-pill);
+  animation: jump-pop 160ms ease;
+}
+.jump-latest svg { width: 1.1rem; height: 1.1rem; }
+.jump-latest:active { opacity: 0.7; transform: scale(0.98); }
+/* Invisible hit-slop lifting the 36px circle to the 44px tap-target floor. */
+.jump-latest::after {
+  content: "";
+  position: absolute;
+  inset: -0.25rem;
+  border-radius: var(--radius-pill);
+}
+@keyframes jump-pop {
+  from { opacity: 0; transform: scale(0.7); }
+}
