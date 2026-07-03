@@ -20,8 +20,15 @@ struct ChatScreen: View {
 
     var body: some View {
         ZStack(alignment: .top) {
+            // Full-bleed on BOTH vertical edges, keyboard included: a webview
+            // whose frame tracks the keyboard can't animate with it (the web
+            // process relayouts once, asynchronously, at the final size — the
+            // transcript would sit still and snap at the end). The frame stays
+            // fixed; the thread instead pads its bottom by the measured
+            // composer/keyboard obstruction fed over the bridge, and animates
+            // that padding web-side so content slides with the keyboard.
             TranscriptWebView(bridge: bridge)
-                .ignoresSafeArea(edges: .top)
+                .ignoresSafeArea(.all, edges: [.top, .bottom])
 
             ChatHeaderView(connState: store.connState) {
                 confirmLogout = true
@@ -29,6 +36,15 @@ struct ChatScreen: View {
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             ComposerView(store: store)
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.frame(in: .global).minY
+                } action: { minY in
+                    // The composer's own geometry is the one signal that
+                    // tracks BOTH the keyboard it rides and its own growth
+                    // (notice line, staged strip, multiline field). The bridge
+                    // converts to the covered strip against the WINDOW bottom.
+                    bridge.setComposerTop(minY)
+                }
         }
         .background(Theme.paper)
         .onAppear {

@@ -18,6 +18,8 @@ final class TranscriptBridge: NSObject, ObservableObject {
     weak var webView: WKWebView?
     private var ready = false
     private var pending: [String] = []
+    private var lastBottomInset = Int.min
+    private var composerTop: CGFloat?
 
     init(store: ChatStore) {
         self.store = store
@@ -69,6 +71,29 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("setLanguage", jsonLiteral(lang))
     }
 
+    /// The composer's top edge in `.global` (window) coordinates. Fires once
+    /// per keyboard/composer settle, at the animation START (SwiftUI geometry
+    /// jumps to the target); the web side animates its padding to match the
+    /// keyboard's slide (the webview's own frame never moves).
+    func setComposerTop(_ minYInWindow: CGFloat) {
+        composerTop = minYInWindow
+        pushBottomInset()
+    }
+
+    /// Convert the composer edge to the covered-strip height against the
+    /// WINDOW bottom (`.global` is window space; UIScreen would over-inset any
+    /// non-fullscreen iPad window). Deduped on whole pixels; the dedup — and
+    /// the value itself — is replayed from the `ready` handler because a
+    /// jetsammed web process silently reloads to a page whose inset var is
+    /// back at 0 while the composer geometry never re-fires.
+    private func pushBottomInset() {
+        guard let composerTop, let window = webView?.window else { return }
+        let px = max(0, Int((window.bounds.height - composerTop).rounded()))
+        guard px != lastBottomInset else { return }
+        lastBottomInset = px
+        call("setBottomInset", String(px))
+    }
+
     private func deliverInit() {
         guard let store else { return }
         let restored = UserDefaults.standard.string(forKey: ChatDefaults.transcriptState)
@@ -88,7 +113,7 @@ final class TranscriptBridge: NSObject, ObservableObject {
 
     private func call(_ method: String, _ argumentLiteral: String) {
         let js = "window.baybo && window.baybo.\(method)(\(argumentLiteral));"
-        guard ready, let webView else {
+        guard ready, webView != nil else {
             pending.append(js)
             return
         }
@@ -167,6 +192,13 @@ extension TranscriptBridge: WKScriptMessageHandler {
             ready = true
             deliverInit()
             flushPending()
+            // Fresh page (first load or silent reload after a web-process
+            // kill): its inset var is at the 0px default — replay the inset
+            // past the dedup. Also the cold-launch delivery: the composer
+            // geometry usually fires before the webview joins a window, and
+            // by page-load time it has one.
+            lastBottomInset = Int.min
+            pushBottomInset()
         case "ordinal":
             let ordinal = (body["lastOrdinal"] as? NSNumber)?.int64Value
             store?.ordinalAdvanced(ordinal)

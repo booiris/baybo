@@ -102,6 +102,22 @@ struct ComposerView: View {
             pickerItem = nil
             stage(item)
         }
+        #if DEBUG
+            // `-baybo-demo-keyboard`: raise then drop the keyboard without a
+            // tap, so the keyboard-tracking transcript slide is recordable
+            // headlessly on a simulator (pair with -baybo-open-chat).
+            .onAppear {
+                guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-keyboard") else {
+                    return
+                }
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(2))
+                    focused = true
+                    try? await Task.sleep(for: .seconds(3))
+                    focused = false
+                }
+            }
+        #endif
     }
 
     private var stagedStrip: some View {

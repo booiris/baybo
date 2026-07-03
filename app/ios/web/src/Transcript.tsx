@@ -688,6 +688,36 @@ export function Transcript({
     ]);
   };
 
+  // Native chrome (composer + ridden keyboard) covering the webview's bottom.
+  // Arrives once per keyboard/composer settle, at the ANIMATION START (SwiftUI
+  // geometry callbacks jump to the target value); the CSS transition on
+  // padding-bottom (.inset-animated) then tracks the keyboard's slide. While
+  // the padding animates, scrollHeight moves every frame — re-pin through the
+  // transition so the newest edge rides the keyboard instead of snapping.
+  // Fully imperative: a setState here would re-render the thread per event.
+  const insetAnimated = useRef(false);
+  const pinDeadline = useRef(0);
+  const handleBottomInset = (px: number) => {
+    document.documentElement.style.setProperty("--thread-bottom-inset", `${px}px`);
+    const el = logRef.current;
+    if (!el) return;
+    if (!insetAnimated.current) {
+      // First (launch) inset: apply without sliding, then arm the transition.
+      insetAnimated.current = true;
+      if (followRef.current) el.scrollTop = el.scrollHeight;
+      requestAnimationFrame(() => el.classList.add("inset-animated"));
+      return;
+    }
+    const already = pinDeadline.current > performance.now();
+    pinDeadline.current = performance.now() + 350;
+    if (already) return; // a pin loop is running; it picked up the new deadline
+    const step = () => {
+      if (followRef.current) el.scrollTop = el.scrollHeight;
+      if (performance.now() < pinDeadline.current) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  };
+
   // Native (re)connected. Any history request in flight rode the old leg and is
   // abandoned (its late `history_page` is dropped by the epoch tag) — clear the
   // guards so a future fetch isn't blocked / the spinner isn't stuck / a queued
@@ -705,14 +735,15 @@ export function Transcript({
   // Bridge events call the LATEST handlers through this ref (assigned each
   // render), so the subscription registers once without re-subscribing per
   // render.
-  const handlersRef = useRef({ handleFrame, handleUserSent, handleConnEpoch });
-  handlersRef.current = { handleFrame, handleUserSent, handleConnEpoch };
+  const handlersRef = useRef({ handleFrame, handleUserSent, handleConnEpoch, handleBottomInset });
+  handlersRef.current = { handleFrame, handleUserSent, handleConnEpoch, handleBottomInset };
   useEffect(
     () =>
       subscribeTranscript({
         frame: (frameJson) => handlersRef.current.handleFrame(frameJson),
         connEpoch: (epoch) => handlersRef.current.handleConnEpoch(epoch),
         userSent: (payload) => handlersRef.current.handleUserSent(payload),
+        bottomInset: (px) => handlersRef.current.handleBottomInset(px),
       }),
     [],
   );

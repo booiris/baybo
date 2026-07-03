@@ -76,10 +76,26 @@ matters: web bundle → `App/Resources/transcript/` → xcodegen → xcodebuild.
   drops go back to `connecting` + 2s backoff; foreground reconnects debounce
   400ms; the core coalesces concurrent dials.
 - **Bridge** (`App/Web/TranscriptBridge.swift` ⇄ `web/src/bridge.ts`):
-  native→web `init/pushFrame/setConnEpoch/userSent/imageResult/setLanguage`;
+  native→web
+  `init/pushFrame/setConnEpoch/userSent/imageResult/setLanguage/setBottomInset`;
   web→native `ready/ordinal/persist/fetchHistory/requestImage/openUrl/log`.
   Transcript persistence lives in UserDefaults (`ChatDefaults.*`), NOT webview
   localStorage (file:// storage is unreliable and upgrade-fragile).
+- **Keyboard**: the transcript webview is FULL-BLEED and its frame never
+  tracks the keyboard — a keyboard-resized WKWebView relayouts once, async,
+  at the final size, so content sits still through the slide and snaps at the
+  end. Instead ChatScreen measures the composer's top edge (it rides the
+  keyboard via safe area) and feeds the covered strip over `setBottomInset`;
+  SwiftUI geometry jumps to the target at animation START, so the web side
+  animates `--thread-bottom-inset` on a keyboard-like 250ms curve
+  (`.chat-log.inset-animated`) and re-pins the newest edge per frame while
+  following. One signal covers keyboard, composer growth, and the notice line.
+- **Wire-type sentinel**: `web/src/wireSentinel.ts` (and
+  `app/web/src/api/wireSentinel.ts` for the web chat) pin the hand-written
+  frame mirrors to the ts-rs-generated contract
+  (`sidecars/sdk/channel-ts/src/generated/`) at compile time — a wire-side
+  rename/retype fails `pnpm build`. `bigint`→`number` is mapped (this bundle
+  receives JSON, not the SDK's msgpack).
 - **Transcript rendering** (web-chat parity, mobile-restyled): user messages
   keep the black bubble; assistant replies are bubble-less full-width
   react-markdown + remark-gfm prose, rendered live WHILE streaming
@@ -92,7 +108,10 @@ matters: web bundle → `App/Resources/transcript/` → xcodegen → xcodebuild.
 - **Headless UI verification**: launch with `-baybo-open-chat
   -baybo-demo-frames` (DEBUG) to feed one canned turn (thinking → tool →
   streamed markdown → finalize) through the real bridge — screenshot the sim
-  at ~3s/~6s/~12s. `scripts/build.sh` pins products at
+  at ~3s/~6s/~12s. `-baybo-demo-keyboard` raises the keyboard 2s in and drops
+  it at 5s (record with `simctl io recordVideo`, extract frames with ffmpeg);
+  the software keyboard only appears with Simulator.app running and hardware
+  keyboard disconnected. `scripts/build.sh` pins products at
   `build/DerivedData/Build/Products/<config>-<sdk>/Baybo.app` for
   `simctl install`.
 - **Send path**: native mints the msgId, seeds the webview's optimistic bubble

@@ -5,7 +5,9 @@ import WebKit
 /// (`App/Resources/transcript/`, built from `web/`) and wires the bridge. The
 /// webview owns only the message thread — screens, header, and composer are
 /// SwiftUI, so the keyboard never attaches to web content (the entire point of
-/// this architecture).
+/// this architecture). It renders full-bleed and its frame NEVER tracks the
+/// keyboard; the thread clears the overlaying chrome via the bridge-fed
+/// `--thread-top-inset` / `--thread-bottom-inset` instead (see ChatScreen).
 struct TranscriptWebView: UIViewRepresentable {
     @ObservedObject var bridge: TranscriptBridge
 
@@ -21,7 +23,8 @@ struct TranscriptWebView: UIViewRepresentable {
         webView.backgroundColor = .white
         webView.scrollView.backgroundColor = .white
         // The bundle lays out its own insets (`--thread-top-inset` under the
-        // native header veil); automatic adjustment would double them.
+        // native header veil, `--thread-bottom-inset` under the composer);
+        // automatic adjustment would double them.
         webView.scrollView.contentInsetAdjustmentBehavior = .never
         // Dragging down over the thread lowers the keyboard (chat convention;
         // the old web app's overflow scroll behaved the same way).

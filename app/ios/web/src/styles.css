@@ -24,6 +24,12 @@
   /* Top inset so the thread's oldest visible row starts below the native
      header's overlay gradient. Native may retune it (it owns the header). */
   --thread-top-inset: 90px;
+  /* Height of the webview's bottom edge covered by native chrome (composer +
+     the keyboard it rides). The webview is full-bleed and NEVER resizes with
+     the keyboard — native streams this per layout tick over the bridge and
+     the thread pads/pins itself, so content slides in lockstep. Includes the
+     home-indicator area (measured to the screen edge), so no extra env(). */
+  --thread-bottom-inset: 0px;
 
   /* Light-only: pin the scheme so iOS scrollbars/controls never render a dark
      variant the design doesn't define. */
@@ -55,18 +61,25 @@ button {
 }
 
 /* The transcript IS the page: a full-viewport scroller. The top inset clears
-   the native header overlay; the bottom padding keeps the newest bubble off the
-   webview's bottom edge (the native composer sits BELOW the webview, not over
-   it). */
+   the native header overlay; the bottom inset clears the native composer (+
+   keyboard) overlaying the full-bleed webview's bottom edge. */
 .chat-log {
   height: 100dvh;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  padding: var(--thread-top-inset) 1.25rem calc(env(safe-area-inset-bottom, 0px) + 1rem);
+  padding: var(--thread-top-inset) 1.25rem calc(var(--thread-bottom-inset) + 1rem);
   /* Native-app feel: no visible scrollbar on the thread. */
   scrollbar-width: none;
+}
+/* Native reports the bottom obstruction only at keyboard-animation ENDPOINTS
+   (SwiftUI geometry callbacks don't stream interpolated layout), so the web
+   side animates the padding itself on a keyboard-like curve; the transcript
+   re-pins per frame while following (see handleBottomInset). Enabled after the
+   first inset lands so the launch layout doesn't visibly slide. */
+.chat-log.inset-animated {
+  transition: padding-bottom 250ms cubic-bezier(0.33, 1, 0.68, 1);
 }
 .chat-log::-webkit-scrollbar { display: none; }
 /* Short threads hug the bottom edge: the first row's auto top margin absorbs
@@ -303,15 +316,19 @@ button {
   border-radius: var(--radius);
 }
 
-/* Jump-to-latest: floats centered just above the webview's bottom edge (the
-   native composer sits right below it) while the user is off the newest edge;
+/* Jump-to-latest: floats centered just above the native composer (which
+   overlays the webview's bottom edge) while the user is off the newest edge;
    tapping glides back to the bottom. The ::after hit-slop lifts the 36px circle
    to the 44px tap floor. */
 .jump-latest {
   position: fixed;
   left: 0;
   right: 0;
-  bottom: calc(env(safe-area-inset-bottom, 0px) + 1rem);
+  bottom: calc(var(--thread-bottom-inset) + 1rem);
+  /* Ride the same keyboard-slide curve as the thread padding — the inset var
+     jumps to its target, so without this the pill teleports while the thread
+     glides. */
+  transition: bottom 250ms cubic-bezier(0.33, 1, 0.68, 1);
   margin: 0 auto;
   width: 2.25rem;
   height: 2.25rem;
