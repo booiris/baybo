@@ -20,9 +20,10 @@ struct DirectLoginForm: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        // .direct-form: stretch column, 0.9rem gap, capped at 20rem.
+        VStack(alignment: .leading, spacing: 14) {
             Text(verbatim: lang.t("direct.hint"))
-                .font(Theme.mono(15))
+                .font(Theme.mono(16))
                 .foregroundStyle(Theme.inkSoft)
                 .lineSpacing(6)
 
@@ -37,7 +38,7 @@ struct DirectLoginForm: View {
                     .focused($focus, equals: .url)
                     .submitLabel(.next)
                     .onSubmit { focus = .token }
-                    .fieldChrome()
+                    .fieldChrome(focused: focus == .url)
             }
 
             VStack(alignment: .leading, spacing: 5) {
@@ -48,7 +49,7 @@ struct DirectLoginForm: View {
                     .focused($focus, equals: .token)
                     .submitLabel(.go)
                     .onSubmit { connect() }
-                    .fieldChrome()
+                    .fieldChrome(focused: focus == .token)
                 Text(verbatim: lang.t("direct.tokenHint"))
                     .font(Theme.mono(11))
                     .foregroundStyle(Theme.inkSoft)
@@ -84,7 +85,7 @@ struct DirectLoginForm: View {
                     .frame(maxWidth: .infinity)
             }
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: 320) // .direct-form max-width 20rem
     }
 
     private func fieldLabel(_ text: String) -> some View {
@@ -140,18 +141,20 @@ extension String {
 }
 
 extension View {
-    fileprivate func fieldChrome() -> some View {
-        font(Theme.mono(14))
+    /// The web `input` chrome: 1rem mono on PAPER (not surface), hairline
+    /// border that turns ink on focus, 0.65rem/0.85rem padding.
+    fileprivate func fieldChrome(focused: Bool) -> some View {
+        font(Theme.mono(16))
             .foregroundStyle(Theme.ink)
             .padding(.horizontal, 14)
-            .padding(.vertical, 12)
+            .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: Theme.radius)
-                    .fill(Theme.surface)
+                    .fill(Theme.paper)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: Theme.radius)
-                    .strokeBorder(Theme.line, lineWidth: 1)
+                    .strokeBorder(focused ? Theme.ink : Theme.line, lineWidth: 1)
             )
     }
 }

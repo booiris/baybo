@@ -17,7 +17,7 @@ struct PairConfirmView: View {
                 .foregroundStyle(Theme.ink)
 
             Text(verbatim: lang.t("pair.confirmHint"))
-                .font(Theme.mono(15))
+                .font(Theme.mono(16))
                 .foregroundStyle(Theme.inkSoft)
                 .lineSpacing(5)
                 .multilineTextAlignment(.center)

@@ -54,7 +54,7 @@ struct LandingView: View {
     @ViewBuilder
     private var menu: some View {
         Text(verbatim: lang.t("landing.subtitle"))
-            .font(Theme.mono(15))
+            .font(Theme.mono(16))
             .foregroundStyle(Theme.inkSoft)
             .lineSpacing(6)
             .multilineTextAlignment(.center)

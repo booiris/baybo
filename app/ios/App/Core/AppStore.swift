@@ -30,6 +30,16 @@ final class AppStore: ObservableObject {
     private var restoring = false
 
     init() {
+        #if DEBUG
+        // UI-verification hook: `simctl launch ... -baybo-landing-direct` lands
+        // straight on the direct-login form (no binding probe), so screens
+        // behind interaction are screenshotable headlessly.
+        if ProcessInfo.processInfo.arguments.contains("-baybo-landing-direct") {
+            landingView = .direct
+            route = .landing
+            return
+        }
+        #endif
         restoreOnLaunch()
     }
 
