@@ -28,6 +28,21 @@ settings:
     ENABLE_BITCODE: NO
     ARCHS: arm64
     "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+# One explicit shared scheme so Xcode's Run button always targets the app —
+# without it Xcode auto-creates a scheme per target, and picking the
+# NotificationExtension one makes Run ask "choose an app to run" (an extension
+# needs a host). The NSE builds via the app's target dependency.
+schemes:
+  Baybo:
+    build:
+      targets:
+        Baybo: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    archive:
+      config: Release
 targets:
   Baybo:
     type: application
