@@ -86,7 +86,8 @@ struct DirectLoginView: View {
             }
             .buttonStyle(InkPillButtonStyle())
             .disabled(connecting || normalizedUrl == nil || token.trimmed.isEmpty)
-            .opacity(normalizedUrl == nil || token.trimmed.isEmpty ? 0.4 : 1)
+            // The web `button:disabled` dim.
+            .opacity(normalizedUrl == nil || token.trimmed.isEmpty ? 0.35 : 1)
         }
         .padding(.horizontal, 28)
         .padding(.bottom, 18)

@@ -29,6 +29,8 @@ struct LandingView: View {
 
             Spacer()
 
+            // The web `.cta` column: width-capped at 17rem and centered, not
+            // edge-to-edge.
             VStack(spacing: 12) {
                 Button {
                     Haptics.tap()
@@ -47,6 +49,7 @@ struct LandingView: View {
                 }
                 .buttonStyle(OutlinePillButtonStyle())
             }
+            .frame(maxWidth: 272)
 
             statusLine
                 .padding(.top, 18)

@@ -23,14 +23,20 @@ enum Theme {
     }
 }
 
-/// Primary CTA: soft-filled ink pill, paper text, no shadow; press feedback is
-/// a gentle dim + scale (the style guide's `opacity .7 + scale(.98)`).
+/// Primary CTA — the web `.cta`: soft-filled ink pill, paper text, REGULAR
+/// weight, uppercase with 0.18em tracking (+ the matching lead-in that keeps
+/// wide tracking optically centered, the CSS `text-indent` trick); press
+/// feedback is a gentle dim + scale (`opacity .7 + scale(.98)`).
 struct InkPillButtonStyle: ButtonStyle {
+    /// 0.18em of the 15pt CTA face.
+    private static let tracking: CGFloat = 15 * 0.18
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(Theme.mono(15, weight: .bold))
+            .font(Theme.mono(15))
             .textCase(.uppercase)
-            .kerning(2)
+            .kerning(Self.tracking)
+            .padding(.leading, Self.tracking)
             .foregroundStyle(Theme.paper)
             .padding(.vertical, 14)
             .frame(maxWidth: .infinity)
@@ -40,15 +46,15 @@ struct InkPillButtonStyle: ButtonStyle {
     }
 }
 
-/// Secondary CTA: ink outline pill.
+/// Secondary CTA — the web `.cta-secondary`: ink outline pill with NO case
+/// transform and NO tracking (the web class resets both on purpose — quiet
+/// next to the primary).
 struct OutlinePillButtonStyle: ButtonStyle {
     var color: Color = Theme.ink
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(Theme.mono(15, weight: .bold))
-            .textCase(.uppercase)
-            .kerning(2)
+            .font(Theme.mono(15))
             .foregroundStyle(color)
             .padding(.vertical, 14)
             .frame(maxWidth: .infinity)
