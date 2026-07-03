@@ -12,6 +12,10 @@ struct TranscriptWebView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.userContentController.add(bridge, name: TranscriptBridge.messageHandlerName)
+        // The bundle is served over a custom scheme, NOT file:// — Vite's
+        // module scripts fail CORS from a file origin (see the handler's doc).
+        config.setURLSchemeHandler(
+            TranscriptSchemeHandler(), forURLScheme: TranscriptSchemeHandler.scheme)
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.isOpaque = false
         webView.backgroundColor = .white
@@ -27,12 +31,8 @@ struct TranscriptWebView: UIViewRepresentable {
         #endif
         bridge.webView = webView
 
-        if let url = Bundle.main.url(
-            forResource: "index", withExtension: "html", subdirectory: "transcript")
-        {
-            webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
-        } else {
-            NSLog("baybo: transcript bundle missing from app resources")
+        if let url = TranscriptSchemeHandler.indexURL {
+            webView.load(URLRequest(url: url))
         }
         return webView
     }

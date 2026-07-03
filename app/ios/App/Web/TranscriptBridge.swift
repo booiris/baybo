@@ -152,6 +152,7 @@ extension TranscriptBridge: WKScriptMessageHandler {
     private func handle(type: String, body: [String: Any]) {
         switch type {
         case "ready":
+            NSLog("baybo: transcript bridge ready (session=%@)", store?.sessionId ?? "?")
             ready = true
             deliverInit()
             flushPending()

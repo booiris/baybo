@@ -31,12 +31,18 @@ final class AppStore: ObservableObject {
 
     init() {
         #if DEBUG
-        // UI-verification hook: `simctl launch ... -baybo-landing-direct` lands
-        // straight on the direct-login form (no binding probe), so screens
-        // behind interaction are screenshotable headlessly.
+        // UI-verification hooks: land straight on interaction-gated screens so
+        // they are screenshotable/log-verifiable headlessly on the simulator.
+        // `-baybo-landing-direct` opens the direct-login form; `-baybo-open-chat`
+        // opens the chat screen unbound (the dial fails offline — the transcript
+        // webview + bridge still come up, which is what these runs verify).
         if ProcessInfo.processInfo.arguments.contains("-baybo-landing-direct") {
             landingView = .direct
             route = .landing
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("-baybo-open-chat") {
+            route = .chat(sessionId: "debug-session")
             return
         }
         #endif
