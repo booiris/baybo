@@ -10,10 +10,14 @@ struct LandingView: View {
     @ObservedObject private var lang = Lang.shared
 
     var body: some View {
-        // A scroll container, like the web page it replaces: keyboard avoidance
-        // becomes a smooth inset/scroll instead of re-squeezing the centered
-        // hero — a bare centered VStack visibly bounces when focus moves
-        // between fields with different keyboard heights (URL vs password).
+        // A scroll container, like the web page it replaces — and the layout
+        // IGNORES the keyboard entirely. Moving focus between the URL and
+        // password fields swaps keyboards (they are different input views), so
+        // UIKit fires a hide+show pair; any keyboard-driven inset rides both
+        // animations and the page dips down then up. The whole form sits above
+        // the portrait keyboard's top edge anyway (the web page only panned
+        // when something was actually covered — here nothing is), so the right
+        // behavior is: don't move at all.
         GeometryReader { geo in
             ScrollView(showsIndicators: false) {
                 content
@@ -21,6 +25,7 @@ struct LandingView: View {
             }
             .scrollDismissesKeyboard(.interactively)
         }
+        .ignoresSafeArea(.keyboard)
         .overlay(alignment: .topTrailing) {
             LangSwitcher()
                 .padding(.top, 12)
