@@ -127,7 +127,7 @@ struct ComposerView: View {
     /// is reached only under the pill and scrolled content ghosts past the
     /// pill's flanks; only the strip below the pill (bottom padding +
     /// home-indicator area) is solid.
-    private static let veilPeakAlpha = 0.75
+    private static let veilPeakAlpha = 0.8
     private static let veilTailAlphas: [Double] = [0.0, 0.36, 0.64, 0.84, 0.96, 1.0]
 
     /// The dock's gap under the pill — also where the veil turns solid.

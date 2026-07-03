@@ -94,76 +94,93 @@ struct ChatScreen: View {
     }
 }
 
-/// The paper-veil header: a translucent white gradient holding through the
-/// status-bar + bar zone and easing out over a ramp (the smoothstep stops from
-/// `native_header.rs`), with the connection dot + label and the logout button.
-/// The veil ignores touches so scrolls in the ramp reach the thread.
+/// The paper-veil header: a translucent white gradient holding solid through
+/// the status bar and easing out to clear at the connection-status capsule's
+/// bottom edge, with the centered status capsule flanked by glass icon
+/// buttons. The veil ignores touches so scrolls beneath it reach the thread.
 struct ChatHeaderView: View {
     let connState: ChatStore.ConnState
     let onLogout: () -> Void
 
-    /// The fade shape from the old native header: two full stops hold the solid
-    /// zone, then a smoothstep tail (`FADE_ALPHAS` × 0.75 peak — a fraction
-    /// stronger than the web veil because there is no blur underneath).
-    private static let fadeAlphas: [Double] = [1.0, 1.0, 0.9, 0.65, 0.35, 0.1, 0.0]
-    private static let veilPeakAlpha = 0.75
-    private static let barHeight: CGFloat = 44
-    private static let ramp: CGFloat = 36
+    private static let veilPeakAlpha = 0.8
+    private static let barHeight: CGFloat = 46
+    /// Solid → clear smoothstep the veil fades through, below its solid
+    /// status-bar zone (the composer veil's grammar, mirrored to the top).
+    private static let rampAlphas: [Double] = [1.0, 0.9, 0.65, 0.35, 0.1, 0.0]
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
+        ZStack {
+            // Centered connection status — a liquid-glass capsule.
+            HStack(spacing: 6) {
                 Circle()
                     .fill(dotFill)
                     .overlay(
                         Circle().strokeBorder(
                             Theme.inkSoft, lineWidth: connState == .connecting ? 1 : 0)
                     )
-                    .frame(width: 9, height: 9)
+                    .frame(width: 8, height: 8)
                 Text(label)
                     .font(Theme.mono(13))
                     .foregroundStyle(connState == .offline ? Theme.err : Theme.inkSoft)
+            }
+            .padding(.horizontal, 18)
+            .frame(height: 42)
+            .glassEffect(.regular, in: Capsule())
+
+            // Flanking glass circles: a left placeholder (action pending) and
+            // the working logout on the right. Medium-weight glyphs so the ink
+            // reads as solid black over the bright glass.
+            HStack {
+                Button {
+                    // Function intentionally left empty for now (placeholder).
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(Theme.ink)
+                        .frame(width: 42, height: 42)
+                }
+                .glassEffect(.regular.interactive(), in: .circle)
+
                 Spacer()
+
                 Button(action: onLogout) {
                     Image(systemName: "rectangle.portrait.and.arrow.right")
-                        .font(.system(size: 16))
+                        .font(.system(size: 16, weight: .medium))
                         .foregroundStyle(Theme.ink)
-                        .frame(width: 44, height: 44)
+                        .frame(width: 42, height: 42)
                 }
+                .glassEffect(.regular.interactive(), in: .circle)
+                .accessibilityLabel(Text(verbatim: Lang.shared.t("connected.logout")))
             }
-            .padding(.leading, 20)
-            .frame(height: Self.barHeight)
         }
-        .frame(maxWidth: .infinity, alignment: .top)
-        .background(alignment: .top) {
-            LinearGradient(
-                stops: gradientStops,
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .frame(height: Self.barHeight + Self.ramp)
-            .padding(.top, -200) // extend the solid zone up under the status bar
-            .padding(.bottom, -Self.ramp)
-            .allowsHitTesting(false)
-            .ignoresSafeArea(edges: .top)
-        }
+        .padding(.horizontal, 24)
+        .frame(height: Self.barHeight)
+        .frame(maxWidth: .infinity)
+        .background(alignment: .top) { veil }
     }
 
-    private var gradientStops: [Gradient.Stop] {
-        // Solid through the bar, smoothstep tail across the ramp.
-        let total = Self.barHeight + Self.ramp
-        let solid = Self.barHeight / total
-        let tailFractions: [CGFloat] = [0.2, 0.4, 0.6, 0.8, 1.0]
+    /// White paper veil: one fade that floods up over the status bar (so its
+    /// coordinate space is status-bar + bar) and holds solid through the
+    /// status bar, then smoothsteps to clear at the bar's bottom — i.e. the
+    /// connection-status capsule's bottom edge. Nothing below the bar. The
+    /// gradient fill itself carries `ignoresSafeArea(.top)`; nesting the flood
+    /// inside a `.background` clips it (the parent doesn't ignore the inset).
+    private var veil: some View {
+        LinearGradient(stops: Self.veilStops, startPoint: .top, endPoint: .bottom)
+            .ignoresSafeArea(edges: .top)
+            .allowsHitTesting(false)
+    }
+
+    /// Solid through the status bar (~`solidFraction` of the flooded height on
+    /// this device), then the smoothstep tail to clear at the bar's bottom.
+    private static var veilStops: [Gradient.Stop] {
+        let solidFraction: CGFloat = 0.55
         var stops: [Gradient.Stop] = [
-            .init(color: .white.opacity(Self.veilPeakAlpha), location: 0),
-            .init(color: .white.opacity(Self.veilPeakAlpha), location: solid),
+            .init(color: Theme.paper.opacity(veilPeakAlpha), location: 0)
         ]
-        for (alpha, fraction) in zip(Self.fadeAlphas.dropFirst(2), tailFractions) {
-            stops.append(
-                .init(
-                    color: .white.opacity(alpha * Self.veilPeakAlpha),
-                    location: solid + fraction * (1 - solid)
-                ))
+        for (idx, alpha) in rampAlphas.enumerated() {
+            let frac = solidFraction + (1 - solidFraction) * CGFloat(idx) / CGFloat(rampAlphas.count - 1)
+            stops.append(.init(color: Theme.paper.opacity(alpha * veilPeakAlpha), location: frac))
         }
         return stops
     }

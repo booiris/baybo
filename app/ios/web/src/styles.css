@@ -22,8 +22,10 @@
   --radius-pill: 9999px;
 
   /* Top inset so the thread's oldest visible row starts below the native
-     header's overlay gradient. Native may retune it (it owns the header). */
-  --thread-top-inset: 90px;
+     header (status bar + the 42pt glass bar), not under its icons. The
+     status-bar part is device-correct via env() (the webview is full-bleed,
+     viewport-fit=cover); the 54px covers the native bar height + breathing. */
+  --thread-top-inset: calc(env(safe-area-inset-top) + 54px);
   /* Height of the webview's bottom edge covered by native chrome (composer +
      the keyboard it rides). The webview is full-bleed and NEVER resizes with
      the keyboard — native streams this per layout tick over the bridge and
@@ -170,16 +172,7 @@ button {
   color: var(--color-ink-soft);
   font-style: italic;
 }
-/* Divider hairline — same device-thin technique as the table row dividers: a
-   painted 1px bar scaled to half height, so it can't round away on retina the
-   way a sub-pixel border does. */
-.md hr {
-  border: 0;
-  height: 1px;
-  background: var(--color-line);
-  transform: scaleY(0.5);
-  margin: 0.75rem 0;
-}
+.md hr { border: 0; border-top: 1px solid var(--color-line); margin: 0.75rem 0; }
 .md ul, .md ol { padding-left: 1.25rem; }
 .md li { margin: 0.15rem 0; }
 .md img { max-width: 100%; border-radius: 10px; }

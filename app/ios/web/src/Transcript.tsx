@@ -270,6 +270,13 @@ export function Transcript({
   // the log's onScroll; new content auto-scrolls only while pinned, so a reader
   // who scrolled up into history isn't yanked back down.
   const followRef = useRef(true);
+  // True while a finger is down on the transcript. The programmatic pin-to-
+  // newest writes below (stream deltas, ResizeObserver, the keyboard-slide rAF
+  // loop) are the actual scroller inside the WKWebView, so a write landing
+  // mid-drag slams scrollTop back to the bottom every frame — the first drag
+  // then reads as DEAD until the finger lifts. Suspend them while touching;
+  // re-pin on lift so a hold-at-bottom during streaming still catches up.
+  const userTouchingRef = useRef(false);
   // Drives the jump-to-latest button — a render concern, unlike followRef
   // (a ref precisely so scrolling doesn't re-render).
   const [showJump, setShowJump] = useState(false);
@@ -306,7 +313,7 @@ export function Transcript({
   // visible.
   useLayoutEffect(() => {
     const el = logRef.current;
-    if (el && followRef.current && !prependAnchor.current) {
+    if (el && followRef.current && !prependAnchor.current && !userTouchingRef.current) {
       el.scrollTop = el.scrollHeight;
     }
   }, [messages, streaming, turnActive]);
@@ -318,10 +325,32 @@ export function Transcript({
     const el = logRef.current;
     if (!el) return;
     const ro = new ResizeObserver(() => {
-      if (followRef.current) el.scrollTop = el.scrollHeight;
+      if (followRef.current && !userTouchingRef.current) el.scrollTop = el.scrollHeight;
     });
     ro.observe(el);
     return () => ro.disconnect();
+  }, []);
+
+  // Track finger-down so the pin-to-newest writes yield to a drag (see
+  // userTouchingRef). Passive — the listeners never block the scroll itself.
+  useEffect(() => {
+    const el = logRef.current;
+    if (!el) return;
+    const down = () => {
+      userTouchingRef.current = true;
+    };
+    const up = () => {
+      userTouchingRef.current = false;
+      if (followRef.current) el.scrollTop = el.scrollHeight;
+    };
+    el.addEventListener("touchstart", down, { passive: true });
+    el.addEventListener("touchend", up, { passive: true });
+    el.addEventListener("touchcancel", up, { passive: true });
+    return () => {
+      el.removeEventListener("touchstart", down);
+      el.removeEventListener("touchend", up);
+      el.removeEventListener("touchcancel", up);
+    };
   }, []);
 
   // After a scroll-up PREPEND, restore the viewport so the content the user was
@@ -792,7 +821,7 @@ export function Transcript({
     pinDeadline.current = performance.now() + 350;
     if (already) return; // a pin loop is running; it picked up the new deadline
     const step = () => {
-      if (followRef.current) el.scrollTop = el.scrollHeight;
+      if (followRef.current && !userTouchingRef.current) el.scrollTop = el.scrollHeight;
       if (performance.now() < pinDeadline.current) requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
