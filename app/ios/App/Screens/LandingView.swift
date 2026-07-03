@@ -10,6 +10,25 @@ struct LandingView: View {
     @ObservedObject private var lang = Lang.shared
 
     var body: some View {
+        // A scroll container, like the web page it replaces: keyboard avoidance
+        // becomes a smooth inset/scroll instead of re-squeezing the centered
+        // hero — a bare centered VStack visibly bounces when focus moves
+        // between fields with different keyboard heights (URL vs password).
+        GeometryReader { geo in
+            ScrollView(showsIndicators: false) {
+                content
+                    .frame(minHeight: geo.size.height)
+            }
+            .scrollDismissesKeyboard(.interactively)
+        }
+        .overlay(alignment: .topTrailing) {
+            LangSwitcher()
+                .padding(.top, 12)
+                .padding(.trailing, 16)
+        }
+    }
+
+    private var content: some View {
         VStack(spacing: 12) {
             // .landing-hero: flex 1, centered column, 1rem gap.
             VStack(spacing: 16) {
@@ -44,11 +63,6 @@ struct LandingView: View {
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 20)
-        .overlay(alignment: .topTrailing) {
-            LangSwitcher()
-                .padding(.top, 12)
-                .padding(.trailing, 16)
-        }
     }
 
     @ViewBuilder
