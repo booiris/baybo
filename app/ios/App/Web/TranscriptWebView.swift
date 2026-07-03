@@ -19,6 +19,9 @@ struct TranscriptWebView: UIViewRepresentable {
         // The bundle lays out its own insets (`--thread-top-inset` under the
         // native header veil); automatic adjustment would double them.
         webView.scrollView.contentInsetAdjustmentBehavior = .never
+        // Dragging down over the thread lowers the keyboard (chat convention;
+        // the old web app's overflow scroll behaved the same way).
+        webView.scrollView.keyboardDismissMode = .interactive
         #if DEBUG
         webView.isInspectable = true
         #endif

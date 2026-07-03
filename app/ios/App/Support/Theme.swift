@@ -93,6 +93,20 @@ struct LinkButtonStyle: ButtonStyle {
     }
 }
 
+extension View {
+    /// Web-page parity: tapping empty space blurs the focused field and drops
+    /// the keyboard (a WKWebView resigns its input on outside taps; native
+    /// SwiftUI does not). A plain tap gesture, so child buttons/fields keep
+    /// winning their own taps.
+    func tapToDismissKeyboard() -> some View {
+        contentShape(Rectangle())
+            .onTapGesture {
+                UIApplication.shared.sendAction(
+                    #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+            }
+    }
+}
+
 enum Haptics {
     /// Light tap on primary-CTA presses (the style guide's physical beat).
     static func tap() {

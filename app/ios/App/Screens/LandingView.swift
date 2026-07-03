@@ -22,6 +22,7 @@ struct LandingView: View {
             ScrollView(showsIndicators: false) {
                 content
                     .frame(minHeight: geo.size.height)
+                    .tapToDismissKeyboard()
             }
             .scrollDismissesKeyboard(.interactively)
         }
