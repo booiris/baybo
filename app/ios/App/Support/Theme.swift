@@ -5,9 +5,9 @@ import UIKit
 /// monochrome soft line minimalism, light-only, ink-on-paper. Flat surfaces,
 /// 1px hairlines, pill corners, red reserved for destructive/error state.
 ///
-/// Chrome type is monospaced. The web bundle self-hosts Space Mono; native
-/// chrome currently uses the system monospaced face (SF Mono) — bundling Space
-/// Mono TTFs is a noted follow-up, not a blocker.
+/// Chrome type is Space Mono (bundled, `UIAppFonts`), matching the web bundle's
+/// self-hosted face; `Font.custom` falls back to the system face if the TTFs
+/// ever go missing.
 enum Theme {
     static let paper = Color.white
     static let surface = Color(red: 0.98, green: 0.98, blue: 0.98)
@@ -19,7 +19,7 @@ enum Theme {
     static let radius: CGFloat = 14
 
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        .system(size: size, weight: weight, design: .monospaced)
+        Font.custom("Space Mono", size: size).weight(weight)
     }
 }
 

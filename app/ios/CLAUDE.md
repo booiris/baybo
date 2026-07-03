@@ -85,14 +85,22 @@ matters: web bundle → `App/Resources/transcript/` → xcodegen → xcodebuild.
 
 ## Known gaps / follow-ups
 
-- Native chrome uses SF Mono; bundling Space Mono TTFs (style-guide parity) is
-  pending.
-- One-shot migration of the old Tauri webview's localStorage (active session id
-  + transcript mirror) is NOT implemented — first launch after upgrade starts a
-  fresh session (gateway history is intact; scroll-up refetches).
+- ~~Native chrome uses SF Mono~~ — Space Mono is bundled
+  (`App/Resources/Fonts`, OFL) and registered via `UIAppFonts`; `Theme.mono`
+  serves it with a system-face fallback.
+- The old Tauri webview's localStorage (active session id + transcript mirror)
+  is deliberately NOT migrated (owner's call — data gets reconstructed by hand);
+  first launch after upgrade starts a fresh session. Gateway history is intact.
 - `verify-nse.sh` still lives in app/mobile and targets the Tauri project;
   port it when app/mobile retires.
 - Voice input is a placeholder (as in the Tauri app).
+
+## Verified on simulator (2026-07-03)
+
+Landing screen smoke on iPhone 17 Pro / iOS 26.5: app launches, Rust core
+initializes, Space Mono renders the wordmark/CTAs, zh-Hans localization
+resolves, pill styles match the guide. Live chat/pairing flows need a gateway —
+see the device checklist below.
 
 ## Manual verification checklist (device)
 

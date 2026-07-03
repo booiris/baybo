@@ -73,6 +73,10 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         NSCameraUsageDescription: "Baybo uses the camera to scan the pairing QR code."
         BayboKeychainAccessGroup: "$(AppIdentifierPrefix)com.baybo.app"
+        # Space Mono (OFL, App/Resources/Fonts) — the style guide's chrome face.
+        UIAppFonts:
+          - SpaceMono-Regular.ttf
+          - SpaceMono-Bold.ttf
     entitlements:
       path: App/Baybo.entitlements
       properties:
