@@ -35,10 +35,10 @@ use std::collections::HashMap;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use baybo_agent::actor::AgentMessage;
-use baybo_channels::wire::{FolderChange, FolderView, SessionPatch, SlashCommandSpec};
-use baybo_channels::{
-    AgentEvent, STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent, ToolStatus,
+use baybo_channels::wire::{
+    FolderChange, FolderView, SessionPatch, SlashCommandSpec, WireWorkStep, WireWorkStepKind,
 };
+use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent};
 use baybo_model::{
     ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind, FolderId,
     FolderSummary, LlmEntryName, MessageSource, Role, Session, SessionId, ThinkingContent,
@@ -312,6 +312,27 @@ impl ChatWorkStep {
             tool_label,
             tool_status: None,
             tool_summary: None,
+        }
+    }
+}
+
+/// Project the shared wire fold onto the REST shape. The REST surface drops
+/// the wire step's `call_id` (only the live client needs it, to pair a later
+/// `ToolCompleted`); `status` / `summary` map straight onto `tool_status` /
+/// `tool_summary` (both `None` while a tool is still running).
+impl From<WireWorkStep> for ChatWorkStep {
+    fn from(step: WireWorkStep) -> Self {
+        match step.kind {
+            WireWorkStepKind::Reasoning => Self::reasoning(step.text),
+            WireWorkStepKind::Prose => Self::prose(step.text),
+            WireWorkStepKind::Tool => Self {
+                kind: WorkStepKind::Tool,
+                text: String::new(),
+                tool: step.tool,
+                tool_label: step.label,
+                tool_status: step.status,
+                tool_summary: step.summary,
+            },
         }
     }
 }
@@ -1614,50 +1635,100 @@ fn is_stop_control_event(ev: &ControlEvent) -> bool {
 /// joined. Consecutive reasoning / answer deltas were already coalesced by the
 /// channel buffer, so each arrives as a single entry.
 fn in_flight_work_steps(events: Vec<SessionEvent>) -> Vec<ChatWorkStep> {
-    let mut steps: Vec<ChatWorkStep> = Vec::new();
-    let mut pending_tools: HashMap<String, usize> = HashMap::new();
-    for ev in events {
-        let SessionEvent::Agent(out) = ev else {
-            continue;
-        };
-        match out.event {
-            AgentEvent::Reasoning(text) if !text.trim().is_empty() => {
-                steps.push(ChatWorkStep::reasoning(text));
+    crate::channel::work_steps::in_flight_wire_steps(events)
+        .into_iter()
+        .map(ChatWorkStep::from)
+        .collect()
+}
+
+/// Reconstruct each **completed** turn's collapsed work steps from a slice of
+/// persisted catch-up rows (ascending ordinal), keyed by the turn's reply
+/// `ordinal`. The relay `Frame::WorkReplay` counterpart of the web
+/// [`reconstruct_transcript`] work items — the same per-turn fold (thinking →
+/// reasoning, mid-turn text → prose, tool-use + paired tool-result → tool step)
+/// but producing wire steps, and none of the transcript-item / control-event /
+/// cancelled-timing machinery the REST path carries. A turn whose reply is off
+/// the slice, or that produced no steps, contributes nothing. `call_id` is left
+/// unset — a completed turn has no live `ToolCompleted` to pair with.
+pub(crate) fn reconstruct_catchup_work_steps(
+    rows: &[(i64, ChatMessage)],
+) -> HashMap<i64, Vec<WireWorkStep>> {
+    let mut out: HashMap<i64, Vec<WireWorkStep>> = HashMap::new();
+    let mut steps: Vec<WireWorkStep> = Vec::new();
+    let mut pending: HashMap<String, usize> = HashMap::new();
+    for (ordinal, msg) in rows {
+        match msg.role {
+            Role::User if msg.from_user() => {
+                // Turn boundary — start fresh.
+                steps.clear();
+                pending.clear();
             }
-            AgentEvent::AnswerDelta(text) if !text.trim().is_empty() => {
-                steps.push(ChatWorkStep::prose(text));
-            }
-            AgentEvent::ToolStarted {
-                call_id,
-                tool,
-                label,
-            } => {
-                pending_tools.insert(call_id, steps.len());
-                steps.push(ChatWorkStep::tool(tool, label));
-            }
-            AgentEvent::ToolCompleted {
-                call_id,
-                status,
-                summary,
-            } => {
-                if let Some(&idx) = pending_tools.get(&call_id)
-                    && let Some(step) = steps.get_mut(idx)
-                {
-                    step.tool_status = Some(
-                        match status {
-                            ToolStatus::Ok => "ok",
-                            ToolStatus::Error => "error",
-                            ToolStatus::Denied => "denied",
+            // Intermediate agentic iteration: fold its thinking / narration /
+            // tool calls into the open block.
+            Role::Assistant if msg.has_tool_use() => {
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Thinking { content, .. } => {
+                            let text = thinking_text(content);
+                            if !text.is_empty() {
+                                steps.push(WireWorkStep::reasoning(text));
+                            }
                         }
-                        .to_owned(),
-                    );
-                    step.tool_summary = Some(summary);
+                        ContentBlock::Text(t) if !t.trim().is_empty() => {
+                            steps.push(WireWorkStep::prose(t.clone()));
+                        }
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
+                            pending.insert(id.clone(), steps.len());
+                            steps.push(WireWorkStep::tool(
+                                None,
+                                Some(name.clone()),
+                                tool_label(input),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Final reply row: a direct-answer turn carries its reasoning here
+            // (no intermediate rows), so fold this row's thinking when nothing
+            // accumulated. The turn's steps then attach to this reply ordinal.
+            Role::Assistant => {
+                if steps.is_empty() {
+                    for block in &msg.content {
+                        if let ContentBlock::Thinking { content, .. } = block {
+                            let text = thinking_text(content);
+                            if !text.is_empty() {
+                                steps.push(WireWorkStep::reasoning(text));
+                            }
+                        }
+                    }
+                }
+                if !steps.is_empty() {
+                    out.insert(*ordinal, std::mem::take(&mut steps));
+                }
+                pending.clear();
+            }
+            Role::Tool => {
+                for block in &msg.content {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } = block
+                        && let Some(&idx) = pending.get(tool_use_id)
+                        && let Some(step) = steps.get_mut(idx)
+                    {
+                        step.status = Some(tool_result_status(content));
+                        step.summary = Some(summarize_tool_result(content));
+                    }
                 }
             }
             _ => {}
         }
     }
-    steps
+    out
 }
 
 fn reconstruct_transcript(
@@ -2508,6 +2579,62 @@ mod tests {
         assert!(matches!(items[3].kind, TranscriptItemKind::Message));
         assert_eq!(items[3].role, "assistant");
         assert_eq!(items[3].text, "done");
+    }
+
+    #[test]
+    fn catchup_work_steps_fold_completed_turns_by_reply_ordinal() {
+        // A tool-using turn (user → intermediate assistant with thinking + tool
+        // call → tool result → final reply) and a direct-answer turn (thinking +
+        // text in one row). Each turn's steps attach to its reply ordinal.
+        let rows = vec![
+            (1, ChatMessage::user(vec![text("go")])),
+            (
+                2,
+                ChatMessage::assistant(vec![
+                    thinking("weighing it"),
+                    tool_use("c1", "Bash", serde_json::json!({"command": "ls"})),
+                ]),
+            ),
+            (
+                3,
+                ChatMessage::tool_result("c1".to_owned(), "file1\nfile2".to_owned()),
+            ),
+            (4, ChatMessage::assistant(vec![text("done")])),
+            (5, ChatMessage::user(vec![text("hi")])),
+            (
+                6,
+                ChatMessage::assistant(vec![thinking("ponder"), text("hello")]),
+            ),
+        ];
+        let out = reconstruct_catchup_work_steps(&rows);
+
+        // Only the two reply ordinals carry steps.
+        assert_eq!(out.len(), 2, "{out:?}");
+        let tool_turn = out
+            .get(&4)
+            .expect("tool turn steps keyed by reply ordinal 4");
+        assert_eq!(tool_turn.len(), 2);
+        assert_eq!(tool_turn[0].kind, WireWorkStepKind::Reasoning);
+        assert_eq!(tool_turn[0].text, "weighing it");
+        assert_eq!(tool_turn[1].kind, WireWorkStepKind::Tool);
+        assert_eq!(tool_turn[1].tool.as_deref(), Some("Bash"));
+        assert_eq!(tool_turn[1].label.as_deref(), Some("ls"));
+        assert_eq!(
+            tool_turn[1].status.as_deref(),
+            Some("ok"),
+            "tool result folded onto the step"
+        );
+        assert!(
+            tool_turn[1].call_id.is_none(),
+            "a completed turn has no live call_id to pair"
+        );
+
+        let direct = out
+            .get(&6)
+            .expect("direct-answer turn steps keyed by reply ordinal 6");
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].kind, WireWorkStepKind::Reasoning);
+        assert_eq!(direct[0].text, "ponder");
     }
 
     #[test]

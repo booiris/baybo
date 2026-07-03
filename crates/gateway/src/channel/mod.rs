@@ -39,6 +39,7 @@ pub(crate) mod session_resolver;
 pub(crate) mod slash;
 pub mod state;
 pub mod web_token_janitor;
+pub(crate) mod work_steps;
 
 pub use bot_reconciler::ChannelBotReconciler;
 pub use control::{ChannelControlError, ChannelControlRegistry};

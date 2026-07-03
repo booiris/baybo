@@ -80,10 +80,24 @@ Two consequences worth knowing:
   live multi-channel fan-out), at the cost of possibly showing output bytes the
   live UI withheld. `tool_status` (ok/error/denied) is best-effort, keyed off the
   agent's result-formatting prefixes.
-- **WS catch-up replay is message-only.** A reconnect (`channel::route::
-  chat_to_visible_wire_message`) replays just the message bubbles, so work
-  blocks for turns missed during a brief disconnect don't reappear until a full
-  reload re-runs reconstruction.
+- **WS in-flight work-block replay (relay/iOS).** A reconnect's
+  `chat_to_visible_wire_message` catch-up replays only the message *bubbles*,
+  but a (re)`Subscribe` on a live turn now also emits a `Frame::WorkSnapshot` —
+  the whole in-flight work block (reasoning / tool steps from the same
+  per-session buffer), folded once by
+  `channel::work_steps::in_flight_wire_steps` (the REST `ChatWorkStep` derives
+  from the same `WireWorkStep`). A relay client (iOS) that reconnects mid-turn
+  **replaces** its open block with it — never appends, since the buffer is a
+  superset of what it saw live — so the thinking it missed while backgrounded
+  reappears without a full reload. The **web** chat ignores the frame today (it
+  recovers the same steps via the REST reload above). A turn that **completed**
+  while the client was away is recovered too: forward catch-up emits a
+  `Frame::WorkReplay` (a *closed* block) right before that turn's reply,
+  reconstructed from the persisted rows by
+  `api::admin::chat::reconstruct_catchup_work_steps` (the relay counterpart of
+  the REST `reconstruct_transcript` fold). Only the **backward** `FetchHistory`
+  paging path (scroll-up, and the post-`Reset` rebuild) stays message-only — a
+  turn can straddle a page boundary there (see the roadmap below).
 
 ## `TurnState`: the in-flight turn survives a late join
 
@@ -150,6 +164,14 @@ into the close edge — no special-case `TurnState` broadcast in the runner.
   the model's reasoning trace, and **drops `Reasoning` frames entirely** rather than
   rendering them. Other channels (e.g. the web UI) still consume `Reasoning`.
   See [`docs/modules/tui.md`](modules/tui.md#working-indicator--mid-turn-steering).
+- **Relay/iOS work recovery — remaining edges** — forward reconnect catch-up
+  now recovers both the in-flight (`WorkSnapshot`) and completed
+  (`WorkReplay`) work blocks. Still open: **backward `FetchHistory` paging**
+  (scroll-up + the post-`Reset` rebuild) stays message-only — reconstructing a
+  work block for a turn split across a page boundary needs page-spanning state
+  (or a server-side "reconstruct the whole visible window" pass like the REST
+  `get_session`); and an optional **silent-push pre-warm** to run catch-up
+  before the next foreground.
 - **Subagent → parent progress** — subagents run with `delta_tx = None`. Surfacing
   their progress to the parent ties into the planned `SubagentNotification` redesign.
 - **Fine-grained in-tool events** — forward a curated subset of `ToolEventSink`

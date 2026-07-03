@@ -277,6 +277,112 @@ impl From<baybo_model::Task> for TaskView {
     }
 }
 
+/// Kind discriminant for a [`WireWorkStep`] — serialized as `"reasoning"` /
+/// `"prose"` / `"tool"`. A typed enum (mirrors [`AttachmentKind`]) so the
+/// discriminant round-trips cleanly through ts-rs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub enum WireWorkStepKind {
+    /// A model reasoning ("thinking") chunk.
+    Reasoning,
+    /// Answer prose that streamed mid-turn but was superseded by more work.
+    Prose,
+    /// A tool call (started, and — if it finished within the buffered turn —
+    /// completed).
+    Tool,
+}
+
+/// One step inside a turn's in-flight work block, carried in a
+/// [`Frame::WorkSnapshot`]. Mirrors the client's rendered work-step model:
+/// `reasoning` / `prose` bodies live in [`Self::text`]; a `tool` step carries
+/// the call's `call_id` (so a later live [`Frame::ToolCompleted`] still pairs by
+/// id), a display `tool` name + optional `label`, and — once the call finished
+/// within the buffered turn — a `status` (`"ok"` / `"error"` / `"denied"`, else
+/// the tool is still running) and a `summary`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub struct WireWorkStep {
+    pub kind: WireWorkStepKind,
+    /// Reasoning trace or superseded prose body. Empty for `tool` steps.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// Pairs a `tool` step with a later live [`Frame::ToolCompleted`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub call_id: Option<String>,
+    /// Tool name, set when `kind == Tool`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub tool: Option<String>,
+    /// Human preview for the call (path / command / url), when the live
+    /// `progress_label` was present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub label: Option<String>,
+    /// `"ok"` / `"error"` / `"denied"` once the call completed within the
+    /// buffered turn; `None` while it is still running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub status: Option<String>,
+    /// Short result summary, set alongside `status` on completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub summary: Option<String>,
+}
+
+impl WireWorkStep {
+    /// A reasoning ("thinking") step.
+    pub fn reasoning(text: String) -> Self {
+        Self {
+            kind: WireWorkStepKind::Reasoning,
+            text,
+            call_id: None,
+            tool: None,
+            label: None,
+            status: None,
+            summary: None,
+        }
+    }
+
+    /// A superseded mid-turn answer-prose step.
+    pub fn prose(text: String) -> Self {
+        Self {
+            kind: WireWorkStepKind::Prose,
+            text,
+            call_id: None,
+            tool: None,
+            label: None,
+            status: None,
+            summary: None,
+        }
+    }
+
+    /// A tool step (status / summary filled in later on completion). `call_id`
+    /// is `Some` for a still-running in-flight tool (so a later live
+    /// `ToolCompleted` can pair by id) and `None` for a completed-turn replay
+    /// (nothing live to pair with).
+    pub fn tool(call_id: Option<String>, tool: Option<String>, label: Option<String>) -> Self {
+        Self {
+            kind: WireWorkStepKind::Tool,
+            text: String::new(),
+            call_id,
+            tool,
+            label,
+            status: None,
+            summary: None,
+        }
+    }
+}
+
 /// Frame envelope. Tagged on the `kind` field so the receive side
 /// never has to guess. Encoded with
 /// [`rmp_serde::to_vec_named`](rmp_serde::to_vec_named) so field names
@@ -552,6 +658,42 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
         started_at: Option<DateTime<Utc>>,
+    },
+    /// Server → client: the in-flight turn's work block (reasoning / prose /
+    /// tool steps) as one idempotent snapshot that REPLACES the client's open
+    /// work block for this session — the work-block analogue of [`TaskList`],
+    /// not a delta. Sent to a (re)subscribing connection right after the
+    /// `active` [`TurnState`] snapshot, so a client that reconnects mid-turn
+    /// (an iOS relay leg resuming after backgrounding) recovers the thinking it
+    /// missed while disconnected instead of a work block with a hole. The
+    /// buffer is a superset of everything the connection saw live, so a client
+    /// applies it by REPLACING the open block's steps — subsequent live
+    /// `Reasoning` / `ToolStarted` / `ToolCompleted` frames then append. Only
+    /// sent while a turn is in flight and the buffer is non-empty; surfaces
+    /// without a work block (TUI, sidecars) drop it.
+    WorkSnapshot {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        steps: Vec<WireWorkStep>,
+    },
+    /// Server → client: a **completed** turn's collapsed work block, replayed
+    /// during forward catch-up (`Subscribe { since_ordinal }`) right before that
+    /// turn's reply [`Message`], so a client that reconnects *after* the turn
+    /// finished (an iOS relay leg that was backgrounded across the whole turn)
+    /// gets back the reasoning / tool steps it missed instead of a bare answer
+    /// bubble. Distinct from [`WorkSnapshot`]: those `steps` are the *live*
+    /// in-flight turn (rendered as an open block); these are reconstructed from
+    /// the persisted transcript and render as a **closed** "思考了" block. The
+    /// client inserts it in stream order, replacing any leftover open block for
+    /// the same turn. Surfaces without a work block (TUI, sidecars) drop it.
+    WorkReplay {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        steps: Vec<WireWorkStep>,
     },
     /// Server → client: a tool call is blocked waiting for the
     /// channel's user to approve or deny. Clients with an approval UX

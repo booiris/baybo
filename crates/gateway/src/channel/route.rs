@@ -30,7 +30,10 @@ use super::adapter::Sidecar;
 use super::handshake::validate_register;
 use super::state::WsChannelState;
 use super::web_token_janitor::StashedTokenHandle;
-use crate::api::admin::chat::{DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT};
+use super::work_steps;
+use crate::api::admin::chat::{
+    DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT, reconstruct_catchup_work_steps,
+};
 use crate::auth::{AuthedClient, TokenHandle};
 
 /// Maximum time to wait for the client's `Register` frame after the WS
@@ -476,6 +479,35 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                         {
                             tracing::warn!(error = %e, %session_id, "failed to send TurnState snapshot");
                         }
+                        // Recover the in-flight turn's work block (reasoning /
+                        // tool steps) this connection missed while disconnected
+                        // — the catch-up above only replays persisted message
+                        // bubbles, so a client reconnecting mid-turn (an iOS
+                        // relay leg resuming after backgrounding) would see a
+                        // work block with a hole. Only while a turn is
+                        // streaming; the buffer lives on this (Subscribed)
+                        // channel and is populated even with no subscribers.
+                        // `note_in_flight` runs before fan-out, so the buffer is
+                        // a superset of everything delivered live to this
+                        // connection — the client REPLACES its open block with
+                        // it (no double-render of the head). Ordered right after
+                        // the active TurnState, which opens the client's block.
+                        if started_at.is_some() {
+                            let steps = work_steps::in_flight_wire_steps(
+                                sidecar.channel.in_flight_events(&session_id),
+                            );
+                            if !steps.is_empty()
+                                && let Err(e) = sidecar
+                                    .send_frame(Frame::WorkSnapshot {
+                                        session_id: session_id.clone(),
+                                        user_id: String::new(),
+                                        steps,
+                                    })
+                                    .await
+                            {
+                                tracing::warn!(error = %e, %session_id, "failed to send WorkSnapshot");
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, %session_id, "failed to derive TurnState snapshot");
@@ -767,6 +799,11 @@ async fn replay_catch_up(
         }
         return;
     }
+    // Reconstruct each completed turn's collapsed work block (keyed by its reply
+    // ordinal) from the persisted rows, so a client reconnecting AFTER a turn
+    // finished recovers the reasoning / tool steps it missed — not just the
+    // answer bubble. Sent as a `WorkReplay` right before the turn's reply.
+    let work_by_reply = reconstruct_catchup_work_steps(&rows);
     for (ordinal, msg) in rows {
         let Some(wire) = chat_to_visible_wire_message(
             channel_type,
@@ -779,6 +816,23 @@ async fn replay_catch_up(
         else {
             continue;
         };
+        if let Some(steps) = work_by_reply.get(&ordinal)
+            && let Err(e) = sidecar
+                .send_frame(Frame::WorkReplay {
+                    session_id: session_id.clone(),
+                    user_id: String::new(),
+                    steps: steps.clone(),
+                })
+                .await
+        {
+            tracing::debug!(
+                error = %e,
+                %channel_type,
+                %session_id,
+                ordinal,
+                "send catch-up WorkReplay failed; continuing with reply",
+            );
+        }
         if let Err(e) = sidecar.send_frame(Frame::Message(wire)).await {
             tracing::debug!(
                 error = %e,

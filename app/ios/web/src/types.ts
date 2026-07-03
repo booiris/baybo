@@ -30,6 +30,20 @@ export type WireMessage = {
   attachments?: WireAttachment[];
 };
 
+/// One in-flight work step in a `Frame::WorkSnapshot` — the wire mirror of the
+/// Rust `wire::WireWorkStep` (snake_case fields). `reasoning` / `prose` carry
+/// `text`; a `tool` step carries the call's id + display name/label and, once
+/// the call finished within the buffered turn, `status` + `summary`.
+export type WireWorkStepFrame = {
+  kind: "reasoning" | "prose" | "tool";
+  text?: string;
+  call_id?: string;
+  tool?: string;
+  label?: string;
+  status?: string;
+  summary?: string;
+};
+
 /// A decrypted wire `Frame`, arriving as JSON text via `window.baybo.pushFrame`.
 /// MessagePack field names round-trip as snake_case JSON; we only model the few
 /// variants the transcript renders and tolerate the rest.
@@ -45,6 +59,14 @@ export type WireFrame =
   // `transient: true` marks mid-turn progress narration (folded into the work
   // block); absent/false is a terminal notice (its own centered row).
   | { kind: "notice"; level: string; text: string; transient?: boolean }
+  // The in-flight turn's whole work block, replayed on a mid-turn (re)subscribe
+  // so a client that reconnected (after backgrounding) recovers the reasoning /
+  // tool steps it missed. Idempotent snapshot — REPLACES the open block.
+  | { kind: "work_snapshot"; steps: WireWorkStepFrame[] }
+  // A COMPLETED turn's collapsed work block, replayed on catch-up right before
+  // that turn's reply — recovers the thinking for a turn that finished while we
+  // were backgrounded. Rendered as a closed "思考了" block.
+  | { kind: "work_replay"; steps: WireWorkStepFrame[] }
   | { kind: "reset"; reason: string }
   | {
       kind: "history_page";

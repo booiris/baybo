@@ -7,6 +7,7 @@ import type { SessionPatch } from "./SessionPatch";
 import type { SlashCommandSpec } from "./SlashCommandSpec";
 import type { TaskView } from "./TaskView";
 import type { WireAttachment } from "./WireAttachment";
+import type { WireWorkStep } from "./WireWorkStep";
 
 /**
  * Frame envelope. Tagged on the `kind` field so the receive side
@@ -27,7 +28,7 @@ transient?: boolean, } | { "kind": "task_list", session_id: string, user_id?: st
 /**
  * `Some` iff `active`.
  */
-started_at?: string, } | { "kind": "approval_requested", call_id: string, session_id: string, user_id?: string, tool: string, accesses: Array<ResourceAccess>, params_preview: string, 
+started_at?: string, } | { "kind": "work_snapshot", session_id: string, user_id?: string, steps: Array<WireWorkStep>, } | { "kind": "work_replay", session_id: string, user_id?: string, steps: Array<WireWorkStep>, } | { "kind": "approval_requested", call_id: string, session_id: string, user_id?: string, tool: string, accesses: Array<ResourceAccess>, params_preview: string, 
 /**
  * Optional human-readable label the tool produced via
  * `Tool::call_label` (e.g. Bash's `description` parameter).

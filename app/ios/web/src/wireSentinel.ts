@@ -33,6 +33,8 @@ type MirroredKind =
   | "tool_started"
   | "tool_completed"
   | "turn_state"
+  | "work_snapshot"
+  | "work_replay"
   | "notice"
   | "reset"
   | "history_page";

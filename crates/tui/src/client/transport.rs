@@ -363,6 +363,14 @@ fn map_frame(
             // Reasoning; the web dashboard is its consumer.
             None
         }
+        Frame::WorkSnapshot { .. } | Frame::WorkReplay { .. } => {
+            // The in-flight work-block snapshot and the completed-turn replay
+            // both recover the reasoning/tool steps a reconnecting client
+            // missed. The TUI drops Reasoning already, so they have nothing to
+            // render here either. Their consumers are the relay/iOS and web
+            // work blocks.
+            None
+        }
         Frame::ToolStarted {
             session_id,
             call_id,

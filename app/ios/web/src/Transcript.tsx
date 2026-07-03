@@ -19,9 +19,27 @@ import {
   type WireAttachment,
   type WireFrame,
   type WireMessage,
+  type WireWorkStepFrame,
   type WorkRow,
   type WorkStep,
 } from "./types";
+
+// Map a `Frame::WorkSnapshot` wire step onto the transcript's rendered
+// WorkStep. A `tool` step keeps its `call_id` so a later live `ToolCompleted`
+// still pairs by id; `status` defaults to "running" until the call finished
+// within the buffered turn.
+function wireStepToWork(s: WireWorkStepFrame): WorkStep {
+  if (s.kind === "tool") {
+    return {
+      kind: "tool",
+      callId: s.call_id ?? "",
+      label: s.label || s.tool || "",
+      status: s.status ?? "running",
+      summary: s.summary || undefined,
+    };
+  }
+  return { kind: s.kind, text: s.text ?? "" };
+}
 
 /// Rows per transcript-history fetch — both the reset-recovery refetch (newest
 /// page) and a scroll-up older page. Matches the gateway's default page size
@@ -333,14 +351,20 @@ export function Transcript({
     }
   }, []);
 
-  const clearStreaming = useCallback(() => {
-    streamText.current = "";
+  // Set the streaming reply to an exact text in ONE synchronous update — no rAF
+  // defer, no clear→append two-step. A WorkSnapshot recovers the answer tail
+  // with this, so the reply line grows in place (batched with the block replace)
+  // instead of blanking for a frame.
+  const setStreamingText = useCallback((text: string) => {
+    streamText.current = text;
     if (streamRaf.current !== undefined) {
       cancelAnimationFrame(streamRaf.current);
       streamRaf.current = undefined;
     }
-    setStreaming("");
+    setStreaming(text);
   }, []);
+
+  const clearStreaming = useCallback(() => setStreamingText(""), [setStreamingText]);
 
   useEffect(
     () => () => {
@@ -392,6 +416,44 @@ export function Transcript({
       return [...rows.slice(0, -1), { ...last, active: false, elapsedMs }];
     });
   }, []);
+
+  // Recover the in-flight turn's work block on a mid-turn (re)subscribe (an iOS
+  // relay leg resuming after backgrounding). The snapshot is the whole coalesced
+  // turn — a superset of anything shown live — so REPLACE the open block's steps
+  // rather than append (appending would double-render the head already on screen
+  // before we backgrounded). The trailing prose step is the CURRENT answer tail,
+  // which the live view renders as the streaming reply below the block, not as a
+  // work step — route it to the stream so the recovered shape matches live and
+  // the terminal Message replaces it cleanly.
+  const applyWorkSnapshot = useCallback(
+    (wireSteps: WireWorkStepFrame[]) => {
+      const steps = wireSteps.map(wireStepToWork);
+      if (steps.length === 0) return;
+      const tail = steps[steps.length - 1];
+      const tailProse = tail.kind === "prose";
+      const workSteps = tailProse ? steps.slice(0, -1) : steps;
+      // Drive the live reply to the recovered answer tail (or clear it) in one
+      // shot, batched with the block replace below — so the reply grows in place
+      // rather than blanking for a frame.
+      setStreamingText(tailProse ? tail.text : "");
+      setMessages((rows) => {
+        const last = rows[rows.length - 1];
+        const openBlock = last && last.role === "work" ? last : undefined;
+        if (workSteps.length === 0) {
+          // Answer-only turn: no block, the streamed reply stands alone; drop a
+          // stale empty/restored block if it's the tail.
+          return openBlock && openBlock.steps.length === 0 ? rows.slice(0, -1) : rows;
+        }
+        // Re-open a block a prior restore froze (relaunch mid-turn) and replace
+        // its steps; otherwise open a fresh one after the turn's user message.
+        const rebuilt: WorkRow = openBlock
+          ? { ...openBlock, steps: workSteps, active: true, startedAt: openBlock.startedAt ?? Date.now(), elapsedMs: undefined }
+          : { id: uid(), role: "work", steps: workSteps, active: true, startedAt: Date.now() };
+        return openBlock ? [...rows.slice(0, -1), rebuilt] : [...rows, rebuilt];
+      });
+    },
+    [setStreamingText],
+  );
 
   // Fire a transcript-history request through native. The page streams back
   // later as a `history_page` frame; `mode` tags it for that handler (REPLACE
@@ -595,6 +657,23 @@ export function Transcript({
         setTurnActive(frame.active);
         if (!frame.active) closeWork();
         break;
+      case "work_snapshot":
+        applyWorkSnapshot(frame.steps);
+        break;
+      case "work_replay": {
+        // A completed turn's collapsed work block, replayed on catch-up just
+        // before its reply. Insert it (closed) in stream order, replacing any
+        // leftover open block for the same turn (the in-flight block still on
+        // screen from before we backgrounded) so the thinking isn't doubled.
+        const replaySteps = frame.steps.map(wireStepToWork);
+        if (replaySteps.length === 0) break;
+        setMessages((m) => {
+          const block: WorkRow = { id: uid(), role: "work", steps: replaySteps, active: false };
+          const last = m[m.length - 1];
+          return last && last.role === "work" ? [...m.slice(0, -1), block] : [...m, block];
+        });
+        break;
+      }
       case "notice":
         if (frame.transient) {
           // Mid-turn progress narration belongs to the work block, not the log.
