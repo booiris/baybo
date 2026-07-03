@@ -23,6 +23,19 @@ const COMPONENTS: Components = {
       </a>
     );
   },
+  // A wide table gets its OWN horizontal scroller (the reading band is narrow on
+  // phone). Without the wrapper the table inherits the prose's `overflow-wrap:
+  // anywhere` and shrinks its cells to fit instead of overflowing — so it never
+  // scrolls, it just folds each cell into a tall column of broken words. The
+  // wrapper is the scroll box; `white-space: nowrap` on the cells (styles.css)
+  // keeps content on one line so the table grows past the band and scrolls.
+  table({ children }) {
+    return (
+      <div className="md-table-wrap">
+        <table>{children}</table>
+      </div>
+    );
+  },
 };
 
 /// The assistant-prose renderer. Memoized: during a stream the parent

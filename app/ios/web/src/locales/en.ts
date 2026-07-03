@@ -4,7 +4,6 @@ export const en = {
   translation: {
     chat: {
       loadOlder: "Load earlier messages",
-      jumpToLatest: "Jump to the latest message",
       loadingImage: "Loading image…",
       tapToLoad: "Tap to load image",
       imageAlt: "image",

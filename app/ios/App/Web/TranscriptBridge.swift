@@ -20,6 +20,9 @@ final class TranscriptBridge: NSObject, ObservableObject {
     private var pending: [String] = []
     private var lastBottomInset = Int.min
     private var composerTop: CGFloat?
+    /// Mirror of the web transcript's `showJump` state — drives the native
+    /// glass jump-to-latest button above the composer.
+    @Published private(set) var jumpVisible = false
 
     init(store: ChatStore) {
         self.store = store
@@ -93,6 +96,31 @@ final class TranscriptBridge: NSObject, ObservableObject {
         lastBottomInset = px
         call("setBottomInset", String(px))
     }
+
+    /// A native jump-button tap runs the web side's glide (scroll state and
+    /// settle logic live with the scroll container).
+    func jumpToLatest() {
+        call("jumpToLatest", "")
+    }
+
+    #if DEBUG
+        /// `-baybo-demo-jump`: 4s in, shove the log off the newest edge from
+        /// inside the page — the REAL onScroll → showJump → `jumpVisible`
+        /// mirror fires — then 3s later run the native jump path. The glass
+        /// button's full round trip, screenshot-verifiable headlessly (pair
+        /// with -baybo-open-chat -baybo-demo-frames).
+        func startDemoJumpIfRequested() {
+            guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-jump") else { return }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(4))
+                evaluate(
+                    "document.querySelector('.chat-log').scrollBy({top: -1400, behavior: 'instant'});"
+                )
+                try? await Task.sleep(for: .seconds(3))
+                jumpToLatest()
+            }
+        }
+    #endif
 
     private func deliverInit() {
         guard let store else { return }
@@ -199,6 +227,9 @@ extension TranscriptBridge: WKScriptMessageHandler {
             // by page-load time it has one.
             lastBottomInset = Int.min
             pushBottomInset()
+            // Same fresh-page reasoning: the new page opens pinned to the
+            // newest edge, so a jetsam reload must not strand a stale button.
+            jumpVisible = false
         case "ordinal":
             let ordinal = (body["lastOrdinal"] as? NSNumber)?.int64Value
             store?.ordinalAdvanced(ordinal)
@@ -219,6 +250,8 @@ extension TranscriptBridge: WKScriptMessageHandler {
             {
                 store?.requestImage(id: id, blobId: blobId)
             }
+        case "jumpVisible":
+            jumpVisible = (body["visible"] as? Bool) ?? false
         case "openUrl":
             // Markdown links leave the app for the system browser — navigating
             // the transcript webview itself would replace the thread.

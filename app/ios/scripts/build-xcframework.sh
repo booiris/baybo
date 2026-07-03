@@ -61,4 +61,15 @@ for t in "${TARGETS[@]}"; do
 done
 xcodebuild -create-xcframework ${XCF_ARGS[@]+"${XCF_ARGS[@]}"} -output Externals/BayboCore.xcframework | cat
 
+# Device builds (Xcode 15+/26) reject any referenced xcframework that isn't
+# code-signed, and `-create-xcframework` emits an unsigned bundle. Sign it here
+# so a device build links cleanly. Sim-only bundles are skipped — the simulator
+# SDK never enforces the signature.
+if [[ "$SIM_ONLY" != 1 ]]; then
+  : "${BAYBO_IOS_CODESIGN_IDENTITY:=Apple Development}"
+  codesign --force --timestamp=none --sign "$BAYBO_IOS_CODESIGN_IDENTITY" \
+    Externals/BayboCore.xcframework
+  echo "signed xcframework with: $BAYBO_IOS_CODESIGN_IDENTITY"
+fi
+
 echo "OK: Generated/$(ls Generated) + Externals/BayboCore.xcframework ($PROFILE, targets: ${TARGETS[*]})"

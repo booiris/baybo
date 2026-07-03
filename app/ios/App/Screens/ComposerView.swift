@@ -4,8 +4,7 @@ import SwiftUI
 /// The native composer dock: autosizing field, image staging via PhotosPicker,
 /// in-field send. Interaction contract preserved from the web composer:
 /// * staged picks count as a draft, so an attachment-only send works with an
-///   empty field (the field also expands over the mic slot whenever a draft
-///   exists);
+///   empty field;
 /// * send is gated while any staged item is uploading (`waitingUpload` notice);
 /// * picks over 100 MiB are rejected up front (`tooLarge`), matching the
 ///   gateway's blob cap.
@@ -37,66 +36,68 @@ struct ComposerView: View {
                             .foregroundStyle(Theme.inkSoft)
                     }
                 }
-                .padding(.horizontal, 6)
+                .padding(.horizontal, 18)
             }
 
             if !staged.isEmpty {
                 stagedStrip
             }
 
-            HStack(alignment: .bottom, spacing: 8) {
+            // One ChatGPT-style pill: inline plus on the left, in-field send
+            // on the right — no satellite icon circles.
+            HStack(alignment: .bottom, spacing: 4) {
                 PhotosPicker(selection: $pickerItem, matching: .images) {
-                    Image(systemName: "paperclip")
-                        .font(.system(size: 18))
+                    Image(systemName: "plus")
+                        .font(.system(size: 22, weight: .light))
                         .foregroundStyle(Theme.ink)
-                        .frame(width: 40, height: 40)
+                        .frame(width: 46, height: 48)
                 }
                 .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.addImage")))
 
-                HStack(alignment: .bottom, spacing: 4) {
-                    TextField(lang.t("chat.placeholder"), text: $text, axis: .vertical)
-                        .lineLimit(1...6)
-                        .font(.system(size: 16))
-                        .focused($focused)
-                        .padding(.leading, 14)
-                        .padding(.vertical, 10)
+                // 13pt vertical padding makes the single-line field exactly
+                // the row's 48pt (17pt body ≈ 22pt line), so the cursor sits
+                // vertically centered despite the .bottom stack alignment;
+                // extra lines still grow upward.
+                TextField(lang.t("chat.placeholder"), text: $text, axis: .vertical)
+                    .lineLimit(1...6)
+                    .font(.system(size: 17))
+                    .focused($focused)
+                    .padding(.vertical, 13)
 
-                    Button {
-                        send()
-                    } label: {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 26))
-                            .foregroundStyle(hasDraft ? Theme.ink : Theme.line)
-                    }
-                    .disabled(!hasDraft)
-                    .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.send")))
-                    .padding(.trailing, 6)
-                    .padding(.bottom, 6)
+                Button {
+                    send()
+                } label: {
+                    Circle()
+                        .fill(hasDraft ? Theme.ink : Theme.line)
+                        .frame(width: 36, height: 36)
+                        .overlay(
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(Theme.paper)
+                        )
                 }
-                .background(
-                    RoundedRectangle(cornerRadius: 22)
-                        .fill(Theme.paper)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 22)
-                        .strokeBorder(Theme.line, lineWidth: 1)
-                )
-
-                // The mic placeholder collapses whenever a draft exists (no
-                // capture wired yet, mirroring the web composer).
-                if !hasDraft {
-                    Image(systemName: "mic")
-                        .font(.system(size: 18))
-                        .foregroundStyle(Theme.inkSoft)
-                        .frame(width: 40, height: 40)
-                        .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.voice")))
-                }
+                .disabled(!hasDraft)
+                .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.send")))
+                .padding(.trailing, 6)
+                .padding(.bottom, 6)
             }
+            .frame(minHeight: 48)
+            // Borderless pill (ChatGPT-style): over the thread's blank white
+            // at-rest strip the untinted glass is nearly invisible, so a soft
+            // ambient shadow carries the boundary instead of a hairline.
+            .glassEffect(
+                .regular.tint(Theme.paper.opacity(0.25)), in: .rect(cornerRadius: 24)
+            )
+            .shadow(color: Theme.ink.opacity(0.08), radius: 14, y: 4)
+            // At rest the pill holds a moderate width; focus stretches it out
+            // toward the screen edges — a small gutter stays — on the
+            // keyboard's beat. The notice/staged rows keep their own gutters.
+            .padding(.horizontal, focused ? 14 : 40)
+            .animation(.easeOut(duration: 0.25), value: focused)
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 8)
-        .padding(.bottom, 6)
-        .background(Theme.paper)
+        .padding(.top, 0)
+        .padding(.bottom, dockBottomPadding)
+        .background { composerVeil }
         .onChange(of: pickerItem) { _, item in
             guard let item else { return }
             pickerItem = nil
@@ -118,6 +119,44 @@ struct ComposerView: View {
                 }
             }
         #endif
+    }
+
+    /// Quadratic ease-out (`1 − (1−t)²` at t = 0, 0.2 … 1.0): the fade rises
+    /// fast then levels off. It spans the dock itself: alpha 0 at the dock's
+    /// top edge down to the peak at the PILL'S BOTTOM edge, so peak opacity
+    /// is reached only under the pill and scrolled content ghosts past the
+    /// pill's flanks; only the strip below the pill (bottom padding +
+    /// home-indicator area) is solid.
+    private static let veilPeakAlpha = 0.75
+    private static let veilTailAlphas: [Double] = [0.0, 0.36, 0.64, 0.84, 0.96, 1.0]
+
+    /// The dock's gap under the pill — also where the veil turns solid.
+    private var dockBottomPadding: CGFloat { focused ? 12 : 0 }
+
+    /// Bottom mirror of the header veil, replacing the old opaque paper dock.
+    /// Nothing overhangs the dock, and the whole veil hit-tests: gutter taps
+    /// must not fall through and scroll the webview. The solid tail finishes
+    /// the home-indicator strip and masks the web-vs-native inset animation
+    /// phase mismatch; the notice/staged rows sit in the fade, backed by the
+    /// thread's blank at-rest strip.
+    private var composerVeil: some View {
+        GeometryReader { geo in
+            VStack(spacing: 0) {
+                LinearGradient(
+                    stops: Self.veilTailAlphas.enumerated().map { idx, alpha in
+                        .init(
+                            color: Theme.paper.opacity(alpha * Self.veilPeakAlpha),
+                            location: CGFloat(idx) / CGFloat(Self.veilTailAlphas.count - 1)
+                        )
+                    },
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: geo.size.height - dockBottomPadding)
+                Theme.paper.opacity(Self.veilPeakAlpha)
+                    .frame(height: dockBottomPadding + geo.safeAreaInsets.bottom)
+            }
+        }
     }
 
     private var stagedStrip: some View {
@@ -155,7 +194,7 @@ struct ComposerView: View {
                     }
                 }
             }
-            .padding(.horizontal, 6)
+            .padding(.horizontal, 18)
             .padding(.top, 6)
         }
     }

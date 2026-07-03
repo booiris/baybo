@@ -42,6 +42,26 @@ before `xcodegen generate`, so the project always references fresh products.
 `generate_context!`-style staleness does not exist here, but the ORDER still
 matters: web bundle → `App/Resources/transcript/` → xcodegen → xcodebuild.
 
+**Device builds need the device slice AND a signed xcframework.** `build.sh`
+defaults to sim-only (`XCF_FLAGS=(--sim-only)`), so a plain run produces a
+sim-only `BayboCore.xcframework`; switching Xcode's destination to a physical
+device then fails with *"no library for this platform was found."* Pass
+`--device` (or run `build-xcframework.sh` with no flags) to add the `ios-arm64`
+slice. Xcode 15+/26 also rejects any xcframework referenced by a device build
+that isn't code-signed (*"The Framework … is unsigned"*) — `-create-xcframework`
+emits an unsigned bundle, so `build-xcframework.sh` now `codesign`s it for
+non-sim-only builds (identity via `BAYBO_IOS_CODESIGN_IDENTITY`, default
+`Apple Development`). Run the signing build from an interactive Terminal in your
+GUI login session: codesign needs the unlocked login keychain, and a headless
+shell fails with `errSecInternalComponent` / "User interaction is not allowed."
+
+**Sim-verification loops must not clobber the device xcframework.** A plain
+`build.sh` run overwrites `Externals/BayboCore.xcframework` with a sim-only
+unsigned bundle, and the next Xcode device Run fails with exactly the two
+errors above. When iterating on Swift/web only (no `ffi/` changes), pass
+`--skip-rust`; after a full run does clobber it, restore with
+`scripts/build-xcframework.sh` (no flags).
+
 ## Continuity contract (do not change — existing installs depend on it)
 
 - Bundle ids `com.baybo.app` / `com.baybo.app.NotificationExtension`; team
@@ -77,8 +97,9 @@ matters: web bundle → `App/Resources/transcript/` → xcodegen → xcodebuild.
   400ms; the core coalesces concurrent dials.
 - **Bridge** (`App/Web/TranscriptBridge.swift` ⇄ `web/src/bridge.ts`):
   native→web
-  `init/pushFrame/setConnEpoch/userSent/imageResult/setLanguage/setBottomInset`;
-  web→native `ready/ordinal/persist/fetchHistory/requestImage/openUrl/log`.
+  `init/pushFrame/setConnEpoch/userSent/imageResult/setLanguage/setBottomInset/jumpToLatest`;
+  web→native
+  `ready/ordinal/persist/fetchHistory/requestImage/openUrl/log/jumpVisible`.
   Transcript persistence lives in UserDefaults (`ChatDefaults.*`), NOT webview
   localStorage (file:// storage is unreliable and upgrade-fragile).
 - **Keyboard**: the transcript webview is FULL-BLEED and its frame never
@@ -108,7 +129,9 @@ matters: web bundle → `App/Resources/transcript/` → xcodegen → xcodebuild.
 - **Headless UI verification**: launch with `-baybo-open-chat
   -baybo-demo-frames` (DEBUG) to feed one canned turn (thinking → tool →
   streamed markdown → finalize) through the real bridge — screenshot the sim
-  at ~3s/~6s/~12s. `-baybo-demo-keyboard` raises the keyboard 2s in and drops
+  at ~3s/~6s/~12s. `-baybo-demo-jump` scrolls the log off the newest edge at
+  4s (native glass jump button pops) and runs the native jump path at 7s.
+  `-baybo-demo-keyboard` raises the keyboard 2s in and drops
   it at 5s (record with `simctl io recordVideo`, extract frames with ffmpeg);
   the software keyboard only appears with Simulator.app running and hardware
   keyboard disconnected. `scripts/build.sh` pins products at
@@ -116,6 +139,25 @@ matters: web bundle → `App/Resources/transcript/` → xcodegen → xcodebuild.
   `simctl install`.
 - **Send path**: native mints the msgId, seeds the webview's optimistic bubble
   + echo-dedup FIRST, then enqueues on the leg.
+- **Liquid Glass (iOS 26)**: the chat composer dock and the jump-to-latest
+  button are the ONLY glass surfaces — a recorded deviation from the
+  `app/mobile/CLAUDE.md` flat-monochrome system, which still governs
+  everything else. The composer is ONE ChatGPT-style glass pill (inline plus
+  picker on the left, in-field ink send circle on the right; at rest it holds
+  a moderate width, and focus stretches it toward the screen edges — a small
+  gutter stays — on the keyboard's beat). Constraints: white tint only, no
+  `.interactive()` shimmer on the field, the pill is BORDERLESS — a soft ink
+  shadow carries its boundary over the blank at-rest strip (no hairline);
+  the jump button is bare glass (no stroke).
+  The dock's paper veil (bottom mirror of
+  the header veil) is load-bearing, not decoration: it hit-tests the dock
+  rect (gutter taps must not scroll the webview) and masks the web-vs-native
+  inset animation phase mismatch. Its fade spans the dock itself — alpha 0
+  at the dock's top edge, peak only under the PILL'S BOTTOM edge — so
+  scrolled content ghosts past the pill's flanks.
+  The jump button is native: web posts `jumpVisible` on its `showJump` state,
+  native taps call `jumpToLatest` back; the composer-top geometry is measured
+  on the ComposerView alone so the button never inflates the web inset.
 
 ## Known gaps / follow-ups
 
@@ -127,7 +169,10 @@ matters: web bundle → `App/Resources/transcript/` → xcodegen → xcodebuild.
   first launch after upgrade starts a fresh session. Gateway history is intact.
 - `verify-nse.sh` still lives in app/mobile and targets the Tauri project;
   port it when app/mobile retires.
-- Voice input is a placeholder (as in the Tauri app).
+- Voice input has no composer affordance anymore — the mic placeholder button
+  was removed with the Liquid Glass restyle (the Tauri app still shows one).
+  Wiring real capture later means re-adding the button, not just filling in a
+  handler.
 
 ## Verified on simulator (2026-07-03)
 

@@ -33,6 +33,7 @@ type BayboGlobal = {
   imageResult(payload: ImageResultPayload): void;
   setLanguage(lang: string): void;
   setBottomInset(px: number): void;
+  jumpToLatest(): void;
 };
 
 declare global {
@@ -82,6 +83,13 @@ export function postReady(): void {
 
 export function postOrdinal(lastOrdinal: number | null): void {
   postSafe({ type: "ordinal", lastOrdinal });
+}
+
+// The jump-to-latest button is native (liquid glass, above the composer) —
+// the transcript mirrors its visibility state over; taps come back through
+// the `jumpToLatest` transcript event.
+export function postJumpVisible(visible: boolean): void {
+  postSafe({ type: "jumpVisible", visible });
 }
 
 /// Markdown links must not navigate the transcript webview away — native opens
@@ -181,13 +189,16 @@ export type TranscriptEvents = {
   /// keyboard), in CSS px. Streams per layout tick through keyboard
   /// animations.
   bottomInset(px: number): void;
+  /// The native jump-to-latest button was tapped — run the glide.
+  jumpToLatest(): void;
 };
 
 type Buffered =
   | { kind: "frame"; frameJson: string }
   | { kind: "epoch"; epoch: number }
   | { kind: "userSent"; payload: UserSentPayload }
-  | { kind: "bottomInset"; px: number };
+  | { kind: "bottomInset"; px: number }
+  | { kind: "jumpToLatest" };
 
 let initPayload: InitPayload | null = null;
 let onInitCb: ((payload: InitPayload) => void) | null = null;
@@ -226,7 +237,8 @@ function deliver(e: TranscriptEvents, item: Buffered): void {
   if (item.kind === "frame") e.frame(item.frameJson);
   else if (item.kind === "epoch") e.connEpoch(item.epoch);
   else if (item.kind === "userSent") e.userSent(item.payload);
-  else e.bottomInset(item.px);
+  else if (item.kind === "bottomInset") e.bottomInset(item.px);
+  else e.jumpToLatest();
 }
 
 function dispatch(item: Buffered): void {
@@ -261,5 +273,8 @@ window.baybo = {
   },
   setBottomInset(px) {
     dispatch({ kind: "bottomInset", px });
+  },
+  jumpToLatest() {
+    dispatch({ kind: "jumpToLatest" });
   },
 };

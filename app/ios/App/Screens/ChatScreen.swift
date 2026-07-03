@@ -35,22 +35,42 @@ struct ChatScreen: View {
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            ComposerView(store: store)
-                .onGeometryChange(for: CGFloat.self) { proxy in
-                    proxy.frame(in: .global).minY
-                } action: { minY in
-                    // The composer's own geometry is the one signal that
-                    // tracks BOTH the keyboard it rides and its own growth
-                    // (notice line, staged strip, multiline field). The bridge
-                    // converts to the covered strip against the WINDOW bottom.
-                    bridge.setComposerTop(minY)
+            VStack(spacing: 12) {
+                if bridge.jumpVisible {
+                    Button {
+                        bridge.jumpToLatest()
+                    } label: {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 17, weight: .medium))
+                            .foregroundStyle(Theme.ink)
+                            .frame(width: 44, height: 44)
+                    }
+                    .glassEffect(.regular.interactive(), in: .circle)
+                    .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.jumpToLatest")))
+                    .transition(.scale(scale: 0.7).combined(with: .opacity))
                 }
+                ComposerView(store: store)
+                    .onGeometryChange(for: CGFloat.self) { proxy in
+                        proxy.frame(in: .global).minY
+                    } action: { minY in
+                        // The composer's own geometry is the one signal that
+                        // tracks BOTH the keyboard it rides and its own growth
+                        // (notice line, staged strip, multiline field). The
+                        // bridge converts to the covered strip against the
+                        // WINDOW bottom. Measured on the COMPOSER, not the
+                        // wrapping stack: the jump button popping in must
+                        // never inflate the web-side inset.
+                        bridge.setComposerTop(minY)
+                    }
+            }
+            .animation(.easeOut(duration: 0.16), value: bridge.jumpVisible)
         }
         .background(Theme.paper)
         .onAppear {
             store.connect()
             #if DEBUG
                 store.startDemoFramesIfRequested()
+                bridge.startDemoJumpIfRequested()
             #endif
         }
         .onDisappear {

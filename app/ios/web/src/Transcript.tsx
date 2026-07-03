@@ -5,6 +5,7 @@ import {
   imageObjectUrl,
   log,
   persistState,
+  postJumpVisible,
   postOrdinal,
   subscribeTranscript,
   type UserSentPayload,
@@ -814,8 +815,20 @@ export function Transcript({
   // Bridge events call the LATEST handlers through this ref (assigned each
   // render), so the subscription registers once without re-subscribing per
   // render.
-  const handlersRef = useRef({ handleFrame, handleUserSent, handleConnEpoch, handleBottomInset });
-  handlersRef.current = { handleFrame, handleUserSent, handleConnEpoch, handleBottomInset };
+  const handlersRef = useRef({
+    handleFrame,
+    handleUserSent,
+    handleConnEpoch,
+    handleBottomInset,
+    jumpToLatest,
+  });
+  handlersRef.current = {
+    handleFrame,
+    handleUserSent,
+    handleConnEpoch,
+    handleBottomInset,
+    jumpToLatest,
+  };
   useEffect(
     () =>
       subscribeTranscript({
@@ -823,6 +836,7 @@ export function Transcript({
         connEpoch: (epoch) => handlersRef.current.handleConnEpoch(epoch),
         userSent: (payload) => handlersRef.current.handleUserSent(payload),
         bottomInset: (px) => handlersRef.current.handleBottomInset(px),
+        jumpToLatest: () => handlersRef.current.jumpToLatest(),
       }),
     [],
   );
@@ -850,6 +864,13 @@ export function Transcript({
     }, GLIDE_SETTLE_CAP_MS);
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }
+
+  // The button itself is native (a liquid-glass circle above the composer) —
+  // mirror the visibility over the bridge; taps come back via the
+  // `jumpToLatest` transcript event above.
+  useEffect(() => {
+    postJumpVisible(showJump);
+  }, [showJump]);
 
   // While the turn's work block is live it already signals activity; the bare
   // "Working" pending line only covers the gap before the first frame lands.
@@ -911,33 +932,6 @@ export function Transcript({
           </div>
         )}
       </div>
-      {showJump && (
-        <button
-          type="button"
-          className="jump-latest"
-          // Cancelling pointerdown (and the mousedown WebKit still synthesizes)
-          // keeps the tap from stealing focus, so the native composer keeps its
-          // keyboard up while the log glides; click itself still fires.
-          onPointerDown={(e) => e.preventDefault()}
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={jumpToLatest}
-          aria-label={t("chat.jumpToLatest")}
-        >
-          {/* Line-art down arrow. */}
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.8"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            <path d="M12 5v14" />
-            <path d="M19 12l-7 7-7-7" />
-          </svg>
-        </button>
-      )}
     </>
   );
 }

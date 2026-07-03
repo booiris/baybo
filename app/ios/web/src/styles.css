@@ -95,7 +95,7 @@ button {
   border: 1px solid var(--color-line);
   border-radius: var(--radius);
   font-family: var(--font-sans);
-  font-size: 0.95rem;
+  font-size: 1rem;
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
@@ -110,7 +110,7 @@ button {
 .msg.assistant {
   width: 100%;
   font-family: var(--font-sans);
-  font-size: 0.95rem;
+  font-size: 1rem;
   line-height: 1.6;
   color: var(--color-ink);
   word-break: break-word;
@@ -118,7 +118,7 @@ button {
 }
 /* Streaming caret: a pulsing block riding the last rendered markdown element
    (skipped on boxes where an inline caret would look detached). */
-.msg.assistant.streaming .md > :last-child:not(pre):not(table)::after {
+.msg.assistant.streaming .md > :last-child:not(pre):not(.md-table-wrap)::after {
   content: "";
   display: inline-block;
   width: 0.45em;
@@ -134,7 +134,7 @@ button {
    set (GFM: code, tables, quotes, lists, links). */
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
-.md p, .md ul, .md ol, .md pre, .md blockquote, .md table { margin: 0.5rem 0; }
+.md p, .md ul, .md ol, .md pre, .md blockquote, .md-table-wrap { margin: 0.5rem 0; }
 .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 0.9rem 0 0.4rem; line-height: 1.3; }
 .md h1 { font-size: 1.25rem; }
 .md h2 { font-size: 1.15rem; }
@@ -170,19 +170,70 @@ button {
   color: var(--color-ink-soft);
   font-style: italic;
 }
-.md hr { border: 0; border-top: 1px solid var(--color-line); margin: 0.75rem 0; }
+/* Divider hairline — same device-thin technique as the table row dividers: a
+   painted 1px bar scaled to half height, so it can't round away on retina the
+   way a sub-pixel border does. */
+.md hr {
+  border: 0;
+  height: 1px;
+  background: var(--color-line);
+  transform: scaleY(0.5);
+  margin: 0.75rem 0;
+}
 .md ul, .md ol { padding-left: 1.25rem; }
 .md li { margin: 0.15rem 0; }
 .md img { max-width: 100%; border-radius: 10px; }
-/* Wide tables scroll inside their own box instead of stretching the thread. */
-.md table {
-  display: block;
+/* Tables: no fills — a light hairline under each row is the only structure.
+   Each column is capped (max-width) so one long cell can't dominate: content
+   wraps within the cap. The table sizes to its (capped) content, and when that
+   overflows the reading band it scrolls left/right inside the wrapper (its own
+   box, momentum scroll for the WKWebView) rather than squeezing to fit. */
+.md-table-wrap {
+  margin: 0.5rem 0;
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.md-table-wrap table {
+  /* max-content = the table takes each column's own content width (capped by the
+     cell max-width below) instead of shrinking to fit the band — so a wide table
+     OVERFLOWS and scrolls. min-width:100% pulls a table NARROWER than the band up
+     to full width instead, stretching its columns to fill the screen. */
+  width: max-content;
+  min-width: 100%;
   border-collapse: collapse;
   font-size: 0.8rem;
 }
-.md th, .md td { border: 1px solid var(--color-line); padding: 0.25rem 0.5rem; text-align: left; }
-.md th { background: var(--color-surface); font-weight: 700; }
+.md-table-wrap th,
+.md-table-wrap td {
+  /* Reset the prose's break-anywhere so tokens don't shatter mid-word; wrap on
+     natural boundaries only once the cell hits its max-width cap. */
+  overflow-wrap: normal;
+  word-break: normal;
+  max-width: 12rem;
+  padding: 0.4rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+  position: relative;
+}
+.md-table-wrap th { font-weight: 700; }
+/* Row divider as a device-thin hairline. A plain `0.5px` border VANISHES here:
+   in the collapsed-border model WebKit snaps each shared cell border onto the
+   physical pixel grid and rounds a sub-pixel width down to 0. Painting a 1px bar
+   and scaling it to half height instead keeps a crisp ~0.5px line at any DPR — a
+   filled box has area and can't be rounded away like a border edge can. */
+.md-table-wrap thead th::after,
+.md-table-wrap tbody tr:not(:last-child) td::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: var(--color-line);
+  transform: scaleY(0.5);
+  transform-origin: bottom;
+  pointer-events: none;
+}
 
 /* The turn's work block (thinking trace + tool progress). Active: a soft card
    with a spinner header; closed: a dim tappable "Worked Xs ›" summary. */
@@ -228,7 +279,7 @@ button {
 .work-summary:active { opacity: 0.7; }
 .work-chevron { display: inline-block; transition: transform 120ms ease; }
 .work-chevron.open { transform: rotate(90deg); }
-.work-divider { border-top: 1px solid var(--color-line); }
+.work-divider { height: 1px; background: var(--color-line); transform: scaleY(0.5); }
 .work-steps {
   display: flex;
   flex-direction: column;
@@ -314,43 +365,4 @@ button {
   background: var(--color-surface);
   border: 1px solid var(--color-line);
   border-radius: var(--radius);
-}
-
-/* Jump-to-latest: floats centered just above the native composer (which
-   overlays the webview's bottom edge) while the user is off the newest edge;
-   tapping glides back to the bottom. The ::after hit-slop lifts the 36px circle
-   to the 44px tap floor. */
-.jump-latest {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: calc(var(--thread-bottom-inset) + 1rem);
-  /* Ride the same keyboard-slide curve as the thread padding — the inset var
-     jumps to its target, so without this the pill teleports while the thread
-     glides. */
-  transition: bottom 250ms cubic-bezier(0.33, 1, 0.68, 1);
-  margin: 0 auto;
-  width: 2.25rem;
-  height: 2.25rem;
-  padding: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--color-paper);
-  background: var(--color-ink);
-  border: 0;
-  border-radius: var(--radius-pill);
-  animation: jump-pop 160ms ease;
-}
-.jump-latest svg { width: 1.1rem; height: 1.1rem; }
-.jump-latest:active { opacity: 0.7; transform: scale(0.98); }
-/* Invisible hit-slop lifting the 36px circle to the 44px tap-target floor. */
-.jump-latest::after {
-  content: "";
-  position: absolute;
-  inset: -0.25rem;
-  border-radius: var(--radius-pill);
-}
-@keyframes jump-pop {
-  from { opacity: 0; transform: scale(0.7); }
 }

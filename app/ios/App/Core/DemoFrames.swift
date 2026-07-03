@@ -15,10 +15,10 @@
             NSLog("baybo: demo frames starting")
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(500))
-                bridge?.userSent(msgId: "demo-user-1", text: "介绍一下这个项目", attachments: [])
+                bridge?.userSent(msgId: "demo-user-1", text: "Give me an overview of this project", attachments: [])
                 pushDemo(["kind": "turn_state", "active": true])
                 try? await Task.sleep(for: .milliseconds(700))
-                for chunk in ["让我先看看仓库结构。", "核心是一个多通道的智能助手框架,", "读一下模块文档再总结…"] {
+                for chunk in ["Let me look at the repo structure first.", "The core is a multi-channel assistant framework,", "let me read the module docs before summarizing…"] {
                     pushDemo(["kind": "reasoning", "text": chunk])
                     try? await Task.sleep(for: .milliseconds(400))
                 }
@@ -31,29 +31,37 @@
                     "kind": "tool_completed", "call_id": "demo-t1", "status": "ok",
                     "summary": "31 modules",
                 ])
-                pushDemo(["kind": "reasoning", "text": "文档齐全,可以直接总结了。"])
+                pushDemo(["kind": "reasoning", "text": "Docs are thorough — I can summarize directly."])
                 try? await Task.sleep(for: .milliseconds(600))
 
                 let answer = """
-                    **Baybo** 是一个基于大语言模型的智能助手框架,支持多通道接入与工具调用。
+                    **Baybo** is an LLM-powered assistant framework with multi-channel access and tool calling.
 
-                    ## 核心能力
+                    ## Core Capabilities
 
-                    - 多通道接入(Telegram、Discord、Web)
-                    - 工具调用与 `Skill` 扩展
-                    - 上下文管理、压缩与错误恢复
+                    - Multi-channel access (Telegram, Discord, Web)
+                    - Tool calling and `Skill` extensions
+                    - Context management, compression, and error recovery
 
                     ```rust
                     let client = BayboClient::new(config)?;
                     client.chat_send("hello").await?;
                     ```
 
-                    | 模块 | 职责 |
-                    | --- | --- |
-                    | gateway | 通道网关 |
-                    | wire | 帧协议 |
+                    | Module | Responsibility | Key Deps | Status | Owner |
+                    | --- | --- | --- | --- | --- |
+                    | gateway | Channel gateway & session routing | tokio, axum | stable | core-team |
+                    | wire | Frame protocol & serialization | serde, rmp-serde | stable | core-team |
+                    | agent | Agent execution loop | tokio, baybo-tools | iterating | agent-team |
 
-                    详见[模块索引](https://example.com/docs)。
+                    A narrow table stretches to fill the row:
+
+                    | Metric | Value |
+                    | --- | --- |
+                    | Modules | 31 |
+                    | Coverage | 87% |
+
+                    See the [module index](https://example.com/docs).
                     """
                 for chunk in Self.chunked(answer, size: 14) {
                     pushDemo(["kind": "answer_delta", "text": chunk])
