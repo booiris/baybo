@@ -14,12 +14,9 @@ struct RootView: View {
                 if store.challenge != nil {
                     PairConfirmView()
                 } else {
-                    switch store.landingView {
-                    case .menu:
-                        LandingView()
-                    case .direct:
-                        DirectLoginView()
-                    }
+                    // Menu vs the direct form swap INSIDE the landing hero
+                    // (the wordmark stays), mirroring the web.
+                    LandingView()
                 }
             case .chat(let sessionId):
                 ChatScreen(sessionId: sessionId)

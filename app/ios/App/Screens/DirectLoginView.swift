@@ -1,14 +1,16 @@
 import SwiftUI
 
-/// Direct (URL + admin token) login form. URL normalization feedback mirrors
-/// the Rust side (default https://, strip trailing slash) for instant local
-/// validation; the stable `invalidToken` error variant maps to a localized
-/// message; the token never outlives the attempt.
-struct DirectLoginView: View {
+/// The direct (URL + admin token) login form — the web `.direct-form`, rendered
+/// INSIDE the landing hero (the wordmark + rule stay above it). Left-aligned
+/// labeled fields, a full-width connect CTA, a quiet "← Back" link, and the
+/// status line. URL normalization mirrors the Rust side for instant feedback;
+/// the token never outlives the attempt.
+struct DirectLoginForm: View {
     @EnvironmentObject private var store: AppStore
+    @ObservedObject private var lang = Lang.shared
     @State private var url = ""
     @State private var token = ""
-    @State private var error: String?
+    @State private var status: String?
     @State private var connecting = false
     @FocusState private var focus: Field?
 
@@ -18,79 +20,79 @@ struct DirectLoginView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Button {
-                    store.landingView = .menu
-                } label: {
-                    Label("direct.back", systemImage: "chevron.left")
-                        .font(Theme.mono(13))
-                        .foregroundStyle(Theme.ink)
-                }
-                Spacer()
+        VStack(alignment: .leading, spacing: 12) {
+            Text(verbatim: lang.t("direct.hint"))
+                .font(Theme.mono(15))
+                .foregroundStyle(Theme.inkSoft)
+                .lineSpacing(6)
+
+            // .field: label over input, 0.3rem gap.
+            VStack(alignment: .leading, spacing: 5) {
+                fieldLabel(lang.t("direct.urlLabel"))
+                TextField("https://…", text: $url)
+                    .textContentType(.URL)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .focused($focus, equals: .url)
+                    .submitLabel(.next)
+                    .onSubmit { focus = .token }
+                    .fieldChrome()
             }
-            .padding(.top, 8)
 
-            Spacer()
-
-            VStack(alignment: .leading, spacing: 18) {
-                Text("direct.hint")
-                    .font(Theme.mono(13))
+            VStack(alignment: .leading, spacing: 5) {
+                fieldLabel(lang.t("direct.tokenLabel"))
+                SecureField(lang.t("direct.tokenPlaceholder"), text: $token)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .focused($focus, equals: .token)
+                    .submitLabel(.go)
+                    .onSubmit { connect() }
+                    .fieldChrome()
+                Text(verbatim: lang.t("direct.tokenHint"))
+                    .font(Theme.mono(11))
                     .foregroundStyle(Theme.inkSoft)
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("direct.urlLabel")
-                        .font(Theme.mono(12))
-                        .foregroundStyle(Theme.inkSoft)
-                    TextField("baybo.example.com", text: $url)
-                        .textContentType(.URL)
-                        .keyboardType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .focused($focus, equals: .url)
-                        .submitLabel(.next)
-                        .onSubmit { focus = .token }
-                        .fieldChrome()
-                }
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("direct.tokenLabel")
-                        .font(Theme.mono(12))
-                        .foregroundStyle(Theme.inkSoft)
-                    SecureField("direct.tokenPlaceholder", text: $token)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .focused($focus, equals: .token)
-                        .submitLabel(.go)
-                        .onSubmit { connect() }
-                        .fieldChrome()
-                    Text("direct.tokenHint")
-                        .font(Theme.mono(11))
-                        .foregroundStyle(Theme.inkSoft.opacity(0.8))
-                }
-
-                if let error {
-                    Text(verbatim: error)
-                        .font(Theme.mono(12))
-                        .foregroundStyle(Theme.err)
-                }
             }
 
-            Spacer()
-
+            // .direct-form .cta is full width (max-width: none).
             Button {
                 Haptics.tap()
                 connect()
             } label: {
-                Text(connecting ? "direct.connecting" : "direct.connect")
+                Text(verbatim: lang.t(connecting ? "direct.connecting" : "direct.connect"))
             }
             .buttonStyle(InkPillButtonStyle())
-            .disabled(connecting || normalizedUrl == nil || token.trimmed.isEmpty)
+            .disabled(connecting || url.trimmed.isEmpty || token.trimmed.isEmpty)
             // The web `button:disabled` dim.
-            .opacity(normalizedUrl == nil || token.trimmed.isEmpty ? 0.35 : 1)
+            .opacity(url.trimmed.isEmpty || token.trimmed.isEmpty ? 0.35 : 1)
+            .padding(.top, 4)
+
+            Button {
+                store.status = nil
+                store.landingView = .menu
+            } label: {
+                Text(verbatim: "← \(lang.t("direct.back"))")
+            }
+            .buttonStyle(LinkButtonStyle())
+            .disabled(connecting)
+            .frame(maxWidth: .infinity) // .link-btn self-centers
+
+            if let status {
+                Text(verbatim: status)
+                    .font(Theme.mono(13))
+                    .foregroundStyle(Theme.inkSoft)
+                    .frame(maxWidth: .infinity)
+            }
         }
-        .padding(.horizontal, 28)
-        .padding(.bottom, 18)
+        .frame(maxWidth: .infinity)
+    }
+
+    private func fieldLabel(_ text: String) -> some View {
+        Text(verbatim: text)
+            .font(Theme.mono(11))
+            .textCase(.uppercase)
+            .kerning(0.9)
+            .foregroundStyle(Theme.inkSoft)
     }
 
     /// Local mirror of the Rust `normalize_base` for instant feedback; the core
@@ -112,19 +114,18 @@ struct DirectLoginView: View {
     }
 
     private func connect() {
-        guard let base = normalizedUrl, !token.trimmed.isEmpty, !connecting else {
-            if normalizedUrl == nil {
-                error = String(localized: "direct.invalidUrl")
-            }
+        guard !connecting, !token.trimmed.isEmpty else { return }
+        guard let base = normalizedUrl else {
+            status = lang.t("direct.invalidUrl")
             return
         }
         connecting = true
-        error = nil
+        status = nil
         let attemptToken = token.trimmed
         Task {
             let failure = await store.directConnect(baseUrl: base, token: attemptToken)
             connecting = false
-            error = failure
+            status = failure
             if failure == nil {
                 token = "" // never keep the admin token in view state
             }

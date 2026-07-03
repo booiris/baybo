@@ -13,7 +13,7 @@ struct ScanView: View {
         ZStack(alignment: .bottom) {
             if deniedCamera {
                 VStack(spacing: 16) {
-                    Text("scan.permissionOff")
+                    Text(verbatim: Lang.shared.t("scan.permissionOff"))
                         .font(Theme.mono(13))
                         .foregroundStyle(Theme.inkSoft)
                         .multilineTextAlignment(.center)
@@ -45,7 +45,7 @@ struct ScanView: View {
                     .allowsHitTesting(false)
             } else {
                 // Simulator / devices without the scanner: nothing to scan.
-                Text("scan.notBaybo")
+                Text(verbatim: Lang.shared.t("scan.notBaybo"))
                     .font(Theme.mono(13))
                     .foregroundStyle(Theme.inkSoft)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -55,7 +55,7 @@ struct ScanView: View {
             Button {
                 dismiss()
             } label: {
-                Text("scan.cancel")
+                Text(verbatim: Lang.shared.t("scan.cancel"))
                     .font(Theme.mono(14, weight: .bold))
                     .textCase(.uppercase)
                     .kerning(2)

@@ -149,7 +149,7 @@ final class ChatStore: ObservableObject {
                     text: text, msgId: msgId, attachments: attachments)
             } catch {
                 notice = String(
-                    format: String(localized: "chat.sendFailed"), bayboErrorText(error))
+                    format: Lang.shared.t("chat.sendFailed"), bayboErrorText(error))
             }
         }
     }

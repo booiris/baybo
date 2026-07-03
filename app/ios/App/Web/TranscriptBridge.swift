@@ -71,7 +71,10 @@ final class TranscriptBridge: NSObject, ObservableObject {
     private func deliverInit() {
         guard let store else { return }
         let restored = UserDefaults.standard.string(forKey: ChatDefaults.transcriptState)
-        let language = Locale.preferredLanguages.first.map { String($0.prefix(2)) } ?? "en"
+        // The in-app language override (falls back to the device language) —
+        // the same source the native chrome renders from, so the two can't
+        // diverge.
+        let language = Lang.shared.code
         // restoredState is already a JSON object string — splice it in raw.
         let payload = """
             {"language":\(jsonLiteral(language)),\

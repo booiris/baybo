@@ -43,10 +43,13 @@ struct ChatScreen: View {
             }
         }
         .confirmationDialog(
-            "connected.logoutConfirm", isPresented: $confirmLogout, titleVisibility: .visible
+            Text(verbatim: Lang.shared.t("connected.logoutConfirm")),
+            isPresented: $confirmLogout, titleVisibility: .visible
         ) {
-            Button("connected.logout", role: .destructive) {
+            Button(role: .destructive) {
                 Task { await appStore.logout() }
+            } label: {
+                Text(verbatim: Lang.shared.t("connected.logout"))
             }
         }
     }
@@ -136,9 +139,9 @@ struct ChatHeaderView: View {
 
     private var label: String {
         switch connState {
-        case .connected: return String(localized: "chat.connected")
-        case .connecting: return String(localized: "chat.connecting")
-        case .offline: return String(localized: "chat.offline")
+        case .connected: return Lang.shared.t("chat.connected")
+        case .connecting: return Lang.shared.t("chat.connecting")
+        case .offline: return Lang.shared.t("chat.offline")
         }
     }
 }

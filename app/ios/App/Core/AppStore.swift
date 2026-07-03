@@ -75,7 +75,7 @@ final class AppStore: ObservableObject {
     func handleScan(payload: String) {
         scanPresented = false
         guard let target = parsePairQr(text: payload) else {
-            status = String(localized: "scan.notBaybo")
+            status = Lang.shared.t("scan.notBaybo")
             return
         }
         Haptics.success()
@@ -83,7 +83,7 @@ final class AppStore: ObservableObject {
     }
 
     private func pairBegin(target: PairTarget) {
-        status = String(localized: "pair.connecting")
+        status = Lang.shared.t("pair.connecting")
         busy = true
         Task {
             defer { busy = false }
@@ -95,15 +95,14 @@ final class AppStore: ObservableObject {
                 status = nil
                 self.challenge = challenge
             } catch {
-                status = String(
-                    format: String(localized: "pair.failed"), bayboErrorText(error))
+                status = Lang.shared.t("pair.failed", bayboErrorText(error))
             }
         }
     }
 
     func confirmPair(accepted: Bool) {
         guard let challenge else { return }
-        status = String(localized: accepted ? "pair.confirming" : "pair.cancelling")
+        status = Lang.shared.t(accepted ? "pair.confirming" : "pair.cancelling")
         busy = true
         Task {
             defer { busy = false }
@@ -119,8 +118,8 @@ final class AppStore: ObservableObject {
                 // The decline path errors by design ("pairing cancelled") —
                 // render it as the neutral cancelled line, not a failure.
                 status = accepted
-                    ? String(format: String(localized: "pair.failed"), bayboErrorText(error))
-                    : String(localized: "pair.cancelled")
+                    ? Lang.shared.t("pair.failed", bayboErrorText(error))
+                    : Lang.shared.t("pair.cancelled")
             }
         }
     }
@@ -128,7 +127,7 @@ final class AppStore: ObservableObject {
     /// Gateway-side abort while the confirm screen is up: dismiss it.
     func pairAborted(reason: String) {
         challenge = nil
-        status = String(format: String(localized: "pair.cancelledReason"), reason)
+        status = Lang.shared.t("pair.cancelledReason", reason)
     }
 
     // MARK: - Direct login
@@ -144,11 +143,11 @@ final class AppStore: ObservableObject {
             return nil
         } catch let error as BayboError {
             if case .InvalidToken = error {
-                return String(localized: "direct.invalidToken")
+                return Lang.shared.t("direct.invalidToken")
             }
-            return String(format: String(localized: "direct.failed"), bayboErrorText(error))
+            return Lang.shared.t("direct.failed", bayboErrorText(error))
         } catch {
-            return String(format: String(localized: "direct.failed"), bayboErrorText(error))
+            return Lang.shared.t("direct.failed", bayboErrorText(error))
         }
     }
 
@@ -173,7 +172,7 @@ final class AppStore: ObservableObject {
             route = .chat(sessionId: sessionId)
         } catch {
             route = .landing
-            status = String(format: String(localized: "chat.startFailed"), bayboErrorText(error))
+            status = Lang.shared.t("chat.startFailed", bayboErrorText(error))
         }
     }
 
@@ -218,15 +217,17 @@ private final class PairAbortHandler: PairAbortListener, @unchecked Sendable {
 }
 
 /// The user-facing text of a thrown core error: the stable variants map to
-/// localized strings; prose rides through verbatim.
+/// localized strings; prose rides through verbatim. Main-actor because it
+/// resolves through the live language override.
+@MainActor
 func bayboErrorText(_ error: Error) -> String {
     switch error {
     case BayboError.InvalidToken:
-        return String(localized: "direct.invalidToken")
+        return Lang.shared.t("direct.invalidToken")
     case let BayboError.Other(message):
         return message
     case BayboError.NotBound:
-        return String(localized: "landing.subtitle")
+        return Lang.shared.t("landing.subtitle")
     default:
         return error.localizedDescription
     }

@@ -64,6 +64,35 @@ struct OutlinePillButtonStyle: ButtonStyle {
     }
 }
 
+/// The web base `button`: filled ink pill, regular weight, no case transform —
+/// what multi-button rows (pair confirm's Cancel | Pair) render as.
+struct FilledPillButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(Theme.mono(15))
+            .foregroundStyle(Theme.paper)
+            .padding(.vertical, 13)
+            .padding(.horizontal, 19)
+            .frame(maxWidth: .infinity)
+            .background(Theme.ink, in: Capsule())
+            .opacity(configuration.isPressed ? 0.7 : 1)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+    }
+}
+
+/// The web `.link-btn`: a quiet borderless text button (the direct form's
+/// "← Back").
+struct LinkButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(Theme.mono(13.5))
+            .foregroundStyle(Theme.inkSoft)
+            .padding(.horizontal, 13)
+            .frame(minHeight: 44)
+            .opacity(configuration.isPressed ? 0.6 : 1)
+    }
+}
+
 enum Haptics {
     /// Light tap on primary-CTA presses (the style guide's physical beat).
     static func tap() {

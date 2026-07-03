@@ -11,6 +11,7 @@ import SwiftUI
 ///   gateway's blob cap.
 struct ComposerView: View {
     @ObservedObject var store: ChatStore
+    @ObservedObject private var lang = Lang.shared
     @State private var text = ""
     @State private var staged: [StagedAttachment] = []
     @State private var pickerItem: PhotosPickerItem?
@@ -50,10 +51,10 @@ struct ComposerView: View {
                         .foregroundStyle(Theme.ink)
                         .frame(width: 40, height: 40)
                 }
-                .accessibilityLabel(Text("chat.addImage"))
+                .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.addImage")))
 
                 HStack(alignment: .bottom, spacing: 4) {
-                    TextField("chat.placeholder", text: $text, axis: .vertical)
+                    TextField(lang.t("chat.placeholder"), text: $text, axis: .vertical)
                         .lineLimit(1...6)
                         .font(.system(size: 16))
                         .focused($focused)
@@ -68,7 +69,7 @@ struct ComposerView: View {
                             .foregroundStyle(hasDraft ? Theme.ink : Theme.line)
                     }
                     .disabled(!hasDraft)
-                    .accessibilityLabel(Text("chat.send"))
+                    .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.send")))
                     .padding(.trailing, 6)
                     .padding(.bottom, 6)
                 }
@@ -88,7 +89,7 @@ struct ComposerView: View {
                         .font(.system(size: 18))
                         .foregroundStyle(Theme.inkSoft)
                         .frame(width: 40, height: 40)
-                        .accessibilityLabel(Text("chat.voice"))
+                        .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.voice")))
                 }
             }
         }
@@ -133,7 +134,7 @@ struct ComposerView: View {
                                 .foregroundStyle(Theme.ink)
                                 .background(Circle().fill(Theme.paper))
                         }
-                        .accessibilityLabel(Text("chat.remove"))
+                        .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.remove")))
                         .offset(x: 6, y: -6)
                     }
                 }
@@ -148,21 +149,21 @@ struct ComposerView: View {
             let data: Data
             do {
                 guard let loaded = try await item.loadTransferable(type: Data.self) else {
-                    store.notice = String(localized: "chat.attachFailed")
+                    store.notice = Lang.shared.t("chat.attachFailed")
                     return
                 }
                 data = loaded
             } catch {
                 store.notice = String(
-                    format: String(localized: "chat.sendFailed"), bayboErrorText(error))
+                    format: Lang.shared.t("chat.sendFailed"), bayboErrorText(error))
                 return
             }
             guard data.count <= ChatStore.maxAttachmentBytes else {
-                store.notice = String(localized: "chat.tooLarge")
+                store.notice = Lang.shared.t("chat.tooLarge")
                 return
             }
             guard let image = UIImage(data: data) else {
-                store.notice = String(localized: "chat.attachFailed")
+                store.notice = Lang.shared.t("chat.attachFailed")
                 return
             }
             let stagedItem = StagedAttachment(thumbnail: image, byteCount: data.count)
@@ -174,7 +175,7 @@ struct ComposerView: View {
             } catch {
                 update(stagedItem.id) { $0.state = .error }
                 store.notice = String(
-                    format: String(localized: "chat.sendFailed"), bayboErrorText(error))
+                    format: Lang.shared.t("chat.sendFailed"), bayboErrorText(error))
             }
         }
     }
@@ -186,7 +187,7 @@ struct ComposerView: View {
 
     private func send() {
         if staged.contains(where: { $0.state.isUploading }) {
-            store.notice = String(localized: "chat.waitingUpload")
+            store.notice = Lang.shared.t("chat.waitingUpload")
             return
         }
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
