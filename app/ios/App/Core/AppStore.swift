@@ -308,10 +308,11 @@ final class AppStore: ObservableObject {
     }
 
     private func resetChatStores() async {
-        if let store = chatStores.values.first {
+        let stores = Array(chatStores.values)
+        chatStores.removeAll()
+        for store in stores {
             await store.disconnect()
         }
-        chatStores.removeAll()
     }
 
     /// A fresh binding must not inherit the previous gateway's sessions: wipe
@@ -330,6 +331,14 @@ final class AppStore: ObservableObject {
     /// Log out: tear down the live leg, wipe both credential sets, drop the
     /// local session registry + transcripts, and return to landing.
     func logout() async {
+        guard !busy else { return }
+        busy = true
+        chatPath = []
+        directBound = false
+        landingView = .menu
+        status = nil
+        route = .landing
+        defer { busy = false }
         await resetChatStores()
         do {
             try await Baybo.client.logout()
@@ -338,11 +347,6 @@ final class AppStore: ObservableObject {
             NSLog("baybo: logout: %@", bayboErrorText(error))
         }
         SessionIndex.shared.removeAll()
-        chatPath = []
-        directBound = false
-        landingView = .menu
-        status = nil
-        route = .landing
     }
 }
 

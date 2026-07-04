@@ -37,29 +37,41 @@ struct SettingsScreen: View {
             .padding(.horizontal, 24)
 
             Spacer(minLength: 40)
-
-            Button {
-                confirmLogout = true
-            } label: {
-                Text(verbatim: lang.t("connected.logout"))
-            }
-            .buttonStyle(OutlinePillButtonStyle(color: Theme.err))
-            .disabled(appStore.busy)
-            .padding(.horizontal, 24)
         }
         .padding(.top, Self.topInset)
-        .padding(.bottom, Self.bottomInset)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                logoutButton
+                    .padding(.horizontal, 24)
+            }
+            .padding(.top, 16)
+            .padding(.bottom, Self.bottomInset)
+            .background(Theme.paper)
+        }
         .confirmationDialog(
             Text(verbatim: lang.t("connected.logoutConfirm")),
             isPresented: $confirmLogout, titleVisibility: .visible
         ) {
             Button(role: .destructive) {
+                Haptics.tap()
                 Task { await appStore.logout() }
             } label: {
                 Text(verbatim: lang.t("connected.logout"))
             }
         }
+    }
+
+    private var logoutButton: some View {
+        Button {
+            guard !appStore.busy else { return }
+            Haptics.tap()
+            confirmLogout = true
+        } label: {
+            Text(verbatim: lang.t("connected.logout"))
+        }
+        .buttonStyle(OutlinePillButtonStyle(color: Theme.err))
+        .disabled(appStore.busy)
     }
 
     private func actionRow(

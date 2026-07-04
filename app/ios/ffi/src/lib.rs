@@ -170,11 +170,12 @@ impl BayboClient {
         runtime::run(async move {
             direct::forget(&this.direct).await;
             transport::disconnect(&this.relay).await;
-            // Run both wipes regardless of which errored, then surface the first
+            // Run every wipe regardless of which errored, then surface the first
             // failure.
             let direct_wiped = direct::logout();
             let relay_wiped = relay::forget_pairing();
-            direct_wiped.and(relay_wiped)
+            let marker_wiped = crate::keychain::delete_active_binding();
+            direct_wiped.and(relay_wiped).and(marker_wiped)
         })
         .await
     }

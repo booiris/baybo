@@ -398,6 +398,12 @@ pub fn read_active_binding() -> Result<Option<String>, String> {
     Ok(imp::read_private_blob(ACTIVE_BINDING_ACCOUNT)?.map(|b| String::from_utf8_lossy(&b).into()))
 }
 
+/// Delete the active-binding marker. Logout wipes both credential records, so the
+/// tie-breaker marker should be removed with them.
+pub fn delete_active_binding() -> Result<(), String> {
+    imp::delete_private_blob(ACTIVE_BINDING_ACCOUNT)
+}
+
 /// Delete a device's push key from the shared keychain (the write side is
 /// [`store_push_key`]). Called on unpair so a stale per-device key can't linger.
 pub fn delete_push_key(bid: &str) -> Result<(), String> {
