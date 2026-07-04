@@ -879,6 +879,52 @@ pub enum Frame {
     Pong,
 }
 
+impl Frame {
+    /// Session id a client can use to route this frame into a per-session bucket.
+    /// Returns `None` for connection-global frames. `Messages` returns the first
+    /// message's session id; empty batches route nowhere.
+    pub fn routing_session_id(&self) -> Option<&SessionId> {
+        match self {
+            Frame::Subscribe { session_id, .. }
+            | Frame::Unsubscribe { session_id }
+            | Frame::FetchHistory { session_id, .. }
+            | Frame::HistoryPage { session_id, .. }
+            | Frame::Attachment { session_id, .. }
+            | Frame::AnswerDelta { session_id, .. }
+            | Frame::Reasoning { session_id, .. }
+            | Frame::ToolStarted { session_id, .. }
+            | Frame::ToolCompleted { session_id, .. }
+            | Frame::Status { session_id, .. }
+            | Frame::Notice { session_id, .. }
+            | Frame::TaskList { session_id, .. }
+            | Frame::TurnState { session_id, .. }
+            | Frame::WorkSnapshot { session_id, .. }
+            | Frame::WorkReplay { session_id, .. }
+            | Frame::ApprovalRequested { session_id, .. }
+            | Frame::PendingApprovalsSnapshot { session_id, .. }
+            | Frame::HistoryAppend { session_id, .. }
+            | Frame::HistorySnapshot { session_id, .. }
+            | Frame::SessionUpdated { session_id, .. }
+            | Frame::SessionActivity { session_id, .. } => Some(session_id),
+            Frame::Message(message) => Some(&message.session_id),
+            Frame::Messages { messages } => messages.first().map(|message| &message.session_id),
+            Frame::Register { .. }
+            | Frame::RegisterAck { .. }
+            | Frame::UpdateApnsToken { .. }
+            | Frame::Reset { .. }
+            | Frame::ApprovalResolved { .. }
+            | Frame::ResolveApproval { .. }
+            | Frame::StartBot { .. }
+            | Frame::StopBot { .. }
+            | Frame::BotStatus { .. }
+            | Frame::SlashManifest { .. }
+            | Frame::FoldersChanged { .. }
+            | Frame::Ping
+            | Frame::Pong => None,
+        }
+    }
+}
+
 /// Sparse mutation surface carried on [`Frame::SessionUpdated`].
 /// Every field is independently optional; producers populate only what
 /// changed. Receivers merge present fields onto their local view —
@@ -953,6 +999,76 @@ mod tests {
             token: "deadbeef".into(),
             channel_type: ChannelType::from("slack"),
         }
+    }
+
+    fn sample_message(session_id: &str) -> Message {
+        Message {
+            content: "hi".into(),
+            session_id: session_id.into(),
+            user_id: "u1".into(),
+            channel_type: ChannelType::from("http"),
+            bot_id: String::new(),
+            attachments: Vec::new(),
+            platform_msg_id: String::new(),
+            role: MessageRole::User,
+            ordinal: None,
+        }
+    }
+
+    #[test]
+    fn routing_session_id_reads_direct_session_fields() {
+        let subscribe = Frame::Subscribe {
+            session_id: "sess-x".into(),
+            since_ordinal: None,
+        };
+        assert_eq!(
+            subscribe.routing_session_id().map(|id| id.as_str()),
+            Some("sess-x")
+        );
+
+        let activity = Frame::SessionActivity {
+            session_id: "sess-y".into(),
+            source: ActivityKind::Assistant,
+            at: chrono::Utc::now(),
+        };
+        assert_eq!(
+            activity.routing_session_id().map(|id| id.as_str()),
+            Some("sess-y")
+        );
+    }
+
+    #[test]
+    fn routing_session_id_reads_message_payloads() {
+        let message = Frame::Message(sample_message("sess-message"));
+        assert_eq!(
+            message.routing_session_id().map(|id| id.as_str()),
+            Some("sess-message")
+        );
+
+        let batch = Frame::Messages {
+            messages: vec![sample_message("sess-first"), sample_message("sess-second")],
+        };
+        assert_eq!(
+            batch.routing_session_id().map(|id| id.as_str()),
+            Some("sess-first")
+        );
+
+        let empty_batch = Frame::Messages {
+            messages: Vec::new(),
+        };
+        assert!(empty_batch.routing_session_id().is_none());
+    }
+
+    #[test]
+    fn routing_session_id_ignores_connection_global_frames() {
+        assert!(Frame::Ping.routing_session_id().is_none());
+        assert!(
+            Frame::Reset {
+                reason: "queue reset".into()
+            }
+            .routing_session_id()
+            .is_none()
+        );
     }
 
     #[test]

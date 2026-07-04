@@ -13,21 +13,22 @@
 //!   socket already wrapped as a ready [`Connection`]. This is the only divergent
 //!   step; the retry/rotation/handshake details stay inside each impl.
 //!
-//! Everything else — coalesced reconnect, the connect timeout, tear-down-prior-
-//! handle-on-failure, the 45s inbound-liveness watchdog, local Ping→Pong, fanning
-//! frames to the [`FrameSink`], and sealing outbound user messages — is the one
-//! [`SessionRegistry`] + [`pump`] below, written once.
+//! Everything else — coalesced reconnect, the connect timeout, the 45s inbound-
+//! liveness watchdog, local Ping→Pong, per-session sink fan-out, and sealing
+//! outbound user messages — is the one [`SessionRegistry`] + [`pump`] below,
+//! written once.
 //!
 //! Lifted from the Tauri shell's `transport.rs`; the webview `Channel<Frame>` is
 //! now a [`FrameSink`] callback interface, and the app-wide
 //! `content-disconnected` event is the sink's `on_disconnected` — same contract:
-//! it fires ONLY when the session ends on its own, because deliberate teardown
+//! it fires ONLY when the global leg ends on its own, because deliberate teardown
 //! aborts the pump task before the call runs.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use baybo_mobile_core::{Frame, MobileError, WireAttachment, fetch_history_frame};
+use baybo_mobile_core::{Frame, MobileError, WireAttachment, fetch_history_frame, subscribe_frame};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
@@ -39,8 +40,8 @@ use crate::api::FrameSink;
 /// The concrete client socket both legs dial.
 pub(crate) type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Upper bound on a whole [`SessionRegistry::connect`] (dial + handshake + opening
-/// frames). Without it a server that upgrades then never completes the handshake
+/// Upper bound on a whole [`SessionRegistry::connect`] dial + handshake. Without
+/// it a server that upgrades then never completes the handshake
 /// would wedge `connect` with the `connecting` flag held, deadlocking every later
 /// reconnect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -64,7 +65,7 @@ pub(crate) enum TransportError {
     /// prior live session (see [`TransportError::should_reset_session`]).
     #[error("{0}")]
     Precondition(String),
-    /// No live session to send on / disconnect.
+    /// No subscribed session to send on.
     #[error("no active session")]
     NotConnected,
     /// The live session's send half is gone (the pump exited); the next reconnect
@@ -107,52 +108,51 @@ pub(crate) trait FrameCodec: Send {
     fn decode_inbound(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, TransportError>;
 }
 
-/// Builds a leg's outbound user-message `Frame` (binds the live session id + the
-/// leg's identity: device/ios for relay, web-operator/http for direct). Owned +
-/// `Send` so the pump task holds it without borrowing the transport across the
-/// spawn. Args are `(text, msg_id, attachments)`.
-pub(crate) type UserFrameFn = Box<dyn Fn(&str, &str, Vec<WireAttachment>) -> Frame + Send>;
+/// Builds a leg's outbound user-message `Frame` (binds the target session id +
+/// the leg's identity: device/ios for relay, web-operator/http for direct).
+/// Owned + `Send` so the pump task holds it without borrowing the transport
+/// across the spawn. Args are `(session_id, text, msg_id, attachments)`.
+pub(crate) type UserFrameFn = Box<dyn Fn(&str, &str, &str, Vec<WireAttachment>) -> Frame + Send>;
 
-/// Builds a leg's outbound `Frame::FetchHistory` (binds the live session id). The
-/// gateway answers with a `Frame::HistoryPage` on the same leg, which the pump
-/// streams to the sink like any inbound frame. Args are `(before_ordinal,
-/// limit)`. Identity-agnostic, so both legs use the same builder.
-pub(crate) type HistoryFrameFn = Box<dyn Fn(Option<i64>, Option<u32>) -> Frame + Send>;
-
-/// A live, handshaken leg ready to pump: the socket, its frame codec, the frames
-/// to send immediately (Subscribe [+ APNs for relay]), and the outbound frame
-/// builders. Assembled by [`ChatTransport::establish`].
+/// A live, handshaken leg ready to pump: the socket, its frame codec, best-effort
+/// opening frames (APNs for relay), and the outbound frame builder. The initial
+/// and later `Subscribe` frames are ordinary outbound commands so one socket can
+/// carry many sessions.
 pub(crate) struct Connection {
     pub ws: WsStream,
     pub codec: Box<dyn FrameCodec>,
-    /// Required opening frames (e.g. Subscribe): an encode failure ends the session.
-    pub opening: Vec<Frame>,
     /// Best-effort opening frames (e.g. the relay's APNs token refresh): an encode
     /// failure is skipped, not fatal — a transient failure to refresh push must not
     /// kill an otherwise-healthy session. A send failure is still fatal (socket gone).
     pub opening_best_effort: Vec<Frame>,
     pub user_frame: UserFrameFn,
-    pub history_frame: HistoryFrameFn,
 }
 
 /// Seam 2: a chat leg. `establish` is the only divergent step (dial + handshake +
 /// auth); the rest of the lifecycle is the shared [`SessionRegistry`] below.
 pub(crate) trait ChatTransport: Send + Sync {
-    /// Dial, handshake, and authenticate `session_id`, returning the ready
-    /// [`Connection`]. The explicit `+ Send` on the returned future (RPITIT) keeps
+    /// Dial, handshake, and authenticate the chat leg, returning the ready
+    /// [`Connection`]. `session_id` is a bootstrap hint for transports that need
+    /// per-session credentials to open the socket. The explicit `+ Send` on the
+    /// returned future (RPITIT) keeps
     /// it `Send` through the generic [`SessionRegistry::connect`] so the whole
     /// thing can run on the core runtime — no `async_trait` box needed.
     fn establish(
         &self,
         session_id: &str,
-        since_ordinal: Option<i64>,
     ) -> impl std::future::Future<Output = Result<Connection, TransportError>> + Send;
 }
 
 /// A request handed to the pump task to build + seal + send on the live leg.
 enum OutboundCmd {
+    /// Subscribe this global leg to a session and request forward catch-up.
+    Subscribe {
+        session_id: String,
+        since_ordinal: Option<i64>,
+    },
     /// A user message to send.
     Send {
+        session_id: String,
         text: String,
         msg_id: String,
         attachments: Vec<WireAttachment>,
@@ -160,13 +160,14 @@ enum OutboundCmd {
     /// A backward transcript-history request. The reply (`Frame::HistoryPage`)
     /// arrives later through the normal inbound fan-out, not as a direct response.
     FetchHistory {
+        session_id: String,
         before_ordinal: Option<i64>,
         limit: Option<u32>,
     },
 }
 
-/// The live pump for a session: where to enqueue sends, and the task to abort on
-/// teardown.
+/// The live pump for a binding: where to enqueue commands, and the task to abort
+/// on teardown.
 struct Handle {
     outbound_tx: mpsc::UnboundedSender<OutboundCmd>,
     task: tokio::task::JoinHandle<()>,
@@ -175,44 +176,58 @@ struct Handle {
 /// The pump slot plus a teardown epoch. The epoch fences a slow dial against a
 /// teardown that raced it: [`SessionRegistry::disconnect`] bumps it, and a dial
 /// that snapshotted an older epoch discards its connection instead of
-/// installing an orphan pump (whose `user_frame` binds the pre-teardown session
-/// id, so its sends would silently land in a dead conversation).
+/// installing an orphan pump.
 #[derive(Default)]
 struct HandleSlot {
     handle: Option<Handle>,
     epoch: u64,
 }
 
-/// The single live session for one leg: the pump slot plus the in-flight dial's
-/// session id. Each leg embeds one.
-#[derive(Default)]
+/// The single live chat leg for one binding. The socket itself is global, while
+/// `sinks` maps each subscribed session to the Swift owner that should receive
+/// that session's frames.
 pub(crate) struct SessionRegistry {
     slot: Mutex<HandleSlot>,
-    /// The session id of the dial currently in flight, if any. Concurrent
-    /// connects for the SAME session coalesce (iOS fires several foreground
-    /// signals per resume); a connect for a DIFFERENT session errors so the
-    /// caller takes its failed-dial path and retries once the slot frees —
-    /// a false coalesced `Ok` would report "connected" with no pump serving
-    /// the new session's sink.
-    connecting: parking_lot::Mutex<Option<String>>,
+    connect_lock: Mutex<()>,
+    sinks: Arc<Mutex<HashMap<String, Arc<dyn FrameSink>>>>,
 }
 
-/// Clears [`SessionRegistry::connecting`] on every exit from `connect` (success,
-/// error, or early `?`).
-struct ConnectingGuard<'a>(&'a parking_lot::Mutex<Option<String>>);
-
-impl Drop for ConnectingGuard<'_> {
-    fn drop(&mut self) {
-        *self.0.lock() = None;
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self {
+            slot: Mutex::new(HandleSlot::default()),
+            connect_lock: Mutex::new(()),
+            sinks: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
 impl SessionRegistry {
-    /// Open a session for `session_id`, streaming frames to `sink`. Coalesces
-    /// concurrent same-session dials, bounds the whole establish with
-    /// [`CONNECT_TIMEOUT`], and on any failure tears the prior handle down (so a
-    /// stale pump can't keep accepting sends after a failed reconnect) — unless a
-    /// teardown superseded this dial, which the epoch fence detects.
+    /// Open the binding's global chat leg without subscribing any session. Used
+    /// to warm the relay content leg at app launch so the first chat screen only
+    /// needs to enqueue `Subscribe`.
+    pub(crate) async fn preconnect<T: ChatTransport>(
+        &self,
+        transport: &T,
+        session_hint: &str,
+    ) -> Result<(), TransportError> {
+        if self.has_live_pump().await {
+            return Ok(());
+        }
+
+        let _connect = self.connect_lock.lock().await;
+        if self.has_live_pump().await {
+            return Ok(());
+        }
+
+        self.establish_pump(transport, session_hint, "chat preconnect")
+            .await
+    }
+
+    /// Subscribe `session_id` on the binding's global chat leg, streaming that
+    /// session's frames to `sink`. Concurrent first dials coalesce behind
+    /// `connect_lock`; once a socket is live, this only sends another
+    /// `Subscribe`.
     pub(crate) async fn connect<T: ChatTransport>(
         &self,
         transport: &T,
@@ -220,45 +235,69 @@ impl SessionRegistry {
         since_ordinal: Option<i64>,
         sink: Arc<dyn FrameSink>,
     ) -> Result<(), TransportError> {
-        {
-            let mut connecting = self.connecting.lock();
-            match connecting.as_deref() {
-                Some(in_flight) if in_flight == session_id => {
-                    log::debug!(
-                        "chat connect coalesced with in-flight dial (session={session_id})"
-                    );
-                    return Ok(());
-                }
-                Some(_) => {
-                    return Err(TransportError::Other(
-                        "connection busy with another session".into(),
-                    ));
-                }
-                None => *connecting = Some(session_id.to_string()),
-            }
-        }
-        let _connecting = ConnectingGuard(&self.connecting);
+        self.sinks.lock().await.insert(session_id.to_string(), sink);
 
-        // Snapshot the teardown epoch BEFORE dialing: a disconnect that lands
-        // while we're establishing bumps it, and we must not install then.
+        let subscribe = OutboundCmd::Subscribe {
+            session_id: session_id.to_string(),
+            since_ordinal,
+        };
+        if self.try_enqueue(subscribe).await? {
+            return Ok(());
+        }
+
+        let _connect = self.connect_lock.lock().await;
+        let subscribe = OutboundCmd::Subscribe {
+            session_id: session_id.to_string(),
+            since_ordinal,
+        };
+        if self.try_enqueue(subscribe).await? {
+            return Ok(());
+        }
+
+        self.establish_pump(transport, session_id, "chat connect")
+            .await?;
+
+        let subscribe = OutboundCmd::Subscribe {
+            session_id: session_id.to_string(),
+            since_ordinal,
+        };
+        if self.try_enqueue(subscribe).await? {
+            Ok(())
+        } else {
+            Err(TransportError::SessionClosed)
+        }
+    }
+
+    async fn has_live_pump(&self) -> bool {
+        let mut slot = self.slot.lock().await;
+        let Some(handle) = slot.handle.as_ref() else {
+            return false;
+        };
+        if !handle.outbound_tx.is_closed() && !handle.task.is_finished() {
+            return true;
+        }
+        if let Some(prev) = slot.handle.take() {
+            prev.task.abort();
+        }
+        false
+    }
+
+    async fn establish_pump<T: ChatTransport>(
+        &self,
+        transport: &T,
+        session_hint: &str,
+        operation: &str,
+    ) -> Result<(), TransportError> {
         let dial_epoch = self.slot.lock().await.epoch;
 
-        let conn = match tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            transport.establish(session_id, since_ordinal),
-        )
-        .await
+        let conn = match tokio::time::timeout(CONNECT_TIMEOUT, transport.establish(session_hint))
+            .await
         {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
-                // Tear the prior pump down only for a dead-leg failure, so a stale
-                // pump can't keep accepting sends after the leg went down. A
-                // precondition failure (e.g. a transient keychain read on reconnect)
-                // leaves a healthy session alone. Epoch-checked so a late-failing
-                // stale dial can't kill a pump installed after a teardown.
                 let reset = e.should_reset_session();
                 log::warn!(
-                    "chat connect failed: {e} (session={session_id} reset_prior_session={reset})"
+                    "{operation} failed: {e} (session_hint={session_hint} reset_prior_session={reset})"
                 );
                 if reset {
                     self.abort_if_epoch(dial_epoch).await;
@@ -267,7 +306,7 @@ impl SessionRegistry {
             }
             Err(_) => {
                 log::warn!(
-                    "chat connect timed out after {}s (session={session_id})",
+                    "{operation} timed out after {}s (session_hint={session_hint})",
                     CONNECT_TIMEOUT.as_secs()
                 );
                 self.abort_if_epoch(dial_epoch).await;
@@ -277,24 +316,37 @@ impl SessionRegistry {
 
         let mut slot = self.slot.lock().await;
         if slot.epoch != dial_epoch {
-            // A teardown raced this dial: close the fresh socket instead of
-            // installing an orphan pump. The caller's own supersede guard
-            // swallows the error.
             drop(slot);
             let mut ws = conn.ws;
             let _ = ws.close(None).await;
             log::info!(
-                "chat connect discarded: superseded by a teardown mid-dial (session={session_id})"
+                "{operation} discarded: superseded by a teardown mid-dial (session_hint={session_hint})"
             );
             return Err(TransportError::SessionClosed);
         }
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(pump(conn, session_id.to_string(), sink, outbound_rx));
+        let task = tokio::spawn(pump(conn, self.sinks.clone(), outbound_rx));
         if let Some(prev) = slot.handle.take() {
             prev.task.abort();
         }
         slot.handle = Some(Handle { outbound_tx, task });
         Ok(())
+    }
+
+    async fn try_enqueue(&self, cmd: OutboundCmd) -> Result<bool, TransportError> {
+        let mut slot = self.slot.lock().await;
+        let Some(handle) = slot.handle.as_ref() else {
+            return Ok(false);
+        };
+        match handle.outbound_tx.send(cmd) {
+            Ok(()) => Ok(true),
+            Err(_) => {
+                if let Some(prev) = slot.handle.take() {
+                    prev.task.abort();
+                }
+                Ok(false)
+            }
+        }
     }
 
     /// Abort the live pump only if no teardown/install happened since
@@ -311,20 +363,27 @@ impl SessionRegistry {
     /// Queue a user message on the live session for the pump to build + seal + send.
     pub(crate) async fn send(
         &self,
+        session_id: String,
         text: String,
         msg_id: String,
         attachments: Vec<WireAttachment>,
     ) -> Result<(), TransportError> {
-        let guard = self.slot.lock().await;
-        let handle = guard.handle.as_ref().ok_or(TransportError::NotConnected)?;
-        handle
-            .outbound_tx
-            .send(OutboundCmd::Send {
+        if !self.sinks.lock().await.contains_key(&session_id) {
+            return Err(TransportError::NotConnected);
+        }
+        if self
+            .try_enqueue(OutboundCmd::Send {
+                session_id,
                 text,
                 msg_id,
                 attachments,
             })
-            .map_err(|_| TransportError::SessionClosed)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(TransportError::NotConnected)
+        }
     }
 
     /// Queue a transcript-history request on the live session. The reply
@@ -333,18 +392,25 @@ impl SessionRegistry {
     /// switch, mirroring how `Subscribe` catch-up replays arrive).
     pub(crate) async fn fetch_history(
         &self,
+        session_id: String,
         before_ordinal: Option<i64>,
         limit: Option<u32>,
     ) -> Result<(), TransportError> {
-        let guard = self.slot.lock().await;
-        let handle = guard.handle.as_ref().ok_or(TransportError::NotConnected)?;
-        handle
-            .outbound_tx
-            .send(OutboundCmd::FetchHistory {
+        if !self.sinks.lock().await.contains_key(&session_id) {
+            return Err(TransportError::NotConnected);
+        }
+        if self
+            .try_enqueue(OutboundCmd::FetchHistory {
+                session_id,
                 before_ordinal,
                 limit,
             })
-            .map_err(|_| TransportError::SessionClosed)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(TransportError::NotConnected)
+        }
     }
 
     /// Tear down the live pump (if any) and fence out any dial in flight: the
@@ -358,6 +424,8 @@ impl SessionRegistry {
         if let Some(prev) = slot.handle.take() {
             prev.task.abort();
         }
+        drop(slot);
+        self.sinks.lock().await.clear();
     }
 }
 
@@ -371,14 +439,17 @@ pub(crate) trait SessionLeg: ChatTransport {
     fn registry(&self) -> &SessionRegistry;
 }
 
-/// The `FetchHistory` frame builder both legs use. It binds only the session id
-/// (identity-agnostic — unlike the user-message builder, which encodes the leg's
-/// device/web identity), so relay and direct share this verbatim.
-pub(crate) fn session_history_frame(session_id: String) -> HistoryFrameFn {
-    Box::new(move |before_ordinal, limit| fetch_history_frame(&session_id, before_ordinal, limit))
+/// Open `leg`'s global chat connection without subscribing any session.
+/// Stringifies the error for the FFI boundary.
+pub(crate) async fn preconnect<L: SessionLeg>(leg: &L, session_hint: String) -> Result<(), String> {
+    leg.registry()
+        .preconnect(leg, &session_hint)
+        .await
+        .map_err(|e| e.to_string())
 }
 
-/// Open `leg`'s chat session for `session_id`, streaming frames to `sink`.
+/// Subscribe `leg`'s global chat connection to `session_id`, streaming frames to
+/// `sink`.
 /// Stringifies the error for the FFI boundary (the leg-specific establish prose,
 /// including the `invalid_token` code, rides through verbatim).
 pub(crate) async fn connect<L: SessionLeg>(
@@ -396,12 +467,13 @@ pub(crate) async fn connect<L: SessionLeg>(
 /// Queue a user message on `leg`'s live session.
 pub(crate) async fn send<L: SessionLeg>(
     leg: &L,
+    session_id: String,
     text: String,
     msg_id: String,
     attachments: Vec<WireAttachment>,
 ) -> Result<(), String> {
     leg.registry()
-        .send(text, msg_id, attachments)
+        .send(session_id, text, msg_id, attachments)
         .await
         .map_err(|e| e.to_string())
 }
@@ -411,11 +483,12 @@ pub(crate) async fn send<L: SessionLeg>(
 /// the request is enqueued, not the page.
 pub(crate) async fn fetch_history<L: SessionLeg>(
     leg: &L,
+    session_id: String,
     before_ordinal: Option<i64>,
     limit: Option<u32>,
 ) -> Result<(), String> {
     leg.registry()
-        .fetch_history(before_ordinal, limit)
+        .fetch_history(session_id, before_ordinal, limit)
         .await
         .map_err(|e| e.to_string())
 }
@@ -427,66 +500,45 @@ pub(crate) async fn disconnect<L: SessionLeg>(leg: &L) {
     leg.registry().disconnect().await;
 }
 
-/// Own the socket for the session's lifetime: send the opening frames, then fan
-/// inbound frames to the sink and seal outbound user messages. The codec hides
-/// whether bytes are Noise-sealed (relay) or raw msgpack (direct), so this body is
-/// identical for both legs.
+/// Own the socket for the binding's lifetime: send best-effort opening frames,
+/// then fan inbound frames to per-session sinks and seal outbound user messages.
+/// The codec hides whether bytes are Noise-sealed (relay) or raw msgpack
+/// (direct), so this body is identical for both legs.
 ///
 /// Returning means the session ended on its own, so the task calls
 /// [`FrameSink::on_disconnected`] last. A deliberate teardown aborts this task
 /// before the call runs, so it fires only on an unsolicited drop.
 async fn pump(
     conn: Connection,
-    session_id: String,
-    sink: Arc<dyn FrameSink>,
+    sinks: Arc<Mutex<HashMap<String, Arc<dyn FrameSink>>>>,
     outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
 ) {
-    run_pump(conn, &session_id, sink.as_ref(), outbound_rx).await;
-    sink.on_disconnected(session_id);
+    run_pump(conn, sinks.clone(), outbound_rx).await;
+    let sinks: Vec<(String, Arc<dyn FrameSink>)> = sinks
+        .lock()
+        .await
+        .iter()
+        .map(|(session_id, sink)| (session_id.clone(), sink.clone()))
+        .collect();
+    for (session_id, sink) in sinks {
+        sink.on_disconnected(session_id.clone());
+    }
 }
 
-/// The pump body: send the opening frames, then fan inbound frames to the sink
-/// and seal outbound user messages until the session ends for any reason.
-/// `session_id` is log context only — every exit path records its cause here,
-/// because the disconnected callback above carries only the session id.
+/// The pump body: send opening frames, then fan inbound frames to the right
+/// session sink and seal outbound commands until the leg ends for any reason.
 async fn run_pump(
     conn: Connection,
-    session_id: &str,
-    sink: &dyn FrameSink,
+    sinks: Arc<Mutex<HashMap<String, Arc<dyn FrameSink>>>>,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
 ) {
     let Connection {
         ws,
         mut codec,
-        opening,
         opening_best_effort,
         user_frame,
-        history_frame,
     } = conn;
     let (mut sink_ws, mut stream) = ws.split();
-
-    // Required opening frames (Subscribe): an encode failure leaves the session
-    // unusable, so bail.
-    for frame in &opening {
-        match codec.encode_outbound(frame) {
-            Ok(messages) => {
-                for bytes in messages {
-                    if let Err(e) = sink_ws.send(Message::Binary(bytes)).await {
-                        log::warn!(
-                            "chat session start failed: opening frame send failed (subscribe, session={session_id}): {e}"
-                        );
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "chat session start failed: opening frame encode failed (subscribe, session={session_id}): {e}"
-                );
-                return;
-            }
-        }
-    }
 
     // Best-effort opening frames (the relay's APNs token refresh): skip on an encode
     // failure rather than kill an otherwise-healthy session. A send failure is still
@@ -497,7 +549,7 @@ async fn run_pump(
                 for bytes in messages {
                     if let Err(e) = sink_ws.send(Message::Binary(bytes)).await {
                         log::warn!(
-                            "chat session start failed: opening frame send failed (apns_refresh, session={session_id}): {e}"
+                            "chat connection start failed: opening frame send failed (apns_refresh): {e}"
                         );
                         return;
                     }
@@ -505,7 +557,7 @@ async fn run_pump(
             }
             Err(e) => {
                 log::warn!(
-                    "opening frame skipped: encode failed (apns_refresh, session={session_id}; push binding may go stale): {e}"
+                    "opening frame skipped: encode failed (apns_refresh; push binding may go stale): {e}"
                 );
             }
         }
@@ -528,7 +580,7 @@ async fn run_pump(
                             Ok(frames) => frames,
                             Err(e) => {
                                 log::warn!(
-                                    "chat session ended: inbound frame decode failed (session={session_id}; a relay noise desync is unrecoverable): {e}"
+                                    "chat connection ended: inbound frame decode failed (a relay noise desync is unrecoverable): {e}"
                                 );
                                 break 'session;
                             }
@@ -546,38 +598,33 @@ async fn run_pump(
                             // The sink is a foreign callback and can't signal a
                             // dropped consumer (unlike the old webview channel);
                             // session lifetime is owned by explicit disconnects.
-                            match serde_json::to_string(&frame) {
-                                Ok(json) => sink.on_frame(json),
-                                Err(e) => log::warn!(
-                                    "inbound frame dropped: JSON serialize failed (session={session_id}): {e}"
-                                ),
-                            }
+                            dispatch_inbound_frame(&sinks, frame).await;
                         }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                     Some(Ok(Message::Close(frame))) => {
                         match frame {
                             Some(cf) => log::info!(
-                                "chat session ended: socket closed by peer (code={} reason={:?}, session={session_id})",
+                                "chat connection ended: socket closed by peer (code={} reason={:?})",
                                 u16::from(cf.code),
                                 cf.reason
                             ),
                             None => log::info!(
-                                "chat session ended: socket closed by peer (no close frame body, session={session_id})"
+                                "chat connection ended: socket closed by peer (no close frame body)"
                             ),
                         }
                         break 'session;
                     }
                     None => {
                         log::info!(
-                            "chat session ended: socket stream ended (session={session_id})"
+                            "chat connection ended: socket stream ended"
                         );
                         break 'session;
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
                         log::info!(
-                            "chat session ended: socket read error (session={session_id}): {e}"
+                            "chat connection ended: socket read error: {e}"
                         );
                         break 'session;
                     }
@@ -588,16 +635,25 @@ async fn run_pump(
                 // encode + chunk + send path (the codec hides Noise vs raw msgpack).
                 // `cmd_kind` survives for the log lines below (never the text).
                 let (frame, cmd_kind) = match cmd {
-                    Some(OutboundCmd::Send { text, msg_id, attachments }) => {
-                        let frame = user_frame(&text, &msg_id, attachments);
-                        (frame, format!("send msg_id={msg_id}"))
+                    Some(OutboundCmd::Subscribe { session_id, since_ordinal }) => {
+                        (
+                            subscribe_frame(&session_id, since_ordinal),
+                            format!("subscribe session={session_id}"),
+                        )
                     }
-                    Some(OutboundCmd::FetchHistory { before_ordinal, limit }) => {
-                        (history_frame(before_ordinal, limit), "fetch_history".to_string())
+                    Some(OutboundCmd::Send { session_id, text, msg_id, attachments }) => {
+                        let frame = user_frame(&session_id, &text, &msg_id, attachments);
+                        (frame, format!("send session={session_id} msg_id={msg_id}"))
+                    }
+                    Some(OutboundCmd::FetchHistory { session_id, before_ordinal, limit }) => {
+                        (
+                            fetch_history_frame(&session_id, before_ordinal, limit),
+                            format!("fetch_history session={session_id}"),
+                        )
                     }
                     None => {
                         log::debug!(
-                            "chat session ended: outbound command channel closed (session={session_id})"
+                            "chat connection ended: outbound command channel closed"
                         );
                         break 'session;
                     }
@@ -607,7 +663,7 @@ async fn run_pump(
                         for bytes in messages {
                             if let Err(e) = sink_ws.send(Message::Binary(bytes)).await {
                                 log::warn!(
-                                    "chat session ended: outbound send failed ({cmd_kind}, session={session_id}): {e}"
+                                    "chat connection ended: outbound send failed ({cmd_kind}): {e}"
                                 );
                                 break 'session;
                             }
@@ -615,7 +671,7 @@ async fn run_pump(
                     }
                     Err(e) => {
                         log::warn!(
-                            "outbound frame seal failed; {cmd_kind} dropped, session stays up (session={session_id}): {e}"
+                            "outbound frame seal failed; {cmd_kind} dropped, connection stays up: {e}"
                         );
                         continue;
                     }
@@ -623,7 +679,7 @@ async fn run_pump(
             }
             _ = &mut liveness => {
                 log::info!(
-                    "chat session ended: inbound liveness timeout after {}s (socket presumed dead, e.g. iOS background freeze; session={session_id})",
+                    "chat connection ended: inbound liveness timeout after {}s (socket presumed dead, e.g. iOS background freeze)",
                     INBOUND_LIVENESS_TIMEOUT.as_secs()
                 );
                 break 'session;
@@ -631,6 +687,32 @@ async fn run_pump(
         }
     }
     let _ = sink_ws.close().await;
+}
+
+async fn dispatch_inbound_frame(sinks: &Mutex<HashMap<String, Arc<dyn FrameSink>>>, frame: Frame) {
+    let target = frame
+        .routing_session_id()
+        .map(|session_id| session_id.as_str().to_owned());
+    let json = match serde_json::to_string(&frame) {
+        Ok(json) => json,
+        Err(e) => {
+            log::warn!("inbound frame dropped: JSON serialize failed: {e}");
+            return;
+        }
+    };
+    if let Some(session_id) = target {
+        let sink = sinks.lock().await.get(&session_id).cloned();
+        if let Some(sink) = sink {
+            sink.on_frame(json);
+        } else {
+            log::debug!("inbound frame dropped: no sink for session {session_id}");
+        }
+    } else {
+        let sinks: Vec<Arc<dyn FrameSink>> = sinks.lock().await.values().cloned().collect();
+        for sink in sinks {
+            sink.on_frame(json.clone());
+        }
+    }
 }
 
 /// Read the next binary WS message (skipping ping/pong) — used by both legs'

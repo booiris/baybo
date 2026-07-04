@@ -11,8 +11,7 @@
 //! token problem (the token is checked at the upgrade) — its reason is surfaced.
 
 use baybo_mobile_core::{
-    Frame, MobileError, decode, encode, register_http_frame, subscribe_frame,
-    web_user_message_frame,
+    Frame, MobileError, decode, encode, register_http_frame, web_user_message_frame,
 };
 use futures_util::SinkExt;
 use tokio::sync::Mutex;
@@ -24,7 +23,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use super::rest;
 use crate::transport::{
     ChatTransport, Connection, FrameCodec, SessionLeg, SessionRegistry, TransportError,
-    UserFrameFn, WsStream, recv_binary, session_history_frame,
+    UserFrameFn, WsStream, recv_binary,
 };
 
 /// The direct leg's state: the shared session registry plus the current session
@@ -64,7 +63,6 @@ impl ChatTransport for DirectSessions {
     fn establish(
         &self,
         session_id: &str,
-        since_ordinal: Option<i64>,
     ) -> impl std::future::Future<Output = Result<Connection, TransportError>> + Send {
         let session_id = session_id.to_string();
         async move {
@@ -79,25 +77,18 @@ impl ChatTransport for DirectSessions {
             let ws = self.establish_ws(&creds, &session_id).await?;
 
             let codec: Box<dyn FrameCodec> = Box::new(DirectCodec);
-            let opening = vec![subscribe_frame(&session_id, since_ordinal)];
 
             // Direct user messages register as a web client (`web-operator` +
             // `channel_type=http`).
-            let sid = session_id.clone();
-            let user_frame: UserFrameFn = Box::new(move |text, msg_id, attachments| {
-                web_user_message_frame(&sid, text, msg_id, attachments)
+            let user_frame: UserFrameFn = Box::new(move |session_id, text, msg_id, attachments| {
+                web_user_message_frame(session_id, text, msg_id, attachments)
             });
 
-            // History requests bind only the session id (identity-agnostic); the
-            // same `/v1/channel-ws` leg answers `FetchHistory`, so recovery stays
-            // transport-agnostic.
             Ok(Connection {
                 ws,
                 codec,
-                opening,
                 opening_best_effort: Vec::new(),
                 user_frame,
-                history_frame: session_history_frame(session_id),
             })
         }
     }

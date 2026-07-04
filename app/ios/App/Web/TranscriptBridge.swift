@@ -31,7 +31,15 @@ final class TranscriptBridge: NSObject, ObservableObject {
     init(store: ChatStore) {
         self.store = store
         super.init()
-        store.bridge = self
+        attach()
+    }
+
+    func attach() {
+        store?.attachBridge(self)
+    }
+
+    func detach() {
+        store?.detachBridge(self)
     }
 
     // MARK: - Native → web

@@ -6,7 +6,7 @@ import SwiftUI
 /// Contract preserved from the web implementation:
 /// * `offline` has exactly one trigger: a failed dial. An unsolicited pump
 ///   death (`onDisconnected`) flips back to `connecting` and schedules a
-///   backoff redial; deliberate teardown never fires the callback.
+///   backoff redial; deliberate disconnect never fires the callback.
 /// * Foreground reconnects are debounced (400ms) and coalesce with the dial
 ///   already in flight (the core's registry also coalesces).
 /// * A dial generation guards late callbacks from a superseded sink.
@@ -41,16 +41,18 @@ final class ChatStore: ObservableObject {
     private(set) var lastOrdinal: Int64?
 
     /// Accepted floor: sinks below this are muted. Advanced when a dial
-    /// actually REPLACES the pump (success) or on teardown — NOT at dial start,
-    /// so the still-live prior pump keeps rendering through the redial window
-    /// (streamed deltas aren't durable rows; dropping them leaves holes).
+    /// actually REPLACES the pump (success) or on deliberate disconnect — NOT
+    /// at dial start, so the still-live prior pump keeps rendering through the
+    /// redial window (streamed deltas aren't durable rows; dropping them leaves
+    /// holes).
     private var generation = 0
     /// Last generation handed to a dial's sink.
     private var issuedGeneration = 0
     private var retryTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
     private var connectInFlight = false
-    weak var bridge: TranscriptBridge?
+    private weak var bridge: TranscriptBridge?
+    private var bufferedFrames: [String] = []
 
     init(sessionId: String) {
         self.sessionId = sessionId
@@ -64,10 +66,19 @@ final class ChatStore: ObservableObject {
 
     // MARK: - Connection lifecycle
 
+    func connectIfNeeded() {
+        guard connState != .connected else { return }
+        connect()
+    }
+
     func connect() {
         guard !connectInFlight else { return }
+        retryTask?.cancel()
+        retryTask = nil
         connectInFlight = true
-        connState = .connecting
+        if connState != .connected {
+            connState = .connecting
+        }
         // A redial supersedes any lingering transient notice (old contract).
         notice = nil
         issuedGeneration += 1
@@ -80,8 +91,8 @@ final class ChatStore: ObservableObject {
                     sinceOrdinal: lastOrdinal,
                     sink: Sink(store: self, generation: gen)
                 )
-                guard gen >= generation else { return }  // superseded by teardown
-                // The registry swapped pumps; only NOW mute the old sink.
+                guard gen >= generation else { return }  // superseded by disconnect
+                // The subscribe is now accepted; only NOW mute older sinks.
                 generation = gen
                 connEpoch += 1
                 connState = .connected
@@ -122,19 +133,77 @@ final class ChatStore: ObservableObject {
         scheduleRetry()
     }
 
-    /// Leaving the chat screen: cancel timers and tear the live pump down
-    /// (deliberate teardown — the disconnected callback must NOT fire; the
-    /// registry's epoch fence also discards any dial still in flight).
-    func teardown() {
+    /// Binding teardown (logout/rebind): cancel timers and drop the global pump
+    /// deliberately, so the disconnected callback does not fire.
+    func disconnect() async {
         retryTask?.cancel()
+        retryTask = nil
         debounceTask?.cancel()
+        debounceTask = nil
         // Mute every sink, including one handed to a dial still in flight.
         issuedGeneration += 1
         generation = issuedGeneration
-        Task {
-            await Baybo.client.chatDisconnect()
+        connState = .connecting
+        await Baybo.client.chatDisconnect()
+    }
+
+    // MARK: - Bridge lifecycle
+
+    func attachBridge(_ bridge: TranscriptBridge) {
+        self.bridge = bridge
+        flushBufferedFrames(to: bridge)
+    }
+
+    func detachBridge(_ bridge: TranscriptBridge) {
+        if self.bridge === bridge {
+            self.bridge = nil
         }
     }
+
+    private func pushFrame(_ frameJson: String) {
+        advanceLastOrdinal(fromFrameJson: frameJson)
+        if let bridge {
+            bridge.pushFrame(frameJson)
+        } else {
+            bufferedFrames.append(frameJson)
+        }
+    }
+
+    private func advanceLastOrdinal(fromFrameJson frameJson: String) {
+        guard let data = frameJson.data(using: .utf8),
+            let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return }
+        if let ordinal = (frame["ordinal"] as? NSNumber)?.int64Value {
+            noteDurableOrdinal(ordinal)
+        }
+        if let newest = (frame["newest_ordinal"] as? NSNumber)?.int64Value {
+            noteDurableOrdinal(newest)
+        }
+    }
+
+    private func noteDurableOrdinal(_ ordinal: Int64) {
+        guard lastOrdinal == nil || ordinal > (lastOrdinal ?? 0) else { return }
+        lastOrdinal = ordinal
+    }
+
+    private func flushBufferedFrames(to bridge: TranscriptBridge) {
+        guard !bufferedFrames.isEmpty else { return }
+        let frames = bufferedFrames
+        bufferedFrames.removeAll()
+        for frame in frames {
+            bridge.pushFrame(frame)
+        }
+    }
+
+    #if DEBUG
+        func pushDemoUserSent(msgId: String, text: String) {
+            bridge?.userSent(msgId: msgId, text: text, attachments: [])
+        }
+
+        func pushDemoFrame(_ frameJson: String) {
+            pushFrame(frameJson)
+        }
+    #endif
 
     // MARK: - Sending
 
@@ -147,7 +216,7 @@ final class ChatStore: ObservableObject {
         Task {
             do {
                 try await Baybo.client.chatSend(
-                    text: text, msgId: msgId, attachments: attachments)
+                    sessionId: sessionId, text: text, msgId: msgId, attachments: attachments)
             } catch {
                 notice = String(
                     format: Lang.shared.t("chat.sendFailed"), bayboErrorText(error))
@@ -165,7 +234,7 @@ final class ChatStore: ObservableObject {
         Task {
             do {
                 try await Baybo.client.chatFetchHistory(
-                    beforeOrdinal: beforeOrdinal, limit: limit)
+                    sessionId: sessionId, beforeOrdinal: beforeOrdinal, limit: limit)
             } catch {
                 NSLog("baybo: fetchHistory: %@", bayboErrorText(error))
                 // The web bundle's paging/reset guards armed for this request
@@ -178,7 +247,7 @@ final class ChatStore: ObservableObject {
                 if let data = try? JSONSerialization.data(withJSONObject: payload),
                     let json = String(data: data, encoding: .utf8)
                 {
-                    bridge?.pushFrame(json)
+                    pushFrame(json)
                 }
             }
         }
@@ -231,8 +300,8 @@ final class ChatStore: ObservableObject {
         func onFrame(frameJson: String) {
             DispatchQueue.main.async { [weak store, generation] in
                 MainActor.assumeIsolated {
-                    guard let store, generation == store.generation else { return }
-                    store.bridge?.pushFrame(frameJson)
+                    guard let store, generation >= store.generation else { return }
+                    store.pushFrame(frameJson)
                 }
             }
         }

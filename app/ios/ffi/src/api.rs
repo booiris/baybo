@@ -167,9 +167,10 @@ impl From<AttachmentRef> for baybo_mobile_core::WireAttachment {
     }
 }
 
-/// Where a live chat session's frames land. One sink per `chat_connect`; calls
-/// arrive on the core's tokio workers, so the Swift implementation must be
-/// thread-safe (hop to the main actor before touching UI).
+/// Where a subscribed chat session's frames land. The binding owns one global
+/// chat leg; each `chat_connect` registers/replaces the sink for that
+/// `session_id`. Calls arrive on the core's tokio workers, so the Swift
+/// implementation must be thread-safe (hop to the main actor before touching UI).
 #[uniffi::export(with_foreign)]
 pub trait FrameSink: Send + Sync {
     /// One inbound `wire::Frame`, serialized as JSON (the same shape the web
@@ -177,10 +178,10 @@ pub trait FrameSink: Send + Sync {
     /// surfaces here.
     fn on_frame(&self, frame_json: String);
 
-    /// The session ended ON ITS OWN (peer closed, liveness watchdog, Noise
-    /// desync). Deliberate teardown — a fresh connect, `chat_disconnect`,
-    /// `logout` — aborts the pump before this fires, so it signals only
-    /// unsolicited death; the owner reconnects with backoff.
+    /// The global chat leg ended ON ITS OWN (peer closed, liveness watchdog,
+    /// Noise desync). Deliberate teardown — `chat_disconnect`, `logout` —
+    /// aborts the pump before this fires, so it signals only unsolicited death;
+    /// every subscribed owner reconnects with backoff.
     fn on_disconnected(&self, session_id: String);
 }
 

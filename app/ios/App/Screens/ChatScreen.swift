@@ -6,14 +6,12 @@ import SwiftUI
 /// moves the dock and the webview resizes; the web bundle's ResizeObserver
 /// holds the newest edge through that resize.
 struct ChatScreen: View {
-    @StateObject private var store: ChatStore
+    @ObservedObject private var store: ChatStore
     @StateObject private var bridge: TranscriptBridge
-    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismiss) private var dismiss
 
-    init(sessionId: String) {
-        let store = ChatStore(sessionId: sessionId)
-        _store = StateObject(wrappedValue: store)
+    init(store: ChatStore) {
+        _store = ObservedObject(wrappedValue: store)
         _bridge = StateObject(wrappedValue: TranscriptBridge(store: store))
     }
 
@@ -75,8 +73,9 @@ struct ChatScreen: View {
         }
         .background(Theme.paper)
         .onAppear {
+            bridge.attach()
             SessionIndex.shared.touch(sessionId: store.sessionId)
-            store.connect()
+            store.connectIfNeeded()
             #if DEBUG
                 store.startDemoFramesIfRequested()
                 bridge.startDemoJumpIfRequested()
@@ -84,12 +83,7 @@ struct ChatScreen: View {
             #endif
         }
         .onDisappear {
-            store.teardown()
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
-                store.scheduleReconnect()
-            }
+            bridge.detach()
         }
     }
 

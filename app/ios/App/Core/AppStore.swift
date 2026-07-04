@@ -36,9 +36,11 @@ final class AppStore: ObservableObject {
     @Published private(set) var directBound = false
 
     private var restoring = false
+    private var relayPreconnectInFlight = false
     /// A push-notification tap that arrived before the launch restore resolved
     /// the route; consumed once home is up.
     private var pendingPushSession: String?
+    private var chatStores: [String: ChatStore] = [:]
 
     init() {
         AppStore.shared = self
@@ -79,6 +81,8 @@ final class AppStore: ObservableObject {
             }
             if directBound {
                 await registerPushBestEffort()
+            } else if paired != nil {
+                preconnectRelayBestEffort()
             }
             route = .home
             consumePendingPushRoute()
@@ -86,19 +90,38 @@ final class AppStore: ObservableObject {
     }
 
     /// Foreground hook (scenePhase → .active): re-arm APNs registration while
-    /// no token landed, and refresh the direct push binding (a token can arrive
-    /// seconds after launch; the binding needs re-asserting after relaunch).
+    /// no token landed, refresh the direct push binding or warm the relay leg,
+    /// and re-subscribe cached chat stores so catch-up does not wait for a
+    /// screen to reappear.
     func didBecomeActive() {
         if !AppDelegate.hasToken {
             AppDelegate.registerForPush()
         }
         if directBound {
             Task { await registerPushBestEffort() }
+        } else if Baybo.client.pairedDevice() != nil {
+            preconnectRelayBestEffort()
+        }
+        for store in chatStores.values {
+            store.scheduleReconnect()
         }
     }
 
     private func registerPushBestEffort() async {
         _ = try? await Baybo.client.registerPush()
+    }
+
+    private func preconnectRelayBestEffort() {
+        guard !relayPreconnectInFlight else { return }
+        relayPreconnectInFlight = true
+        Task { @MainActor in
+            defer { relayPreconnectInFlight = false }
+            do {
+                try await Baybo.client.relayPreconnect()
+            } catch {
+                NSLog("baybo: relay preconnect: %@", String(describing: error))
+            }
+        }
     }
 
     // MARK: - Scan-to-pair
@@ -143,7 +166,7 @@ final class AppStore: ObservableObject {
                 self.challenge = nil
                 status = nil
                 directBound = false
-                enterHomeFreshBinding()
+                await enterHomeFreshBinding()
             } catch {
                 self.challenge = nil
                 // The decline path errors by design ("pairing cancelled") —
@@ -170,7 +193,7 @@ final class AppStore: ObservableObject {
             _ = try await Baybo.client.directLogin(baseUrl: baseUrl, token: token)
             directBound = true
             await registerPushBestEffort()
-            enterHomeFreshBinding()
+            await enterHomeFreshBinding()
             return nil
         } catch let error as BayboError {
             if case .InvalidToken = error {
@@ -184,9 +207,20 @@ final class AppStore: ObservableObject {
 
     // MARK: - Chat navigation
 
+    func chatStore(for sessionId: String) -> ChatStore {
+        if let store = chatStores[sessionId] {
+            return store
+        }
+        let store = ChatStore(sessionId: sessionId)
+        chatStores[sessionId] = store
+        return store
+    }
+
     /// Open an existing session from the list.
     func openSession(_ sessionId: String) {
-        chatPath = [sessionId]
+        Task {
+            await activateSession(sessionId)
+        }
     }
 
     /// Compose: mint a session on the active binding's leg and enter it.
@@ -197,7 +231,7 @@ final class AppStore: ObservableObject {
         do {
             let sessionId = try await Baybo.client.chatCreateSession()
             SessionIndex.shared.touch(sessionId: sessionId)
-            chatPath = [sessionId]
+            await activateSession(sessionId)
             return nil
         } catch {
             return Lang.shared.t("chat.startFailed", bayboErrorText(error))
@@ -212,8 +246,9 @@ final class AppStore: ObservableObject {
             pendingPushSession = sessionId
             return
         }
-        SessionIndex.shared.touch(sessionId: sessionId)
-        chatPath = [sessionId]
+        Task {
+            await activateSession(sessionId)
+        }
     }
 
     private func consumePendingPushRoute() {
@@ -223,18 +258,39 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Select the foreground session. The FFI transport keeps one global chat
+    /// leg per binding; each opened session subscribes on that leg and keeps its
+    /// sink registered for offscreen buffering.
+    private func activateSession(_ sessionId: String) async {
+        SessionIndex.shared.touch(sessionId: sessionId)
+        _ = chatStore(for: sessionId)
+        chatPath = [sessionId]
+    }
+
+    private func resetChatStores() async {
+        if let store = chatStores.values.first {
+            await store.disconnect()
+        }
+        chatStores.removeAll()
+    }
+
     /// A fresh binding must not inherit the previous gateway's sessions: wipe
     /// the local registry + transcript mirrors, then land on the (empty) list.
     /// On direct the REST refresh repopulates it immediately.
-    private func enterHomeFreshBinding() {
+    private func enterHomeFreshBinding() async {
+        await resetChatStores()
         SessionIndex.shared.removeAll()
         chatPath = []
         route = .home
+        if !directBound {
+            preconnectRelayBestEffort()
+        }
     }
 
     /// Log out: tear down the live leg, wipe both credential sets, drop the
     /// local session registry + transcripts, and return to landing.
     func logout() async {
+        await resetChatStores()
         do {
             try await Baybo.client.logout()
         } catch {

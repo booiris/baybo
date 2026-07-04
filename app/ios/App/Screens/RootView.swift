@@ -27,8 +27,8 @@ struct RootView: View {
                     ChatListScreen()
                         .toolbar(.hidden, for: .navigationBar)
                         .navigationDestination(for: String.self) { sessionId in
-                            ChatScreen(sessionId: sessionId)
-                                .id(sessionId) // a new session gets a fresh store/webview
+                            ChatScreen(store: store.chatStore(for: sessionId))
+                                .id(sessionId) // a new session gets a fresh webview
                                 .toolbar(.hidden, for: .navigationBar)
                                 .navigationBarBackButtonHidden(true)
                         }

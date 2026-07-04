@@ -35,6 +35,8 @@ use binding::{ActiveLeg, active_leg};
 
 uniffi::setup_scaffolding!();
 
+const RELAY_PRECONNECT_SESSION_HINT: &str = "__relay_preconnect__";
+
 /// Parse a scanned QR payload (`baybo://pair?...`) into a pairing target.
 /// `None` = not a pairing QR — keep scanning. A payload without an explicit
 /// relay (`h=`) targets the hosted default.
@@ -209,12 +211,30 @@ impl BayboClient {
         .await
     }
 
-    /// Open the chat session for `session_id` on the active binding's leg and
-    /// stream frames to `sink`. Relay runs the Noise E2E content leg; direct runs
-    /// the raw-MessagePack `/v1/channel-ws` web-identity leg. `since_ordinal` is
-    /// the highest ordinal already rendered — the gateway replays only the gap
-    /// above it (so a reconnect after a background catches up without re-sending
-    /// the whole thread); `None` is a fresh subscribe with no catch-up. Both legs
+    /// Warm the relay content leg without subscribing a session. This is
+    /// best-effort app-start latency hiding: once the Noise leg is up, opening a
+    /// chat only needs to enqueue `Subscribe`. Direct bindings no-op because the
+    /// direct WS token is minted per session.
+    pub async fn relay_preconnect(self: Arc<Self>) -> Result<(), BayboError> {
+        let this = self;
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Relay => {
+                    transport::preconnect(&this.relay, RELAY_PRECONNECT_SESSION_HINT.to_string())
+                        .await
+                }
+                ActiveLeg::Direct => Ok(()),
+            }
+        })
+        .await
+    }
+
+    /// Subscribe `session_id` on the active binding's global chat leg and stream
+    /// frames to `sink`. Relay runs the Noise E2E content leg; direct runs the
+    /// raw-MessagePack `/v1/channel-ws` web-identity leg. `since_ordinal` is the
+    /// highest ordinal already rendered — the gateway replays only the gap above
+    /// it (so a reconnect after a background catches up without re-sending the
+    /// whole thread); `None` is a fresh subscribe with no catch-up. Both legs
     /// share one pump (see `transport`); only the establish/codec seam differs.
     pub async fn chat_connect(
         self: Arc<Self>,
@@ -236,13 +256,14 @@ impl BayboClient {
         .await
     }
 
-    /// Send a user message on the live chat session for the active binding's leg.
-    /// `msg_id` is a fresh per-send idempotency key so a retry doesn't double-fire
-    /// the agent. `attachments` are content-addressed blobs already uploaded over
-    /// a blob leg (empty for a text-only send). Relay sends as device/ios, direct
-    /// as web-operator/http.
+    /// Send a user message to `session_id` on the active binding's global chat
+    /// leg. `msg_id` is a fresh per-send idempotency key so a retry doesn't
+    /// double-fire the agent. `attachments` are content-addressed blobs already
+    /// uploaded over a blob leg (empty for a text-only send). Relay sends as
+    /// device/ios, direct as web-operator/http.
     pub async fn chat_send(
         self: Arc<Self>,
+        session_id: String,
         text: String,
         msg_id: String,
         attachments: Vec<AttachmentRef>,
@@ -252,21 +273,26 @@ impl BayboClient {
             let attachments: Vec<WireAttachment> =
                 attachments.into_iter().map(Into::into).collect();
             match active_leg()? {
-                ActiveLeg::Relay => transport::send(&this.relay, text, msg_id, attachments).await,
-                ActiveLeg::Direct => transport::send(&this.direct, text, msg_id, attachments).await,
+                ActiveLeg::Relay => {
+                    transport::send(&this.relay, session_id, text, msg_id, attachments).await
+                }
+                ActiveLeg::Direct => {
+                    transport::send(&this.direct, session_id, text, msg_id, attachments).await
+                }
             }
         })
         .await
     }
 
-    /// Request a backward page of the live chat session's transcript over the
-    /// active binding's leg. `before_ordinal` pages older (`None` = newest page);
-    /// `limit` caps the page. The reply is **not** this call's return value: the
-    /// gateway answers with a `HistoryPage` frame that streams back through the
-    /// session's sink (mirroring how `Subscribe` catch-up replays arrive). Returns
-    /// once the request is enqueued on the live leg.
+    /// Request a backward page of `session_id`'s transcript over the active
+    /// binding's global chat leg. `before_ordinal` pages older (`None` = newest
+    /// page); `limit` caps the page. The reply is **not** this call's return
+    /// value: the gateway answers with a `HistoryPage` frame that streams back
+    /// through the session's sink (mirroring how `Subscribe` catch-up replays
+    /// arrive). Returns once the request is enqueued on the live leg.
     pub async fn chat_fetch_history(
         self: Arc<Self>,
+        session_id: String,
         before_ordinal: Option<i64>,
         limit: Option<u32>,
     ) -> Result<(), BayboError> {
@@ -274,23 +300,23 @@ impl BayboClient {
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => {
-                    transport::fetch_history(&this.relay, before_ordinal, limit).await
+                    transport::fetch_history(&this.relay, session_id, before_ordinal, limit).await
                 }
                 ActiveLeg::Direct => {
-                    transport::fetch_history(&this.direct, before_ordinal, limit).await
+                    transport::fetch_history(&this.direct, session_id, before_ordinal, limit).await
                 }
             }
         })
         .await
     }
 
-    /// Tear down the live chat session (the user left the chat view). Any
-    /// leg-specific durable state survives: the direct leg keeps its session id +
-    /// channel token for reconnect; the relay leg reloads its pairing record on
-    /// the next connect. At most one leg is ever live (one binding), but the
-    /// binding may already be gone — a disconnect/unpair deletes the credentials
-    /// *before* this fires — so tear both down unconditionally; a disconnect on an
-    /// idle registry is a no-op.
+    /// Tear down the active binding's global chat leg. Any leg-specific durable
+    /// state survives: the direct leg keeps its last session id + channel token
+    /// for reconnect; the relay leg reloads its pairing record on the next
+    /// connect. At most one binding mode is live, but the binding may already be
+    /// gone — a disconnect/unpair deletes the credentials *before* this fires —
+    /// so tear both legs down unconditionally; a disconnect on an idle registry is
+    /// a no-op.
     pub async fn chat_disconnect(self: Arc<Self>) {
         let this = self;
         let _ = runtime::run(async move {

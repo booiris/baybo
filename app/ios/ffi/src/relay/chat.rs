@@ -6,14 +6,13 @@
 //! Noise) and [`RelayCodec`] (seal/open). The crypto + frame codec themselves live
 //! in the host-tested core ([`ContentHandshake`] / [`ContentSession`]).
 //!
-//! One session at a time: opening a new one aborts the previous pump. Content is
-//! relay-only — the app reaches the (possibly NAT'd) gateway through C's blind
-//! content-join leg.
+//! One content leg can subscribe to multiple sessions. Content is relay-only —
+//! the app reaches the (possibly NAT'd) gateway through C's blind content-join leg.
 
 use std::sync::Arc;
 
 use baybo_mobile_core::{
-    ContentHandshake, ContentSession, Frame, apns_token_frame, subscribe_frame, user_message_frame,
+    ContentHandshake, ContentSession, Frame, apns_token_frame, user_message_frame,
 };
 use device_proto::noise::StaticKeypair;
 use futures_util::SinkExt;
@@ -24,7 +23,7 @@ use super::pairing::{PairedRecord, load_paired_record};
 use crate::apns::ApnsState;
 use crate::transport::{
     ChatTransport, Connection, FrameCodec, SessionLeg, SessionRegistry, TransportError,
-    UserFrameFn, WsStream, recv_binary, session_history_frame,
+    UserFrameFn, WsStream, recv_binary,
 };
 
 /// The relay leg's state: the shared session registry plus the APNs state it
@@ -67,7 +66,6 @@ impl ChatTransport for RelaySessions {
     fn establish(
         &self,
         session_id: &str,
-        since_ordinal: Option<i64>,
     ) -> impl std::future::Future<Output = Result<Connection, TransportError>> + Send {
         let session_id = session_id.to_string();
         let apns = self.apns.clone();
@@ -92,11 +90,6 @@ impl ChatTransport for RelaySessions {
                 session: established.session,
             });
 
-            // Self-pull: Subscribe so the gateway streams live agent output and
-            // replays any thread rows above `since_ordinal` (the catch-up gap on a
-            // reconnect; `None` = no catch-up).
-            let opening = vec![subscribe_frame(&session_id, since_ordinal)];
-
             // Best-effort: tell the gateway our current APNs token so it keeps C's
             // push binding fresh across token rotation — skipped when iOS hasn't
             // issued a token yet, and non-fatal if it can't be sealed.
@@ -112,18 +105,15 @@ impl ChatTransport for RelaySessions {
 
             // Relay user messages carry the device id + `channel_type=ios`.
             let device_id = record.device_id.clone();
-            let sid = session_id.clone();
-            let user_frame: UserFrameFn = Box::new(move |text, msg_id, attachments| {
-                user_message_frame(&sid, &device_id, text, msg_id, attachments)
+            let user_frame: UserFrameFn = Box::new(move |session_id, text, msg_id, attachments| {
+                user_message_frame(session_id, &device_id, text, msg_id, attachments)
             });
 
             Ok(Connection {
                 ws: established.ws,
                 codec,
-                opening,
                 opening_best_effort,
                 user_frame,
-                history_frame: session_history_frame(session_id),
             })
         }
     }

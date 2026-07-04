@@ -117,8 +117,18 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 - **BayboClient** (ffi) is a long-lived singleton (`Baybo.client`); the chat
   pump and parked pairing sessions live inside it between calls. Frames cross
   the FFI as JSON on a `FrameSink` callback; `onDisconnected` fires ONLY on
-  unsolicited pump death (deliberate teardown aborts first) — the reconnect
-  state machine in `ChatStore` depends on that contract.
+  unsolicited pump death (deliberate disconnect aborts first) — the reconnect
+  state machine in `ChatStore` depends on that contract. `AppStore` owns one
+  cached `ChatStore` per opened session. The FFI transport owns one global chat
+  leg per binding (relay content or direct channel WS); opening a session sends a
+  `Subscribe` on that leg and registers/replaces that session's sink. Backing out
+  to the list only detaches the `TranscriptBridge`; frames that arrive while no
+  webview is attached buffer in the store and flush in order on the next attach.
+  Switching sessions does not redial or disconnect the old subscription. Relay
+  bindings also call `relay_preconnect()` on launch/foreground to warm the
+  content leg before a chat is opened; it dials + handshakes but sends no
+  `Subscribe`. Logout, rebind, or explicit app teardown calls `chat_disconnect`,
+  which drops the global leg and all registered sinks.
 - **Frame ordering**: sink callbacks hop to the main queue via GCD (FIFO), not
   `Task` — reordered `answer_delta`s would corrupt the transcript.
 - **connState** has exactly one `offline` trigger: a failed dial. Unsolicited

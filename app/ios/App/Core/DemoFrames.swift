@@ -15,7 +15,7 @@
             NSLog("baybo: demo frames starting")
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(500))
-                bridge?.userSent(msgId: "demo-user-1", text: "Give me an overview of this project", attachments: [])
+                pushDemoUserSent(msgId: "demo-user-1", text: "Give me an overview of this project")
                 pushDemo(["kind": "turn_state", "active": true])
                 try? await Task.sleep(for: .milliseconds(700))
                 for chunk in ["Let me look at the repo structure first.", "The core is a multi-channel assistant framework,", "let me read the module docs before summarizing…"] {
@@ -45,7 +45,7 @@
 
                     ```rust
                     let client = BayboClient::new(config)?;
-                    client.chat_send("hello").await?;
+                    client.chat_send(session_id, "hello").await?;
                     ```
 
                     | Module | Responsibility | Key Deps | Status | Owner |
@@ -80,7 +80,7 @@
             guard let data = try? JSONSerialization.data(withJSONObject: object),
                 let json = String(data: data, encoding: .utf8)
             else { return }
-            bridge?.pushFrame(json)
+            pushDemoFrame(json)
         }
 
         private static func chunked(_ text: String, size: Int) -> [String] {

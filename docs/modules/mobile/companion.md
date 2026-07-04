@@ -271,9 +271,17 @@ and the content session reconnects (with catch-up) on every iOS foreground. It
 also reconnects on its own when a live leg drops mid-session: the Rust pump emits
 a `content-disconnected` event on any unsolicited exit (socket close, the
 inbound-liveness lapse, a remote-host restart) — but not on a deliberate
-reconnect/disconnect, which aborts the task first — and the webview retries on a
-short backoff, so chat recovers without waiting for the next foreground. A failed
-dial backs off and retries the same way instead of stranding on "Connect failed".
+reconnect/disconnect, which aborts the task first — and the native chat store
+retries on a short backoff, so chat recovers without waiting for the next
+foreground. In the SwiftUI app `AppStore` caches a `ChatStore` per opened
+session, while the Rust FFI keeps one global chat leg per binding and sends
+per-session `Subscribe` frames on that leg. Backing out to the list detaches the
+webview but leaves the session sink registered, buffering frames until the
+session view attaches again; switching sessions adds/reuses a subscription
+instead of redialing. Relay bindings warm that global content leg on
+launch/foreground before any session is selected; the warm-up performs the
+relay/Noise handshake and APNs refresh but sends no `Subscribe`. A failed dial
+backs off and retries the same way instead of stranding on "Connect failed".
 `push_key` is persisted to the App Group keychain on a successful pair so the NSE
 can read it on-device.
 
