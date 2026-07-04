@@ -39,7 +39,6 @@ pub(crate) mod session_pulse;
 pub(crate) mod session_resolver;
 pub(crate) mod slash;
 pub mod state;
-pub mod web_token_janitor;
 pub(crate) mod work_steps;
 
 pub use bot_reconciler::ChannelBotReconciler;
@@ -49,7 +48,6 @@ pub use history::TuiHistoryStore;
 pub use route::routes;
 pub use session_resolver::ChannelSessionResolver;
 pub use state::WsChannelState;
-pub use web_token_janitor::{StashedTokenHandle, WebTokenJanitor};
 
 /// Deterministic short hash of an identifier for log attribution.
 /// Four hex chars distinguish concurrent pendings in a tracing log

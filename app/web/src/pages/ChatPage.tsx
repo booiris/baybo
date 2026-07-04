@@ -308,7 +308,7 @@ export function ChatPage() {
   const { sessionId } = useParams<{ sessionId?: string }>();
   const navigate = useNavigate();
   const client = useAdminClient();
-  const { baseUrl } = useAuth();
+  const { baseUrl, token: adminToken } = useAuth();
   const queueStore = useQueueStore();
   const folderStore = useFolderStore();
   // Reactive interjection queue for the active session (drives the panel, the
@@ -325,14 +325,6 @@ export function ChatPage() {
   const [models, setModels] = useState<ModelOption[]>([]);
   const [defaultModelName, setDefaultModelName] = useState('');
 
-  // Channel token + bootstrap state. The token is minted once per tab
-  // lifetime; the WS reuses it across every session the user switches
-  // through. The anchor session is the one whose POST .../{id}/token
-  // call produced our token. If the server rejects our token later
-  // (e.g. after a gateway restart wipes the in-memory token table),
-  // ChatWs fires onTokenRejected and we mint a fresh one for the
-  // same anchor — see handleTokenRejected below.
-  const [channelToken, setChannelToken] = useState<string | null>(null);
   // Files picked in the composer, uploaded to the blob store on select and
   // attached to the next outgoing message once their upload lands.
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
@@ -412,20 +404,12 @@ export function ChatPage() {
   // depends on `locationPathname`. Capturing `navigate` directly in any
   // effect's dep array would re-run that effect on every URL change,
   // which for the WS effect means tearing down the live socket on every
-  // session switch (the server revokes the channel-token on close, so
-  // the next reconnect hits a dead-token 401 → reconnect loop). The ref
-  // gives long-lived closures a stable handle to "whatever navigate is
-  // right now".
+  // session switch. The ref gives long-lived closures a stable handle to
+  // "whatever navigate is right now".
   const navigateRef = useRef(navigate);
   useEffect(() => {
     navigateRef.current = navigate;
   });
-  // Holds the latest token-rejected handler so the ChatWs callback
-  // (captured at construction) always calls the current closure.
-  const onTokenRejectedRef = useRef<((reason: string) => void) | null>(null);
-  // Generation counter so a retry chain started by an older
-  // rejection stops if a newer rejection (or unmount) supersedes it.
-  const tokenRemintGenRef = useRef(0);
   // Last-touched wall-clock per session bucket — bumped on nav and on
   // every inbound view-mutating frame. Drives the LRU eviction effect
   // below. Lives in a ref so the WS onFrame closure can read/write it
@@ -570,7 +554,7 @@ export function ChatPage() {
     recencyRef.current.delete(sid);
   }, [cancelPacer]);
 
-  // ── Bootstrap: load session list + slash manifest, mint a token ─────
+  // ── Bootstrap: load session list + slash manifest ──────────────────
   // Runs once on mount. Anchor selection priority:
   //   1. URL's `sessionId` if it names an existing http session — opening
   //      a tab to `/chat/<id>` should land on *that* session, not silently
@@ -644,49 +628,24 @@ export function ChatPage() {
           ? sessionId
           : existing[0]?.session_id;
 
-      let anchorId: string;
-      let token: string;
       if (preferred) {
-        const { data: refreshed, error } = await client.POST(
-          '/v1/chat/sessions/{session_id}/token',
-          { params: { path: { session_id: preferred } } },
-        );
-        if (cancelled) return;
-        if (error || !refreshed?.channel_token) {
-          // Anchor session vanished between list and refresh — fall
-          // through to creating a new one.
-          console.warn(
-            'chat bootstrap: refresh token failed for',
-            preferred,
-            error,
-          );
-          const result = await createAnchorSession();
-          if (!result) return;
-          anchorId = result.sessionId;
-          token = result.token;
-        } else {
-          anchorId = preferred;
-          token = refreshed.channel_token;
+        anchorSessionIdRef.current = preferred;
+        if (!sessionId || sessionId !== preferred) {
+          navigateRef.current(`/chat/${preferred}`, { replace: true });
         }
       } else {
-        const result = await createAnchorSession();
-        if (!result) return;
-        anchorId = result.sessionId;
-        token = result.token;
-      }
-      if (cancelled) return;
-      anchorSessionIdRef.current = anchorId;
-      setChannelToken(token);
-      // Land on a session: if the URL has none, redirect to the
-      // anchor; if it points at an unknown id, also redirect.
-      if (!sessionId || sessionId !== anchorId) {
-        navigateRef.current(`/chat/${anchorId}`, { replace: true });
+        const anchorId = await createAnchorSession();
+        if (!anchorId) return;
+        anchorSessionIdRef.current = anchorId;
+        if (!sessionId || sessionId !== anchorId) {
+          navigateRef.current(`/chat/${anchorId}`, { replace: true });
+        }
       }
 
-      async function createAnchorSession(): Promise<{ sessionId: string; token: string } | null> {
+      async function createAnchorSession(): Promise<string | null> {
         const { data, error } = await client.POST('/v1/chat/sessions', {});
         if (cancelled) return null;
-        if (error || !data?.channel_token) {
+        if (error || !data?.session_id) {
           console.warn('chat bootstrap: create session failed', error);
           return null;
         }
@@ -704,7 +663,7 @@ export function ChatPage() {
                 ...prev,
               ],
         );
-        return { sessionId: data.session_id, token: data.channel_token };
+        return data.session_id;
       }
     })();
     return () => {
@@ -713,46 +672,15 @@ export function ChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, folderStore]); // intentionally NOT depending on sessionId — bootstrap is one-shot
 
-  // Always-current handler for register_ack { ok: false }. Mints a
-  // fresh token against the anchor session and feeds it back into
-  // ChatWs via replaceToken. Backs off on POST failure, abandons the
-  // chain if a newer rejection (or unmount) bumps the generation.
-  useEffect(() => {
-    onTokenRejectedRef.current = (_reason: string) => {
-      const anchor = anchorSessionIdRef.current;
-      if (!anchor) return;
-      const myGen = ++tokenRemintGenRef.current;
-      let attempt = 0;
-      const tryMint = async (): Promise<void> => {
-        if (tokenRemintGenRef.current !== myGen) return;
-        const { data, error } = await client.POST(
-          '/v1/chat/sessions/{session_id}/token',
-          { params: { path: { session_id: anchor } } },
-        );
-        if (tokenRemintGenRef.current !== myGen) return;
-        if (!error && data?.channel_token) {
-          wsRef.current?.replaceToken(data.channel_token);
-          return;
-        }
-        attempt += 1;
-        const delay = Math.min(2_000 * 2 ** Math.min(attempt - 1, 4), 30_000);
-        setTimeout(() => {
-          void tryMint();
-        }, delay);
-      };
-      void tryMint();
-    };
-  }, [client]);
-
-  // ── WS lifecycle: tied to channelToken, not to sessionId ────────────
-  // Opens once we have a token, lives until the component unmounts
+  // ── WS lifecycle: tied to adminToken, not to sessionId ──────────────
+  // Opens once we have the admin token, lives until the component unmounts
   // (i.e. the user navigates away from /chat). Reconnect is internal
   // to ChatWs.
   useEffect(() => {
-    if (!channelToken) return;
+    if (!adminToken) return;
     const ws = new ChatWs({
       baseUrl,
-      channelToken,
+      adminToken,
       initialSessionIds: [],
       onStatus: (s) => {
         statusRef.current = s;
@@ -917,7 +845,6 @@ export function ChatPage() {
         // completion, and pause the pipeline on a /stop-cancel or error notice.
         queueFrameRef.current?.(frame);
       },
-      onTokenRejected: (reason) => onTokenRejectedRef.current?.(reason),
       onReset: (reason) => {
         // Stream is stale (per Frame::Reset contract — see chatWs.ts
         // onReset docs). The chatWs has already cleared its cursors;
@@ -949,14 +876,12 @@ export function ChatPage() {
     });
     wsRef.current = ws;
     return () => {
-      // Bump the generation so any in-flight retry chain stops.
-      tokenRemintGenRef.current += 1;
       ws.close();
       wsRef.current = null;
     };
   }, [
     baseUrl,
-    channelToken,
+    adminToken,
     releaseSessionView,
     enqueueDelta,
     cancelPacer,
@@ -1066,7 +991,7 @@ export function ChatPage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, channelToken, historyEpoch]); // views intentionally excluded — we react to nav, WS readiness, and Reset-driven refetch via the epoch
+  }, [sessionId, adminToken, historyEpoch]); // views intentionally excluded — we react to nav, WS readiness, and Reset-driven refetch via the epoch
 
   // Auto-scroll on transcript append — but only if the user is already
   // parked at the bottom. Otherwise raise the "new messages" pill so
@@ -1676,14 +1601,14 @@ export function ChatPage() {
         { localId, filename: file.name, mime, size: file.size, status: 'uploading', previewUrl },
       ]);
       try {
-        // The web operator's channel token authorises `/v1/blobs` (it
-        // resolves to `AuthedClient::Web`, which bypasses pairing); the
+        // The web operator's admin bearer authorises `/v1/blobs` and
+        // resolves to `AuthedClient::Web`, which bypasses pairing; the
         // returned content-addressed blob id is what the message references.
         const base = (baseUrl || '').replace(/\/+$/, '');
         const res = await fetch(`${base}/v1/blobs`, {
           method: 'POST',
           headers: {
-            'x-baybo-channel-token': channelToken ?? '',
+            Authorization: `Bearer ${adminToken ?? ''}`,
             'content-type': mime,
           },
           body: file,
@@ -1701,7 +1626,7 @@ export function ChatPage() {
         );
       }
     },
-    [baseUrl, channelToken],
+    [baseUrl, adminToken],
   );
 
   const handleFilePick = useCallback(
@@ -2287,7 +2212,7 @@ export function ChatPage() {
                   <MessageBubble
                     key={row.key}
                     row={row}
-                    channelToken={channelToken}
+                    adminToken={adminToken}
                     baseUrl={baseUrl}
                   />,
                 ];
@@ -2314,7 +2239,7 @@ export function ChatPage() {
                     hasAttachments: item.attachments.length > 0,
                     pending: true,
                   }}
-                  channelToken={channelToken}
+                  adminToken={adminToken}
                   baseUrl={baseUrl}
                 />
               ))}
@@ -2366,7 +2291,7 @@ export function ChatPage() {
               <QueuePanel
                 sessionId={sessionId}
                 baseUrl={baseUrl}
-                channelToken={channelToken}
+                adminToken={adminToken}
                 onFire={fireQueuedItem}
                 onResume={resumeQueue}
               />
@@ -2498,7 +2423,7 @@ export function ChatPage() {
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={!channelToken || status.state !== 'connected'}
+                    disabled={!adminToken || status.state !== 'connected'}
                     className="group shrink-0 h-7 w-7 flex items-center justify-center bg-surface text-ink-soft hover:text-ink border-2 border-black rounded-md shadow-brutal-xs hover:bg-canvas hover:-translate-y-px active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer transition-[transform,box-shadow,background-color,color] duration-150"
                     title="Attach image or file"
                     aria-label="Attach image or file"
@@ -4046,11 +3971,11 @@ function MarkdownBody({ text }: { text: string }) {
 function AttachmentList({
   attachments,
   baseUrl,
-  channelToken,
+  adminToken,
 }: {
   attachments: WireAttachment[];
   baseUrl: string;
-  channelToken: string | null;
+  adminToken: string | null;
 }) {
   return (
     <div className="flex flex-wrap gap-2">
@@ -4061,7 +3986,7 @@ function AttachmentList({
             blobId={a.blob_id}
             alt={a.filename ?? 'image'}
             baseUrl={baseUrl}
-            channelToken={channelToken}
+            adminToken={adminToken}
           />
         ) : (
           <span
@@ -4080,11 +4005,11 @@ function AttachmentList({
 
 function MessageBubble({
   row,
-  channelToken,
+  adminToken,
   baseUrl,
 }: {
   row: TranscriptRow;
-  channelToken: string | null;
+  adminToken: string | null;
   baseUrl: string;
 }) {
   if (row.kind === 'work') {
@@ -4178,7 +4103,7 @@ function MessageBubble({
                 <AttachmentList
                   attachments={attachmentDetails}
                   baseUrl={baseUrl}
-                  channelToken={channelToken}
+                  adminToken={adminToken}
                 />
               </div>
             ) : null}

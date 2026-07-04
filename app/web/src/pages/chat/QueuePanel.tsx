@@ -38,7 +38,7 @@ import { useSessionQueue, type PauseReason, type QueuedItem } from './queueStore
 export interface QueuePanelProps {
   sessionId: string;
   baseUrl: string;
-  channelToken: string | null;
+  adminToken: string | null;
   onFire: (item: QueuedItem) => void;
   onResume: () => void;
 }
@@ -46,7 +46,7 @@ export interface QueuePanelProps {
 export function QueuePanel({
   sessionId,
   baseUrl,
-  channelToken,
+  adminToken,
   onFire,
   onResume,
 }: QueuePanelProps) {
@@ -108,7 +108,7 @@ export function QueuePanel({
                   sessionId={sessionId}
                   item={item}
                   baseUrl={baseUrl}
-                  channelToken={channelToken}
+                  adminToken={adminToken}
                   onFire={() => onFire(item)}
                 />
               ))}
@@ -132,13 +132,13 @@ function QueuedRow({
   sessionId,
   item,
   baseUrl,
-  channelToken,
+  adminToken,
   onFire,
 }: {
   sessionId: string;
   item: QueuedItem;
   baseUrl: string;
-  channelToken: string | null;
+  adminToken: string | null;
   onFire: () => void;
 }) {
   const { removeItem, editItem } = useSessionQueue(sessionId);
@@ -219,7 +219,7 @@ function QueuedRow({
                     blobId={a.blob_id}
                     alt={a.filename ?? 'image'}
                     baseUrl={baseUrl}
-                    channelToken={channelToken}
+                    adminToken={adminToken}
                   />
                 </div>
               ) : (

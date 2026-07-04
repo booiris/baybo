@@ -14,30 +14,33 @@ use baybo_channels::{
     AgentEvent, AgentOutput, ChannelKind, MessageRole, OutgoingMessage, RouterInbound,
 };
 use baybo_config::ChannelsConfig;
-use baybo_gateway::auth::{
-    ChannelTokenTable, ClientIdentity, TokenHandle, WEB_CLIENT_LABEL_PREFIX, WEB_OPERATOR_USER_ID,
-};
-use baybo_gateway::channel::{StashedTokenHandle, boot};
-use baybo_gateway::channel_listener::ChannelServer;
+use baybo_gateway::auth::WEB_OPERATOR_USER_ID;
+use baybo_gateway::channel::boot;
+use baybo_gateway::server::{GatewayDeps, build_admin_router_for_tests};
 use baybo_gateway::test_support::build_test_deps;
 use baybo_model::{ChannelType, ChatMessage, ContentBlock, MessageMetadata, User};
 use futures::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-/// Mint a web-flavoured channel-token (the exact shape
-/// `POST /v1/chat/sessions` mints) and return it together with the
-/// owning handle. Caller keeps the handle alive for the test's
-/// duration so the live table doesn't revoke the token mid-stream.
-fn mint_web_token(tokens: &ChannelTokenTable, slot: &str) -> (String, TokenHandle) {
-    let handle = tokens.mint(ClientIdentity {
-        pid: std::process::id(),
-        label: format!("{WEB_CLIENT_LABEL_PREFIX}{slot}"),
-        bound_channel_type: Some(ChannelType::http().to_string()),
+async fn start_admin_ws_server(
+    deps: &GatewayDeps,
+    shutdown: baybo_agent::service::ShutdownSignal,
+) -> Result<(u16, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let router = build_admin_router_for_tests(deps);
+    let handle = tokio::spawn(async move {
+        let shutdown_fut = async move {
+            shutdown.wait().await;
+        };
+        let _ = axum::serve(listener, router.into_make_service())
+            .with_graceful_shutdown(shutdown_fut)
+            .await;
     });
-    (handle.token().to_string(), handle)
+    Ok((port, handle))
 }
 
 async fn connect_register(
@@ -184,11 +187,7 @@ async fn expect_idle_turn_state(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn web_token_attaches_subscribes_and_receives_dispatch() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file =
-        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
-
+async fn admin_token_attaches_web_chat_and_receives_dispatch() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
 
     // Eagerly install the http channel — production wires this from
@@ -197,19 +196,12 @@ async fn web_token_attaches_subscribes_and_receives_dispatch() {
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
-    let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
-    let server = ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone())
-        .expect("bind ChannelServer");
-    let port = server.port();
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
 
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run(server_shutdown).await;
-    });
-
-    let (token, _handle) = mint_web_token(&channel_tokens, "tab-a");
-    let mut client = connect_register(port, &token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("WS handshake");
 
@@ -277,9 +269,6 @@ async fn web_token_attaches_subscribes_and_receives_dispatch() {
 /// re-hydrates the list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscribe_hydrates_durable_task_list_snapshot() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file =
-        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
@@ -313,18 +302,12 @@ async fn subscribe_hydrates_durable_task_list_snapshot() {
         .await
         .expect("seed task");
 
-    let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
-    let server =
-        ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone()).expect("bind server");
-    let port = server.port();
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run(server_shutdown).await;
-    });
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
 
-    let (token, _handle) = mint_web_token(&channel_tokens, "tab-a");
-    let mut client = connect_register(port, &token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("WS handshake");
 
@@ -366,9 +349,6 @@ async fn subscribe_hydrates_durable_task_list_snapshot() {
 /// with the start instant while a turn-kind job is non-terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscribe_hydrates_turn_state_snapshot() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file =
-        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
@@ -385,15 +365,10 @@ async fn subscribe_hydrates_turn_state_snapshot() {
         .await
         .expect("create session");
 
-    let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
-    let server =
-        ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone()).expect("bind server");
-    let port = server.port();
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run(server_shutdown).await;
-    });
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
 
     let expect_turn_state = |frame: Frame, want_active: bool| match frame {
         Frame::TurnState {
@@ -410,8 +385,7 @@ async fn subscribe_hydrates_turn_state_snapshot() {
     };
 
     // Idle session: the snapshot is a definitive `active: false`.
-    let (token, _handle) = mint_web_token(&channel_tokens, "tab-a");
-    let mut tab_a = connect_register(port, &token, ChannelType::http())
+    let mut tab_a = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("WS handshake");
     send_frame(
@@ -451,8 +425,7 @@ async fn subscribe_hydrates_turn_state_snapshot() {
         .await
         .expect("job → InProgress");
 
-    let (token_b, _handle_b) = mint_web_token(&channel_tokens, "tab-b");
-    let mut tab_b = connect_register(port, &token_b, ChannelType::http())
+    let mut tab_b = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("WS handshake (tab b)");
     send_frame(
@@ -478,32 +451,20 @@ async fn subscribe_hydrates_turn_state_snapshot() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_subscribers_to_same_session_both_receive_dispatch() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file =
-        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
-
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
-    let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
-    let server = ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone())
-        .expect("bind ChannelServer");
-    let port = server.port();
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
 
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run(server_shutdown).await;
-    });
-
-    let (token_a, _ha) = mint_web_token(&channel_tokens, "tab-a");
-    let (token_b, _hb) = mint_web_token(&channel_tokens, "tab-b");
-    let mut tab_a = connect_register(port, &token_a, ChannelType::http())
+    let mut tab_a = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("tab A handshake");
-    let mut tab_b = connect_register(port, &token_b, ChannelType::http())
+    let mut tab_b = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("tab B handshake");
 
@@ -564,28 +525,17 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsubscribed_session_does_not_receive_dispatch() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file =
-        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
-
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
-    let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
-    let server = ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone())
-        .expect("bind ChannelServer");
-    let port = server.port();
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
 
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run(server_shutdown).await;
-    });
-
-    let (token, _handle) = mint_web_token(&channel_tokens, "watch");
-    let mut client = connect_register(port, &token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("handshake");
     send_frame(
@@ -656,34 +606,23 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
     // subscribed to any session at all. This is the contract the
     // sidebar relies on to converge across browsers / devices without
     // polling.
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file =
-        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
-
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
-    let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
-    let server = ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone())
-        .expect("bind ChannelServer");
-    let port = server.port();
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run(server_shutdown).await;
-    });
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
 
     // Two tabs, two personas:
     //   * subscriber — attached and subscribed to "sess-x"
     //   * bystander  — attached but never subscribed
-    let (tok_sub, _h_sub) = mint_web_token(&channel_tokens, "subscriber");
-    let (tok_by, _h_by) = mint_web_token(&channel_tokens, "bystander");
-    let mut subscriber = connect_register(port, &tok_sub, ChannelType::http())
+    let mut subscriber = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("subscriber handshake");
-    let mut bystander = connect_register(port, &tok_by, ChannelType::http())
+    let mut bystander = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("bystander handshake");
 
@@ -748,27 +687,17 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
     // observer: a UserEcho produces `ActivityKind::User`; a completed
     // agent `Message` produces `ActivityKind::Assistant` (mid-turn
     // streaming events like AnswerDelta deliberately don't pulse).
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file =
-        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
-
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
-    let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
-    let server = ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone())
-        .expect("bind ChannelServer");
-    let port = server.port();
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run(server_shutdown).await;
-    });
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
 
-    let (token, _h) = mint_web_token(&channel_tokens, "bystander");
-    let mut client = connect_register(port, &token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("handshake");
 
@@ -863,27 +792,17 @@ async fn duplicate_platform_msg_id_drops_retry_on_subscribed_channel() {
     // attempt. The gateway's `InboundDedup` rejects every attempt past
     // the first inside its recency window, so the router sees a single
     // inbound and the agent doesn't pay for two turns.
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file =
-        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
-
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
-    let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
     let mut incoming_rx = tg.incoming_rx;
-    let server =
-        ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone()).expect("bind server");
-    let port = server.port();
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run(server_shutdown).await;
-    });
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
 
-    let (token, _handle) = mint_web_token(&channel_tokens, "tab-dedup");
-    let mut client = connect_register(port, &token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("handshake");
     send_frame(
@@ -973,27 +892,17 @@ async fn messages_batch_reaches_router_as_one_ordered_intake() {
     // `RouterInbound::Batch` (so the actor coalesces them into a single turn),
     // preserving order — never as N separate intakes that could race the
     // actor's coalescing window.
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file =
-        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
-
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
-    let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
     let mut incoming_rx = tg.incoming_rx;
-    let server =
-        ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone()).expect("bind server");
-    let port = server.port();
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run(server_shutdown).await;
-    });
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
 
-    let (token, _handle) = mint_web_token(&channel_tokens, "tab-batch");
-    let mut client = connect_register(port, &token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("handshake");
     send_frame(
@@ -1075,9 +984,6 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
     // to that one connection. Agent-injected rows (skill reminders,
     // tool calls, system frames) are filtered out — the catch-up has
     // to match what a continuously-connected client would have seen.
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file =
-        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
@@ -1113,18 +1019,12 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
             .expect("append");
     }
 
-    let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
-    let server =
-        ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone()).expect("bind server");
-    let port = server.port();
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run(server_shutdown).await;
-    });
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
 
-    let (token, _handle) = mint_web_token(&channel_tokens, "reconnect");
-    let mut client = connect_register(port, &token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("handshake");
 
@@ -1200,9 +1100,6 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
 /// the raw `oldest`/`newest_ordinal` bounds and `has_more`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_history_returns_backward_page_of_visible_rows() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file =
-        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
@@ -1236,18 +1133,12 @@ async fn fetch_history_returns_backward_page_of_visible_rows() {
             .expect("append");
     }
 
-    let channel_tokens = tg.channel_tokens.clone();
     let shutdown = tg.shutdown.clone();
-    let server =
-        ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone()).expect("bind server");
-    let port = server.port();
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run(server_shutdown).await;
-    });
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
 
-    let (token, _handle) = mint_web_token(&channel_tokens, "history");
-    let mut client = connect_register(port, &token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("handshake");
 
@@ -1344,101 +1235,6 @@ async fn fetch_history_returns_backward_page_of_visible_rows() {
     assert!(!has_more);
 
     drop(client);
-    shutdown.trigger();
-    let _ = server_handle.await;
-}
-
-/// The web mint endpoint stashes a `TokenHandle` in `web_chat_tokens`;
-/// the channel-WS upgrade claims it (removes it from the stash) for the
-/// connection's lifetime, and on close RE-STASHES it (fresh `minted_at`)
-/// instead of dropping/revoking it — so the client's own backoff
-/// reconnect can re-present the same `?token=` and re-claim a still-live
-/// token rather than eating a 401. An abandoned token is bounded only by
-/// the janitor's TTL sweep of the re-stashed entry.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn web_ws_close_restashes_token_so_reconnect_reuses_it() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let port_file =
-        baybo_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
-
-    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let cfg = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
-
-    let channel_tokens = tg.channel_tokens.clone();
-    let web_chat_tokens = Arc::clone(&tg.deps.web_chat_tokens);
-    let shutdown = tg.shutdown.clone();
-    let server =
-        ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone()).expect("bind server");
-    let port = server.port();
-    let server_shutdown = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run(server_shutdown).await;
-    });
-
-    // Mimic the admin mint path: mint a token and stash the handle
-    // keyed by token string.
-    let handle = channel_tokens.mint(ClientIdentity {
-        pid: std::process::id(),
-        label: format!("{WEB_CLIENT_LABEL_PREFIX}lifecycle-test"),
-        bound_channel_type: Some(ChannelType::http().to_string()),
-    });
-    let token = handle.token().to_owned();
-    web_chat_tokens.insert(token.clone(), StashedTokenHandle::new(handle));
-    assert!(
-        channel_tokens.lookup(&token).is_some(),
-        "fresh mint is live"
-    );
-    assert!(web_chat_tokens.contains_key(&token), "handle stashed");
-
-    let client = connect_register(port, &token, ChannelType::http())
-        .await
-        .expect("handshake");
-
-    // After upgrade, the stash entry is gone — the route claimed the
-    // handle for the connection's lifetime — but the token stays live.
-    assert!(
-        !web_chat_tokens.contains_key(&token),
-        "WS upgrade should have claimed the stashed handle",
-    );
-    assert!(
-        channel_tokens.lookup(&token).is_some(),
-        "token stays live while the WS is open",
-    );
-
-    drop(client);
-
-    // Server-side close detection is async — poll until the route's
-    // teardown has re-stashed the handle. The token must NEVER go dead in
-    // the process (it's handed straight from the connection back into the
-    // stash, not dropped).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        assert!(
-            channel_tokens.lookup(&token).is_some(),
-            "token must stay live across close (re-stashed, never revoked)",
-        );
-        if web_chat_tokens.contains_key(&token) {
-            break;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("handle should have been re-stashed after WS close");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    // The whole point: a reconnect presenting the SAME token re-claims it
-    // and handshakes cleanly instead of getting a dead-token 401.
-    let client2 = connect_register(port, &token, ChannelType::http())
-        .await
-        .expect("reconnect with the same token must succeed");
-    assert!(
-        !web_chat_tokens.contains_key(&token),
-        "reconnect re-claimed the re-stashed handle",
-    );
-    assert!(channel_tokens.lookup(&token).is_some(), "token still live");
-
-    drop(client2);
     shutdown.trigger();
     let _ = server_handle.await;
 }

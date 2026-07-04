@@ -543,11 +543,11 @@
         "operationId": "create_session",
         "responses": {
           "200": {
-            "description": "New session id + freshly-minted channel-token",
+            "description": "New session id",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ChatSessionCredential"
+                  "$ref": "#/components/schemas/ChatSessionCreated"
                 }
               }
             }
@@ -563,7 +563,7 @@
             }
           },
           "500": {
-            "description": "Session creation or token mint failed",
+            "description": "Session creation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -849,57 +849,6 @@
         "responses": {
           "204": {
             "description": "Pin state updated"
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Session not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/chat/sessions/{session_id}/token": {
-      "post": {
-        "tags": [
-          "chat"
-        ],
-        "operationId": "refresh_session_token",
-        "parameters": [
-          {
-            "name": "session_id",
-            "in": "path",
-            "description": "Session id whose token to refresh",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Fresh channel-token (old one revoked)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ChatSessionCredential"
-                }
-              }
-            }
           },
           "401": {
             "description": "Unauthorized",
@@ -2996,26 +2945,16 @@
           }
         }
       },
-      "ChatSessionCredential": {
+      "ChatSessionCreated": {
         "type": "object",
-        "description": "Response from `POST /v1/chat/sessions` and the\n`POST /v1/chat/sessions/:id/token` token-refresh endpoint. Carries\nthe freshly-minted channel-token the web client presents on its\n`/v1/channel-ws` upgrade via the\n[`CHANNEL_TOKEN_HEADER`](crate::auth::CHANNEL_TOKEN_HEADER) header\n(or the `?token=` query when the browser's WebSocket API can't set\ncustom headers — which it never can).",
+        "description": "Response from `POST /v1/chat/sessions`.",
         "required": [
-          "session_id",
-          "channel_token",
-          "channel_token_header"
+          "session_id"
         ],
         "properties": {
-          "channel_token": {
-            "type": "string",
-            "description": "Capability token bound to a `web/<uuid>` identity. Live for the\nlifetime of the session row; calling\n`POST /v1/chat/sessions/:id/token` revokes the previous token\nand returns a new one."
-          },
-          "channel_token_header": {
-            "type": "string",
-            "description": "Header name the web client must use when presenting the\nchannel-token on the channel listener."
-          },
           "session_id": {
             "type": "string",
-            "description": "New (or existing) session id."
+            "description": "New session id."
           }
         }
       },
@@ -4597,7 +4536,7 @@
     },
     {
       "name": "chat",
-      "description": "Web chat sessions + channel-token mint"
+      "description": "Web chat sessions"
     },
     {
       "name": "push",

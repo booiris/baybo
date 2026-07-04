@@ -28,6 +28,6 @@ pub use admin::{AdminAuthState, AdminToken, require_admin_token};
 pub use channel::{AuthedClient, ChannelAuthState, attach as attach_channel_auth};
 pub use token::{
     CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TOOL_CLIENT_LABEL_PREFIX,
-    TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY, TokenHandle, WEB_CLIENT_LABEL_PREFIX,
-    WEB_OPERATOR_USER_ID, constant_time_eq, generate_token,
+    TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY, TokenHandle, WEB_OPERATOR_USER_ID, constant_time_eq,
+    generate_token,
 };

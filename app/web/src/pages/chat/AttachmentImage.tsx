@@ -2,19 +2,18 @@ import { useEffect, useState } from 'react';
 import { RiImageLine, RiLoader4Line } from 'react-icons/ri';
 
 // Renders a blob-backed image attachment. `<img>` can't carry the
-// `x-baybo-channel-token` header, so we fetch the blob ourselves and hand the
-// bitmap to the tag as an object URL. Re-fetches when the channel token lands
-// (e.g. a queued attachment whose preview rebuilds after a page reload).
+// Authorization header, so we fetch the blob ourselves and hand the bitmap to
+// the tag as an object URL.
 export function AttachmentImage({
   blobId,
   alt,
   baseUrl,
-  channelToken,
+  adminToken,
 }: {
   blobId: string;
   alt: string;
   baseUrl: string;
-  channelToken: string | null;
+  adminToken: string | null;
 }) {
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
@@ -25,7 +24,7 @@ export function AttachmentImage({
       try {
         const base = (baseUrl || '').replace(/\/+$/, '');
         const res = await fetch(`${base}/v1/blobs/${encodeURIComponent(blobId)}`, {
-          headers: { 'x-baybo-channel-token': channelToken ?? '' },
+          headers: { Authorization: `Bearer ${adminToken ?? ''}` },
         });
         if (!res.ok) throw new Error(`blob ${res.status}`);
         const blob = await res.blob();
@@ -40,7 +39,7 @@ export function AttachmentImage({
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [blobId, baseUrl, channelToken]);
+  }, [blobId, baseUrl, adminToken]);
 
   if (failed) {
     return (

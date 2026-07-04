@@ -77,8 +77,6 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
         channel_bot_store: tg.deps.stores.channel_bot.clone(),
         channel_control: std::sync::Arc::clone(&tg.deps.channel_control),
         secret_vault: std::sync::Arc::clone(&tg.deps.secret_vault),
-        channel_tokens: tg.deps.channel_tokens.clone(),
-        web_chat_tokens: std::sync::Arc::new(dashmap::DashMap::new()),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     };
     let (admin_router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();

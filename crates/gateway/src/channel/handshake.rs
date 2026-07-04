@@ -66,17 +66,16 @@ pub(crate) fn validate_register(
                 "label '{label}' is reserved for tool sidecars and may not register on /v1/channel-ws",
             ));
         }
-        AuthedClient::Web { label, token } => {
+        AuthedClient::Web => {
             if normalized != ChannelType::HTTP {
                 return Err(format!(
-                    "web chat token must register as channel_type '{}', got '{normalized}'",
+                    "web chat must register as channel_type '{}', got '{normalized}'",
                     ChannelType::HTTP,
                 ));
             }
-            let _ = (label, token);
         }
         // A paired, approved device registers as the iOS channel only —
-        // fixed like the web token's `http`, so a leaked device token can't be
+        // fixed like web auth's `http`, so a leaked device token can't be
         // redirected onto another channel's session stream.
         AuthedClient::Device { device_id, .. } => {
             if normalized != ChannelType::IOS {
@@ -347,35 +346,27 @@ mod tests {
 
     #[test]
     fn accepts_web_auth_claiming_http_channel() {
-        // The web chat page mints a token under `WEB_CLIENT_LABEL_PREFIX`
-        // via the admin POST /v1/chat/sessions handler; the auth
-        // middleware turns it into AuthedClient::Web. That identity is
-        // the *only* path allowed to claim the otherwise-reserved
-        // "http" channel type.
+        // The admin listener turns a valid admin bearer into AuthedClient::Web.
+        // That identity is the *only* path allowed to claim the
+        // otherwise-reserved "http" channel type.
         let tokens = ChannelTokenTable::new();
         let frame = register("", ChannelType::HTTP);
-        let authed = AuthedClient::Web {
-            label: "web/abc".to_string(),
-            token: "test-token".to_string(),
-        };
+        let authed = AuthedClient::Web;
         let outcome = validate_register(frame, &authed, &tokens).unwrap();
         assert_eq!(outcome.channel_type.as_str(), ChannelType::HTTP);
     }
 
     #[test]
     fn rejects_web_auth_claiming_other_channel() {
-        // A web token must not be redirectable to telegram (or any
+        // Web chat must not be redirectable to telegram (or any
         // other channel). The handshake fixes the channel type for
         // this auth variant.
         let tokens = ChannelTokenTable::new();
         let frame = register("", "telegram");
-        let authed = AuthedClient::Web {
-            label: "web/abc".to_string(),
-            token: "test-token".to_string(),
-        };
+        let authed = AuthedClient::Web;
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(
-            err.contains("web chat token must register as channel_type"),
+            err.contains("web chat must register as channel_type"),
             "got: {err}",
         );
     }

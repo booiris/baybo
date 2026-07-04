@@ -1,12 +1,9 @@
 //! Integration coverage for the admin-side `/v1/chat/*` REST surface.
 //!
 //! Spins a tower-style admin router (no TCP listener) and walks the
-//! happy path: create session → mint credential → list shows it →
-//! get returns transcript → refresh issues a fresh token (the old
-//! one stays live so concurrent tabs don't revoke each other) →
-//! DELETE hides the row (the session itself stays on the server,
-//! only the chat list filters it) → unhide restores it to the
-//! default listing.
+//! happy path: create session → list shows it → get returns transcript →
+//! DELETE hides the row (the session itself stays on the server, only the
+//! chat list filters it) → unhide restores it to the default listing.
 
 use std::sync::Arc;
 
@@ -14,7 +11,6 @@ use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use baybo_channels::ChannelKind;
 use baybo_config::ChannelsConfig;
-use baybo_gateway::auth::WEB_CLIENT_LABEL_PREFIX;
 use baybo_gateway::channel::boot;
 use baybo_gateway::test_support::build_test_deps;
 use baybo_model::{ChatMessage, ContentBlock, SessionId};
@@ -33,27 +29,14 @@ async fn chat_api_round_trip() {
     // ── 1. Create a session ────────────────────────────────────────
     let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
     let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
-    let token = cred["channel_token"]
-        .as_str()
-        .expect("channel_token")
-        .to_owned();
-    assert!(!token.is_empty(), "minted token should be non-empty");
     assert!(
-        cred["channel_token_header"].is_string(),
-        "credential carries the header name",
+        cred.get("channel_token").is_none(),
+        "web chat now reuses the admin bearer instead of minting a channel token",
     );
-
-    // The token is alive in the live channel_tokens table.
-    let identity = state
-        .channel_tokens
-        .lookup(&token)
-        .expect("token must be live in the table");
     assert!(
-        identity.label.starts_with(WEB_CLIENT_LABEL_PREFIX),
-        "label is web/<uuid>: got {}",
-        identity.label,
+        cred.get("channel_token_header").is_none(),
+        "no channel-token header is returned",
     );
-    assert_eq!(identity.bound_channel_type.as_deref(), Some("http"));
 
     // ── 2. List shows it ───────────────────────────────────────────
     let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
@@ -80,32 +63,7 @@ async fn chat_api_round_trip() {
         "transcript is empty on a fresh session",
     );
 
-    // ── 4. Refresh issues a fresh token, leaves the old one live ────
-    // Two tabs against the same anchor session must each keep their
-    // own working token — keying the handle map by token (not
-    // session_id) is what prevents the second mint from revoking the
-    // first tab's bearer.
-    let refreshed = post(
-        &router,
-        &format!("/v1/chat/sessions/{session_id}/token"),
-        Body::empty(),
-        StatusCode::OK,
-    )
-    .await;
-    let new_token = refreshed["channel_token"]
-        .as_str()
-        .expect("refreshed token");
-    assert_ne!(new_token, token, "refresh must mint a fresh token");
-    assert!(
-        state.channel_tokens.lookup(&token).is_some(),
-        "old token must stay live after refresh so the sibling tab's WS keeps working",
-    );
-    assert!(
-        state.channel_tokens.lookup(new_token).is_some(),
-        "new token must be live after refresh",
-    );
-
-    // ── 5. Slash manifest exposes /compact but hides /new ───────────
+    // ── 4. Slash manifest exposes /compact but hides /new ───────────
     let manifest = get(&router, "/v1/chat/slash-manifest", StatusCode::OK).await;
     let manifest_items = manifest["items"].as_array().expect("items");
     assert!(
@@ -125,7 +83,7 @@ async fn chat_api_round_trip() {
         "web composer should not see /new — it has a 'New chat' button instead, got {commands:?}",
     );
 
-    // ── 6. DELETE hides — row + token both stay live ────────────────
+    // ── 5. DELETE hides — row stays live ───────────────────────────
     let response = router
         .clone()
         .oneshot(
@@ -138,11 +96,6 @@ async fn chat_api_round_trip() {
         .await
         .expect("router responds");
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert!(
-        state.channel_tokens.lookup(new_token).is_some(),
-        "token must still be live — hide is a soft filter, not a revocation",
-    );
-
     // GET still returns the row, with hidden = true.
     let detail = get(
         &router,
@@ -176,7 +129,7 @@ async fn chat_api_round_trip() {
         .expect("hidden row should show up under include_hidden");
     assert_eq!(hidden_row["hidden"].as_bool(), Some(true));
 
-    // ── 7. Unhide brings it back into the default list ──────────────
+    // ── 6. Unhide brings it back into the default list ──────────────
     let unhide = post(
         &router,
         &format!("/v1/chat/sessions/{session_id}/unhide"),
@@ -224,8 +177,6 @@ fn build_admin_state(
         channel_bot_store: tg.deps.stores.channel_bot.clone(),
         channel_control: Arc::clone(&tg.deps.channel_control),
         secret_vault: Arc::clone(&tg.deps.secret_vault),
-        channel_tokens: tg.deps.channel_tokens.clone(),
-        web_chat_tokens: Arc::clone(&tg.deps.web_chat_tokens),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     }
 }
