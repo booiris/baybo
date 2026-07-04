@@ -14,7 +14,7 @@ use baybo_channels::{
     AgentEvent, AgentOutput, ChannelKind, MessageRole, OutgoingMessage, RouterInbound,
 };
 use baybo_config::ChannelsConfig;
-use baybo_gateway::auth::WEB_OPERATOR_USER_ID;
+use baybo_gateway::auth::{DEVICE_ID_HEADER, WEB_OPERATOR_USER_ID};
 use baybo_gateway::channel::boot;
 use baybo_gateway::server::{GatewayDeps, build_admin_router_for_tests};
 use baybo_gateway::test_support::build_test_deps;
@@ -24,6 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 async fn start_admin_ws_server(
     deps: &GatewayDeps,
@@ -49,10 +50,25 @@ async fn connect_register(
     channel_type: ChannelType,
 ) -> Result<tokio_tungstenite::WebSocketStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>>
 {
+    connect_register_with_device_header(port, token, channel_type, None).await
+}
+
+async fn connect_register_with_device_header(
+    port: u16,
+    token: &str,
+    channel_type: ChannelType,
+    device_id: Option<&str>,
+) -> Result<tokio_tungstenite::WebSocketStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>>
+{
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let stream = TcpStream::connect(addr).await?;
     let url = format!("ws://127.0.0.1:{port}/v1/channel-ws?token={token}");
-    let request = url.into_client_request()?;
+    let mut request = url.into_client_request()?;
+    if let Some(device_id) = device_id {
+        request
+            .headers_mut()
+            .insert(DEVICE_ID_HEADER, HeaderValue::from_str(device_id)?);
+    }
     let (mut ws, _) = client_async(request, stream).await?;
 
     let frame = Frame::Register {
@@ -259,6 +275,55 @@ async fn admin_token_attaches_web_chat_and_receives_dispatch() {
     }
 
     drop(client);
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_token_with_device_header_registers_device_channel() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let cfg = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+
+    let shutdown = tg.shutdown.clone();
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
+
+    let device_key = device_proto::delegation::generate_signing_key();
+    let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
+    let mut client = connect_register_with_device_header(
+        port,
+        &tg.deps.admin_token,
+        ChannelType::device(),
+        Some(&device_id),
+    )
+    .await
+    .expect("device WS handshake");
+
+    let device_channel = tg
+        .deps
+        .channel_registry
+        .get(&ChannelType::device())
+        .expect("device channel installed");
+    assert_eq!(device_channel.kind(), ChannelKind::Subscribed);
+    assert_eq!(device_channel.connection_count(), 1);
+
+    let rejected = connect_register_with_device_header(
+        port,
+        &tg.deps.admin_token,
+        ChannelType::http(),
+        Some(&device_id),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        rejected.contains("device token must register as channel_type 'device'"),
+        "device identity must not be allowed to claim http: {rejected}",
+    );
+
+    client.close(None).await.expect("close client");
     shutdown.trigger();
     let _ = server_handle.await;
 }
@@ -1002,12 +1067,13 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
     // Mix of rows: visible bubbles + agent-internal rows that the
     // catch-up replay must skip.
     let rows: &[ChatMessage] = &[
-        ChatMessage::user(vec![ContentBlock::Text("hi".into())]).with_platform_msg_id("ios-msg-0"),
+        ChatMessage::user(vec![ContentBlock::Text("hi".into())])
+            .with_platform_msg_id("device-msg-0"),
         // Agent-injected user-role reminder — must NOT replay.
         ChatMessage::agent_context(vec![ContentBlock::Text("[skill reminder]".into())]),
         ChatMessage::assistant(vec![ContentBlock::Text("hello there".into())]),
         ChatMessage::user(vec![ContentBlock::Text("how are you".into())])
-            .with_platform_msg_id("ios-msg-3"),
+            .with_platform_msg_id("device-msg-3"),
         // Tool-result row — must NOT replay.
         ChatMessage::tool_result("t1".into(), "ok".into()),
         ChatMessage::assistant(vec![ContentBlock::Text("doing well".into())]),
@@ -1076,7 +1142,7 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
                 3,
                 "how are you".to_string(),
                 MessageRole::User,
-                "ios-msg-3".to_string()
+                "device-msg-3".to_string()
             ),
             (
                 5,
@@ -1118,11 +1184,12 @@ async fn fetch_history_returns_backward_page_of_visible_rows() {
     // Same mix as the catch-up test: visible bubbles interleaved with
     // agent-internal rows the history page must filter out.
     let rows: &[ChatMessage] = &[
-        ChatMessage::user(vec![ContentBlock::Text("hi".into())]).with_platform_msg_id("ios-msg-0"),
+        ChatMessage::user(vec![ContentBlock::Text("hi".into())])
+            .with_platform_msg_id("device-msg-0"),
         ChatMessage::agent_context(vec![ContentBlock::Text("[skill reminder]".into())]),
         ChatMessage::assistant(vec![ContentBlock::Text("hello there".into())]),
         ChatMessage::user(vec![ContentBlock::Text("how are you".into())])
-            .with_platform_msg_id("ios-msg-3"),
+            .with_platform_msg_id("device-msg-3"),
         ChatMessage::tool_result("t1".into(), "ok".into()),
         ChatMessage::assistant(vec![ContentBlock::Text("doing well".into())]),
     ];
@@ -1205,7 +1272,7 @@ async fn fetch_history_returns_backward_page_of_visible_rows() {
                 0,
                 "hi".to_string(),
                 MessageRole::User,
-                "ios-msg-0".to_string()
+                "device-msg-0".to_string()
             ),
             (
                 2,
@@ -1217,7 +1284,7 @@ async fn fetch_history_returns_backward_page_of_visible_rows() {
                 3,
                 "how are you".to_string(),
                 MessageRole::User,
-                "ios-msg-3".to_string()
+                "device-msg-3".to_string()
             ),
             (
                 5,

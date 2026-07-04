@@ -12,15 +12,15 @@
 //! C verifies with **no stored secret and no trust-on-first-use**:
 //!
 //! - The **device** (P) holds an Ed25519 identity key `D`. Its `device_id` *is*
-//!   that public key (`ios-<hex(D_pub)>`), so C re-derives `device_id` from the
-//!   key carried in the request and the binding self-certifies.
+//!   that public key (`device-<hex(D_pub)>`), so C re-derives `device_id` from
+//!   the key carried in the request and the binding self-certifies.
 //! - At pairing P signs a **delegation** authorizing the gateway's Ed25519 push
 //!   key `G` to manage P's binding.
 //! - The **gateway** (A) signs each `/register` and `/notify` with `G`, including
 //!   a strictly-increasing `counter` for replay rejection.
 //!
-//! C checks: `device_id == ios-<hex(D_pub)>`, the delegation under `D_pub`, and
-//! the request signature under `G_pub`. Only the holder of `D` can authorize a
+//! C checks: `device_id == device-<hex(D_pub)>`, the delegation under `D_pub`,
+//! and the request signature under `G_pub`. Only the holder of `D` can authorize a
 //! `G`, and only the holder of `G` can mutate/notify the binding — independent of
 //! relay admission. C (a separate Cargo workspace that cannot link this
 //! crate) re-implements verification against this byte layout. The domain-
@@ -39,7 +39,7 @@ use crate::error::ProtoError;
 
 /// `device_id` text prefix. The remainder is `hex(D_pub)` (32 Ed25519 public
 /// bytes → 64 lowercase hex chars).
-pub const DEVICE_ID_PREFIX: &str = "ios-";
+pub const DEVICE_ID_PREFIX: &str = "device-";
 /// Ed25519 public key length.
 pub const PUBLIC_LEN: usize = 32;
 /// Ed25519 signature length.
@@ -63,7 +63,7 @@ pub fn generate_signing_key() -> SigningKey {
     key
 }
 
-/// The `device_id` for a device verifying key: `ios-<hex(pub)>`. This is the
+/// The `device_id` for a device verifying key: `device-<hex(pub)>`. This is the
 /// only place the mapping is defined; C re-derives the same string and compares.
 pub fn device_id_for(device_pub: &VerifyingKey) -> String {
     format!("{DEVICE_ID_PREFIX}{}", hex::encode(device_pub.to_bytes()))
@@ -213,7 +213,7 @@ mod tests {
     fn device_id_round_trips_through_key() {
         let d = generate_signing_key();
         let id = device_id_for(&d.verifying_key());
-        assert!(id.starts_with("ios-"));
+        assert!(id.starts_with("device-"));
         assert_eq!(id.len(), DEVICE_ID_PREFIX.len() + PUBLIC_LEN * 2);
         let recovered = device_pubkey_from_id(&id).unwrap();
         assert_eq!(recovered, d.verifying_key());
@@ -222,8 +222,8 @@ mod tests {
     #[test]
     fn malformed_device_ids_are_rejected() {
         assert!(device_pubkey_from_id("nope-deadbeef").is_err()); // wrong prefix
-        assert!(device_pubkey_from_id("ios-zz").is_err()); // not hex
-        assert!(device_pubkey_from_id("ios-00").is_err()); // wrong length
+        assert!(device_pubkey_from_id("device-zz").is_err()); // not hex
+        assert!(device_pubkey_from_id("device-00").is_err()); // wrong length
     }
 
     #[test]
@@ -257,13 +257,27 @@ mod tests {
     fn register_signature_binds_every_field() {
         let gateway = generate_signing_key();
         let gp = gateway.verifying_key();
-        let sig = sign_register(&gateway, "ios-aa", "tok", ENV_SANDBOX, 7);
-        assert!(verify_register(&gp, "ios-aa", "tok", ENV_SANDBOX, 7, &sig));
+        let sig = sign_register(&gateway, "device-aa", "tok", ENV_SANDBOX, 7);
+        assert!(verify_register(
+            &gp,
+            "device-aa",
+            "tok",
+            ENV_SANDBOX,
+            7,
+            &sig
+        ));
         // Each field is covered: flipping any one breaks verification.
-        assert!(!verify_register(&gp, "ios-bb", "tok", ENV_SANDBOX, 7, &sig));
         assert!(!verify_register(
             &gp,
-            "ios-aa",
+            "device-bb",
+            "tok",
+            ENV_SANDBOX,
+            7,
+            &sig
+        ));
+        assert!(!verify_register(
+            &gp,
+            "device-aa",
             "tok2",
             ENV_SANDBOX,
             7,
@@ -271,32 +285,71 @@ mod tests {
         ));
         assert!(!verify_register(
             &gp,
-            "ios-aa",
+            "device-aa",
             "tok",
             ENV_PRODUCTION,
             7,
             &sig
         ));
-        assert!(!verify_register(&gp, "ios-aa", "tok", ENV_SANDBOX, 8, &sig));
+        assert!(!verify_register(
+            &gp,
+            "device-aa",
+            "tok",
+            ENV_SANDBOX,
+            8,
+            &sig
+        ));
     }
 
     #[test]
     fn notify_signature_binds_every_field() {
         let gateway = generate_signing_key();
         let gp = gateway.verifying_key();
-        let sig = sign_notify(&gateway, "ios-aa", "enc", "n", "ios-aa", 42);
-        assert!(verify_notify(&gp, "ios-aa", "enc", "n", "ios-aa", 42, &sig));
-        assert!(!verify_notify(
-            &gp, "ios-aa", "enc2", "n", "ios-aa", 42, &sig
+        let sig = sign_notify(&gateway, "device-aa", "enc", "n", "device-aa", 42);
+        assert!(verify_notify(
+            &gp,
+            "device-aa",
+            "enc",
+            "n",
+            "device-aa",
+            42,
+            &sig
         ));
         assert!(!verify_notify(
-            &gp, "ios-aa", "enc", "n2", "ios-aa", 42, &sig
+            &gp,
+            "device-aa",
+            "enc2",
+            "n",
+            "device-aa",
+            42,
+            &sig
         ));
         assert!(!verify_notify(
-            &gp, "ios-aa", "enc", "n", "ios-bb", 42, &sig
+            &gp,
+            "device-aa",
+            "enc",
+            "n2",
+            "device-aa",
+            42,
+            &sig
         ));
         assert!(!verify_notify(
-            &gp, "ios-aa", "enc", "n", "ios-aa", 43, &sig
+            &gp,
+            "device-aa",
+            "enc",
+            "n",
+            "device-bb",
+            42,
+            &sig
+        ));
+        assert!(!verify_notify(
+            &gp,
+            "device-aa",
+            "enc",
+            "n",
+            "device-aa",
+            43,
+            &sig
         ));
     }
 
@@ -306,8 +359,16 @@ mod tests {
         // with otherwise-matching fields — the domain-separation contexts differ.
         let gateway = generate_signing_key();
         let gp = gateway.verifying_key();
-        let reg = sign_register(&gateway, "ios-aa", "x", ENV_SANDBOX, 1);
-        assert!(!verify_notify(&gp, "ios-aa", "x", "x", "ios-aa", 1, &reg));
+        let reg = sign_register(&gateway, "device-aa", "x", ENV_SANDBOX, 1);
+        assert!(!verify_notify(
+            &gp,
+            "device-aa",
+            "x",
+            "x",
+            "device-aa",
+            1,
+            &reg
+        ));
     }
 
     /// Pin the wire byte layout to fixed vectors. The remote-host push crate
@@ -321,7 +382,7 @@ mod tests {
         let device_id = device_id_for(&device.verifying_key());
         assert_eq!(
             device_id,
-            "ios-8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+            "device-8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
         );
         assert_eq!(
             hex::encode(gateway.verifying_key().to_bytes()),
@@ -335,13 +396,13 @@ mod tests {
             hex::encode(
                 sign_register(&gateway, &device_id, "apns-tok", ENV_SANDBOX, 42).to_bytes()
             ),
-            "29f370f97837868aafc24f4d99fc02971a342416c534d5e569115bfecb42df48933b5a6afe3d88b8d3391c72ce69fb3c32324dc170b6bf587e1b65b0aa4d320a"
+            "bd2f828205bcdf66a7676b9a073e74b2ad546de3577adff293ac63eb65f81c2623e1d9e7cbfb2bd66038413f73a0731e62f979b719aac5db8aee2f3c66c28b02"
         );
         assert_eq!(
             hex::encode(
                 sign_notify(&gateway, &device_id, "ZW5j", "bm9uY2U", &device_id, 42).to_bytes()
             ),
-            "8f96a51b0b1d2fcceff1f851039229aa888e420ec6614ff227419ea9a287ecda9817261179bc35a0efebe3337875a731a2c731f9035fdc8fd64eb988d250ee01"
+            "0cfd42d4b7af3d5c361993a4c9adb0afcf416931b900f57d3dab37a88c00ea801c2a3a3ca61062178a2958793c50938a1303e1b6ab7c3770df6e7bab31a13a0f"
         );
     }
 

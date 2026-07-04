@@ -36,7 +36,7 @@ pub(crate) const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// process per view = `Subscribed`), not from operator preference.
 fn kind_for(channel_type: &ChannelType) -> ChannelKind {
     match channel_type.as_str() {
-        ChannelType::HTTP | ChannelType::TUI | ChannelType::IOS => ChannelKind::Subscribed,
+        ChannelType::HTTP | ChannelType::TUI | ChannelType::DEVICE => ChannelKind::Subscribed,
         ChannelType::TELEGRAM | ChannelType::DISCORD | ChannelType::WEIXIN => {
             ChannelKind::Multiplexed
         }
@@ -74,11 +74,11 @@ pub fn install_channels(
     // [`install_channel`] so the lazy-install fallback in
     // [`super::adapter::Sidecar::build`] can never miss it either.
     install_channel(registry, ChannelType::http())?;
-    // The iOS companion is a `Subscribed` channel like `http`: paired devices
-    // register as `ios` and self-pull threads via `Frame::Subscribe`. Always
+    // The mobile companion device channel is `Subscribed` like `http`: paired
+    // devices register as `device` and self-pull threads via `Frame::Subscribe`. Always
     // installed — the device-auth gate (an approved `auth_token`) is what
     // actually admits a connection, so the waiting channel costs nothing.
-    install_channel(registry, ChannelType::ios())?;
+    install_channel(registry, ChannelType::device())?;
     Ok(())
 }
 
@@ -173,7 +173,7 @@ mod tests {
     fn kind_for_known_types() {
         assert!(kind_for(&ChannelType::http()).is_subscribed());
         assert!(kind_for(&ChannelType::tui()).is_subscribed());
-        assert!(kind_for(&ChannelType::ios()).is_subscribed());
+        assert!(kind_for(&ChannelType::device()).is_subscribed());
         assert!(kind_for(&ChannelType::telegram()).is_multiplexed());
         assert!(kind_for(&ChannelType::weixin()).is_multiplexed());
         assert!(kind_for(&ChannelType::discord()).is_multiplexed());

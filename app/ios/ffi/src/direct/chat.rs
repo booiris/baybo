@@ -4,10 +4,10 @@
 //!
 //! The generic frame pump + session lifecycle live in [`crate::transport`]; this
 //! file is just the direct-specific seams: [`DirectSessions::establish`] (dial
-//! with the stored admin Bearer, run the web `Register`/`RegisterAck` handshake)
-//! and [`DirectCodec`] (encode/decode). Auth matches browser web chat: the admin
-//! listener validates the Bearer on the HTTP upgrade, then marks the connection
-//! as `AuthedClient::Web`.
+//! with the stored gateway Bearer plus device id header, run the device
+//! `Register`/`RegisterAck` handshake) and [`DirectCodec`] (encode/decode). The
+//! admin listener validates the Bearer + device id header on the HTTP upgrade,
+//! then marks the connection as `AuthedClient::Device`.
 
 use futures_util::SinkExt;
 use tokio_tungstenite::connect_async;
@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use super::rest;
 use crate::core::{
-    Frame, MobileError, decode, encode, register_http_frame, web_user_message_frame,
+    Frame, MobileError, decode, encode, register_device_frame, user_message_frame,
 };
 use crate::transport::{
     ChatTransport, Connection, FrameCodec, SessionLeg, SessionRegistry, TransportError,
@@ -48,6 +48,7 @@ impl FrameCodec for DirectCodec {
 }
 
 impl ChatTransport for DirectSessions {
+    #[allow(clippy::manual_async_fn)]
     fn establish(
         &self,
     ) -> impl std::future::Future<Output = Result<Connection, TransportError>> + Send {
@@ -60,14 +61,16 @@ impl ChatTransport for DirectSessions {
                 .ok_or_else(|| {
                     TransportError::Precondition("not connected; sign in first".into())
                 })?;
-            let ws = self.establish_ws(&creds).await?;
+            let device_id = super::device_id().map_err(TransportError::Precondition)?;
+            let ws = self.establish_ws(&creds, &device_id).await?;
 
             let codec: Box<dyn FrameCodec> = Box::new(DirectCodec);
 
-            // Direct user messages register as a web client (`web-operator` +
-            // `channel_type=http`).
+            // Direct user messages carry the device id + `channel_type=device`,
+            // matching the relay content leg while still using the admin-bearer
+            // direct transport.
             let user_frame: UserFrameFn = Box::new(move |session_id, text, msg_id, attachments| {
-                web_user_message_frame(session_id, text, msg_id, attachments)
+                user_message_frame(session_id, &device_id, text, msg_id, attachments)
             });
 
             Ok(Connection {
@@ -81,12 +84,13 @@ impl ChatTransport for DirectSessions {
 }
 
 impl DirectSessions {
-    /// Complete the WS handshake as the admin-authenticated web client.
+    /// Complete the WS handshake as the admin-authenticated direct device.
     async fn establish_ws(
         &self,
         creds: &super::DirectCredentials,
+        device_id: &str,
     ) -> Result<WsStream, TransportError> {
-        match dial_and_register(&creds.base_url, &creds.token).await {
+        match dial_and_register(&creds.base_url, &creds.token, device_id).await {
             Ok(ws) => Ok(ws),
             Err(DialErr::Unauthorized) => {
                 Err(TransportError::Other(super::INVALID_TOKEN_CODE.to_string()))
@@ -121,17 +125,25 @@ enum DialErr {
     Other(String),
 }
 
-/// Dial `/v1/channel-ws` with the admin Bearer, then run the web Register /
+/// Dial `/v1/channel-ws` with the gateway Bearer, then run the device Register /
 /// RegisterAck handshake.
-async fn dial_and_register(base_url: &str, admin_token: &str) -> Result<WsStream, DialErr> {
+async fn dial_and_register(
+    base_url: &str,
+    access_token: &str,
+    device_id: &str,
+) -> Result<WsStream, DialErr> {
     let url = super::channel_ws_url(base_url).map_err(DialErr::Other)?;
     let mut req = url
         .as_str()
         .into_client_request()
         .map_err(|e| DialErr::Other(format!("bad ws url: {e}")))?;
-    let value = HeaderValue::from_str(&format!("Bearer {admin_token}"))
-        .map_err(|e| DialErr::Other(format!("bad admin token: {e}")))?;
+    let value = HeaderValue::from_str(&format!("Bearer {access_token}"))
+        .map_err(|e| DialErr::Other(format!("bad access token: {e}")))?;
     req.headers_mut().insert(AUTHORIZATION, value);
+    let device_id_value = HeaderValue::from_str(device_id)
+        .map_err(|e| DialErr::Other(format!("bad device id: {e}")))?;
+    req.headers_mut()
+        .insert(super::DEVICE_ID_HEADER, device_id_value);
 
     let mut ws = match connect_async(req).await {
         Ok((ws, _)) => ws,
@@ -141,7 +153,7 @@ async fn dial_and_register(base_url: &str, admin_token: &str) -> Result<WsStream
         Err(e) => return Err(DialErr::Other(format!("ws connect: {e}"))),
     };
 
-    let register = encode(&register_http_frame())
+    let register = encode(&register_device_frame())
         .map_err(|e| DialErr::Other(format!("encode register: {e}")))?;
     ws.send(Message::Binary(register))
         .await

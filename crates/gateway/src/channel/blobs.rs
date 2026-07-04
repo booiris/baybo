@@ -29,7 +29,7 @@ use crate::auth::AuthedClient;
 pub(crate) const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024;
 const DEFAULT_BLOB_MIME: &str = "application/octet-stream";
 const HEADER_CONTENT_SHA256: &str = "x-baybo-content-sha256";
-const DEVICE_UPLOAD_IDENTITY_PREFIX: &str = "ios-device:";
+const DEVICE_UPLOAD_IDENTITY_PREFIX: &str = "device:";
 
 /// Sidecar-supplied originator identity. The sidecar fills these in
 /// from the inbound platform event so the gateway can run the same
@@ -71,7 +71,7 @@ enum UploadAuth {
         bot_id: String,
         user_id: String,
     },
-    /// Approved iOS companion device. Device uploads are not per-bot/per-user, but
+    /// Approved companion device. Device uploads are not per-bot/per-user, but
     /// still carry a durable uploader marker for diagnostics.
     Device { device_id: String },
     /// Subprocess sidecar; pairing not yet approved. Body contains the

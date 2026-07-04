@@ -8,11 +8,16 @@
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::Extension;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode, header};
 use axum::middleware;
 use axum::routing::get;
 use baybo_gateway::auth::admin::{AdminAuthState, require_admin_token};
+use baybo_gateway::auth::{AuthedClient, DEVICE_ID_HEADER};
+use baybo_storage::test_support::MemoryDeviceStore;
+use baybo_store::{DeviceRow, DeviceStatus, DeviceStore};
+use std::sync::Arc;
 use tower::ServiceExt;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -23,11 +28,23 @@ async fn echo_uri(req: Request) -> String {
     req.uri().to_string()
 }
 
-fn app() -> Router {
-    let state = AdminAuthState::new(TOKEN.to_owned());
+async fn echo_identity(Extension(authed): Extension<AuthedClient>) -> &'static str {
+    match authed {
+        AuthedClient::Web => "web",
+        AuthedClient::Device { .. } => "device",
+        AuthedClient::Tui | AuthedClient::Tool { .. } | AuthedClient::Subprocess { .. } => "other",
+    }
+}
+
+fn app_with_state(state: AdminAuthState) -> Router {
     Router::new()
         .route("/v1/ping", get(echo_uri))
+        .route("/v1/who", get(echo_identity))
         .layer(middleware::from_fn_with_state(state, require_admin_token))
+}
+
+fn app() -> Router {
+    app_with_state(AdminAuthState::new(TOKEN.to_owned()))
 }
 
 fn req(method: Method, uri: &str, token_header: Option<&str>) -> Request<Body> {
@@ -36,6 +53,36 @@ fn req(method: Method, uri: &str, token_header: Option<&str>) -> Request<Body> {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {tok}"));
     }
     builder.body(Body::empty()).expect("request")
+}
+
+fn device_req(uri: &str, token: &str, device_id: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(DEVICE_ID_HEADER, device_id)
+        .body(Body::empty())
+        .expect("request")
+}
+
+fn device_id() -> String {
+    let key = device_proto::delegation::generate_signing_key();
+    device_proto::delegation::device_id_for(&key.verifying_key())
+}
+
+fn approved_device(device_id: &str, auth_token: &str) -> DeviceRow {
+    DeviceRow {
+        device_id: device_id.into(),
+        device_pubkey: vec![0u8; 32],
+        auth_token: auth_token.into(),
+        status: DeviceStatus::Approved,
+        rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
+        created_at: 1,
+        approved_at: Some(2),
+        last_seen_at: None,
+        relay_url: "wss://relay.test".into(),
+        remote_api_key: "inst-test".into(),
+    }
 }
 
 #[tokio::test]
@@ -124,4 +171,85 @@ async fn header_beats_query_on_mismatch() {
         .await
         .expect("oneshot");
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_token_with_device_header_marks_device() {
+    let id = device_id();
+    let resp = app()
+        .oneshot(device_req("/v1/who", TOKEN, &id))
+        .await
+        .expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1024)
+        .await
+        .expect("body");
+    assert_eq!(std::str::from_utf8(&body).expect("utf8"), "device");
+}
+
+#[tokio::test]
+async fn device_token_with_matching_device_header_marks_device() {
+    let id = device_id();
+    let store = Arc::new(MemoryDeviceStore::new());
+    store
+        .create(&approved_device(&id, "device-token"))
+        .await
+        .expect("seed device");
+    let state = AdminAuthState::new(TOKEN.to_owned()).with_device_store(store);
+
+    let resp = app_with_state(state)
+        .oneshot(device_req("/v1/who", "device-token", &id))
+        .await
+        .expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1024)
+        .await
+        .expect("body");
+    assert_eq!(std::str::from_utf8(&body).expect("utf8"), "device");
+}
+
+#[tokio::test]
+async fn device_token_with_mismatched_device_header_is_unauthorized() {
+    let id = device_id();
+    let other = device_id();
+    let store = Arc::new(MemoryDeviceStore::new());
+    store
+        .create(&approved_device(&id, "device-token"))
+        .await
+        .expect("seed device");
+    let state = AdminAuthState::new(TOKEN.to_owned()).with_device_store(store);
+
+    let resp = app_with_state(state)
+        .oneshot(device_req("/v1/who", "device-token", &other))
+        .await
+        .expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn device_token_without_device_header_is_unauthorized() {
+    let id = device_id();
+    let store = Arc::new(MemoryDeviceStore::new());
+    store
+        .create(&approved_device(&id, "device-token"))
+        .await
+        .expect("seed device");
+    let state = AdminAuthState::new(TOKEN.to_owned()).with_device_store(store);
+
+    let resp = app_with_state(state)
+        .oneshot(req(Method::GET, "/v1/who", Some("device-token")))
+        .await
+        .expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn malformed_device_header_is_bad_request() {
+    let resp = app()
+        .oneshot(device_req("/v1/who", TOKEN, "device-1"))
+        .await
+        .expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

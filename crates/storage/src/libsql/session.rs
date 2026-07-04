@@ -1515,9 +1515,9 @@ mod tests {
         store.save(&session).await.unwrap();
 
         let msg = baybo_model::ChatMessage::user(vec![baybo_model::ContentBlock::Text(
-            "from ios".into(),
+            "from device".into(),
         )])
-        .with_platform_msg_id("ios-msg-1");
+        .with_platform_msg_id("device-msg-1");
         store
             .append_session_message(&session.id, &msg)
             .await
@@ -1526,7 +1526,7 @@ mod tests {
             .load_active_session_messages(&session.id)
             .await
             .unwrap();
-        assert_eq!(loaded[0].platform_msg_id(), "ios-msg-1");
+        assert_eq!(loaded[0].platform_msg_id(), "device-msg-1");
 
         pool.conn()
             .execute(

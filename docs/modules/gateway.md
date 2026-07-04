@@ -9,12 +9,13 @@ by side against the same manager graph:
    operator controls (config, jobs, cron, traces, skills, tools,
    channels-list, llm, status) that mirror the CLI command families, plus
    the `/v1/chat/*` web-chat family that backs the embedded React
-   dashboard. The admin listener also **co-hosts** the admin-bearer-
+   dashboard. The admin listener also **co-hosts** the admin/device-
    authed `/v1/channel-ws` + `/v1/blobs` subrouter (see
    `build_admin_router` in `src/server.rs`) so a browser chat tab loaded
    from the admin origin can open its WebSocket without discovering the
-   loopback port. The co-hosted subrouter accepts the same admin bearer
-   as the rest of the dashboard surface. The admin/channel split is about
+   loopback port. The co-hosted subrouter accepts the same admin bearer as
+   the rest of the dashboard surface, or an approved device bearer when
+   paired with `x-baybo-device-id`. The admin/channel split is about
    *which credential* gates a route, not a hard "no session data here"
    boundary.
 2. **Channel listener** — loopback TCP (`127.0.0.1:<ephemeral>`),
@@ -187,7 +188,7 @@ Token comparison differs by listener:
 deliberately per the above. `/healthz` and `/readyz` skip auth on both
 listeners.
 
-### Web chat auth — admin bearer
+### Web/device chat auth — bearer plus identity claim
 
 Browser chat tabs use the same admin bearer as the rest of the React
 dashboard. REST calls carry `Authorization: Bearer <admin_token>`.
@@ -196,6 +197,19 @@ Browser `WebSocket` cannot set request headers, so the web client opens
 validates the bearer, strips the query token before tracing, and marks
 the request as `AuthedClient::Web`. The WebSocket Register handshake
 then constrains that identity to the reserved `http` channel.
+
+Direct device clients add `x-baybo-device-id: device-<hex(ed25519 pub)>` on every
+`/v1/*` call. The header is only an identity claim: admin auth accepts it
+only when the bearer is either the admin token or the matching approved
+device `auth_token` in `DeviceStore`. Once accepted, the request is tagged
+as `AuthedClient::Device { device_id }`, so chat REST is scoped to the
+`device` channel, `/v1/channel-ws` must register as `device`, and `/v1/blobs`
+stamps uploads with `device:<device_id>`.
+Relay-mode device clients reach the same `v1_router_and_spec()` surface through
+the Noise-authenticated API tunnel. After the IK device handshake, the
+gateway injects `Authorization: Bearer <device auth_token>` plus
+`x-baybo-device-id` before dispatching into the in-process router, so relay
+and direct requests resolve identity through the same admin auth path.
 
 The loopback channel listener remains channel-token-only for the TUI,
 tool sidecars, and subprocess sidecars. The admin listener's co-hosted
@@ -578,11 +592,13 @@ GET    /v1/openapi.json                 live OpenAPI 3.1 document for the admin 
 ```
 
 `/v1/chat/*` is the web-chat family (`api/admin/chat.rs`, OpenAPI tag
-`chat`). Despite the admin bearer in front of these routes, they read and
-write session rows and transcripts — the admin/channel split is by
-credential, not by "session data never touches admin". The web client
-uses the same admin bearer for REST, blob fetch/upload, and the
-co-hosted `/v1/channel-ws` route on this same admin listener.
+`chat`). Despite the admin/device bearer in front of these routes, they
+read and write session rows and transcripts — the admin/channel split is
+by credential, not by "session data never touches admin". The web client
+uses the admin bearer for REST, blob fetch/upload, and the co-hosted
+`/v1/channel-ws` route on this same admin listener; direct device clients add the
+device header and may use either the admin token or its approved device
+token.
 
 `GET /v1/chat/sessions/:id` returns a typed transcript: each
 `ChatTranscriptItem` is either a `message` (user / final-assistant bubble)
@@ -613,9 +629,10 @@ GET    /v1/blobs/:blob_id               fetch media bytes by blob_id
 The `/v1/channel-ws` + `/v1/blobs` handlers are mounted on **both**
 listeners, but behind different auth middleware. The loopback channel
 listener uses channel tokens for the TUI and subprocess sidecars. The
-admin listener uses the same admin bearer as the rest of the dashboard, so
-a browser chat tab loaded from the admin origin can open the WS without
-discovering the ephemeral loopback port or minting a second credential.
+admin listener uses the admin/device bearer path: browser chat tabs with
+only the admin token are marked `Web`, while direct device requests carrying
+`x-baybo-device-id` are marked `Device` only if the bearer is the admin
+token or that device's approved auth token.
 
 The WS protocol is defined by [`baybo_channels::wire::Frame`]
 (tagged on `kind`, MessagePack-named). The client opens with a
@@ -624,10 +641,10 @@ chat leaves the legacy `token` field empty because HTTP auth already
 ran); the server validates it via `channel::handshake::validate_register` against
 the [`auth::channel::AuthedClient`] the middleware already attached:
 `Tui` → must claim `"tui"`; `Web` → must claim `"http"` (the only path
-that may claim the reserved `http` type); `Subprocess` → must match the
-minted identity's `(pid, label)`, respect its `bound_channel_type`, and
-claim a non-reserved type; `Tool` → rejected outright (tool sidecars
-don't register channels). The validator returns only the channel type —
+that may claim the reserved `http` type); `Device` → must claim `"device"`;
+`Subprocess` → must match the minted identity's `(pid, label)`, respect
+its `bound_channel_type`, and claim a non-reserved type; `Tool` →
+rejected outright (tool sidecars don't register channels). The validator returns only the channel type —
 per-session interest is negotiated **after** the handshake via
 `Subscribe`, so `Register` carries no `session_id`.
 
@@ -663,7 +680,7 @@ The full frame set (see `crates/channels/src/wire.rs`):
 - **Bot multiplexing (Multiplexed channels):** `StartBot`, `StopBot`
   (server → client), `BotStatus` (client → server), `SlashManifest`
   (server → client).
-- **Web-chat session signalling (http channel):** `SessionUpdated
+- **Chat session signalling (http + device subscribed channels):** `SessionUpdated
   { session_id, patch }` (the `SessionPatch` carries Create/Hide/Unhide
   plus `pinned` and `folder_id` changes), `SessionActivity { session_id,
   source, at }`, `FoldersChanged { folders }` (a full folder-tree snapshot

@@ -130,7 +130,7 @@ impl BayboClient {
         .await
     }
 
-    /// Direct (non-relay) login: validate the gateway base URL + admin token
+    /// Direct (non-relay) login: validate the gateway base URL + access token
     /// against `GET /v1/status`, then persist them. Returns the normalized base
     /// URL.
     pub async fn direct_login(
@@ -180,7 +180,7 @@ impl BayboClient {
 
     /// Create a fresh chat session for the active binding and return its id. Direct
     /// creates a gateway session over REST (the id is server-assigned and the
-    /// admin Bearer continues to authorize WS/blob legs); relay picks a fresh
+    /// stored Bearer continues to authorize WS/blob legs); relay picks a fresh
     /// client id (the relay leg needs no gateway pre-registration).
     pub async fn chat_create_session(self: Arc<Self>) -> Result<String, BayboError> {
         runtime::run(async move {
@@ -225,9 +225,9 @@ impl BayboClient {
 
     /// Subscribe `session_id` on the active binding's global chat leg and stream
     /// frames to `sink`. Relay runs the Noise E2E content leg; direct runs the
-    /// raw-MessagePack `/v1/channel-ws` web-identity leg. `since_ordinal` is the
-    /// highest ordinal already rendered — the gateway replays only the gap above
-    /// it (so a reconnect after a background catches up without re-sending the
+    /// raw-MessagePack `/v1/channel-ws` direct device leg. `since_ordinal`
+    /// is the highest ordinal already rendered — the gateway replays only the
+    /// gap above it (so a reconnect after a background catches up without re-sending the
     /// whole thread); `None` is a fresh subscribe with no catch-up. Both legs
     /// share one pump (see `transport`); only the establish/codec seam differs.
     pub async fn chat_connect(
@@ -253,8 +253,8 @@ impl BayboClient {
     /// Send a user message to `session_id` on the active binding's global chat
     /// leg. `msg_id` is a fresh per-send idempotency key so a retry doesn't
     /// double-fire the agent. `attachments` are content-addressed blobs already
-    /// uploaded over a blob leg (empty for a text-only send). Relay sends as
-    /// device/ios, direct as web-operator/http.
+    /// uploaded over a blob leg (empty for a text-only send). Both relay and
+    /// direct send as the device identity on channel `device`.
     pub async fn chat_send(
         self: Arc<Self>,
         session_id: String,
@@ -321,8 +321,8 @@ impl BayboClient {
 
     /// Upload a picked image's raw bytes over the active binding's blob
     /// transport. Relay sends `POST /v1/blobs` over a dedicated E2E API tunnel
-    /// blob leg; direct POSTs to plain `/v1/blobs` (admin Bearer). Returns the
-    /// content-addressed `blob_id` to reference in the next message.
+    /// blob leg; direct POSTs to plain `/v1/blobs` (Bearer + device id).
+    /// Returns the content-addressed `blob_id` to reference in the next message.
     pub async fn blob_upload_bytes(
         self: Arc<Self>,
         bytes: Vec<u8>,
@@ -341,7 +341,7 @@ impl BayboClient {
     /// transport, returning the verified bytes. Relay sends `GET /v1/blobs/{id}`
     /// over a dedicated E2E API tunnel blob leg into a content-addressed
     /// on-device cache (reused on the next render); direct GETs plain
-    /// `/v1/blobs/{id}` (admin Bearer).
+    /// `/v1/blobs/{id}` (Bearer + device id).
     pub async fn blob_image(self: Arc<Self>, blob_id: String) -> Result<Vec<u8>, BayboError> {
         runtime::run(async move {
             match active_leg()? {

@@ -99,7 +99,7 @@ impl ChatTransport for RelaySessions {
                 );
             }
 
-            // Relay user messages carry the device id + `channel_type=ios`.
+            // Relay user messages carry the device id + `channel_type=device`.
             let device_id = record.device_id.clone();
             let user_frame: UserFrameFn = Box::new(move |session_id, text, msg_id, attachments| {
                 user_message_frame(session_id, &device_id, text, msg_id, attachments)

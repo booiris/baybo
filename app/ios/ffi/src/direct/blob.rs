@@ -1,6 +1,6 @@
 //! Direct-transport attachments over plain HTTP `/v1/blobs`, authenticated with
-//! the stored admin Bearer on the admin listener. The gateway marks these calls
-//! as the web identity; device/ios tokens use the relay blob leg instead.
+//! the stored gateway Bearer plus device id header on the admin listener. The
+//! gateway marks these calls as the direct device identity.
 
 use serde::Deserialize;
 
@@ -14,10 +14,12 @@ fn admin_context() -> Result<(String, String), String> {
 /// Upload raw bytes (`POST /v1/blobs`, mime in `content-type`) → content-addressed
 /// `blob_id` to reference on the next message.
 pub async fn upload_bytes(bytes: Vec<u8>, mime_type: String) -> Result<String, String> {
-    let (base, admin_token) = admin_context()?;
+    let (base, access_token) = admin_context()?;
+    let device_id = super::device_id()?;
     let resp = reqwest::Client::new()
         .post(format!("{base}/v1/blobs"))
-        .bearer_auth(admin_token)
+        .bearer_auth(access_token)
+        .header(super::DEVICE_ID_HEADER, device_id)
         .header(reqwest::header::CONTENT_TYPE, mime_type)
         .body(bytes)
         .send()
@@ -44,7 +46,8 @@ pub async fn upload_bytes(bytes: Vec<u8>, mime_type: String) -> Result<String, S
 /// wrap in an object URL. `blob_id` (`sha256:<hex>.<token>`) is pushed as a single
 /// path segment so its `:` / `.` / token chars are percent-encoded.
 pub async fn image_data(blob_id: String) -> Result<Vec<u8>, String> {
-    let (base, admin_token) = admin_context()?;
+    let (base, access_token) = admin_context()?;
+    let device_id = super::device_id()?;
     let mut url = reqwest::Url::parse(&format!("{base}/v1/blobs"))
         .map_err(|e| format!("bad Baybo address: {e}"))?;
     url.path_segments_mut()
@@ -52,7 +55,8 @@ pub async fn image_data(blob_id: String) -> Result<Vec<u8>, String> {
         .push(&blob_id);
     let resp = reqwest::Client::new()
         .get(url)
-        .bearer_auth(admin_token)
+        .bearer_auth(access_token)
+        .header(super::DEVICE_ID_HEADER, device_id)
         .send()
         .await
         .map_err(|e| format!("could not reach Baybo: {e}"))?;

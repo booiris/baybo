@@ -38,3 +38,7 @@ pub mod pairing;
 pub mod psk_pair;
 
 pub use error::ProtoError;
+
+/// HTTP header a direct admin-bearer device request carries so the gateway can
+/// mark it as the device identity after bearer authentication.
+pub const DEVICE_ID_HEADER: &str = "x-baybo-device-id";

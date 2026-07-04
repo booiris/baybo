@@ -450,7 +450,7 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                         // Recover the in-flight turn's work block (reasoning /
                         // tool steps) this connection missed while disconnected
                         // — the catch-up above only replays persisted message
-                        // bubbles, so a client reconnecting mid-turn (an iOS
+                        // bubbles, so a client reconnecting mid-turn (a device
                         // relay leg resuming after backgrounding) would see a
                         // work block with a hole. Only while a turn is
                         // streaming; the buffer lives on this (Subscribed)
@@ -495,7 +495,7 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
             } => {
                 // Backward transcript paging over the live (Noise-sealed) leg —
                 // the relay equivalent of REST GET /v1/chat/sessions/:id, for
-                // clients (the iOS relay leg) with no admin REST surface.
+                // clients (the device relay leg) with no admin REST surface.
                 // Subscribed-kind only, and the connection must already be
                 // subscribed to the session — parity with the `Message` path
                 // below, not true per-device isolation (since `subscribe` itself
@@ -817,7 +817,7 @@ async fn replay_catch_up(
 /// Serve one **backward** page of `session_id`'s persisted transcript to
 /// this connection only, in response to a [`Frame::FetchHistory`] — the
 /// Noise-sealed relay equivalent of REST `GET /v1/chat/sessions/:id` for
-/// clients (the iOS relay leg) that have no admin REST surface. Where
+/// clients (the device relay leg) that have no admin REST surface. Where
 /// [`replay_catch_up`] pages *forward* (rows above the cursor, streamed as
 /// individual [`Frame::Message`]s) this pages *backward* (rows below
 /// `before_ordinal`, or the newest page when `None`) and replies with a

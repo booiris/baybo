@@ -1,4 +1,4 @@
-//! `/v1/push/*` — admin-side direct-mode (web-identity) push registration.
+//! `/v1/push/*` — admin-side direct-mode device push registration.
 //!
 //! Scan-to-pair devices bootstrap their push binding over the Noise pairing
 //! handshake. The **direct** transport (URL + admin token, no pairing) has no
@@ -12,7 +12,7 @@
 //!    verifies the delegation and persists the binding ([`crate::push::web`]).
 //!
 //! The resulting binding is cryptographically identical to a paired device's, so
-//! the dispatcher, the remote host (C), and the iOS NSE are all unchanged. See
+//! the dispatcher, the remote host (C), and the APNs NSE path are unchanged. See
 //! `docs/modules/mobile/relay-push-security.md` for the (weaker, TLS-bearer)
 //! trust model versus the Noise path.
 
@@ -67,7 +67,7 @@ async fn push_params(State(state): State<AdminState>) -> Result<Json<PushParams>
 /// Request body for `POST /v1/push/register`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RegisterPushRequest {
-    /// The client's self-certifying `device_id` (`ios-<hex(ed25519 pub)>`); the
+    /// The client's self-certifying `device_id` (`device-<hex(ed25519 pub)>`); the
     /// gateway recovers the public key from it and re-derives the canonical id.
     pub device_id: String,
     /// The client's current APNs device token (hex).
@@ -86,7 +86,7 @@ pub struct RegisterPushRequest {
 /// Response of `POST /v1/push/register`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RegisterPushResponse {
-    /// The `ios-<hex(pub)>` id the binding was stored under (== the push `bid`).
+    /// The `device-<hex(pub)>` id the binding was stored under (== the push `bid`).
     pub device_id: String,
 }
 
@@ -119,7 +119,7 @@ async fn register_push(
     let device_pub = delegation::device_pubkey_from_id(req.device_id.trim()).map_err(|_| {
         reject_register(
             &remote_host_protocol::device_id_log(req.device_id.trim()),
-            "device_id is not a valid ios-<hex> identity",
+            "device_id is not a valid device-<hex> identity",
         )
     })?;
     let device_id = delegation::device_id_for(&device_pub);

@@ -1,6 +1,6 @@
-//! Admin-Bearer REST calls the direct transport needs: create a chat session
-//! and list the gateway's chat sessions. The same stored admin Bearer token
-//! also authorizes the direct WS + blob paths on the admin listener.
+//! Bearer REST calls the direct transport needs: create a chat session and list
+//! the gateway's device chat sessions. The stored gateway access token plus device
+//! id header also authorizes the direct WS + blob paths on the admin listener.
 
 use serde::Deserialize;
 
@@ -15,11 +15,13 @@ pub(super) struct ChatSessionCreated {
 /// Create a fresh chat session (`POST /v1/chat/sessions`, empty body).
 pub(super) async fn create_session(
     base: &str,
-    admin_token: &str,
+    access_token: &str,
 ) -> Result<ChatSessionCreated, String> {
+    let device_id = super::device_id()?;
     let resp = reqwest::Client::new()
         .post(format!("{base}/v1/chat/sessions"))
-        .bearer_auth(admin_token)
+        .bearer_auth(access_token)
+        .header(super::DEVICE_ID_HEADER, device_id)
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -59,15 +61,17 @@ pub(super) struct SessionSummary {
     pub(super) pinned: bool,
 }
 
-/// List the gateway's chat sessions (`GET /v1/chat/sessions`, hidden + cron
+/// List the gateway's device chat sessions (`GET /v1/chat/sessions`, hidden + cron
 /// filtered by the gateway's defaults).
 pub(super) async fn list_sessions(
     base: &str,
-    admin_token: &str,
+    access_token: &str,
 ) -> Result<Vec<SessionSummary>, String> {
+    let device_id = super::device_id()?;
     let resp = reqwest::Client::new()
         .get(format!("{base}/v1/chat/sessions"))
-        .bearer_auth(admin_token)
+        .bearer_auth(access_token)
+        .header(super::DEVICE_ID_HEADER, device_id)
         .send()
         .await
         .map_err(|e| format!("could not reach Baybo: {e}"))?;

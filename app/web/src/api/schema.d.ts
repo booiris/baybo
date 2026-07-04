@@ -1324,7 +1324,7 @@ export interface components {
              */
             delegation: string;
             /**
-             * @description The client's self-certifying `device_id` (`ios-<hex(ed25519 pub)>`); the
+             * @description The client's self-certifying `device_id` (`device-<hex(ed25519 pub)>`); the
              *     gateway recovers the public key from it and re-derives the canonical id.
              */
             device_id: string;
@@ -1337,7 +1337,7 @@ export interface components {
         };
         /** @description Response of `POST /v1/push/register`. */
         RegisterPushResponse: {
-            /** @description The `ios-<hex(pub)>` id the binding was stored under (== the push `bid`). */
+            /** @description The `device-<hex(pub)>` id the binding was stored under (== the push `bid`). */
             device_id: string;
         };
         /**

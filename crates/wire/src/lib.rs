@@ -3,8 +3,8 @@
 //!
 //! These are the **pure wire types** — `Frame`, `Message`, `MessageRole`,
 //! the attachment / folder / task projections — plus the MessagePack codec.
-//! They were extracted from `baybo-channels` into their own crate so the iOS
-//! companion's `baybo-mobile-core` can speak the exact same protocol without
+//! They were extracted from `baybo-channels` into their own crate so the device
+//! companion core can speak the exact same protocol without
 //! pulling `baybo-channels → baybo-tools → { libsql, axum, reqwest, … }`, a
 //! chain that cannot cross-compile to iOS. `baybo-channels` re-exports this
 //! crate as its `wire` module, so server-side consumers are unchanged.
@@ -17,7 +17,7 @@
 //! entirely and see every session of their channel type.
 //!
 //! Consumers: the TypeScript SDK at `sidecars/sdk/channel-ts/`, the built-in
-//! TUI's WS client, the web chat page, and the iOS companion. All speak the
+//! TUI's WS client, the web chat page, and device companion clients. All speak the
 //! types below verbatim, both encode/decode via MessagePack with named
 //! fields.
 
@@ -444,7 +444,7 @@ pub enum Frame {
     },
     /// Client → server. Request one backward page of `session_id`'s
     /// persisted transcript — the Noise-sealed relay equivalent of the
-    /// REST `GET /v1/chat/sessions/:id`, for clients (the iOS relay leg)
+    /// REST `GET /v1/chat/sessions/:id`, for clients (the device relay leg)
     /// that have no admin REST surface. Where [`Subscribe`] catch-up
     /// pages *forward* (rows above `since_ordinal`), this pages
     /// *backward*: the server replies with a single [`HistoryPage`] of
@@ -487,7 +487,7 @@ pub enum Frame {
         newest_ordinal: Option<i64>,
         has_more: bool,
     },
-    /// Client → server, **iOS only**. The device's current APNs token (+ env
+    /// Client → server, **APNs clients only**. The device's current APNs token (+ env
     /// `"sandbox"`/`"production"`), sent on every content connect so the gateway
     /// can keep C's push binding fresh across APNs token rotation (reinstall,
     /// restore-from-backup, new device — Apple does not guarantee a stable
@@ -502,7 +502,7 @@ pub enum Frame {
     /// indeterminate state (slow-consumer drop, server-side
     /// reconfiguration, etc.); clients should re-subscribe and refetch
     /// session history — via the REST `/v1/chat/sessions/:id` endpoint, or
-    /// (for clients with no REST surface, e.g. the iOS relay leg) via a
+    /// (for clients with no REST surface, e.g. the device relay leg) via a
     /// [`FetchHistory`] over this same connection. The connection stays
     /// live, so a follow-up `FetchHistory` is answerable. Sent
     /// best-effort; clients that ignore it may end up with a stale
@@ -664,7 +664,7 @@ pub enum Frame {
     /// work block for this session — the work-block analogue of [`TaskList`],
     /// not a delta. Sent to a (re)subscribing connection right after the
     /// `active` [`TurnState`] snapshot, so a client that reconnects mid-turn
-    /// (an iOS relay leg resuming after backgrounding) recovers the thinking it
+    /// (a device relay leg resuming after backgrounding) recovers the thinking it
     /// missed while disconnected instead of a work block with a hole. The
     /// buffer is a superset of everything the connection saw live, so a client
     /// applies it by REPLACING the open block's steps — subsequent live
@@ -681,7 +681,7 @@ pub enum Frame {
     /// Server → client: a **completed** turn's collapsed work block, replayed
     /// during forward catch-up (`Subscribe { since_ordinal }`) right before that
     /// turn's reply [`Message`], so a client that reconnects *after* the turn
-    /// finished (an iOS relay leg that was backgrounded across the whole turn)
+    /// finished (a device relay leg that was backgrounded across the whole turn)
     /// gets back the reasoning / tool steps it missed instead of a bare answer
     /// bubble. Distinct from [`WorkSnapshot`]: those `steps` are the *live*
     /// in-flight turn (rendered as an open block); these are reconstructed from
@@ -1134,7 +1134,7 @@ mod tests {
                     content: "first".into(),
                     session_id: "s1".into(),
                     user_id: String::new(),
-                    channel_type: ChannelType::from("ios"),
+                    channel_type: ChannelType::from("device"),
                     bot_id: String::new(),
                     attachments: Vec::new(),
                     platform_msg_id: String::new(),
@@ -1145,7 +1145,7 @@ mod tests {
                     content: "reply".into(),
                     session_id: "s1".into(),
                     user_id: String::new(),
-                    channel_type: ChannelType::from("ios"),
+                    channel_type: ChannelType::from("device"),
                     bot_id: String::new(),
                     attachments: Vec::new(),
                     platform_msg_id: String::new(),

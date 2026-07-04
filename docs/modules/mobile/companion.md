@@ -70,7 +70,7 @@ shared blind relay and is **not** bound 1:1.
   single `PairedRecord`; the UI offers **Replace** (re-pair, overwrite on success)
   and **Forget** (`forget_pairing` — drops the record + push key). The app's
   Noise static identity lives under its own account (`baybo.device-identity`) and
-  is **stable** across re-pairings, so the derived `device_id` (`ios-<pubkey[..8]>`)
+  is **stable** across re-pairings, so the derived `device_id` (`device-<pubkey[..8]>`)
   is stable; *Forget* deliberately keeps it.
 
 ## Components
@@ -149,7 +149,7 @@ static in the device row. The gateway runs a **Noise IK responder**
 first handshake message, authenticates the device by matching its static to an
 *approved* row (`DeviceStore::lookup_approved_by_pubkey` — **no token rides the
 content leg**), then Noise-wraps the *same* channel frame loop the TUI / web chat
-use (`ChannelType::ios`, `Subscribe` + self-pull). Frames are chunked
+use (`ChannelType::device`, `Subscribe` + self-pull). Frames are chunked
 (`write_chunked` / `FrameReassembler`). The transport is generic
 (`BinarySink` / `BinarySource`), so the responder can be tested in memory and
 runs in production over the outbound relay data leg.

@@ -10,7 +10,7 @@
 //! pinned cross-impl vector in `verify_accepts_pinned_device_proto_vector`.
 //!
 //! C verifies, with no stored secret and no trust-on-first-use:
-//! - `device_id == ios-<hex(device_pubkey)>` — the binding self-certifies;
+//! - `device_id == device-<hex(device_pubkey)>` — the binding self-certifies;
 //! - the **delegation** under the device key (device authorized a gateway key);
 //! - each `/register` and `/notify` **request signature** under that gateway key.
 //!
@@ -23,7 +23,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use remote_host_protocol::push::{DELEGATION_CONTEXT, NOTIFY_CONTEXT, REGISTER_CONTEXT};
 
 /// `device_id` text prefix; the remainder is `hex(device_pubkey)` (32 bytes).
-pub const DEVICE_ID_PREFIX: &str = "ios-";
+pub const DEVICE_ID_PREFIX: &str = "device-";
 
 /// Canonical `env` byte in the signed register message (matches `device-proto`).
 pub const ENV_SANDBOX: u8 = 0;
@@ -32,7 +32,7 @@ pub const ENV_PRODUCTION: u8 = 1;
 const PUBLIC_LEN: usize = 32;
 const SIGNATURE_LEN: usize = 64;
 
-/// Recover the device verifying key from a `device_id` (`ios-<hex(pub)>`).
+/// Recover the device verifying key from a `device_id` (`device-<hex(pub)>`).
 pub fn device_pubkey_from_id(device_id: &str) -> Option<VerifyingKey> {
     let hex_part = device_id.strip_prefix(DEVICE_ID_PREFIX)?;
     let bytes = hex::decode(hex_part).ok()?;
@@ -258,10 +258,10 @@ mod tests {
     // seed [2u8;32] (see device-proto's `delegation::tests::pinned_vector`). Any
     // byte-layout drift on either side breaks this test before it breaks prod.
     const PIN_DEVICE_ID: &str =
-        "ios-8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c";
+        "device-8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c";
     const PIN_GATEWAY_PUB: &str =
         "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394";
     const PIN_DELEGATION: &str = "3d3d3bc2446e76a660d2ea8cfe0ce39d3ffaec4586afe941b1c8b5b09183143b1aea130de49118eb8da5f30c4069f884e0b53902ac7faf4654a0a9a600df170c";
-    const PIN_REGISTER: &str = "29f370f97837868aafc24f4d99fc02971a342416c534d5e569115bfecb42df48933b5a6afe3d88b8d3391c72ce69fb3c32324dc170b6bf587e1b65b0aa4d320a";
-    const PIN_NOTIFY: &str = "8f96a51b0b1d2fcceff1f851039229aa888e420ec6614ff227419ea9a287ecda9817261179bc35a0efebe3337875a731a2c731f9035fdc8fd64eb988d250ee01";
+    const PIN_REGISTER: &str = "bd2f828205bcdf66a7676b9a073e74b2ad546de3577adff293ac63eb65f81c2623e1d9e7cbfb2bd66038413f73a0731e62f979b719aac5db8aee2f3c66c28b02";
+    const PIN_NOTIFY: &str = "0cfd42d4b7af3d5c361993a4c9adb0afcf416931b900f57d3dab37a88c00ea801c2a3a3ca61062178a2958793c50938a1303e1b6ab7c3770df6e7bab31a13a0f";
 }

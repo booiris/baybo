@@ -28,9 +28,10 @@ pub struct ChannelType(pub String);
 impl ChannelType {
     pub const HTTP: &'static str = "http";
     pub const TUI: &'static str = "tui";
-    /// The iOS companion app. A `Subscribed` channel like `HTTP`: paired
-    /// devices register as `ios` and self-pull threads via `Frame::Subscribe`.
-    pub const IOS: &'static str = "ios";
+    /// Paired companion devices. A `Subscribed` channel like `HTTP`: mobile
+    /// devices register as `device` and self-pull threads via
+    /// `Frame::Subscribe`.
+    pub const DEVICE: &'static str = "device";
     pub const TELEGRAM: &'static str = "telegram";
     pub const DISCORD: &'static str = "discord";
     pub const WEIXIN: &'static str = "weixin";
@@ -43,8 +44,8 @@ impl ChannelType {
         Self(Self::TUI.to_owned())
     }
 
-    pub fn ios() -> Self {
-        Self(Self::IOS.to_owned())
+    pub fn device() -> Self {
+        Self(Self::DEVICE.to_owned())
     }
 
     pub fn telegram() -> Self {

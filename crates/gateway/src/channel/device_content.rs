@@ -18,7 +18,7 @@
 //!
 //! So this module is just a Noise-wrapping transport ([`NoiseFrameSink`] /
 //! [`NoiseFrameSource`]) around the existing `Subscribed`-channel machinery: the
-//! device registers as [`ChannelType::ios`], `Subscribe`s a session, and
+//! device registers as [`ChannelType::device`], `Subscribe`s a session, and
 //! self-pulls / sends like any other subscribed connection.
 
 use std::sync::Arc;
@@ -45,6 +45,11 @@ use crate::device::load_or_create_static_keypair;
 /// How long the responder waits for the initiator's first handshake message
 /// after the WS upgrade — a stalled peer must not pin a connection.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) struct AuthenticatedDevice {
+    pub(crate) device_id: String,
+    pub(crate) auth_token: String,
+}
 
 /// Run the content responder over an outbound **relay** data leg (the gateway
 /// dialed C's `/content/host/{relay_key}` after a control-plane signal). No
@@ -76,7 +81,8 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
 ) -> Result<(), String> {
     // Authenticate the device and bring up the Noise transport (shared with the
     // blob leg — both authenticate the same way before diverging).
-    let (transport, device_id) = responder_handshake(&mut sink, &mut source, state).await?;
+    let (transport, device) = responder_handshake(&mut sink, &mut source, state).await?;
+    let device_id = device.device_id;
     let transport = Arc::new(Mutex::new(transport));
 
     // Gateway-only device dedup: now that this leg has a viable Noise session, make
@@ -97,9 +103,9 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
     // just with a Noise-wrapped transport: reuse the channel registry + the
     // shared inbound loop so `Subscribe` catch-up, live fan-out, and inbound
     // `Message` routing all work exactly as they do for the TUI / web chat.
-    let channel_type = ChannelType::ios();
+    let channel_type = ChannelType::device();
     let channel = super::adapter::resolve_or_install_channel(&state.registry, &channel_type)
-        .map_err(|e| format!("resolve ios channel: {e}"))?;
+        .map_err(|e| format!("resolve device channel: {e}"))?;
 
     let sidecar = Sidecar::build(
         channel_type.clone(),
@@ -147,15 +153,16 @@ async fn recv_handshake<So: BinarySource>(
 
 /// Run the Noise IK responder handshake over the leg and authenticate the device
 /// by matching the initiator's static key to an *approved* device row, returning
-/// the established [`TransportState`] and the device's id. No prior channel-auth
-/// ran (the gateway dialed the relay data leg blind), so the static-key match is
-/// the sole gate — and C, a relay, can't MITM it. Shared by the chat content
-/// session and the blob leg, which authenticate identically before diverging.
+/// the established [`TransportState`] plus the approved device identity. No
+/// prior channel-auth ran (the gateway dialed the relay data leg blind), so the
+/// static-key match is the sole gate — and C, a relay, can't MITM it. Shared by
+/// the chat content session and the API/blob tunnel legs, which authenticate
+/// identically before diverging.
 pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
     sink: &mut Si,
     source: &mut So,
     state: &WsChannelState,
-) -> Result<(TransportState, String), String> {
+) -> Result<(TransportState, AuthenticatedDevice), String> {
     let gateway_static = load_or_create_static_keypair(&state.secret_vault)
         .await
         .map_err(|e| format!("gateway static key: {e}"))?;
@@ -181,7 +188,10 @@ pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
         .await
         .map_err(|e| format!("device lookup by pubkey: {e}"))?
         .ok_or_else(|| "no approved device for this static key".to_string())?;
-    let device_id = row.device_id;
+    let device = AuthenticatedDevice {
+        device_id: row.device_id,
+        auth_token: row.auth_token,
+    };
 
     let n = handshake
         .write_message(&[], &mut buf)
@@ -195,11 +205,15 @@ pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
 
     // Best-effort liveness bump for the operator's device list.
     let now = chrono::Utc::now().timestamp();
-    if let Err(e) = state.device_store.touch_last_seen(&device_id, now).await {
+    if let Err(e) = state
+        .device_store
+        .touch_last_seen(&device.device_id, now)
+        .await
+    {
         tracing::debug!(error = %e, "touch device last_seen failed");
     }
 
-    Ok((transport, device_id))
+    Ok((transport, device))
 }
 
 /// A binary-message duplex the content responder runs over: the outbound relay
@@ -482,11 +496,11 @@ mod tests {
         tg.deps
             .stores
             .device
-            .create(&device_row("ios-dev", device.public().to_vec()))
+            .create(&device_row("device-dev", device.public().to_vec()))
             .await
             .expect("seed approved device row");
-        crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::ios())
-            .expect("install ios channel");
+        crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::device())
+            .expect("install device channel");
         let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
             .await
             .expect("gateway static key");
@@ -524,7 +538,7 @@ mod tests {
             content: "via relay".into(),
             session_id: "sess-r".into(),
             user_id: "user-1".into(),
-            channel_type: ChannelType::ios(),
+            channel_type: ChannelType::device(),
             bot_id: String::new(),
             attachments: Vec::new(),
             platform_msg_id: "m1".into(),
@@ -573,11 +587,11 @@ mod tests {
         tg.deps
             .stores
             .device
-            .create(&device_row("ios-dev", device.public().to_vec()))
+            .create(&device_row("device-dev", device.public().to_vec()))
             .await
             .expect("seed approved device row");
-        crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::ios())
-            .expect("install ios channel");
+        crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::device())
+            .expect("install device channel");
         let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
             .await
             .expect("gateway static key");
@@ -611,7 +625,7 @@ mod tests {
             .unwrap();
 
         // The interception persists asynchronously inside the pump; poll the vault.
-        let name = crate::push::device_apns_secret_name("ios-dev");
+        let name = crate::push::device_apns_secret_name("device-dev");
         let mut stored = None;
         for _ in 0..50 {
             if let Ok(Some(secret)) = vault.get_secret(&name).await {

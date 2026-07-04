@@ -172,18 +172,18 @@ fn device_row(device_id: &str, pubkey: Vec<u8>) -> DeviceRow {
 async fn real_relay_splices_gateway_responder_and_mock_app() {
     let port = boot_relay().await;
 
-    // Gateway deps: an approved device (keyed by the mock app's static), the ios
+    // Gateway deps: an approved device (keyed by the mock app's static), the device
     // channel, and the gateway's own static key the app handshakes against.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let device = StaticKeypair::generate().unwrap();
     tg.deps
         .stores
         .device
-        .create(&device_row("ios-dev", device.public().to_vec()))
+        .create(&device_row("device-dev", device.public().to_vec()))
         .await
         .expect("seed approved device row");
-    crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::ios())
-        .expect("install ios channel");
+    crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::device())
+        .expect("install device channel");
     let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
         .await
         .expect("gateway static key");
@@ -252,7 +252,7 @@ async fn real_relay_splices_gateway_responder_and_mock_app() {
         content: "over real relay".into(),
         session_id: "sess-e2e".into(),
         user_id: "user-1".into(),
-        channel_type: ChannelType::ios(),
+        channel_type: ChannelType::device(),
         bot_id: String::new(),
         attachments: Vec::new(),
         platform_msg_id: "m1".into(),

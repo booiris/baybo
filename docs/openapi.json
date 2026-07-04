@@ -4077,7 +4077,7 @@
           },
           "device_id": {
             "type": "string",
-            "description": "The client's self-certifying `device_id` (`ios-<hex(ed25519 pub)>`); the\ngateway recovers the public key from it and re-derives the canonical id."
+            "description": "The client's self-certifying `device_id` (`device-<hex(ed25519 pub)>`); the\ngateway recovers the public key from it and re-derives the canonical id."
           },
           "push_key": {
             "type": "string",
@@ -4094,7 +4094,7 @@
         "properties": {
           "device_id": {
             "type": "string",
-            "description": "The `ios-<hex(pub)>` id the binding was stored under (== the push `bid`)."
+            "description": "The `device-<hex(pub)>` id the binding was stored under (== the push `bid`)."
           }
         }
       },
@@ -4536,11 +4536,11 @@
     },
     {
       "name": "chat",
-      "description": "Web chat sessions"
+      "description": "Web and device chat sessions"
     },
     {
       "name": "push",
-      "description": "Direct-mode (web-identity) push registration"
+      "description": "Direct-mode device push registration"
     },
     {
       "name": "llm",

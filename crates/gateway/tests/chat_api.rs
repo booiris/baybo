@@ -11,10 +11,12 @@ use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use baybo_channels::ChannelKind;
 use baybo_config::ChannelsConfig;
-use baybo_gateway::auth::AuthedClient;
+use baybo_gateway::auth::{AuthedClient, DEVICE_ID_HEADER};
 use baybo_gateway::channel::boot;
+use baybo_gateway::server::build_admin_router_for_tests;
 use baybo_gateway::test_support::build_test_deps;
 use baybo_model::{ChannelType, ChatMessage, ContentBlock, SessionId, User};
+use baybo_store::{DeviceRow, DeviceStatus};
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -155,24 +157,24 @@ async fn chat_list_uses_device_scope_when_forwarded_from_tunnel() {
     let http_config = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
-    let ios = tg
+    let device_session = tg
         .deps
         .session_manager
         .create_session(
             User {
                 id: "device-1".into(),
                 name: None,
-                channel: ChannelType::ios(),
+                channel: ChannelType::device(),
             },
-            ChannelType::ios(),
+            ChannelType::device(),
         )
         .await
         .unwrap();
     tg.deps
         .session_manager
         .append_session_message(
-            &ios.id,
-            &ChatMessage::user(vec![ContentBlock::Text("from ios".into())]),
+            &device_session.id,
+            &ChatMessage::user(vec![ContentBlock::Text("from device".into())]),
         )
         .await
         .unwrap();
@@ -224,7 +226,124 @@ async fn chat_list_uses_device_scope_when_forwarded_from_tunnel() {
         .iter()
         .map(|row| row["session_id"].as_str().expect("session_id"))
         .collect();
-    assert_eq!(ids, vec![ios.id.as_str()]);
+    assert_eq!(ids, vec![device_session.id.as_str()]);
+}
+
+#[tokio::test]
+async fn admin_device_header_creates_and_lists_device_sessions() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let router = build_admin_router_for_tests(&tg.deps);
+    let device_key = device_proto::delegation::generate_signing_key();
+    let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
+
+    let created = authed_device_request(
+        &router,
+        "POST",
+        "/v1/chat/sessions",
+        &tg.deps.admin_token,
+        &device_id,
+        StatusCode::OK,
+    )
+    .await;
+    let session_id = created["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let session = tg
+        .deps
+        .session_manager
+        .get(&SessionId::from(session_id.as_str()))
+        .await
+        .unwrap()
+        .expect("created session");
+    assert_eq!(session.channel, ChannelType::device());
+    assert_eq!(session.user.id, device_id);
+    assert_eq!(session.user.channel, ChannelType::device());
+
+    let list = authed_device_request(
+        &router,
+        "GET",
+        "/v1/chat/sessions",
+        &tg.deps.admin_token,
+        &session.user.id,
+        StatusCode::OK,
+    )
+    .await;
+    let items = list["items"].as_array().expect("items");
+    assert!(
+        items
+            .iter()
+            .any(|row| row["session_id"].as_str() == Some(session_id.as_str())),
+        "device-scoped list should contain the created device session: {items:?}",
+    );
+
+    let detail = authed_device_request(
+        &router,
+        "GET",
+        &format!("/v1/chat/sessions/{session_id}"),
+        &tg.deps.admin_token,
+        &session.user.id,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(detail["session_id"].as_str(), Some(session_id.as_str()));
+
+    let web_response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/chat/sessions/{session_id}"))
+                .header("authorization", format!("Bearer {}", tg.deps.admin_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        web_response.status(),
+        StatusCode::NOT_FOUND,
+        "plain web identity must not see device-scoped sessions",
+    );
+}
+
+#[tokio::test]
+async fn approved_device_token_with_header_creates_device_session() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let device_key = device_proto::delegation::generate_signing_key();
+    let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
+    tg.deps
+        .stores
+        .device
+        .create(&approved_device(&device_id, "approved-device-token"))
+        .await
+        .expect("seed approved device");
+
+    let router = build_admin_router_for_tests(&tg.deps);
+    let created = authed_device_request(
+        &router,
+        "POST",
+        "/v1/chat/sessions",
+        "approved-device-token",
+        &device_id,
+        StatusCode::OK,
+    )
+    .await;
+    let session_id = created["session_id"].as_str().expect("session_id");
+    let session = tg
+        .deps
+        .session_manager
+        .get(&SessionId::from(session_id))
+        .await
+        .unwrap()
+        .expect("created session");
+    assert_eq!(session.channel, ChannelType::device());
+    assert_eq!(session.user.id, device_id);
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
@@ -263,6 +382,21 @@ fn build_admin_state(
 fn build_router(state: baybo_gateway::server::AdminState) -> axum::Router {
     let (router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();
     router.with_state(state)
+}
+
+fn approved_device(device_id: &str, auth_token: &str) -> DeviceRow {
+    DeviceRow {
+        device_id: device_id.into(),
+        device_pubkey: vec![0u8; 32],
+        auth_token: auth_token.into(),
+        status: DeviceStatus::Approved,
+        rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
+        created_at: 1,
+        approved_at: Some(2),
+        last_seen_at: None,
+        relay_url: "wss://relay.test".into(),
+        remote_api_key: "inst-test".into(),
+    }
 }
 
 async fn post(router: &axum::Router, uri: &str, body: Body, expected: StatusCode) -> Value {
@@ -342,6 +476,42 @@ async fn get(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
     let bytes = body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .expect("body bytes");
+    serde_json::from_slice(&bytes).expect("response is json")
+}
+
+async fn authed_device_request(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    admin_token: &str,
+    device_id: &str,
+    expected: StatusCode,
+) -> Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {admin_token}"))
+                .header(DEVICE_ID_HEADER, device_id)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        response.status(),
+        expected,
+        "{method} {uri} expected {expected:?} got {:?}",
+        response.status(),
+    );
+    let bytes = body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("body bytes");
+    if bytes.is_empty() {
+        return Value::Null;
+    }
     serde_json::from_slice(&bytes).expect("response is json")
 }
 

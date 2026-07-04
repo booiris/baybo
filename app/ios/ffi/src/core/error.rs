@@ -1,4 +1,4 @@
-//! Error surface for the iOS client protocol core.
+//! Error surface for the device client protocol core.
 
 use device_proto::ProtoError;
 use thiserror::Error;

@@ -43,8 +43,8 @@ use crate::server::AdminState;
         (name = "skills", description = "Registered skills"),
         (name = "tools", description = "Registered tool manifests"),
         (name = "channels", description = "Registered channel plugins"),
-        (name = "chat", description = "Web chat sessions"),
-        (name = "push", description = "Direct-mode (web-identity) push registration"),
+        (name = "chat", description = "Web and device chat sessions"),
+        (name = "push", description = "Direct-mode device push registration"),
         (name = "llm", description = "Configured LLM provider"),
         (name = "logs", description = "Recent tracing events (in-memory ring buffer)"),
     )

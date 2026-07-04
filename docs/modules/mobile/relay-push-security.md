@@ -307,7 +307,7 @@ Push has three separate protections:
 - P authenticates preview content locally with the `push_key` AEAD tag.
 
 The binding is owned by the device's Ed25519 identity: `device_id ==
-ios-<hex(device_pubkey)>`, so it self-certifies at C. At pairing the device signs
+device-<hex(device_pubkey)>`, so it self-certifies at C. At pairing the device signs
 a **delegation** authorizing A's gateway push key, and A signs every `/register`
 and `/notify`. The signed byte layout is pinned in `device-proto`'s `delegation`
 module; C re-implements verification against it.
@@ -327,7 +327,7 @@ Registration:
 
 ```json
 {
-  "device_id": "ios-<hex(ed25519 pubkey)>",
+  "device_id": "device-<hex(ed25519 pubkey)>",
   "apns_token": "...",
   "env": "sandbox",
   "gateway_pubkey": "base64(gateway ed25519 pub)",
@@ -337,7 +337,7 @@ Registration:
 }
 ```
 
-   C verifies `device_id == ios-<hex(device_pubkey)>`, the delegation under the
+   C verifies `device_id == device-<hex(device_pubkey)>`, the delegation under the
    device key, the register signature under `gateway_pubkey`, and that `counter`
    strictly exceeds the device's last accepted one; then it stores `device_id ->
    { apns_token, env, gateway_pubkey, last_counter }`. The app no longer registers
@@ -472,7 +472,7 @@ Registration is gateway-mediated and signed end to end; the app never POSTs C's
 Keys (all established at pairing — see
 [Shared relay key tenancy](#shared-relay-key-tenancy-and-push-binding-authentication)):
 
-- Device Ed25519 identity `D` — `device_id == ios-<hex(D_pub)>` — in P's private
+- Device Ed25519 identity `D` — `device_id == device-<hex(D_pub)>` — in P's private
   keychain.
 - Gateway Ed25519 push key `G`, vault-persisted on A (`gateway.push_signing_key`),
   one per gateway.
@@ -496,7 +496,7 @@ Keys (all established at pairing — see
 
    ```json
    {
-     "device_id": "ios-<hex(D_pub)>",
+     "device_id": "device-<hex(D_pub)>",
      "apns_token": "...",
      "env": "sandbox",
      "gateway_pubkey": "base64(G_pub)",
@@ -506,7 +506,7 @@ Keys (all established at pairing — see
    }
    ```
 
-   C verifies `device_id == ios-<hex(D_pub)>`, the delegation under `D_pub`, the
+   C verifies `device_id == device-<hex(D_pub)>`, the delegation under `D_pub`, the
    register signature under `G_pub`, and `counter` strictly above the device's last
    accepted; on success it stores `device_id -> { apns_token, env, gateway_pubkey,
    last_counter }`. Any failure → `403`, binding untouched. A caches the
@@ -565,9 +565,9 @@ Encryption and `/notify`:
 
 ```json
 {
-  "device_id": "ios-<hex(ed25519 pubkey)>",
+  "device_id": "device-<hex(ed25519 pubkey)>",
   "collapse_id": "<hex(sha256(device_id || ':' || session_id))[..16]>",
-  "bid": "ios-...",
+  "bid": "device-...",
   "enc": "base64(ciphertext||tag)",
   "n": "base64(nonce)",
   "sig": "base64(gateway signature over this notify)",
@@ -592,7 +592,7 @@ C to APNs:
   },
   "enc": "...",
   "n": "...",
-  "bid": "ios-..."
+  "bid": "device-..."
 }
 ```
 
@@ -634,7 +634,7 @@ Relevant code:
 
 1. The app reuses its long-term **Ed25519 push identity** (`baybo.device-sign-key`,
    the *same* key the relay path uses, so a phone keeps one `device_id ==
-   ios-<hex(pub)>` whichever way it connects).
+   device-<hex(pub)>` whichever way it connects).
 2. `GET /v1/push/params` (admin Bearer) returns the gateway's Ed25519 push public
    key `G_pub`.
 3. The app **load-or-creates** a stable 32-byte `push_key` in the **shared App
@@ -785,7 +785,7 @@ The binding is authenticated to its **device key**, independent of the relay
 admission key:
 
 - The device holds an Ed25519 identity key `D`. Its `device_id` *is* that public
-  key (`ios-<hex(D_pub)>`), so the binding self-certifies — C re-derives
+  key (`device-<hex(D_pub)>`), so the binding self-certifies — C re-derives
   `device_id` from the key carried in the request.
 - At pairing the device signs a delegation authorizing the gateway's Ed25519 push
   key `G` (carried in `GatewayWelcome`); it sends the delegation as the sealed 6th
@@ -794,7 +794,7 @@ admission key:
   strictly-increasing `counter`.
 
 C verifies, with **no stored secret and no trust-on-first-use**: `device_id ==
-ios-<hex(D_pub)>`, the delegation under `D_pub`, the request signature under
+device-<hex(D_pub)>`, the delegation under `D_pub`, the request signature under
 `G_pub` (stored at register), and `counter` strictly greater than the device's
 last accepted. Only the holder of `D` can authorize a `G`, and only the holder of
 `G` can mutate or notify the binding.

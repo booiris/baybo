@@ -1,17 +1,18 @@
-//! Direct-mode push registration over the admin-token REST surface.
+//! Direct-mode push registration over the gateway REST surface.
 //!
 //! Provisions the SAME push binding a scan-to-pair device gets, but bootstrapped
-//! over TLS + the admin Bearer token instead of a Noise handshake: the app reuses
-//! its stable Ed25519 push identity (so `device_id == ios-<hex(pub)>`), generates
-//! a fresh preview key it stores for its own NSE, signs a delegation over the
-//! gateway push key, and registers all of it. The gateway then registers +
+//! over TLS + the stored Bearer token + device id header instead of a Noise
+//! handshake: the app reuses its stable Ed25519 push identity (so
+//! `device_id == device-<hex(pub)>`), generates a fresh preview key it stores for
+//! its own NSE, signs a delegation over the gateway push key, and registers all
+//! of it. The gateway then registers +
 //! notifies through its configured remote host (C) exactly as for a paired
 //! device, so C and the NSE are unchanged.
 //!
 //! Best-effort: a no-op when iOS hasn't issued an APNs token yet, or the gateway
 //! has no `[push]` remote host configured. The caller re-runs it on foreground so
 //! a token that arrives after login still binds. The preview key rides TLS + the
-//! admin token rather than a Noise handshake — a weaker (but still
+//! stored Bearer rather than a Noise handshake — a weaker (but still
 //! endpoint-to-endpoint) trust model than the relay path; see
 //! `docs/modules/mobile/relay-push-security.md`.
 
@@ -54,9 +55,12 @@ pub async fn register(apns_token: String, apns_env: &str) -> Result<Option<Strin
     let client = reqwest::Client::new();
 
     // 1. Fetch the gateway push key to sign the delegation over.
+    let sign_key = keychain::load_or_create_device_sign_key()?;
+    let device_id = delegation::device_id_for(&sign_key.verifying_key());
     let params: PushParams = client
         .get(format!("{}/v1/push/params", creds.base_url))
         .bearer_auth(&creds.token)
+        .header(super::DEVICE_ID_HEADER, device_id.as_str())
         .send()
         .await
         .map_err(|e| format!("push params: {e}"))?
@@ -72,9 +76,6 @@ pub async fn register(apns_token: String, apns_env: &str) -> Result<Option<Strin
 
     // 2. The app's stable Ed25519 push identity (shared with the relay path, so a
     //    phone keeps one device_id whether it pairs or connects directly).
-    let sign_key = keychain::load_or_create_device_sign_key()?;
-    let device_id = delegation::device_id_for(&sign_key.verifying_key());
-
     // 3. The preview key in the SHARED App-Group keychain so this app's NSE can
     //    decrypt previews addressed to `bid = device_id`. Load-or-create: minted
     //    once and reused, so every re-register sends the SAME key — the NSE never
@@ -85,7 +86,7 @@ pub async fn register(apns_token: String, apns_env: &str) -> Result<Option<Strin
     // 4. Authorize the gateway push key to manage our binding at C.
     let deleg = delegation::sign_delegation(&sign_key, &gw_pub);
 
-    // 5. Register the binding (admin Bearer over TLS).
+    // 5. Register the binding (Bearer + device id over TLS).
     let body = RegisterReq {
         device_id: device_id.clone(),
         apns_token,
@@ -96,6 +97,7 @@ pub async fn register(apns_token: String, apns_env: &str) -> Result<Option<Strin
     let resp: RegisterResp = client
         .post(format!("{}/v1/push/register", creds.base_url))
         .bearer_auth(&creds.token)
+        .header(super::DEVICE_ID_HEADER, device_id.as_str())
         .json(&body)
         .send()
         .await

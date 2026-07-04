@@ -2,7 +2,7 @@
 
 **Status:** implementation plan / migration in progress.
 
-The iOS relay path currently has a sharp split:
+The device relay path currently has a sharp split:
 
 - Chat uses the paired device's Noise-protected content leg and exchanges
   `wire::Frame`s.
@@ -13,8 +13,8 @@ The iOS relay path currently has a sharp split:
   but relay mode cannot list sessions because the relay wire protocol has no
   list operation and the phone cannot reach the NAT'd gateway's HTTP listener.
 
-This doc proposes a general **API tunnel** for paired mobile clients: the iOS
-app presents URL-shaped requests internally, while the transport carries raw
+This doc proposes a general **API tunnel** for paired mobile clients: the app
+presents URL-shaped requests internally, while the transport carries raw
 binary request/response streams over dedicated WebSocket relay data legs wrapped
 in the existing Noise IK device authentication.
 
@@ -24,7 +24,7 @@ tunnel protocol.
 
 ## Goals
 
-1. Let relay-bound iOS call a small, mobile-safe API surface that looks like
+1. Let relay-bound device clients call a small, mobile-safe API surface that looks like
    HTTP from the app side.
 2. Avoid adding `wire::Frame` variants for session listing, session metadata, or
    blob chunks.
@@ -229,7 +229,7 @@ Bearer token through the tunnel.
 ## Session listing semantics
 
 The direct admin endpoint currently lists `ChannelType::http` chat sessions. A
-relay-paired phone creates and sends sessions as `ChannelType::ios`. The tunnel
+relay-paired phone creates and sends sessions as `ChannelType::device`. The tunnel
 must not blindly call the admin handler and return only HTTP rows unless that is
 the intended product behavior.
 
@@ -244,22 +244,22 @@ Under an admin/direct principal, this can preserve today's HTTP-channel
 behavior. Under a paired-device principal, it should list the sessions visible to
 that device. The likely first rule is:
 
-- include non-hidden `ChannelType::ios` user sessions for the approved device's
+- include non-hidden `ChannelType::device` user sessions for the approved device's
   gateway;
 - exclude cron-triggered sessions by default, matching the web sidebar;
 - omit empty draft rows unless they are pinned or have a user preview, matching
-  the current iOS `SessionIndex.merge(remote:)` filtering behavior;
-- sort newest-first at the service boundary, while the iOS list can keep its
+  the current device `SessionIndex.merge(remote:)` filtering behavior;
+- sort newest-first at the service boundary, while the device list can keep its
   local pinned-first projection.
 
 Open product question: should a paired phone also list the user's web/direct
-`http` conversations, or only its own `ios` conversations? The implementation
+`http` conversations, or only its own `device` conversations? The implementation
 should make this policy explicit in one place rather than relying on the
 underlying REST endpoint's channel filter.
 
 ## APNs token update migration
 
-`Frame::UpdateApnsToken` is an iOS-only chat frame today. The app sends it as an
+`Frame::UpdateApnsToken` is an APNs-specific chat frame today. The app sends it as an
 opening best-effort frame on every relay content connect so the gateway can keep
 the paired device's APNs token fresh across reinstall, restore-from-backup, and
 Apple token rotation.
@@ -291,7 +291,7 @@ Migration path:
 1. Add the tunneled endpoint and gateway tests proving it updates the same
    persisted fields and triggers the same re-registration behavior as today's
    frame path.
-2. In the same migration change, cut iOS over to the tunneled request and remove
+2. In the same migration change, cut APNs clients over to the tunneled request and remove
    the opening best-effort `Frame::UpdateApnsToken` send from the relay chat
    connection.
 3. Delete `Frame::UpdateApnsToken` and the pre-router special case that handles
@@ -326,7 +326,7 @@ changes.
    - `device_proto::blob::{BlobRequest, BlobResponse}`
    - `app/mobile/core/src/blob.rs` protocol state that is specific to
      `BlobRequest`/`BlobResponse`
-   - iOS/Tauri relay blob client code that speaks the bespoke protocol
+   - mobile relay blob client code that speaks the bespoke protocol
    - `crates/gateway/src/channel/blob_content.rs`
 
 Do not remove:
@@ -366,7 +366,7 @@ Do not remove:
    - direct mode may continue calling existing REST endpoints
    - relay mode gets equivalent typed wrappers through the tunnel
 
-## iOS / mobile client plan
+## Device / mobile client plan
 
 1. Add an `ApiTunnelSession` beside `ContentSession`.
    - same Noise IK handshake
@@ -431,7 +431,7 @@ Relay tests:
 - `blob` legs reserve background bandwidth and preserve chat headroom
 - relay logs never include path, blob id, request body, or response body
 
-iOS tests:
+Device client tests:
 
 - relay-bound `ChatListScreen.refresh()` populates from the tunnel
 - direct-bound refresh still uses direct REST and preserves behavior
@@ -469,12 +469,12 @@ Phase 4: harden and test tunnel coverage
 Phase 5: remove `Frame::UpdateApnsToken`
 
 - add the tunneled `POST /v1/mobile/apns-token` endpoint
-- switch iOS to the tunneled request in the same change
-- remove the old opening frame and delete the iOS-only `wire::Frame` variant
+- switch APNs clients to the tunneled request in the same change
+- remove the old opening frame and delete the APNs-specific `wire::Frame` variant
 
 ## Open questions
 
-- Should relay-bound iOS list only `ios` sessions, or should it show the user's
+- Should relay-bound device clients list only `device` sessions, or should they show the user's
   `http` web/direct sessions too?
 - Is a warm multiplexed API leg worth the complexity, or is one request per leg
   fast enough after relay preconnect?

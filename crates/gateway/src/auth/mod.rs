@@ -2,8 +2,9 @@
 //!
 //! Three sub-modules, one per listener / credential family:
 //!
-//! * [`admin`] — bearer-token middleware for the admin TCP listener
-//!   plus the [`AdminToken`] vault-backed lifecycle helper.
+//! * [`admin`] — bearer-token middleware for the admin TCP listener,
+//!   including Web vs. Device identity resolution, plus the
+//!   [`AdminToken`] vault-backed lifecycle helper.
 //! * [`channel`] — channel-listener middleware that turns the
 //!   `x-baybo-channel-token` header into an [`AuthedClient`] for
 //!   downstream handlers, distinguishing the bundled TUI from
@@ -25,7 +26,9 @@ pub mod channel;
 pub mod token;
 
 pub use admin::{AdminAuthState, AdminToken, require_admin_token};
-pub use channel::{AuthedClient, ChannelAuthState, attach as attach_channel_auth};
+pub use channel::{
+    AuthedClient, ChannelAuthState, DEVICE_ID_HEADER, attach as attach_channel_auth,
+};
 pub use token::{
     CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TOOL_CLIENT_LABEL_PREFIX,
     TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY, TokenHandle, WEB_OPERATOR_USER_ID, constant_time_eq,

@@ -97,7 +97,7 @@ pub fn user_message_frame(
         content: text.to_owned(),
         session_id: SessionId::from(session_id),
         user_id: user_id.to_owned(),
-        channel_type: ChannelType::ios(),
+        channel_type: ChannelType::device(),
         bot_id: String::new(),
         attachments,
         platform_msg_id: platform_msg_id.to_owned(),
@@ -106,30 +106,9 @@ pub fn user_message_frame(
     })
 }
 
-pub const WEB_OPERATOR_USER_ID: &str = "web-operator";
-
-pub fn register_http_frame() -> Frame {
+pub fn register_device_frame() -> Frame {
     Frame::Register {
         token: String::new(),
-        channel_type: ChannelType::http(),
+        channel_type: ChannelType::device(),
     }
-}
-
-pub fn web_user_message_frame(
-    session_id: &str,
-    text: &str,
-    platform_msg_id: &str,
-    attachments: Vec<WireAttachment>,
-) -> Frame {
-    Frame::Message(Message {
-        content: text.to_owned(),
-        session_id: SessionId::from(session_id),
-        user_id: WEB_OPERATOR_USER_ID.to_owned(),
-        channel_type: ChannelType::http(),
-        bot_id: String::new(),
-        attachments,
-        platform_msg_id: platform_msg_id.to_owned(),
-        role: MessageRole::User,
-        ordinal: None,
-    })
 }

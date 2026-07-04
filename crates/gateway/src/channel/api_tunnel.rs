@@ -9,7 +9,7 @@ use std::io;
 use std::time::Duration;
 
 use axum::body::{self, Body};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri, header};
 use bytes::Bytes;
 use device_proto::api_tunnel::{
     self, MAX_TUNNEL_CHUNK, TunnelHeader, TunnelRequest, TunnelResponse,
@@ -22,18 +22,16 @@ use tower::ServiceExt;
 
 use super::blobs::MAX_BLOB_BYTES;
 use super::device_content::{
-    BinarySink, BinarySource, RelayWs, TungBinSink, TungBinSource, responder_handshake,
+    AuthenticatedDevice, BinarySink, BinarySource, RelayWs, TungBinSink, TungBinSource,
+    responder_handshake,
 };
 use super::state::WsChannelState;
-use crate::auth::AuthedClient;
+use crate::auth::DEVICE_ID_HEADER;
 
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const TUNNEL_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TUNNEL_UPLOAD_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HEADER_CONTENT_LENGTH: &str = "content-length";
-const PATH_BLOBS: &str = "/v1/blobs";
-const PATH_BLOBS_PREFIX: &str = "/v1/blobs/";
-const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
 const TUNNEL_HTTP_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
 const FORBIDDEN_HEADERS: &[&str] = &[
     "authorization",
@@ -46,6 +44,7 @@ const FORBIDDEN_HEADERS: &[&str] = &[
     "trailer",
     "transfer-encoding",
     "upgrade",
+    DEVICE_ID_HEADER,
 ];
 
 struct RequestHead {
@@ -68,12 +67,12 @@ async fn run_tunnel_session<Si: BinarySink, So: BinarySource>(
     mut source: So,
     state: &WsChannelState,
 ) -> Result<(), String> {
-    let (mut transport, device_id) = responder_handshake(&mut sink, &mut source, state).await?;
+    let (mut transport, device) = responder_handshake(&mut sink, &mut source, state).await?;
     let mut reassembler = FrameReassembler::new();
     let mut pending = VecDeque::new();
 
     tracing::info!(
-        device = %super::short_hash(&device_id),
+        device = %super::short_hash(&device.device_id),
         "device api tunnel established",
     );
 
@@ -120,27 +119,15 @@ async fn run_tunnel_session<Si: BinarySink, So: BinarySource>(
         return Ok(());
     }
 
-    if is_http_forward(&head) {
-        handle_http_forward(
-            &mut sink,
-            &mut source,
-            &mut transport,
-            &mut reassembler,
-            &mut pending,
-            state,
-            &device_id,
-            head,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    send_error(
+    handle_http_forward(
         &mut sink,
+        &mut source,
         &mut transport,
-        head.request_id,
-        404,
-        "unsupported tunnel endpoint",
+        &mut reassembler,
+        &mut pending,
+        state,
+        &device,
+        head,
     )
     .await?;
     Ok(())
@@ -189,42 +176,31 @@ async fn handle_http_forward<Si: BinarySink, So: BinarySource>(
     reassembler: &mut FrameReassembler,
     pending: &mut VecDeque<TunnelRequest>,
     state: &WsChannelState,
-    device_id: &str,
+    device: &AuthenticatedDevice,
     head: RequestHead,
 ) -> Result<(), String> {
-    if is_blob_upload(&head) {
-        return handle_http_upload_forward(
+    if request_body_len(&head) != 0 {
+        return handle_http_body_forward(
             sink,
             source,
             transport,
             reassembler,
             pending,
             state,
-            device_id,
+            device,
             head,
         )
         .await;
     }
 
-    if request_body_len(&head) != 0 {
-        send_error(
-            sink,
-            transport,
-            head.request_id,
-            400,
-            "forwarded endpoint does not accept a request body",
-        )
-        .await?;
-        return Ok(());
-    }
-    let req = match build_forward_request(&head, device_id, Body::empty()) {
+    let req = match build_forward_request(&head, device, Body::empty()) {
         Ok(req) => req,
         Err((status, reason)) => {
             send_error(sink, transport, head.request_id, status, &reason).await?;
             return Ok(());
         }
     };
-    let response = super::tunnel_http::router(state.admin_state.clone(), state.clone())
+    let response = super::tunnel_http::router(state.clone())
         .oneshot(req)
         .await
         .map_err(|e| format!("forward tunnel HTTP request: {e}"))?;
@@ -232,37 +208,24 @@ async fn handle_http_forward<Si: BinarySink, So: BinarySource>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_http_upload_forward<Si: BinarySink, So: BinarySource>(
+async fn handle_http_body_forward<Si: BinarySink, So: BinarySource>(
     sink: &mut Si,
     source: &mut So,
     transport: &mut TransportState,
     reassembler: &mut FrameReassembler,
     pending: &mut VecDeque<TunnelRequest>,
     state: &WsChannelState,
-    device_id: &str,
+    device: &AuthenticatedDevice,
     head: RequestHead,
 ) -> Result<(), String> {
-    let declared_len = match head.body_len {
-        Some(len) => len,
-        None => {
-            send_error(
-                sink,
-                transport,
-                head.request_id,
-                411,
-                "missing content length",
-            )
-            .await?;
-            return Ok(());
-        }
-    };
+    let declared_len = request_body_len(&head);
     if declared_len > MAX_BLOB_BYTES as u64 {
         send_error(
             sink,
             transport,
             head.request_id,
             413,
-            "blob exceeds size limit",
+            "request body exceeds size limit",
         )
         .await?;
         return Ok(());
@@ -270,17 +233,17 @@ async fn handle_http_upload_forward<Si: BinarySink, So: BinarySource>(
 
     let request_id = head.request_id;
     let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(4);
-    let req =
-        match build_forward_request(&head, device_id, Body::from_stream(ReceiverStream::new(rx))) {
-            Ok(req) => req,
-            Err((status, reason)) => {
-                close_forward_body(tx, reason.clone()).await;
-                send_error(sink, transport, request_id, status, &reason).await?;
-                return Ok(());
-            }
-        };
+    let req = match build_forward_request(&head, device, Body::from_stream(ReceiverStream::new(rx)))
+    {
+        Ok(req) => req,
+        Err((status, reason)) => {
+            close_forward_body(tx, reason.clone()).await;
+            send_error(sink, transport, request_id, status, &reason).await?;
+            return Ok(());
+        }
+    };
 
-    let router = super::tunnel_http::router(state.admin_state.clone(), state.clone());
+    let router = super::tunnel_http::router(state.clone());
     let response_task = tokio::spawn(async move {
         router
             .oneshot(req)
@@ -312,7 +275,7 @@ async fn handle_http_upload_forward<Si: BinarySink, So: BinarySource>(
 
 fn build_forward_request(
     head: &RequestHead,
-    device_id: &str,
+    device: &AuthenticatedDevice,
     body: Body,
 ) -> Result<Request<Body>, (u16, String)> {
     let method = head
@@ -325,21 +288,16 @@ fn build_forward_request(
         .map_err(|e| (400, format!("invalid request path: {e}")))?;
     let mut builder = Request::builder().method(method).uri(uri);
     let header_content_len = tunnel_header_content_length(&head.headers)?;
-    match (header_content_len, head.body_len) {
+    let effective_body_len = match (header_content_len, head.body_len) {
         (Some(header_len), Some(body_len)) if header_len != body_len => {
             return Err((
                 400,
                 "content-length does not match tunnel body length".to_string(),
             ));
         }
-        (Some(header_len), None) if header_len != 0 => {
-            return Err((
-                400,
-                "content-length does not match tunnel body length".to_string(),
-            ));
-        }
-        _ => {}
-    }
+        (Some(header_len), _) => Some(header_len),
+        (None, body_len) => body_len,
+    };
     for header in &head.headers {
         let name = HeaderName::from_bytes(header.name.as_bytes())
             .map_err(|e| (400, format!("invalid header name: {e}")))?;
@@ -350,15 +308,18 @@ fn build_forward_request(
             .map_err(|e| (400, format!("invalid header value: {e}")))?;
         builder = builder.header(name, value);
     }
-    if let Some(body_len) = head.body_len {
+    if let Some(body_len) = effective_body_len {
         builder = builder.header(HEADER_CONTENT_LENGTH, body_len.to_string());
     }
-    let mut req = builder
+    builder = builder
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", device.auth_token),
+        )
+        .header(DEVICE_ID_HEADER, device.device_id.as_str());
+    let req = builder
         .body(body)
         .map_err(|e| (400, format!("invalid forwarded request: {e}")))?;
-    req.extensions_mut().insert(AuthedClient::Device {
-        device_id: device_id.to_owned(),
-    });
     Ok(req)
 }
 
@@ -482,6 +443,29 @@ async fn send_http_response<S: BinarySink>(
         return send_streaming_http_body(sink, transport, request_id, body, body_len).await;
     }
 
+    if parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|value| {
+            value
+                .to_str()
+                .is_ok_and(|s| s.starts_with("text/event-stream"))
+        })
+    {
+        send_response(
+            sink,
+            transport,
+            &TunnelResponse::Head {
+                request_id,
+                status: parts.status.as_u16(),
+                headers: forwarded_response_headers(&parts.headers, None),
+                body_len: None,
+            },
+        )
+        .await?;
+        return send_streaming_http_body_without_len(sink, transport, request_id, body).await;
+    }
+
     let body = body::to_bytes(body, TUNNEL_HTTP_RESPONSE_LIMIT)
         .await
         .map_err(|e| format!("read forwarded response body: {e}"))?;
@@ -565,6 +549,48 @@ async fn send_streaming_http_body<S: BinarySink>(
     Ok(())
 }
 
+async fn send_streaming_http_body_without_len<S: BinarySink>(
+    sink: &mut S,
+    transport: &mut TransportState,
+    request_id: u64,
+    body: Body,
+) -> Result<(), String> {
+    let mut offset = 0u64;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("read forwarded response body: {e}"))?;
+        let mut chunk_offset = 0usize;
+        while chunk_offset < chunk.len() {
+            let end = std::cmp::min(chunk_offset + MAX_TUNNEL_CHUNK, chunk.len());
+            let next_offset = offset.saturating_add((end - chunk_offset) as u64);
+            send_response(
+                sink,
+                transport,
+                &TunnelResponse::Body {
+                    request_id,
+                    offset,
+                    data: chunk[chunk_offset..end].to_vec(),
+                    last: false,
+                },
+            )
+            .await?;
+            offset = next_offset;
+            chunk_offset = end;
+        }
+    }
+    send_response(
+        sink,
+        transport,
+        &TunnelResponse::Body {
+            request_id,
+            offset,
+            data: Vec::new(),
+            last: true,
+        },
+    )
+    .await
+}
+
 fn forwarded_response_headers(headers: &HeaderMap, body_len: Option<u64>) -> Vec<TunnelHeader> {
     let mut out = Vec::new();
     let mut has_content_length = false;
@@ -614,22 +640,6 @@ async fn next_request<So: BinarySource>(
             return Ok(Some(req));
         }
     }
-}
-
-fn is_http_forward(head: &RequestHead) -> bool {
-    let path = head.path.split('?').next().unwrap_or(head.path.as_str());
-    if head.method.eq_ignore_ascii_case("GET") {
-        path == PATH_CHAT_SESSIONS || path.starts_with(PATH_BLOBS_PREFIX)
-    } else if head.method.eq_ignore_ascii_case("POST") {
-        path == PATH_BLOBS
-    } else {
-        false
-    }
-}
-
-fn is_blob_upload(head: &RequestHead) -> bool {
-    head.method.eq_ignore_ascii_case("POST")
-        && head.path.split('?').next().unwrap_or(head.path.as_str()) == PATH_BLOBS
 }
 
 fn request_body_len(head: &RequestHead) -> u64 {
@@ -695,4 +705,59 @@ fn validate_request_head(head: &RequestHead) -> Result<(), (u16, &'static str)> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn head(headers: Vec<TunnelHeader>) -> RequestHead {
+        RequestHead {
+            request_id: 1,
+            method: "GET".into(),
+            path: "/v1/chat/sessions".into(),
+            headers,
+            body_len: None,
+        }
+    }
+
+    #[test]
+    fn forward_request_injects_gateway_device_auth_headers() {
+        let device = AuthenticatedDevice {
+            device_id: "device-abc".into(),
+            auth_token: "device-token".into(),
+        };
+        let req = build_forward_request(
+            &head(vec![TunnelHeader::new("accept", "application/json")]),
+            &device,
+            Body::empty(),
+        )
+        .expect("request");
+
+        assert_eq!(
+            req.headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer device-token"),
+        );
+        assert_eq!(
+            req.headers()
+                .get(DEVICE_ID_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("device-abc"),
+        );
+        assert_eq!(
+            req.headers().get("accept").and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+        );
+    }
+
+    #[test]
+    fn tunnel_rejects_client_supplied_auth_or_device_headers() {
+        for forbidden in ["authorization", DEVICE_ID_HEADER] {
+            let err = validate_request_head(&head(vec![TunnelHeader::new(forbidden, "value")]))
+                .unwrap_err();
+            assert_eq!(err, (400, "forbidden tunnel header"));
+        }
+    }
 }

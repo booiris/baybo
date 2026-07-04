@@ -1,9 +1,10 @@
 //! Direct (non-relay) gateway access — the web-dashboard style.
 //!
 //! [`login`]/[`status`]/[`logout`] (this file) validate + persist the gateway
-//! base URL + admin Bearer token. The chat transport ([`chat`]) uses that same
-//! Bearer to speak the raw-MessagePack `/v1/channel-ws` protocol — the same one
-//! `app/web` uses — while attachments ([`blob`]) go over plain `/v1/blobs`.
+//! base URL + gateway access token. The chat transport ([`chat`]) uses that same
+//! Bearer plus a stable device id header to speak the raw-MessagePack
+//! `/v1/channel-ws` protocol while attachments ([`blob`]) go over plain
+//! `/v1/blobs` with the same device identity.
 //! This whole path deliberately bypasses the relay + Noise E2E design the
 //! scan-to-pair flow uses (see `pairing.rs`).
 
@@ -25,6 +26,7 @@ use crate::keychain;
 /// boundary. A code, not prose, so reworded errors can't silently change the
 /// contract.
 pub(crate) const INVALID_TOKEN_CODE: &str = "invalid_token";
+pub(crate) use device_proto::DEVICE_ID_HEADER;
 
 /// Persisted direct-connection credentials. Serialized to JSON in the keychain;
 /// the byte format is the upgrade-continuity contract with installs made by the
@@ -71,9 +73,11 @@ pub(crate) async fn login(base_url: String, token: String) -> Result<String, Str
         return Err("enter the access token".into());
     }
 
+    let device_id = device_id()?;
     let resp = reqwest::Client::new()
         .get(format!("{base}/v1/status"))
         .bearer_auth(&token)
+        .header(DEVICE_ID_HEADER, device_id)
         .send()
         .await
         .map_err(|e| format!("could not reach Baybo: {e}"))?;
@@ -142,9 +146,8 @@ pub(crate) fn has_credentials() -> Result<bool, String> {
     Ok(keychain::read_direct_credentials()?.is_some())
 }
 
-/// Read the stored direct credentials (base URL + admin token). `Ok(None)` = not
-/// connected. The REST/WS/blob legs read `base_url` from here, and REST reads the
-/// admin `token`.
+/// Read the stored direct credentials (base URL + gateway access token).
+/// `Ok(None)` = not connected. The REST/WS/blob legs read both values from here.
 pub(crate) fn credentials() -> Result<Option<DirectCredentials>, String> {
     let Some(bytes) = keychain::read_direct_credentials()? else {
         return Ok(None);
@@ -154,8 +157,15 @@ pub(crate) fn credentials() -> Result<Option<DirectCredentials>, String> {
         .map_err(|e| e.to_string())
 }
 
+pub(crate) fn device_id() -> Result<String, String> {
+    let sign_key = keychain::load_or_create_device_sign_key()?;
+    Ok(device_proto::delegation::device_id_for(
+        &sign_key.verifying_key(),
+    ))
+}
+
 /// Build the `/v1/channel-ws` URL from a stored base URL: `http→ws`, `https→wss`,
-/// path `/v1/channel-ws`. The admin Bearer rides the upgrade request's
+/// path `/v1/channel-ws`. The Bearer rides the upgrade request's
 /// `Authorization` header so the client can read a 401 directly.
 pub(crate) fn channel_ws_url(base_url: &str) -> Result<String, String> {
     let rest = base_url

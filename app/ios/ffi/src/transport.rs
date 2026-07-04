@@ -109,7 +109,7 @@ pub(crate) trait FrameCodec: Send {
 }
 
 /// Builds a leg's outbound user-message `Frame` (binds the target session id +
-/// the leg's identity: device/ios for relay, web-operator/http for direct).
+/// the leg's identity; both relay and direct use the device channel.
 /// Owned + `Send` so the pump task holds it without borrowing the transport
 /// across the spawn. Args are `(session_id, text, msg_id, attachments)`.
 pub(crate) type UserFrameFn = Box<dyn Fn(&str, &str, &str, Vec<WireAttachment>) -> Frame + Send>;

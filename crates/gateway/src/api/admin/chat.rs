@@ -2,9 +2,10 @@
 //!
 //! Surface:
 //!
-//! * `POST /v1/chat/sessions` — create a new session (channel=http),
-//!   return its id.
-//! * `GET /v1/chat/sessions` — list the http channel's sessions
+//! * `POST /v1/chat/sessions` — create a new session (web defaults to
+//!   channel=http; direct device requests carrying `x-baybo-device-id` use
+//!   channel=device), return its id.
+//! * `GET /v1/chat/sessions` — list the request identity's chat sessions
 //!   (newest first). Hidden sessions are filtered out unless the
 //!   `include_hidden=true` query is set.
 //! * `GET /v1/chat/sessions/:id` — session detail + transcript history.
@@ -463,11 +464,16 @@ impl From<SlashCommandSpec> for SlashCommandEntry {
         (status = 500, description = "Session creation failed", body = ErrorBody),
     )
 )]
-async fn create_session(State(state): State<AdminState>) -> Result<Json<ChatSessionCreated>> {
-    let user = web_operator_user();
+async fn create_session(
+    State(state): State<AdminState>,
+    authed: Option<Extension<AuthedClient>>,
+) -> Result<Json<ChatSessionCreated>> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let user = chat_user(authed);
+    let channel_type = chat_list_channel(authed);
     let session = state
         .session_manager
-        .create_session(user, ChannelType::http())
+        .create_session(user, channel_type)
         .await
         .map_err(|e| GatewayError::Internal(format!("create chat session: {e}")))?;
     let session_id = session.id.clone();
@@ -577,15 +583,10 @@ async fn get_session(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
     Query(query): Query<GetSessionQuery>,
+    authed: Option<Extension<AuthedClient>>,
 ) -> Result<Json<ChatSessionDetail>> {
-    // `load_web_chat_session` rejects non-`http` channels with the
-    // same `NotFound` shape `session_manager.get(...)` would, so a
-    // caller probing a telegram/weixin id can't tell whether the
-    // session exists at all — the surface stays scoped to browser-
-    // originated chats just like list/hide/unhide above. The
-    // bare `session_manager.get(...)` path that used to live here
-    // would happily serve any persisted transcript.
-    let (sid, session) = load_web_chat_session(&state, &session_id).await?;
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
 
     let limit = query
         .limit
@@ -663,7 +664,7 @@ async fn get_session(
     let in_flight_steps = if active_turn_started.is_some() {
         state
             .channel_registry
-            .get(&ChannelType::http())
+            .get(&session.channel)
             .map(|ch| in_flight_work_steps(ch.in_flight_events(&sid)))
             .unwrap_or_default()
     } else {
@@ -724,12 +725,13 @@ pub struct SetSessionModelResponse {
 async fn set_session_model(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
+    authed: Option<Extension<AuthedClient>>,
     Json(req): Json<SetSessionModelRequest>,
 ) -> Result<Json<SetSessionModelResponse>> {
-    // Same web-chat scoping as get/hide — a non-`http` id 404s.
+    let authed = authed.as_ref().map(|ext| &ext.0);
     // We only need the existence/scope check, not the loaded blob:
     // persistence goes through the targeted `set_last_llm` below.
-    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
+    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
 
     // Validate against the live pool; `None`/empty clears the pin.
     // `resolve` would fall back safely on a stranded name, but a 400 here
@@ -809,10 +811,11 @@ pub struct SetSessionPinRequest {
 async fn set_session_pin(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
+    authed: Option<Extension<AuthedClient>>,
     Json(req): Json<SetSessionPinRequest>,
 ) -> Result<axum::http::StatusCode> {
-    // Same web-chat scoping as get/hide/model — a non-`http` id 404s.
-    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
     // Targeted flat-column write — like `set_hidden`, it survives a
     // concurrent `touch` (full-blob save) so the pin can't be clobbered.
     state
@@ -849,13 +852,15 @@ async fn set_session_pin(
 async fn delete_session(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
+    authed: Option<Extension<AuthedClient>>,
 ) -> Result<axum::http::StatusCode> {
     // Despite the `DELETE` verb this hides rather than removes the
     // row — see the module docstring. Other tabs keep working because
     // web chat authenticates with the admin bearer, not a session-bound
     // credential; users can restore via `POST .../unhide` or
     // `?include_hidden=true`.
-    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
     state
         .session_manager
         .set_hidden(&sid, true)
@@ -888,8 +893,10 @@ async fn delete_session(
 async fn unhide_session(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
+    authed: Option<Extension<AuthedClient>>,
 ) -> Result<axum::http::StatusCode> {
-    let (sid, session) = load_web_chat_session(&state, &session_id).await?;
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
     state
         .session_manager
         .set_hidden(&sid, false)
@@ -931,9 +938,9 @@ fn folder_err(e: SessionError) -> GatewayError {
     }
 }
 
-/// Broadcast the current folder tree as a full snapshot to every open
-/// chat tab. Called after any folder mutation. No-op when the http
-/// channel isn't installed (test fixtures with no live web clients).
+/// Broadcast the current folder tree as a full snapshot to every open web or
+/// device chat client. Called after any folder mutation. No-op when no subscribed
+/// chat channel is installed (test fixtures with no live clients).
 async fn broadcast_folders(state: &AdminState) -> Result<()> {
     let folders: Vec<FolderView> = state
         .session_manager
@@ -949,11 +956,13 @@ async fn broadcast_folders(state: &AdminState) -> Result<()> {
             created_at: f.created_at,
         })
         .collect();
-    let Some(channel) = state.channel_registry.get(&ChannelType::http()) else {
-        return Ok(());
-    };
-    if let Some(sub) = channel.as_subscribed() {
-        sub.broadcast_folders_changed(folders);
+    for channel_type in chat_broadcast_channels() {
+        let Some(channel) = state.channel_registry.get(&channel_type) else {
+            continue;
+        };
+        if let Some(sub) = channel.as_subscribed() {
+            sub.broadcast_folders_changed(folders.clone());
+        }
     }
     Ok(())
 }
@@ -983,9 +992,11 @@ pub struct SetSessionFolderRequest {
 async fn set_session_folder(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
+    authed: Option<Extension<AuthedClient>>,
     Json(req): Json<SetSessionFolderRequest>,
 ) -> Result<axum::http::StatusCode> {
-    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
     let folder = req.folder_id.map(FolderId::from);
     state
         .session_manager
@@ -1321,8 +1332,19 @@ const WEB_HIDDEN_SLASH_COMMANDS: &[&str] = &["new"];
 
 fn chat_list_channel(authed: Option<&AuthedClient>) -> ChannelType {
     match authed {
-        Some(AuthedClient::Device { .. }) => ChannelType::ios(),
+        Some(AuthedClient::Device { .. }) => ChannelType::device(),
         _ => ChannelType::http(),
+    }
+}
+
+fn chat_user(authed: Option<&AuthedClient>) -> User {
+    match authed {
+        Some(AuthedClient::Device { device_id }) => User {
+            id: device_id.clone(),
+            name: None,
+            channel: ChannelType::device(),
+        },
+        _ => web_operator_user(),
     }
 }
 
@@ -1334,15 +1356,17 @@ fn web_operator_user() -> User {
     }
 }
 
-/// Load the session row for `session_id` and verify it lives on the
-/// `http` channel. Both branches return the **same** `NotFound` body so
-/// a request for a Telegram/WeChat session id through the chat API
+/// Load the session row for `session_id` and verify it lives on the request
+/// identity's chat channel (`http` for web, `device` for direct device/relay).
+/// Both branches return the **same** `NotFound` body so a request for a
+/// Telegram/WeChat session id through the chat API
 /// can't be distinguished from a request for a nonexistent id —
 /// `GatewayError::NotFound` serialises its `to_string()` into the JSON
 /// response, so differing messages would otherwise leak existence.
-async fn load_web_chat_session(
+async fn load_scoped_chat_session(
     state: &AdminState,
     session_id: &str,
+    authed: Option<&AuthedClient>,
 ) -> Result<(SessionId, Session)> {
     let sid = SessionId::from(session_id);
     let not_found = || GatewayError::NotFound(format!("chat session {session_id}"));
@@ -1352,34 +1376,34 @@ async fn load_web_chat_session(
         .await
         .map_err(|e| GatewayError::Internal(format!("load session: {e}")))?
         .ok_or_else(not_found)?;
-    if session.channel != ChannelType::http() {
+    if session.channel != chat_list_channel(authed) {
         return Err(not_found());
     }
     Ok((sid, session))
 }
 
-/// Push a [`Frame::SessionUpdated`] patch to every connection on the
-/// `http` channel — every open chat tab, whether in this browser or
-/// another. The patch carries the truth (no refetch round-trip); see
-/// the variant's doc comment for receiver-side merge rules. No-op
-/// when the `http` channel isn't installed (only possible in test
-/// fixtures that skipped `install_channels`); in that case no web
-/// clients can be connected to receive it anyway.
+/// Push a [`Frame::SessionUpdated`] patch to every open web or device chat client.
+/// The patch carries the truth (no refetch round-trip); see the variant's doc
+/// comment for receiver-side merge rules. No-op when subscribed chat channels
+/// are not installed (only possible in test fixtures that skipped
+/// `install_channels`).
 pub(crate) fn broadcast_session_patch(
     state: &AdminState,
     session_id: &SessionId,
     patch: SessionPatch,
 ) {
-    let Some(channel) = state.channel_registry.get(&ChannelType::http()) else {
-        return;
-    };
-    // http is always Subscribed by construction; the `if let Some`
-    // makes the typed-view constraint explicit at the call site
-    // rather than reaching for an `expect` we'd never want to panic
-    // on.
-    if let Some(sub) = channel.as_subscribed() {
-        sub.broadcast_session_patch(session_id.clone(), patch);
+    for channel_type in chat_broadcast_channels() {
+        let Some(channel) = state.channel_registry.get(&channel_type) else {
+            continue;
+        };
+        if let Some(sub) = channel.as_subscribed() {
+            sub.broadcast_session_patch(session_id.clone(), patch.clone());
+        }
     }
+}
+
+fn chat_broadcast_channels() -> [ChannelType; 2] {
+    [ChannelType::http(), ChannelType::device()]
 }
 
 /// True when the session was spawned by a cron trigger rather than a user

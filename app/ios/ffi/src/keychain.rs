@@ -282,7 +282,7 @@ pub fn delete_paired_record() -> Result<(), String> {
 
 /// Account holding the device's long-term Noise static identity, stored as the
 /// 32-byte secret followed by its 32-byte X25519 public (64 bytes). This is what
-/// makes the derived `device_id` (`ios-<public[..8]>`) stable across re-pairings
+/// makes the derived `device_id` (`device-<public[..8]>`) stable across re-pairings
 /// and launches: pairing loads this key instead of minting a fresh one each
 /// time. Kept in its own account (not only inside the paired record) so it
 /// survives an unpair/"forget" and exists before the first pairing completes.
@@ -317,7 +317,7 @@ pub fn read_device_identity() -> Result<Option<DeviceIdentity>, String> {
 
 /// Account holding the device's long-term **Ed25519 push-delegation identity**
 /// (a 32-byte seed), kept in the app's private keychain. Its public half is the
-/// `device_id` (`ios-<hex(pub)>`), and at pairing the app signs a delegation
+/// `device_id` (`device-<hex(pub)>`), and at pairing the app signs a delegation
 /// with it authorizing the gateway's push key — so it must be stable across
 /// re-pairings (a re-pair under the same physical device keeps the same id).
 const DEVICE_SIGN_KEY_ACCOUNT: &str = "baybo.device-sign-key";
@@ -341,7 +341,7 @@ pub fn read_device_sign_key() -> Result<Option<[u8; KEY_LEN]>, String> {
 }
 
 /// Load the device's Ed25519 push-delegation identity, minting + persisting one
-/// on first use. Its public half IS the `device_id` (`ios-<hex(pub)>`). Shared by
+/// on first use. Its public half IS the `device_id` (`device-<hex(pub)>`). Shared by
 /// the relay (scan-to-pair) and direct (push-register) paths so a phone has ONE
 /// stable push identity regardless of how it connects — both store under
 /// [`DEVICE_SIGN_KEY_ACCOUNT`], so the `device_id` and its `baybo.push-key.<id>`
