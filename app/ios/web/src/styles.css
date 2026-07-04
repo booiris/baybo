@@ -75,7 +75,7 @@ button {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  padding: var(--thread-top-inset) 1.25rem calc(var(--thread-bottom-inset) + 1rem);
+  padding: var(--thread-top-inset) 1.25rem calc(var(--thread-bottom-inset) + 4rem);
 }
 /* Native reports the bottom obstruction only at keyboard-animation ENDPOINTS
    (SwiftUI geometry callbacks don't stream interpolated layout), so the web
