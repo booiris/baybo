@@ -10,7 +10,6 @@
 #                                        `baybo-channels` (registration wire)
 #   sidecars/tool/browser/src/generated/   ← `baybo-tools::mcp` (MCP `_meta.baybo.*`)
 #   bench/bench-web/web/src/generated/ ← `baybo-bench-web` (bench spine model)
-#   app/mobile/src/generated/         ← `baybo-mobile-core` (Tauri IPC DTOs)
 #
 # Usage: scripts/check-ts-bindings.sh
 set -euo pipefail
@@ -29,9 +28,6 @@ SURFACES=(
     "sidecars/sdk/channel-ts/src/generated|test -p baybo-channels --features ts-export --lib register_wire"
     "sidecars/tool/browser/src/generated|test -p baybo-tools  --features ts-export --lib mcp::access_rule"
     "bench/bench-web/web/src/generated|test -p baybo-bench-web --features ts-export --lib model"
-    # The mobile app is a separate Cargo workspace; baybo-mobile-core is FFI-free
-    # (no Tauri/webkit), so this regen builds on the ubuntu CI runner unchanged.
-    "app/mobile/src/generated|test --manifest-path app/mobile/Cargo.toml -p baybo-mobile-core --features ts-export --lib"
 )
 
 failed=0

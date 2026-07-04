@@ -42,7 +42,7 @@ members = [
 # `cargo run` / bare `cargo build` operate on the `baybo` binary by default;
 # the rest of the workspace is reached with `--workspace` or `-p <crate>`.
 default-members = ["crates/baybo"]
-exclude = ["crates/security/fuzz", "remote-host", "app/mobile"]
+exclude = ["crates/security/fuzz", "remote-host"]
 
 [workspace.package]
 version = "0.1.0"
