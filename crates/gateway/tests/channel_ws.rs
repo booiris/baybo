@@ -1096,11 +1096,12 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
     // Mix of rows: visible bubbles + agent-internal rows that the
     // catch-up replay must skip.
     let rows: &[ChatMessage] = &[
-        ChatMessage::user(vec![ContentBlock::Text("hi".into())]),
+        ChatMessage::user(vec![ContentBlock::Text("hi".into())]).with_platform_msg_id("ios-msg-0"),
         // Agent-injected user-role reminder — must NOT replay.
         ChatMessage::agent_context(vec![ContentBlock::Text("[skill reminder]".into())]),
         ChatMessage::assistant(vec![ContentBlock::Text("hello there".into())]),
-        ChatMessage::user(vec![ContentBlock::Text("how are you".into())]),
+        ChatMessage::user(vec![ContentBlock::Text("how are you".into())])
+            .with_platform_msg_id("ios-msg-3"),
         // Tool-result row — must NOT replay.
         ChatMessage::tool_result("t1".into(), "ok".into()),
         ChatMessage::assistant(vec![ContentBlock::Text("doing well".into())]),
@@ -1145,7 +1146,7 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
     // Catch-up should stream: row #3 (user "how are you", ord=3) and
     // row #5 (assistant "doing well", ord=5). Row #4 (tool result) is
     // skipped by the visibility filter.
-    let mut got: Vec<(i64, String, MessageRole)> = Vec::new();
+    let mut got: Vec<(i64, String, MessageRole, String)> = Vec::new();
     for _ in 0..2 {
         let frame = recv_frame(&mut client, Duration::from_secs(2))
             .await
@@ -1155,12 +1156,14 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
                 content,
                 ordinal,
                 role,
+                platform_msg_id,
                 ..
             }) => {
                 got.push((
                     ordinal.expect("catch-up frames carry ordinal"),
                     content,
                     role,
+                    platform_msg_id,
                 ));
             }
             other => panic!("expected Message, got {other:?}"),
@@ -1169,8 +1172,18 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
     assert_eq!(
         got,
         vec![
-            (3, "how are you".to_string(), MessageRole::User),
-            (5, "doing well".to_string(), MessageRole::Assistant),
+            (
+                3,
+                "how are you".to_string(),
+                MessageRole::User,
+                "ios-msg-3".to_string()
+            ),
+            (
+                5,
+                "doing well".to_string(),
+                MessageRole::Assistant,
+                String::new()
+            ),
         ],
         "catch-up replays UI-visible rows above cursor in ordinal order",
     );
@@ -1208,10 +1221,11 @@ async fn fetch_history_returns_backward_page_of_visible_rows() {
     // Same mix as the catch-up test: visible bubbles interleaved with
     // agent-internal rows the history page must filter out.
     let rows: &[ChatMessage] = &[
-        ChatMessage::user(vec![ContentBlock::Text("hi".into())]),
+        ChatMessage::user(vec![ContentBlock::Text("hi".into())]).with_platform_msg_id("ios-msg-0"),
         ChatMessage::agent_context(vec![ContentBlock::Text("[skill reminder]".into())]),
         ChatMessage::assistant(vec![ContentBlock::Text("hello there".into())]),
-        ChatMessage::user(vec![ContentBlock::Text("how are you".into())]),
+        ChatMessage::user(vec![ContentBlock::Text("how are you".into())])
+            .with_platform_msg_id("ios-msg-3"),
         ChatMessage::tool_result("t1".into(), "ok".into()),
         ChatMessage::assistant(vec![ContentBlock::Text("doing well".into())]),
     ];
@@ -1282,23 +1296,44 @@ async fn fetch_history_returns_backward_page_of_visible_rows() {
         unreachable!()
     };
 
-    let visible: Vec<(i64, String, MessageRole)> = messages
+    let visible: Vec<(i64, String, MessageRole, String)> = messages
         .into_iter()
         .map(|m| {
             (
                 m.ordinal.expect("history rows carry ordinal"),
                 m.content,
                 m.role,
+                m.platform_msg_id,
             )
         })
         .collect();
     assert_eq!(
         visible,
         vec![
-            (0, "hi".to_string(), MessageRole::User),
-            (2, "hello there".to_string(), MessageRole::Assistant),
-            (3, "how are you".to_string(), MessageRole::User),
-            (5, "doing well".to_string(), MessageRole::Assistant),
+            (
+                0,
+                "hi".to_string(),
+                MessageRole::User,
+                "ios-msg-0".to_string()
+            ),
+            (
+                2,
+                "hello there".to_string(),
+                MessageRole::Assistant,
+                String::new()
+            ),
+            (
+                3,
+                "how are you".to_string(),
+                MessageRole::User,
+                "ios-msg-3".to_string()
+            ),
+            (
+                5,
+                "doing well".to_string(),
+                MessageRole::Assistant,
+                String::new()
+            ),
         ],
         "history page carries UI-visible bubbles in ascending ordinal order",
     );

@@ -976,7 +976,7 @@ async fn chat_to_visible_wire_message(
         channel_type: channel_type.clone(),
         bot_id: String::new(),
         attachments,
-        platform_msg_id: String::new(),
+        platform_msg_id: msg.platform_msg_id().to_string(),
         role,
         ordinal: Some(ordinal),
     })

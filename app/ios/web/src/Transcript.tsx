@@ -89,6 +89,13 @@ function historyMessagesToChatMsgs(messages: WireMessage[]): ChatMsg[] {
   }));
 }
 
+function ordinalFromMessageId(id: string): number | null {
+  const match = /^m(\d+)$/.exec(id);
+  if (!match) return null;
+  const n = Number(match[1]);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 /// Restored rows re-enter with any live-turn state stripped: an "active" work
 /// block can't still be running after a relaunch, and an empty one has nothing
 /// to show. Unknown roles from a future persist format are dropped.
@@ -245,6 +252,17 @@ export function Transcript({
   // restored), so the server's echo or a catch-up replay doesn't render twice.
   const sentIds = useRef<Set<string>>(
     new Set((restored?.messages ?? []).filter((m) => m.role === "user").map((m) => m.id)),
+  );
+  // Durable ordinals already rendered. This catches the network-race where an
+  // old leg delivers a final Message just before a reconnect's Subscribe replay
+  // sends the same row again.
+  const renderedOrdinals = useRef<Set<number>>(
+    new Set(
+      (restored?.messages ?? [])
+        .filter((m) => m.role === "user" || m.role === "assistant")
+        .map((m) => ordinalFromMessageId(m.id))
+        .filter((n): n is number => n !== null),
+    ),
   );
   // Highest durable ordinal rendered — the newest-edge cursor. Native uses it
   // as sinceOrdinal on reconnect, so every advance is posted over the bridge.
@@ -541,6 +559,8 @@ export function Transcript({
     }
     for (const m of older) {
       if (m.role === "user") sentIds.current.add(m.id);
+      const ordinal = ordinalFromMessageId(m.id);
+      if (ordinal !== null) renderedOrdinals.current.add(ordinal);
     }
     setMessages((m) => {
       const seen = new Set(m.map((x) => x.id));
@@ -618,18 +638,21 @@ export function Transcript({
     }
     switch (frame.kind) {
       case "message": {
+        const ordinal = typeof frame.ordinal === "number" ? frame.ordinal : null;
         // Advance the cursor first — even for our own echo we dedup below — so
         // a later reconnect doesn't re-replay this row. A `null` cursor (post
         // reset) takes the first real ordinal that lands.
-        if (
-          typeof frame.ordinal === "number" &&
-          (lastOrdinal.current === null || frame.ordinal > lastOrdinal.current)
-        ) {
-          setNewestOrdinal(frame.ordinal);
+        if (ordinal !== null && (lastOrdinal.current === null || ordinal > lastOrdinal.current)) {
+          setNewestOrdinal(ordinal);
         }
         const role = frame.role === "user" ? "user" : "assistant";
         if (role === "user" && frame.platform_msg_id && sentIds.current.has(frame.platform_msg_id)) {
+          if (ordinal !== null) renderedOrdinals.current.add(ordinal);
           return; // our own message / already rendered
+        }
+        if (ordinal !== null && renderedOrdinals.current.has(ordinal)) {
+          if (role === "user" && frame.platform_msg_id) sentIds.current.add(frame.platform_msg_id);
+          return;
         }
         if (role === "user" && frame.platform_msg_id) {
           sentIds.current.add(frame.platform_msg_id);
@@ -640,10 +663,11 @@ export function Transcript({
           closeWork();
           clearStreaming();
         }
+        if (ordinal !== null) renderedOrdinals.current.add(ordinal);
         setMessages((m) => [
           ...m,
           {
-            id: frame.platform_msg_id || uid(),
+            id: frame.platform_msg_id || (ordinal !== null ? `m${ordinal}` : uid()),
             role,
             content: frame.content,
             attachments: frame.attachments,
@@ -763,6 +787,11 @@ export function Transcript({
           for (const m of frame.messages) {
             if (m.role === "user" && m.platform_msg_id) sentIds.current.add(m.platform_msg_id);
           }
+          renderedOrdinals.current = new Set(
+            rows
+              .map((m) => ordinalFromMessageId(m.id))
+              .filter((n): n is number => n !== null),
+          );
           setNewestOrdinal(frame.newest_ordinal ?? 0);
           oldestOrdinal.current = frame.oldest_ordinal ?? null;
           setHasMoreOlder(frame.has_more);

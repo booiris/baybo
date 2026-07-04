@@ -224,6 +224,10 @@ impl LibsqlPool {
                     -- subagent tasks); this column tells the genuine prompt and
                     -- the cron fire apart from them without guessing by content.
                     source        TEXT NOT NULL DEFAULT 'agent',
+                    -- Client idempotency key for genuine channel input. Used by
+                    -- reconnect/history replay to reconcile optimistic user
+                    -- bubbles; empty for rows without a client-supplied id.
+                    platform_msg_id TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (session_id, ordinal)
                 );
                 CREATE INDEX IF NOT EXISTS idx_session_messages_active
@@ -554,6 +558,7 @@ impl LibsqlPool {
             "ALTER TABLE sessions ADD COLUMN folder_id TEXT",
             "ALTER TABLE devices ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE devices ADD COLUMN remote_api_key TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE session_messages ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {
