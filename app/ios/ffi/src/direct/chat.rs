@@ -12,23 +12,15 @@
 use futures_util::SinkExt;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode, header::AUTHORIZATION};
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use super::rest;
-use crate::core::{
-    Frame, MobileError, decode, encode, register_device_frame, user_message_frame,
-};
+use crate::core::{Frame, MobileError, decode, encode, register_device_frame, user_message_frame};
 use crate::transport::{
-    ChatTransport, Connection, FrameCodec, SessionLeg, SessionRegistry, TransportError,
-    UserFrameFn, WsStream, recv_binary,
+    ChatTransport, Connection, FrameCodec, SessionLeg, TransportError, UserFrameFn, WsStream,
+    recv_binary,
 };
-
-/// The direct leg's shared session registry.
-#[derive(Default)]
-pub(crate) struct DirectSessions {
-    registry: SessionRegistry,
-}
 
 /// The direct frame codec: raw MessagePack, one frame per WS message — no Noise,
 /// no reassembly.
@@ -47,7 +39,7 @@ impl FrameCodec for DirectCodec {
     }
 }
 
-impl ChatTransport for DirectSessions {
+impl ChatTransport for super::DirectSessions {
     #[allow(clippy::manual_async_fn)]
     fn establish(
         &self,
@@ -56,19 +48,15 @@ impl ChatTransport for DirectSessions {
             // A precondition failure must not tear down a healthy live session on a
             // foreground reconnect (matches the original, which only reset on a
             // failed dial in `establish_ws`).
-            let creds = super::credentials()
-                .map_err(TransportError::Precondition)?
-                .ok_or_else(|| {
-                    TransportError::Precondition("not connected; sign in first".into())
-                })?;
-            let device_id = super::device_id().map_err(TransportError::Precondition)?;
-            let ws = self.establish_ws(&creds, &device_id).await?;
+            let http = self.http_client().map_err(TransportError::Precondition)?;
+            let ws = self.establish_ws(&http).await?;
 
             let codec: Box<dyn FrameCodec> = Box::new(DirectCodec);
 
             // Direct user messages carry the device id + `channel_type=device`,
             // matching the relay content leg while still using the admin-bearer
             // direct transport.
+            let device_id = http.device_id().to_owned();
             let user_frame: UserFrameFn = Box::new(move |session_id, text, msg_id, attachments| {
                 user_message_frame(session_id, &device_id, text, msg_id, attachments)
             });
@@ -83,14 +71,10 @@ impl ChatTransport for DirectSessions {
     }
 }
 
-impl DirectSessions {
+impl super::DirectSessions {
     /// Complete the WS handshake as the admin-authenticated direct device.
-    async fn establish_ws(
-        &self,
-        creds: &super::DirectCredentials,
-        device_id: &str,
-    ) -> Result<WsStream, TransportError> {
-        match dial_and_register(&creds.base_url, &creds.token, device_id).await {
+    async fn establish_ws(&self, http: &super::DirectHttp) -> Result<WsStream, TransportError> {
+        match dial_and_register(http).await {
             Ok(ws) => Ok(ws),
             Err(DialErr::Unauthorized) => {
                 Err(TransportError::Other(super::INVALID_TOKEN_CODE.to_string()))
@@ -101,22 +85,23 @@ impl DirectSessions {
 }
 
 /// Create a fresh chat session and return the id.
-pub(crate) async fn session_create() -> Result<String, String> {
-    let creds = super::credentials()?.ok_or("not connected; sign in first")?;
-    let cred = rest::create_session(&creds.base_url, &creds.token).await?;
+pub(crate) async fn session_create(sessions: &super::DirectSessions) -> Result<String, String> {
+    let http = sessions.http_client()?;
+    let cred = rest::create_session(&http).await?;
     Ok(cred.session_id)
 }
 
-impl SessionLeg for DirectSessions {
-    fn registry(&self) -> &SessionRegistry {
-        &self.registry
+impl SessionLeg for super::DirectSessions {
+    fn registry(&self) -> &crate::transport::SessionRegistry {
+        self.chat_registry()
     }
 }
 
 /// Like [`transport::disconnect`](crate::transport::disconnect), used by logout so
 /// a later reconnect can't resurrect the now keychain-creds-less direct session.
-pub(crate) async fn forget(sessions: &DirectSessions) {
-    sessions.registry.disconnect().await;
+pub(crate) async fn forget(sessions: &super::DirectSessions) {
+    sessions.chat_registry().disconnect().await;
+    sessions.clear_http_client();
 }
 
 /// Distinguishes rejected admin auth from a hard failure.
@@ -127,23 +112,15 @@ enum DialErr {
 
 /// Dial `/v1/channel-ws` with the gateway Bearer, then run the device Register /
 /// RegisterAck handshake.
-async fn dial_and_register(
-    base_url: &str,
-    access_token: &str,
-    device_id: &str,
-) -> Result<WsStream, DialErr> {
-    let url = super::channel_ws_url(base_url).map_err(DialErr::Other)?;
+async fn dial_and_register(http: &super::DirectHttp) -> Result<WsStream, DialErr> {
+    let url = super::channel_ws_url(http.base_url()).map_err(DialErr::Other)?;
     let mut req = url
         .as_str()
         .into_client_request()
         .map_err(|e| DialErr::Other(format!("bad ws url: {e}")))?;
-    let value = HeaderValue::from_str(&format!("Bearer {access_token}"))
-        .map_err(|e| DialErr::Other(format!("bad access token: {e}")))?;
-    req.headers_mut().insert(AUTHORIZATION, value);
-    let device_id_value = HeaderValue::from_str(device_id)
-        .map_err(|e| DialErr::Other(format!("bad device id: {e}")))?;
-    req.headers_mut()
-        .insert(super::DEVICE_ID_HEADER, device_id_value);
+    for (name, value) in http.headers() {
+        req.headers_mut().insert(name.clone(), value.clone());
+    }
 
     let mut ws = match connect_async(req).await {
         Ok((ws, _)) => ws,

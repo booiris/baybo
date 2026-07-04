@@ -138,7 +138,8 @@ impl BayboClient {
         base_url: String,
         token: String,
     ) -> Result<String, BayboError> {
-        runtime::run(direct::login(base_url, token)).await
+        let this = self;
+        runtime::run(async move { direct::login(&this.direct, base_url, token).await }).await
     }
 
     /// Best-effort direct-mode push registration: provision (or refresh) this
@@ -150,7 +151,7 @@ impl BayboClient {
         let this = self;
         runtime::run(async move {
             let token = this.apns.token().unwrap_or_default();
-            direct::register_push(token, this.apns.env().as_str()).await
+            direct::register_push(&this.direct, token, this.apns.env().as_str()).await
         })
         .await
     }
@@ -185,7 +186,7 @@ impl BayboClient {
     pub async fn chat_create_session(self: Arc<Self>) -> Result<String, BayboError> {
         runtime::run(async move {
             match active_leg()? {
-                ActiveLeg::Direct => direct::session_create().await,
+                ActiveLeg::Direct => direct::session_create(&self.direct).await,
                 ActiveLeg::Relay => Ok(uuid::Uuid::new_v4().to_string()),
             }
         })
@@ -201,7 +202,7 @@ impl BayboClient {
     ) -> Result<Vec<ChatSessionSummary>, BayboError> {
         runtime::run(async move {
             match active_leg()? {
-                ActiveLeg::Direct => direct::sessions_list().await,
+                ActiveLeg::Direct => direct::sessions_list(&self.direct).await,
                 ActiveLeg::Relay => relay::sessions_list().await,
             }
         })
@@ -331,7 +332,7 @@ impl BayboClient {
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => relay::upload_bytes(bytes, mime_type).await,
-                ActiveLeg::Direct => direct::upload_bytes(bytes, mime_type).await,
+                ActiveLeg::Direct => direct::upload_bytes(&self.direct, bytes, mime_type).await,
             }
         })
         .await
@@ -346,7 +347,7 @@ impl BayboClient {
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => relay::image_data(blob_id).await,
-                ActiveLeg::Direct => direct::image_data(blob_id).await,
+                ActiveLeg::Direct => direct::image_data(&self.direct, blob_id).await,
             }
         })
         .await

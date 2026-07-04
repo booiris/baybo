@@ -13,15 +13,10 @@ pub(super) struct ChatSessionCreated {
 }
 
 /// Create a fresh chat session (`POST /v1/chat/sessions`, empty body).
-pub(super) async fn create_session(
-    base: &str,
-    access_token: &str,
-) -> Result<ChatSessionCreated, String> {
-    let device_id = super::device_id()?;
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/chat/sessions"))
-        .bearer_auth(access_token)
-        .header(super::DEVICE_ID_HEADER, device_id)
+pub(super) async fn create_session(http: &super::DirectHttp) -> Result<ChatSessionCreated, String> {
+    let resp = http
+        .client()
+        .post(http.url("/v1/chat/sessions"))
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -63,15 +58,10 @@ pub(super) struct SessionSummary {
 
 /// List the gateway's device chat sessions (`GET /v1/chat/sessions`, hidden + cron
 /// filtered by the gateway's defaults).
-pub(super) async fn list_sessions(
-    base: &str,
-    access_token: &str,
-) -> Result<Vec<SessionSummary>, String> {
-    let device_id = super::device_id()?;
-    let resp = reqwest::Client::new()
-        .get(format!("{base}/v1/chat/sessions"))
-        .bearer_auth(access_token)
-        .header(super::DEVICE_ID_HEADER, device_id)
+pub(super) async fn list_sessions(http: &super::DirectHttp) -> Result<Vec<SessionSummary>, String> {
+    let resp = http
+        .client()
+        .get(http.url("/v1/chat/sessions"))
         .send()
         .await
         .map_err(|e| format!("could not reach Baybo: {e}"))?;

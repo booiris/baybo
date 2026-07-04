@@ -44,23 +44,29 @@ struct RegisterResp {
 /// Register (or refresh) this app's direct-mode push binding with the connected
 /// gateway. `Ok(None)` when there is no APNs token yet (the caller retries on the
 /// next foreground); `Ok(Some(device_id))` on success.
-pub async fn register(apns_token: String, apns_env: &str) -> Result<Option<String>, String> {
+pub async fn register(
+    sessions: &super::DirectSessions,
+    apns_token: String,
+    apns_env: &str,
+) -> Result<Option<String>, String> {
     // No token yet (iOS hasn't delivered it) → nothing to register; the caller
     // retries on the next foreground once it lands.
     let apns_token = apns_token.trim().to_string();
     if apns_token.is_empty() {
         return Ok(None);
     }
-    let creds = super::credentials()?.ok_or("not connected; sign in first")?;
-    let client = reqwest::Client::new();
+    let http = sessions.http_client()?;
 
     // 1. Fetch the gateway push key to sign the delegation over.
     let sign_key = keychain::load_or_create_device_sign_key()?;
     let device_id = delegation::device_id_for(&sign_key.verifying_key());
-    let params: PushParams = client
-        .get(format!("{}/v1/push/params", creds.base_url))
-        .bearer_auth(&creds.token)
-        .header(super::DEVICE_ID_HEADER, device_id.as_str())
+    if device_id != http.device_id() {
+        sessions.clear_http_client();
+        return Err("device identity changed; retry direct request".into());
+    }
+    let params: PushParams = http
+        .client()
+        .get(http.url("/v1/push/params"))
         .send()
         .await
         .map_err(|e| format!("push params: {e}"))?
@@ -94,10 +100,9 @@ pub async fn register(apns_token: String, apns_env: &str) -> Result<Option<Strin
         push_key: hex::encode(push_key),
         delegation: hex::encode(deleg.to_bytes()),
     };
-    let resp: RegisterResp = client
-        .post(format!("{}/v1/push/register", creds.base_url))
-        .bearer_auth(&creds.token)
-        .header(super::DEVICE_ID_HEADER, device_id.as_str())
+    let resp: RegisterResp = http
+        .client()
+        .post(http.url("/v1/push/register"))
         .json(&body)
         .send()
         .await

@@ -6,20 +6,17 @@ use serde::Deserialize;
 
 use super::INVALID_TOKEN_CODE;
 
-fn admin_context() -> Result<(String, String), String> {
-    let creds = super::credentials()?.ok_or("not connected; sign in first")?;
-    Ok((creds.base_url, creds.token))
-}
-
 /// Upload raw bytes (`POST /v1/blobs`, mime in `content-type`) → content-addressed
 /// `blob_id` to reference on the next message.
-pub async fn upload_bytes(bytes: Vec<u8>, mime_type: String) -> Result<String, String> {
-    let (base, access_token) = admin_context()?;
-    let device_id = super::device_id()?;
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/blobs"))
-        .bearer_auth(access_token)
-        .header(super::DEVICE_ID_HEADER, device_id)
+pub async fn upload_bytes(
+    sessions: &super::DirectSessions,
+    bytes: Vec<u8>,
+    mime_type: String,
+) -> Result<String, String> {
+    let http = sessions.http_client()?;
+    let resp = http
+        .client()
+        .post(http.url("/v1/blobs"))
         .header(reqwest::header::CONTENT_TYPE, mime_type)
         .body(bytes)
         .send()
@@ -45,18 +42,19 @@ pub async fn upload_bytes(bytes: Vec<u8>, mime_type: String) -> Result<String, S
 /// Fetch an attachment (`GET /v1/blobs/{blob_id}`) → raw bytes for the webview to
 /// wrap in an object URL. `blob_id` (`sha256:<hex>.<token>`) is pushed as a single
 /// path segment so its `:` / `.` / token chars are percent-encoded.
-pub async fn image_data(blob_id: String) -> Result<Vec<u8>, String> {
-    let (base, access_token) = admin_context()?;
-    let device_id = super::device_id()?;
-    let mut url = reqwest::Url::parse(&format!("{base}/v1/blobs"))
+pub async fn image_data(
+    sessions: &super::DirectSessions,
+    blob_id: String,
+) -> Result<Vec<u8>, String> {
+    let http = sessions.http_client()?;
+    let mut url = reqwest::Url::parse(&http.url("/v1/blobs"))
         .map_err(|e| format!("bad Baybo address: {e}"))?;
     url.path_segments_mut()
         .map_err(|_| "bad Baybo address".to_string())?
         .push(&blob_id);
-    let resp = reqwest::Client::new()
+    let resp = http
+        .client()
         .get(url)
-        .bearer_auth(access_token)
-        .header(super::DEVICE_ID_HEADER, device_id)
         .send()
         .await
         .map_err(|e| format!("could not reach Baybo: {e}"))?;
