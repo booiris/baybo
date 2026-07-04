@@ -8,6 +8,7 @@ use baybo_sandbox::{
     StdinSource,
 };
 use baybo_tools::{ExecSandbox, RunningChild, SandboxedOutput, SpawnOpts, ToolError};
+use baybo_workspace::absolutise;
 
 pub struct SandboxAdapter {
     runner: Arc<dyn SandboxRunner>,
@@ -62,21 +63,32 @@ impl SandboxAdapter {
     /// RO; everything outside that union remains invisible. Each
     /// `denied_paths` entry is then masked with a per-call empty tmpfs
     /// so credential vaults sitting inside `extra_root` still can't be
-    /// read or written. Non-existent denied paths are silently dropped
-    /// (bwrap's `--tmpfs` would otherwise fail). The cwd-must-be-in-
-    /// workspace check is relaxed because the agent's writable surface
-    /// is now wider than `workspace_root`.
+    /// read or written.
+    ///
+    /// `extra_root` and every denied path are resolved through their
+    /// symlinks before reaching the backend. bwrap's `--tmpfs`/`--bind`
+    /// follow a symlinked target *within the sandbox root*, so a state
+    /// dir reached via a symlink to an unbound location (e.g. a default
+    /// `~/.baybo` symlinked to a `/data/...` path outside the permissive
+    /// bind set) resolves to a target that doesn't exist in the assembled
+    /// root and aborts sandbox setup. Canonicalising also drops
+    /// non-existent denied paths — a missing `--tmpfs` target is a hard
+    /// bwrap error, not a no-op. The cwd-must-be-in-workspace check is
+    /// relaxed because the agent's writable surface is now wider than
+    /// `workspace_root`.
     pub fn with_permissive_filesystem(
         mut self,
         extra_root: PathBuf,
         denied_paths: Vec<PathBuf>,
     ) -> Self {
-        let denied_paths = denied_paths
+        let mut denied_paths = denied_paths
             .into_iter()
-            .filter(|p| p.exists())
+            .filter_map(|p| p.canonicalize().ok())
             .collect::<Vec<_>>();
+        denied_paths.sort();
+        denied_paths.dedup();
         self.filesystem_policy = FilesystemPolicy::Permissive {
-            extra_root,
+            extra_root: absolutise(&extra_root),
             denied_paths,
         };
         self.cwd_must_be_in_workspace = false;
@@ -89,11 +101,16 @@ impl SandboxAdapter {
     /// `Permissive`, the RO bind is layered on top of the denylist's
     /// masking tmpfs (the agent's denylist masks all of `~/.baybo`), so
     /// the script stays readable while the rest of the baybo state stays
-    /// hidden. Non-existent paths are dropped — bwrap's `--ro-bind-try`
-    /// tolerates them, but Docker's `-v …:ro` would fail and an SBPL
-    /// allow on a missing path is dead weight.
+    /// hidden. Paths are canonicalised (same symlinked-target reasoning
+    /// as [`Self::with_permissive_filesystem`]) and non-existent ones are
+    /// dropped — bwrap's `--ro-bind-try` tolerates a missing source, but
+    /// Docker's `-v …:ro` would fail and an SBPL allow on a missing path
+    /// is dead weight.
     pub fn with_readable_paths(mut self, paths: Vec<PathBuf>) -> Self {
-        self.readable_paths = paths.into_iter().filter(|p| p.exists()).collect();
+        self.readable_paths = paths
+            .into_iter()
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
         self
     }
 
@@ -375,8 +392,52 @@ mod tests {
         let seen = runner.seen.lock().take().expect("runner saw spec");
         assert_eq!(
             seen.readable_paths,
-            vec![skills.path().to_path_buf()],
-            "existing readable path must round-trip; missing path must be dropped"
+            vec![skills.path().canonicalize().expect("canonicalize skills")],
+            "existing readable path must round-trip (canonicalised); missing path must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn permissive_denied_symlink_resolves_to_real_target() {
+        // Reproduces the `~/.baybo -> /data/.../.baybo` shape: a denied
+        // path reached via a symlink must be handed to the backend as its
+        // real target, otherwise bwrap's `--tmpfs` follows the link into
+        // an unbound location and fails sandbox setup.
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let real_state = tempfile::tempdir().expect("state tempdir");
+        let link = workspace.path().join("state-link");
+        std::os::unix::fs::symlink(real_state.path(), &link).expect("symlink");
+        let runner = Arc::new(RecordingRunner::default());
+        let adapter = SandboxAdapter::new(
+            Arc::clone(&runner) as Arc<dyn SandboxRunner>,
+            workspace.path().to_path_buf(),
+            NetworkPolicy::All,
+        )
+        .with_permissive_filesystem(workspace.path().to_path_buf(), vec![link]);
+        adapter
+            .spawn_command(
+                Path::new("/bin/echo"),
+                &["hi".into()],
+                SpawnOpts {
+                    timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recording runner accepts");
+        let seen = runner.seen.lock().take().expect("runner saw spec");
+        let FilesystemPolicy::Permissive { denied_paths, .. } = seen.filesystem_policy else {
+            panic!("expected permissive filesystem policy");
+        };
+        assert_eq!(
+            denied_paths,
+            vec![
+                real_state
+                    .path()
+                    .canonicalize()
+                    .expect("canonicalize state")
+            ],
+            "denied symlink must be resolved to its real target for --tmpfs",
         );
     }
 
