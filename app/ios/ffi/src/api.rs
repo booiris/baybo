@@ -93,8 +93,8 @@ pub struct PairChallenge {
     pub confirm_code: String,
 }
 
-impl From<baybo_mobile_core::PairChallenge> for PairChallenge {
-    fn from(c: baybo_mobile_core::PairChallenge) -> Self {
+impl From<crate::core::PairChallenge> for PairChallenge {
+    fn from(c: crate::core::PairChallenge) -> Self {
         Self {
             device_id: c.device_id,
             confirm_code: c.confirm_code,
@@ -109,8 +109,8 @@ pub struct PairedSummary {
     pub rendezvous_id: String,
 }
 
-impl From<baybo_mobile_core::PairedSummary> for PairedSummary {
-    fn from(s: baybo_mobile_core::PairedSummary) -> Self {
+impl From<crate::core::PairedSummary> for PairedSummary {
+    fn from(s: crate::core::PairedSummary) -> Self {
         Self {
             relay_node_id: s.relay_node_id,
             rendezvous_id: s.rendezvous_id,
@@ -150,12 +150,12 @@ pub enum AttachmentKind {
     File,
 }
 
-impl From<AttachmentRef> for baybo_mobile_core::WireAttachment {
+impl From<AttachmentRef> for crate::core::WireAttachment {
     fn from(a: AttachmentRef) -> Self {
         let kind = match a.kind {
-            AttachmentKind::Image => baybo_mobile_core::AttachmentKind::Image,
-            AttachmentKind::Audio => baybo_mobile_core::AttachmentKind::Audio,
-            AttachmentKind::File => baybo_mobile_core::AttachmentKind::File,
+            AttachmentKind::Image => crate::core::AttachmentKind::Image,
+            AttachmentKind::Audio => crate::core::AttachmentKind::Audio,
+            AttachmentKind::File => crate::core::AttachmentKind::File,
         };
         Self {
             kind,

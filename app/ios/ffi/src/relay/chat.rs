@@ -4,16 +4,13 @@
 //! The generic frame pump + session lifecycle live in [`crate::transport`]; this
 //! file is just the relay-specific seams: [`RelaySessions::establish`] (dial +
 //! Noise) and [`RelayCodec`] (seal/open). The crypto + frame codec themselves live
-//! in the host-tested core ([`ContentHandshake`] / [`ContentSession`]).
+//! in the local protocol core ([`ContentHandshake`] / [`ContentSession`]).
 //!
 //! One content leg can subscribe to multiple sessions. Content is relay-only —
 //! the app reaches the (possibly NAT'd) gateway through C's blind content-join leg.
 
 use std::sync::Arc;
 
-use baybo_mobile_core::{
-    ContentHandshake, ContentSession, Frame, apns_token_frame, user_message_frame,
-};
 use device_proto::noise::StaticKeypair;
 use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::Message;
@@ -21,6 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use super::dial::dial_content_join;
 use super::pairing::{PairedRecord, load_paired_record};
 use crate::apns::ApnsState;
+use crate::core::{ContentHandshake, ContentSession, Frame, apns_token_frame, user_message_frame};
 use crate::transport::{
     ChatTransport, Connection, FrameCodec, SessionLeg, SessionRegistry, TransportError,
     UserFrameFn, WsStream, recv_binary,

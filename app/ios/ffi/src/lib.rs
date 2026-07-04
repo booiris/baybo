@@ -1,10 +1,9 @@
 //! The Baybo iOS core — the SwiftUI app's engine, exported over UniFFI.
 //!
-//! A thin FFI shell around the host-tested `baybo-mobile-core`: Swift drives
-//! scan-to-connect, chat, and attachments through [`BayboClient`], while remote
-//! notifications are handled out-of-process by the Notification Service
-//! Extension. The protocol/crypto live in the shared crates, so interop with the
-//! gateway is guaranteed by construction.
+//! A thin FFI shell: Swift drives scan-to-connect, chat, and attachments through
+//! [`BayboClient`], while remote notifications are handled out-of-process by the
+//! Notification Service Extension. The protocol/crypto live in the shared crates,
+//! so interop with the gateway is guaranteed by construction.
 //!
 //! Lifted from the Tauri shell (`app/mobile/src-tauri`): the command surface is
 //! the same, with Tauri channels/events replaced by the callback interfaces in
@@ -14,6 +13,7 @@
 mod api;
 mod apns;
 mod binding;
+mod core;
 mod direct;
 mod keychain;
 mod logging;
@@ -24,7 +24,7 @@ mod transport;
 
 use std::sync::Arc;
 
-use baybo_mobile_core::WireAttachment;
+use crate::core::WireAttachment;
 
 pub use api::{
     ApnsEnvironment, AttachmentKind, AttachmentRef, BayboError, ChatSessionSummary, ClientConfig,

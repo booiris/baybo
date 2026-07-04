@@ -7,10 +7,6 @@
 
 use std::time::Duration;
 
-use baybo_mobile_core::{
-    ApiTunnelSession, ContentHandshake, MAX_TUNNEL_CHUNK, TunnelHeader, TunnelRequest,
-    TunnelResponse, blob_id_sha256_hex,
-};
 use device_proto::noise::StaticKeypair;
 use futures_util::SinkExt;
 use serde::Deserialize;
@@ -20,6 +16,10 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::dial::dial_content_join;
 use super::pairing::{PairedRecord, load_paired_record};
+use crate::core::{
+    ApiTunnelSession, ContentHandshake, MAX_TUNNEL_CHUNK, TunnelHeader, TunnelRequest,
+    TunnelResponse, blob_id_sha256_hex,
+};
 use crate::transport::WsStream;
 
 const BLOB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -169,10 +169,7 @@ async fn download_to_path(blob_id: &str, dest_path: &str) -> Result<(), String> 
     loop {
         match next_response(&mut ws, &mut session).await? {
             TunnelResponse::Body {
-                offset,
-                data,
-                last,
-                ..
+                offset, data, last, ..
             } => {
                 if offset != expected_body_offset {
                     drop(file);

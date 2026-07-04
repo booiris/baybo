@@ -10,9 +10,6 @@
 //! rotated once over REST and the dial retried. A `RegisterAck{ok:false}` is not a
 //! token problem (the token is checked at the upgrade) — its reason is surfaced.
 
-use baybo_mobile_core::{
-    Frame, MobileError, decode, encode, register_http_frame, web_user_message_frame,
-};
 use futures_util::SinkExt;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
@@ -21,6 +18,9 @@ use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use super::rest;
+use crate::core::{
+    Frame, MobileError, decode, encode, register_http_frame, web_user_message_frame,
+};
 use crate::transport::{
     ChatTransport, Connection, FrameCodec, SessionLeg, SessionRegistry, TransportError,
     UserFrameFn, WsStream, recv_binary,

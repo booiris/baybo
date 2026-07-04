@@ -22,7 +22,7 @@ const LOG_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const LOG_FILES_KEPT: usize = 2;
 
 /// Crates logged at Debug; everything else at Warn (matches the Tauri shell).
-const DEBUG_TARGETS: [&str; 2] = ["baybo_ffi", "baybo_mobile_core"];
+const DEBUG_TARGETS: [&str; 2] = ["baybo_ffi", "baybo_ffi::core"];
 
 struct FileState {
     file: File,

@@ -144,7 +144,7 @@ dependencies = [
 name = "baybo-ios-ffi"
 version = "0.1.0"
 dependencies = [
- "baybo-mobile-core",
+ "baybo-model",
  "core-foundation",
  "core-foundation-sys",
  "device-proto",
@@ -158,22 +158,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "snow",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "uniffi",
  "uuid",
-]
-
-[[package]]
-name = "baybo-mobile-core"
-version = "0.1.0"
-dependencies = [
- "baybo-model",
- "device-proto",
- "serde",
- "snow",
- "thiserror 2.0.18",
  "wire",
 ]
 

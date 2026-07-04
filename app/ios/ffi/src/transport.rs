@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use baybo_mobile_core::{Frame, MobileError, WireAttachment, fetch_history_frame, subscribe_frame};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
@@ -36,6 +35,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::api::FrameSink;
+use crate::core::{Frame, MobileError, WireAttachment, fetch_history_frame, subscribe_frame};
 
 /// The concrete client socket both legs dial.
 pub(crate) type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;

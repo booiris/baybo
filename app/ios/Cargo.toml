@@ -1,14 +1,12 @@
-# iOS companion, SwiftUI generation — a SEPARATE Cargo workspace (the root
-# `[workspace]` excludes `app/ios` just like `app/mobile`) so the host
+# iOS companion, SwiftUI generation — a SEPARATE Cargo workspace so the host
 # `cargo clippy --all` gate never builds an iOS-configured crate.
 #
 # `ffi/` is the UniFFI core the SwiftUI app links as a static library: the
 # transport legs (relay Noise E2E + direct raw-msgpack), pairing, keychain, and
-# blob transfer, lifted from `app/mobile/src-tauri` with the Tauri shell
-# replaced by UniFFI callback interfaces. The protocol/crypto stay in the shared
-# crates (`wire`, `device-proto`, `baybo-mobile-core`), so interop with the
-# gateway is guaranteed by construction. `bindgen/` is the uniffi-bindgen CLI
-# kept as its own member so the `cli` feature never unifies into the lib build.
+# blob transfer behind UniFFI callback interfaces. The protocol/crypto stay in
+# the shared crates (`wire`, `device-proto`), so interop with the gateway is
+# guaranteed by construction. `bindgen/` is the uniffi-bindgen CLI kept as its own
+# member so the `cli` feature never unifies into the lib build.
 [workspace]
 resolver = "2"
 members = ["bindgen", "ffi"]
@@ -19,7 +17,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-baybo-mobile-core = { path = "../mobile/core" }
+baybo-model = { path = "../../crates/model" }
 wire = { path = "../../crates/wire" }
 device-proto = { path = "../../crates/device-proto" }
 # The remote-host (C) wire contract: relay route/URL builders + header names.
@@ -28,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 hex = "0.4"
+snow = "0.9"
 # Client-minted relay chat-session ids (the relay leg needs no gateway pre-registration).
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"

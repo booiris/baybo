@@ -1,5 +1,6 @@
 //! The pairing transport: dial the gateway's pair-rendezvous WS and drive the
-//! XXpsk0 + mutual-confirm handshake through `baybo_mobile_core::PairingClient`.
+//! XXpsk0 + mutual-confirm handshake through the local protocol core's
+//! `PairingClient`.
 //!
 //! The handshake pauses for a human decision, so it is split across two FFI
 //! calls: [`pair_begin`] runs up to the confirmation step and returns the
@@ -20,7 +21,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use baybo_mobile_core::{PairChallenge, PairedSummary, PairingClient, PairingRequest};
 use device_proto::aead::KEY_LEN;
 use device_proto::delegation;
 use device_proto::noise::StaticKeypair;
@@ -34,6 +34,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::api::{PairAbortListener, PairTarget};
 use crate::apns::ApnsState;
+use crate::core::{PairChallenge, PairedSummary, PairingClient, PairingRequest};
 
 /// How long the decline path waits for the gateway to acknowledge our
 /// `DeviceConfirm(false)` before dropping the socket — long enough for the relay
