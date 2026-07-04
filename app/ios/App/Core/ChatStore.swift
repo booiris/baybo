@@ -54,7 +54,7 @@ final class ChatStore: ObservableObject {
 
     init(sessionId: String) {
         self.sessionId = sessionId
-        if let blob = UserDefaults.standard.string(forKey: ChatDefaults.transcriptState),
+        if let blob = TranscriptStore.read(sessionId: sessionId),
             let data = blob.data(using: .utf8),
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         {
@@ -143,6 +143,7 @@ final class ChatStore: ObservableObject {
     func send(text: String, attachments: [AttachmentRef]) {
         let msgId = UUID().uuidString
         bridge?.userSent(msgId: msgId, text: text, attachments: attachments)
+        SessionIndex.shared.recordUserSend(sessionId: sessionId, text: text)
         Task {
             do {
                 try await Baybo.client.chatSend(

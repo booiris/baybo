@@ -22,6 +22,7 @@ pub(crate) use push::register as register_push;
 
 use serde::{Deserialize, Serialize};
 
+use crate::api::ChatSessionSummary;
 use crate::keychain;
 
 /// The header the gateway reads the minted channel token from on `/v1/channel-ws`
@@ -118,6 +119,24 @@ pub(crate) async fn login(base_url: String, token: String) -> Result<String, Str
 /// The current direct connection's base URL, if credentials are persisted.
 pub(crate) fn status() -> Result<Option<String>, String> {
     Ok(credentials()?.map(|c| c.base_url))
+}
+
+/// List the gateway's chat sessions over REST (the web sidebar's list, hidden +
+/// cron filtered). Direct-only: the relay wire protocol has no list frame, so
+/// the app renders its device-local registry there instead.
+pub(crate) async fn sessions_list() -> Result<Vec<ChatSessionSummary>, String> {
+    let creds = credentials()?.ok_or("not connected; sign in first")?;
+    let items = rest::list_sessions(&creds.base_url, &creds.token).await?;
+    Ok(items
+        .into_iter()
+        .map(|s| ChatSessionSummary {
+            session_id: s.session_id,
+            created_at: s.created_at,
+            last_active: s.last_active,
+            last_user_text: s.last_user_text,
+            pinned: s.pinned,
+        })
+        .collect())
 }
 
 /// Forget the direct-connection credentials.

@@ -85,6 +85,35 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 
 ## Architecture notes
 
+- **Navigation**: the chat LIST is home (`AppStore.Route.home` holds a
+  `NavigationStack` — `ChatListScreen` root, `ChatScreen` pushed via
+  `chatPath`). No session is minted at launch or login; the compose button is
+  the only session creator. Both screens hide the system nav bar (custom
+  chrome), which disables UIKit's interactive pop — `PopGestureEnabler`
+  (attached to ChatScreen) re-enables the edge-swipe back with a root +
+  in-flight-transition guard, hands the delegate back on disappear, and
+  clamps `velocityInView:` (dynamic subclass, `PopVelocityClamp`) so iOS 26's
+  fluid pop can't inherit a fast flick's velocity and overshoot the revealed
+  list (the "list slides right then rubber-bands" glitch; stock Settings
+  does the same, it just hides it better).
+- **Chat list data**: `SessionIndex` (Application Support/baybo/sessions.json)
+  is the device-local registry backing the list on BOTH legs — the relay wire
+  protocol cannot list sessions (client-minted ids), so local rows are the
+  single rendering source, updated at send time. A direct binding merges
+  `chat_list_sessions()` (REST `GET /v1/chat/sessions`) over it on
+  appear/foreground/pull; remote wins for existence (a row missing remotely was
+  hidden elsewhere) unless the local row saw newer activity. Per-session
+  transcript mirrors live in `Application Support/baybo/transcripts/<id>.json`
+  (pruned to the ~10 most recent); the legacy single-session UserDefaults keys
+  (`ChatDefaults`) are migrated once and retired.
+- **Push tap routing**: the gateway embeds `session_id` INSIDE the encrypted
+  preview plaintext (never the outer APNs payload — C stays blind, matching the
+  hashed collapse-id invariant). The NSE decodes it (optional field; the pinned
+  AEAD fixture predates it and must keep decoding) and stashes it in the
+  delivered `userInfo` under `PushPayloadKeys.sessionId` (one file compiled
+  into both targets). The app's `UNUserNotificationCenterDelegate` routes the
+  tap to that session via `AppStore.routeToSession` (stash-and-consume across
+  the launch restore); foreground pushes present nothing.
 - **BayboClient** (ffi) is a long-lived singleton (`Baybo.client`); the chat
   pump and parked pairing sessions live inside it between calls. Frames cross
   the FFI as JSON on a `FrameSink` callback; `onDisconnected` fires ONLY on

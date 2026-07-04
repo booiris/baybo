@@ -6,11 +6,10 @@ import SwiftUI
 /// moves the dock and the webview resizes; the web bundle's ResizeObserver
 /// holds the newest edge through that resize.
 struct ChatScreen: View {
-    @EnvironmentObject private var appStore: AppStore
     @StateObject private var store: ChatStore
     @StateObject private var bridge: TranscriptBridge
     @Environment(\.scenePhase) private var scenePhase
-    @State private var confirmLogout = false
+    @Environment(\.dismiss) private var dismiss
 
     init(sessionId: String) {
         let store = ChatStore(sessionId: sessionId)
@@ -29,11 +28,20 @@ struct ChatScreen: View {
             // that padding web-side so content slides with the keyboard.
             TranscriptWebView(bridge: bridge)
                 .ignoresSafeArea(.all, edges: [.top, .bottom])
+                // Fade the transcript in once it has painted (bridge `shown`),
+                // rather than popping the content in as the screen slides on.
+                // Opacity 0 shows the paper background behind it, seamless with
+                // the slide-in; the content emerges as it settles.
+                .opacity(bridge.contentVisible ? 1 : 0)
+                .animation(.easeOut(duration: 0.3), value: bridge.contentVisible)
 
             ChatHeaderView(connState: store.connState) {
-                confirmLogout = true
+                dismiss()
             }
         }
+        // The system nav bar is hidden (custom chrome), which also disables the
+        // interactive pop — this presence-only host re-enables the edge swipe.
+        .background(PopGestureEnabler().frame(width: 0, height: 0))
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 12) {
                 if bridge.jumpVisible {
@@ -67,10 +75,12 @@ struct ChatScreen: View {
         }
         .background(Theme.paper)
         .onAppear {
+            SessionIndex.shared.touch(sessionId: store.sessionId)
             store.connect()
             #if DEBUG
                 store.startDemoFramesIfRequested()
                 bridge.startDemoJumpIfRequested()
+                startDemoBackIfRequested()
             #endif
         }
         .onDisappear {
@@ -81,26 +91,30 @@ struct ChatScreen: View {
                 store.scheduleReconnect()
             }
         }
-        .confirmationDialog(
-            Text(verbatim: Lang.shared.t("connected.logoutConfirm")),
-            isPresented: $confirmLogout, titleVisibility: .visible
-        ) {
-            Button(role: .destructive) {
-                Task { await appStore.logout() }
-            } label: {
-                Text(verbatim: Lang.shared.t("connected.logout"))
+    }
+
+    #if DEBUG
+        /// `-baybo-demo-back`: pop to the chat list 6s in — the back function's
+        /// headless round trip (pair with `-baybo-open-chat`; screenshot the
+        /// chat at ~3s and the list at ~8s). Exercises the programmatic pop,
+        /// not the gesture physics — those need a device/manual pass.
+        private func startDemoBackIfRequested() {
+            guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-back") else { return }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(6))
+                dismiss()
             }
         }
-    }
+    #endif
 }
 
 /// The paper-veil header: a translucent white gradient holding solid through
 /// the status bar and easing out to clear at the connection-status capsule's
-/// bottom edge, with the centered status capsule flanked by glass icon
-/// buttons. The veil ignores touches so scrolls beneath it reach the thread.
+/// bottom edge, with the centered status capsule flanked by the glass back
+/// button. The veil ignores touches so scrolls beneath it reach the thread.
 struct ChatHeaderView: View {
     let connState: ChatStore.ConnState
-    let onLogout: () -> Void
+    let onBack: () -> Void
 
     private static let veilPeakAlpha = 0.8
     private static let barHeight: CGFloat = 46
@@ -127,30 +141,20 @@ struct ChatHeaderView: View {
             .frame(height: 42)
             .glassEffect(.regular, in: Capsule())
 
-            // Flanking glass circles: a left placeholder (action pending) and
-            // the working logout on the right. Medium-weight glyphs so the ink
-            // reads as solid black over the bright glass.
+            // The flanking glass back circle (logout moved to the chat list's
+            // header — leaving the account lives one level up now). Semibold
+            // glyph so the ink reads as solid black over the bright glass.
             HStack {
-                Button {
-                    // Function intentionally left empty for now (placeholder).
-                } label: {
+                Button(action: onBack) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundStyle(Theme.ink)
                         .frame(width: 42, height: 42)
                 }
                 .glassEffect(.regular.interactive(), in: .circle)
+                .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.back")))
 
                 Spacer()
-
-                Button(action: onLogout) {
-                    Image(systemName: "rectangle.portrait.and.arrow.right")
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundStyle(Theme.ink)
-                        .frame(width: 42, height: 42)
-                }
-                .glassEffect(.regular.interactive(), in: .circle)
-                .accessibilityLabel(Text(verbatim: Lang.shared.t("connected.logout")))
             }
         }
         .padding(.horizontal, 24)
@@ -173,7 +177,9 @@ struct ChatHeaderView: View {
 
     /// Solid through the status bar (~`solidFraction` of the flooded height on
     /// this device), then the smoothstep tail to clear at the bar's bottom.
-    private static var veilStops: [Gradient.Stop] {
+    /// Shared with the chat list's header so the two screens' veils can't
+    /// drift apart.
+    static var veilStops: [Gradient.Stop] {
         let solidFraction: CGFloat = 0.55
         var stops: [Gradient.Stop] = [
             .init(color: Theme.paper.opacity(veilPeakAlpha), location: 0)

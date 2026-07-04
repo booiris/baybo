@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        // Tap routing (didReceive below); foreground presentation stays silent.
+        UNUserNotificationCenter.current().delegate = self
         Self.registerForPush()
         return true
     }
@@ -49,6 +51,34 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             DispatchQueue.main.async {
                 UIApplication.shared.registerForRemoteNotifications()
             }
+        }
+    }
+}
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    /// Foreground pushes present nothing (the pre-delegate behavior, kept on
+    /// purpose): the chat list refreshes on foreground and the live session
+    /// streams its own frames, so a banner would only duplicate them.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        []
+    }
+
+    /// A notification tap: route into the conversation the NSE decrypted the
+    /// session id for. No id (legacy sender, failed decrypt, non-default
+    /// action) → do nothing; the app lands on the chat list as usual.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        guard response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+            let sessionId = response.notification.request.content
+                .userInfo[PushPayloadKeys.sessionId] as? String
+        else { return }
+        await MainActor.run {
+            AppStore.shared?.routeToSession(sessionId)
         }
     }
 }

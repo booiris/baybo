@@ -9,7 +9,7 @@ import "@fontsource/space-mono/700.css";
 import "@fontsource-variable/inter";
 import i18n from "./i18n";
 import "./styles.css";
-import { hasNativeBridge, onInit, onLanguage, postReady } from "./bridge";
+import { hasNativeBridge, onInit, onLanguage, postContentReady, postReady } from "./bridge";
 import { Transcript } from "./Transcript";
 
 onLanguage((lang) => void i18n.changeLanguage(lang));
@@ -29,6 +29,10 @@ onInit((payload) => {
           <Transcript restored={payload.restoredState} initialConnEpoch={payload.connEpoch} />
         </React.StrictMode>,
       );
+      // Two frames after the first render commits the transcript has painted —
+      // tell native so it fades the webview in instead of popping the content
+      // in as the chat screen slides on.
+      requestAnimationFrame(() => requestAnimationFrame(() => postContentReady()));
     });
 });
 

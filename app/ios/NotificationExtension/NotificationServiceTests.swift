@@ -29,6 +29,26 @@ final class NotificationServiceTests: XCTestCase {
         )
         XCTAssertEqual(preview?.title, "Baybo")
         XCTAssertEqual(preview?.body, "The agent finished replying.")
+        // The pinned plaintext predates tap-routing: no session_id → nil,
+        // never a decode failure.
+        XCTAssertNil(preview?.sessionId)
+    }
+
+    /// The gateway now embeds `session_id` in the sealed plaintext (tap
+    /// routing). The AEAD interop is pinned above; this seals the NEW shape
+    /// locally and proves the decode surfaces the field.
+    func testDecodesTheSessionIdFromTheSealedPreview() throws {
+        let key = SymmetricKey(data: Self.key)
+        let plaintext = Data(
+            #"{"title":"Baybo","body":"done","session_id":"sess-42"}"#.utf8)
+        let box = try ChaChaPoly.seal(plaintext, using: key)
+        let preview = NotificationService.open(
+            key: key,
+            nonce: Data(box.nonce),
+            ciphertextAndTag: box.ciphertext + box.tag
+        )
+        XCTAssertEqual(preview?.title, "Baybo")
+        XCTAssertEqual(preview?.sessionId, "sess-42")
     }
 
     func testWrongKeyFallsBackToNil() throws {

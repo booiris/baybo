@@ -18,9 +18,21 @@ struct RootView: View {
                     // (the wordmark stays), mirroring the web.
                     LandingView()
                 }
-            case .chat(let sessionId):
-                ChatScreen(sessionId: sessionId)
-                    .id(sessionId) // a new session gets a fresh store/webview
+            case .home:
+                // The chat list is home; a session rides the path. Both screens
+                // draw their own chrome, so the system bar stays hidden — the
+                // interactive pop gesture that hiding disables is re-enabled by
+                // ChatScreen's PopGestureEnabler.
+                NavigationStack(path: $store.chatPath) {
+                    ChatListScreen()
+                        .toolbar(.hidden, for: .navigationBar)
+                        .navigationDestination(for: String.self) { sessionId in
+                            ChatScreen(sessionId: sessionId)
+                                .id(sessionId) // a new session gets a fresh store/webview
+                                .toolbar(.hidden, for: .navigationBar)
+                                .navigationBarBackButtonHidden(true)
+                        }
+                }
             }
         }
         .sheet(isPresented: $store.scanPresented) {

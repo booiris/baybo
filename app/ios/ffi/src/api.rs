@@ -118,6 +118,20 @@ impl From<baybo_mobile_core::PairedSummary> for PairedSummary {
     }
 }
 
+/// One chat-session row for the native chat list, mirroring the gateway's
+/// `ChatSessionSummary` (the web sidebar's row shape). Timestamps are RFC 3339
+/// strings — Swift parses them for the age label.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatSessionSummary {
+    pub session_id: String,
+    pub created_at: String,
+    pub last_active: String,
+    /// Preview drawn from the most-recent user-authored message; `None` for a
+    /// session without a user turn yet.
+    pub last_user_text: Option<String>,
+    pub pinned: bool,
+}
+
 /// A content-addressed attachment reference on an outbound message (already
 /// uploaded via `blob_upload_bytes`).
 #[derive(Debug, Clone, uniffi::Record)]

@@ -22,17 +22,19 @@ enum Baybo {
     }()
 }
 
-/// UserDefaults keys for the durable chat pointers the webview's localStorage
-/// used to hold (native owns navigation + persistence now).
+/// LEGACY UserDefaults keys from the single-session era — never written
+/// anymore. Durable chat state now lives in Application Support: the session
+/// registry (`SessionIndex`) and per-session transcript mirrors
+/// (`TranscriptStore`). These keys survive only so
+/// `SessionIndex.migrateLegacySingleSession` can fold a pre-list install's one
+/// conversation into the registry (and scrub the keys).
 enum ChatDefaults {
     /// The active chat session id (`CHAT_SESSION_KEY` successor).
     static let sessionId = "baybo.chat.session"
-    /// The persisted transcript state JSON the web bundle sends over the bridge
-    /// (`CHAT_STATE_KEY` successor). Also the single durable source of the
-    /// reconnect cursor — its embedded `lastOrdinal` is written atomically with
-    /// the messages it matches.
+    /// The persisted transcript state JSON the web bundle sent over the bridge
+    /// (`CHAT_STATE_KEY` successor); its embedded `lastOrdinal` was the
+    /// reconnect cursor.
     static let transcriptState = "baybo.chat.state"
-    /// Legacy separate-cursor key: never written anymore (the cursor could
-    /// durably outrun the debounced transcript blob); still scrubbed on logout.
+    /// Even older separate-cursor key.
     static let lastOrdinal = "baybo.chat.lastOrdinal"
 }

@@ -1,14 +1,19 @@
 import SwiftUI
 
 /// The root state machine: unbound (landing / direct login / scan / pair
-/// confirm) vs bound (chat). Chat is home — a bound app auto-opens its chat on
-/// launch, mirroring the Tauri app's launch-restore.
+/// confirm) vs bound (home). Home is the chat list — sessions are entered by
+/// pushing onto `chatPath` (a tap, a compose, a push-notification route) and
+/// left with the back chevron or the edge-swipe pop.
 @MainActor
 final class AppStore: ObservableObject {
+    /// The app's one live store, reachable from UIKit delegate callbacks (the
+    /// notification-tap router) that sit outside the SwiftUI environment.
+    private(set) static weak var shared: AppStore?
+
     enum Route: Equatable {
         case launching
         case landing
-        case chat(sessionId: String)
+        case home
     }
 
     enum LandingView {
@@ -18,39 +23,48 @@ final class AppStore: ObservableObject {
 
     @Published var route: Route = .launching
     @Published var landingView: LandingView = .menu
+    /// The NavigationStack path over the chat list: at most one pushed session.
+    @Published var chatPath: [String] = []
     /// Landing / pairing status line (localized, already resolved).
     @Published var status: String?
     @Published var busy = false
     /// Non-nil while the pair-confirm screen is up.
     @Published var challenge: PairChallenge?
     @Published var scanPresented = false
-    /// Whether the active binding is direct (drives push re-registration).
+    /// Whether the active binding is direct (drives push re-registration and
+    /// the chat list's REST refresh).
     @Published private(set) var directBound = false
 
     private var restoring = false
+    /// A push-notification tap that arrived before the launch restore resolved
+    /// the route; consumed once home is up.
+    private var pendingPushSession: String?
 
     init() {
+        AppStore.shared = self
         #if DEBUG
         // UI-verification hooks: land straight on interaction-gated screens so
         // they are screenshotable/log-verifiable headlessly on the simulator.
         // `-baybo-landing-direct` opens the direct-login form; `-baybo-open-chat`
         // opens the chat screen unbound (the dial fails offline — the transcript
-        // webview + bridge still come up, which is what these runs verify).
+        // webview + bridge still come up, which is what these runs verify); a
+        // back-pop from it lands on the (empty) chat list.
         if ProcessInfo.processInfo.arguments.contains("-baybo-landing-direct") {
             landingView = .direct
             route = .landing
             return
         }
         if ProcessInfo.processInfo.arguments.contains("-baybo-open-chat") {
-            route = .chat(sessionId: "debug-session")
+            route = .home
+            chatPath = ["debug-session"]
             return
         }
         #endif
         restoreOnLaunch()
     }
 
-    /// Probe the durable binding and reopen the chat (restored session id when
-    /// one is persisted, else a fresh session).
+    /// Probe the durable binding and land on home (the chat list). No session
+    /// is minted at launch — the compose button is the only session creator.
     private func restoreOnLaunch() {
         guard !restoring else { return }
         restoring = true
@@ -66,7 +80,8 @@ final class AppStore: ObservableObject {
             if directBound {
                 await registerPushBestEffort()
             }
-            await openChat()
+            route = .home
+            consumePendingPushRoute()
         }
     }
 
@@ -128,7 +143,7 @@ final class AppStore: ObservableObject {
                 self.challenge = nil
                 status = nil
                 directBound = false
-                await openChat(freshSession: true)
+                enterHomeFreshBinding()
             } catch {
                 self.challenge = nil
                 // The decline path errors by design ("pairing cancelled") —
@@ -155,7 +170,7 @@ final class AppStore: ObservableObject {
             _ = try await Baybo.client.directLogin(baseUrl: baseUrl, token: token)
             directBound = true
             await registerPushBestEffort()
-            await openChat(freshSession: true)
+            enterHomeFreshBinding()
             return nil
         } catch let error as BayboError {
             if case .InvalidToken = error {
@@ -167,33 +182,58 @@ final class AppStore: ObservableObject {
         }
     }
 
-    // MARK: - Chat lifecycle
+    // MARK: - Chat navigation
 
-    /// Enter the chat: reuse the persisted session id, else mint one on the
-    /// active binding's leg. `freshSession` forces a new session (a new binding
-    /// must not inherit the previous gateway's session pointer).
-    func openChat(freshSession: Bool = false) async {
-        if freshSession {
-            clearPersistedChat()
-        }
-        if !freshSession,
-            let existing = UserDefaults.standard.string(forKey: ChatDefaults.sessionId)
-        {
-            route = .chat(sessionId: existing)
-            return
-        }
+    /// Open an existing session from the list.
+    func openSession(_ sessionId: String) {
+        chatPath = [sessionId]
+    }
+
+    /// Compose: mint a session on the active binding's leg and enter it.
+    /// Returns the localized error line on failure (the list renders it).
+    func startNewChat() async -> String? {
+        busy = true
+        defer { busy = false }
         do {
             let sessionId = try await Baybo.client.chatCreateSession()
-            UserDefaults.standard.set(sessionId, forKey: ChatDefaults.sessionId)
-            route = .chat(sessionId: sessionId)
+            SessionIndex.shared.touch(sessionId: sessionId)
+            chatPath = [sessionId]
+            return nil
         } catch {
-            route = .landing
-            status = Lang.shared.t("chat.startFailed", bayboErrorText(error))
+            return Lang.shared.t("chat.startFailed", bayboErrorText(error))
         }
     }
 
+    /// A push-notification tap targeting `sessionId`: route straight into that
+    /// conversation. Before the launch restore resolves the route, stash it —
+    /// `restoreOnLaunch` consumes the stash once home is up.
+    func routeToSession(_ sessionId: String) {
+        guard route == .home else {
+            pendingPushSession = sessionId
+            return
+        }
+        SessionIndex.shared.touch(sessionId: sessionId)
+        chatPath = [sessionId]
+    }
+
+    private func consumePendingPushRoute() {
+        if let sessionId = pendingPushSession {
+            pendingPushSession = nil
+            routeToSession(sessionId)
+        }
+    }
+
+    /// A fresh binding must not inherit the previous gateway's sessions: wipe
+    /// the local registry + transcript mirrors, then land on the (empty) list.
+    /// On direct the REST refresh repopulates it immediately.
+    private func enterHomeFreshBinding() {
+        SessionIndex.shared.removeAll()
+        chatPath = []
+        route = .home
+    }
+
     /// Log out: tear down the live leg, wipe both credential sets, drop the
-    /// persisted chat pointers, and return to landing.
+    /// local session registry + transcripts, and return to landing.
     func logout() async {
         do {
             try await Baybo.client.logout()
@@ -201,18 +241,12 @@ final class AppStore: ObservableObject {
             // Teardown is best-effort by design; surface nothing fatal.
             NSLog("baybo: logout: %@", bayboErrorText(error))
         }
-        clearPersistedChat()
+        SessionIndex.shared.removeAll()
+        chatPath = []
         directBound = false
         landingView = .menu
         status = nil
         route = .landing
-    }
-
-    private func clearPersistedChat() {
-        let defaults = UserDefaults.standard
-        defaults.removeObject(forKey: ChatDefaults.sessionId)
-        defaults.removeObject(forKey: ChatDefaults.transcriptState)
-        defaults.removeObject(forKey: ChatDefaults.lastOrdinal)
     }
 }
 

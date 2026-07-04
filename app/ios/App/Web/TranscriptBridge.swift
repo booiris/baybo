@@ -23,6 +23,10 @@ final class TranscriptBridge: NSObject, ObservableObject {
     /// Mirror of the web transcript's `showJump` state — drives the native
     /// glass jump-to-latest button above the composer.
     @Published private(set) var jumpVisible = false
+    /// `false` until the transcript has painted its first frame (`shown`), so
+    /// the webview can fade in rather than pop its content in as the chat
+    /// screen slides on. Re-armed on every fresh page load (`ready`).
+    @Published private(set) var contentVisible = false
 
     init(store: ChatStore) {
         self.store = store
@@ -125,7 +129,7 @@ final class TranscriptBridge: NSObject, ObservableObject {
 
     private func deliverInit() {
         guard let store else { return }
-        let restored = UserDefaults.standard.string(forKey: ChatDefaults.transcriptState)
+        let restored = TranscriptStore.read(sessionId: store.sessionId)
         // The in-app language override (falls back to the device language) —
         // the same source the native chrome renders from, so the two can't
         // diverge.
@@ -231,15 +235,23 @@ extension TranscriptBridge: WKScriptMessageHandler {
             // Same fresh-page reasoning: the new page opens pinned to the
             // newest edge, so a jetsam reload must not strand a stale button.
             jumpVisible = false
+            // A fresh page hasn't painted its transcript yet — re-hide the
+            // webview so it fades in on the next `shown` (covers a jetsam
+            // reload as well as the first load).
+            contentVisible = false
+        case "shown":
+            // The transcript painted its first frame — fade the webview in.
+            contentVisible = true
         case "ordinal":
             let ordinal = (body["lastOrdinal"] as? NSNumber)?.int64Value
             store?.ordinalAdvanced(ordinal)
         case "persist":
-            if let state = body["state"],
+            if let sessionId = store?.sessionId,
+                let state = body["state"],
                 let data = try? JSONSerialization.data(withJSONObject: state),
                 let json = String(data: data, encoding: .utf8)
             {
-                UserDefaults.standard.set(json, forKey: ChatDefaults.transcriptState)
+                TranscriptStore.write(sessionId: sessionId, stateJson: json)
             }
         case "fetchHistory":
             let before = (body["beforeOrdinal"] as? NSNumber)?.int64Value

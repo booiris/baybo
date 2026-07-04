@@ -38,6 +38,14 @@ final class NotificationService: UNNotificationServiceExtension {
         if let preview = Self.decryptPreview(userInfo: request.content.userInfo) {
             mutable.title = preview.title
             mutable.body = preview.body
+            // Surface the decrypted routing target to the main app's tap
+            // handler — the outer payload deliberately never carries it
+            // (the relay must stay blind to session ids).
+            if let sessionId = preview.sessionId {
+                var userInfo = mutable.userInfo
+                userInfo[PushPayloadKeys.sessionId] = sessionId
+                mutable.userInfo = userInfo
+            }
         }
         contentHandler(mutable)
     }
@@ -49,9 +57,18 @@ final class NotificationService: UNNotificationServiceExtension {
     }
 
     /// The decrypted preview shape A encrypts (see the pinned `PLAINTEXT`).
+    /// `sessionId` is optional: senders predating tap-routing omit it, and the
+    /// pinned interop fixture stays valid without it.
     struct Preview: Decodable {
         let title: String
         let body: String
+        let sessionId: String?
+
+        enum CodingKeys: String, CodingKey {
+            case title
+            case body
+            case sessionId = "session_id"
+        }
     }
 
     /// Parse the APNs payload, load the push key for `bid`, and decrypt.

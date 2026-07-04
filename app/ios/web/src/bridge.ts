@@ -81,6 +81,12 @@ export function postReady(): void {
   post({ type: "ready" });
 }
 
+/// The transcript has rendered its first frame — lets native fade the webview
+/// in rather than popping the content in when the chat screen slides on.
+export function postContentReady(): void {
+  postSafe({ type: "shown" });
+}
+
 export function postOrdinal(lastOrdinal: number | null): void {
   postSafe({ type: "ordinal", lastOrdinal });
 }

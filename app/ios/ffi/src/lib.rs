@@ -27,8 +27,8 @@ use std::sync::Arc;
 use baybo_mobile_core::WireAttachment;
 
 pub use api::{
-    ApnsEnvironment, AttachmentKind, AttachmentRef, BayboError, ClientConfig, FrameSink,
-    PairAbortListener, PairChallenge, PairTarget, PairedSummary,
+    ApnsEnvironment, AttachmentKind, AttachmentRef, BayboError, ChatSessionSummary, ClientConfig,
+    FrameSink, PairAbortListener, PairChallenge, PairTarget, PairedSummary,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -187,6 +187,23 @@ impl BayboClient {
             match active_leg()? {
                 ActiveLeg::Direct => direct::session_create(&this.direct).await,
                 ActiveLeg::Relay => Ok(uuid::Uuid::new_v4().to_string()),
+            }
+        })
+        .await
+    }
+
+    /// List the gateway's chat sessions (newest first, hidden/cron filtered) over
+    /// the direct binding's REST surface — the data the native chat list merges
+    /// into its device-local registry. Relay has no listing capability on the
+    /// wire (session ids are client-minted), so a relay binding errors and the
+    /// caller renders its local registry alone.
+    pub async fn chat_list_sessions(
+        self: Arc<Self>,
+    ) -> Result<Vec<ChatSessionSummary>, BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => direct::sessions_list().await,
+                ActiveLeg::Relay => Err("session listing requires a direct connection".to_string()),
             }
         })
         .await

@@ -53,6 +53,10 @@ targets:
           - "Resources/transcript/**"
       - path: Generated/BayboCore.swift
         createIntermediateGroups: false
+      # Shared with the NSE target: the userInfo keys the NSE writes after
+      # decrypting a push preview and the app's tap handler reads back.
+      - path: NotificationExtension/PushPayloadKeys.swift
+        createIntermediateGroups: false
       # The transcript web bundle (built by `pnpm build` in web/, copied here by
       # scripts/build.sh) ships as a folder reference so index.html + hashed
       # assets load via loadFileURL.
