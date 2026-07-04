@@ -5,112 +5,26 @@
 //! ride URL-shaped tunnel messages (`GET/POST /v1/blobs`) instead of the
 //! previous bespoke blob protocol.
 
-use std::time::Duration;
-
 use device_proto::noise::StaticKeypair;
-use futures_util::SinkExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_tungstenite::tungstenite::Message;
 
-use super::dial::dial_content_join;
-use super::pairing::{PairedRecord, load_paired_record};
-use crate::core::{
-    ApiTunnelSession, ContentHandshake, MAX_TUNNEL_CHUNK, TunnelHeader, TunnelRequest,
-    TunnelResponse, blob_id_sha256_hex,
+use super::pairing::load_paired_record;
+use super::tunnel::{
+    REQUEST_ID, collect_response_body, dial_tunnel_leg, expect_response_head, next_response,
+    send_request,
 };
-use crate::transport::WsStream;
+use crate::core::{
+    MAX_TUNNEL_CHUNK, TunnelHeader, TunnelRequest, TunnelResponse, blob_id_sha256_hex,
+};
 
-const BLOB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-const REQUEST_ID: u64 = 1;
 const BLOB_CACHE_SUBDIR: &str = "baybo-blob-cache";
 const BLOB_STAGING_SUBDIR: &str = "baybo-blob-staging";
 const HEADER_CONTENT_TYPE: &str = "content-type";
 const HEADER_CONTENT_LENGTH: &str = "content-length";
 const HEADER_CONTENT_SHA256: &str = "x-baybo-content-sha256";
 const HEADER_RANGE: &str = "range";
-
-async fn dial_blob_leg(
-    record: &PairedRecord,
-    local: &StaticKeypair,
-) -> Result<(WsStream, ApiTunnelSession), String> {
-    let mut ws =
-        dial_content_join(record, Some(remote_host_protocol::relay::LegClass::Blob)).await?;
-    let (handshake, msg1) = ContentHandshake::start(local, &record.gateway_static_pubkey)
-        .map_err(|e| format!("start handshake: {e}"))?;
-    ws.send(Message::Binary(msg1))
-        .await
-        .map_err(|e| format!("send handshake: {e}"))?;
-    let msg2 = recv_binary_with_timeout(&mut ws, BLOB_HANDSHAKE_TIMEOUT).await?;
-    let session = handshake
-        .finish_api_tunnel(&msg2)
-        .map_err(|e| format!("finish handshake: {e}"))?;
-    Ok((ws, session))
-}
-
-async fn recv_binary_with_timeout(ws: &mut WsStream, timeout: Duration) -> Result<Vec<u8>, String> {
-    tokio::time::timeout(timeout, recv_binary(ws))
-        .await
-        .map_err(|_| "handshake timed out".to_string())?
-}
-
-async fn recv_binary(ws: &mut WsStream) -> Result<Vec<u8>, String> {
-    crate::transport::recv_binary(ws)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-async fn send_request(
-    ws: &mut WsStream,
-    session: &mut ApiTunnelSession,
-    request: &TunnelRequest,
-) -> Result<(), String> {
-    for message in session
-        .seal(request)
-        .map_err(|e| format!("seal tunnel request: {e}"))?
-    {
-        ws.send(Message::Binary(message))
-            .await
-            .map_err(|e| format!("send tunnel request: {e}"))?;
-    }
-    Ok(())
-}
-
-async fn next_response(
-    ws: &mut WsStream,
-    session: &mut ApiTunnelSession,
-) -> Result<TunnelResponse, String> {
-    loop {
-        let bytes = recv_binary(ws).await?;
-        let responses = session
-            .open(&bytes)
-            .map_err(|e| format!("open tunnel response: {e}"))?;
-        if let Some(response) = responses.into_iter().next() {
-            return Ok(response);
-        }
-    }
-}
-
-async fn expect_response_head(
-    ws: &mut WsStream,
-    session: &mut ApiTunnelSession,
-) -> Result<(u16, Vec<TunnelHeader>, Option<u64>), String> {
-    loop {
-        match next_response(ws, session).await? {
-            TunnelResponse::Head {
-                status,
-                headers,
-                body_len,
-                ..
-            } => return Ok((status, headers, body_len)),
-            TunnelResponse::Error { status, reason, .. } => {
-                return Err(format!("HTTP {status}: {reason}"));
-            }
-            TunnelResponse::Body { .. } => {}
-        }
-    }
-}
 
 async fn download_to_path(blob_id: &str, dest_path: &str) -> Result<(), String> {
     let expected_hex = blob_id_sha256_hex(blob_id)
@@ -119,7 +33,8 @@ async fn download_to_path(blob_id: &str, dest_path: &str) -> Result<(), String> 
         .to_owned();
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
-    let (mut ws, mut session) = dial_blob_leg(&record, &local).await?;
+    let (mut ws, mut session) =
+        dial_tunnel_leg(&record, &local, remote_host_protocol::relay::LegClass::Blob).await?;
 
     let part_path = format!("{dest_path}.part");
     let mut hasher = Sha256::new();
@@ -251,7 +166,8 @@ async fn upload_from_path(src_path: &str, mime_type: &str) -> Result<String, Str
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
     let (sha256_hex, size) = hash_file(src_path).await?;
-    let (mut ws, mut session) = dial_blob_leg(&record, &local).await?;
+    let (mut ws, mut session) =
+        dial_tunnel_leg(&record, &local, remote_host_protocol::relay::LegClass::Blob).await?;
 
     send_request(
         &mut ws,
@@ -319,21 +235,7 @@ async fn upload_from_path(src_path: &str, mime_type: &str) -> Result<String, Str
     if !(200..300).contains(&status) {
         return Err(format!("upload failed: HTTP {status}"));
     }
-    let mut body = Vec::new();
-    loop {
-        match next_response(&mut ws, &mut session).await? {
-            TunnelResponse::Body { data, last, .. } => {
-                body.extend(data);
-                if last {
-                    break;
-                }
-            }
-            TunnelResponse::Error { status, reason, .. } => {
-                return Err(format!("upload failed: HTTP {status}: {reason}"));
-            }
-            TunnelResponse::Head { .. } => {}
-        }
-    }
+    let body = collect_response_body(&mut ws, &mut session, _body_len).await?;
     let _ = ws.close(None).await;
     #[derive(Deserialize)]
     struct BlobIdResp {

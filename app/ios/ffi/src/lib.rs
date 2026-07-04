@@ -195,18 +195,17 @@ impl BayboClient {
         .await
     }
 
-    /// List the gateway's chat sessions (newest first, hidden/cron filtered) over
-    /// the direct binding's REST surface — the data the native chat list merges
-    /// into its device-local registry. Relay has no listing capability on the
-    /// wire (session ids are client-minted), so a relay binding errors and the
-    /// caller renders its local registry alone.
+    /// List the gateway's chat sessions (newest first, hidden/cron filtered) for
+    /// the active binding. Direct uses the admin REST surface; relay uses the
+    /// Noise-protected API tunnel so a NAT'd gateway can still refresh the
+    /// native list from durable session rows.
     pub async fn chat_list_sessions(
         self: Arc<Self>,
     ) -> Result<Vec<ChatSessionSummary>, BayboError> {
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Direct => direct::sessions_list().await,
-                ActiveLeg::Relay => Err("session listing requires a direct connection".to_string()),
+                ActiveLeg::Relay => relay::sessions_list().await,
             }
         })
         .await

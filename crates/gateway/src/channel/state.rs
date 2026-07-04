@@ -100,6 +100,10 @@ pub struct WsChannelState {
     /// the live `TurnState` broadcasts cover connected clients; this
     /// covers the late joiner who missed them.
     pub job_lifecycle: Arc<baybo_job::JobLifecycle>,
+    /// Admin HTTP state reused by the API tunnel's in-process HTTP forwarder.
+    /// The forwarder authenticates the device before dispatch and allowlists
+    /// paths before requests reach this state-backed router.
+    pub admin_state: crate::server::AdminState,
     /// Recent-window dedup for sidecar-supplied
     /// `(channel_type, bot_id, platform_msg_id)` triples. Sidecars that
     /// replay their long-poll buffer after a restart hit this and the
@@ -138,6 +142,7 @@ impl WsChannelState {
             blob_store: deps.stores.blob.clone(),
             task_store: deps.stores.task.clone(),
             job_lifecycle: Arc::clone(&deps.job_lifecycle),
+            admin_state: crate::server::AdminState::from_deps(deps),
             inbound_dedup: Arc::new(InboundDedup::new()),
         }
     }

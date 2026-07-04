@@ -26,8 +26,8 @@
 
 use std::collections::HashMap;
 
-use axum::Json;
 use axum::extract::{Path, Query, State};
+use axum::{Extension, Json};
 use baybo_agent::actor::AgentMessage;
 use baybo_channels::wire::{
     FolderChange, FolderView, SessionPatch, SlashCommandSpec, WireWorkStep, WireWorkStepKind,
@@ -46,7 +46,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::api::dto::{ErrorBody, ListResponse};
-use crate::auth::WEB_OPERATOR_USER_ID;
+use crate::auth::{AuthedClient, WEB_OPERATOR_USER_ID};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
@@ -505,7 +505,9 @@ async fn create_session(State(state): State<AdminState>) -> Result<Json<ChatSess
 async fn list_sessions(
     State(state): State<AdminState>,
     Query(query): Query<ListSessionsQuery>,
+    authed: Option<Extension<AuthedClient>>,
 ) -> Result<Json<ChatSessionsList>> {
+    let channel_type = chat_list_channel(authed.as_ref().map(|ext| &ext.0));
     // Push the channel filter into SQL so a long-running gateway
     // with thousands of bot sessions (telegram / weixin / …) doesn't
     // pay an O(all-sessions) libsql round-trip on every chat-list
@@ -519,7 +521,7 @@ async fn list_sessions(
     // them until the first agent turn ran.
     let scoped = state
         .session_manager
-        .list_by_channel(&ChannelType::http())
+        .list_by_channel(&channel_type)
         .await
         .map_err(|e| GatewayError::Internal(format!("list sessions: {e}")))?;
     let visible: Vec<Session> = scoped
@@ -1316,6 +1318,13 @@ async fn slash_manifest(
 const WEB_HIDDEN_SLASH_COMMANDS: &[&str] = &["new"];
 
 // ── helpers ──────────────────────────────────────────────────────────
+
+fn chat_list_channel(authed: Option<&AuthedClient>) -> ChannelType {
+    match authed {
+        Some(AuthedClient::Device { .. }) => ChannelType::ios(),
+        _ => ChannelType::http(),
+    }
+}
 
 fn web_operator_user() -> User {
     User {

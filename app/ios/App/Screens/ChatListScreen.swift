@@ -2,7 +2,7 @@ import SwiftUI
 
 /// The Chats section: the chat list, the root of the Chats tab's
 /// NavigationStack. Local-first — rows render from the device's `SessionIndex`
-/// instantly (both legs); a direct binding refreshes it from REST on appear, on
+/// instantly; the active binding refreshes it from the gateway on appear, on
 /// foreground, and by pull. Rows push a `ChatScreen`; the header's compose
 /// button (top-right) mints a session and enters it.
 struct ChatListScreen: View {
@@ -94,12 +94,9 @@ struct ChatListScreen: View {
         }
     }
 
-    /// Merge the gateway's list over the local registry — direct binding only
-    /// (relay has no listing capability; its local rows are already the truth).
-    /// Failures stay quiet: the local rows keep rendering, which is the whole
-    /// point of local-first.
+    /// Merge the gateway's list over the local registry. Failures stay quiet:
+    /// the local rows keep rendering, which is the whole point of local-first.
     private func refresh() async {
-        guard appStore.directBound else { return }
         do {
             let items = try await Baybo.client.chatListSessions()
             SessionIndex.shared.merge(remote: items)

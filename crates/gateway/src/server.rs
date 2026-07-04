@@ -168,7 +168,7 @@ pub struct ChannelState {
 }
 
 impl AdminState {
-    fn from_deps(deps: &GatewayDeps) -> Self {
+    pub(crate) fn from_deps(deps: &GatewayDeps) -> Self {
         let query_api = Arc::new(baybo_query::QueryApi::new(
             deps.session_manager.store(),
             Arc::clone(&deps.job_lifecycle),

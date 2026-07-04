@@ -7,11 +7,14 @@
 //! shared frame pump lives in [`crate::transport`]; this path only supplies its
 //! relay-specific establish + codec seams.
 
+mod api;
 mod blob;
 mod chat;
 mod dial;
 mod pairing;
+mod tunnel;
 
+pub(crate) use api::sessions_list;
 pub(crate) use blob::{image_data, upload_bytes};
 pub(crate) use chat::RelaySessions;
 pub(crate) use pairing::{

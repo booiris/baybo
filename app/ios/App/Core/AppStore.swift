@@ -44,8 +44,7 @@ final class AppStore: ObservableObject {
     /// Non-nil while the pair-confirm screen is up.
     @Published var challenge: PairChallenge?
     @Published var scanPresented = false
-    /// Whether the active binding is direct (drives push re-registration and
-    /// the chat list's REST refresh).
+    /// Whether the active binding is direct (drives push re-registration).
     @Published private(set) var directBound = false
 
     private var restoring = false

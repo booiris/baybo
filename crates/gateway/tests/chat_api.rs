@@ -11,9 +11,10 @@ use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use baybo_channels::ChannelKind;
 use baybo_config::ChannelsConfig;
+use baybo_gateway::auth::AuthedClient;
 use baybo_gateway::channel::boot;
 use baybo_gateway::test_support::build_test_deps;
-use baybo_model::{ChatMessage, ContentBlock, SessionId};
+use baybo_model::{ChannelType, ChatMessage, ContentBlock, SessionId, User};
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -146,6 +147,84 @@ async fn chat_api_round_trip() {
             .any(|row| row["session_id"].as_str() == Some(session_id.as_str())),
         "session must show up again after unhide",
     );
+}
+
+#[tokio::test]
+async fn chat_list_uses_device_scope_when_forwarded_from_tunnel() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let ios = tg
+        .deps
+        .session_manager
+        .create_session(
+            User {
+                id: "device-1".into(),
+                name: None,
+                channel: ChannelType::ios(),
+            },
+            ChannelType::ios(),
+        )
+        .await
+        .unwrap();
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &ios.id,
+            &ChatMessage::user(vec![ContentBlock::Text("from ios".into())]),
+        )
+        .await
+        .unwrap();
+
+    let http = tg
+        .deps
+        .session_manager
+        .create_session(
+            User {
+                id: "web".into(),
+                name: None,
+                channel: ChannelType::http(),
+            },
+            ChannelType::http(),
+        )
+        .await
+        .unwrap();
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &http.id,
+            &ChatMessage::user(vec![ContentBlock::Text("from web".into())]),
+        )
+        .await
+        .unwrap();
+
+    let router = build_router(build_admin_state(&tg));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/chat/sessions")
+                .extension(AuthedClient::Device {
+                    device_id: "device-1".into(),
+                })
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("body bytes");
+    let list: Value = serde_json::from_slice(&bytes).expect("response is json");
+    let ids: Vec<&str> = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|row| row["session_id"].as_str().expect("session_id"))
+        .collect();
+    assert_eq!(ids, vec![ios.id.as_str()]);
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
