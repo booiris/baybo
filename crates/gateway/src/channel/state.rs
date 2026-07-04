@@ -21,7 +21,6 @@ use super::control::ChannelControlRegistry;
 use super::dedup::InboundDedup;
 use super::history::TuiHistoryStore;
 use super::session_resolver::ChannelSessionResolver;
-use super::web_token_janitor::StashedTokenHandle;
 use crate::auth::ChannelTokenTable;
 use crate::log_buffer::LogBuffer;
 use crate::server::GatewayDeps;
@@ -34,13 +33,6 @@ pub struct WsChannelState {
     pub registry: Arc<ChannelRegistry>,
     pub incoming_tx: mpsc::Sender<RouterInbound>,
     pub tokens: ChannelTokenTable,
-    /// Stash of live web-chat token handles. The admin mint
-    /// endpoint inserts here keyed by the token string; the channel
-    /// WS route takes the matching handle out on successful upgrade
-    /// and moves it into the resulting [`super::adapter::Sidecar`]
-    /// so the token revokes itself when the WS closes. Shared with
-    /// [`crate::server::AdminState::web_chat_tokens`].
-    pub web_chat_tokens: Arc<DashMap<String, StashedTokenHandle>>,
     pub session_manager: Arc<SessionManager>,
     /// Vault-backed TUI input-history store. Shared across every
     /// concurrent TUI client on this gateway — the server is the single
@@ -132,7 +124,6 @@ impl WsChannelState {
             registry: Arc::clone(&deps.channel_registry),
             incoming_tx: deps.incoming_tx.clone(),
             tokens: deps.channel_tokens.clone(),
-            web_chat_tokens: Arc::clone(&deps.web_chat_tokens),
             session_manager: Arc::clone(&deps.session_manager),
             tui_history,
             log_buffer: Arc::clone(&deps.log_buffer),

@@ -2,7 +2,8 @@
 //!
 //! Split along the two-listener contract:
 //!
-//! * [`admin`] — TCP, bearer-token authenticated. No chat content.
+//! * [`admin`] — TCP, bearer-token authenticated. Operator controls plus
+//!   the web chat REST surface.
 //! * [`health`] — `/healthz` + `/readyz`, served by both listeners
 //!   with no auth. (The channel TCP listener's chat surface is the
 //!   WS endpoint in [`crate::channel`] — not a REST router.)

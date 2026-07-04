@@ -9,17 +9,17 @@ by side against the same manager graph:
    operator controls (config, jobs, cron, traces, skills, tools,
    channels-list, llm, status) that mirror the CLI command families, plus
    the `/v1/chat/*` web-chat family that backs the embedded React
-   dashboard. The admin listener also **co-hosts** the channel-token-
+   dashboard. The admin listener also **co-hosts** the admin-bearer-
    authed `/v1/channel-ws` + `/v1/blobs` subrouter (see
    `build_admin_router` in `src/server.rs`) so a browser chat tab loaded
    from the admin origin can open its WebSocket without discovering the
-   loopback port — that subrouter rides its own channel-token middleware,
-   independent of the admin bearer. The admin/channel split is about
+   loopback port. The co-hosted subrouter accepts the same admin bearer
+   as the rest of the dashboard surface. The admin/channel split is about
    *which credential* gates a route, not a hard "no session data here"
    boundary.
 2. **Channel listener** — loopback TCP (`127.0.0.1:<ephemeral>`),
    authenticated by a vault-issued channel token (TUI, subprocess
-   sidecar, embedded tool sidecar, or web chat tab). The chosen port is
+   sidecar, embedded tool sidecar). The chosen port is
    published to `<workspace>/state/channel.port`
    (mode `0o600`) so the TUI and spawned sidecars discover it without
    a config roundtrip. The listener hosts `GET /v1/channel-ws` (upgrades
@@ -64,9 +64,10 @@ plugin running as a child of the gateway holds only a channel token,
 not the admin bearer, so it has no admin surface to hit even if
 compromised. The split is **not** a hard "no session data on admin"
 boundary — the admin listener serves the `/v1/chat/*` web-chat family
-(create/list/get/hide session, transcript history, token mint) and
-co-hosts the channel-token-authed `/v1/channel-ws` + `/v1/blobs`
-subrouter so the browser dashboard can chat over the public admin bind.
+(create/list/get/hide session, transcript history) and co-hosts the
+admin-bearer-authed `/v1/channel-ws` + `/v1/blobs` subrouter so the
+browser dashboard can chat over the public admin bind without a second
+credential.
 Both listeners share the same manager graph (`SessionManager`,
 `JobLifecycle`, …). The channel listener hosts `/v1/channel-ws` and
 `/v1/blobs`; the router sees a single `IncomingMessage` stream
@@ -89,13 +90,13 @@ invalidate a leaked token. Because the vault requires the master
 encryption key, the token's confidentiality rides on the same root
 secret as every other credential in the project.
 
-### Channel auth — vault-issued tokens (TUI, subprocess, tool, web)
+### Channel auth — vault-issued tokens (TUI, subprocess, tool)
 
 The channel listener enforces a single header on every request:
 `x-baybo-channel-token: <hex>`, looked up against the in-memory
 `ChannelTokenTable`. Each entry carries a `ClientIdentity { pid, label,
 bound_channel_type }`; the auth middleware maps the entry's `label` to
-one of four `auth::channel::AuthedClient` variants by reserved label /
+one of three `auth::channel::AuthedClient` variants by reserved label /
 prefix:
 
 - **`Tui`** — label equals `baybo_gateway::TUI_CLIENT_LABEL` ("tui").
@@ -106,14 +107,6 @@ prefix:
   the channel-WS handshake** — tool sidecars don't register channels.
 - **`Subprocess`** — any other label (e.g. `sidecar-telegram`). Carries
   `pid`, `label`, and the bound `channel_type`.
-- **`Web`** — label starts with `WEB_CLIENT_LABEL_PREFIX` ("web/", e.g.
-  `web/<uuid>`). Minted by `POST /v1/chat/sessions` after the operator
-  presents a valid admin bearer; it is the **only** identity allowed to
-  claim the otherwise-reserved `http` channel type on `/v1/channel-ws`.
-  Carries the raw token string so the WS route can take the matching
-  `TokenHandle` out of `web_chat_tokens` on upgrade (bind token lifetime
-  to the WS) and `WEB_OPERATOR_USER_ID` ("web-operator") is stamped as
-  the synthetic user on web-originated sessions.
 
 The flavours of token that end up in the table:
 
@@ -136,11 +129,6 @@ The flavours of token that end up in the table:
   TCP carries no kernel-attested peer credential and the token's
   uniqueness + same-UID-only delivery already cover the threat
   model.
-- **Web chat tokens.** Minted by the admin `POST /v1/chat/sessions`
-  handler (and refreshed by `.../token`), stashed in `web_chat_tokens`
-  keyed by the token string, and revoked when the WS that claimed them
-  closes (`WebTokenJanitor` sweeps mints that never reached a WS).
-
 For runtimes whose WebSocket client cannot set custom headers (any
 WHATWG `WebSocket`, browser-style clients) the listener also accepts
 `?token=<hex>` on the upgrade URL. The auth middleware strips the
@@ -198,6 +186,20 @@ Token comparison differs by listener:
 `baybo_gateway::constant_time_eq` is wired on the admin bearer path only,
 deliberately per the above. `/healthz` and `/readyz` skip auth on both
 listeners.
+
+### Web chat auth — admin bearer
+
+Browser chat tabs use the same admin bearer as the rest of the React
+dashboard. REST calls carry `Authorization: Bearer <admin_token>`.
+Browser `WebSocket` cannot set request headers, so the web client opens
+`/v1/channel-ws?token=<admin_token>` on the admin listener; admin auth
+validates the bearer, strips the query token before tracing, and marks
+the request as `AuthedClient::Web`. The WebSocket Register handshake
+then constrains that identity to the reserved `http` channel.
+
+The loopback channel listener remains channel-token-only for the TUI,
+tool sidecars, and subprocess sidecars. The admin listener's co-hosted
+channel subrouter no longer accepts web-specific channel tokens.
 
 ### Admin auth — bearer token, URI sanitisation before tracing
 
@@ -551,7 +553,7 @@ POST   /v1/llm/models/:name/test        probe the entry's provider
 PUT    /v1/llm/default                  set default-llm (hot-reloaded)
 GET    /v1/llm/usage                    ?since=&until=  per-entry usage aggregates
 
-POST   /v1/chat/sessions                create http session + mint web channel-token
+POST   /v1/chat/sessions                create http session
 GET    /v1/chat/sessions                ?include_hidden=&include_cron=  newest-first list
 GET    /v1/chat/sessions/:id            ?before_ordinal=&limit=  detail + transcript slice (+ last_llm pin)
 PUT    /v1/chat/sessions/:id/model      pin this session's LLM (re-pins live actor; null ⇒ default-llm)
@@ -559,7 +561,6 @@ PUT    /v1/chat/sessions/:id/pin        pin/unpin (lifts to the sidebar's Pinned
 PUT    /v1/chat/sessions/:id/folder     file into a folder (null ⇒ Uncategorized)
 DELETE /v1/chat/sessions/:id            hide (row preserved); 204
 POST   /v1/chat/sessions/:id/unhide     restore a hidden session
-POST   /v1/chat/sessions/:id/token      refresh the web channel-token
 GET    /v1/chat/cron-messages           cron-fire sessions with prompt/response previews
 GET    /v1/chat/slash-manifest          slash commands for the composer's /-autocomplete
 GET    /v1/chat/folders                 the conversation-folder tree
@@ -580,9 +581,8 @@ GET    /v1/openapi.json                 live OpenAPI 3.1 document for the admin 
 `chat`). Despite the admin bearer in front of these routes, they read and
 write session rows and transcripts — the admin/channel split is by
 credential, not by "session data never touches admin". The web client
-exchanges the bearer for a short-lived `web/` channel-token via `POST
-/v1/chat/sessions`, then opens `/v1/channel-ws` (co-hosted on this same
-admin listener) with that token.
+uses the same admin bearer for REST, blob fetch/upload, and the
+co-hosted `/v1/channel-ws` route on this same admin listener.
 
 `GET /v1/chat/sessions/:id` returns a typed transcript: each
 `ChatTranscriptItem` is either a `message` (user / final-assistant bubble)
@@ -610,21 +610,18 @@ POST   /v1/blobs                        upload non-text media → blob_id
 GET    /v1/blobs/:blob_id               fetch media bytes by blob_id
 ```
 
-The `/v1/channel-ws` + `/v1/blobs` subrouter (`build_channel_v1_subrouter`
-in `src/server.rs`) is mounted on **both** listeners under the same
-channel-token middleware — the loopback channel listener for the TUI and
-subprocess sidecars, and the admin listener so a browser chat tab loaded
-from the admin origin can open the WS without discovering the ephemeral
-loopback port. The admin bearer does **not** gate this subrouter; the
-channel token does. (The repo's `admin_has_no_channels` test asserts
-404s for `/v1/sessions*` / `/v1/approvals*` — routes that never existed —
-and does not exercise the channel subrouter, so it does *not* establish
-that channel routes are absent from the admin listener.)
+The `/v1/channel-ws` + `/v1/blobs` handlers are mounted on **both**
+listeners, but behind different auth middleware. The loopback channel
+listener uses channel tokens for the TUI and subprocess sidecars. The
+admin listener uses the same admin bearer as the rest of the dashboard, so
+a browser chat tab loaded from the admin origin can open the WS without
+discovering the ephemeral loopback port or minting a second credential.
 
 The WS protocol is defined by [`baybo_channels::wire::Frame`]
 (tagged on `kind`, MessagePack-named). The client opens with a
-`Register { token, channel_type }` frame (no `protocol_version`); the
-server validates it via `channel::handshake::validate_register` against
+`Register { token, channel_type }` frame (no `protocol_version`; web
+chat leaves the legacy `token` field empty because HTTP auth already
+ran); the server validates it via `channel::handshake::validate_register` against
 the [`auth::channel::AuthedClient`] the middleware already attached:
 `Tui` → must claim `"tui"`; `Web` → must claim `"http"` (the only path
 that may claim the reserved `http` type); `Subprocess` → must match the
@@ -830,8 +827,7 @@ crates/gateway/
 │   │   ├── session_pulse.rs #   http-channel dispatch observer → throttled Frame::SessionActivity
 │   │   ├── session_resolver.rs # ChannelSessionResolver (Multiplexed (channel,user)→session)
 │   │   ├── slash.rs         #   slash-command manifest + sidecar slash handling
-│   │   ├── state.rs         #   WsChannelState (registry, tokens, web_chat_tokens, stores, pairing, …)
-│   │   └── web_token_janitor.rs # StashedTokenHandle + WebTokenJanitor (TTL-sweep unused web tokens)
+│   │   └── state.rs         #   WsChannelState (registry, tokens, stores, pairing, …)
 │   ├── sidecar/             # embedded JS sidecar packaging + supervision
 │   │   ├── mod.rs           #   SidecarRuntime / SidecarSupervisor, BUN/NODE binary env, domains
 │   │   ├── assets.rs        #   include!s $OUT_DIR/sidecar_assets.rs; materialises bundles to disk

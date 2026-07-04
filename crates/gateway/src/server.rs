@@ -4,7 +4,7 @@
 //!
 //! * **Admin** — TCP, bearer-token authenticated. Hosts config,
 //!   status, jobs, cron, memory, traces, skills, tools, llm, and a
-//!   read-only channel list. Also co-hosts the channel-token web chat
+//!   read-only channel list. Also co-hosts the web chat
 //!   routes (`/v1/channel-ws`, `/v1/blobs/*`) so browser clients can
 //!   reach them over the public bind.
 //! * **Channel** — loopback TCP (`127.0.0.1:<ephemeral>`),
@@ -14,9 +14,9 @@
 //!   (`/v1/channel-ws`) for the TUI and subprocess sidecars (which
 //!   live on the same host and reach it via the discovered ephemeral
 //!   port). The admin listener co-hosts the same `/v1/channel-ws`
-//!   route under the same channel-token middleware so browser-side
-//!   web chat clients can open the WS over the public bind without
-//!   port discovery. Session CRUD lives on the admin surface; the
+//!   route under admin-bearer auth so browser-side web chat clients
+//!   can open the WS over the public bind without port discovery.
+//!   Session CRUD lives on the admin surface; the
 //!   router creates sessions lazily on first message frame.
 //!
 //! [`AdminState`] and [`ChannelState`] split the old monolithic
@@ -98,20 +98,9 @@ pub struct GatewayDeps {
     /// Router intake. Cloned into the WS channel server so sidecar
     /// frames can be forwarded as `IncomingMessage`s.
     pub incoming_tx: mpsc::Sender<RouterInbound>,
-    /// Per-install capability tokens. The channel TCP listener
+    /// Per-install capability tokens. The loopback channel TCP listener
     /// passes this to the WS server for Register-frame verification.
     pub channel_tokens: ChannelTokenTable,
-    /// Stash of [`crate::channel::StashedTokenHandle`]s for web chat
-    /// tabs, keyed by the token string. The admin chat handler
-    /// inserts on mint; the channel WS route takes the handle on
-    /// successful upgrade so it rides the connection lifetime — when
-    /// the WS closes the handle drops and the token revokes itself
-    /// out of [`Self::channel_tokens`]. The
-    /// [`crate::channel::WebTokenJanitor`] sweeps unclaimed entries
-    /// on a TTL so mints that never reach a WS upgrade don't leak.
-    /// Shared by `AdminState` and `WsChannelState` so the mint side
-    /// and the take side address the same map.
-    pub web_chat_tokens: Arc<dashmap::DashMap<String, crate::channel::StashedTokenHandle>>,
     /// Vault handle shared with the channel server so the WS route can
     /// build a [`crate::channel::TuiHistoryStore`] without re-opening
     /// libsql. The gateway is the only process that writes the TUI
@@ -160,20 +149,6 @@ pub struct AdminState {
     pub channel_bot_store: Arc<dyn ChannelBotStore>,
     pub channel_control: Arc<crate::channel::ChannelControlRegistry>,
     pub secret_vault: Arc<SecretVault>,
-    /// Shared with the channel listener so `POST /v1/chat/session`
-    /// can mint short-lived web channel-tokens that the same
-    /// `require_channel_auth` middleware accepts on `/v1/channel-ws`.
-    pub channel_tokens: crate::auth::ChannelTokenTable,
-    /// Stash of live web-chat token handles, keyed by the token
-    /// string. The admin mint endpoint inserts here; the channel WS
-    /// route removes (and moves the handle into the resulting
-    /// `Sidecar`) on successful upgrade. Handles still in the map
-    /// are tokens that were minted but never used to open a WS —
-    /// they sit here until claimed, reaped by the
-    /// [`crate::channel::WebTokenJanitor`] on TTL expiry, or
-    /// released at process exit. Shared with
-    /// `GatewayDeps::web_chat_tokens` and `WsChannelState`.
-    pub web_chat_tokens: Arc<dashmap::DashMap<String, crate::channel::StashedTokenHandle>>,
     /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
 }
@@ -219,8 +194,6 @@ impl AdminState {
             channel_bot_store: Arc::clone(&deps.stores.channel_bot),
             channel_control: Arc::clone(&deps.channel_control),
             secret_vault: Arc::clone(&deps.secret_vault),
-            channel_tokens: deps.channel_tokens.clone(),
-            web_chat_tokens: Arc::clone(&deps.web_chat_tokens),
             bind_display: deps.runtime_config.admin_bind.to_string(),
         }
     }
@@ -251,7 +224,7 @@ impl GatewayServer {
     pub fn new(deps: GatewayDeps) -> Self {
         let bind = deps.runtime_config.admin_bind;
         let shutdown_grace = deps.runtime_config.shutdown_grace;
-        let router = build_admin_router(deps);
+        let router = build_admin_router(&deps);
         Self {
             bind,
             router,
@@ -305,62 +278,52 @@ pub fn spawn_relay_content(
     crate::channel::relay_content::spawn(WsChannelState::from_deps(deps), shutdown)
 }
 
-fn build_admin_router(deps: GatewayDeps) -> Router {
-    let state = AdminState::from_deps(&deps);
+fn build_admin_router(deps: &GatewayDeps) -> Router {
+    let state = AdminState::from_deps(deps);
     let auth_state = AdminAuthState::new(deps.admin_token.clone());
 
     let cors = build_cors(&deps.runtime_config.cors_allowed_origins);
 
     let (admin_router, _admin_spec) = api::admin::v1_router_and_spec();
+    let admin_router = admin_router.with_state(state);
+
+    // Browser-facing `/v1/channel-ws` + `/v1/blobs`. Same handlers the
+    // loopback channel listener serves, but mounted here so the web
+    // chat page (which loads from this admin origin) can open its WS
+    // without discovering the ephemeral loopback port. The merged admin
+    // router below applies the admin bearer middleware to these routes too.
+    let channel_v1 = channel_auth::attach_web_identity(build_channel_v1_subrouter(
+        WsChannelState::from_deps(deps),
+    ));
+
     // TraceLayer goes *inside* the auth middleware so it sees the
     // URI AFTER `require_admin_token` has stripped `?token=…`. If
     // TraceLayer is on the outside it would log the raw URI (token
     // and all) before auth rewrites it — tower middleware runs outer-
     // to-inner, so "outer" = "logs first".
-    let admin_router = admin_router
-        .with_state(state)
+    let admin_router = Router::new()
+        .merge(admin_router)
+        .merge(channel_v1)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
-            auth_state,
+            auth_state.clone(),
             require_admin_token,
         ));
-
-    // Browser-facing `/v1/channel-ws` + `/v1/blobs`. Same handlers the
-    // loopback channel listener serves, but mounted here so the web
-    // chat page (which loads from this admin origin) can open its WS
-    // without discovering the ephemeral loopback port. The channel-
-    // token auth path is independent of the admin bearer; tokens are
-    // only issued after the operator hits `POST /v1/chat/sessions`
-    // through the bearer-protected admin surface above.
-    let channel_v1 = build_channel_v1_subrouter(
-        WsChannelState::from_deps(&deps),
-        channel_auth::ChannelAuthState::new(deps.channel_tokens.clone())
-            .with_device_store(deps.stores.device.clone()),
-    );
 
     Router::new()
         .merge(api::health::routes().layer(TraceLayer::new_for_http()))
         .merge(admin_router)
-        .merge(channel_v1)
         .fallback(api::webui::serve)
         .layer(cors)
 }
 
-/// `/v1/channel-ws` + `/v1/blobs` subtree, wrapped in channel-token
-/// auth. Shared between the admin listener (for the browser-side web
-/// chat page) and the loopback channel listener (for the TUI and
-/// subprocess sidecars).
-fn build_channel_v1_subrouter(
-    state: WsChannelState,
-    auth_state: channel_auth::ChannelAuthState,
-) -> Router {
-    // TraceLayer goes *inside* the auth middleware so it sees the
-    // URI AFTER `require_channel_auth` has stripped `?token=…`.
-    let inner: Router<()> = crate::channel::routes()
-        .with_state(state)
-        .layer(TraceLayer::new_for_http());
-    let v1_authed = channel_auth::attach(inner, auth_state);
-    Router::new().nest("/v1", v1_authed)
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_admin_router_for_tests(deps: &GatewayDeps) -> Router {
+    build_admin_router(deps)
+}
+
+fn build_channel_v1_subrouter(state: WsChannelState) -> Router {
+    Router::new().nest("/v1", crate::channel::routes().with_state(state))
 }
 
 /// Build the router served on the channel TCP listener. Called by
@@ -372,7 +335,9 @@ pub fn build_channel_router(
     auth_state: channel_auth::ChannelAuthState,
 ) -> Router {
     let _channel_state = ChannelState::from_deps(deps);
-    let channel_v1 = build_channel_v1_subrouter(WsChannelState::from_deps(deps), auth_state);
+    let channel_v1 = build_channel_v1_subrouter(WsChannelState::from_deps(deps))
+        .layer(TraceLayer::new_for_http());
+    let channel_v1 = channel_auth::attach(channel_v1, auth_state);
     Router::new()
         .merge(api::health::routes().layer(TraceLayer::new_for_http()))
         .merge(channel_v1)

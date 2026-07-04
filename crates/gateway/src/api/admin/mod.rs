@@ -1,6 +1,6 @@
 //! Admin surface (TCP + bearer token). Hosts config/status/jobs/cron/
-//! traces/skills/tools/llm and a read-only channel list. No chat
-//! content flows through these endpoints.
+//! traces/skills/tools/llm, a read-only channel list, and the web chat
+//! REST surface.
 
 pub mod analytics;
 pub mod channels;
@@ -43,7 +43,7 @@ use crate::server::AdminState;
         (name = "skills", description = "Registered skills"),
         (name = "tools", description = "Registered tool manifests"),
         (name = "channels", description = "Registered channel plugins"),
-        (name = "chat", description = "Web chat sessions + channel-token mint"),
+        (name = "chat", description = "Web chat sessions"),
         (name = "push", description = "Direct-mode (web-identity) push registration"),
         (name = "llm", description = "Configured LLM provider"),
         (name = "logs", description = "Recent tracing events (in-memory ring buffer)"),

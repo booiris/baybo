@@ -90,9 +90,7 @@ async fn authorize_upload(
     match authed {
         // TUI, web chat, and tool-sidecar uploads are session-scoped
         // (not per-bot/per-user) — pairing doesn't apply.
-        AuthedClient::Tui | AuthedClient::Tool { .. } | AuthedClient::Web { .. } => {
-            UploadAuth::Bypass
-        }
+        AuthedClient::Tui | AuthedClient::Tool { .. } | AuthedClient::Web => UploadAuth::Bypass,
         // iOS devices may not upload through the HTTP blob side channel. Mobile
         // attachment upload uses the E2E relay blob leg instead.
         AuthedClient::Device { .. } => UploadAuth::Reject(

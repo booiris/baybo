@@ -1,9 +1,8 @@
 // WebSocket transport for the /chat page.
 //
-// Connects to /v1/channel-ws with a channel-token minted by
-// POST /v1/chat/sessions, encodes/decodes msgpack-framed Frame
-// values, handles the Register → Subscribe sequence, and offers an
-// async iterator over inbound Frames for the UI to consume. Auto-
+// Connects to /v1/channel-ws with the admin bearer, encodes/decodes
+// msgpack-framed Frame values, handles the Register → Subscribe sequence,
+// and offers an async iterator over inbound Frames for the UI to consume. Auto-
 // reconnect uses exponential backoff (1s, 2s, 4s, … capped at 30s);
 // each reconnect re-issues Subscribe for the active session_ids the
 // caller is interested in.
@@ -210,16 +209,6 @@ const HEARTBEAT_LIVENESS_TIMEOUT_MS = 45_000;
  *  the actual deadline without busy-spinning. */
 const HEARTBEAT_TICK_MS = 5_000;
 
-/** How many consecutive WS attempts that closed before reaching
- *  `register_ack` constitute a "token presumed dead" signal that
- *  triggers {@link ChatWsOptions.onTokenRejected}. A browser
- *  WebSocket can't see the HTTP upgrade status, so a 401 from the
- *  gateway's channel-auth middleware reaches us only as `onclose`
- *  with no prior frames. Two in a row rules out a one-off transient
- *  (DNS hiccup, server still booting) while still recovering in
- *  ~3 seconds via the existing backoff ladder. */
-const PRESUME_TOKEN_DEAD_THRESHOLD = 2;
-
 export type ConnectionStatus =
   | { state: 'connecting' }
   | { state: 'connected' }
@@ -230,8 +219,8 @@ export interface ChatWsOptions {
    *  the admin listener in dev/prod (the gateway serves both on one
    *  axum router). */
   baseUrl: string;
-  /** Channel-token from `POST /v1/chat/sessions`. */
-  channelToken: string;
+  /** Admin bearer token for the gateway admin listener. */
+  adminToken: string;
   /** Initial session_ids to subscribe to after RegisterAck. The
    *  caller is free to mutate the subscription set later via
    *  {@link ChatWs.subscribe} / {@link ChatWs.unsubscribe}. */
@@ -241,12 +230,6 @@ export interface ChatWsOptions {
   onFrame: (frame: Frame) => void;
   /** Callback for connection state changes. */
   onStatus?: (status: ConnectionStatus) => void;
-  /** Fired when the server replies `register_ack { ok: false }`. The
-   *  socket pauses auto-reconnect at this point; the caller is
-   *  expected to mint a fresh channel-token and call
-   *  {@link ChatWs.replaceToken} to resume. If the caller does
-   *  nothing, the connection stays disconnected. */
-  onTokenRejected?: (reason: string) => void;
   /** Fired when the server sends `Frame::Reset` — typically because
    *  the client's `since_ordinal` cursor implied a catch-up gap
    *  larger than the gateway's WS replay cap, or because the live
@@ -264,7 +247,7 @@ export interface ChatWsOptions {
 
 export class ChatWs {
   private ws: WebSocket | null = null;
-  private channelToken: string;
+  private adminToken: string;
   /** Per-session subscription state. The value is the highest
    *  persisted `ordinal` the client has ever seen for that session;
    *  `undefined` means "no persisted cursor yet" (fresh subscribe).
@@ -276,9 +259,6 @@ export class ChatWs {
   private retryAttempt = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
-  /** Paused after the server rejected our token — auto-reconnect
-   *  stops until {@link replaceToken} swaps in a fresh one. */
-  private suspended = false;
   /** Combined heartbeat-send + liveness-watchdog tick. `null` while
    *  disconnected. Set in {@link startHeartbeat} after RegisterAck. */
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -287,23 +267,8 @@ export class ChatWs {
    *  {@link HEARTBEAT_LIVENESS_TIMEOUT_MS} to detect half-open TCP
    *  state that the browser would otherwise hide. */
   private lastFrameAt = 0;
-  /** True once the current connect attempt received `register_ack
-   *  { ok: true }`. Reset on every {@link connect}; consulted by
-   *  {@link onClose} to tell apart "WS closed mid-session" from "WS
-   *  never came up". A 401 on the HTTP upgrade closes the socket
-   *  before a single frame arrives, so the only signal we have for
-   *  auth-time rejection from a browser WebSocket is "connect → close
-   *  without ever flipping `reachedConnectedThisAttempt = true`". */
-  private reachedConnectedThisAttempt = false;
-  /** Consecutive WS attempts that died before reaching RegisterAck.
-   *  Reset on a successful RegisterAck. When it crosses
-   *  {@link PRESUME_TOKEN_DEAD_THRESHOLD} we presume the channel
-   *  token is dead (revoked, gateway restart, …) and route to
-   *  `onTokenRejected` so the caller can re-mint. */
-  private consecutivePreAckCloses = 0;
-
   constructor(private readonly opts: ChatWsOptions) {
-    this.channelToken = opts.channelToken;
+    this.adminToken = opts.adminToken;
     for (const sid of opts.initialSessionIds ?? []) this.subscriptions.set(sid, undefined);
     this.connect();
   }
@@ -418,23 +383,6 @@ export class ChatWs {
     this.sendFrame({ kind: 'resolve_approval', call_id: callId, decision });
   }
 
-  /** Swap the channel-token in (e.g. after the server rejected the
-   *  previous one) and reconnect immediately. Clears the suspended
-   *  flag so subsequent rejections can re-trigger
-   *  `onTokenRejected`. */
-  replaceToken(newToken: string): void {
-    this.channelToken = newToken;
-    this.suspended = false;
-    this.retryAttempt = 0;
-    this.consecutivePreAckCloses = 0;
-    if (this.retryTimer) {
-      clearTimeout(this.retryTimer);
-      this.retryTimer = null;
-    }
-    this.detachAndCloseWs();
-    this.connect();
-  }
-
   /** Tear the connection down permanently. No further reconnects. */
   close(): void {
     this.closed = true;
@@ -504,10 +452,9 @@ export class ChatWs {
   }
 
   private connect(): void {
-    if (this.closed || this.suspended) return;
-    this.reachedConnectedThisAttempt = false;
+    if (this.closed) return;
     this.notifyStatus({ state: 'connecting' });
-    const url = buildWsUrl(this.opts.baseUrl, this.channelToken);
+    const url = buildWsUrl(this.opts.baseUrl, this.adminToken);
     let ws: WebSocket;
     try {
       ws = new WebSocket(url);
@@ -548,23 +495,16 @@ export class ChatWs {
       case 'register_ack': {
         if (!frame.ok) {
           const reason = frame.reason ?? 'register rejected';
-          // Pause auto-reconnect — looping with the same dead token
-          // would just hammer the gateway. The caller's
-          // onTokenRejected is expected to mint a fresh token and
-          // call replaceToken().
-          this.suspended = true;
           this.detachAndCloseWs();
           this.notifyStatus({
             state: 'disconnected',
             retryInMs: 0,
-            lastError: `token rejected: ${reason}`,
+            lastError: `register rejected: ${reason}`,
           });
-          this.opts.onTokenRejected?.(reason);
+          this.scheduleReconnect(reason);
           return;
         }
         this.retryAttempt = 0;
-        this.reachedConnectedThisAttempt = true;
-        this.consecutivePreAckCloses = 0;
         this.notifyStatus({ state: 'connected' });
         // Replay every subscription. Cursor (if any) tells the server
         // what we've already seen so it can stream catch-up frames for
@@ -627,34 +567,11 @@ export class ChatWs {
     this.ws = null;
     if (this.closed) return;
     const reason = `ws close (${e.code}${e.reason ? `: ${e.reason}` : ''})`;
-    // A close that lands before `register_ack { ok: true }` arrived
-    // is suspicious. The most common cause in production is the
-    // gateway's HTTP upgrade rejecting our token (401) — browsers
-    // surface that as a plain `onclose` with no preceding frames, so
-    // we can't distinguish it from a generic socket failure. After
-    // two such attempts in a row we presume the token is dead and
-    // route to `onTokenRejected` so the page can re-mint, mirroring
-    // the explicit `register_ack { ok: false }` path. The threshold
-    // rules out one-off transients (DNS, server still booting).
-    if (!this.reachedConnectedThisAttempt) {
-      this.consecutivePreAckCloses += 1;
-      if (this.consecutivePreAckCloses >= PRESUME_TOKEN_DEAD_THRESHOLD) {
-        this.consecutivePreAckCloses = 0;
-        this.suspended = true;
-        this.notifyStatus({
-          state: 'disconnected',
-          retryInMs: 0,
-          lastError: `token presumed dead after upgrade close: ${reason}`,
-        });
-        this.opts.onTokenRejected?.(`upgrade-time close: ${reason}`);
-        return;
-      }
-    }
     this.scheduleReconnect(reason);
   }
 
   private scheduleReconnect(reason: string): void {
-    if (this.closed || this.suspended) return;
+    if (this.closed) return;
     const delay = Math.min(
       RECONNECT_BASE_MS * 2 ** this.retryAttempt,
       RECONNECT_MAX_MS,
@@ -687,6 +604,8 @@ function buildWsUrl(baseUrl: string, token: string): string {
   u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
   u.pathname = '/v1/channel-ws';
   u.search = '';
+  // Browser WebSocket cannot set Authorization, so the admin auth
+  // middleware accepts this query-param form and strips it before tracing.
   u.searchParams.set('token', token);
   return u.toString();
 }

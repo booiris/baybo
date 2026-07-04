@@ -80,9 +80,9 @@ On that loop the gateway emits `Frame::Attachment` carrying `WireAttachment{kind
 mime_type, size, filename}` — a **reference only**. The `WireAttachment` doc
 (`crates/wire/src/lib.rs:95-101`) is explicit: the bytes "never ride the WS — they live in
 the gateway's `BlobStore` and are uploaded/fetched out-of-band via `POST/GET /v1/blobs/*`."
-That out-of-band route is channel-token HTTP on the gateway — reachable by the TUI, web,
-and local sidecars, but **not** by a phone behind NAT. So the companion holds attachment
-references it cannot resolve.
+That out-of-band route is HTTP on the gateway — channel-token-authenticated for the TUI
+and local sidecars, admin-token-authenticated for web chat, but **not** reachable by a
+phone behind NAT. So the companion holds attachment references it cannot resolve.
 
 ## Contract (non-negotiable)
 

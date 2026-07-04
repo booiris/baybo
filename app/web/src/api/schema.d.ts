@@ -216,22 +216,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/chat/sessions/{session_id}/token": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["refresh_session_token"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/chat/sessions/{session_id}/unhide": {
         parameters: {
             query?: never;
@@ -788,29 +772,9 @@ export interface components {
         ChatCronMessagesList: {
             items: components["schemas"]["ChatCronMessage"][];
         };
-        /**
-         * @description Response from `POST /v1/chat/sessions` and the
-         *     `POST /v1/chat/sessions/:id/token` token-refresh endpoint. Carries
-         *     the freshly-minted channel-token the web client presents on its
-         *     `/v1/channel-ws` upgrade via the
-         *     [`CHANNEL_TOKEN_HEADER`](crate::auth::CHANNEL_TOKEN_HEADER) header
-         *     (or the `?token=` query when the browser's WebSocket API can't set
-         *     custom headers — which it never can).
-         */
-        ChatSessionCredential: {
-            /**
-             * @description Capability token bound to a `web/<uuid>` identity. Live for the
-             *     lifetime of the session row; calling
-             *     `POST /v1/chat/sessions/:id/token` revokes the previous token
-             *     and returns a new one.
-             */
-            channel_token: string;
-            /**
-             * @description Header name the web client must use when presenting the
-             *     channel-token on the channel listener.
-             */
-            channel_token_header: string;
-            /** @description New (or existing) session id. */
+        /** @description Response from `POST /v1/chat/sessions`. */
+        ChatSessionCreated: {
+            /** @description New session id. */
             session_id: string;
         };
         ChatSessionDetail: {
@@ -1985,13 +1949,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description New session id + freshly-minted channel-token */
+            /** @description New session id */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ChatSessionCredential"];
+                    "application/json": components["schemas"]["ChatSessionCreated"];
                 };
             };
             /** @description Unauthorized */
@@ -2003,7 +1967,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Session creation or token mint failed */
+            /** @description Session creation failed */
             500: {
                 headers: {
                     [name: string]: unknown;
@@ -2226,47 +2190,6 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Session not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    refresh_session_token: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Session id whose token to refresh */
-                session_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Fresh channel-token (old one revoked) */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ChatSessionCredential"];
-                };
             };
             /** @description Unauthorized */
             401: {

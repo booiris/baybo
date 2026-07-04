@@ -29,9 +29,8 @@ use futures::{SinkExt, StreamExt};
 use super::adapter::Sidecar;
 use super::handshake::validate_register;
 use super::state::WsChannelState;
-use super::web_token_janitor::StashedTokenHandle;
 use crate::api::admin::chat::{DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT};
-use crate::auth::{AuthedClient, TokenHandle};
+use crate::auth::AuthedClient;
 
 /// Maximum time to wait for the client's `Register` frame after the WS
 /// upgrade completes. Keeps idle connections that never speak from
@@ -87,26 +86,6 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
     };
 
     let channel_type = outcome.channel_type;
-
-    // For web-chat connections, claim the `TokenHandle` stashed at mint
-    // time — removing it from `web_chat_tokens` so the janitor won't reap
-    // it mid-session. We hold it here for the connection's lifetime and,
-    // on a clean teardown, RE-STASH it (see end of fn) instead of letting
-    // it drop: dropping revokes the token, which would 401 the client's
-    // own backoff reconnect that re-presents the same `?token=`. Keeping
-    // the token live lets a reconnect re-claim it; an abandoned tab is
-    // still bounded by the janitor's TTL sweep of the re-stashed entry.
-    // `None` for non-web auth (TUI / sidecars own their handles elsewhere)
-    // and for the rare race where a second WS upgrades with the same token
-    // before the first closed — the second runs without it; the token
-    // stays alive as long as either connection holds or re-stashes it.
-    let mut web_token_handle: Option<(String, TokenHandle)> = match &authed {
-        AuthedClient::Web { token, .. } => state
-            .web_chat_tokens
-            .remove(token)
-            .map(|(_, stashed)| (token.clone(), stashed.handle)),
-        _ => None,
-    };
 
     // Resolve the channel (with lazy install fallback for custom
     // out-of-tree sidecars) *before* committing the sink to the
@@ -192,17 +171,6 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
         }
     }
     let _ = sidecar.into_pump().await;
-
-    // Re-stash the web token handle (fresh `minted_at`) instead of letting
-    // it drop-revoke, so the client's reconnect re-claims the same token
-    // rather than eating a 401. The janitor reaps it after its TTL if no
-    // reconnect arrives. Setup-failure paths above return early, dropping
-    // the handle (revoke) — only a connection that actually ran re-stashes.
-    if let Some((token, handle)) = web_token_handle.take() {
-        state
-            .web_chat_tokens
-            .insert(token, StashedTokenHandle::new(handle));
-    }
 
     tracing::info!(
         %channel_type,

@@ -4,9 +4,9 @@
 //!
 //! * **Admin** — TCP, bearer-token authenticated. Config / status /
 //!   jobs / cron / memory / traces / skills / tools / llm and a
-//!   read-only channel list. Also co-hosts the channel-token web chat
-//!   routes (`/v1/channel-ws`, `/v1/blobs/*`) so browser clients can
-//!   reach them over the public bind.
+//!   read-only channel list. Also co-hosts admin-token web chat routes
+//!   (`/v1/channel-ws`, `/v1/blobs/*`) so browser clients can reach
+//!   them over the public bind.
 //! * **Channel** — loopback TCP (`127.0.0.1:<ephemeral>`),
 //!   vault-issued channel-token authenticated. Hosts a single
 //!   WebSocket endpoint (`/v1/channel-ws`) over which the bundled

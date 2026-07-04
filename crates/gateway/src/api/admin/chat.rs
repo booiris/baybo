@@ -3,32 +3,26 @@
 //! Surface:
 //!
 //! * `POST /v1/chat/sessions` — create a new session (channel=http),
-//!   mint a short-lived channel-token bound to that session's web tab,
-//!   return both.
+//!   return its id.
 //! * `GET /v1/chat/sessions` — list the http channel's sessions
 //!   (newest first). Hidden sessions are filtered out unless the
 //!   `include_hidden=true` query is set.
 //! * `GET /v1/chat/sessions/:id` — session detail + transcript history.
 //! * `DELETE /v1/chat/sessions/:id` — **hide** the session from the
-//!   chat list. The row, transcript, and channel-token stay live;
-//!   admin / trace surfaces still see it. Reversible via
+//!   chat list. The row and transcript stay live; admin / trace
+//!   surfaces still see it. Reversible via
 //!   `POST /v1/chat/sessions/:id/unhide`.
 //! * `POST /v1/chat/sessions/:id/unhide` — undo the hide.
 //! * `PUT /v1/chat/sessions/:id/pin` — pin (or unpin) the session to
 //!   the top of the chat list. Presentation only; the row is otherwise
 //!   unchanged.
-//! * `POST /v1/chat/sessions/:id/token` — refresh the channel-token
-//!   (drop old, mint new). Used by the web client when its existing
-//!   token's lifetime is close to expiring.
 //! * `GET /v1/chat/slash-manifest` — list of slash commands the input
 //!   composer's `/`-autocomplete should surface.
 //!
-//! The web client uses the returned `channel_token` to authenticate
-//! against `/v1/channel-ws`, which the admin listener co-hosts on its
-//! public bind (so the browser can reach it from the same origin that
-//! served the web bundle) alongside the loopback channel listener.
-//! The channel-auth middleware turns the token into
-//! [`crate::auth::AuthedClient::Web`].
+//! The web client uses the admin bearer to authenticate against
+//! `/v1/channel-ws`, which the admin listener co-hosts on its public bind
+//! so the browser can reach it from the same origin that served the web
+//! bundle.
 
 use std::collections::HashMap;
 
@@ -52,10 +46,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::api::dto::{ErrorBody, ListResponse};
-use crate::auth::{
-    CHANNEL_TOKEN_HEADER, ClientIdentity, WEB_CLIENT_LABEL_PREFIX, WEB_OPERATOR_USER_ID,
-};
-use crate::channel::StashedTokenHandle;
+use crate::auth::WEB_OPERATOR_USER_ID;
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
@@ -69,7 +60,6 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(set_session_folder))
         .routes(routes!(delete_session))
         .routes(routes!(unhide_session))
-        .routes(routes!(refresh_session_token))
         .routes(routes!(slash_manifest))
         .routes(routes!(list_cron_messages))
         .routes(routes!(list_folders))
@@ -139,25 +129,11 @@ pub struct GetSessionQuery {
 
 // ── DTOs ─────────────────────────────────────────────────────────────
 
-/// Response from `POST /v1/chat/sessions` and the
-/// `POST /v1/chat/sessions/:id/token` token-refresh endpoint. Carries
-/// the freshly-minted channel-token the web client presents on its
-/// `/v1/channel-ws` upgrade via the
-/// [`CHANNEL_TOKEN_HEADER`](crate::auth::CHANNEL_TOKEN_HEADER) header
-/// (or the `?token=` query when the browser's WebSocket API can't set
-/// custom headers — which it never can).
+/// Response from `POST /v1/chat/sessions`.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct ChatSessionCredential {
-    /// New (or existing) session id.
+pub struct ChatSessionCreated {
+    /// New session id.
     pub session_id: String,
-    /// Capability token bound to a `web/<uuid>` identity. Live for the
-    /// lifetime of the session row; calling
-    /// `POST /v1/chat/sessions/:id/token` revokes the previous token
-    /// and returns a new one.
-    pub channel_token: String,
-    /// Header name the web client must use when presenting the
-    /// channel-token on the channel listener.
-    pub channel_token_header: &'static str,
 }
 
 /// Discriminator for [`ChatTranscriptItem`] — serialized as
@@ -461,12 +437,12 @@ impl From<SlashCommandSpec> for SlashCommandEntry {
     path = "/chat/sessions",
     tag = "chat",
     responses(
-        (status = 200, description = "New session id + freshly-minted channel-token", body = ChatSessionCredential),
+        (status = 200, description = "New session id", body = ChatSessionCreated),
         (status = 401, description = "Unauthorized", body = ErrorBody),
-        (status = 500, description = "Session creation or token mint failed", body = ErrorBody),
+        (status = 500, description = "Session creation failed", body = ErrorBody),
     )
 )]
-async fn create_session(State(state): State<AdminState>) -> Result<Json<ChatSessionCredential>> {
+async fn create_session(State(state): State<AdminState>) -> Result<Json<ChatSessionCreated>> {
     let user = web_operator_user();
     let session = state
         .session_manager
@@ -474,7 +450,6 @@ async fn create_session(State(state): State<AdminState>) -> Result<Json<ChatSess
         .await
         .map_err(|e| GatewayError::Internal(format!("create chat session: {e}")))?;
     let session_id = session.id.clone();
-    let cred = mint_credential(&state, &session_id);
     // Created emits a full patch — sibling tabs construct the row
     // straight from this without a list refetch.
     broadcast_session_patch(
@@ -491,7 +466,9 @@ async fn create_session(State(state): State<AdminState>) -> Result<Json<ChatSess
             folder_id: None,
         },
     );
-    Ok(Json(cred))
+    Ok(Json(ChatSessionCreated {
+        session_id: session_id.to_string(),
+    }))
 }
 
 #[utoipa::path(
@@ -582,7 +559,7 @@ async fn get_session(
     // same `NotFound` shape `session_manager.get(...)` would, so a
     // caller probing a telegram/weixin id can't tell whether the
     // session exists at all — the surface stays scoped to browser-
-    // originated chats just like list/token/hide/unhide above. The
+    // originated chats just like list/hide/unhide above. The
     // bare `session_manager.get(...)` path that used to live here
     // would happily serve any persisted transcript.
     let (sid, session) = load_web_chat_session(&state, &session_id).await?;
@@ -726,7 +703,7 @@ async fn set_session_model(
     Path(session_id): Path<String>,
     Json(req): Json<SetSessionModelRequest>,
 ) -> Result<Json<SetSessionModelResponse>> {
-    // Same web-chat scoping as get/hide/token — a non-`http` id 404s.
+    // Same web-chat scoping as get/hide — a non-`http` id 404s.
     // We only need the existence/scope check, not the loaded blob:
     // persistence goes through the targeted `set_last_llm` below.
     let (sid, _) = load_web_chat_session(&state, &session_id).await?;
@@ -851,9 +828,10 @@ async fn delete_session(
     Path(session_id): Path<String>,
 ) -> Result<axum::http::StatusCode> {
     // Despite the `DELETE` verb this hides rather than removes the
-    // row — see the module docstring. The channel-token stays alive
-    // so any tab still anchored on this session keeps working; users
-    // can restore via `POST .../unhide` or `?include_hidden=true`.
+    // row — see the module docstring. Other tabs keep working because
+    // web chat authenticates with the admin bearer, not a session-bound
+    // credential; users can restore via `POST .../unhide` or
+    // `?include_hidden=true`.
     let (sid, _) = load_web_chat_session(&state, &session_id).await?;
     state
         .session_manager
@@ -1243,30 +1221,6 @@ async fn delete_folder(
 }
 
 #[utoipa::path(
-    post,
-    path = "/chat/sessions/{session_id}/token",
-    tag = "chat",
-    params(
-        ("session_id" = String, Path, description = "Session id whose token to refresh"),
-    ),
-    responses(
-        (status = 200, description = "Fresh channel-token (old one revoked)", body = ChatSessionCredential),
-        (status = 401, description = "Unauthorized", body = ErrorBody),
-        (status = 404, description = "Session not found", body = ErrorBody),
-    )
-)]
-async fn refresh_session_token(
-    State(state): State<AdminState>,
-    Path(session_id): Path<String>,
-) -> Result<Json<ChatSessionCredential>> {
-    // Confirm the session exists (and is an http session) before
-    // minting a token for it — minting for a non-existent session
-    // would issue credentials that never reach a useful target.
-    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
-    Ok(Json(mint_credential(&state, &sid)))
-}
-
-#[utoipa::path(
     get,
     path = "/chat/cron-messages",
     tag = "chat",
@@ -1341,35 +1295,6 @@ async fn slash_manifest(
 const WEB_HIDDEN_SLASH_COMMANDS: &[&str] = &["new"];
 
 // ── helpers ──────────────────────────────────────────────────────────
-
-/// Mint a fresh web channel-token for `session_id`, store the handle
-/// on [`AdminState::web_chat_tokens`] keyed by the token itself, and
-/// return the credential. Caller is responsible for any "session
-/// must exist" check; `create_session` issues a fresh session row
-/// directly above this call so it doesn't bother.
-///
-/// The map is keyed by the token string so concurrent tabs anchored
-/// to the same session each get their own live `TokenHandle` — keying
-/// by `session_id` would make the second tab's mint drop (and
-/// revoke) the first tab's handle, breaking the first tab's
-/// reconnect path.
-fn mint_credential(state: &AdminState, session_id: &SessionId) -> ChatSessionCredential {
-    let label = format!("{WEB_CLIENT_LABEL_PREFIX}{}", uuid::Uuid::new_v4());
-    let handle = state.channel_tokens.mint(ClientIdentity {
-        pid: std::process::id(),
-        label,
-        bound_channel_type: Some(ChannelType::http().to_string()),
-    });
-    let token = handle.token().to_owned();
-    state
-        .web_chat_tokens
-        .insert(token.clone(), StashedTokenHandle::new(handle));
-    ChatSessionCredential {
-        session_id: session_id.to_string(),
-        channel_token: token,
-        channel_token_header: CHANNEL_TOKEN_HEADER,
-    }
-}
 
 fn web_operator_user() -> User {
     User {

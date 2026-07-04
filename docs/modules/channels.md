@@ -250,14 +250,13 @@ reaches the agent through that same endpoint:
 | Channel        | Kind          | ID prefix | Transport / auth                                                            |
 | -------------- | ------------- | --------- | --------------------------------------------------------------------------- |
 | `tui`          | `Subscribed`  | `tui_`    | `/v1/channel-ws` (per-start token from `gateway.tui_token`)                 |
-| `http` (web)   | `Subscribed`  | `web_`    | `/v1/channel-ws` (per-tab token minted by `POST /v1/chat/sessions/:id/token`) |
+| `http` (web)   | `Subscribed`  | `web_`    | `/v1/channel-ws` on the admin listener (dashboard admin token)                |
 | Sidecars       | `Multiplexed` | `<name>_` | `/v1/channel-ws` (per-spawn capability token, claims its own `channel_type`)|
 
 See [`tui.md`](./tui.md) for the TUI client side and
-[`gateway.md`](./gateway.md) for the server side (including the
-http-channel token lifecycle and the `StashedTokenHandle` /
-`web_chat_tokens` TTL janitor that binds a web token's lifetime to its
-WS).
+[`gateway.md`](./gateway.md) for the server side, including the split
+between the loopback channel-token listener and the admin listener's
+co-hosted web chat route.
 
 The only public SDK for third-party sidecars is the TypeScript package
 at `sidecars/sdk/channel-ts/`. Its primary surface is a `Channel` interface

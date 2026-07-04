@@ -88,6 +88,21 @@ impl AdminAuthState {
             expected: Arc::new(token),
         }
     }
+
+    /// Validate the admin bearer on `req` and strip a `?token=...` query
+    /// parameter before downstream layers can log the URI.
+    pub fn authenticate_request(&self, req: &mut Request<Body>) -> bool {
+        let Some(presented) = extract_token(req) else {
+            return false;
+        };
+        if !super::token::constant_time_eq(self.expected.as_bytes(), presented.as_bytes()) {
+            return false;
+        }
+        if let Some(sanitised) = sanitise_uri(req.uri()) {
+            *req.uri_mut() = sanitised;
+        }
+        true
+    }
 }
 
 /// Axum middleware: extracts the token (Authorization header preferred,
@@ -99,14 +114,8 @@ pub async fn require_admin_token(
     mut req: Request<Body>,
     next: Next,
 ) -> std::result::Result<Response, StatusCode> {
-    let Some(presented) = extract_token(&req) else {
+    if !state.authenticate_request(&mut req) {
         return Err(StatusCode::UNAUTHORIZED);
-    };
-    if !super::token::constant_time_eq(state.expected.as_bytes(), presented.as_bytes()) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    if let Some(sanitised) = sanitise_uri(req.uri()) {
-        *req.uri_mut() = sanitised;
     }
     Ok(next.run(req).await)
 }

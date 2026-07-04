@@ -1,12 +1,16 @@
 //! Channel auth middleware.
 //!
-//! Single authentication mode — the `x-baybo-channel-token` header (or
-//! `?token=` query for runtimes that can't set custom headers on a WS
+//! The loopback channel listener accepts `x-baybo-channel-token` (or
+//! `?token=` for runtimes that can't set custom headers on a WS
 //! upgrade). Every entry in [`ChannelTokenTable`] carries a
 //! [`ClientIdentity`] (pid + label); the middleware looks up the
-//! presented token, distinguishes the bundled TUI from a subprocess
-//! sidecar via the reserved [`TUI_CLIENT_LABEL`], and stashes the
-//! matching [`AuthedClient`] on the request.
+//! presented token, distinguishes the bundled TUI from subprocess and
+//! tool sidecars via reserved labels, and stashes the matching
+//! [`AuthedClient`] on the request.
+//!
+//! The admin listener co-hosts `/v1/channel-ws` for browser web chat
+//! tabs. That route is authenticated by the admin bearer middleware
+//! before this module marks successful requests as [`AuthedClient::Web`].
 //!
 //! The TUI token is minted by the gateway at startup, written to the
 //! secret vault under [`super::token::TUI_TOKEN_VAULT_KEY`], and
@@ -28,7 +32,7 @@ use std::sync::Arc;
 
 use super::token::{
     CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TOOL_CLIENT_LABEL_PREFIX,
-    TUI_CLIENT_LABEL, WEB_CLIENT_LABEL_PREFIX,
+    TUI_CLIENT_LABEL,
 };
 use axum::body::Body;
 use axum::extract::State;
@@ -63,22 +67,10 @@ pub enum AuthedClient {
         /// in that case.
         channel_type: Option<String>,
     },
-    /// Admin-side web chat tab. The token was minted by
-    /// `POST /v1/chat/session` after the operator presented a valid
-    /// admin bearer; the channel-WS handshake accepts this identity
-    /// only when it claims `ChannelType::HTTP`.
-    Web {
-        /// Full label string starting with [`WEB_CLIENT_LABEL_PREFIX`]
-        /// (e.g. `"web/<uuid>"`). The suffix uniquely identifies the
-        /// minted session so logs and metrics can attribute traffic.
-        label: String,
-        /// Raw token string the caller presented. The channel WS
-        /// route uses this to take the matching `TokenHandle` out of
-        /// `web_chat_tokens` on successful upgrade so the handle
-        /// rides the connection lifetime (and revokes the token on
-        /// close).
-        token: String,
-    },
+    /// Admin-side web chat tab. Authenticated by the admin bearer on the
+    /// admin listener, then constrained by the Register handshake to
+    /// `ChannelType::HTTP`.
+    Web,
     /// A paired, operator-approved iOS companion device. Resolved by its
     /// persisted `auth_token` against the [`DeviceStore`] (not the in-memory
     /// [`ChannelTokenTable`]) — only `approved` rows match, so a pending or
@@ -92,17 +84,12 @@ pub enum AuthedClient {
 }
 
 impl AuthedClient {
-    fn from_identity(identity: ClientIdentity, token: &str) -> Self {
+    fn from_identity(identity: ClientIdentity) -> Self {
         if identity.label == TUI_CLIENT_LABEL {
             AuthedClient::Tui
         } else if identity.label.starts_with(TOOL_CLIENT_LABEL_PREFIX) {
             AuthedClient::Tool {
                 label: identity.label,
-            }
-        } else if identity.label.starts_with(WEB_CLIENT_LABEL_PREFIX) {
-            AuthedClient::Web {
-                label: identity.label,
-                token: token.to_owned(),
             }
         } else {
             AuthedClient::Subprocess {
@@ -149,6 +136,19 @@ where
     S: Clone + Send + Sync + 'static,
 {
     router.layer(middleware::from_fn_with_state(state, require_channel_auth))
+}
+
+/// Mark the already-admin-authenticated co-hosted channel routes as web chat.
+pub fn attach_web_identity<S>(router: axum::Router<S>) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(middleware::from_fn(mark_web_identity))
+}
+
+async fn mark_web_identity(mut req: Request<Body>, next: Next) -> Response {
+    req.extensions_mut().insert(AuthedClient::Web);
+    next.run(req).await
 }
 
 /// Middleware: validates the channel token header (or `?token=` query),
@@ -199,11 +199,8 @@ pub async fn require_channel_auth(
                         "channel auth: accepted via subprocess token",
                     );
                 }
-                AuthedClient::Web { label, .. } => {
-                    tracing::debug!(
-                        %path, label = %label,
-                        "channel auth: accepted via web chat token",
-                    );
+                AuthedClient::Web => {
+                    tracing::debug!(%path, "channel auth: accepted via web chat identity");
                 }
             }
             req.extensions_mut().insert(authed);
@@ -266,7 +263,7 @@ async fn resolve_token(
     token: &str,
 ) -> std::result::Result<Option<AuthedClient>, StatusCode> {
     if let Some(identity) = state.tokens.lookup(token) {
-        return Ok(Some(AuthedClient::from_identity(identity, token)));
+        return Ok(Some(AuthedClient::from_identity(identity)));
     }
     // In-memory miss: a paired iOS device presents a persisted `auth_token`,
     // not an in-table token. Only `approved` rows resolve (the store filters
