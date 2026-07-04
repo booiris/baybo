@@ -57,7 +57,11 @@ struct ChatListScreen: View {
                 Button {
                     appStore.openSession(row.id)
                 } label: {
-                    SessionRowView(row: row, langCode: lang.current.lproj)
+                    SessionRowView(
+                        row: row,
+                        langCode: lang.current.lproj,
+                        justNow: lang.t("list.justNow")
+                    )
                 }
                 .listRowBackground(Theme.paper)
                 .listRowSeparatorTint(Theme.line)
@@ -121,6 +125,9 @@ struct SessionRowView: View {
     /// The app language's locale identifier (drives the age formatter, so it
     /// can't diverge from the chrome language).
     let langCode: String
+    let justNow: String
+
+    private static let justNowThreshold: TimeInterval = 5
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -135,7 +142,7 @@ struct SessionRowView: View {
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(Theme.inkSoft)
                 }
-                Text(verbatim: Self.age(of: row.lastActive, locale: langCode))
+                Text(verbatim: Self.age(of: row.lastActive, locale: langCode, justNow: justNow))
                     .font(Theme.mono(12))
                     .foregroundStyle(Theme.inkSoft)
             }
@@ -145,11 +152,19 @@ struct SessionRowView: View {
         .contentShape(Rectangle())
     }
 
-    private static func age(of date: Date, locale: String) -> String {
+    private static func age(
+        of date: Date,
+        locale: String,
+        justNow: String,
+        relativeTo now: Date = Date()
+    ) -> String {
+        if now.timeIntervalSince(date) < Self.justNowThreshold {
+            return justNow
+        }
         let formatter = RelativeDateTimeFormatter()
         formatter.locale = Locale(identifier: locale)
         formatter.unitsStyle = .short
-        return formatter.localizedString(for: date, relativeTo: Date())
+        return formatter.localizedString(for: date, relativeTo: now)
     }
 }
 

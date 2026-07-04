@@ -545,6 +545,23 @@
         }
       }
     },
+    "list.justNow" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "just now"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "刚刚"
+          }
+        }
+      }
+    },
     "list.newChat" : {
       "extractionState" : "stale",
       "localizations" : {
