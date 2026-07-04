@@ -117,7 +117,7 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   is the device-local registry backing the list on BOTH legs — the relay wire
   protocol cannot list sessions (client-minted ids), so local rows are the
   single rendering source, updated at send time. A direct binding merges
-  `chat_list_sessions()` (REST `GET /v1/chat/sessions`) over it on
+  `chat_list_sessions()` (REST `GET /v1/chat/sessions`, admin Bearer) over it on
   appear/foreground/pull; remote wins for existence (a row missing remotely was
   hidden elsewhere) unless the local row saw newer activity. Per-session
   transcript mirrors live in `Application Support/baybo/transcripts/<id>.json`

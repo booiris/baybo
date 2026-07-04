@@ -63,9 +63,7 @@ impl FrameCodec for RelayCodec {
 impl ChatTransport for RelaySessions {
     fn establish(
         &self,
-        session_id: &str,
     ) -> impl std::future::Future<Output = Result<Connection, TransportError>> + Send {
-        let session_id = session_id.to_string();
         let apns = self.apns.clone();
         async move {
             // Preconditions surface as `Precondition` so a transient failure here
@@ -96,7 +94,7 @@ impl ChatTransport for RelaySessions {
                 opening_best_effort.push(apns_token_frame(&token, apns.env().as_str()));
             } else {
                 log::info!(
-                    "connecting without an APNs token (not yet issued); push binding not refreshed this session (session={session_id} device={})",
+                    "connecting without an APNs token (not yet issued); push binding not refreshed this session (device={})",
                     record.device_id
                 );
             }

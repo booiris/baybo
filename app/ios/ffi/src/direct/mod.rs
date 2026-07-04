@@ -1,15 +1,11 @@
 //! Direct (non-relay) gateway access — the web-dashboard style.
 //!
 //! [`login`]/[`status`]/[`logout`] (this file) validate + persist the gateway
-//! base URL + admin Bearer token. The chat transport ([`chat`]) then mints a
-//! narrower **channel token** over REST ([`rest`]) and speaks the raw-MessagePack
-//! `/v1/channel-ws` protocol — the same one `app/web` uses — while attachments
-//! ([`blob`]) go over plain `/v1/blobs`. This whole path deliberately bypasses
-//! the relay + Noise E2E design the scan-to-pair flow uses (see `pairing.rs`).
-//!
-//! Two credentials, never conflated: the **admin Bearer** token (stored here,
-//! authorizes the REST surface) and the minted **channel token** (authorizes the
-//! WS + blobs, held live in [`chat::DirectSessions`]).
+//! base URL + admin Bearer token. The chat transport ([`chat`]) uses that same
+//! Bearer to speak the raw-MessagePack `/v1/channel-ws` protocol — the same one
+//! `app/web` uses — while attachments ([`blob`]) go over plain `/v1/blobs`.
+//! This whole path deliberately bypasses the relay + Noise E2E design the
+//! scan-to-pair flow uses (see `pairing.rs`).
 
 mod blob;
 mod chat;
@@ -24,11 +20,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::ChatSessionSummary;
 use crate::keychain;
-
-/// The header the gateway reads the minted channel token from on `/v1/channel-ws`
-/// and `/v1/blobs` (mirrors the gateway's `auth/token.rs` constant). The admin
-/// Bearer token is NEVER sent here — these endpoints reject it.
-pub(crate) const CHANNEL_TOKEN_HEADER: &str = "x-baybo-channel-token";
 
 /// Stable 401 discriminator, folded into `BayboError::InvalidToken` at the FFI
 /// boundary. A code, not prose, so reworded errors can't silently change the
@@ -164,8 +155,8 @@ pub(crate) fn credentials() -> Result<Option<DirectCredentials>, String> {
 }
 
 /// Build the `/v1/channel-ws` URL from a stored base URL: `http→ws`, `https→wss`,
-/// path `/v1/channel-ws`. The channel token rides a request header (set by the
-/// caller), not the query string — the client can read a 401 directly.
+/// path `/v1/channel-ws`. The admin Bearer rides the upgrade request's
+/// `Authorization` header so the client can read a 401 directly.
 pub(crate) fn channel_ws_url(base_url: &str) -> Result<String, String> {
     let rest = base_url
         .strip_prefix("https://")

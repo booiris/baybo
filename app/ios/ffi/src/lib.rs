@@ -35,8 +35,6 @@ use binding::{ActiveLeg, active_leg};
 
 uniffi::setup_scaffolding!();
 
-const RELAY_PRECONNECT_SESSION_HINT: &str = "__relay_preconnect__";
-
 /// Parse a scanned QR payload (`baybo://pair?...`) into a pairing target.
 /// `None` = not a pairing QR — keep scanning. A payload without an explicit
 /// relay (`h=`) targets the hosted default.
@@ -180,15 +178,14 @@ impl BayboClient {
         .await
     }
 
-    /// Mint a fresh chat session for the active binding and return its id. Direct
-    /// mints a gateway session over REST (the id is server-assigned + a channel
-    /// token is stashed for the WS/blob legs); relay picks a fresh client id (the
-    /// relay leg needs no gateway pre-registration).
+    /// Create a fresh chat session for the active binding and return its id. Direct
+    /// creates a gateway session over REST (the id is server-assigned and the
+    /// admin Bearer continues to authorize WS/blob legs); relay picks a fresh
+    /// client id (the relay leg needs no gateway pre-registration).
     pub async fn chat_create_session(self: Arc<Self>) -> Result<String, BayboError> {
-        let this = self;
         runtime::run(async move {
             match active_leg()? {
-                ActiveLeg::Direct => direct::session_create(&this.direct).await,
+                ActiveLeg::Direct => direct::session_create().await,
                 ActiveLeg::Relay => Ok(uuid::Uuid::new_v4().to_string()),
             }
         })
@@ -214,15 +211,12 @@ impl BayboClient {
     /// Warm the relay content leg without subscribing a session. This is
     /// best-effort app-start latency hiding: once the Noise leg is up, opening a
     /// chat only needs to enqueue `Subscribe`. Direct bindings no-op because the
-    /// direct WS token is minted per session.
+    /// direct leg dials the admin-authenticated WS on demand.
     pub async fn relay_preconnect(self: Arc<Self>) -> Result<(), BayboError> {
         let this = self;
         runtime::run(async move {
             match active_leg()? {
-                ActiveLeg::Relay => {
-                    transport::preconnect(&this.relay, RELAY_PRECONNECT_SESSION_HINT.to_string())
-                        .await
-                }
+                ActiveLeg::Relay => transport::preconnect(&this.relay).await,
                 ActiveLeg::Direct => Ok(()),
             }
         })
@@ -310,13 +304,11 @@ impl BayboClient {
         .await
     }
 
-    /// Tear down the active binding's global chat leg. Any leg-specific durable
-    /// state survives: the direct leg keeps its last session id + channel token
-    /// for reconnect; the relay leg reloads its pairing record on the next
-    /// connect. At most one binding mode is live, but the binding may already be
-    /// gone — a disconnect/unpair deletes the credentials *before* this fires —
-    /// so tear both legs down unconditionally; a disconnect on an idle registry is
-    /// a no-op.
+    /// Tear down the active binding's global chat leg. The relay leg reloads its
+    /// pairing record on the next connect. At most one binding mode is live, but
+    /// the binding may already be gone — a disconnect/unpair deletes the
+    /// credentials *before* this fires — so tear both legs down unconditionally; a
+    /// disconnect on an idle registry is a no-op.
     pub async fn chat_disconnect(self: Arc<Self>) {
         let this = self;
         let _ = runtime::run(async move {
@@ -329,18 +321,17 @@ impl BayboClient {
 
     /// Upload a picked image's raw bytes over the active binding's blob
     /// transport. Relay sends `POST /v1/blobs` over a dedicated E2E API tunnel
-    /// blob leg; direct POSTs to plain `/v1/blobs` (channel token). Returns the
+    /// blob leg; direct POSTs to plain `/v1/blobs` (admin Bearer). Returns the
     /// content-addressed `blob_id` to reference in the next message.
     pub async fn blob_upload_bytes(
         self: Arc<Self>,
         bytes: Vec<u8>,
         mime_type: String,
     ) -> Result<String, BayboError> {
-        let this = self;
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => relay::upload_bytes(bytes, mime_type).await,
-                ActiveLeg::Direct => direct::upload_bytes(&this.direct, bytes, mime_type).await,
+                ActiveLeg::Direct => direct::upload_bytes(bytes, mime_type).await,
             }
         })
         .await
@@ -350,13 +341,12 @@ impl BayboClient {
     /// transport, returning the verified bytes. Relay sends `GET /v1/blobs/{id}`
     /// over a dedicated E2E API tunnel blob leg into a content-addressed
     /// on-device cache (reused on the next render); direct GETs plain
-    /// `/v1/blobs/{id}` (channel token).
+    /// `/v1/blobs/{id}` (admin Bearer).
     pub async fn blob_image(self: Arc<Self>, blob_id: String) -> Result<Vec<u8>, BayboError> {
-        let this = self;
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => relay::image_data(blob_id).await,
-                ActiveLeg::Direct => direct::image_data(&this.direct, blob_id).await,
+                ActiveLeg::Direct => direct::image_data(blob_id).await,
             }
         })
         .await

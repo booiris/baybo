@@ -3,18 +3,16 @@
 //! is exactly one `wire::encode(&Frame)`).
 //!
 //! The generic frame pump + session lifecycle live in [`crate::transport`]; this
-//! file is just the direct-specific seams: [`DirectSessions::establish`] (mint /
-//! rotate the channel token, dial, run the web `Register`/`RegisterAck` handshake)
-//! and [`DirectCodec`] (encode/decode). Auth is a minted **channel token** (header
-//! `x-baybo-channel-token`), not the admin Bearer; on a 401 upgrade the token is
-//! rotated once over REST and the dial retried. A `RegisterAck{ok:false}` is not a
-//! token problem (the token is checked at the upgrade) — its reason is surfaced.
+//! file is just the direct-specific seams: [`DirectSessions::establish`] (dial
+//! with the stored admin Bearer, run the web `Register`/`RegisterAck` handshake)
+//! and [`DirectCodec`] (encode/decode). Auth matches browser web chat: the admin
+//! listener validates the Bearer on the HTTP upgrade, then marks the connection
+//! as `AuthedClient::Web`.
 
 use futures_util::SinkExt;
-use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, StatusCode};
+use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode, header::AUTHORIZATION};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use super::rest;
@@ -26,20 +24,10 @@ use crate::transport::{
     UserFrameFn, WsStream, recv_binary,
 };
 
-/// The direct leg's state: the shared session registry plus the current session
-/// id + channel token, stashed so a reconnect or a blob op reuses it (and
-/// outlives the pump). The token is the durable bit the relay leg has no analog
-/// for, so it lives here on the transport, not in the generic registry.
+/// The direct leg's shared session registry.
 #[derive(Default)]
 pub(crate) struct DirectSessions {
     registry: SessionRegistry,
-    session: Mutex<Option<DirectSessionInfo>>,
-}
-
-#[derive(Clone)]
-struct DirectSessionInfo {
-    session_id: String,
-    channel_token: String,
 }
 
 /// The direct frame codec: raw MessagePack, one frame per WS message — no Noise,
@@ -62,9 +50,7 @@ impl FrameCodec for DirectCodec {
 impl ChatTransport for DirectSessions {
     fn establish(
         &self,
-        session_id: &str,
     ) -> impl std::future::Future<Output = Result<Connection, TransportError>> + Send {
-        let session_id = session_id.to_string();
         async move {
             // A precondition failure must not tear down a healthy live session on a
             // foreground reconnect (matches the original, which only reset on a
@@ -74,7 +60,7 @@ impl ChatTransport for DirectSessions {
                 .ok_or_else(|| {
                     TransportError::Precondition("not connected; sign in first".into())
                 })?;
-            let ws = self.establish_ws(&creds, &session_id).await?;
+            let ws = self.establish_ws(&creds).await?;
 
             let codec: Box<dyn FrameCodec> = Box::new(DirectCodec);
 
@@ -95,77 +81,25 @@ impl ChatTransport for DirectSessions {
 }
 
 impl DirectSessions {
-    /// Resolve a channel token for `session_id` and complete the WS handshake. On a
-    /// rejected token (401 upgrade) it rotates once and retries; any other failure
-    /// surfaces.
+    /// Complete the WS handshake as the admin-authenticated web client.
     async fn establish_ws(
         &self,
         creds: &super::DirectCredentials,
-        session_id: &str,
     ) -> Result<WsStream, TransportError> {
-        let token = self
-            .channel_token_for(&creds.base_url, &creds.token, session_id)
-            .await?;
-        match dial_and_register(&creds.base_url, &token).await {
+        match dial_and_register(&creds.base_url, &creds.token).await {
             Ok(ws) => Ok(ws),
-            Err(DialErr::TokenDead) => {
-                let cred = rest::rotate_token(&creds.base_url, &creds.token, session_id)
-                    .await
-                    .map_err(TransportError::Other)?;
-                self.stash_token(session_id, &cred.channel_token).await;
-                dial_and_register(&creds.base_url, &cred.channel_token)
-                    .await
-                    .map_err(|e| match e {
-                        DialErr::TokenDead => {
-                            TransportError::Other("channel token rejected".to_string())
-                        }
-                        DialErr::Other(s) => TransportError::Other(s),
-                    })
+            Err(DialErr::Unauthorized) => {
+                Err(TransportError::Other(super::INVALID_TOKEN_CODE.to_string()))
             }
             Err(DialErr::Other(s)) => Err(TransportError::Other(s)),
         }
     }
-
-    /// The channel token for `session_id`: reuse the stashed one if it matches,
-    /// otherwise mint a fresh one (the relaunch case — only the id survived).
-    async fn channel_token_for(
-        &self,
-        base: &str,
-        admin_token: &str,
-        session_id: &str,
-    ) -> Result<String, TransportError> {
-        {
-            let st = self.session.lock().await;
-            if let Some(s) = &*st
-                && s.session_id == session_id
-            {
-                return Ok(s.channel_token.clone());
-            }
-        }
-        let cred = rest::rotate_token(base, admin_token, session_id)
-            .await
-            .map_err(TransportError::Other)?;
-        self.stash_token(session_id, &cred.channel_token).await;
-        Ok(cred.channel_token)
-    }
-
-    async fn stash_token(&self, session_id: &str, token: &str) {
-        *self.session.lock().await = Some(DirectSessionInfo {
-            session_id: session_id.to_string(),
-            channel_token: token.to_string(),
-        });
-    }
 }
 
-/// Mint a fresh chat session (gateway-assigned id + channel token), stash it, and
-/// return the id.
-pub(crate) async fn session_create(sessions: &DirectSessions) -> Result<String, String> {
+/// Create a fresh chat session and return the id.
+pub(crate) async fn session_create() -> Result<String, String> {
     let creds = super::credentials()?.ok_or("not connected; sign in first")?;
-    let cred = rest::mint_session(&creds.base_url, &creds.token).await?;
-    *sessions.session.lock().await = Some(DirectSessionInfo {
-        session_id: cred.session_id.clone(),
-        channel_token: cred.channel_token,
-    });
+    let cred = rest::create_session(&creds.base_url, &creds.token).await?;
     Ok(cred.session_id)
 }
 
@@ -175,55 +109,34 @@ impl SessionLeg for DirectSessions {
     }
 }
 
-/// Like [`transport::disconnect`](crate::transport::disconnect) but also drops the
-/// stashed session id + channel token. The logout path uses this so a later
-/// reconnect can't resurrect the (now keychain-creds-less) session, and the broad
-/// channel token doesn't linger in memory after the user disconnects.
+/// Like [`transport::disconnect`](crate::transport::disconnect), used by logout so
+/// a later reconnect can't resurrect the now keychain-creds-less direct session.
 pub(crate) async fn forget(sessions: &DirectSessions) {
     sessions.registry.disconnect().await;
-    *sessions.session.lock().await = None;
 }
 
-/// `(base_url, channel_token)` for the blob legs — base from the keychain creds,
-/// token from the live session.
-pub(super) async fn channel_context(sessions: &DirectSessions) -> Result<(String, String), String> {
-    let base = super::credentials()?
-        .ok_or("not connected; sign in first")?
-        .base_url;
-    let token = sessions
-        .session
-        .lock()
-        .await
-        .as_ref()
-        .map(|s| s.channel_token.clone())
-        .ok_or("no active direct session")?;
-    Ok((base, token))
-}
-
-/// Distinguishes a rejected channel token (rotate + retry) from a hard failure.
+/// Distinguishes rejected admin auth from a hard failure.
 enum DialErr {
-    TokenDead,
+    Unauthorized,
     Other(String),
 }
 
-/// Dial `/v1/channel-ws` with the channel token, then run the web Register /
-/// RegisterAck handshake. Returns the ready socket, or [`DialErr::TokenDead`] on a
-/// 401 upgrade or `RegisterAck{ok:false}`.
-async fn dial_and_register(base_url: &str, channel_token: &str) -> Result<WsStream, DialErr> {
+/// Dial `/v1/channel-ws` with the admin Bearer, then run the web Register /
+/// RegisterAck handshake.
+async fn dial_and_register(base_url: &str, admin_token: &str) -> Result<WsStream, DialErr> {
     let url = super::channel_ws_url(base_url).map_err(DialErr::Other)?;
     let mut req = url
         .as_str()
         .into_client_request()
         .map_err(|e| DialErr::Other(format!("bad ws url: {e}")))?;
-    let value = HeaderValue::from_str(channel_token)
-        .map_err(|e| DialErr::Other(format!("bad channel token: {e}")))?;
-    req.headers_mut()
-        .insert(HeaderName::from_static(super::CHANNEL_TOKEN_HEADER), value);
+    let value = HeaderValue::from_str(&format!("Bearer {admin_token}"))
+        .map_err(|e| DialErr::Other(format!("bad admin token: {e}")))?;
+    req.headers_mut().insert(AUTHORIZATION, value);
 
     let mut ws = match connect_async(req).await {
         Ok((ws, _)) => ws,
         Err(WsError::Http(resp)) if resp.status() == StatusCode::UNAUTHORIZED => {
-            return Err(DialErr::TokenDead);
+            return Err(DialErr::Unauthorized);
         }
         Err(e) => return Err(DialErr::Other(format!("ws connect: {e}"))),
     };
@@ -236,9 +149,6 @@ async fn dial_and_register(base_url: &str, channel_token: &str) -> Result<WsStre
 
     match recv_frame(&mut ws).await.map_err(DialErr::Other)? {
         Frame::RegisterAck { ok: true, .. } => Ok(ws),
-        // A rejected Register is NOT a token problem — the channel token is checked
-        // at the HTTP upgrade (surfaced as the 401 above). Surface the server's
-        // reason instead of pointlessly rotating the working token.
         Frame::RegisterAck { ok: false, reason } => Err(DialErr::Other(
             reason.unwrap_or_else(|| "register rejected".into()),
         )),

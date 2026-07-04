@@ -132,14 +132,11 @@ pub(crate) struct Connection {
 /// auth); the rest of the lifecycle is the shared [`SessionRegistry`] below.
 pub(crate) trait ChatTransport: Send + Sync {
     /// Dial, handshake, and authenticate the chat leg, returning the ready
-    /// [`Connection`]. `session_id` is a bootstrap hint for transports that need
-    /// per-session credentials to open the socket. The explicit `+ Send` on the
-    /// returned future (RPITIT) keeps
+    /// [`Connection`]. The explicit `+ Send` on the returned future (RPITIT) keeps
     /// it `Send` through the generic [`SessionRegistry::connect`] so the whole
     /// thing can run on the core runtime — no `async_trait` box needed.
     fn establish(
         &self,
-        session_id: &str,
     ) -> impl std::future::Future<Output = Result<Connection, TransportError>> + Send;
 }
 
@@ -209,7 +206,6 @@ impl SessionRegistry {
     pub(crate) async fn preconnect<T: ChatTransport>(
         &self,
         transport: &T,
-        session_hint: &str,
     ) -> Result<(), TransportError> {
         if self.has_live_pump().await {
             return Ok(());
@@ -220,8 +216,7 @@ impl SessionRegistry {
             return Ok(());
         }
 
-        self.establish_pump(transport, session_hint, "chat preconnect")
-            .await
+        self.establish_pump(transport, "chat preconnect").await
     }
 
     /// Subscribe `session_id` on the binding's global chat leg, streaming that
@@ -254,8 +249,7 @@ impl SessionRegistry {
             return Ok(());
         }
 
-        self.establish_pump(transport, session_id, "chat connect")
-            .await?;
+        self.establish_pump(transport, "chat connect").await?;
 
         let subscribe = OutboundCmd::Subscribe {
             session_id: session_id.to_string(),
@@ -285,30 +279,22 @@ impl SessionRegistry {
     async fn establish_pump<T: ChatTransport>(
         &self,
         transport: &T,
-        session_hint: &str,
         operation: &str,
     ) -> Result<(), TransportError> {
         let dial_epoch = self.slot.lock().await.epoch;
 
-        let conn = match tokio::time::timeout(CONNECT_TIMEOUT, transport.establish(session_hint))
-            .await
-        {
+        let conn = match tokio::time::timeout(CONNECT_TIMEOUT, transport.establish()).await {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
                 let reset = e.should_reset_session();
-                log::warn!(
-                    "{operation} failed: {e} (session_hint={session_hint} reset_prior_session={reset})"
-                );
+                log::warn!("{operation} failed: {e} (reset_prior_session={reset})");
                 if reset {
                     self.abort_if_epoch(dial_epoch).await;
                 }
                 return Err(e);
             }
             Err(_) => {
-                log::warn!(
-                    "{operation} timed out after {}s (session_hint={session_hint})",
-                    CONNECT_TIMEOUT.as_secs()
-                );
+                log::warn!("{operation} timed out after {}s", CONNECT_TIMEOUT.as_secs());
                 self.abort_if_epoch(dial_epoch).await;
                 return Err(TransportError::Timeout);
             }
@@ -319,9 +305,7 @@ impl SessionRegistry {
             drop(slot);
             let mut ws = conn.ws;
             let _ = ws.close(None).await;
-            log::info!(
-                "{operation} discarded: superseded by a teardown mid-dial (session_hint={session_hint})"
-            );
+            log::info!("{operation} discarded: superseded by a teardown mid-dial");
             return Err(TransportError::SessionClosed);
         }
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
@@ -415,9 +399,7 @@ impl SessionRegistry {
 
     /// Tear down the live pump (if any) and fence out any dial in flight: the
     /// epoch bump makes a slow establish discard its connection instead of
-    /// resurrecting a session the owner just tore down. Any leg-specific durable
-    /// state (e.g. the direct leg's stashed channel token) is owned by the
-    /// transport, not here.
+    /// resurrecting a session the owner just tore down.
     pub(crate) async fn disconnect(&self) {
         let mut slot = self.slot.lock().await;
         slot.epoch += 1;
@@ -441,9 +423,9 @@ pub(crate) trait SessionLeg: ChatTransport {
 
 /// Open `leg`'s global chat connection without subscribing any session.
 /// Stringifies the error for the FFI boundary.
-pub(crate) async fn preconnect<L: SessionLeg>(leg: &L, session_hint: String) -> Result<(), String> {
+pub(crate) async fn preconnect<L: SessionLeg>(leg: &L) -> Result<(), String> {
     leg.registry()
-        .preconnect(leg, &session_hint)
+        .preconnect(leg)
         .await
         .map_err(|e| e.to_string())
 }
@@ -493,9 +475,7 @@ pub(crate) async fn fetch_history<L: SessionLeg>(
         .map_err(|e| e.to_string())
 }
 
-/// Tear down `leg`'s live pump (if any). Any leg-specific durable state (e.g. the
-/// direct leg's stashed channel token) is owned by the leg, not the registry, so it
-/// survives.
+/// Tear down `leg`'s live pump (if any).
 pub(crate) async fn disconnect<L: SessionLeg>(leg: &L) {
     leg.registry().disconnect().await;
 }
