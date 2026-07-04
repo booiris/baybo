@@ -774,6 +774,7 @@ impl PushDispatcher {
             self.reply_text_at(session_id, reply_ordinal)
                 .await
                 .as_deref(),
+            session_id,
         )
     }
 
@@ -800,12 +801,18 @@ impl PushDispatcher {
 /// The preview JSON the NSE rewrites into `title`/`body`. `None` text yields the
 /// generic placeholder (used when the reply row can't be read), so a stale
 /// previous-turn reply is never encrypted.
-fn preview_json(text: Option<&str>) -> String {
+///
+/// `session_id` rides INSIDE the sealed plaintext — never the outer APNs
+/// payload — so the app can deep-link a notification tap to its conversation
+/// while C stays blind to session ids (the same invariant that hashes
+/// [`push_collapse_id`]). Older NSE builds ignore the extra field
+/// (`JSONDecoder` tolerates unknown keys); newer ones treat it as optional.
+fn preview_json(text: Option<&str>, session_id: &SessionId) -> String {
     let body = match text {
         Some(t) => t.chars().take(PREVIEW_MAX_CHARS).collect::<String>(),
         None => "New message".to_string(),
     };
-    json!({ "title": "Baybo", "body": body }).to_string()
+    json!({ "title": "Baybo", "body": body, "session_id": session_id.to_string() }).to_string()
 }
 
 /// Pure: AEAD-seal `preview` under `key`, base64 the output, and frame the
@@ -1015,16 +1022,22 @@ mod tests {
 
     #[test]
     fn preview_json_truncates_and_falls_back_to_placeholder() {
+        let session = SessionId::from("sess-9");
         let long = "x".repeat(500);
-        let v: serde_json::Value = serde_json::from_str(&preview_json(Some(&long))).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&preview_json(Some(&long), &session)).unwrap();
         assert_eq!(v["title"], "Baybo");
         assert_eq!(
             v["body"].as_str().unwrap().chars().count(),
             PREVIEW_MAX_CHARS
         );
+        // The tap-routing target rides inside the sealed plaintext (the outer
+        // payload must never carry it — C stays blind to session ids).
+        assert_eq!(v["session_id"], "sess-9");
         // None → generic placeholder (never a stale previous-turn reply).
-        let g: serde_json::Value = serde_json::from_str(&preview_json(None)).unwrap();
+        let g: serde_json::Value = serde_json::from_str(&preview_json(None, &session)).unwrap();
         assert_eq!(g["body"], "New message");
+        assert_eq!(g["session_id"], "sess-9");
     }
 
     #[test]
