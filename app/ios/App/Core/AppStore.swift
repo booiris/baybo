@@ -21,8 +21,21 @@ final class AppStore: ObservableObject {
         case direct
     }
 
+    /// The home shell's bottom-menu sections. Only `chats` and `settings` have
+    /// real screens today; `agents`/`works` are placeholders. Compose and
+    /// push-tap routing force `chats` so backing out of a conversation lands on
+    /// the list, not whatever section was showing.
+    enum HomeTab: CaseIterable {
+        case agents
+        case works
+        case chats
+        case settings
+    }
+
     @Published var route: Route = .launching
     @Published var landingView: LandingView = .menu
+    /// The selected home section (the bottom menu bar's current tab).
+    @Published var homeTab: HomeTab = .chats
     /// The NavigationStack path over the chat list: at most one pushed session.
     @Published var chatPath: [String] = []
     /// Landing / pairing status line (localized, already resolved).
@@ -59,6 +72,28 @@ final class AppStore: ObservableObject {
         if ProcessInfo.processInfo.arguments.contains("-baybo-open-chat") {
             route = .home
             chatPath = ["debug-session"]
+            return
+        }
+        // `-baybo-open-home` lands on the tabbed home shell (chat list + bottom
+        // menu bar) WITHOUT pushing a conversation, so the bar/header/sections
+        // are screenshotable headlessly. Optional `-baybo-home-tab
+        // <agents|works|chats|settings>` preselects a section; a few demo rows
+        // seed the list so content ghosts under the glass bar.
+        if ProcessInfo.processInfo.arguments.contains("-baybo-open-home") {
+            for i in 1...6 {
+                SessionIndex.shared.recordUserSend(
+                    sessionId: "demo-\(i)", text: "Demo conversation number \(i)")
+            }
+            let args = ProcessInfo.processInfo.arguments
+            if let idx = args.firstIndex(of: "-baybo-home-tab"), idx + 1 < args.count {
+                switch args[idx + 1] {
+                case "agents": homeTab = .agents
+                case "works": homeTab = .works
+                case "settings": homeTab = .settings
+                default: homeTab = .chats
+                }
+            }
+            route = .home
             return
         }
         #endif
@@ -219,19 +254,19 @@ final class AppStore: ObservableObject {
     /// Open an existing session from the list.
     func openSession(_ sessionId: String) {
         Task {
-            await activateSession(sessionId)
+            await activateSession(sessionId, ensureListed: true)
         }
     }
 
-    /// Compose: mint a session on the active binding's leg and enter it.
+    /// Compose: mint a draft session on the active binding's leg and enter it.
+    /// It does not enter the chat list until the first send records activity.
     /// Returns the localized error line on failure (the list renders it).
     func startNewChat() async -> String? {
         busy = true
         defer { busy = false }
         do {
             let sessionId = try await Baybo.client.chatCreateSession()
-            SessionIndex.shared.touch(sessionId: sessionId)
-            await activateSession(sessionId)
+            await activateSession(sessionId, ensureListed: false)
             return nil
         } catch {
             return Lang.shared.t("chat.startFailed", bayboErrorText(error))
@@ -247,7 +282,7 @@ final class AppStore: ObservableObject {
             return
         }
         Task {
-            await activateSession(sessionId)
+            await activateSession(sessionId, ensureListed: true)
         }
     }
 
@@ -261,9 +296,14 @@ final class AppStore: ObservableObject {
     /// Select the foreground session. The FFI transport keeps one global chat
     /// leg per binding; each opened session subscribes on that leg and keeps its
     /// sink registered for offscreen buffering.
-    private func activateSession(_ sessionId: String) async {
-        SessionIndex.shared.touch(sessionId: sessionId)
+    private func activateSession(_ sessionId: String, ensureListed: Bool) async {
+        if ensureListed {
+            SessionIndex.shared.touch(sessionId: sessionId)
+        }
         _ = chatStore(for: sessionId)
+        // A conversation always belongs to the Chats section — backing out of it
+        // must land on the list, whatever tab launched the compose/push.
+        homeTab = .chats
         chatPath = [sessionId]
     }
 

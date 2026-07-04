@@ -86,13 +86,20 @@ final class SessionIndex: ObservableObject {
     /// for existence — a local row missing remotely was hidden/deleted from
     /// another client — and for row fields, unless the local row saw activity
     /// after the remote snapshot (a just-sent message racing the refetch).
+    /// Empty remote rows that this device has never listed are draft sessions:
+    /// keep them out of the chat list until a send records local activity, or
+    /// the gateway reports user-authored preview text.
     func merge(remote: [ChatSessionSummary]) {
         var merged: [SessionRow] = []
         let local = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
         for summary in remote {
+            let mine = local[summary.sessionId]
+            let hasRemotePreview = !(summary.lastUserText ?? "").isEmpty
+            guard mine != nil || hasRemotePreview || summary.pinned else { continue }
+
             let createdAt = Self.parseDate(summary.createdAt)
             let lastActive = Self.parseDate(summary.lastActive)
-            if let mine = local[summary.sessionId], mine.lastActive > lastActive {
+            if let mine, mine.lastActive > lastActive {
                 merged.append(
                     SessionRow(
                         id: summary.sessionId, createdAt: createdAt,

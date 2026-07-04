@@ -14,6 +14,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Cargo may inherit a global `RUSTC_WRAPPER=sccache`; in iOS build contexts that
+# wrapper can fail before rustc starts with "Operation not permitted".
+export RUSTC_WRAPPER=
+
 PROFILE=debug
 CARGO_FLAGS=()
 SIM_ONLY=0

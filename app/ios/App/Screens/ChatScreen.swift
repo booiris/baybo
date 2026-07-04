@@ -74,7 +74,6 @@ struct ChatScreen: View {
         .background(Theme.paper)
         .onAppear {
             bridge.attach()
-            SessionIndex.shared.touch(sessionId: store.sessionId)
             store.connectIfNeeded()
             #if DEBUG
                 store.startDemoFramesIfRequested()

@@ -1,34 +1,34 @@
 import SwiftUI
 
-/// Home: the chat list. Local-first — rows render from the device's
-/// `SessionIndex` instantly (both legs); a direct binding refreshes it from
-/// REST on appear, on foreground, and by pull. Rows push a `ChatScreen` onto
-/// the NavigationStack; compose mints a session and enters it.
+/// The Chats section: the chat list, the root of the Chats tab's
+/// NavigationStack. Local-first — rows render from the device's `SessionIndex`
+/// instantly (both legs); a direct binding refreshes it from REST on appear, on
+/// foreground, and by pull. Rows push a `ChatScreen`; the header's compose
+/// button (top-right) mints a session and enters it.
 struct ChatListScreen: View {
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject private var index = SessionIndex.shared
     @ObservedObject private var lang = Lang.shared
     @Environment(\.scenePhase) private var scenePhase
-    @State private var confirmLogout = false
-    /// Transient compose/refresh failure line (localized, already resolved).
+    /// Transient compose-failure line (localized, already resolved).
     @State private var notice: String?
 
-    /// Clearance for the overlaid header: bar height + a breath.
+    /// Clearance for the overlaid header: bar height + a breath. (The native tab
+    /// bar's bottom inset is handled by the system, so no bottom margin here.)
     private static let topContentMargin: CGFloat = 58
 
     var body: some View {
         ZStack(alignment: .top) {
-            if index.sorted.isEmpty {
-                emptyState
-            } else {
-                sessionList
+            Group {
+                if index.sorted.isEmpty {
+                    emptyState
+                } else {
+                    sessionList
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            ListHeaderView(
-                notice: notice,
-                onLogout: { confirmLogout = true },
-                onCompose: compose
-            )
+            HomeHeaderView(notice: notice, onCompose: compose)
         }
         .background(Theme.paper)
         .task {
@@ -37,16 +37,6 @@ struct ChatListScreen: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 Task { await refresh() }
-            }
-        }
-        .confirmationDialog(
-            Text(verbatim: Lang.shared.t("connected.logoutConfirm")),
-            isPresented: $confirmLogout, titleVisibility: .visible
-        ) {
-            Button(role: .destructive) {
-                Task { await appStore.logout() }
-            } label: {
-                Text(verbatim: Lang.shared.t("connected.logout"))
             }
         }
     }
@@ -128,6 +118,7 @@ struct SessionRowView: View {
     let justNow: String
 
     private static let justNowThreshold: TimeInterval = 5
+    private static let absoluteTimeThreshold: TimeInterval = 24 * 60 * 60
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -158,80 +149,20 @@ struct SessionRowView: View {
         justNow: String,
         relativeTo now: Date = Date()
     ) -> String {
-        if now.timeIntervalSince(date) < Self.justNowThreshold {
+        let elapsed = now.timeIntervalSince(date)
+        if elapsed < Self.justNowThreshold {
             return justNow
+        }
+        if elapsed >= Self.absoluteTimeThreshold {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: locale)
+            let sameYear = Calendar.current.isDate(date, equalTo: now, toGranularity: .year)
+            formatter.setLocalizedDateFormatFromTemplate(sameYear ? "Mdjm" : "yMdjm")
+            return formatter.string(from: date)
         }
         let formatter = RelativeDateTimeFormatter()
         formatter.locale = Locale(identifier: locale)
         formatter.unitsStyle = .short
         return formatter.localizedString(for: date, relativeTo: now)
-    }
-}
-
-/// The list's paper-veil header, mirroring the chat header's grammar: centered
-/// wordmark, flanking glass circles — logout left (it moved here from the chat
-/// screen; leaving the account lives one level up now), compose right.
-struct ListHeaderView: View {
-    let notice: String?
-    let onLogout: () -> Void
-    let onCompose: () -> Void
-
-    private static let barHeight: CGFloat = 46
-
-    var body: some View {
-        VStack(spacing: 6) {
-            ZStack {
-                // The landing wordmark, header-scaled.
-                Text(verbatim: "Baybo")
-                    .font(Theme.mono(17))
-                    .textCase(.uppercase)
-                    .kerning(5)
-                    .padding(.leading, 5)
-                    .foregroundStyle(Theme.ink)
-
-                HStack {
-                    Button(action: onLogout) {
-                        Image(systemName: "rectangle.portrait.and.arrow.right")
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundStyle(Theme.ink)
-                            .frame(width: 42, height: 42)
-                    }
-                    .glassEffect(.regular.interactive(), in: .circle)
-                    .accessibilityLabel(Text(verbatim: Lang.shared.t("connected.logout")))
-
-                    Spacer()
-
-                    Button(action: onCompose) {
-                        Image(systemName: "square.and.pencil")
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundStyle(Theme.ink)
-                            .frame(width: 42, height: 42)
-                    }
-                    .glassEffect(.regular.interactive(), in: .circle)
-                    .accessibilityLabel(Text(verbatim: Lang.shared.t("list.newChat")))
-                }
-            }
-            .padding(.horizontal, 24)
-            .frame(height: Self.barHeight)
-
-            if let notice {
-                Text(verbatim: notice)
-                    .font(Theme.mono(12))
-                    .foregroundStyle(Theme.err)
-                    .padding(.horizontal, 24)
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .background(alignment: .top) { veil }
-    }
-
-    /// The chat header's veil, reused: solid through the status bar, easing to
-    /// clear at the bar's bottom so rows ghost past underneath.
-    private var veil: some View {
-        LinearGradient(
-            stops: ChatHeaderView.veilStops, startPoint: .top, endPoint: .bottom
-        )
-        .ignoresSafeArea(edges: .top)
-        .allowsHitTesting(false)
     }
 }

@@ -85,11 +85,28 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 
 ## Architecture notes
 
-- **Navigation**: the chat LIST is home (`AppStore.Route.home` holds a
-  `NavigationStack` — `ChatListScreen` root, `ChatScreen` pushed via
-  `chatPath`). No session is minted at launch or login; the compose button is
-  the only session creator. Both screens hide the system nav bar (custom
-  chrome), which disables UIKit's interactive pop — `PopGestureEnabler`
+- **Navigation**: the home shell (`AppStore.Route.home`) is `HomeTabView`, a
+  NATIVE iOS 26 `TabView(selection: $homeTab)` (Liquid Glass tab bar) with four
+  sections (Agents · Works · Chats · Settings, `AppStore.HomeTab`). Only `chats`
+  (`ChatListScreen`) and `settings` (`SettingsScreen` — language, version, log
+  out) have real screens; `agents`/`works` are `PlaceholderScreen`. An OUTER
+  `NavigationStack(path: $chatPath)` in `RootView` WRAPS the whole TabView;
+  opening a session pushes `ChatScreen` over the ENTIRE shell (tab bar
+  included), so the bar reveals together with the pop transition. (Do NOT move
+  the stack inside the Chats tab and hide the bar with `.toolbar(.hidden, for:
+  .tabBar)` — that reappears the bar abruptly AFTER the pop, the "bar missing
+  then pops in" glitch.) No session is minted at launch or login; the compose button —
+  the Chats header's top-right glass circle — is the only session creator, and
+  compose / push-tap routing force `homeTab = .chats` (in `activateSession`) so
+  a pushed conversation lands in the Chats stack. `.tint(Theme.ink)` colours the
+  selected tab item ink (the HIG blesses a monochromatic tab bar); the selection
+  capsule is the system Liquid Glass material — no public API recolours it and
+  none is wanted (neutral glass, no forced blue). Compose is NOT in the tab bar:
+  the native bar is for navigation not actions (HIG) and exposes no slot for a
+  custom button — an earlier custom glass pill bar (with a separate compose
+  circle) was dropped for exactly this, to get the native selection morph. The
+  `ChatScreen` still hides the system nav bar (custom chrome), which disables
+  UIKit's interactive pop — `PopGestureEnabler`
   (attached to ChatScreen) re-enables the edge-swipe back with a root +
   in-flight-transition guard, hands the delegate back on disappear, and
   clamps `velocityInView:` (dynamic subclass, `PopVelocityClamp`) so iOS 26's
@@ -165,10 +182,15 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   interrupted by more work settles into the block as a prose step. Markdown
   links post `openUrl` to native (system browser) — an in-webview navigation
   would replace the thread.
-- **Headless UI verification**: launch with `-baybo-open-chat
-  -baybo-demo-frames` (DEBUG) to feed one canned turn (thinking → tool →
-  streamed markdown → finalize) through the real bridge — screenshot the sim
-  at ~3s/~6s/~12s. `-baybo-demo-jump` scrolls the log off the newest edge at
+- **Headless UI verification**: `-baybo-open-home` (DEBUG) lands on the tabbed
+  home shell WITHOUT pushing a conversation (seeds a few demo list rows), so
+  the menu bar / header / sections screenshot headlessly; add `-baybo-home-tab
+  <agents|works|chats|settings>` to preselect a section. `-baybo-demo-tabs`
+  cycles the tab selection on a timer so the native Liquid Glass tab morph is
+  recordable (`simctl io recordVideo` + ffmpeg montage). Launch with
+  `-baybo-open-chat -baybo-demo-frames` (DEBUG) to feed one canned turn
+  (thinking → tool → streamed markdown → finalize) through the real bridge —
+  screenshot the sim at ~3s/~6s/~12s. `-baybo-demo-jump` scrolls the log off the newest edge at
   4s (native glass jump button pops) and runs the native jump path at 7s.
   `-baybo-demo-keyboard` raises the keyboard 2s in and drops
   it at 5s (record with `simctl io recordVideo`, extract frames with ffmpeg);
@@ -178,10 +200,23 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   `simctl install`.
 - **Send path**: native mints the msgId, seeds the webview's optimistic bubble
   + echo-dedup FIRST, then enqueues on the leg.
-- **Liquid Glass (iOS 26)**: the chat composer dock and the jump-to-latest
-  button are the ONLY glass surfaces — a recorded deviation from the
-  `app/mobile/CLAUDE.md` flat-monochrome system, which still governs
-  everything else. The composer is ONE ChatGPT-style glass pill (inline plus
+- **Liquid Glass (iOS 26)**: the bottom tab bar is the NATIVE `TabView` Liquid
+  Glass bar — its selection-capsule morph (the glass that slides + stretches
+  between tabs) is the SYSTEM's, and getting that authentic morph is exactly why
+  the custom bar was dropped. Kept monochrome via `.tint(Theme.ink)` (ink
+  selected item, neutral system-glass capsule, no accent hue); tab icons are
+  thin line SF Symbols (`sparkles`/`square.grid.2x2`/`bubble.left.and.bubble
+  .right`/`gearshape`). The remaining CUSTOM glass surfaces are the chat composer
+  dock, the jump-to-latest button, and the Chats header's compose circle
+  (`square.and.pencil`) — a recorded deviation from the `app/mobile/CLAUDE.md`
+  flat-monochrome system, which still governs everything else. History (see git
+  log, don't re-tread): a custom glass pill bar was built first — `matchedGeometry`
+  chip → then a `GlassEffectContainer`+`glassEffectID` morph (which cross-faded on
+  far hops and threw a red chromatic fringe) → then a single sliding-`.position`
+  lozenge with a drag gel-stretch; none matched the native selection stretch, so
+  we went native `TabView` (the native bar can't host the separate compose action
+  circle — HIG: tab bar is navigation, not actions — so compose moved to the
+  Chats header top-right). The composer is ONE ChatGPT-style glass pill (inline plus
   picker on the left, in-field ink send circle on the right; at rest it holds
   a moderate width, and focus stretches it toward the screen edges — a small
   gutter stays — on the keyboard's beat). Constraints: white tint only, no

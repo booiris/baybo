@@ -19,16 +19,18 @@ struct RootView: View {
                     LandingView()
                 }
             case .home:
-                // The chat list is home; a session rides the path. Both screens
-                // draw their own chrome, so the system bar stays hidden — the
-                // interactive pop gesture that hiding disables is re-enabled by
-                // ChatScreen's PopGestureEnabler.
+                // Home is the native TabView shell wrapped in ONE NavigationStack:
+                // a pushed ChatScreen covers the whole shell (tab bar included),
+                // so backing out reveals the bar together with the pop transition
+                // instead of popping it back in afterward. The system nav bar
+                // stays hidden (custom chrome); ChatScreen's PopGestureEnabler
+                // re-enables the edge-swipe pop that hiding disables.
                 NavigationStack(path: $store.chatPath) {
-                    ChatListScreen()
+                    HomeTabView()
                         .toolbar(.hidden, for: .navigationBar)
                         .navigationDestination(for: String.self) { sessionId in
                             ChatScreen(store: store.chatStore(for: sessionId))
-                                .id(sessionId) // a new session gets a fresh webview
+                                .id(sessionId)  // a new session gets a fresh webview
                                 .toolbar(.hidden, for: .navigationBar)
                                 .navigationBarBackButtonHidden(true)
                         }
