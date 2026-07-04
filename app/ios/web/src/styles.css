@@ -76,6 +76,13 @@ button {
   flex-direction: column;
   gap: 0.5rem;
   padding: var(--thread-top-inset) 1.25rem calc(var(--thread-bottom-inset) + 4rem);
+  /* Fill from the TOP down. A fresh chat's first message rises to the top and
+     the reply streams below it; any thread shorter than the screen is
+     top-aligned with the empty space BELOW the last row (not above the first).
+     flex-start IS the flex default, but pin it explicitly — this replaced a
+     `:first-child{margin-top:auto}` bottom-hug and must not silently regress.
+     Once content overflows one screen the follow-bottom pin leads as usual. */
+  justify-content: flex-start;
 }
 /* Native reports the bottom obstruction only at keyboard-animation ENDPOINTS
    (SwiftUI geometry callbacks don't stream interpolated layout), so the web
@@ -88,10 +95,6 @@ button {
 /* No visible scrollbar on the (document) scroller — the native-app feel. */
 html { scrollbar-width: none; }
 html::-webkit-scrollbar { display: none; }
-/* Short threads hug the bottom edge: the first row's auto top margin absorbs
-   the leftover flex space, so there's no void below the last bubble. Once
-   content overflows the margin resolves to 0 and scrolling behaves as normal. */
-.chat-log > :first-child { margin-top: auto; }
 
 /* Chat MESSAGE bodies read as Inter sans (comfortable long-read); the chrome
    stays monospace. Soft uniform rounded bubbles, hairline outlined. */
