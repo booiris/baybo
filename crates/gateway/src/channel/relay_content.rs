@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use super::blob_content::run_blob_over_relay;
+use super::api_tunnel::run_api_tunnel_over_relay;
 use super::device_content::run_content_over_relay;
 use super::state::{LegDedup, WsChannelState};
 use remote_host_protocol::key_tag;
@@ -479,12 +479,12 @@ async fn run_once(
 }
 
 /// Dial a content data leg for `relay_key` and run the responder for its `class`:
-/// the Noise chat content session ([`LegClass::Chat`]) or the blob sub-protocol
-/// ([`LegClass::Blob`]). `ah_rx` delivers this task's own
+/// the Noise chat content session ([`LegClass::Chat`]) or the API tunnel
+/// ([`LegClass::Api`] / [`LegClass::Blob`]). `ah_rx` delivers this task's own
 /// [`AbortHandle`](tokio::task::AbortHandle) (sent by the spawner), which the
 /// session registers in the matching device-dedup registry once it resolves the
-/// `device_id` — chat and blob use *separate* registries so a blob leg never
-/// aborts the chat leg.
+/// `device_id`. Blob legs are not deduped; concurrent transfers are bounded by
+/// the relay connection cap.
 async fn open_data_leg(
     state: &WsChannelState,
     relay_url: &str,
@@ -530,13 +530,13 @@ async fn open_data_leg(
         "relay-content: data leg established"
     );
     match class {
-        // Blob legs run **concurrently** — one per transfer — so they are NOT
-        // deduped: a second blob transfer for the same device must not abort the
-        // first. Concurrency is bounded by the relay's per-key connection cap.
-        // (The leg's own AbortHandle oneshot goes unused; drop it.)
-        LegClass::Blob => {
+        // Tunnel legs are one-shot request/response legs, so they are NOT
+        // deduped. Concurrent tunnel transfers are bounded by the relay's
+        // per-key connection cap. (The leg's own AbortHandle oneshot goes unused;
+        // drop it.)
+        LegClass::Api | LegClass::Blob => {
             drop(ah_rx);
-            run_blob_over_relay(ws, state).await;
+            run_api_tunnel_over_relay(ws, state).await;
         }
         // Chat dedups to one live leg per device: learn our own AbortHandle (sent
         // right after spawn) so a fresh leg aborts a stale predecessor; if it never

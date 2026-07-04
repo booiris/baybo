@@ -287,8 +287,9 @@ can read it on-device.
 
 ## Attachments
 
-Mobile attachments use dedicated relay blob legs rather than the chat leg. The
-blob path, token gate, bandwidth class, and upload quota are documented in
+Mobile attachments use dedicated relay blob legs rather than the chat leg, with
+blob bytes carried as API tunnel requests over those background legs. The blob
+path, token gate, bandwidth class, and upload quota are documented in
 [`blob-transfer.md`](blob-transfer.md).
 
 ## Status & open items

@@ -4,17 +4,20 @@
 //! It runs in the Tauri shell's `src-tauri` (reached from the webview via Tauri
 //! commands) and speaks the exact same protocol as the gateway by depending on
 //! the same crates — [`wire`] for the `Frame` wire types and
-//! [`device_proto`] for XXpsk0 pairing, Noise content/blob legs, and the AEAD
+//! [`device_proto`] for XXpsk0 pairing, Noise content/API legs, and the AEAD
 //! push-preview framing. No FFI, no
 //! Tauri, no platform APIs here, so it is fully host-unit-testable and
 //! cross-compiles to `aarch64-apple-ios` unchanged.
 
-pub mod blob;
+pub mod api_tunnel;
 pub mod content;
 pub mod error;
 pub mod pairing;
 
-pub use blob::{BlobDownload, BlobRequest, BlobResponse, BlobSession, DownloadStep};
+pub use api_tunnel::{
+    ApiTunnelSession, MAX_TUNNEL_CHUNK, TunnelHeader, TunnelRequest, TunnelResponse,
+    blob_id_sha256_hex,
+};
 pub use content::{
     ContentHandshake, ContentSession, WEB_OPERATOR_USER_ID, apns_token_frame, fetch_history_frame,
     register_http_frame, subscribe_frame, user_message_frame, user_text_frame,

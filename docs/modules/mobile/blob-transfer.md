@@ -10,12 +10,13 @@ Implemented pieces:
   `remote-host/crates/relay/src/bandwidth.rs`);
 - `x-relay-leg-class` plumbing and connection-cap reserve
   (`remote-host/crates/{protocol,relay}`);
-- the gateway blob responder for download/upload with `BlobStore::open_at`,
-  per-blob size enforcement, and content-hash validation
-  (`crates/gateway/src/channel/blob_content.rs`, `crates/store`, `crates/storage`);
-- the shared sub-protocol (`crates/device-proto/src/blob.rs`);
-- the mobile Rust/Tauri/TS client (`app/mobile/core/src/blob.rs`,
-  `app/mobile/src-tauri/src/blob.rs`, `app/mobile/src/blob.ts`).
+- the gateway API tunnel blob responder, backed by the same blob service used by
+  `/v1/blobs` for range download, per-blob size enforcement, and content-hash
+  validation (`crates/gateway/src/channel/{api_tunnel,blob_service,blobs}.rs`,
+  `crates/store`, `crates/storage`);
+- the shared tunnel protocol (`crates/device-proto/src/api_tunnel.rs`);
+- the mobile Rust/Tauri/TS client (`app/mobile/core/src/api_tunnel.rs`,
+  `app/mobile/src-tauri/src/relay/blob.rs`, `app/mobile/src/blob.ts`).
 
 There is deliberately no background blob sweeper and no
 `BlobStore::purge_older_than`: device-uploaded blobs are durable. The upload
@@ -139,10 +140,11 @@ No new routes. The phone declares a leg's class on its existing `/content/join` 
 new header:
 
 ```
-x-relay-leg-class: chat | blob        (RELAY_LEG_CLASS_HEADER; default chat when absent/unparseable)
+x-relay-leg-class: chat | api | blob  (RELAY_LEG_CLASS_HEADER; default chat when absent/unparseable)
 ```
 
-The phone owns the join, so the phone authors the class. `content_join_handler`
+The phone owns the join, so the phone authors the class. `api` and `blob` both route to the
+gateway API tunnel; `api` is interactive, while `blob` is background. `content_join_handler`
 (`remote-host/crates/relay/src/serve.rs:532`) reads it and stores `(server_id, class)` as
 the value of `pending_content_legs`. It threads the class into the control signal,
 and recovers it on the gateway-side host leg
@@ -159,38 +161,40 @@ cannot cross the per-key wall.
 `ControlSignal::OpenDataLeg` gains a `class` field (or a sibling `OpenBlobLeg{relay_key}`):
 
 ```rust
-ControlSignal::OpenDataLeg { relay_key: String, class: LegClass }   // LegClass = Chat | Blob
+ControlSignal::OpenDataLeg { relay_key: String, class: LegClass }   // LegClass = Chat | Api | Blob
 ```
 
 Flow (mirrors content): phone dials `/content/join/{relay_node_id}` with
 `x-relay-leg-class: blob` → C mints `relay_key`, records `(relay_node_id, Blob)` in
 `pending_content_legs`, calls `signal_open(relay_node_id, relay_key, Blob)` which pushes the
 signal down the gateway's cap-exempt `/control` connection → gateway dials
-`/content/host/{relay_key}` and runs the **blob sub-protocol** (not the chat loop) → C
-splices by `relay_key` and meters both legs `Background`.
+`/content/host/{relay_key}` and runs the **API tunnel blob responder** (not the chat loop)
+→ C splices by `relay_key` and meters both legs `Background`.
 
-### The blob sub-protocol
+### The API tunnel blob protocol
 
 After the identical Noise IK responder handshake (`device_content.rs:83-115`; device auth =
-`lookup_approved_by_pubkey`), the leg runs a small request/response loop — **not**
-`run_inbound_loop` / `wire::Frame`. Each logical message is Noise-sealed through the same
-`write_chunked` / `FrameReassembler` chunking as chat
+`lookup_approved_by_pubkey`), the leg runs `device_proto::api_tunnel` — **not**
+`run_inbound_loop` / `wire::Frame`. Each logical tunnel message is MessagePack-encoded and
+Noise-sealed through the same `write_chunked` / `FrameReassembler` chunking as chat
 (`crates/device-proto/src/noise.rs`, `≤ NOISE_MAX_MESSAGE = 65535`). One transfer per leg,
-so no per-message multiplexing is needed; `request_id` is kept only to correlate a resume.
+so no per-message multiplexing is needed; `request_id` correlates the head/body/error
+messages for the in-flight request.
 
 ```
-phone → gw   BlobPull  { request_id, blob_id, offset }            // download / resume
-gw → phone   BlobChunk { request_id, offset, data(≤64 KiB), last }
-gw → phone   BlobDone  { request_id, total_size, sha256_hex } | BlobErr { reason }
+phone → gw   Head { method: "GET", path: "/v1/blobs/{blob_id}", Range? }
+gw → phone   Head { status: 200|206, Content-Length, Content-Type }
+gw → phone   Body { offset, data(≤60 KiB), last } | Error { status, reason }
 
-phone → gw   BlobPush      { request_id, mime, size, sha256_hex, filename? }   // upload
-gw → phone   BlobPushGrant { request_id, resume_offset } | BlobErr
-phone → gw   BlobChunk     { request_id, offset, data, last }
-gw → phone   BlobPushDone  { request_id, blob_id }
+phone → gw   Head { method: "POST", path: "/v1/blobs",
+                    Content-Type, Content-Length, x-baybo-content-sha256 }
+phone → gw   Body { offset, data(≤60 KiB), last }
+gw → phone   Head { status: 201, Content-Type: application/json }
+gw → phone   Body { data: {"blob_id": "..."} }
 ```
 
-64 KiB chunks seal to ~one Noise message, comfortably under the relay's 128 KiB frame cap
-(`serve.rs:61`).
+60 KiB chunks seal to ~one Noise message with MessagePack + Noise overhead, comfortably
+under the relay's 128 KiB frame cap (`serve.rs:61`).
 
 ### Bandwidth: chat-priority background class
 
@@ -301,9 +305,8 @@ bypasses `stat()` has zero token enforcement.**
 A device only ever learns a full token-bearing `blob_id` over its **own authenticated chat
 leg** (the agent Noise-seals a `Frame::Attachment` to it). It cannot guess another blob's
 token, so it cannot pull a blob it was never sent — identical to how the existing
-`GET /v1/blobs/{id}` authorizes on the token alone (`blobs.rs:238-268`, which doesn't even
-take an `authed`). Defense-in-depth: the blob leg also requires a Noise-IK-approved device
-row to exist at all.
+`GET /v1/blobs/{id}` authorizes on the token alone through the shared blob service.
+Defense-in-depth: the blob leg also requires a Noise-IK-approved device row to exist at all.
 
 **Critical implementation constraint.** `BlobStore::open_at(blob_id, offset)` **must
 re-enter `stat()` before opening `blob_path(hex)` and seeking**. The obvious
@@ -322,8 +325,8 @@ rejects `AuthedClient::Device`, `blobs.rs`) only behind these bounds (Adversaria
 - **Per-blob size cap:** `put_stream`'s incremental `max_bytes` caps a single blob at
   100 MiB (`MAX_BLOB_BYTES`). There is no per-device aggregate quota on this leg, and
   device-uploaded blobs are durable (no LRU/age-based delete).
-- **Integrity:** `BlobDone.sha256_hex` / the claimed push hash must equal the **hex prefix**
-  of the content-addressed `blob_id` (split on `.`), not the whole id.
+- **Integrity:** `x-baybo-content-sha256` must equal the **hex prefix** of the
+  content-addressed `blob_id` (split on `.`), not the whole id.
 
 **Deferred (needs extra `BlobStore` surface):** a global disk ceiling (for example a
 `total_bytes` method) and a reference-tied-lifetime sweep of unreferenced device uploads.
@@ -334,9 +337,9 @@ The companion is a Tauri app (`app/mobile/`): a Rust core that runs the Noise IK
 **initiator**, and a TS/React UI.
 
 - **Rust core:** a blob-leg client that dials `/content/join` with `x-relay-leg-class: blob`,
-  runs the Noise IK initiator and the blob sub-protocol, writes `BlobChunk`s to a temp file
-  at `offset`, verifies `sha256` against the requested `blob_id` hex on `BlobDone`, and
-  resumes by re-`BlobPull`ing from `temp_file_len` after a drop.
+  runs the Noise IK initiator and the API tunnel protocol, writes response `Body` chunks to
+  a temp file at `offset`, verifies `sha256` against the requested `blob_id` hex, and resumes
+  by reissuing `GET /v1/blobs/{id}` with `Range: bytes=<temp_file_len>-` after a drop.
 - **TS/React:** `useBlobDownload` / `useBlobUpload` hooks; `MessageAttachment` renders an
   image/file once downloaded (spinner + retry); send-with-attachment uploads first, then
   embeds the returned `blob_id` in the outgoing `Message`.

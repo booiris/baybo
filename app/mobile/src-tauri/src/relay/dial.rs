@@ -55,11 +55,12 @@ pub(super) fn ws_error_detail(e: &WsError) -> String {
 }
 
 /// Dial the blind relay's content-join leg for this pairing's `relay_node_id`,
-/// retrying a transient `503` for a bounded window. `leg_class` tags the leg's class
-/// header — `Some(LegClass::Blob)` meters it as background bandwidth and steers the
-/// gateway's blob sub-protocol; `None` is the default chat class. Returns the raw
-/// socket; the caller runs the leg's Noise handshake over it. Errors are prose (each
-/// caller stringifies or wraps them for its own error surface).
+/// retrying a transient `503` for a bounded window. `leg_class` tags the leg's
+/// class header — `Api` and `Blob` both steer the gateway's API tunnel, while
+/// `Blob` also meters as background bandwidth; `None` is the default chat class.
+/// Returns the raw socket; the caller runs the leg's Noise handshake over it.
+/// Errors are prose (each caller stringifies or wraps them for its own error
+/// surface).
 pub(super) async fn dial_content_join(
     record: &PairedRecord,
     leg_class: Option<LegClass>,

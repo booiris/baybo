@@ -329,9 +329,9 @@ impl BayboClient {
     }
 
     /// Upload a picked image's raw bytes over the active binding's blob
-    /// transport. Relay seals + chunks over a dedicated E2E blob leg; direct
-    /// POSTs to plain `/v1/blobs` (channel token). Returns the content-addressed
-    /// `blob_id` to reference in the next message.
+    /// transport. Relay sends `POST /v1/blobs` over a dedicated E2E API tunnel
+    /// blob leg; direct POSTs to plain `/v1/blobs` (channel token). Returns the
+    /// content-addressed `blob_id` to reference in the next message.
     pub async fn blob_upload_bytes(
         self: Arc<Self>,
         bytes: Vec<u8>,
@@ -348,9 +348,10 @@ impl BayboClient {
     }
 
     /// Fetch an attachment `blob_id` for display over the active binding's blob
-    /// transport, returning the verified bytes. Relay downloads over a dedicated
-    /// E2E blob leg into a content-addressed on-device cache (reused on the next
-    /// render); direct GETs plain `/v1/blobs/{id}` (channel token).
+    /// transport, returning the verified bytes. Relay sends `GET /v1/blobs/{id}`
+    /// over a dedicated E2E API tunnel blob leg into a content-addressed
+    /// on-device cache (reused on the next render); direct GETs plain
+    /// `/v1/blobs/{id}` (channel token).
     pub async fn blob_image(self: Arc<Self>, blob_id: String) -> Result<Vec<u8>, BayboError> {
         let this = self;
         runtime::run(async move {

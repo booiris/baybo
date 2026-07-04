@@ -17,12 +17,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use baybo_model::ChannelType;
 use baybo_pairing::CheckOutcome;
-use baybo_store::StorageError;
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::Serialize;
 use tokio_util::io::ReaderStream;
 
+use super::blob_service::{self, BlobServiceError, MAX_BLOB_BYTES};
 use super::state::WsChannelState;
 use crate::auth::AuthedClient;
 
@@ -35,16 +35,8 @@ use crate::auth::AuthedClient;
 const HEADER_BOT_ID: &str = "x-baybo-bot-id";
 const HEADER_USER_ID: &str = "x-baybo-user-id";
 
-/// Hard cap on a single upload, matched against `DefaultBodyLimit`.
-/// Larger blobs would block the WS-paired connection's Tokio worker
-/// for the duration of a multi-second I/O — sidecars that need to
-/// transfer more than this should chunk on their side. Shared with the
-/// relay blob-leg upload path ([`super::blob_content`]).
-pub(crate) const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024;
-
-/// JSON returned on a successful upload. Mirrors the shape produced by
-/// `BlobStore::put`. Kept tiny by design — sidecars only need the id
-/// to embed in `WireAttachment`.
+/// JSON returned on a successful upload. Kept tiny by design — sidecars only
+/// need the id to embed in `WireAttachment`.
 #[derive(Debug, Serialize)]
 struct UploadResponse {
     blob_id: String,
@@ -187,7 +179,7 @@ async fn upload(
     let mime = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
+        .unwrap_or(blob_service::DEFAULT_BLOB_MIME)
         .to_owned();
 
     // Hand axum's body straight to the blob store as a `Stream<Bytes>`.
@@ -204,15 +196,25 @@ async fn upload(
         })
         .boxed();
 
-    match state
-        .blob_store
-        .put_stream(
-            stream,
-            &mime,
-            uploader_identity.as_deref(),
-            MAX_BLOB_BYTES as u64,
-        )
-        .await
+    let claimed_sha256 = match headers
+        .get(blob_service::HEADER_CONTENT_SHA256)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(value) => match blob_service::require_sha256_hex(Some(value)) {
+            Ok(value) => Some(value),
+            Err(err) => return service_error_response(err),
+        },
+        None => None,
+    };
+
+    match blob_service::put_upload(
+        state.blob_store.as_ref(),
+        stream,
+        &mime,
+        uploader_identity.as_deref(),
+        claimed_sha256.as_deref(),
+    )
+    .await
     {
         Ok(blob_ref) => (
             StatusCode::CREATED,
@@ -221,51 +223,49 @@ async fn upload(
             }),
         )
             .into_response(),
-        Err(StorageError::TooLarge { limit, actual }) => {
-            tracing::debug!(limit, actual, "blob upload exceeded cap");
-            (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("blob exceeds {limit}-byte cap"),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "blob upload persist failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "blob store failure").into_response()
-        }
+        Err(err) => service_error_response(err),
     }
 }
 
-async fn download(State(state): State<WsChannelState>, Path(blob_id): Path<String>) -> Response {
-    // `stat` first so missing rows surface as 404 before we hold a
-    // file handle; the open path itself also re-verifies, but ordering
-    // here lets us send Content-Length up front.
-    let meta = match state.blob_store.stat(&blob_id).await {
-        Ok(m) => m,
-        Err(StorageError::NotFound(_)) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, blob_id, "blob stat failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let reader = match state.blob_store.open(&blob_id).await {
-        Ok(r) => r,
-        Err(StorageError::NotFound(_)) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, blob_id, "blob open failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let body = Body::from_stream(ReaderStream::new(reader));
-    let mut response = (StatusCode::OK, body).into_response();
+async fn download(
+    State(state): State<WsChannelState>,
+    Path(blob_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let offset = blob_service::parse_range_start(
+        headers
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok()),
+    );
+    let download =
+        match blob_service::open_download(state.blob_store.as_ref(), &blob_id, offset).await {
+            Ok(download) => download,
+            Err(err) => return service_error_response(err),
+        };
+
+    let body = Body::from_stream(ReaderStream::new(download.reader));
+    let mut response = (download.status, body).into_response();
     let headers = response.headers_mut();
-    if let Ok(value) = HeaderValue::from_str(&meta.mime_type) {
+    if let Ok(value) = HeaderValue::from_str(&download.mime_type) {
         headers.insert(header::CONTENT_TYPE, value);
     }
-    if let Ok(value) = HeaderValue::from_str(&meta.size.to_string()) {
+    if let Ok(value) = HeaderValue::from_str(&download.body_len.to_string()) {
         headers.insert(header::CONTENT_LENGTH, value);
     }
+    if let Some(content_range) = download.content_range
+        && let Ok(value) = HeaderValue::from_str(&content_range)
+    {
+        headers.insert(header::CONTENT_RANGE, value);
+    }
     response
+}
+
+fn service_error_response(err: BlobServiceError) -> Response {
+    let status = err.status_code();
+    if status == StatusCode::NOT_FOUND {
+        return status.into_response();
+    }
+    (status, err.client_message()).into_response()
 }
 
 #[cfg(test)]

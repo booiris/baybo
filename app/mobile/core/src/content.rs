@@ -6,8 +6,9 @@
 //! static key, so it's near-0-RTT), then exchanges `Frame`s inside the
 //! authenticated, forward-secret transport: it sends a
 //! [`Frame::Subscribe`](wire::Frame::Subscribe) and decodes the replayed
-//! [`Frame::Message`](wire::Frame::Message) rows. C (the relay) sees only
-//! Noise ciphertext.
+//! [`Frame::Message`](wire::Frame::Message) rows. Dedicated API tunnel legs use
+//! the same Noise handshake and carry HTTP-shaped request/response messages
+//! instead of `wire::Frame`. C (the relay) sees only Noise ciphertext.
 //!
 //! Transport-agnostic and host-testable: the Tauri shell pumps the opaque bytes
 //! over the relay WebSocket; the crypto is entirely [`device_proto`] and the
@@ -49,14 +50,16 @@ impl ContentHandshake {
         })
     }
 
-    /// Like [`finish`](Self::finish), but finalize into a [`BlobSession`](crate::blob::BlobSession)
-    /// for a **blob leg** — the same Noise IK handshake, then the blob
-    /// sub-protocol instead of the `Frame` loop. The leg is dialed with the
-    /// `x-relay-leg-class: blob` header so the relay meters it as background.
-    pub fn finish_blob(mut self, reply: &[u8]) -> Result<crate::blob::BlobSession, MobileError> {
+    /// Like [`finish`](Self::finish), but finalize into an API tunnel session.
+    /// Blob transfers dial this leg with `x-relay-leg-class: blob` so the relay
+    /// meters the opaque traffic as background.
+    pub fn finish_api_tunnel(
+        mut self,
+        reply: &[u8],
+    ) -> Result<crate::api_tunnel::ApiTunnelSession, MobileError> {
         let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
         self.state.read_message(reply, &mut buf)?;
-        Ok(crate::blob::BlobSession::new(
+        Ok(crate::api_tunnel::ApiTunnelSession::new(
             self.state.into_transport_mode()?,
         ))
     }

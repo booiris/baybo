@@ -17,7 +17,7 @@
 //!   AAD) matches Apple CryptoKit's `ChaChaPoly.SealedBox`, so the iOS
 //!   Notification Service Extension decrypts a preview natively with no Rust.
 //! - [`noise`] — the Noise (`snow`) IK session both sides run for post-pairing
-//!   content and blob legs.
+//!   content and API tunnel legs.
 //! - [`pairing`] — the wire messages swapped during the pairing handshake
 //!   (the `DeviceHello` body, routing, push registration, confirm decision).
 //! - [`fixtures`] — pinned cross-language test vectors the iOS NSE's Swift
@@ -28,7 +28,7 @@
 //! same protocol.
 
 pub mod aead;
-pub mod blob;
+pub mod api_tunnel;
 pub mod delegation;
 pub mod error;
 pub mod fixtures;
