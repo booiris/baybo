@@ -16,6 +16,8 @@ struct ComposerView: View {
     @State private var pickerItem: PhotosPickerItem?
     @FocusState private var focused: Bool
 
+    private static let inputHitSlop: CGFloat = 10
+
     private var hasDraft: Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !staged.isEmpty
     }
@@ -63,6 +65,14 @@ struct ComposerView: View {
                     .font(.system(size: 17))
                     .focused($focused)
                     .padding(.vertical, 13)
+                    .background {
+                        Color.clear
+                            .padding(-Self.inputHitSlop)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                focused = true
+                            }
+                    }
 
                 Button {
                     send()
