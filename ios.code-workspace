@@ -9,8 +9,7 @@
     "rust-analyzer.cargo.features": [],
     "rust-analyzer.linkedProjects": [
       "Cargo.toml",
-      "remote-host/Cargo.toml",
-      "app/mobile/Cargo.toml"
+      "remote-host/Cargo.toml"
     ]
   }
 }
