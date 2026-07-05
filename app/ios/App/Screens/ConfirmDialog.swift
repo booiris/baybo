@@ -20,6 +20,7 @@ struct ConfirmDialog: View {
     /// and would cancel a dialog the user never saw (haptic fires, nothing
     /// appears, the trigger reads as dead). The card's buttons are never gated.
     @State private var scrimArmed = false
+    @State private var pulse = false
 
     private static let scrimGraceMs = 400
 
@@ -48,7 +49,11 @@ struct ConfirmDialog: View {
                 .ignoresSafeArea()
                 .contentShape(Rectangle())
                 .onTapGesture {
-                    if scrimArmed { onCancel() }
+                    if scrimArmed {
+                        onCancel()
+                    } else {
+                        acknowledgeEarlyTap()
+                    }
                 }
                 .transition(.opacity)
 
@@ -57,6 +62,21 @@ struct ConfirmDialog: View {
         .task {
             try? await Task.sleep(for: .milliseconds(Self.scrimGraceMs))
             scrimArmed = true
+        }
+    }
+
+    /// An unarmed scrim tap is deliberately not a cancel, but it must not be
+    /// silent either: a light haptic acknowledges the touch, and a brief card
+    /// pulse points at the button row (the pulse alone would leave the Reduce
+    /// Motion cohort with the exact dead-trigger feel this dialog exists to
+    /// prevent — haptics are not motion, so the tick stays).
+    private func acknowledgeEarlyTap() {
+        Haptics.tap()
+        guard !reduceMotion, !pulse else { return }
+        withAnimation(.spring(response: 0.18, dampingFraction: 0.5)) { pulse = true }
+        Task {
+            try? await Task.sleep(for: .milliseconds(160))
+            withAnimation(.easeOut(duration: 0.12)) { pulse = false }
         }
     }
 
@@ -107,6 +127,7 @@ struct ConfirmDialog: View {
         // Optical center: the dimmed tab bar weights the bottom edge, so a
         // geometrically centered card reads low.
         .offset(y: -12)
+        .scaleEffect(pulse ? 1.02 : 1)
         .accessibilityAddTraits(.isModal)
         .accessibilityAction(.escape, onCancel)
         .transition(

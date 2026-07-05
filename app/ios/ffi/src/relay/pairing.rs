@@ -46,6 +46,13 @@ const DECLINE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// reply (a `msg2` that never arrives).
 const HANDSHAKE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the accept path waits for the sealed `GatewayWelcome`. Generous
+/// because the gateway-side operator may still need to confirm (human latency),
+/// but bounded so a dead relay/gateway can't pin `pair_confirm` — and with it
+/// the app's busy flag, which freezes the confirm screen — open forever.
+/// Dropping the socket on timeout makes the gateway's side abort cleanly.
+const WELCOME_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The one warn every missed push-delegation step shares (see [`finish_pair`]) —
 /// pairing reports success, so this line is the only trace that pushes for the
 /// device were never provisioned.
@@ -391,7 +398,10 @@ async fn finish_pair(
         return Err("pairing cancelled".into());
     }
 
-    let paired = match recv(ws).await? {
+    let welcome = tokio::time::timeout(WELCOME_TIMEOUT, recv(ws))
+        .await
+        .map_err(|_| "pairing timed out waiting for the gateway's welcome".to_string())??;
+    let paired = match welcome {
         PairFrame::Sealed { msg } => client.on_welcome(&msg).map_err(|e| e.to_string())?,
         // The operator declined in the window between our accept and the welcome.
         PairFrame::Reject { reason } => {

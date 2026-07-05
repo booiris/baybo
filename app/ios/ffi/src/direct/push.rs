@@ -67,6 +67,7 @@ pub async fn register(
     let params: PushParams = http
         .client()
         .get(http.url("/v1/push/params"))
+        .timeout(super::REST_REPLY_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("push params: {e}"))?
@@ -104,6 +105,7 @@ pub async fn register(
         .client()
         .post(http.url("/v1/push/register"))
         .json(&body)
+        .timeout(super::REST_REPLY_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("push register: {e}"))?

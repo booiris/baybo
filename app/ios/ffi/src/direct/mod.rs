@@ -16,6 +16,8 @@ pub(crate) use blob::download_blob_bytes;
 pub(crate) use chat::forget;
 pub(crate) use push::register as register_push;
 
+use std::time::Duration;
+
 use parking_lot::Mutex;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
@@ -29,6 +31,19 @@ use crate::transport::SessionRegistry;
 /// boundary. A code, not prose, so reworded errors can't silently change the
 /// contract.
 pub(crate) const INVALID_TOKEN_CODE: &str = "invalid_token";
+
+/// TCP/TLS connect budget for the shared REST/blob client: a black-holed
+/// gateway address must fail the dial instead of pinning `login` (and the UI's
+/// busy flag) open until the OS gives up. Matches the WS dial budget
+/// (`transport::CONNECT_TIMEOUT`).
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Whole-request budget for the small JSON calls that gate UI state — the
+/// login `/v1/status` probe and push params/register. Applied at those call
+/// sites only, NOT on the client or in the `GatewayJsonClient` impl: blob
+/// transfers and the transcript history/catch-up pages share the pool and may
+/// legitimately outlive any sane fixed cap on a slow link.
+const REST_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) use device_proto::DEVICE_ID_HEADER;
 
 /// Persisted direct-connection credentials. Serialized to JSON in the keychain;
@@ -221,6 +236,7 @@ impl DirectHttpCache {
         headers.insert(HeaderName::from_static(DEVICE_ID_HEADER), device);
         let client = reqwest::Client::builder()
             .default_headers(headers.clone())
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .build()
             .map_err(|e| format!("build direct HTTP client: {e}"))?;
         Ok(Self {
@@ -295,6 +311,7 @@ pub(crate) async fn login(
         .http
         .client()
         .get(cached.http.url("/v1/status"))
+        .timeout(REST_REPLY_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("could not reach Baybo: {e}"))?;

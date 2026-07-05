@@ -470,9 +470,12 @@ final class ChatStore: ObservableObject {
         Task {
             do {
                 let bytes = try await Baybo.client.blobDownloadBytes(blobId: blobId)
-                bridge?.blobResult(
-                    id: id, dataBase64: bytes.base64EncodedString(),
-                    mimeType: sniffBlobMimeType(bytes), error: nil)
+                // Encode off the main actor: base64 of a large blob (up to
+                // 100 MiB) would stall every tap for seconds.
+                let (encoded, mime) = await Task.detached(priority: .userInitiated) {
+                    (bytes.base64EncodedString(), Self.sniffBlobMimeType(bytes))
+                }.value
+                bridge?.blobResult(id: id, dataBase64: encoded, mimeType: mime, error: nil)
             } catch {
                 bridge?.blobResult(
                     id: id, dataBase64: nil, mimeType: "", error: bayboErrorText(error))
@@ -482,7 +485,7 @@ final class ChatStore: ObservableObject {
 
     /// Cheap magic-byte sniff so the webview can build a typed Blob; the exact
     /// subtype only matters for the object URL, so `image/*` fallbacks are fine.
-    private func sniffBlobMimeType(_ data: Data) -> String {
+    private nonisolated static func sniffBlobMimeType(_ data: Data) -> String {
         if data.starts(with: [0xFF, 0xD8, 0xFF]) { return "image/jpeg" }
         if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "image/png" }
         if data.starts(with: [0x47, 0x49, 0x46]) { return "image/gif" }
