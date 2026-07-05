@@ -39,6 +39,14 @@ final class TranscriptBridge: NSObject, ObservableObject {
     }
 
     func detach() {
+        // Flush the web side's debounced transcript mirror before the webview
+        // can tear down. Frames delivered while attached go straight to the
+        // webview (never the native buffer), so any work steps rendered since
+        // the last debounce would otherwise be in neither the mirror nor the
+        // buffer — and a same-session re-entry has no reconnect to backfill them
+        // from the server, so they'd drop out of the work block. The pop
+        // animation keeps the webview alive long enough for this to land.
+        call("flushPersist", "")
         store?.detachBridge(self)
     }
 

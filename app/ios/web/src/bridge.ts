@@ -35,6 +35,11 @@ type BayboGlobal = {
   setLanguage(lang: string): void;
   setBottomInset(px: number): void;
   jumpToLatest(): void;
+  /// Native invokes this just before it detaches the bridge (back-out) so the
+  /// debounced transcript mirror is written up to that instant — otherwise
+  /// steps delivered live since the last debounce sit in neither the mirror nor
+  /// the native frame buffer and vanish from the work block on re-entry.
+  flushPersist(): void;
 };
 
 declare global {
@@ -297,5 +302,8 @@ window.baybo = {
   },
   jumpToLatest() {
     dispatch({ kind: "jumpToLatest" });
+  },
+  flushPersist() {
+    flushPersist();
   },
 };

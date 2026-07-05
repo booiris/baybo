@@ -110,14 +110,37 @@ function isStableWorkId(id: string): boolean {
   return /^w\d+$/.test(id);
 }
 
-/// Restored rows re-enter with any live-turn state stripped: an "active" work
-/// block can't still be running after a relaunch, and an empty one has nothing
-/// to show. Unknown roles from a future persist format are dropped.
+/// Restored rows re-enter with live-turn state INTACT: a work block that was
+/// live at persist stays live ("working"), because exiting and re-entering
+/// mid-turn — or before the agent's final reply — must NOT collapse it to
+/// "worked". The buffered continuation frames extend that same block (keeping
+/// its real `startedAt`), and only its terminal reply / turn-end closes it with
+/// a real "Worked Xs". A block that persisted already-closed stays closed.
+/// Empty blocks have nothing to show; unknown future roles are dropped. Also
+/// folds back together any turn a pre-fix mirror split into two work cards.
 function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
   const out: Row[] = [];
   for (const r of rows ?? []) {
     if (r.role === "work") {
-      if (Array.isArray(r.steps) && r.steps.length > 0) out.push({ ...r, active: false });
+      if (!Array.isArray(r.steps) || r.steps.length === 0) continue;
+      // Heal a mirror already split by the old re-entry bug: a work block that
+      // never closed cleanly (no elapsedMs) directly followed by another work
+      // block is ONE turn torn in two — a healthy turn always has a message
+      // between its block and the next. Fold the pieces into one card, staying
+      // "working" if either half was still live (a turn with no final reply must
+      // not read as "worked"); the split's real duration was lost, so it stays
+      // untimed.
+      const prev = out[out.length - 1];
+      if (prev && prev.role === "work" && prev.elapsedMs === undefined) {
+        out[out.length - 1] = {
+          ...prev,
+          steps: [...prev.steps, ...r.steps],
+          active: prev.active || r.active,
+          elapsedMs: undefined,
+        };
+      } else {
+        out.push({ ...r });
+      }
     } else if (r.role === "user" || r.role === "assistant" || r.role === "notice") {
       // A send still "sending" when we persisted can't be in flight after a
       // relaunch (the leg is gone) — drop the stale spinner. A "failed" state is
@@ -512,6 +535,9 @@ export function Transcript({
   const withOpenWork = useCallback((mutate: (row: WorkRow) => WorkRow) => {
     setMessages((rows) => {
       const last = rows[rows.length - 1];
+      // A restored live block stays `active`, so a re-entry's buffered
+      // continuation extends THIS block (keeping its real startedAt) instead of
+      // opening a second one.
       if (last && last.role === "work" && last.active) {
         return [...rows.slice(0, -1), mutate(last)];
       }
