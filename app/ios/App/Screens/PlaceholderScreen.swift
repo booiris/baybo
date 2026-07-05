@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// A not-yet-built home section (Agents / Works): a centered line icon over the
+/// A not-yet-built home section (Agents / Projects): a centered line icon over the
 /// section title and a quiet "coming soon" line. Monochrome, flat — a calm
 /// placeholder until the real screen lands.
 struct PlaceholderScreen: View {

@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// The bound app's home: a NATIVE iOS 26 `TabView` (Liquid Glass tab bar) over
-/// four sections — Agents · Works · Chats · Settings. Only Chats and Settings
-/// have real screens; Agents/Works are placeholders. The chat push lives on the
+/// four sections — Agents · Projects · Chats · Settings. Only Chats and Settings
+/// have real screens; Agents/Projects are placeholders. The chat push lives on the
 /// OUTER `NavigationStack` in `RootView` that WRAPS this TabView, so a pushed
 /// `ChatScreen` covers the whole shell (tab bar included) and both slide back
 /// together on pop — an inner-stack `.toolbar(.hidden, for: .tabBar)` instead
@@ -44,7 +44,7 @@ struct HomeTabView: View {
             ChatListScreen()
         case .settings:
             section { SettingsScreen() }
-        case .agents, .works:
+        case .agents, .projects:
             section { PlaceholderScreen(icon: tab.icon, titleKey: tab.labelKey) }
         }
     }
@@ -63,7 +63,7 @@ struct HomeTabView: View {
         /// switch is recordable headlessly (`simctl io recordVideo` + ffmpeg).
         private func demoTabCycleIfRequested() async {
             guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-tabs") else { return }
-            let order: [AppStore.HomeTab] = [.chats, .agents, .settings, .works, .agents, .chats]
+            let order: [AppStore.HomeTab] = [.chats, .agents, .settings, .projects, .agents, .chats]
             while !Task.isCancelled {
                 for tab in order {
                     try? await Task.sleep(for: .milliseconds(1000))
@@ -81,8 +81,8 @@ extension AppStore.HomeTab {
     var icon: String {
         switch self {
         case .agents: return "sparkles"
-        case .works: return "square.grid.2x2"
-        case .chats: return "bubble.left.and.bubble.right"
+        case .projects: return "square.stack.3d.up"
+        case .chats: return "message"
         case .settings: return "gearshape"
         }
     }
@@ -90,7 +90,7 @@ extension AppStore.HomeTab {
     var labelKey: String {
         switch self {
         case .agents: return "home.tab.agents"
-        case .works: return "home.tab.works"
+        case .projects: return "home.tab.projects"
         case .chats: return "home.tab.chats"
         case .settings: return "home.tab.settings"
         }

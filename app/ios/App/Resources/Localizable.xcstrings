@@ -545,19 +545,19 @@
         }
       }
     },
-    "home.tab.works" : {
+    "home.tab.projects" : {
       "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Works"
+            "value" : "Projects"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "作品"
+            "value" : "项目"
           }
         }
       }

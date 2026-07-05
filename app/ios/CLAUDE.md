@@ -87,9 +87,9 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 
 - **Navigation**: the home shell (`AppStore.Route.home`) is `HomeTabView`, a
   NATIVE iOS 26 `TabView(selection: $homeTab)` (Liquid Glass tab bar) with four
-  sections (Agents · Works · Chats · Settings, `AppStore.HomeTab`). Only `chats`
+  sections (Agents · Projects · Chats · Settings, `AppStore.HomeTab`). Only `chats`
   (`ChatListScreen`) and `settings` (`SettingsScreen` — language, version, log
-  out) have real screens; `agents`/`works` are `PlaceholderScreen`. An OUTER
+  out) have real screens; `agents`/`projects` are `PlaceholderScreen`. An OUTER
   `NavigationStack(path: $chatPath)` in `RootView` WRAPS the whole TabView;
   opening a session pushes `ChatScreen` over the ENTIRE shell (tab bar
   included), so the bar reveals together with the pop transition. (Do NOT move
@@ -185,7 +185,7 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 - **Headless UI verification**: `-baybo-open-home` (DEBUG) lands on the tabbed
   home shell WITHOUT pushing a conversation (seeds a few demo list rows), so
   the menu bar / header / sections screenshot headlessly; add `-baybo-home-tab
-  <agents|works|chats|settings>` to preselect a section. `-baybo-demo-tabs`
+  <agents|projects|chats|settings>` to preselect a section. `-baybo-demo-tabs`
   cycles the tab selection on a timer so the native Liquid Glass tab morph is
   recordable (`simctl io recordVideo` + ffmpeg montage). Launch with
   `-baybo-open-chat -baybo-demo-frames` (DEBUG) to feed one canned turn
@@ -205,8 +205,8 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   between tabs) is the SYSTEM's, and getting that authentic morph is exactly why
   the custom bar was dropped. Kept monochrome via `.tint(Theme.ink)` (ink
   selected item, neutral system-glass capsule, no accent hue); tab icons are
-  thin line SF Symbols (`sparkles`/`square.grid.2x2`/`bubble.left.and.bubble
-  .right`/`gearshape`). The remaining CUSTOM glass surfaces are the chat composer
+  thin line SF Symbols (`sparkles`/`square.stack.3d.up`/`message`/
+  `gearshape`). The remaining CUSTOM glass surfaces are the chat composer
   dock, the jump-to-latest button, and the Chats header's compose circle
   (`square.and.pencil`) — a recorded deviation from the `app/mobile/CLAUDE.md`
   flat-monochrome system, which still governs everything else. History (see git
