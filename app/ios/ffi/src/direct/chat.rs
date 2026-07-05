@@ -63,7 +63,6 @@ impl ChatTransport for super::DirectSessions {
             Ok(Connection {
                 ws,
                 codec,
-                opening_best_effort: Vec::new(),
                 user_frame,
             })
         }

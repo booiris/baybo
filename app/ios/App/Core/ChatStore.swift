@@ -50,6 +50,7 @@ final class ChatStore: ObservableObject {
     private var issuedGeneration = 0
     private var retryTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
+    private var catchUpTask: Task<Void, Never>?
     private var connectInFlight = false
     private weak var bridge: TranscriptBridge?
     private var bufferedFrames: [String] = []
@@ -75,6 +76,9 @@ final class ChatStore: ObservableObject {
         guard !connectInFlight else { return }
         retryTask?.cancel()
         retryTask = nil
+        catchUpTask?.cancel()
+        catchUpTask = nil
+        let sinceOrdinal = lastOrdinal
         connectInFlight = true
         if connState != .connected {
             connState = .connecting
@@ -88,7 +92,7 @@ final class ChatStore: ObservableObject {
             do {
                 try await Baybo.client.chatConnect(
                     sessionId: sessionId,
-                    sinceOrdinal: lastOrdinal,
+                    sinceOrdinal: sinceOrdinal,
                     sink: Sink(store: self, generation: gen)
                 )
                 guard gen >= generation else { return }  // superseded by disconnect
@@ -97,11 +101,29 @@ final class ChatStore: ObservableObject {
                 connEpoch += 1
                 connState = .connected
                 bridge?.setConnEpoch(connEpoch)
+                if let sinceOrdinal {
+                    fetchCatchUp(sinceOrdinal: sinceOrdinal, generation: gen)
+                }
             } catch {
                 guard gen >= generation else { return }
                 // The one place `offline` is set — a failed dial.
                 connState = .offline
                 scheduleRetry()
+            }
+        }
+    }
+
+    private func fetchCatchUp(sinceOrdinal: Int64, generation gen: Int) {
+        catchUpTask?.cancel()
+        catchUpTask = Task {
+            do {
+                let frame = try await Baybo.client.chatCatchUp(
+                    sessionId: sessionId, sinceOrdinal: sinceOrdinal)
+                guard !Task.isCancelled, gen >= generation else { return }
+                pushFrame(frame)
+            } catch {
+                guard !Task.isCancelled else { return }
+                NSLog("baybo: catchUp: %@", bayboErrorText(error))
             }
         }
     }
@@ -140,6 +162,8 @@ final class ChatStore: ObservableObject {
         retryTask = nil
         debounceTask?.cancel()
         debounceTask = nil
+        catchUpTask?.cancel()
+        catchUpTask = nil
         // Mute every sink, including one handed to a dial still in flight.
         issuedGeneration += 1
         generation = issuedGeneration
@@ -233,13 +257,14 @@ final class ChatStore: ObservableObject {
     func fetchHistory(beforeOrdinal: Int64?, limit: UInt32) {
         Task {
             do {
-                try await Baybo.client.chatFetchHistory(
+                let frame = try await Baybo.client.chatFetchHistory(
                     sessionId: sessionId, beforeOrdinal: beforeOrdinal, limit: limit)
+                pushFrame(frame)
             } catch {
                 NSLog("baybo: fetchHistory: %@", bayboErrorText(error))
                 // The web bundle's paging/reset guards armed for this request
                 // must unwind; a synthesized frame rides the ordered frame path
-                // (the old invoke() rejection played this role).
+                // just like a successful native history fetch.
                 let payload: [String: Any] = [
                     "kind": "history_failed",
                     "error": bayboErrorText(error),

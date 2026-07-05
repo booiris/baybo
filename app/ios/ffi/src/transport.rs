@@ -35,7 +35,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::api::FrameSink;
-use crate::core::{Frame, MobileError, WireAttachment, fetch_history_frame, subscribe_frame};
+use crate::core::{Frame, MobileError, WireAttachment, subscribe_frame};
 
 /// The concrete client socket both legs dial.
 pub(crate) type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -114,17 +114,12 @@ pub(crate) trait FrameCodec: Send {
 /// across the spawn. Args are `(session_id, text, msg_id, attachments)`.
 pub(crate) type UserFrameFn = Box<dyn Fn(&str, &str, &str, Vec<WireAttachment>) -> Frame + Send>;
 
-/// A live, handshaken leg ready to pump: the socket, its frame codec, best-effort
-/// opening frames (APNs for relay), and the outbound frame builder. The initial
-/// and later `Subscribe` frames are ordinary outbound commands so one socket can
-/// carry many sessions.
+/// A live, handshaken leg ready to pump: the socket, its frame codec, and the
+/// outbound frame builder. The initial and later `Subscribe` frames are ordinary
+/// outbound commands so one socket can carry many sessions.
 pub(crate) struct Connection {
     pub ws: WsStream,
     pub codec: Box<dyn FrameCodec>,
-    /// Best-effort opening frames (e.g. the relay's APNs token refresh): an encode
-    /// failure is skipped, not fatal — a transient failure to refresh push must not
-    /// kill an otherwise-healthy session. A send failure is still fatal (socket gone).
-    pub opening_best_effort: Vec<Frame>,
     pub user_frame: UserFrameFn,
 }
 
@@ -153,13 +148,6 @@ enum OutboundCmd {
         text: String,
         msg_id: String,
         attachments: Vec<WireAttachment>,
-    },
-    /// A backward transcript-history request. The reply (`Frame::HistoryPage`)
-    /// arrives later through the normal inbound fan-out, not as a direct response.
-    FetchHistory {
-        session_id: String,
-        before_ordinal: Option<i64>,
-        limit: Option<u32>,
     },
 }
 
@@ -370,33 +358,6 @@ impl SessionRegistry {
         }
     }
 
-    /// Queue a transcript-history request on the live session. The reply
-    /// (`Frame::HistoryPage`) streams back through the session's sink — there is
-    /// no synchronous return value (the page is consumed by the transcript's frame
-    /// switch, mirroring how `Subscribe` catch-up replays arrive).
-    pub(crate) async fn fetch_history(
-        &self,
-        session_id: String,
-        before_ordinal: Option<i64>,
-        limit: Option<u32>,
-    ) -> Result<(), TransportError> {
-        if !self.sinks.lock().await.contains_key(&session_id) {
-            return Err(TransportError::NotConnected);
-        }
-        if self
-            .try_enqueue(OutboundCmd::FetchHistory {
-                session_id,
-                before_ordinal,
-                limit,
-            })
-            .await?
-        {
-            Ok(())
-        } else {
-            Err(TransportError::NotConnected)
-        }
-    }
-
     /// Tear down the live pump (if any) and fence out any dial in flight: the
     /// epoch bump makes a slow establish discard its connection instead of
     /// resurrecting a session the owner just tore down.
@@ -413,8 +374,8 @@ impl SessionRegistry {
 
 /// A chat leg, seen as "the thing that owns a [`SessionRegistry`]". Exposing the
 /// registry through one trait lets the generic session fns below
-/// ([`connect`]/[`send`]/[`fetch_history`]/[`disconnect`]) drive either leg, so
-/// neither `RelaySessions` nor `DirectSessions` re-declares the same four
+/// ([`connect`]/[`send`]/[`disconnect`]) drive either leg, so
+/// neither `RelaySessions` nor `DirectSessions` re-declares the same
 /// delegating wrappers. Each leg is already a [`ChatTransport`], so the bound
 /// carries the `establish` seam the registry needs to open a session.
 pub(crate) trait SessionLeg: ChatTransport {
@@ -460,28 +421,13 @@ pub(crate) async fn send<L: SessionLeg>(
         .map_err(|e| e.to_string())
 }
 
-/// Queue a backward transcript-history request on `leg`'s live session. The
-/// `Frame::HistoryPage` reply streams back through the sink, so this returns once
-/// the request is enqueued, not the page.
-pub(crate) async fn fetch_history<L: SessionLeg>(
-    leg: &L,
-    session_id: String,
-    before_ordinal: Option<i64>,
-    limit: Option<u32>,
-) -> Result<(), String> {
-    leg.registry()
-        .fetch_history(session_id, before_ordinal, limit)
-        .await
-        .map_err(|e| e.to_string())
-}
-
 /// Tear down `leg`'s live pump (if any).
 pub(crate) async fn disconnect<L: SessionLeg>(leg: &L) {
     leg.registry().disconnect().await;
 }
 
-/// Own the socket for the binding's lifetime: send best-effort opening frames,
-/// then fan inbound frames to per-session sinks and seal outbound user messages.
+/// Own the socket for the binding's lifetime: fan inbound frames to per-session
+/// sinks and seal outbound user messages.
 /// The codec hides whether bytes are Noise-sealed (relay) or raw msgpack
 /// (direct), so this body is identical for both legs.
 ///
@@ -515,33 +461,9 @@ async fn run_pump(
     let Connection {
         ws,
         mut codec,
-        opening_best_effort,
         user_frame,
     } = conn;
     let (mut sink_ws, mut stream) = ws.split();
-
-    // Best-effort opening frames (the relay's APNs token refresh): skip on an encode
-    // failure rather than kill an otherwise-healthy session. A send failure is still
-    // the socket dying, so it stays fatal.
-    for frame in &opening_best_effort {
-        match codec.encode_outbound(frame) {
-            Ok(messages) => {
-                for bytes in messages {
-                    if let Err(e) = sink_ws.send(Message::Binary(bytes)).await {
-                        log::warn!(
-                            "chat connection start failed: opening frame send failed (apns_refresh): {e}"
-                        );
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "opening frame skipped: encode failed (apns_refresh; push binding may go stale): {e}"
-                );
-            }
-        }
-    }
 
     let liveness = tokio::time::sleep(INBOUND_LIVENESS_TIMEOUT);
     tokio::pin!(liveness);
@@ -624,12 +546,6 @@ async fn run_pump(
                     Some(OutboundCmd::Send { session_id, text, msg_id, attachments }) => {
                         let frame = user_frame(&session_id, &text, &msg_id, attachments);
                         (frame, format!("send session={session_id} msg_id={msg_id}"))
-                    }
-                    Some(OutboundCmd::FetchHistory { session_id, before_ordinal, limit }) => {
-                        (
-                            fetch_history_frame(&session_id, before_ordinal, limit),
-                            format!("fetch_history session={session_id}"),
-                        )
                     }
                     None => {
                         log::debug!(

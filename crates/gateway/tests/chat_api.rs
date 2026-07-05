@@ -17,7 +17,7 @@ use baybo_gateway::server::build_admin_router_for_tests;
 use baybo_gateway::test_support::build_test_deps;
 use baybo_model::{ChannelType, ChatMessage, ContentBlock, SessionId, User};
 use baybo_store::{DeviceRow, DeviceStatus};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -148,6 +148,124 @@ async fn chat_api_round_trip() {
             .iter()
             .any(|row| row["session_id"].as_str() == Some(session_id.as_str())),
         "session must show up again after unhide",
+    );
+}
+
+#[tokio::test]
+async fn chat_catch_up_api_returns_completed_work_before_reply() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+    let sid = SessionId::from(session_id.as_str());
+    let rows = [
+        ChatMessage::user(vec![ContentBlock::Text("run it".into())])
+            .with_platform_msg_id("client-msg-1"),
+        ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "c1".into(),
+            name: "Bash".into(),
+            input: json!({"command": "echo hi"}),
+            signature: None,
+        }]),
+        ChatMessage::tool_result("c1".to_owned(), "hi".to_owned()),
+        ChatMessage::assistant(vec![ContentBlock::Text("done".into())]),
+    ];
+    for msg in rows {
+        tg.deps
+            .session_manager
+            .append_session_message(&sid, &msg)
+            .await
+            .expect("append");
+    }
+
+    let catch_up = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/catch-up?since_ordinal=-1"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(catch_up["truncated"].as_bool(), Some(false));
+    let items = catch_up["items"].as_array().expect("items");
+    let kinds: Vec<&str> = items
+        .iter()
+        .map(|item| item["kind"].as_str().expect("kind"))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["message", "work", "message"],
+        "catch-up should interleave completed work before the final reply: {items:?}",
+    );
+    assert_eq!(items[0]["role"].as_str(), Some("user"));
+    assert_eq!(items[0]["content"].as_str(), Some("run it"));
+    assert_eq!(items[0]["platform_msg_id"].as_str(), Some("client-msg-1"));
+    assert_eq!(items[2]["role"].as_str(), Some("assistant"));
+    assert_eq!(items[2]["content"].as_str(), Some("done"));
+    assert_eq!(
+        items[1]["ordinal"].as_i64(),
+        items[2]["ordinal"].as_i64(),
+        "work item is keyed to the final reply ordinal",
+    );
+    let steps = items[1]["steps"].as_array().expect("work steps");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["kind"].as_str(), Some("tool"));
+    assert_eq!(steps[0]["tool"].as_str(), Some("Bash"));
+    assert_eq!(steps[0]["label"].as_str(), Some("echo hi"));
+    assert_eq!(steps[0]["status"].as_str(), Some("ok"));
+    assert_eq!(
+        catch_up["newest_ordinal"].as_i64(),
+        items[2]["ordinal"].as_i64(),
+        "cursor advances to the newest visible message row",
+    );
+}
+
+#[tokio::test]
+async fn chat_catch_up_cursor_does_not_skip_internal_rows_before_reply() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+    let sid = SessionId::from(session_id.as_str());
+    let rows = [
+        ChatMessage::user(vec![ContentBlock::Text("run it".into())]),
+        ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "c1".into(),
+            name: "Bash".into(),
+            input: json!({"command": "echo hi"}),
+            signature: None,
+        }]),
+        ChatMessage::tool_result("c1".to_owned(), "hi".to_owned()),
+    ];
+    for msg in rows {
+        tg.deps
+            .session_manager
+            .append_session_message(&sid, &msg)
+            .await
+            .expect("append");
+    }
+
+    let catch_up = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/catch-up?since_ordinal=-1"),
+        StatusCode::OK,
+    )
+    .await;
+    let items = catch_up["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "only the visible user row is returned");
+    assert_eq!(items[0]["kind"].as_str(), Some("message"));
+    assert_eq!(
+        catch_up["newest_ordinal"].as_i64(),
+        items[0]["ordinal"].as_i64(),
+        "cursor must not advance past internal tool rows needed to reconstruct the later final reply",
     );
 }
 
@@ -310,6 +428,46 @@ async fn admin_device_header_creates_and_lists_device_sessions() {
 }
 
 #[tokio::test]
+async fn device_apns_token_api_persists_registration() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_admin_router_for_tests(&tg.deps);
+    let device_key = device_proto::delegation::generate_signing_key();
+    let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/mobile/apns-token")
+                .header("authorization", format!("Bearer {}", tg.deps.admin_token))
+                .header(DEVICE_ID_HEADER, &device_id)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "apns_token": "new-token",
+                        "apns_env": "production",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let secret = tg
+        .deps
+        .secret_vault
+        .get_secret(&format!("device.{device_id}.apns"))
+        .await
+        .expect("vault read")
+        .expect("apns registration persisted");
+    let reg: Value = serde_json::from_slice(secret.as_bytes()).expect("registration json");
+    assert_eq!(reg["apns_token"].as_str(), Some("new-token"));
+    assert_eq!(reg["apns_env"].as_str(), Some("production"));
+}
+
+#[tokio::test]
 async fn approved_device_token_with_header_creates_device_session() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
@@ -374,6 +532,7 @@ fn build_admin_state(
         log_buffer: Arc::clone(&tg.deps.log_buffer),
         channel_bot_store: tg.deps.stores.channel_bot.clone(),
         channel_control: Arc::clone(&tg.deps.channel_control),
+        blob_store: tg.deps.stores.blob.clone(),
         secret_vault: Arc::clone(&tg.deps.secret_vault),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     }

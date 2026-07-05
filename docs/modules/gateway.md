@@ -614,6 +614,13 @@ tool loop is still found. See `docs/turn-progress-events.md` for the
 operator-only raw-tool-output disclosure and the message-only WS catch-up
 caveat.
 
+`GET /v1/chat/sessions/:id/catch-up?since_ordinal=N` is the forward reconnect
+companion for device clients. It scans active rows above the cursor with the
+same cap as WS replay, returns no partial slice when truncated, and interleaves
+closed `work` items immediately before the matching final-assistant `message`.
+The WS `Subscribe { since_ordinal }` path remains message-only; native merges
+this API result into the same transcript stream after subscribe.
+
 **Channel listener (loopback TCP, vault-issued tokens)** —
 `auth::channel::require_channel_auth`:
 

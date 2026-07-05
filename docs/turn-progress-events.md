@@ -91,13 +91,15 @@ Two consequences worth knowing:
   superset of what it saw live — so the thinking it missed while backgrounded
   reappears without a full reload. The **web** chat ignores the frame today (it
   recovers the same steps via the REST reload above). A turn that **completed**
-  while the client was away is recovered too: forward catch-up emits a
-  `Frame::WorkReplay` (a *closed* block) right before that turn's reply,
-  reconstructed from the persisted rows by
-  `api::admin::chat::reconstruct_catchup_work_steps` (the relay counterpart of
-  the REST `reconstruct_transcript` fold). Only the **backward** `FetchHistory`
-  paging path (scroll-up, and the post-`Reset` rebuild) stays message-only — a
-  turn can straddle a page boundary there (see the roadmap below).
+  while the client was away is recovered by the device forward catch-up API
+  (`GET /v1/chat/sessions/:id/catch-up`): it reconstructs closed work items
+  from persisted rows with
+  `api::admin::chat::reconstruct_catchup_work_steps` and native merges the
+  synthesized `catch_up` frame with the message-only WS replay. Only the native
+  **backward** history bridge (scroll-up, and the post-`Reset` rebuild) stays
+  message-only — it reads the chat API and maps message rows into a local
+  `history_page`, so a turn can straddle a page boundary there (see the roadmap
+  below).
 
 ## `TurnState`: the in-flight turn survives a late join
 
@@ -165,13 +167,13 @@ into the close edge — no special-case `TurnState` broadcast in the runner.
   rendering them. Other channels (e.g. the web UI) still consume `Reasoning`.
   See [`docs/modules/tui.md`](modules/tui.md#working-indicator--mid-turn-steering).
 - **Relay/iOS work recovery — remaining edges** — forward reconnect catch-up
-  now recovers both the in-flight (`WorkSnapshot`) and completed
-  (`WorkReplay`) work blocks. Still open: **backward `FetchHistory` paging**
-  (scroll-up + the post-`Reset` rebuild) stays message-only — reconstructing a
-  work block for a turn split across a page boundary needs page-spanning state
-  (or a server-side "reconstruct the whole visible window" pass like the REST
-  `get_session`); and an optional **silent-push pre-warm** to run catch-up
-  before the next foreground.
+  now recovers both in-flight work (`WorkSnapshot` on the chat stream) and
+  completed work (the device `catch-up` API merged with WS message replay).
+  Still open: the native **backward history API bridge** (scroll-up + the
+  post-`Reset` rebuild) stays message-only — reconstructing a work block for a
+  turn split across a page boundary needs page-spanning state (or exposing the
+  REST `get_session` work items directly); and an optional **silent-push
+  pre-warm** to run catch-up before the next foreground.
 - **Subagent → parent progress** — subagents run with `delta_tx = None`. Surfacing
   their progress to the parent ties into the planned `SubagentNotification` redesign.
 - **Fine-grained in-tool events** — forward a curated subset of `ToolEventSink`

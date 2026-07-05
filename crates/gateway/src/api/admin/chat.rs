@@ -9,6 +9,9 @@
 //!   (newest first). Hidden sessions are filtered out unless the
 //!   `include_hidden=true` query is set.
 //! * `GET /v1/chat/sessions/:id` — session detail + transcript history.
+//! * `GET /v1/chat/sessions/:id/catch-up` — forward reconnect catch-up for
+//!   device transcripts (`since_ordinal` → missed visible rows + completed work
+//!   blocks).
 //! * `DELETE /v1/chat/sessions/:id` — **hide** the session from the
 //!   chat list. The row and transcript stay live; admin / trace
 //!   surfaces still see it. Reversible via
@@ -31,7 +34,8 @@ use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use baybo_agent::actor::AgentMessage;
 use baybo_channels::wire::{
-    FolderChange, FolderView, SessionPatch, SlashCommandSpec, WireWorkStep, WireWorkStepKind,
+    AttachmentKind, FolderChange, FolderView, SessionPatch, SlashCommandSpec, WireAttachment,
+    WireWorkStep, WireWorkStepKind,
 };
 use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent};
 use baybo_model::{
@@ -56,6 +60,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(create_session))
         .routes(routes!(list_sessions))
         .routes(routes!(get_session))
+        .routes(routes!(catch_up_session))
         .routes(routes!(set_session_model))
         .routes(routes!(set_session_pin))
         .routes(routes!(set_session_folder))
@@ -92,6 +97,10 @@ pub const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// Hard cap so a misbehaving (or curious) client can't ask for the
 /// whole transcript by passing `limit=999999`.
 pub const MAX_HISTORY_LIMIT: usize = 200;
+/// Default page size for forward reconnect catch-up. Kept aligned with
+/// reverse history so one reconnect fills the same row budget as one reset
+/// refetch.
+pub const DEFAULT_CATCH_UP_LIMIT: usize = DEFAULT_HISTORY_LIMIT;
 
 /// Maximum length of the truncated preview the sidebar shows for each
 /// session. Sized to fit a 260px-wide sidebar row at the web client's
@@ -124,6 +133,20 @@ pub struct GetSessionQuery {
     pub before_ordinal: Option<i64>,
     /// Maximum rows to return. Defaults to
     /// [`DEFAULT_HISTORY_LIMIT`], clamped to [`MAX_HISTORY_LIMIT`].
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Query string for `GET /v1/chat/sessions/{session_id}/catch-up`. Forward-
+/// paginates the active transcript for reconnect merge: the response contains
+/// rows whose persisted ordinal is strictly greater than `since_ordinal`.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct CatchUpSessionQuery {
+    /// Newest durable ordinal the client has already rendered.
+    pub since_ordinal: i64,
+    /// Maximum rows to scan. Defaults to [`DEFAULT_CATCH_UP_LIMIT`], clamped to
+    /// [`MAX_HISTORY_LIMIT`]. If the gap is larger, the response is marked
+    /// `truncated` and carries no partial middle slice.
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -192,6 +215,11 @@ pub struct ChatTranscriptItem {
     /// `true` when this row had non-text content (image / audio /
     /// file). The web client currently shows a placeholder.
     pub has_attachments: bool,
+    /// Blob attachments for message items. This mirrors the chat WS attachment
+    /// shape so native clients can rebuild historical image/file bubbles from
+    /// the REST transcript.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ChatAttachment>,
     /// Wall-clock time the row was persisted, sourced from
     /// `session_messages.created_at`. Lets the client render a
     /// per-message timestamp without a second lookup. Live WS frames
@@ -221,6 +249,112 @@ pub struct ChatTranscriptItem {
     /// colors it the way the live frame did. `None` for `message` / `work` items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice_level: Option<String>,
+}
+
+/// A blob attachment embedded in a historical chat transcript item.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ChatAttachment {
+    pub kind: String,
+    pub blob_id: String,
+    pub mime_type: String,
+    pub size: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+}
+
+impl From<WireAttachment> for ChatAttachment {
+    fn from(att: WireAttachment) -> Self {
+        let kind = match att.kind {
+            AttachmentKind::Image => "image",
+            AttachmentKind::Audio => "audio",
+            AttachmentKind::File => "file",
+        };
+        Self {
+            kind: kind.to_owned(),
+            blob_id: att.blob_id,
+            mime_type: att.mime_type,
+            size: att.size,
+            filename: att.filename,
+        }
+    }
+}
+
+/// Discriminator for [`ChatCatchUpItem`] — serialized as
+/// `"message"` / `"work"`.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CatchUpItemKind {
+    Message,
+    Work,
+}
+
+/// One work step in the forward catch-up API. This intentionally mirrors
+/// `wire::WireWorkStep`'s JSON field names (not the REST transcript's
+/// `tool_label` / `tool_status` names) because the device transcript reuses the
+/// live `WorkSnapshot` renderer for catch-up work blocks.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatCatchUpWorkStep {
+    pub kind: WorkStepKind,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl From<WireWorkStep> for ChatCatchUpWorkStep {
+    fn from(step: WireWorkStep) -> Self {
+        let kind = match step.kind {
+            WireWorkStepKind::Reasoning => WorkStepKind::Reasoning,
+            WireWorkStepKind::Prose => WorkStepKind::Prose,
+            WireWorkStepKind::Tool => WorkStepKind::Tool,
+        };
+        Self {
+            kind,
+            text: step.text,
+            tool: step.tool,
+            label: step.label,
+            status: step.status,
+            summary: step.summary,
+        }
+    }
+}
+
+/// Forward reconnect item for native device clients. The sequence is ordered by
+/// persisted ordinal; a completed tool-using assistant reply appears as a
+/// `work` item followed by the matching `message` item with the same `ordinal`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatCatchUpItem {
+    pub kind: CatchUpItemKind,
+    pub ordinal: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub platform_msg_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ChatAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<ChatCatchUpWorkStep>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatCatchUpResponse {
+    pub items: Vec<ChatCatchUpItem>,
+    /// Newest visible message ordinal included in `items`. Internal tool /
+    /// thinking rows are deliberately not exposed as the cursor, because a
+    /// later final answer may still need them to reconstruct its completed work
+    /// block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_ordinal: Option<i64>,
+    /// True when the requested gap exceeds the catch-up cap. The client should
+    /// discard this partial answer and rebuild from the normal history API.
+    pub truncated: bool,
 }
 
 /// One reconstructed step inside a `work` transcript item — the durable
@@ -621,6 +755,7 @@ async fn get_session(
     // so the client can't infer these from the transcript — it gets them here).
     let oldest_ordinal = tail.first().map(|(o, _, _)| *o);
     let newest_ordinal = tail.last().map(|(o, _, _)| *o);
+    let attachment_map = transcript_attachments(&tail, state.blob_store.as_ref()).await;
     // Out-of-band control events (slash-command echoes + notices) live in their
     // own table; interleave those whose `after_ordinal` anchor falls within this
     // page. `upper` is the page's last row; `lower` is its first, except the
@@ -670,8 +805,13 @@ async fn get_session(
     } else {
         Vec::new()
     };
-    let transcript =
-        reconstruct_transcript(tail, control_events, active_turn_started, in_flight_steps);
+    let transcript = reconstruct_transcript_with_attachments(
+        tail,
+        control_events,
+        active_turn_started,
+        in_flight_steps,
+        &attachment_map,
+    );
     Ok(Json(ChatSessionDetail {
         session_id,
         created_at: session.created_at,
@@ -682,6 +822,78 @@ async fn get_session(
         oldest_ordinal,
         newest_ordinal,
         last_llm: session.state.last_llm.as_ref().map(|n| n.to_string()),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/chat/sessions/{session_id}/catch-up",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to catch up"),
+        CatchUpSessionQuery,
+    ),
+    responses(
+        (status = 200, description = "Forward transcript catch-up for device reconnect merge", body = ChatCatchUpResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn catch_up_session(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<CatchUpSessionQuery>,
+    authed: Option<Extension<AuthedClient>>,
+) -> Result<Json<ChatCatchUpResponse>> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, _session) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_CATCH_UP_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT);
+    let rows = state
+        .session_manager
+        .history_since(&sid, query.since_ordinal, limit + 1)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("load catch-up history: {e}")))?;
+    if rows.len() > limit {
+        return Ok(Json(ChatCatchUpResponse {
+            items: Vec::new(),
+            newest_ordinal: None,
+            truncated: true,
+        }));
+    }
+    let work_by_reply = reconstruct_catchup_work_steps(&rows);
+    let mut items = Vec::new();
+    let mut newest_ordinal = None;
+    for (ordinal, msg) in rows {
+        let Some(message) = catch_up_message_item(ordinal, msg, state.blob_store.as_ref()).await
+        else {
+            continue;
+        };
+        if let Some(steps) = work_by_reply.get(&ordinal) {
+            let steps = steps
+                .iter()
+                .cloned()
+                .map(ChatCatchUpWorkStep::from)
+                .collect();
+            items.push(ChatCatchUpItem {
+                kind: CatchUpItemKind::Work,
+                ordinal,
+                role: String::new(),
+                content: String::new(),
+                platform_msg_id: String::new(),
+                attachments: Vec::new(),
+                steps,
+            });
+        }
+        items.push(message);
+        newest_ordinal = Some(ordinal);
+    }
+    Ok(Json(ChatCatchUpResponse {
+        items,
+        newest_ordinal,
+        truncated: false,
     }))
 }
 
@@ -1480,6 +1692,65 @@ fn extract_text(content: &[ContentBlock]) -> String {
     text
 }
 
+async fn transcript_attachments(
+    rows: &[(i64, DateTime<Utc>, ChatMessage)],
+    blob_store: &dyn baybo_store::BlobStore,
+) -> HashMap<i64, Vec<ChatAttachment>> {
+    let mut attachments = HashMap::new();
+    for (ordinal, _created_at, msg) in rows {
+        if !msg.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Image { .. } | ContentBlock::Audio { .. } | ContentBlock::File { .. }
+            )
+        }) {
+            continue;
+        }
+        let (_text, wire_attachments) =
+            crate::channel::adapter::split_content(&msg.content, blob_store).await;
+        if !wire_attachments.is_empty() {
+            attachments.insert(
+                *ordinal,
+                wire_attachments
+                    .into_iter()
+                    .map(ChatAttachment::from)
+                    .collect(),
+            );
+        }
+    }
+    attachments
+}
+
+async fn catch_up_message_item(
+    ordinal: i64,
+    msg: ChatMessage,
+    blob_store: &dyn baybo_store::BlobStore,
+) -> Option<ChatCatchUpItem> {
+    let role = match msg.role {
+        Role::User if msg.from_user() => "user",
+        Role::Assistant => "assistant",
+        _ => return None,
+    };
+    if msg.role == Role::Assistant && msg.has_tool_use() {
+        return None;
+    }
+    let platform_msg_id = msg.platform_msg_id().to_string();
+    let (content, attachments) =
+        crate::channel::adapter::split_content(&msg.content, blob_store).await;
+    if content.is_empty() && attachments.is_empty() {
+        return None;
+    }
+    Some(ChatCatchUpItem {
+        kind: CatchUpItemKind::Message,
+        ordinal,
+        role: role.to_owned(),
+        content,
+        platform_msg_id,
+        attachments: attachments.into_iter().map(ChatAttachment::from).collect(),
+        steps: Vec::new(),
+    })
+}
+
 /// Fetch the most-recent user-authored text for `session_id` and shape it
 /// into the sidebar preview the list endpoint serves. Returns `None` when
 /// the session has no user turn, when that turn is media-only, or when the
@@ -1498,7 +1769,7 @@ async fn last_user_preview(
     // extracts the display text the same way the transcript does; the
     // ordinal it stamps is unused here.
     let (created_at, msg) = manager.last_user_message(session_id).await.ok().flatten()?;
-    let item = message_item(0, created_at, "user", &msg)?;
+    let item = message_item(0, created_at, "user", &msg, Vec::new())?;
     (!item.text.is_empty()).then(|| truncate_preview(&item.text))
 }
 
@@ -1544,6 +1815,7 @@ impl WorkAccumulator {
                 role: String::new(),
                 text: String::new(),
                 has_attachments: false,
+                attachments: Vec::new(),
                 created_at: started.unwrap_or_else(Utc::now),
                 steps: std::mem::take(&mut self.steps),
                 work_started_at: started,
@@ -1601,12 +1873,12 @@ fn in_flight_work_steps(events: Vec<SessionEvent>) -> Vec<ChatWorkStep> {
 
 /// Reconstruct each **completed** turn's collapsed work steps from a slice of
 /// persisted catch-up rows (ascending ordinal), keyed by the turn's reply
-/// `ordinal`. The relay `Frame::WorkReplay` counterpart of the web
-/// [`reconstruct_transcript`] work items — the same per-turn fold (thinking →
-/// reasoning, mid-turn text → prose, tool-use + paired tool-result → tool step)
-/// but producing wire steps, and none of the transcript-item / control-event /
-/// cancelled-timing machinery the REST path carries. A turn whose reply is off
-/// the slice, or that produced no steps, contributes nothing. `call_id` is left
+/// `ordinal`. This powers the forward catch-up API's mobile work items and is
+/// the narrow counterpart of the web [`reconstruct_transcript`] work fold:
+/// thinking → reasoning, mid-turn text → prose, tool-use + paired tool-result →
+/// tool step, without the transcript-item / control-event / cancelled-timing
+/// machinery the full REST history path carries. A turn whose reply is off the
+/// slice, or that produced no steps, contributes nothing. `call_id` is left
 /// unset — a completed turn has no live `ToolCompleted` to pair with.
 pub(crate) fn reconstruct_catchup_work_steps(
     rows: &[(i64, ChatMessage)],
@@ -1689,11 +1961,29 @@ pub(crate) fn reconstruct_catchup_work_steps(
     out
 }
 
+#[cfg(test)]
 fn reconstruct_transcript(
     tail: Vec<(i64, DateTime<Utc>, ChatMessage)>,
     control_events: Vec<ControlEvent>,
     active_turn_started: Option<DateTime<Utc>>,
     in_flight_steps: Vec<ChatWorkStep>,
+) -> Vec<ChatTranscriptItem> {
+    let attachments_by_ordinal = HashMap::new();
+    reconstruct_transcript_with_attachments(
+        tail,
+        control_events,
+        active_turn_started,
+        in_flight_steps,
+        &attachments_by_ordinal,
+    )
+}
+
+fn reconstruct_transcript_with_attachments(
+    tail: Vec<(i64, DateTime<Utc>, ChatMessage)>,
+    control_events: Vec<ControlEvent>,
+    active_turn_started: Option<DateTime<Utc>>,
+    in_flight_steps: Vec<ChatWorkStep>,
+    attachments_by_ordinal: &HashMap<i64, Vec<ChatAttachment>>,
 ) -> Vec<ChatTranscriptItem> {
     // Merge message rows and out-of-band control events into one ordinal-ordered
     // stream: a control event with `after_ordinal = N` sorts right after the row
@@ -1783,7 +2073,16 @@ fn reconstruct_transcript(
             Role::User if msg.from_user() => {
                 work.flush(&mut items, None);
                 turn_started = Some(created_at);
-                if let Some(item) = message_item(ordinal, created_at, "user", &msg) {
+                if let Some(item) = message_item(
+                    ordinal,
+                    created_at,
+                    "user",
+                    &msg,
+                    attachments_by_ordinal
+                        .get(&ordinal)
+                        .cloned()
+                        .unwrap_or_default(),
+                ) {
                     items.push(item);
                 }
             }
@@ -1866,7 +2165,16 @@ fn reconstruct_transcript(
                     work.cancelled = true;
                 }
                 work.flush(&mut items, Some(created_at));
-                if let Some(mut item) = message_item(ordinal, created_at, "assistant", &msg) {
+                if let Some(mut item) = message_item(
+                    ordinal,
+                    created_at,
+                    "assistant",
+                    &msg,
+                    attachments_by_ordinal
+                        .get(&ordinal)
+                        .cloned()
+                        .unwrap_or_default(),
+                ) {
                     if cancelled {
                         // Drop the model-facing cancelled-turn marker so the
                         // salvaged reply renders as clean partial output.
@@ -1945,6 +2253,7 @@ fn message_item(
     created_at: DateTime<Utc>,
     role: &str,
     msg: &ChatMessage,
+    attachments: Vec<ChatAttachment>,
 ) -> Option<ChatTranscriptItem> {
     let mut text = String::new();
     let mut has_attachments = false;
@@ -1971,6 +2280,7 @@ fn message_item(
         role: role.to_owned(),
         text,
         has_attachments,
+        attachments,
         created_at,
         steps: Vec::new(),
         work_started_at: None,
@@ -2000,6 +2310,7 @@ fn control_event_item(ev: ControlEvent) -> ChatTranscriptItem {
         role,
         text: ev.text,
         has_attachments: false,
+        attachments: Vec::new(),
         created_at: ev.created_at,
         steps: Vec::new(),
         work_started_at: None,
@@ -2802,10 +3113,10 @@ mod tests {
     #[test]
     fn message_item_skips_empty_keeps_text() {
         let only_tool = ChatMessage::assistant(vec![tool_use("c1", "X", serde_json::json!({}))]);
-        assert!(message_item(1, ts(1), "assistant", &only_tool).is_none());
+        assert!(message_item(1, ts(1), "assistant", &only_tool, Vec::new()).is_none());
 
         let multi = ChatMessage::assistant(vec![text("a"), text("b")]);
-        let item = message_item(1, ts(1), "assistant", &multi).expect("non-empty");
+        let item = message_item(1, ts(1), "assistant", &multi, Vec::new()).expect("non-empty");
         assert_eq!(item.text, "a\nb");
         assert!(!item.has_attachments);
     }

@@ -52,8 +52,9 @@ same request shape.
 
 ## Why not reuse chat frames?
 
-`Frame::Subscribe` and `Frame::FetchHistory` both require the client to already
-know a `session_id`. They cannot discover unknown sessions.
+`Frame::Subscribe` requires the client to already know a `session_id`. It cannot
+discover unknown sessions, and it is still a live-stream operation rather than a
+request/response API.
 
 `Frame::SessionUpdated` and `Frame::SessionActivity` could be extended as a
 metadata event stream, but that solves only "push known rows to the list". It
@@ -174,7 +175,7 @@ Native Swift code can then call typed wrappers:
 - `chat_get_session(session_id, before_ordinal, limit)`
 - `blob_upload_bytes(bytes, mime_type)`
 - `blob_download_bytes(blob_id)`
-- eventually, `update_apns_token(apns_token, apns_env)`
+- `update_apns_token(apns_token, apns_env)`
 
 Those wrappers hide whether the active binding is direct or relay.
 
@@ -199,10 +200,9 @@ Recommended initial allowlist:
 - `GET /v1/chat/sessions`
 - `GET /v1/chat/sessions/{session_id}`
 - `POST /v1/chat/sessions`
-- `POST /v1/chat/sessions/{session_id}/token` only if the relay path ever needs
-  channel-token compatibility, otherwise omit
 - `GET /v1/blobs/{blob_id}`
 - `POST /v1/blobs`
+- `POST /v1/mobile/apns-token`
 
 Defer these until the mobile UI actually needs them:
 
@@ -211,8 +211,6 @@ Defer these until the mobile UI actually needs them:
   it.
 - folder mutation endpoints
 - model pinning
-- `POST /v1/mobile/apns-token`, after the tunnel is stable enough to replace
-  the current `Frame::UpdateApnsToken` opening frame
 - cron-message/admin/status/analytics/config endpoints
 
 The tunnel must reject:
@@ -258,16 +256,16 @@ Open product question: should a paired phone also list the user's web/direct
 should make this policy explicit in one place rather than relying on the
 underlying REST endpoint's channel filter.
 
-## APNs token update migration
+## APNs token update
 
-`Frame::UpdateApnsToken` is an APNs-specific chat frame today. The app sends it as an
-opening best-effort frame on every relay content connect so the gateway can keep
-the paired device's APNs token fresh across reinstall, restore-from-backup, and
-Apple token rotation.
+APNs token refresh is a device API call, not a chat frame. The app sends it as a
+best-effort `POST /v1/mobile/apns-token` before relay preconnect / chat connect
+so the gateway can keep the paired device's APNs token fresh across reinstall,
+restore-from-backup, and Apple token rotation.
 
-Unlike `WorkSnapshot` or `WorkReplay`, this is not an ordered chat transcript
-event. It is an idempotent device-state update, so it is a good candidate for
-the API tunnel once the tunnel exists.
+Unlike `WorkSnapshot` or message catch-up, this is not an ordered chat
+transcript event. It is an idempotent device-state update, so it belongs on the
+API tunnel.
 
 Proposed tunneled shape:
 
@@ -278,29 +276,21 @@ POST /v1/mobile/apns-token
 
 Semantics:
 
-- relay mode calls this over an interactive API tunnel leg after launch,
-  foreground, pairing completion, and successful chat reconnect;
+- relay mode calls this over an interactive API tunnel leg before relay preconnect
+  and chat connect;
 - failures are logged at debug/info level and never fail chat connect;
 - the gateway authenticates the device through the tunnel's Noise IK principal,
   not through a bearer token in the body;
-- the handler updates the approved device row only when the token/env changed;
+- the handler persists the device APNs material under the same vault key pairing
+  uses;
 - re-registration with the remote push host remains gateway-owned and signed,
-  matching today's `UpdateApnsToken` path.
+  matching the former content-frame path.
 
-Migration path:
-
-1. Add the tunneled endpoint and gateway tests proving it updates the same
-   persisted fields and triggers the same re-registration behavior as today's
-   frame path.
-2. In the same migration change, cut APNs clients over to the tunneled request and remove
-   the opening best-effort `Frame::UpdateApnsToken` send from the relay chat
-   connection.
-3. Delete `Frame::UpdateApnsToken` and the pre-router special case that handles
-   it on the device content leg.
-
-Do not move work/progress recovery frames this way. `WorkSnapshot`,
-`WorkReplay`, `TurnState`, `Message`, and live reasoning/tool frames are ordered
-session-stream events and should stay on the chat frame stream.
+Do not move live work/progress frames this way. `WorkSnapshot`, `TurnState`,
+`Message`, and live reasoning/tool frames are ordered session-stream events and
+should stay on the chat frame stream. Completed work recovery is the exception:
+native calls `GET /v1/chat/sessions/:id/catch-up` after subscribe and merges
+that API result with the message-only WS catch-up.
 
 ## Blob migration
 
@@ -383,17 +373,13 @@ Do not remove:
    - `chat_list_sessions()` no longer errors on relay
    - `chat_create_session()` uses the same `POST /v1/chat/sessions` wrapper on
      direct and relay; relay reaches it over an API tunnel leg
-   - cut `UpdateApnsToken` over to the tunneled token update in the final APNs
-     migration change
+   - APNs refresh uses the tunneled `POST /v1/mobile/apns-token` wrapper
    - `blob_upload_bytes()` and `blob_download_bytes()` move as part of the blob cutover
 
 ## APNs token migration
 
-`Frame::UpdateApnsToken` remains on the chat content leg during the blob cutover.
-Do not dual-send it. After the blob protocol has been removed and the tunnel is
-stable, migrate APNs token refresh directly to a tunneled mobile endpoint such as
-`POST /v1/mobile/apns-token`, then remove the frame variant and gateway
-intercept in that APNs-specific change.
+Completed: APNs token refresh now uses `POST /v1/mobile/apns-token`; the
+content-leg frame and gateway intercept were removed.
 
 4. Keep `SessionIndex` as the list render source.
    - direct and relay both merge remote summaries into the local registry
@@ -420,7 +406,7 @@ Gateway tests:
 - the handler does not delete or mutate session rows during list refresh
 - device principal cannot call non-allowlisted admin endpoints
 - tunneled APNs token update persists the same device fields as
-  `Frame::UpdateApnsToken`
+  pairing-time APNs material
 - APNs token update failures do not fail chat reconnect
 - blob download refuses an invalid read token
 - blob upload enforces the size cap and deletes a mismatched content hash
@@ -466,11 +452,12 @@ Phase 4: harden and test tunnel coverage
 - cover blob digest mismatch, invalid read token, resume range, and upload cap
 - cover relay logs and bandwidth class behavior
 
-Phase 5: remove `Frame::UpdateApnsToken`
+Phase 5: APNs token refresh over API
 
-- add the tunneled `POST /v1/mobile/apns-token` endpoint
-- switch APNs clients to the tunneled request in the same change
-- remove the old opening frame and delete the APNs-specific `wire::Frame` variant
+- done: add the tunneled `POST /v1/mobile/apns-token` endpoint
+- done: switch APNs clients to the tunneled request
+- done: remove the old opening frame and delete the APNs-specific `wire::Frame`
+  variant
 
 ## Open questions
 

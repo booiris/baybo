@@ -168,6 +168,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/catch-up": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["catch_up_session"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/folder": {
         parameters: {
             query?: never;
@@ -488,6 +504,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/mobile/apns-token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["update_device_apns_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/push/params": {
         parameters: {
             query?: never;
@@ -716,12 +748,72 @@ export interface components {
             jobs: components["schemas"]["BackgroundJob"][];
         };
         /**
+         * @description Discriminator for [`ChatCatchUpItem`] — serialized as
+         *     `"message"` / `"work"`.
+         * @enum {string}
+         */
+        CatchUpItemKind: "message" | "work";
+        /**
          * @description Admin-surface mirror of [`baybo_model::ChannelType`]. Transparent
          *     wrapper around a snake_case string so the OpenAPI surface stays
          *     stable while the core type is open-ended (runtime-registered
          *     sidecars like `"slack"` pass through unchanged).
          */
         ChannelType: string;
+        /** @description A blob attachment embedded in a historical chat transcript item. */
+        ChatAttachment: {
+            blob_id: string;
+            filename?: string | null;
+            kind: string;
+            mime_type: string;
+            /** Format: int32 */
+            size: number;
+        };
+        /**
+         * @description Forward reconnect item for native device clients. The sequence is ordered by
+         *     persisted ordinal; a completed tool-using assistant reply appears as a
+         *     `work` item followed by the matching `message` item with the same `ordinal`.
+         */
+        ChatCatchUpItem: {
+            attachments?: components["schemas"]["ChatAttachment"][];
+            content: string;
+            kind: components["schemas"]["CatchUpItemKind"];
+            /** Format: int64 */
+            ordinal: number;
+            platform_msg_id?: string;
+            role?: string;
+            steps?: components["schemas"]["ChatCatchUpWorkStep"][];
+        };
+        ChatCatchUpResponse: {
+            items: components["schemas"]["ChatCatchUpItem"][];
+            /**
+             * Format: int64
+             * @description Newest visible message ordinal included in `items`. Internal tool /
+             *     thinking rows are deliberately not exposed as the cursor, because a
+             *     later final answer may still need them to reconstruct its completed work
+             *     block.
+             */
+            newest_ordinal?: number | null;
+            /**
+             * @description True when the requested gap exceeds the catch-up cap. The client should
+             *     discard this partial answer and rebuild from the normal history API.
+             */
+            truncated: boolean;
+        };
+        /**
+         * @description One work step in the forward catch-up API. This intentionally mirrors
+         *     `wire::WireWorkStep`'s JSON field names (not the REST transcript's
+         *     `tool_label` / `tool_status` names) because the device transcript reuses the
+         *     live `WorkSnapshot` renderer for catch-up work blocks.
+         */
+        ChatCatchUpWorkStep: {
+            kind: components["schemas"]["WorkStepKind"];
+            label?: string | null;
+            status?: string | null;
+            summary?: string | null;
+            text?: string;
+            tool?: string | null;
+        };
         /**
          * @description One entry in the cron-messages list. Each row corresponds to a
          *     distinct cron fire (cron creates a fresh session per trigger, so
@@ -862,6 +954,12 @@ export interface components {
          *     [`reconstruct_transcript`]).
          */
         ChatTranscriptItem: {
+            /**
+             * @description Blob attachments for message items. This mirrors the chat WS attachment
+             *     shape so native clients can rebuild historical image/file bubbles from
+             *     the REST transcript.
+             */
+            attachments?: components["schemas"]["ChatAttachment"][];
             /**
              * @description `true` when this `work` item belongs to a turn that was cancelled
              *     (e.g. `/stop`) rather than run to a normal reply — the client labels it
@@ -1466,6 +1564,13 @@ export interface components {
         UnsetConfigRequest: {
             path: string;
         };
+        /** @description Request body for `POST /v1/mobile/apns-token`. */
+        UpdateDeviceApnsTokenRequest: {
+            /** @description APNs environment: `"sandbox"` (debug / TestFlight) or `"production"`. */
+            apns_env: string;
+            /** @description The device's current APNs device token (hex). */
+            apns_token: string;
+        };
         UpdateFolderRequest: {
             /** @description New name (absent = unchanged). */
             name?: string | null;
@@ -2050,6 +2155,56 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    catch_up_session: {
+        parameters: {
+            query: {
+                /** @description Newest durable ordinal the client has already rendered. */
+                since_ordinal: number;
+                /**
+                 * @description Maximum rows to scan. Defaults to [`DEFAULT_CATCH_UP_LIMIT`], clamped to
+                 *     [`MAX_HISTORY_LIMIT`]. If the gap is larger, the response is marked
+                 *     `truncated` and carries no partial middle slice.
+                 */
+                limit?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description Session id to catch up */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Forward transcript catch-up for device reconnect merge */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatCatchUpResponse"];
+                };
             };
             /** @description Unauthorized */
             401: {
@@ -3139,6 +3294,46 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_device_apns_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateDeviceApnsTokenRequest"];
+            };
+        };
+        responses: {
+            /** @description Paired device APNs token refreshed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Persist failed */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

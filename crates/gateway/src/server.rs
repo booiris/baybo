@@ -44,7 +44,7 @@ use axum::middleware;
 use baybo_security::SecretVault;
 use baybo_skills::SkillRegistry;
 use baybo_storage::Store;
-use baybo_store::ChannelBotStore;
+use baybo_store::{BlobStore, ChannelBotStore};
 use baybo_tools::ToolRegistry;
 use baybo_trace::TraceStore;
 use tokio::sync::mpsc;
@@ -148,6 +148,7 @@ pub struct AdminState {
     pub log_buffer: Arc<LogBuffer>,
     pub channel_bot_store: Arc<dyn ChannelBotStore>,
     pub channel_control: Arc<crate::channel::ChannelControlRegistry>,
+    pub blob_store: Arc<dyn BlobStore>,
     pub secret_vault: Arc<SecretVault>,
     /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
@@ -193,6 +194,7 @@ impl AdminState {
             log_buffer: Arc::clone(&deps.log_buffer),
             channel_bot_store: Arc::clone(&deps.stores.channel_bot),
             channel_control: Arc::clone(&deps.channel_control),
+            blob_store: deps.stores.blob.clone(),
             secret_vault: Arc::clone(&deps.secret_vault),
             bind_display: deps.runtime_config.admin_bind.to_string(),
         }

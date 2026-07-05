@@ -48,6 +48,23 @@ impl GatewayJsonClient for GatewayApi {
             serde_json::from_slice(&body).map_err(|e| format!("decode response: {e}"))
         }
     }
+
+    fn post_empty<'a>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
+        async move {
+            let _body = request(
+                "POST",
+                path,
+                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, "application/json")],
+                Some(body),
+            )
+            .await?;
+            Ok(())
+        }
+    }
 }
 
 async fn request(

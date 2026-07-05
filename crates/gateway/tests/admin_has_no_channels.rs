@@ -59,6 +59,7 @@ async fn admin_router() -> axum::Router {
         log_buffer: std::sync::Arc::clone(&tg.deps.log_buffer),
         channel_bot_store: tg.deps.stores.channel_bot.clone(),
         channel_control: std::sync::Arc::clone(&tg.deps.channel_control),
+        blob_store: tg.deps.stores.blob.clone(),
         secret_vault: std::sync::Arc::clone(&tg.deps.secret_vault),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     };

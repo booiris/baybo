@@ -67,25 +67,6 @@ pub fn subscribe_frame(session_id: &str, since_ordinal: Option<i64>) -> Frame {
     }
 }
 
-pub fn fetch_history_frame(
-    session_id: &str,
-    before_ordinal: Option<i64>,
-    limit: Option<u32>,
-) -> Frame {
-    Frame::FetchHistory {
-        session_id: SessionId::from(session_id),
-        before_ordinal,
-        limit,
-    }
-}
-
-pub fn apns_token_frame(apns_token: &str, apns_env: &str) -> Frame {
-    Frame::UpdateApnsToken {
-        apns_token: apns_token.to_owned(),
-        apns_env: apns_env.to_owned(),
-    }
-}
-
 pub fn user_message_frame(
     session_id: &str,
     user_id: &str,

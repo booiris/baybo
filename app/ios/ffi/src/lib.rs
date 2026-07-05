@@ -69,7 +69,7 @@ impl BayboClient {
         debug_seed_push_key();
         let apns = Arc::new(ApnsState::new(config.apns_env));
         Arc::new(Self {
-            relay: relay::RelaySessions::new(apns.clone()),
+            relay: relay::RelaySessions::new(),
             direct: direct::DirectSessions::default(),
             pairing: relay::PairingSessions::default(),
             apns,
@@ -78,7 +78,7 @@ impl BayboClient {
 
     /// Store the APNs device token (lowercase hex), delivered by Swift's
     /// `didRegisterForRemoteNotificationsWithDeviceToken`. Read by pairing, the
-    /// relay leg's token-refresh opening frame, and direct push registration.
+    /// relay token-refresh API call, and direct push registration.
     pub fn set_apns_token(&self, token_hex: String) {
         self.apns.set_token(token_hex);
     }
@@ -224,7 +224,10 @@ impl BayboClient {
         let this = self;
         runtime::run(async move {
             match active_leg()? {
-                ActiveLeg::Relay => transport::preconnect(&this.relay).await,
+                ActiveLeg::Relay => {
+                    refresh_relay_apns_best_effort(&this.apns).await;
+                    transport::preconnect(&this.relay).await
+                }
                 ActiveLeg::Direct => Ok(()),
             }
         })
@@ -248,6 +251,7 @@ impl BayboClient {
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => {
+                    refresh_relay_apns_best_effort(&this.apns).await;
                     transport::connect(&this.relay, session_id, since_ordinal, sink).await
                 }
                 ActiveLeg::Direct => {
@@ -286,26 +290,53 @@ impl BayboClient {
         .await
     }
 
-    /// Request a backward page of `session_id`'s transcript over the active
-    /// binding's global chat leg. `before_ordinal` pages older (`None` = newest
-    /// page); `limit` caps the page. The reply is **not** this call's return
-    /// value: the gateway answers with a `HistoryPage` frame that streams back
-    /// through the session's sink (mirroring how `Subscribe` catch-up replays
-    /// arrive). Returns once the request is enqueued on the live leg.
+    /// Fetch a backward page of `session_id`'s transcript over the active
+    /// binding's API surface and return a native-synthesized `history_page` JSON
+    /// frame for the web transcript bridge.
     pub async fn chat_fetch_history(
         self: Arc<Self>,
         session_id: String,
         before_ordinal: Option<i64>,
         limit: Option<u32>,
-    ) -> Result<(), BayboError> {
-        let this = self;
+    ) -> Result<String, BayboError> {
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => {
-                    transport::fetch_history(&this.relay, session_id, before_ordinal, limit).await
+                    gateway_api::fetch_history_page(
+                        &relay::GatewayApi,
+                        session_id,
+                        before_ordinal,
+                        limit,
+                    )
+                    .await
                 }
                 ActiveLeg::Direct => {
-                    transport::fetch_history(&this.direct, session_id, before_ordinal, limit).await
+                    let client = self.direct.http_client()?;
+                    gateway_api::fetch_history_page(&client, session_id, before_ordinal, limit)
+                        .await
+                }
+            }
+        })
+        .await
+    }
+
+    /// Fetch the forward reconnect catch-up page over the active binding's API
+    /// surface and return a native-synthesized `catch_up` JSON frame for the web
+    /// transcript bridge.
+    pub async fn chat_catch_up(
+        self: Arc<Self>,
+        session_id: String,
+        since_ordinal: i64,
+    ) -> Result<String, BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Relay => {
+                    gateway_api::fetch_catch_up(&relay::GatewayApi, session_id, since_ordinal)
+                        .await
+                }
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::fetch_catch_up(&client, session_id, since_ordinal).await
                 }
             }
         })
@@ -406,6 +437,18 @@ fn debug_seed_push_key() {
     };
     let _ = std::fs::write(std::env::temp_dir().join("baybo-seed-result.txt"), &result);
     log::debug!("keychain self-check: {result}");
+}
+
+async fn refresh_relay_apns_best_effort(apns: &ApnsState) {
+    let Some(token) = apns.token() else {
+        log::info!("connecting without an APNs token; relay push binding not refreshed");
+        return;
+    };
+    if let Err(e) = gateway_api::update_apns_token(&relay::GatewayApi, &token, apns.env().as_str())
+        .await
+    {
+        log::warn!("relay APNs token refresh failed: {e}");
+    }
 }
 
 /// Select the rustls crypto provider for the process. `tokio-tungstenite` pulls

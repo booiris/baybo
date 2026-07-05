@@ -184,14 +184,11 @@ for this device. Before the first push to a device in a gateway run, A
 best-effort POSTs a signed `/register` carrying `{device_id, apns_token, env,
 gateway_pubkey, delegation, sig, counter}` from the persisted material, so a
 restarted/pruned C can recover before `/notify`. If iOS delivers or rotates the
-APNs token after pairing, P sends it to A over the sealed content channel
-(`Frame::UpdateApnsToken`) on every connect; the gateway persists it and
-re-registers on the next push. The phone never POSTs C's `/register` directly and
-never holds the APNs `.p8` or any push provider credential; it only holds its APNs
-device token, relay admission key, device identity, and `push_key`. The token is
-captured at launch by hooking the Tauri/wry-owned `UIApplicationDelegate`
-(`push_register.rs`, `class_addMethod` on
-`didRegisterForRemoteNotificationsWithDeviceToken`).
+APNs token after pairing, P sends it to A through the device API
+`POST /v1/mobile/apns-token`; the gateway persists it and re-registers on the
+next push. The phone never POSTs C's `/register` directly and never holds the
+APNs `.p8` or any push provider credential; it only holds its APNs device token,
+relay admission key, device identity, and `push_key`.
 
 **Direct-mode push (no pairing):** the direct transport has no pairing handshake,
 so it provisions the *same* binding over the admin-token REST surface instead.

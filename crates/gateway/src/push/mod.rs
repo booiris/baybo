@@ -343,8 +343,8 @@ pub struct PushDispatcher {
     apns_registrar: Option<Arc<dyn ApnsRegistrar>>,
     /// The APNs token last registered with C per device this run, so we register
     /// at most once per (device, token): a token that **changed** (APNs rotation,
-    /// pushed to A over the content channel via `Frame::UpdateApnsToken`) differs
-    /// from the cached one and re-registers; an unchanged token is skipped.
+    /// pushed to A via `POST /v1/mobile/apns-token`) differs from the cached one
+    /// and re-registers; an unchanged token is skipped.
     registered: Mutex<HashMap<String, String>>,
     /// A's gateway Ed25519 push-signing key, lazily loaded from the vault and
     /// cached for the dispatcher's lifetime.

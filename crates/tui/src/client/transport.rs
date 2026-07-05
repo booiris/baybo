@@ -363,12 +363,10 @@ fn map_frame(
             // Reasoning; the web dashboard is its consumer.
             None
         }
-        Frame::WorkSnapshot { .. } | Frame::WorkReplay { .. } => {
-            // The in-flight work-block snapshot and the completed-turn replay
-            // both recover the reasoning/tool steps a reconnecting client
-            // missed. The TUI drops Reasoning already, so they have nothing to
-            // render here either. Their consumers are the relay/iOS and web
-            // work blocks.
+        Frame::WorkSnapshot { .. } => {
+            // The in-flight work-block snapshot recovers the reasoning/tool
+            // steps a reconnecting work-block client missed. The TUI drops
+            // Reasoning already, so it has nothing to render here either.
             None
         }
         Frame::ToolStarted {
@@ -455,9 +453,6 @@ fn map_frame(
         | Frame::RegisterAck { .. }
         | Frame::Subscribe { .. }
         | Frame::Unsubscribe { .. }
-        | Frame::FetchHistory { .. }
-        | Frame::HistoryPage { .. }
-        | Frame::UpdateApnsToken { .. }
         | Frame::Reset { .. }
         | Frame::ResolveApproval { .. }
         | Frame::HistoryAppend { .. }
@@ -468,9 +463,7 @@ fn map_frame(
             // StartBot / StopBot / BotStatus are sidecar control-plane
             // frames — the TUI never participates in that flow.
             // SlashManifest is also sidecar-only: the TUI owns its
-            // slash commands client-side via TuiSlashHandler. FetchHistory
-            // (client→server) and HistoryPage (the TUI never requests it —
-            // it backfills via Subscribe catch-up) are likewise inert here.
+            // slash commands client-side via TuiSlashHandler.
             warn!("unexpected frame from gateway; dropping");
             None
         }

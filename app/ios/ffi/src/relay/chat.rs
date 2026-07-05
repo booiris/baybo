@@ -9,35 +9,29 @@
 //! One content leg can subscribe to multiple sessions. Content is relay-only —
 //! the app reaches the (possibly NAT'd) gateway through C's blind content-join leg.
 
-use std::sync::Arc;
-
 use device_proto::noise::StaticKeypair;
 use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::dial::dial_content_join;
 use super::pairing::{PairedRecord, load_paired_record};
-use crate::apns::ApnsState;
-use crate::core::{ContentHandshake, ContentSession, Frame, apns_token_frame, user_message_frame};
+use crate::core::{ContentHandshake, ContentSession, Frame, user_message_frame};
 use crate::transport::{
     ChatTransport, Connection, FrameCodec, SessionLeg, SessionRegistry, TransportError,
     UserFrameFn, WsStream, recv_binary,
 };
 
-/// The relay leg's state: the shared session registry plus the APNs state it
-/// reads for the best-effort token-refresh opening frame. The durable pairing
+/// The relay leg's state: the shared session registry. The durable pairing
 /// record is reloaded from the keychain on each connect, so the leg itself is
 /// otherwise stateless.
 pub(crate) struct RelaySessions {
     registry: SessionRegistry,
-    apns: Arc<ApnsState>,
 }
 
 impl RelaySessions {
-    pub(crate) fn new(apns: Arc<ApnsState>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             registry: SessionRegistry::default(),
-            apns,
         }
     }
 }
@@ -61,10 +55,10 @@ impl FrameCodec for RelayCodec {
 }
 
 impl ChatTransport for RelaySessions {
+    #[allow(clippy::manual_async_fn)]
     fn establish(
         &self,
     ) -> impl std::future::Future<Output = Result<Connection, TransportError>> + Send {
-        let apns = self.apns.clone();
         async move {
             // Preconditions surface as `Precondition` so a transient failure here
             // doesn't tear down a healthy live session on a foreground reconnect
@@ -86,19 +80,6 @@ impl ChatTransport for RelaySessions {
                 session: established.session,
             });
 
-            // Best-effort: tell the gateway our current APNs token so it keeps C's
-            // push binding fresh across token rotation — skipped when iOS hasn't
-            // issued a token yet, and non-fatal if it can't be sealed.
-            let mut opening_best_effort = Vec::new();
-            if let Some(token) = apns.token() {
-                opening_best_effort.push(apns_token_frame(&token, apns.env().as_str()));
-            } else {
-                log::info!(
-                    "connecting without an APNs token (not yet issued); push binding not refreshed this session (device={})",
-                    record.device_id
-                );
-            }
-
             // Relay user messages carry the device id + `channel_type=device`.
             let device_id = record.device_id.clone();
             let user_frame: UserFrameFn = Box::new(move |session_id, text, msg_id, attachments| {
@@ -108,7 +89,6 @@ impl ChatTransport for RelaySessions {
             Ok(Connection {
                 ws: established.ws,
                 codec,
-                opening_best_effort,
                 user_frame,
             })
         }

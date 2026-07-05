@@ -14,6 +14,7 @@ import { MarkdownBody } from "./Markdown";
 import { WorkBlockView } from "./WorkBlock";
 import {
   uid,
+  type CatchUpItem,
   type ChatMsg,
   type PersistedState,
   type Row,
@@ -75,11 +76,11 @@ function scrollEl(): HTMLElement | null {
   return document.scrollingElement as HTMLElement | null;
 }
 
-/// Rebuild `ChatMsg[]` from a `HistoryPage`'s `wire::Message` rows. Mirrors the
-/// live `case "message"` mapping; each row carries real `attachments` (blob
-/// refs), so images render inline. Keyed by `platform_msg_id` (the live-path
-/// key) when present, else the ordinal, so a row keeps a stable React key
-/// across a scroll-up prepend.
+/// Rebuild `ChatMsg[]` from a native history API page's message rows. Mirrors
+/// the live `case "message"` mapping; each row carries real `attachments` (blob
+/// refs), so images render inline. Keyed by `platform_msg_id` (the live-path key)
+/// when present, else the ordinal, so a row keeps a stable React key across a
+/// scroll-up prepend.
 function historyMessagesToChatMsgs(messages: WireMessage[]): ChatMsg[] {
   return messages.map((m) => ({
     id: m.platform_msg_id || (typeof m.ordinal === "number" ? `m${m.ordinal}` : uid()),
@@ -94,6 +95,18 @@ function ordinalFromMessageId(id: string): number | null {
   if (!match) return null;
   const n = Number(match[1]);
   return Number.isSafeInteger(n) ? n : null;
+}
+
+function stableWorkId(ordinal: number): string {
+  return `w${ordinal}`;
+}
+
+function stableMessageId(ordinal: number): string {
+  return `m${ordinal}`;
+}
+
+function isStableWorkId(id: string): boolean {
+  return /^w\d+$/.test(id);
 }
 
 /// Restored rows re-enter with any live-turn state stripped: an "active" work
@@ -275,11 +288,11 @@ export function Transcript({
   // True while a `Frame::Reset` recovery is in flight, so a burst of Resets
   // (back-pressure) doesn't stack concurrent refetches.
   const recovering = useRef(false);
-  // Serializes history requests AND tags the streamed `history_page` reply so
-  // its handler knows whether to REPLACE (reset recovery) or PREPEND
+  // Serializes native history API requests AND tags the pushed `history_page`
+  // reply so its handler knows whether to REPLACE (reset recovery) or PREPEND
   // (scroll-up). The epoch captured at request time lets a reply that arrives
-  // under a different connection epoch be dropped as stale (the old connGen
-  // guard). `null` = no history request in flight.
+  // under a different connection epoch be dropped as stale. `null` = no history
+  // request in flight.
   const relayHistory = useRef<{ mode: "reset" | "page"; epoch: number } | null>(null);
   // A reset recovery that arrived while a request was already in flight, so
   // it's queued to run when that request's `history_page` lands (rather than
@@ -527,11 +540,11 @@ export function Transcript({
     [setStreamingText],
   );
 
-  // Fire a transcript-history request through native. The page streams back
-  // later as a `history_page` frame; `mode` tags it for that handler (REPLACE
-  // for a reset, PREPEND for scroll-up), and the current epoch tags it against
-  // late delivery across a reconnect. One at a time — returns `false` if a
-  // request is already in flight (the caller then unwinds its own guards).
+  // Fire a transcript-history request through native. The API result is pushed
+  // later as a local `history_page` frame; `mode` tags it for that handler
+  // (REPLACE for a reset, PREPEND for scroll-up), and the current epoch tags it
+  // against late delivery across a reconnect. One at a time — returns `false`
+  // if a request is already in flight (the caller then unwinds its own guards).
   const requestHistory = useCallback((mode: "reset" | "page", beforeOrdinal: number | null): boolean => {
     if (relayHistory.current) return false;
     relayHistory.current = { mode, epoch: connEpochRef.current };
@@ -575,9 +588,9 @@ export function Transcript({
   // Recover from a gateway `Frame::Reset` (catch-up gap over the replay cap, or
   // outbound back-pressure). Left unhandled this *loops*: the stale pre-gap
   // cursor goes back out on the next reconnect and overflows again. One
-  // `fetchHistory` over the live leg rebuilds the thread and reseeds the
-  // cursors — no reconnect needed. If a request is already in flight (`false`)
-  // — e.g. a scroll-up page — the reset can't ride it (that response is a
+  // native `fetchHistory` rebuilds the thread and reseeds the cursors — no
+  // reconnect needed. If a request is already in flight (`false`) — e.g. a
+  // scroll-up page — the reset can't ride it (that response is a
   // PREPEND), so QUEUE it to run when that request completes; dropping it would
   // leave the stale cursor in place and re-arm the very reset loop we're
   // breaking. A re-entrancy guard keeps a burst of Resets from stacking
@@ -598,7 +611,7 @@ export function Transcript({
     }
   }, [requestHistory, appendNotice]);
 
-  // Load the next older page (scroll-up): fire a fetchHistory whose
+  // Load the next older page (scroll-up): fire a native fetchHistory whose
   // `history_page` reply prepends in the frame switch (and clears the guards
   // there). `pagingRef` gates re-entry.
   const loadOlder = useCallback(() => {
@@ -626,6 +639,93 @@ export function Transcript({
   const setNewestOrdinal = (value: number | null) => {
     lastOrdinal.current = value;
     postOrdinal(value);
+  };
+
+  const applyCatchUp = (items: CatchUpItem[], newestOrdinal: number | null | undefined, truncated: boolean) => {
+    if (truncated) {
+      recoverFromReset();
+      return;
+    }
+    const hasAssistantMessage = items.some((item) => item.kind === "message" && item.role === "assistant");
+    if (hasAssistantMessage) clearStreaming();
+
+    setMessages((rows) => {
+      const next = [...rows];
+      const hasRowId = (id: string) => next.some((row) => row.id === id);
+      const findMessageByOrdinal = (ordinal: number) =>
+        next.findIndex((row) => {
+          if (row.role !== "user" && row.role !== "assistant") return false;
+          return ordinalFromMessageId(row.id) === ordinal;
+        });
+      const closeTrailingWork = () => {
+        const last = next[next.length - 1];
+        if (!last || last.role !== "work" || !last.active) return;
+        if (last.steps.length === 0) {
+          next.pop();
+          return;
+        }
+        next[next.length - 1] = {
+          ...last,
+          active: false,
+          elapsedMs: last.startedAt !== undefined ? Date.now() - last.startedAt : last.elapsedMs,
+        };
+      };
+
+      for (const item of items) {
+        const ordinal = item.ordinal;
+        if (!Number.isSafeInteger(ordinal)) continue;
+        if (item.kind === "work") {
+          const steps = item.steps.map(wireStepToWork);
+          if (steps.length === 0) continue;
+          const id = stableWorkId(ordinal);
+          if (hasRowId(id)) continue;
+          const block: WorkRow = { id, role: "work", steps, active: false };
+          const msgIndex = findMessageByOrdinal(ordinal);
+          if (msgIndex >= 0) {
+            const prev = next[msgIndex - 1];
+            if (prev && prev.role === "work" && !isStableWorkId(prev.id)) {
+              next[msgIndex - 1] = block;
+            } else {
+              next.splice(msgIndex, 0, block);
+            }
+            continue;
+          }
+          const last = next[next.length - 1];
+          if (last && last.role === "work" && !isStableWorkId(last.id)) {
+            next[next.length - 1] = block;
+          } else {
+            next.push(block);
+          }
+          continue;
+        }
+
+        const role = item.role === "user" ? "user" : "assistant";
+        const platformMsgId = item.platform_msg_id || "";
+        const id = platformMsgId || stableMessageId(ordinal);
+        const alreadySent = role === "user" && platformMsgId !== "" && sentIds.current.has(platformMsgId);
+        const alreadyRendered =
+          hasRowId(id) || renderedOrdinals.current.has(ordinal) || findMessageByOrdinal(ordinal) >= 0;
+        if (alreadySent || alreadyRendered) {
+          renderedOrdinals.current.add(ordinal);
+          if (role === "user" && platformMsgId) sentIds.current.add(platformMsgId);
+          continue;
+        }
+        if (role === "assistant") closeTrailingWork();
+        if (role === "user" && platformMsgId) sentIds.current.add(platformMsgId);
+        renderedOrdinals.current.add(ordinal);
+        next.push({
+          id,
+          role,
+          content: item.content,
+          attachments: item.attachments,
+        });
+      }
+      return next;
+    });
+
+    if (typeof newestOrdinal === "number" && (lastOrdinal.current === null || newestOrdinal > lastOrdinal.current)) {
+      setNewestOrdinal(newestOrdinal);
+    }
   };
 
   const handleFrame = (frameJson: string) => {
@@ -739,20 +839,6 @@ export function Transcript({
       case "work_snapshot":
         applyWorkSnapshot(frame.steps);
         break;
-      case "work_replay": {
-        // A completed turn's collapsed work block, replayed on catch-up just
-        // before its reply. Insert it (closed) in stream order, replacing any
-        // leftover open block for the same turn (the in-flight block still on
-        // screen from before we backgrounded) so the thinking isn't doubled.
-        const replaySteps = frame.steps.map(wireStepToWork);
-        if (replaySteps.length === 0) break;
-        setMessages((m) => {
-          const block: WorkRow = { id: uid(), role: "work", steps: replaySteps, active: false };
-          const last = m[m.length - 1];
-          return last && last.role === "work" ? [...m.slice(0, -1), block] : [...m, block];
-        });
-        break;
-      }
       case "notice":
         if (frame.transient) {
           // Mid-turn progress narration belongs to the work block, not the log.
@@ -767,6 +853,9 @@ export function Transcript({
         // per-dial channel there's no per-frame generation to check here;
         // `recoverFromReset` still self-guards a Reset burst.
         recoverFromReset();
+        break;
+      case "catch_up":
+        applyCatchUp(frame.items, frame.newest_ordinal ?? null, frame.truncated);
         break;
       case "history_page": {
         // `relayHistory.current` (set when we fired the request) says whether
@@ -882,11 +971,12 @@ export function Transcript({
     requestAnimationFrame(step);
   };
 
-  // Native (re)connected. Any history request in flight rode the old leg and is
-  // abandoned (its late `history_page` is dropped by the epoch tag) — clear the
-  // guards so a future fetch isn't blocked / the spinner isn't stuck / a queued
-  // reset isn't stranded. The reconnect's own subscribe re-triggers a Reset if
-  // the cursor is still stale, so a dropped queued reset self-heals.
+  // Native (re)connected. Any history request in flight belongs to the old
+  // epoch and is abandoned (its late `history_page` is dropped by the epoch tag)
+  // — clear the guards so a future fetch isn't blocked / the spinner isn't
+  // stuck / a queued reset isn't stranded. The reconnect's own subscribe
+  // re-triggers a Reset if the cursor is still stale, so a dropped queued reset
+  // self-heals.
   const handleConnEpoch = (epoch: number) => {
     connEpochRef.current = epoch;
     relayHistory.current = null;

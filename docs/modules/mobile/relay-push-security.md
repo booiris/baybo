@@ -342,11 +342,11 @@ Registration:
    strictly exceeds the device's last accepted one; then it stores `device_id ->
    { apns_token, env, gateway_pubkey, last_counter }`. The app no longer registers
    directly with C (it holds no gateway push key). Instead the app sends its
-   current APNs token to the gateway on every content connect (a sealed
-   `Frame::UpdateApnsToken` over the Noise IK leg); the gateway persists it and
-   re-registers (signed) on its next push when the token changed — so a token that
-   arrived after pairing, or rotated later (reinstall / restore / new device), is
-   bound on the next connect with no re-pair.
+   current APNs token to the gateway through the device API
+   `POST /v1/mobile/apns-token`; the gateway persists it and re-registers
+   (signed) on its next push when the token changed — so a token that arrived
+   after pairing, or rotated later (reinstall / restore / new device), is bound
+   without a re-pair.
 
 Notification:
 
@@ -519,11 +519,11 @@ Keys (all established at pairing — see
    the device is still unknown after that re-register (missing delegation/APNs
    material), A logs a warning rather than failing silently.
 4. **Token refresh.** A token that missed `DeviceHello`, or rotated after pairing,
-   reaches A over the content channel: P sends its current token in a sealed
-   `Frame::UpdateApnsToken { apns_token, apns_env }` over the Noise IK content leg
-   on every connect. A intercepts it before the generic router and persists it
-   (`device.<device_id>.apns`); because the cached token now differs, the
-   dispatcher re-registers (signed, as in step 3) on its next push — no re-pair.
+   reaches A through the device API: P sends its current token with
+   `POST /v1/mobile/apns-token`. A authenticates the device principal and
+   persists it (`device.<device_id>.apns`); because the cached token now differs,
+   the dispatcher re-registers (signed, as in step 3) on its next push — no
+   re-pair.
 5. **Pruning.** When APNs rejects a token (`400`/`410`), C unbinds it (the device
    row on A is never touched); a later push re-registers from A's persisted material.
 
@@ -811,10 +811,9 @@ last accepted. Only the holder of `D` can authorize a `G`, and only the holder o
   two against drift.
 - The gateway is the **only** registrar (it holds `G`). A token that missed
   `DeviceHello`, or rotated after pairing (APNs tokens are not stable across
-  reinstall / restore / new device), reaches the gateway over the content channel:
-  the app sends its current token in a sealed `Frame::UpdateApnsToken` on every
-  connect, and the gateway persists it and re-registers (signed) on its next push
-  when it changed — no re-pair needed.
+  reinstall / restore / new device), reaches the gateway through
+  `POST /v1/mobile/apns-token`, and the gateway persists it and re-registers
+  (signed) on its next push when it changed — no re-pair needed.
 - This protects binding *integrity and delivery routing*, not the existence or
   timing of a push, nor preview confidentiality (which `push_key` already covers).
 
@@ -956,8 +955,8 @@ not from C admission.
 - `/register` is sent only by A (it holds the gateway push signing key the binding
   is authenticated with); P cannot register directly, and never holds APNs
   provider credentials. P keeps the binding current by sending its APNs token to A
-  over the content channel (`Frame::UpdateApnsToken`) on every connect, so a token
-  that missed `DeviceHello` or rotated later is re-registered without a re-pair.
+  via `POST /v1/mobile/apns-token`, so a token that missed `DeviceHello` or
+  rotated later is re-registered without a re-pair.
 - A retries push registration (signed) from non-empty APNs material persisted in
   the vault before its first push in a run, which self-heals a missing C-side
   token binding when the token was available to A. A `/notify` answered `404`

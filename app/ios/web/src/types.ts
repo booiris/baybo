@@ -18,8 +18,8 @@ export function attachmentKind(mime: string): WireAttachment["kind"] {
 }
 
 /// One durable message row's fields, shared by a live `Frame::Message` (where
-/// they sit next to `kind: "message"`) and a `Frame::HistoryPage` entry (a bare
-/// `wire::Message`, no `kind`). Same shape either way.
+/// they sit next to `kind: "message"`) and the native-synthesized history API
+/// page (a bare message row, no `kind`). Same shape either way.
 export type WireMessage = {
   content: string;
   role?: "user" | "assistant";
@@ -44,6 +44,21 @@ export type WireWorkStepFrame = {
   summary?: string;
 };
 
+export type CatchUpItem =
+  | {
+      kind: "message";
+      ordinal: number;
+      role: "user" | "assistant";
+      content: string;
+      platform_msg_id?: string;
+      attachments?: WireAttachment[];
+    }
+  | {
+      kind: "work";
+      ordinal: number;
+      steps: WireWorkStepFrame[];
+    };
+
 /// A decrypted wire `Frame`, arriving as JSON text via `window.baybo.pushFrame`.
 /// MessagePack field names round-trip as snake_case JSON; we only model the few
 /// variants the transcript renders and tolerate the rest.
@@ -59,14 +74,10 @@ export type WireFrame =
   // `transient: true` marks mid-turn progress narration (folded into the work
   // block); absent/false is a terminal notice (its own centered row).
   | { kind: "notice"; level: string; text: string; transient?: boolean }
-  // The in-flight turn's whole work block, replayed on a mid-turn (re)subscribe
+  // The in-flight turn's whole work block, sent on a mid-turn (re)subscribe
   // so a client that reconnected (after backgrounding) recovers the reasoning /
   // tool steps it missed. Idempotent snapshot — REPLACES the open block.
   | { kind: "work_snapshot"; steps: WireWorkStepFrame[] }
-  // A COMPLETED turn's collapsed work block, replayed on catch-up right before
-  // that turn's reply — recovers the thinking for a turn that finished while we
-  // were backgrounded. Rendered as a closed "思考了" block.
-  | { kind: "work_replay"; steps: WireWorkStepFrame[] }
   | { kind: "reset"; reason: string }
   | {
       kind: "history_page";
@@ -77,9 +88,16 @@ export type WireFrame =
     }
   // Server-pushed standalone media a tool produced mid-turn (its own bubble).
   | { kind: "attachment"; user_id?: string; attachments?: WireAttachment[] }
-  // Synthesized NATIVE-side (not a wire frame): a chat_fetch_history call
-  // failed before reaching the leg, so the paging/reset guards armed for it
-  // must unwind (the old Tauri invoke() rejection played this role).
+  // Synthesized NATIVE-side (not a wire frame): forward reconnect API merge.
+  // Carries missed completed work blocks plus matching final message rows.
+  | {
+      kind: "catch_up";
+      items: CatchUpItem[];
+      newest_ordinal?: number | null;
+      truncated: boolean;
+    }
+  // Synthesized NATIVE-side (not a wire frame): a chatFetchHistory API call
+  // failed, so the paging/reset guards armed for it must unwind.
   | { kind: "history_failed"; error: string }
   // Frames we don't render (reasoning, tool progress, ping/pong, …) arrive with
   // other `kind`s and fall through the switch's `default`.

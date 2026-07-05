@@ -442,71 +442,12 @@ pub enum Frame {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
     },
-    /// Client → server. Request one backward page of `session_id`'s
-    /// persisted transcript — the Noise-sealed relay equivalent of the
-    /// REST `GET /v1/chat/sessions/:id`, for clients (the device relay leg)
-    /// that have no admin REST surface. Where [`Subscribe`] catch-up
-    /// pages *forward* (rows above `since_ordinal`), this pages
-    /// *backward*: the server replies with a single [`HistoryPage`] of
-    /// UI-visible rows whose ordinal is below `before_ordinal` (or the
-    /// newest page when `None`), capped at `limit` (server-clamped to the
-    /// same bounds as the REST endpoint). The client pages further back
-    /// with `before_ordinal = HistoryPage.oldest_ordinal`. `Subscribed`-
-    /// kind only, and the connection must already be subscribed to
-    /// `session_id` (parity with the inbound `Message` path).
-    FetchHistory {
-        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        session_id: SessionId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "ts-export", ts(optional))]
-        before_ordinal: Option<i64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "ts-export", ts(optional))]
-        limit: Option<u32>,
-    },
-    /// Server → client. One backward page of `session_id`'s persisted
-    /// transcript, in response to a [`FetchHistory`]. `messages` are the
-    /// same UI-visible projection [`Subscribe`] catch-up replays (user
-    /// prompts + final tool-free assistant replies, carrying real
-    /// attachment refs), ordered ascending by ordinal. `oldest_ordinal` /
-    /// `newest_ordinal` are the real `session_messages.ordinal` bounds of
-    /// the *raw* page (`None` for an empty page) — authoritative paging
-    /// cursors that stay monotonic even across a page whose visible-row
-    /// set is empty. The client pages older with `before_ordinal =
-    /// oldest_ordinal` and seeds its catch-up cursor from `newest_ordinal`;
-    /// `has_more` is true while older rows remain below this page.
-    HistoryPage {
-        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        session_id: SessionId,
-        messages: Vec<Message>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "ts-export", ts(optional))]
-        oldest_ordinal: Option<i64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "ts-export", ts(optional))]
-        newest_ordinal: Option<i64>,
-        has_more: bool,
-    },
-    /// Client → server, **APNs clients only**. The device's current APNs token (+ env
-    /// `"sandbox"`/`"production"`), sent on every content connect so the gateway
-    /// can keep C's push binding fresh across APNs token rotation (reinstall,
-    /// restore-from-backup, new device — Apple does not guarantee a stable
-    /// token). The gateway persists it and re-registers (signed) with C when the
-    /// token changed. Handled on the device content leg before the generic
-    /// router; other channels never send it.
-    UpdateApnsToken {
-        apns_token: String,
-        apns_env: String,
-    },
     /// Server → client. The connection's live stream is in an
     /// indeterminate state (slow-consumer drop, server-side
-    /// reconfiguration, etc.); clients should re-subscribe and refetch
-    /// session history — via the REST `/v1/chat/sessions/:id` endpoint, or
-    /// (for clients with no REST surface, e.g. the device relay leg) via a
-    /// [`FetchHistory`] over this same connection. The connection stays
-    /// live, so a follow-up `FetchHistory` is answerable. Sent
-    /// best-effort; clients that ignore it may end up with a stale
-    /// transcript until the next reconnect.
+    /// reconfiguration, etc.); clients should re-subscribe and refetch session
+    /// history via the REST `/v1/chat/sessions/:id` endpoint. Sent best-effort;
+    /// clients that ignore it may end up with a stale transcript until the next
+    /// reconnect.
     Reset { reason: String },
     /// A user-visible message flowing in either direction. Inbound it
     /// is user input (role=User); outbound it is either the agent's
@@ -672,23 +613,6 @@ pub enum Frame {
     /// sent while a turn is in flight and the buffer is non-empty; surfaces
     /// without a work block (TUI, sidecars) drop it.
     WorkSnapshot {
-        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        session_id: SessionId,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        user_id: String,
-        steps: Vec<WireWorkStep>,
-    },
-    /// Server → client: a **completed** turn's collapsed work block, replayed
-    /// during forward catch-up (`Subscribe { since_ordinal }`) right before that
-    /// turn's reply [`Message`], so a client that reconnects *after* the turn
-    /// finished (a device relay leg that was backgrounded across the whole turn)
-    /// gets back the reasoning / tool steps it missed instead of a bare answer
-    /// bubble. Distinct from [`WorkSnapshot`]: those `steps` are the *live*
-    /// in-flight turn (rendered as an open block); these are reconstructed from
-    /// the persisted transcript and render as a **closed** "思考了" block. The
-    /// client inserts it in stream order, replacing any leftover open block for
-    /// the same turn. Surfaces without a work block (TUI, sidecars) drop it.
-    WorkReplay {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -887,8 +811,6 @@ impl Frame {
         match self {
             Frame::Subscribe { session_id, .. }
             | Frame::Unsubscribe { session_id }
-            | Frame::FetchHistory { session_id, .. }
-            | Frame::HistoryPage { session_id, .. }
             | Frame::Attachment { session_id, .. }
             | Frame::AnswerDelta { session_id, .. }
             | Frame::Reasoning { session_id, .. }
@@ -899,7 +821,6 @@ impl Frame {
             | Frame::TaskList { session_id, .. }
             | Frame::TurnState { session_id, .. }
             | Frame::WorkSnapshot { session_id, .. }
-            | Frame::WorkReplay { session_id, .. }
             | Frame::ApprovalRequested { session_id, .. }
             | Frame::PendingApprovalsSnapshot { session_id, .. }
             | Frame::HistoryAppend { session_id, .. }
@@ -910,7 +831,6 @@ impl Frame {
             Frame::Messages { messages } => messages.first().map(|message| &message.session_id),
             Frame::Register { .. }
             | Frame::RegisterAck { .. }
-            | Frame::UpdateApnsToken { .. }
             | Frame::Reset { .. }
             | Frame::ApprovalResolved { .. }
             | Frame::ResolveApproval { .. }
@@ -1099,75 +1019,6 @@ mod tests {
     fn round_trip_unsubscribe() {
         let frame = Frame::Unsubscribe {
             session_id: "sess-x".into(),
-        };
-        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-    }
-
-    #[test]
-    fn round_trip_fetch_history() {
-        let frame = Frame::FetchHistory {
-            session_id: "sess-x".into(),
-            before_ordinal: Some(120),
-            limit: Some(50),
-        };
-        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-    }
-
-    #[test]
-    fn round_trip_fetch_history_newest_page() {
-        // `before_ordinal`/`limit` both absent => the newest page at the
-        // server default. Their `skip_serializing_if` keeps them off the wire.
-        let frame = Frame::FetchHistory {
-            session_id: "sess-x".into(),
-            before_ordinal: None,
-            limit: None,
-        };
-        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-    }
-
-    #[test]
-    fn round_trip_history_page() {
-        let frame = Frame::HistoryPage {
-            session_id: "s1".into(),
-            messages: vec![
-                Message {
-                    content: "first".into(),
-                    session_id: "s1".into(),
-                    user_id: String::new(),
-                    channel_type: ChannelType::from("device"),
-                    bot_id: String::new(),
-                    attachments: Vec::new(),
-                    platform_msg_id: String::new(),
-                    role: MessageRole::User,
-                    ordinal: Some(3),
-                },
-                Message {
-                    content: "reply".into(),
-                    session_id: "s1".into(),
-                    user_id: String::new(),
-                    channel_type: ChannelType::from("device"),
-                    bot_id: String::new(),
-                    attachments: Vec::new(),
-                    platform_msg_id: String::new(),
-                    role: MessageRole::Assistant,
-                    ordinal: Some(4),
-                },
-            ],
-            oldest_ordinal: Some(3),
-            newest_ordinal: Some(4),
-            has_more: true,
-        };
-        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-    }
-
-    #[test]
-    fn round_trip_history_page_empty() {
-        let frame = Frame::HistoryPage {
-            session_id: "s1".into(),
-            messages: Vec::new(),
-            oldest_ordinal: None,
-            newest_ordinal: None,
-            has_more: false,
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }

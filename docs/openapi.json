@@ -694,6 +694,80 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/catch-up": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "catch_up_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to catch up",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since_ordinal",
+            "in": "query",
+            "description": "Newest durable ordinal the client has already rendered.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum rows to scan. Defaults to [`DEFAULT_CATCH_UP_LIMIT`], clamped to\n[`MAX_HISTORY_LIMIT`]. If the gap is larger, the response is marked\n`truncated` and carries no partial middle slice.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Forward transcript catch-up for device reconnect merge",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatCatchUpResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/folder": {
       "put": {
         "tags": [
@@ -2190,6 +2264,49 @@
         }
       }
     },
+    "/v1/mobile/apns-token": {
+      "post": {
+        "tags": [
+          "push"
+        ],
+        "operationId": "update_device_apns_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateDeviceApnsTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Paired device APNs token refreshed"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Persist failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/push/params": {
       "get": {
         "tags": [
@@ -2885,9 +3002,154 @@
           }
         }
       },
+      "CatchUpItemKind": {
+        "type": "string",
+        "description": "Discriminator for [`ChatCatchUpItem`] — serialized as\n`\"message\"` / `\"work\"`.",
+        "enum": [
+          "message",
+          "work"
+        ]
+      },
       "ChannelType": {
         "type": "string",
         "description": "Admin-surface mirror of [`baybo_model::ChannelType`]. Transparent\nwrapper around a snake_case string so the OpenAPI surface stays\nstable while the core type is open-ended (runtime-registered\nsidecars like `\"slack\"` pass through unchanged)."
+      },
+      "ChatAttachment": {
+        "type": "object",
+        "description": "A blob attachment embedded in a historical chat transcript item.",
+        "required": [
+          "kind",
+          "blob_id",
+          "mime_type",
+          "size"
+        ],
+        "properties": {
+          "blob_id": {
+            "type": "string"
+          },
+          "filename": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "ChatCatchUpItem": {
+        "type": "object",
+        "description": "Forward reconnect item for native device clients. The sequence is ordered by\npersisted ordinal; a completed tool-using assistant reply appears as a\n`work` item followed by the matching `message` item with the same `ordinal`.",
+        "required": [
+          "kind",
+          "ordinal",
+          "content"
+        ],
+        "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatAttachment"
+            }
+          },
+          "content": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CatchUpItemKind"
+          },
+          "ordinal": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "platform_msg_id": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatCatchUpWorkStep"
+            }
+          }
+        }
+      },
+      "ChatCatchUpResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "truncated"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatCatchUpItem"
+            }
+          },
+          "newest_ordinal": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Newest visible message ordinal included in `items`. Internal tool /\nthinking rows are deliberately not exposed as the cursor, because a\nlater final answer may still need them to reconstruct its completed work\nblock."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when the requested gap exceeds the catch-up cap. The client should\ndiscard this partial answer and rebuild from the normal history API."
+          }
+        }
+      },
+      "ChatCatchUpWorkStep": {
+        "type": "object",
+        "description": "One work step in the forward catch-up API. This intentionally mirrors\n`wire::WireWorkStep`'s JSON field names (not the REST transcript's\n`tool_label` / `tool_status` names) because the device transcript reuses the\nlive `WorkSnapshot` renderer for catch-up work blocks.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/WorkStepKind"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "tool": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       },
       "ChatCronMessage": {
         "type": "object",
@@ -3088,6 +3350,13 @@
           "created_at"
         ],
         "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatAttachment"
+            },
+            "description": "Blob attachments for message items. This mirrors the chat WS attachment\nshape so native clients can rebuild historical image/file bubbles from\nthe REST transcript."
+          },
           "cancelled": {
             "type": "boolean",
             "description": "`true` when this `work` item belongs to a turn that was cancelled\n(e.g. `/stop`) rather than run to a normal reply — the client labels it\n\"Cancelled\" instead of a plain `Worked Xs`. Always false for\n`message` / `notice` items."
@@ -4397,6 +4666,24 @@
         "properties": {
           "path": {
             "type": "string"
+          }
+        }
+      },
+      "UpdateDeviceApnsTokenRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/mobile/apns-token`.",
+        "required": [
+          "apns_token",
+          "apns_env"
+        ],
+        "properties": {
+          "apns_env": {
+            "type": "string",
+            "description": "APNs environment: `\"sandbox\"` (debug / TestFlight) or `\"production\"`."
+          },
+          "apns_token": {
+            "type": "string",
+            "description": "The device's current APNs device token (hex)."
           }
         }
       },

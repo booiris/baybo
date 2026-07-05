@@ -105,9 +105,8 @@ export function openUrl(url: string): void {
   else window.open(url, "_blank", "noopener");
 }
 
-// Fetches are fire-and-forget too, but throwing is useful to the caller: the
-// transcript's recover/paging paths surface a failed post as a notice bubble
-// (the old invoke() rejection path).
+// History fetches are fire-and-forget from Web's perspective: native calls the
+// chat API and pushes back a local `history_page` / `history_failed` frame.
 export function fetchHistory(beforeOrdinal: number | null, limit: number): void {
   post({ type: "fetchHistory", beforeOrdinal, limit });
 }
