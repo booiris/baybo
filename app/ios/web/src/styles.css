@@ -42,12 +42,14 @@
   color: var(--color-ink);
   background: var(--color-paper);
   -webkit-font-smoothing: antialiased;
-  /* Native-app feel: chrome carries no web-style text selection or iOS
-     long-press callout (user-select + touch-callout inherit, so :root covers
-     the tree); the message content opts back in below so it's copyable. */
+  /* Native-app feel: chrome carries no web-style text selection, iOS
+     long-press callout, or gray tap-highlight flash (all three inherit, so
+     :root covers the tree); the message content opts selection back in below
+     so it's copyable. */
   -webkit-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
 * { box-sizing: border-box; }
@@ -109,10 +111,6 @@ button {
 .chat-log.inset-animated {
   transition: padding-bottom 250ms cubic-bezier(0.33, 1, 0.68, 1);
 }
-/* No visible scrollbar on the (document) scroller — the native-app feel. */
-html { scrollbar-width: none; }
-html::-webkit-scrollbar { display: none; }
-
 /* Chat MESSAGE bodies read as Inter sans (comfortable long-read); the chrome
    stays monospace. Soft uniform rounded bubbles, hairline outlined. */
 .bubble {
@@ -278,7 +276,8 @@ html::-webkit-scrollbar { display: none; }
 @keyframes work-spin { to { transform: rotate(360deg); } }
 .work.closed { display: flex; flex-direction: column; gap: 0.45rem; }
 .work-summary {
-  align-self: flex-start;
+  position: relative;
+  width: 100%;
   display: flex;
   align-items: center;
   gap: 0.3rem;
@@ -286,12 +285,20 @@ html::-webkit-scrollbar { display: none; }
   border: 0;
   background: none;
   font-family: var(--font-mono);
-  font-size: 0.75rem;
+  font-size: 0.8rem;
   color: var(--color-ink-soft);
+  text-align: left;
+}
+/* Grow the tap target above/below without adding visible padding (which would
+   change the block's spacing): an invisible overlay extends the hit area. */
+.work-summary::before {
+  content: "";
+  position: absolute;
+  inset: -0.5rem 0;
 }
 .work-summary:active { opacity: 0.7; }
-.work-chevron { display: inline-block; transition: transform 120ms ease; }
-.work-chevron.open { transform: rotate(90deg); }
+.work-chevron { display: inline-block; flex: 0 0 auto; line-height: 1; transition: transform 120ms ease; }
+.work-chevron.open { transform: translateY(1px) rotate(90deg); }
 .work-divider { height: 1px; background: var(--color-line); transform: scaleY(0.5); }
 .work-steps {
   display: flex;
