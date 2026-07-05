@@ -263,10 +263,24 @@ struct ComposerView: View {
                 size: UInt32(clamping: item.byteCount), filename: nil)
         }
         guard !body.isEmpty || !refs.isEmpty else { return }
-        store.notice = nil
+        // Guard the write: an unconditional `store.notice = nil` publishes an
+        // objectWillChange every send even when already nil, forcing a
+        // ComposerView recompute in the same beat as the field reset — extra
+        // transaction churn in exactly the window the deferred clear dodges.
+        if store.notice != nil {
+            store.notice = nil
+        }
         store.send(text: body, attachments: refs)
-        text = ""
         staged.removeAll()
+        // The multiline TextField(axis:) stays first responder through send, so
+        // a synchronous `text = ""` here can land inside the field's own
+        // in-flight edit transaction and be dropped — leftover glyphs, widened
+        // by a CJK IME's extra commit/predictive churn. Defer to the next
+        // runloop so the reset lands in a clean transaction after the edit
+        // commits.
+        DispatchQueue.main.async {
+            text = ""
+        }
     }
 
     private static func sniffMime(_ data: Data) -> String {
