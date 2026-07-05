@@ -38,6 +38,7 @@ pub mod grep;
 pub mod now;
 pub(crate) mod paths;
 pub mod read;
+mod rg;
 pub mod secret;
 pub mod send_local_file;
 pub mod todo;

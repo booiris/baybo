@@ -1,4 +1,10 @@
-//! `Glob` — file pattern matching, results sorted by mtime (newest first).
+//! `Glob` — filename matching via the `rg` (ripgrep) binary, results
+//! sorted by modification time (newest first).
+//!
+//! Backed by `rg --files --glob <pattern>` so pattern semantics match
+//! `Grep` and ripgrep: a pattern with no `/` matches a file's basename
+//! at any depth (`*.rs` finds every Rust file in the tree), while `/`
+//! anchors the match relative to the search root.
 
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -9,24 +15,29 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::paths::require_absolute;
+use super::rg;
 use crate::{ResourceAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput};
 
 const MAX_RESULTS: usize = 1000;
-const SCAN_CAP: usize = MAX_RESULTS * 2;
+const NO_MATCHES_MESSAGE: &str = "No files found";
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "Find files by glob pattern (e.g. `**/*.rs`). Always use this \
-         instead of Bash commands like find or ls for file searching. \
-         Results are sorted by modification time, newest first, and \
-         capped at {MAX_RESULTS} entries.\n\n\
-         PATHS: `path` is REQUIRED and MUST be an absolute filesystem path. \
-         Relative paths and omission are rejected. `pattern` MUST be \
-         relative — absolute patterns (e.g. `/etc/**/*`) are rejected so \
-         the search root is always the declared `path`.\n\n\
-         BEFORE BROAD PATTERNS: When pointing at an unfamiliar directory, \
-         start with a narrow pattern (e.g. top-level `*` or `*/*.rs`) to \
-         gauge the file count before issuing recursive `**/*` walks."
+        "Find files by glob pattern (e.g. `**/*.rs`), backed by ripgrep. \
+         Always use this instead of Bash commands like find or ls for \
+         file searching. Results are absolute paths sorted by \
+         modification time, newest first, and capped at {MAX_RESULTS} \
+         entries.\n\n\
+         PATHS: `path` is REQUIRED and MUST be an absolute filesystem \
+         path. Relative paths and omission are rejected. `pattern` MUST \
+         be relative to `path` — absolute patterns (e.g. `/etc/**/*`) \
+         are rejected.\n\n\
+         PATTERN SEMANTICS: a pattern with no `/` matches a file's name \
+         at ANY depth — `*.rs` finds every Rust file under `path`, and \
+         `*` finds every file. `*` never crosses `/`, so add separators \
+         to anchor depth: `src/*.rs` matches `.rs` directly under \
+         `src/`, `**/*.rs` matches at any depth. To narrow a broad \
+         search, tighten `path` rather than widening the pattern."
     )
 });
 
@@ -57,7 +68,7 @@ impl Tool for GlobTool {
         json!({
             "type": "object",
             "properties": {
-                "pattern": { "type": "string", "description": "Glob pattern to match" },
+                "pattern": { "type": "string", "description": "Glob pattern to match, relative to `path`" },
                 "path":    { "type": "string", "description": "Absolute directory to search in (required)" }
             },
             "required": ["pattern", "path"]
@@ -65,9 +76,9 @@ impl Tool for GlobTool {
     }
 
     fn max_timeout(&self) -> Duration {
-        // Recursive walks against large monorepos can blow past 30 s
-        // even with the SCAN_CAP early-exit; 60 s gives headroom while
-        // still bounding a runaway pattern.
+        // `--sortr=modified` forces a single-threaded traversal, so a
+        // cold-cache walk of a large monorepo can exceed the 30 s
+        // default; 60 s gives headroom.
         Duration::from_secs(60)
     }
 
@@ -91,7 +102,7 @@ impl Tool for GlobTool {
             .unwrap_or_default()
     }
 
-    async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
@@ -104,53 +115,50 @@ impl Tool for GlobTool {
             )));
         }
 
-        let base = p.path;
-        tokio::task::spawn_blocking(move || run_glob(&base, &p.pattern))
-            .await
-            .map_err(|e| ToolError::Execution(format!("join: {e}")))?
+        run_glob(&p, ctx).await
     }
 }
 
-fn run_glob(base: &std::path::Path, pattern: &str) -> crate::Result<ToolOutput> {
-    let full_pattern = base.join(pattern).to_string_lossy().into_owned();
+async fn run_glob(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
+    // `--files` lists files only (never directories); `--glob` filters by
+    // pattern; `--sortr=modified` streams newest-first so truncating the
+    // tail keeps the most recent matches; `--hidden` + `--no-ignore`
+    // mirror a plain filesystem walk (dotfiles included, .gitignore not
+    // applied); `--null` delimits paths unambiguously.
+    let cap = rg::capture(ctx, rg::MAX_STDOUT_BYTES, |cmd| {
+        cmd.arg("--files")
+            .arg("--hidden")
+            .arg("--no-ignore")
+            .arg("--sortr=modified")
+            .arg("--null")
+            .arg("--glob")
+            .arg(&p.pattern)
+            .arg("--")
+            .arg(&p.path);
+    })
+    .await?;
 
-    let paths = glob::glob(&full_pattern)
-        .map_err(|e| ToolError::InvalidParams(format!("glob pattern: {e}")))?;
-
-    let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-    let mut truncated = false;
-    for entry in paths {
-        let path = match entry {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let Ok(meta) = path.metadata() else { continue };
-        if !meta.is_file() {
-            continue;
-        }
-        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-        entries.push((path, mtime));
-        if entries.len() >= SCAN_CAP {
-            truncated = true;
-            break;
-        }
+    // rg exits 2 both on a bad glob pattern (empty stdout) and on an
+    // unreadable entry hit mid-traversal (partial stdout). Surface the
+    // former; keep the partial listing for the latter, matching the old
+    // filesystem walk that silently skipped unreadable entries.
+    if cap.code >= 2 && cap.stdout.is_empty() {
+        return Err(cap.into_error());
     }
 
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
-    if entries.len() > MAX_RESULTS {
-        truncated = true;
+    let mut paths: Vec<String> = rg::iter_null_paths(&cap.stdout).collect();
+    if paths.is_empty() {
+        return Ok(ToolOutput::Text(NO_MATCHES_MESSAGE.to_string()));
     }
-    entries.truncate(MAX_RESULTS);
 
-    let mut lines: Vec<String> = entries
-        .into_iter()
-        .map(|(p, _)| p.to_string_lossy().into_owned())
-        .collect();
+    let truncated = paths.len() > MAX_RESULTS;
+    paths.truncate(MAX_RESULTS);
     if truncated {
-        lines.push(format!("… [truncated to {MAX_RESULTS}]"));
+        paths.push(format!(
+            "… [truncated to {MAX_RESULTS} results — narrow the `path` or use a more specific pattern]"
+        ));
     }
-
-    Ok(ToolOutput::Text(lines.join("\n")))
+    Ok(ToolOutput::Text(paths.join("\n")))
 }
 
 #[cfg(test)]
@@ -233,5 +241,72 @@ mod tests {
         assert!(s.contains("a.rs"));
         assert!(s.contains("b.rs"));
         assert!(!s.contains("c.txt"));
+    }
+
+    /// A bare `*` matches file basenames at any depth (ripgrep semantics).
+    /// Regression: the old `glob` crate treated `*` as non-recursive, so
+    /// a directory whose top level held only subdirectories returned
+    /// nothing — the empty result that motivated the rg backend.
+    #[tokio::test]
+    async fn star_matches_files_at_any_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("deep.rs"), "").await.unwrap();
+
+        let out = GlobTool
+            .execute(json!({ "pattern": "*", "path": dir.path() }), &ctx())
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else {
+            panic!();
+        };
+        assert!(s.contains("deep.rs"), "expected recursive match, got: {s}");
+        assert_ne!(s, NO_MATCHES_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn extension_pattern_matches_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("a").join("b");
+        tokio::fs::create_dir_all(&sub).await.unwrap();
+        tokio::fs::write(dir.path().join("top.rs"), "")
+            .await
+            .unwrap();
+        tokio::fs::write(sub.join("low.rs"), "").await.unwrap();
+        tokio::fs::write(sub.join("note.txt"), "").await.unwrap();
+
+        let out = GlobTool
+            .execute(json!({ "pattern": "*.rs", "path": dir.path() }), &ctx())
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else {
+            panic!();
+        };
+        assert!(s.contains("top.rs"));
+        assert!(s.contains("low.rs"));
+        assert!(!s.contains("note.txt"));
+    }
+
+    /// Empty result carries an explicit sentinel, never a bare empty
+    /// string — the ambiguity that made a real empty glob look broken.
+    #[tokio::test]
+    async fn empty_result_reports_no_files_found() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("a.txt"), "")
+            .await
+            .unwrap();
+
+        let out = GlobTool
+            .execute(
+                json!({ "pattern": "*.nomatch", "path": dir.path() }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else {
+            panic!();
+        };
+        assert_eq!(s, NO_MATCHES_MESSAGE);
     }
 }
