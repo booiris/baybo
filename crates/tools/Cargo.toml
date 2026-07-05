@@ -49,7 +49,6 @@ tracing = { workspace = true }
 tokio-util = { workspace = true }
 libc = { workspace = true }
 anyhow = { workspace = true }
-glob = { workspace = true }
 shell-words = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }

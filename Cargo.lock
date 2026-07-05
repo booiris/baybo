@@ -1065,7 +1065,6 @@ dependencies = [
  "dashmap",
  "dom_smoothie",
  "futures",
- "glob",
  "hex",
  "htmd",
  "iana-time-zone",
