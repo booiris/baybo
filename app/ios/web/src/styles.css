@@ -42,8 +42,9 @@
   color: var(--color-ink);
   background: var(--color-paper);
   -webkit-font-smoothing: antialiased;
-  /* Native-app feel: no web-style text selection or iOS long-press callout
-     anywhere (user-select + touch-callout inherit, so :root covers the tree). */
+  /* Native-app feel: chrome carries no web-style text selection or iOS
+     long-press callout (user-select + touch-callout inherit, so :root covers
+     the tree); the message content opts back in below so it's copyable. */
   -webkit-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;
@@ -52,10 +53,24 @@
 * { box-sizing: border-box; }
 body { margin: 0; }
 
-/* Don't let images be drag-ghosted out of the (otherwise native-feeling) app. */
+/* Don't let images be drag-ghosted out of the (otherwise native-feeling) app,
+   and keep the save/copy callout off even inside now-selectable message rows. */
 img {
   -webkit-user-drag: none;
   user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* Transcript content is selectable + carries the iOS long-press Copy callout
+   (the counterpart to :root's global off): user bubbles, assistant prose, and
+   the work-block step text. Chrome outside these — header, composer, the
+   "Worked Xs" toggle, buttons — stays inert. */
+.bubble,
+.msg,
+.work-steps {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
 }
 
 button {
