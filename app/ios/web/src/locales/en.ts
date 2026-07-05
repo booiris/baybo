@@ -10,7 +10,12 @@ export const en = {
       recoverFailed: "Couldn't reload history: {{error}}",
       working: "Working",
       worked: "Worked",
-      workedFor: "Worked {{s}}s",
+      workedFor: "Worked {{dur}}",
+      durS: "{{s}}s",
+      durM: "{{m}}m",
+      durMS: "{{m}}m {{s}}s",
+      durH: "{{h}}h",
+      durHM: "{{h}}h {{m}}m",
     },
   },
 };

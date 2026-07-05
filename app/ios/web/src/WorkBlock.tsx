@@ -4,23 +4,43 @@ import { useTranslation } from "react-i18next";
 import { MarkdownBody } from "./Markdown";
 import type { WorkRow, WorkStep } from "./types";
 
-/// Live seconds counter for an open work block; suppressed below 1s so quick
+/// Humanized duration: seconds under a minute, "Xm Ys" under an hour,
+/// "Xh Ym" beyond (seconds dropped at hour scale).
+function formatDuration(t: TFunction, ms: number): string {
+  const total = Math.round(ms / 1000);
+  if (total < 60) return t("chat.durS", { s: total });
+  if (total < 3600) {
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return s > 0 ? t("chat.durMS", { m, s }) : t("chat.durM", { m });
+  }
+  let h = Math.floor(total / 3600);
+  let m = Math.round((total % 3600) / 60);
+  if (m === 60) {
+    h += 1;
+    m = 0;
+  }
+  return m > 0 ? t("chat.durHM", { h, m }) : t("chat.durH", { h });
+}
+
+/// Live elapsed counter for an open work block; suppressed below 1s so quick
 /// turns don't flash "0s".
 function LiveElapsed({ startedAt }: { startedAt?: number }) {
+  const { t } = useTranslation();
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
   if (startedAt === undefined) return null;
-  const s = Math.floor((now - startedAt) / 1000);
-  if (s < 1) return null;
-  return <span className="work-elapsed">{s}s</span>;
+  const ms = now - startedAt;
+  if (ms < 1000) return null;
+  return <span className="work-elapsed">{formatDuration(t, ms)}</span>;
 }
 
 function workedLabel(t: TFunction, elapsedMs?: number): string {
   if (elapsedMs !== undefined && elapsedMs >= 1000) {
-    return t("chat.workedFor", { s: Math.round(elapsedMs / 1000) });
+    return t("chat.workedFor", { dur: formatDuration(t, elapsedMs) });
   }
   return t("chat.worked");
 }
