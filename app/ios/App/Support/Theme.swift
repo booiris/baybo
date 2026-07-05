@@ -62,6 +62,9 @@ struct OutlinePillButtonStyle: ButtonStyle {
             .foregroundStyle(color)
             .padding(.vertical, 14)
             .frame(maxWidth: .infinity)
+            // Stroke-only pill: without an explicit shape the transparent
+            // interior doesn't hit-test, leaving only the text column tappable.
+            .contentShape(Capsule())
             .overlay(Capsule().strokeBorder(color, lineWidth: 1))
             .opacity(configuration.isPressed ? 0.7 : 1)
             .scaleEffect(configuration.isPressed ? 0.98 : 1)
@@ -93,6 +96,8 @@ struct LinkButtonStyle: ButtonStyle {
             .foregroundStyle(Theme.inkSoft)
             .padding(.horizontal, 13)
             .frame(minHeight: 44)
+            // The 44pt target is the point: hit-test the padding, not the glyphs.
+            .contentShape(Rectangle())
             .opacity(configuration.isPressed ? 0.6 : 1)
     }
 }
