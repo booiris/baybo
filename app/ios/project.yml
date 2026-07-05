@@ -39,6 +39,10 @@ schemes:
         Baybo: all
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - BayboUITests
     profile:
       config: Release
     archive:
@@ -104,6 +108,21 @@ targets:
           - group.com.baybo.app
         keychain-access-groups:
           - "$(AppIdentifierPrefix)com.baybo.app"
+  # Headless interaction smokes (`xcodebuild test` on a sim) for flows that a
+  # static `-baybo-*` screenshot can't prove — gesture/tap sequences like the
+  # logout-confirm dismiss-and-reopen loop.
+  BayboUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: Baybo
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.baybo.app.UITests
+        TEST_TARGET_NAME: Baybo
+        GENERATE_INFOPLIST_FILE: YES
   NotificationExtension:
     type: app-extension
     platform: iOS

@@ -6,7 +6,6 @@ import SwiftUI
 struct SettingsScreen: View {
     @EnvironmentObject private var appStore: AppStore
     @ObservedObject private var lang = Lang.shared
-    @State private var confirmLogout = false
 
     /// Clearance for the overlaid header; the native tab bar's bottom inset is
     /// handled by the system, so the bottom is just a breathing gap.
@@ -49,29 +48,21 @@ struct SettingsScreen: View {
             .padding(.bottom, Self.bottomInset)
             .background(Theme.paper)
         }
-        .confirmationDialog(
-            Text(verbatim: lang.t("connected.logoutConfirm")),
-            isPresented: $confirmLogout, titleVisibility: .visible
-        ) {
-            Button(role: .destructive) {
-                Haptics.tap()
-                Task { await appStore.logout() }
-            } label: {
-                Text(verbatim: lang.t("connected.logout"))
-            }
-        }
     }
 
+    // No busy gate: presenting the confirm is pure UI (`AppStore.logout()`
+    // guards its own re-entry), and a `.disabled` pill here has no disabled
+    // look — it just reads as a dead button.
     private var logoutButton: some View {
         Button {
-            guard !appStore.busy else { return }
             Haptics.tap()
-            confirmLogout = true
+            withAnimation(ConfirmDialog.enterMotion) {
+                appStore.confirmLogout = true
+            }
         } label: {
             Text(verbatim: lang.t("connected.logout"))
         }
         .buttonStyle(OutlinePillButtonStyle(color: Theme.err))
-        .disabled(appStore.busy)
     }
 
     private func actionRow(

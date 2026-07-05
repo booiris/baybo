@@ -36,9 +36,32 @@ struct RootView: View {
                         }
                 }
             }
+
+            // The logout confirm mounts HERE, above the NavigationStack: the
+            // only layer that dims and hit-blocks the whole shell — Liquid
+            // Glass tab bar included — so a tab switch can't orphan it.
+            if store.confirmLogout {
+                ConfirmDialog(
+                    titleKey: "connected.logout",
+                    bodyKey: "connected.logoutConfirm",
+                    destructiveKey: "connected.logout",
+                    onCancel: dismissLogoutConfirm,
+                    onConfirm: {
+                        dismissLogoutConfirm()
+                        Task { await store.logout() }
+                    }
+                )
+                .zIndex(1)
+            }
         }
         .sheet(isPresented: $store.scanPresented) {
             ScanView()
+        }
+    }
+
+    private func dismissLogoutConfirm() {
+        withAnimation(ConfirmDialog.exitMotion) {
+            store.confirmLogout = false
         }
     }
 }

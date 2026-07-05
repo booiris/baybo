@@ -44,6 +44,12 @@ final class AppStore: ObservableObject {
     /// Non-nil while the pair-confirm screen is up.
     @Published var challenge: PairChallenge?
     @Published var scanPresented = false
+    /// The hand-rolled logout confirm (`ConfirmDialog` in `RootView`). App-shell
+    /// state, not screen state, so the overlay can dim the ENTIRE shell — tab
+    /// bar included — and tab switches can't orphan a system presentation (the
+    /// stock `.confirmationDialog` left `isPresented` latched true after a
+    /// scrim dismiss, deadening the logout button).
+    @Published var confirmLogout = false
     /// Whether the active binding is direct (drives push re-registration).
     @Published private(set) var directBound = false
 
@@ -104,6 +110,11 @@ final class AppStore: ObservableObject {
                 case "settings": homeTab = .settings
                 default: homeTab = .chats
                 }
+            }
+            // `-baybo-demo-logout-confirm`: raise the logout confirm dialog on
+            // arrival so the overlay is screenshotable headlessly.
+            if args.contains("-baybo-demo-logout-confirm") {
+                confirmLogout = true
             }
             route = .home
             return

@@ -17,6 +17,10 @@ enum Theme {
     static let err = Color(red: 0xD4 / 255.0, green: 0, blue: 0)
 
     static let radius: CGFloat = 14
+    /// Floating layers only (the confirm dialog): in-plane inset boxes keep
+    /// `radius`; a floating card scales its corners with elevation, continuous
+    /// curvature, or it reads sharp next to iOS 26 chrome.
+    static let radiusModal: CGFloat = 20
 
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.custom("Space Mono", size: size).weight(weight)
@@ -71,7 +75,7 @@ struct FilledPillButtonStyle: ButtonStyle {
         configuration.label
             .font(Theme.mono(15))
             .foregroundStyle(Theme.paper)
-            .padding(.vertical, 13)
+            .padding(.vertical, 14)
             .padding(.horizontal, 19)
             .frame(maxWidth: .infinity)
             .background(Theme.ink, in: Capsule())
