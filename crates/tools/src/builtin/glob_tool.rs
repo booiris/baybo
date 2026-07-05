@@ -120,21 +120,48 @@ impl Tool for GlobTool {
 }
 
 async fn run_glob(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
+    // rg matches `--glob` against each candidate path relative to its own
+    // working directory, so we run rg *inside* the search root and search
+    // `.` rather than passing the root as an argument — otherwise an
+    // anchored pattern like `src/*.rs` is matched against baybo's CWD and
+    // finds nothing. Validate the root up front so a missing directory
+    // reports clearly instead of the chdir failure surfacing (via ENOENT)
+    // as the misleading "rg not found".
+    match tokio::fs::metadata(&p.path).await {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(ToolError::InvalidParams(format!(
+                "Glob `path` is not a directory: {}",
+                p.path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(ToolError::InvalidParams(format!(
+                "Glob `path` does not exist: {} ({e})",
+                p.path.display()
+            )));
+        }
+    }
+
+    // rg does not normalize a leading `./`, so `./*.rs` would match
+    // nothing; strip it so these valid relative patterns behave like their
+    // plain form (the old filesystem-join walk accepted them).
+    let pattern = p.pattern.trim_start_matches("./");
+
     // `--files` lists files only (never directories); `--glob` filters by
     // pattern; `--sortr=modified` streams newest-first so truncating the
     // tail keeps the most recent matches; `--hidden` + `--no-ignore`
     // mirror a plain filesystem walk (dotfiles included, .gitignore not
     // applied); `--null` delimits paths unambiguously.
     let cap = rg::capture(ctx, rg::MAX_STDOUT_BYTES, |cmd| {
-        cmd.arg("--files")
+        cmd.current_dir(&p.path)
+            .arg("--files")
             .arg("--hidden")
             .arg("--no-ignore")
             .arg("--sortr=modified")
             .arg("--null")
             .arg("--glob")
-            .arg(&p.pattern)
-            .arg("--")
-            .arg(&p.path);
+            .arg(pattern);
     })
     .await?;
 
@@ -146,7 +173,11 @@ async fn run_glob(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         return Err(cap.into_error());
     }
 
-    let mut paths: Vec<String> = rg::iter_null_paths(&cap.stdout).collect();
+    // rg prints paths relative to its CWD (the search root); restore the
+    // absolute paths callers expect.
+    let mut paths: Vec<String> = rg::iter_null_paths(&cap.stdout)
+        .map(|rel| p.path.join(rel).to_string_lossy().into_owned())
+        .collect();
     if paths.is_empty() {
         return Ok(ToolOutput::Text(NO_MATCHES_MESSAGE.to_string()));
     }
@@ -180,6 +211,13 @@ mod tests {
             workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             ..ToolContext::for_test()
         }
+    }
+
+    async fn text(params: Value) -> String {
+        let ToolOutput::Text(s) = GlobTool.execute(params, &ctx()).await.unwrap() else {
+            panic!("expected text output");
+        };
+        s
     }
 
     #[tokio::test]
@@ -286,6 +324,58 @@ mod tests {
         assert!(s.contains("top.rs"));
         assert!(s.contains("low.rs"));
         assert!(!s.contains("note.txt"));
+    }
+
+    /// An anchored pattern (one containing `/`) must match relative to
+    /// `path`, not to baybo's process CWD. Regression: rg matches `--glob`
+    /// relative to its working directory, so `src/*.rs` found nothing
+    /// until rg was run inside the search root.
+    #[tokio::test]
+    async fn anchored_pattern_is_relative_to_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("src").join("deep");
+        tokio::fs::create_dir_all(&deep).await.unwrap();
+        tokio::fs::write(dir.path().join("top.rs"), "")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("src").join("inner.rs"), "")
+            .await
+            .unwrap();
+        tokio::fs::write(deep.join("low.rs"), "").await.unwrap();
+
+        // One level under src/: only inner.rs.
+        let s = text(json!({ "pattern": "src/*.rs", "path": dir.path() })).await;
+        assert!(s.contains("inner.rs"), "src/*.rs missed inner.rs: {s}");
+        assert!(!s.contains("top.rs"), "src/*.rs leaked top.rs: {s}");
+        assert!(!s.contains("low.rs"), "src/*.rs leaked nested low.rs: {s}");
+
+        // Any depth under src/: inner.rs and low.rs, but not top.rs.
+        let s = text(json!({ "pattern": "src/**/*.rs", "path": dir.path() })).await;
+        assert!(s.contains("inner.rs"), "src/**/*.rs missed inner.rs: {s}");
+        assert!(s.contains("low.rs"), "src/**/*.rs missed low.rs: {s}");
+        assert!(!s.contains("top.rs"), "src/**/*.rs leaked top.rs: {s}");
+    }
+
+    /// A leading `./` is a valid relative pattern the old walk accepted,
+    /// but ripgrep's `--glob` matches it literally and finds nothing;
+    /// [`run_glob`] strips it so these patterns keep working.
+    #[tokio::test]
+    async fn leading_dot_slash_pattern_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(dir.path().join("src")).await.unwrap();
+        tokio::fs::write(dir.path().join("top.rs"), "")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("src").join("inner.rs"), "")
+            .await
+            .unwrap();
+
+        let s = text(json!({ "pattern": "./*.rs", "path": dir.path() })).await;
+        assert!(s.contains("top.rs"), "./*.rs missed top.rs: {s}");
+
+        let s = text(json!({ "pattern": "./src/**/*.rs", "path": dir.path() })).await;
+        assert!(s.contains("inner.rs"), "./src/**/*.rs missed inner.rs: {s}");
+        assert!(!s.contains("top.rs"), "./src/**/*.rs leaked top.rs: {s}");
     }
 
     /// Empty result carries an explicit sentinel, never a bare empty
