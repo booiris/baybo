@@ -13,11 +13,10 @@ struct SessionRow: Codable, Identifiable, Equatable {
     var pinned: Bool
 }
 
-/// The device-local session registry backing the chat list on BOTH legs — the
-/// relay wire protocol cannot list sessions (ids are client-minted), so the
-/// list's single rendering source lives here, and a direct binding enriches it
-/// from `GET /v1/chat/sessions`. Rows persist as one small JSON file in
-/// Application Support; transcript mirrors live next to it (`TranscriptStore`).
+/// The device-local session registry backing the chat list on BOTH legs. Remote
+/// refreshes from direct REST or the relay API tunnel merge into this same
+/// rendering source. Rows persist as one small JSON file in Application Support;
+/// transcript mirrors live next to it (`TranscriptStore`).
 @MainActor
 final class SessionIndex: ObservableObject {
     static let shared = SessionIndex()
@@ -62,9 +61,9 @@ final class SessionIndex: ObservableObject {
     }
 
     /// A user message left this device: capture the preview + activity locally
-    /// so the list is correct even where REST can't refresh it (relay leg,
-    /// offline). An attachment-only send (empty text) bumps activity but keeps
-    /// the previous preview.
+    /// so the list is correct even where remote refresh is unavailable
+    /// (offline/failed tunnel). An attachment-only send (empty text) bumps
+    /// activity but keeps the previous preview.
     func recordUserSend(sessionId: String, text: String) {
         let preview = String(text.prefix(Self.previewMaxChars))
         let now = Date()

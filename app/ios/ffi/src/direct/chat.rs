@@ -15,7 +15,6 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
-use super::rest;
 use crate::core::{Frame, MobileError, decode, encode, register_device_frame, user_message_frame};
 use crate::transport::{
     ChatTransport, Connection, FrameCodec, SessionLeg, TransportError, UserFrameFn, WsStream,
@@ -82,13 +81,6 @@ impl super::DirectSessions {
             Err(DialErr::Other(s)) => Err(TransportError::Other(s)),
         }
     }
-}
-
-/// Create a fresh chat session and return the id.
-pub(crate) async fn session_create(sessions: &super::DirectSessions) -> Result<String, String> {
-    let http = sessions.http_client()?;
-    let cred = rest::create_session(&http).await?;
-    Ok(cred.session_id)
 }
 
 impl SessionLeg for super::DirectSessions {

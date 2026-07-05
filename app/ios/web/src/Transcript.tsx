@@ -1,8 +1,8 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+  blobObjectUrl,
   fetchHistory,
-  imageObjectUrl,
   log,
   persistState,
   postJumpVisible,
@@ -115,7 +115,7 @@ function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
 /// on device), wraps it in an object URL, shows a spinner while loading and a
 /// tap-to-retry on failure. The old in-session previewUrl short-circuit is
 /// gone — native previews don't cross the bridge, so a just-sent image renders
-/// by fetching its own bytes back over requestImage (device-cached, so fast).
+/// by fetching its own bytes back over requestBlob (device-cached, so fast).
 function AttachmentImage({
   attachment,
   connEpoch,
@@ -138,7 +138,7 @@ function AttachmentImage({
     failedRef.current = false;
     setFailed(false);
     setUrl(null);
-    imageObjectUrl(attachment.blob_id, attachment.mime_type)
+    blobObjectUrl(attachment.blob_id, attachment.mime_type)
       .then((u) => {
         if (cancelled) {
           URL.revokeObjectURL(u);

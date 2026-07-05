@@ -24,8 +24,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
 snow = { workspace = true }
-uuid = { workspace = true }
 sha2 = { workspace = true }
+bytes = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }

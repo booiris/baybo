@@ -253,15 +253,15 @@ final class ChatStore: ObservableObject {
         }
     }
 
-    func requestImage(id: Int, blobId: String) {
+    func requestBlob(id: Int, blobId: String) {
         Task {
             do {
-                let bytes = try await Baybo.client.blobImage(blobId: blobId)
-                bridge?.imageResult(
+                let bytes = try await Baybo.client.blobDownloadBytes(blobId: blobId)
+                bridge?.blobResult(
                     id: id, dataBase64: bytes.base64EncodedString(),
-                    mimeType: mimeTypeForImage(bytes), error: nil)
+                    mimeType: sniffBlobMimeType(bytes), error: nil)
             } catch {
-                bridge?.imageResult(
+                bridge?.blobResult(
                     id: id, dataBase64: nil, mimeType: "", error: bayboErrorText(error))
             }
         }
@@ -269,14 +269,14 @@ final class ChatStore: ObservableObject {
 
     /// Cheap magic-byte sniff so the webview can build a typed Blob; the exact
     /// subtype only matters for the object URL, so `image/*` fallbacks are fine.
-    private func mimeTypeForImage(_ data: Data) -> String {
+    private func sniffBlobMimeType(_ data: Data) -> String {
         if data.starts(with: [0xFF, 0xD8, 0xFF]) { return "image/jpeg" }
         if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "image/png" }
         if data.starts(with: [0x47, 0x49, 0x46]) { return "image/gif" }
         if data.count > 11, data[8...11] == Data([0x57, 0x45, 0x42, 0x50]) {
             return "image/webp"
         }
-        return "application/octet-stream"
+        return ""
     }
 
     /// The per-dial frame sink. Callbacks arrive on the core's tokio workers;

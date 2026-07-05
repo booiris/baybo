@@ -27,12 +27,12 @@ serde_json = "1"
 thiserror = "2"
 hex = "0.4"
 snow = "0.9"
-# Client-minted relay chat-session ids (the relay leg needs no gateway pre-registration).
-uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+bytes = "1"
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls-no-provider",
+    "stream",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "fs", "io-util"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

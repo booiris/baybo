@@ -114,13 +114,12 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   list (the "list slides right then rubber-bands" glitch; stock Settings
   does the same, it just hides it better).
 - **Chat list data**: `SessionIndex` (Application Support/baybo/sessions.json)
-  is the device-local registry backing the list on BOTH legs — the relay wire
-  protocol cannot list sessions (client-minted ids), so local rows are the
-  single rendering source, updated at send time. A direct binding merges
-  `chat_list_sessions()` (REST `GET /v1/chat/sessions`, stored Bearer plus
-  `x-baybo-device-id`) over it on appear/foreground/pull; remote wins for
-  existence (a row missing remotely was hidden elsewhere) unless the local row
-  saw newer activity. Per-session transcript mirrors live in
+  is the device-local registry backing the list on BOTH legs. Both direct and
+  relay merge `chat_list_sessions()` over it on appear/foreground/pull: direct
+  uses REST `GET /v1/chat/sessions` with the stored Bearer plus
+  `x-baybo-device-id`, while relay uses the Noise-protected API tunnel. Remote
+  wins for existence (a row missing remotely was hidden elsewhere) unless the
+  local row saw newer activity. Per-session transcript mirrors live in
   `Application Support/baybo/transcripts/<id>.json`
   (pruned to the ~10 most recent); the legacy single-session UserDefaults keys
   (`ChatDefaults`) are migrated once and retired.
@@ -154,9 +153,9 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   400ms; the core coalesces concurrent dials.
 - **Bridge** (`App/Web/TranscriptBridge.swift` ⇄ `web/src/bridge.ts`):
   native→web
-  `init/pushFrame/setConnEpoch/userSent/imageResult/setLanguage/setBottomInset/jumpToLatest`;
+  `init/pushFrame/setConnEpoch/userSent/blobResult/setLanguage/setBottomInset/jumpToLatest`;
   web→native
-  `ready/ordinal/persist/fetchHistory/requestImage/openUrl/log/jumpVisible`.
+  `ready/ordinal/persist/fetchHistory/requestBlob/openUrl/log/jumpVisible`.
   Transcript persistence lives in UserDefaults (`ChatDefaults.*`), NOT webview
   localStorage (file:// storage is unreliable and upgrade-fragile).
 - **Keyboard**: the transcript webview is FULL-BLEED and its frame never

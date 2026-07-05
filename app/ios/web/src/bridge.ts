@@ -18,7 +18,7 @@ export type UserSentPayload = {
   attachments: WireAttachment[];
 };
 
-type ImageResultPayload = {
+type BlobResultPayload = {
   id: number;
   dataBase64: string | null;
   mimeType: string;
@@ -30,7 +30,7 @@ type BayboGlobal = {
   pushFrame(frameJson: string): void;
   setConnEpoch(epoch: number): void;
   userSent(payload: UserSentPayload): void;
-  imageResult(payload: ImageResultPayload): void;
+  blobResult(payload: BlobResultPayload): void;
   setLanguage(lang: string): void;
   setBottomInset(px: number): void;
   jumpToLatest(): void;
@@ -140,10 +140,10 @@ export function persistState(state: PersistedState): void {
 // A backgrounded WKWebView can be torn down before the debounce fires.
 window.addEventListener("pagehide", flushPersist);
 
-// ---- image fetch (replaces invoke("blob_image")) ---------------------------
+// ---- blob fetch ------------------------------------------------------------
 
-let imageReqId = 0;
-const imagePending = new Map<
+let blobReqId = 0;
+const blobPending = new Map<
   number,
   { resolve: (url: string) => void; reject: (err: Error) => void; fallbackMime: string }
 >();
@@ -151,27 +151,27 @@ const imagePending = new Map<
 /// Fetch attachment bytes via native (device-cached blob leg) and wrap them in
 /// an object URL for an <img> src. The caller owns the URL and must
 /// URL.revokeObjectURL it when done.
-export function imageObjectUrl(blobId: string, mimeType: string): Promise<string> {
+export function blobObjectUrl(blobId: string, mimeType: string): Promise<string> {
   if (!native) return Promise.reject(new Error("no native bridge"));
-  imageReqId += 1;
-  const id = imageReqId;
+  blobReqId += 1;
+  const id = blobReqId;
   return new Promise((resolve, reject) => {
-    imagePending.set(id, { resolve, reject, fallbackMime: mimeType });
+    blobPending.set(id, { resolve, reject, fallbackMime: mimeType });
     try {
-      post({ type: "requestImage", id, blobId });
+      post({ type: "requestBlob", id, blobId });
     } catch (e) {
-      imagePending.delete(id);
+      blobPending.delete(id);
       reject(new Error(String(e)));
     }
   });
 }
 
-function settleImage(payload: ImageResultPayload): void {
-  const pending = imagePending.get(payload.id);
+function settleBlob(payload: BlobResultPayload): void {
+  const pending = blobPending.get(payload.id);
   if (!pending) return;
-  imagePending.delete(payload.id);
+  blobPending.delete(payload.id);
   if (payload.dataBase64 === null) {
-    pending.reject(new Error(payload.error ?? "image fetch failed"));
+    pending.reject(new Error(payload.error ?? "blob fetch failed"));
     return;
   }
   try {
@@ -271,8 +271,8 @@ window.baybo = {
   userSent(payload) {
     dispatch({ kind: "userSent", payload });
   },
-  imageResult(payload) {
-    settleImage(payload);
+  blobResult(payload) {
+    settleBlob(payload);
   },
   setLanguage(lang) {
     onLanguageCb?.(lang);

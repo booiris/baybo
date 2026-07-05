@@ -3,25 +3,25 @@
 //! [`login`]/[`status`]/[`logout`] (this file) validate + persist the gateway
 //! base URL + gateway access token. The chat transport ([`chat`]) uses that same
 //! Bearer plus a stable device id header to speak the raw-MessagePack
-//! `/v1/channel-ws` protocol while attachments ([`blob`]) go over plain
-//! `/v1/blobs` with the same device identity.
+//! `/v1/channel-ws` protocol. HTTP-shaped chat metadata and blob calls reuse
+//! one authenticated client via [`crate::gateway_api`].
 //! This whole path deliberately bypasses the relay + Noise E2E design the
 //! scan-to-pair flow uses (see `pairing.rs`).
 
 mod blob;
 mod chat;
 mod push;
-mod rest;
 
-pub(crate) use blob::{image_data, upload_bytes};
-pub(crate) use chat::{forget, session_create};
+pub(crate) use blob::download_blob_bytes;
+pub(crate) use chat::forget;
 pub(crate) use push::register as register_push;
 
 use parking_lot::Mutex;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::api::ChatSessionSummary;
+use crate::gateway_api::GatewayJsonClient;
 use crate::keychain;
 use crate::transport::SessionRegistry;
 
@@ -126,6 +126,60 @@ impl DirectHttp {
     pub(crate) fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
+}
+
+#[allow(clippy::manual_async_fn)]
+impl GatewayJsonClient for DirectHttp {
+    fn get_json<'a, T>(
+        &'a self,
+        path: &'a str,
+    ) -> impl std::future::Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        async move {
+            let resp = self
+                .client()
+                .get(self.url(path))
+                .send()
+                .await
+                .map_err(|e| format!("could not reach Baybo: {e}"))?;
+            parse_json_response(resp).await
+        }
+    }
+
+    fn post_json<'a, T>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<T, String>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        async move {
+            let resp = self
+                .client()
+                .post(self.url(path))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| format!("could not reach Baybo: {e}"))?;
+            parse_json_response(resp).await
+        }
+    }
+}
+
+async fn parse_json_response<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T, String> {
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(INVALID_TOKEN_CODE.into());
+    }
+    if !resp.status().is_success() {
+        return Err(format!("Baybo returned HTTP {}", resp.status().as_u16()));
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("decode response: {e}"))
 }
 
 impl DirectHttpCache {
@@ -246,26 +300,6 @@ pub(crate) async fn login(
 /// The current direct connection's base URL, if credentials are persisted.
 pub(crate) fn status() -> Result<Option<String>, String> {
     Ok(credentials()?.map(|c| c.base_url))
-}
-
-/// List the gateway's chat sessions over REST (the web sidebar's list, hidden +
-/// cron filtered). Direct-only: the relay wire protocol has no list frame, so
-/// the app renders its device-local registry there instead.
-pub(crate) async fn sessions_list(
-    sessions: &DirectSessions,
-) -> Result<Vec<ChatSessionSummary>, String> {
-    let http = sessions.http_client()?;
-    let items = rest::list_sessions(&http).await?;
-    Ok(items
-        .into_iter()
-        .map(|s| ChatSessionSummary {
-            session_id: s.session_id,
-            created_at: s.created_at,
-            last_active: s.last_active,
-            last_user_text: s.last_user_text,
-            pinned: s.pinned,
-        })
-        .collect())
 }
 
 /// Forget the direct-connection credentials.

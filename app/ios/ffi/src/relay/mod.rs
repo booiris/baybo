@@ -14,8 +14,7 @@ mod dial;
 mod pairing;
 mod tunnel;
 
-pub(crate) use api::sessions_list;
-pub(crate) use blob::{image_data, upload_bytes};
+pub(crate) use api::GatewayApi;
 pub(crate) use chat::RelaySessions;
 pub(crate) use pairing::{
     PairingSessions, forget_pairing, has_pairing, pair_begin, pair_confirm, paired_device,

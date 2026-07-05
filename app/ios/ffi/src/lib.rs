@@ -13,8 +13,10 @@
 mod api;
 mod apns;
 mod binding;
+mod blob_helper;
 mod core;
 mod direct;
+mod gateway_api;
 mod keychain;
 mod logging;
 mod qr;
@@ -179,15 +181,17 @@ impl BayboClient {
         .await
     }
 
-    /// Create a fresh chat session for the active binding and return its id. Direct
-    /// creates a gateway session over REST (the id is server-assigned and the
-    /// stored Bearer continues to authorize WS/blob legs); relay picks a fresh
-    /// client id (the relay leg needs no gateway pre-registration).
+    /// Create a fresh chat session for the active binding and return its id. Both
+    /// direct and relay use the gateway API (`POST /v1/chat/sessions`); direct
+    /// reaches it over REST, relay through the Noise-protected API tunnel.
     pub async fn chat_create_session(self: Arc<Self>) -> Result<String, BayboError> {
         runtime::run(async move {
             match active_leg()? {
-                ActiveLeg::Direct => direct::session_create(&self.direct).await,
-                ActiveLeg::Relay => Ok(uuid::Uuid::new_v4().to_string()),
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::create_session(&client).await
+                }
+                ActiveLeg::Relay => gateway_api::create_session(&relay::GatewayApi).await,
             }
         })
         .await
@@ -202,8 +206,11 @@ impl BayboClient {
     ) -> Result<Vec<ChatSessionSummary>, BayboError> {
         runtime::run(async move {
             match active_leg()? {
-                ActiveLeg::Direct => direct::sessions_list(&self.direct).await,
-                ActiveLeg::Relay => relay::sessions_list().await,
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::list_sessions(&client).await
+                }
+                ActiveLeg::Relay => gateway_api::list_sessions(&relay::GatewayApi).await,
             }
         })
         .await
@@ -320,7 +327,7 @@ impl BayboClient {
         .await;
     }
 
-    /// Upload a picked image's raw bytes over the active binding's blob
+    /// Upload a picked attachment's raw bytes over the active binding's blob
     /// transport. Relay sends `POST /v1/blobs` over a dedicated E2E API tunnel
     /// blob leg; direct POSTs to plain `/v1/blobs` (Bearer + device id).
     /// Returns the content-addressed `blob_id` to reference in the next message.
@@ -331,8 +338,13 @@ impl BayboClient {
     ) -> Result<String, BayboError> {
         runtime::run(async move {
             match active_leg()? {
-                ActiveLeg::Relay => relay::upload_bytes(bytes, mime_type).await,
-                ActiveLeg::Direct => direct::upload_bytes(&self.direct, bytes, mime_type).await,
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::upload_bytes(&client, bytes, mime_type).await
+                }
+                ActiveLeg::Relay => {
+                    gateway_api::upload_bytes(&relay::GatewayApi, bytes, mime_type).await
+                }
             }
         })
         .await
@@ -343,11 +355,16 @@ impl BayboClient {
     /// over a dedicated E2E API tunnel blob leg into a content-addressed
     /// on-device cache (reused on the next render); direct GETs plain
     /// `/v1/blobs/{id}` (Bearer + device id).
-    pub async fn blob_image(self: Arc<Self>, blob_id: String) -> Result<Vec<u8>, BayboError> {
+    pub async fn blob_download_bytes(
+        self: Arc<Self>,
+        blob_id: String,
+    ) -> Result<Vec<u8>, BayboError> {
         runtime::run(async move {
             match active_leg()? {
-                ActiveLeg::Relay => relay::image_data(blob_id).await,
-                ActiveLeg::Direct => direct::image_data(&self.direct, blob_id).await,
+                ActiveLeg::Direct => direct::download_blob_bytes(&self.direct, blob_id).await,
+                ActiveLeg::Relay => {
+                    gateway_api::download_blob_bytes(&relay::GatewayApi, blob_id).await
+                }
             }
         })
         .await

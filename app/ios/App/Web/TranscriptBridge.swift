@@ -72,14 +72,14 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("userSent", jsonObjectLiteral(payload))
     }
 
-    func imageResult(id: Int, dataBase64: String?, mimeType: String, error: String?) {
+    func blobResult(id: Int, dataBase64: String?, mimeType: String, error: String?) {
         let payload: [String: Any] = [
             "id": id,
             "dataBase64": dataBase64 as Any,
             "mimeType": mimeType,
             "error": error as Any,
         ]
-        call("imageResult", jsonObjectLiteral(payload))
+        call("blobResult", jsonObjectLiteral(payload))
     }
 
     func setLanguage(_ lang: String) {
@@ -265,11 +265,11 @@ extension TranscriptBridge: WKScriptMessageHandler {
             let before = (body["beforeOrdinal"] as? NSNumber)?.int64Value
             let limit = (body["limit"] as? NSNumber)?.uint32Value ?? 50
             store?.fetchHistory(beforeOrdinal: before, limit: limit)
-        case "requestImage":
+        case "requestBlob":
             if let id = (body["id"] as? NSNumber)?.intValue,
                 let blobId = body["blobId"] as? String
             {
-                store?.requestImage(id: id, blobId: blobId)
+                store?.requestBlob(id: id, blobId: blobId)
             }
         case "jumpVisible":
             jumpVisible = (body["visible"] as? Bool) ?? false

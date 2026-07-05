@@ -27,8 +27,9 @@ additional `BlobStore` surface.
 The mobile chat-view UI is now wired (`app/mobile/src/App.tsx` + `blob.ts`): an
 `accept="image/*"` picker stages picked images and uploads them over a blob leg
 (`blob_upload_bytes`, raw IPC body since iOS hands the webview `File` bytes, not a path),
+successful uploads seed the same content-addressed on-device cache used by downloads,
 the outgoing `Frame::Message` carries the resulting `WireAttachment`s, and inbound/restored
-image attachments render via a download-to-cache + object-URL component (`blob_image`).
+image attachments render via a download-to-cache + object-URL component (`blob_download_bytes`).
 
 The shape in one line: a **dedicated relay leg per blob transfer** (separate TCP + Noise +
 pump from chat), metered against the **same** per-tenant bandwidth budget as chat but as a

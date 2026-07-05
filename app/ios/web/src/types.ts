@@ -1,6 +1,6 @@
 /** A media reference carried on a chat message — mirrors the Rust
  * `wire::WireAttachment` (snake_case fields). The bytes never ride the message;
- * only this id does — fetch them with `imageObjectUrl` in bridge.ts. */
+ * only this id does — fetch them with `blobObjectUrl` in bridge.ts. */
 export type WireAttachment = {
   kind: "image" | "audio" | "file";
   blob_id: string;

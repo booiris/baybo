@@ -1,6 +1,6 @@
 # Mobile Relay API Tunnel
 
-**Status:** implementation plan / migration in progress.
+**Status:** implementation in progress.
 
 The device relay path currently has a sharp split:
 
@@ -9,18 +9,19 @@ The device relay path currently has a sharp split:
 - Blob upload/download uses dedicated relay blob legs. This migration replaces
   the old bespoke `device_proto::blob` request/response protocol with the API
   tunnel on those same background legs.
-- Direct mode can call gateway REST endpoints such as `GET /v1/chat/sessions`,
-  but relay mode cannot list sessions because the relay wire protocol has no
-  list operation and the phone cannot reach the NAT'd gateway's HTTP listener.
+- Direct mode calls gateway REST endpoints such as `GET /v1/chat/sessions`.
+- Relay mode reaches mobile-safe HTTP-shaped endpoints through the API tunnel;
+  session list/create and blob upload/download now use tunneled requests while
+  later mobile REST features are still being migrated.
 
-This doc proposes a general **API tunnel** for paired mobile clients: the app
+This doc tracks the general **API tunnel** for paired mobile clients: the app
 presents URL-shaped requests internally, while the transport carries raw
 binary request/response streams over dedicated WebSocket relay data legs wrapped
 in the existing Noise IK device authentication.
 
-The goal is to solve session listing without adding chat `Frame` variants, and
-to make blob transfer ordinary streaming HTTP-shaped traffic over the same
-tunnel protocol.
+The tunnel lets relay-bound devices use session listing and blob transfer
+without adding chat `Frame` variants; future mobile REST features can reuse the
+same request shape.
 
 ## Goals
 
@@ -172,7 +173,7 @@ Native Swift code can then call typed wrappers:
 - `chat_list_sessions()`
 - `chat_get_session(session_id, before_ordinal, limit)`
 - `blob_upload_bytes(bytes, mime_type)`
-- `blob_image(blob_id)`
+- `blob_download_bytes(blob_id)`
 - eventually, `update_apns_token(apns_token, apns_env)`
 
 Those wrappers hide whether the active binding is direct or relay.
@@ -380,12 +381,11 @@ Do not remove:
 
 3. Refactor typed wrappers to use the request abstraction.
    - `chat_list_sessions()` no longer errors on relay
-   - `chat_create_session()` can either keep client-minted relay ids or move to
-     a tunneled `POST /v1/chat/sessions` once mobile session semantics are
-     settled
+   - `chat_create_session()` uses the same `POST /v1/chat/sessions` wrapper on
+     direct and relay; relay reaches it over an API tunnel leg
    - cut `UpdateApnsToken` over to the tunneled token update in the final APNs
      migration change
-   - `blob_upload_bytes()` and `blob_image()` move as part of the blob cutover
+   - `blob_upload_bytes()` and `blob_download_bytes()` move as part of the blob cutover
 
 ## APNs token migration
 
@@ -436,7 +436,7 @@ Device client tests:
 - relay-bound `ChatListScreen.refresh()` populates from the tunnel
 - direct-bound refresh still uses direct REST and preserves behavior
 - local send still updates `SessionIndex` before the network round trip
-- blob image cache still avoids re-downloads
+- blob download cache still avoids re-downloads
 - failed relay API request keeps the local list visible and logs only sanitized
   errors
 
