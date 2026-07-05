@@ -45,6 +45,11 @@ pub fn parse_pair_qr(text: String) -> Option<PairTarget> {
     qr::parse_pair_qr(&text)
 }
 
+#[uniffi::export]
+pub fn new_chat_session_id() -> String {
+    baybo_model::SessionId::new().into()
+}
+
 /// The app's engine: one long-lived instance owns the live transport legs, the
 /// in-flight pairing sessions, and the APNs state. Construct once at launch and
 /// share it; the pumps it spawns keep running between calls.
@@ -181,18 +186,28 @@ impl BayboClient {
         .await
     }
 
-    /// Create a fresh chat session for the active binding and return its id. Both
+    /// Ensure `session_id` exists for the active binding and return its id. Both
     /// direct and relay use the gateway API (`POST /v1/chat/sessions`); direct
     /// reaches it over REST, relay through the Noise-protected API tunnel.
-    pub async fn chat_create_session(self: Arc<Self>) -> Result<String, BayboError> {
+    pub async fn chat_create_session(
+        self: Arc<Self>,
+        session_id: String,
+    ) -> Result<String, BayboError> {
         runtime::run(async move {
-            match active_leg()? {
+            let requested = session_id.clone();
+            let created = match active_leg()? {
                 ActiveLeg::Direct => {
                     let client = self.direct.http_client()?;
-                    gateway_api::create_session(&client).await
+                    gateway_api::create_session(&client, &session_id).await
                 }
-                ActiveLeg::Relay => gateway_api::create_session(&relay::GatewayApi).await,
+                ActiveLeg::Relay => gateway_api::create_session(&relay::GatewayApi, &session_id).await,
+            }?;
+            if created != requested {
+                return Err(format!(
+                    "gateway returned session id {created} for requested session id {requested}"
+                ));
             }
+            Ok(created)
         })
         .await
     }
@@ -284,6 +299,52 @@ impl BayboClient {
                 }
                 ActiveLeg::Direct => {
                     transport::send(&this.direct, session_id, text, msg_id, attachments).await
+                }
+            }
+        })
+        .await
+    }
+
+    /// Subscribe `session_id` if needed and queue a user message behind that
+    /// subscription on the active binding's global chat leg.
+    pub async fn chat_send_after_connect(
+        self: Arc<Self>,
+        session_id: String,
+        since_ordinal: Option<i64>,
+        sink: Arc<dyn FrameSink>,
+        text: String,
+        msg_id: String,
+        attachments: Vec<AttachmentRef>,
+    ) -> Result<(), BayboError> {
+        let this = self;
+        runtime::run(async move {
+            let attachments: Vec<WireAttachment> =
+                attachments.into_iter().map(Into::into).collect();
+            match active_leg()? {
+                ActiveLeg::Relay => {
+                    refresh_relay_apns_best_effort(&this.apns).await;
+                    transport::connect_and_send(
+                        &this.relay,
+                        session_id,
+                        since_ordinal,
+                        sink,
+                        text,
+                        msg_id,
+                        attachments,
+                    )
+                    .await
+                }
+                ActiveLeg::Direct => {
+                    transport::connect_and_send(
+                        &this.direct,
+                        session_id,
+                        since_ordinal,
+                        sink,
+                        text,
+                        msg_id,
+                        attachments,
+                    )
+                    .await
                 }
             }
         })

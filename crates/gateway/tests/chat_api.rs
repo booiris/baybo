@@ -152,6 +152,43 @@ async fn chat_api_round_trip() {
 }
 
 #[tokio::test]
+async fn chat_create_accepts_client_supplied_session_id() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    let requested = "client-session-1";
+
+    let created = post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "session_id": requested }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(created["session_id"].as_str(), Some(requested));
+
+    let duplicate = post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "session_id": requested }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(duplicate["session_id"].as_str(), Some(requested));
+
+    let detail = get(
+        &router,
+        &format!("/v1/chat/sessions/{requested}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(detail["session_id"].as_str(), Some(requested));
+}
+
+#[tokio::test]
 async fn chat_catch_up_api_returns_completed_work_before_reply() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();

@@ -643,7 +643,7 @@ export function ChatPage() {
       }
 
       async function createAnchorSession(): Promise<string | null> {
-        const { data, error } = await client.POST('/v1/chat/sessions', {});
+        const { data, error } = await client.POST('/v1/chat/sessions', { body: {} });
         if (cancelled) return null;
         if (error || !data?.session_id) {
           console.warn('chat bootstrap: create session failed', error);
@@ -1971,7 +1971,7 @@ export function ChatPage() {
     async (folderId: string) => {
       setCreating(true);
       try {
-        const { data } = await client.POST('/v1/chat/sessions', {});
+        const { data } = await client.POST('/v1/chat/sessions', { body: {} });
         if (data?.session_id) {
           const sid = data.session_id;
           setSessions((prev) =>
@@ -2100,7 +2100,7 @@ export function ChatPage() {
   const handleNewChat = useCallback(async () => {
     setCreating(true);
     try {
-      const { data } = await client.POST('/v1/chat/sessions', {});
+      const { data } = await client.POST('/v1/chat/sessions', { body: {} });
       if (data?.session_id) {
         // The server's Created broadcast (Frame::SessionUpdated, full
         // patch) reaches this tab too and `applySessionPatch` adds the

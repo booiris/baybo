@@ -47,6 +47,10 @@ final class SessionIndex: ObservableObject {
         }
     }
 
+    func contains(sessionId: String) -> Bool {
+        rows.contains { $0.id == sessionId }
+    }
+
     /// Ensure a row exists for a session being opened. Does NOT bump
     /// `lastActive` on an existing row — ordering means message activity, not
     /// visits.

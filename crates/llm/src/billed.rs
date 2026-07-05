@@ -51,7 +51,7 @@ impl Attribution {
     pub fn system(component: &str) -> Self {
         Self {
             user_id: SYSTEM_USER_ID.to_string(),
-            session_id: SessionId::new(format!("system:{component}")),
+            session_id: SessionId::from(format!("system:{component}")),
             job_id: JobId::new(),
             span_id: SpanId::new(),
             reason: CallReason::System,

@@ -10,7 +10,6 @@ use crate::api::ChatSessionSummary;
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
 const PATH_MOBILE_APNS_TOKEN: &str = "/v1/mobile/apns-token";
 pub(crate) const PATH_BLOBS: &str = "/v1/blobs";
-const EMPTY_JSON_OBJECT: &[u8] = b"{}";
 const CATCH_UP_LIMIT: u32 = 200;
 
 pub(crate) trait GatewayJsonClient {
@@ -52,6 +51,11 @@ pub(crate) trait GatewayBlobClient {
 #[derive(Deserialize)]
 struct ChatSessionCreated {
     session_id: String,
+}
+
+#[derive(Serialize)]
+struct CreateSessionRequest<'a> {
+    session_id: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -146,9 +150,12 @@ struct UpdateApnsTokenRequest<'a> {
 
 pub(crate) async fn create_session<C: GatewayJsonClient + Sync>(
     client: &C,
+    session_id: &str,
 ) -> Result<String, String> {
+    let body = serde_json::to_vec(&CreateSessionRequest { session_id })
+        .map_err(|e| format!("encode create session request: {e}"))?;
     let created: ChatSessionCreated = client
-        .post_json(PATH_CHAT_SESSIONS, EMPTY_JSON_OBJECT.to_vec())
+        .post_json(PATH_CHAT_SESSIONS, body)
         .await?;
     Ok(created.session_id)
 }

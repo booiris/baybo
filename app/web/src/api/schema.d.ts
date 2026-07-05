@@ -869,6 +869,11 @@ export interface components {
             /** @description New session id. */
             session_id: string;
         };
+        /** @description Request body for `POST /v1/chat/sessions`. */
+        CreateSessionRequest: {
+            /** @description Optional client-supplied session id. If omitted, the gateway mints one. */
+            session_id?: string | null;
+        };
         ChatSessionDetail: {
             /** Format: date-time */
             created_at: string;
@@ -2052,7 +2057,11 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["CreateSessionRequest"];
+            };
+        };
         responses: {
             /** @description New session id */
             200: {
@@ -2061,6 +2070,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ChatSessionCreated"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description Unauthorized */

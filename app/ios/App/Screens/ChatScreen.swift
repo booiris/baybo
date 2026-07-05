@@ -186,6 +186,7 @@ struct ChatHeaderView: View {
 
     private var dotFill: Color {
         switch connState {
+        case .draft: return Theme.ink
         case .connected: return Theme.ink
         case .connecting: return .clear
         case .offline: return Theme.err
@@ -194,6 +195,7 @@ struct ChatHeaderView: View {
 
     private var label: String {
         switch connState {
+        case .draft: return Lang.shared.t("chat.draft")
         case .connected: return Lang.shared.t("chat.connected")
         case .connecting: return Lang.shared.t("chat.connecting")
         case .offline: return Lang.shared.t("chat.offline")

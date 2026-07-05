@@ -30,7 +30,8 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Path, Query, State};
+use axum::body::Bytes;
+use axum::extract::{FromRequest, Path, Query, Request, State};
 use axum::{Extension, Json};
 use baybo_agent::actor::AgentMessage;
 use baybo_channels::wire::{
@@ -158,6 +159,31 @@ pub struct CatchUpSessionQuery {
 pub struct ChatSessionCreated {
     /// New session id.
     pub session_id: String,
+}
+
+/// Request body for `POST /v1/chat/sessions`.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct CreateSessionRequest {
+    /// Optional client-supplied session id. If omitted, the gateway mints one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, ToSchema)]
+struct OptionalCreateSessionRequest(#[schema(inline)] CreateSessionRequest);
+
+impl<S> FromRequest<S> for OptionalCreateSessionRequest
+where
+    S: Send + Sync,
+{
+    type Rejection = GatewayError;
+
+    async fn from_request(req: Request, state: &S) -> std::result::Result<Self, Self::Rejection> {
+        let body = Bytes::from_request(req, state)
+            .await
+            .map_err(|e| GatewayError::BadRequest(format!("read create session body: {e}")))?;
+        parse_create_session_request(&body).map(Self)
+    }
 }
 
 /// Discriminator for [`ChatTranscriptItem`] — serialized as
@@ -592,8 +618,10 @@ impl From<SlashCommandSpec> for SlashCommandEntry {
     post,
     path = "/chat/sessions",
     tag = "chat",
+    request_body = CreateSessionRequest,
     responses(
         (status = 200, description = "New session id", body = ChatSessionCreated),
+        (status = 400, description = "Invalid request", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 500, description = "Session creation failed", body = ErrorBody),
     )
@@ -601,15 +629,13 @@ impl From<SlashCommandSpec> for SlashCommandEntry {
 async fn create_session(
     State(state): State<AdminState>,
     authed: Option<Extension<AuthedClient>>,
+    OptionalCreateSessionRequest(requested): OptionalCreateSessionRequest,
 ) -> Result<Json<ChatSessionCreated>> {
     let authed = authed.as_ref().map(|ext| &ext.0);
     let user = chat_user(authed);
     let channel_type = chat_list_channel(authed);
-    let session = state
-        .session_manager
-        .create_session(user, channel_type)
-        .await
-        .map_err(|e| GatewayError::Internal(format!("create chat session: {e}")))?;
+    let session =
+        create_or_load_chat_session(&state, requested.session_id, user, channel_type).await?;
     let session_id = session.id.clone();
     // Created emits a full patch — sibling tabs construct the row
     // straight from this without a list refetch.
@@ -619,8 +645,8 @@ async fn create_session(
         SessionPatch {
             created_at: Some(session.created_at),
             last_active: Some(session.last_active),
-            hidden: Some(false),
-            pinned: Some(false),
+            hidden: Some(session.hidden),
+            pinned: Some(session.pinned),
             // A freshly-created session is always uncategorized; absent =
             // no change, which a newly-constructed client row renders as
             // uncategorized.
@@ -1541,6 +1567,60 @@ async fn slash_manifest(
 const WEB_HIDDEN_SLASH_COMMANDS: &[&str] = &["new"];
 
 // ── helpers ──────────────────────────────────────────────────────────
+
+fn parse_create_session_request(body: &Bytes) -> Result<CreateSessionRequest> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(CreateSessionRequest::default());
+    }
+    let mut request: CreateSessionRequest = serde_json::from_slice(body)
+        .map_err(|e| GatewayError::BadRequest(format!("invalid create session body: {e}")))?;
+    if let Some(session_id) = request.session_id.as_mut() {
+        *session_id = session_id.trim().to_owned();
+        if session_id.is_empty() {
+            return Err(GatewayError::BadRequest(
+                "session_id must not be empty".to_owned(),
+            ));
+        }
+    }
+    Ok(request)
+}
+
+async fn create_or_load_chat_session(
+    state: &AdminState,
+    requested_session_id: Option<String>,
+    user: User,
+    channel_type: ChannelType,
+) -> Result<Session> {
+    let Some(session_id) = requested_session_id else {
+        return state
+            .session_manager
+            .create_session(user, channel_type)
+            .await
+            .map_err(|e| GatewayError::Internal(format!("create chat session: {e}")));
+    };
+
+    let sid = SessionId::from(session_id.as_str());
+    if let Some(existing) = state
+        .session_manager
+        .get(&sid)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("load requested chat session: {e}")))?
+    {
+        if existing.channel != channel_type
+            || existing.user.id != user.id
+            || is_cron_triggered(&existing)
+        {
+            return Err(GatewayError::NotFound(format!("chat session {session_id}")));
+        }
+        return Ok(existing);
+    }
+
+    state
+        .session_manager
+        .get_or_create(&sid, user, channel_type)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("create requested chat session: {e}")))
+}
 
 fn chat_list_channel(authed: Option<&AuthedClient>) -> ChannelType {
     match authed {

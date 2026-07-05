@@ -22,12 +22,12 @@ final class AppStore: ObservableObject {
     }
 
     /// The home shell's bottom-menu sections. Only `chats` and `settings` have
-    /// real screens today; `agents`/`works` are placeholders. Compose and
+    /// real screens today; `agents`/`projects` are placeholders. Compose and
     /// push-tap routing force `chats` so backing out of a conversation lands on
     /// the list, not whatever section was showing.
     enum HomeTab: CaseIterable {
         case agents
-        case works
+        case projects
         case chats
         case settings
     }
@@ -76,7 +76,7 @@ final class AppStore: ObservableObject {
         // `-baybo-open-home` lands on the tabbed home shell (chat list + bottom
         // menu bar) WITHOUT pushing a conversation, so the bar/header/sections
         // are screenshotable headlessly. Optional `-baybo-home-tab
-        // <agents|works|chats|settings>` preselects a section; a few demo rows
+        // <agents|projects|chats|settings>` preselects a section; a few demo rows
         // seed the list so content ghosts under the glass bar.
         if ProcessInfo.processInfo.arguments.contains("-baybo-open-home") {
             for i in 1...6 {
@@ -87,7 +87,7 @@ final class AppStore: ObservableObject {
             if let idx = args.firstIndex(of: "-baybo-home-tab"), idx + 1 < args.count {
                 switch args[idx + 1] {
                 case "agents": homeTab = .agents
-                case "works": homeTab = .works
+                case "projects": homeTab = .projects
                 case "settings": homeTab = .settings
                 default: homeTab = .chats
                 }
@@ -257,19 +257,12 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// Compose: mint a draft session on the active binding's leg and enter it.
-    /// It does not enter the chat list until the first send records activity.
-    /// Returns the localized error line on failure (the list renders it).
+    /// Compose: mint a local draft id and enter it. The durable gateway row is
+    /// created on first send, so abandoned drafts do not pollute the session list.
     func startNewChat() async -> String? {
-        busy = true
-        defer { busy = false }
-        do {
-            let sessionId = try await Baybo.client.chatCreateSession()
-            await activateSession(sessionId, ensureListed: false)
-            return nil
-        } catch {
-            return Lang.shared.t("chat.startFailed", bayboErrorText(error))
-        }
+        let sessionId = newChatSessionId()
+        await activateSession(sessionId, ensureListed: false)
+        return nil
     }
 
     /// A push-notification tap targeting `sessionId`: route straight into that

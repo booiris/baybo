@@ -86,6 +86,23 @@
         }
       }
     },
+    "chat.draft" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draft"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "草稿"
+          }
+        }
+      }
+    },
     "chat.jumpToLatest" : {
       "extractionState" : "stale",
       "localizations" : {

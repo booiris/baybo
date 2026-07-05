@@ -541,6 +541,15 @@
           "chat"
         ],
         "operationId": "create_session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "New session id",
@@ -548,6 +557,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ChatSessionCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -3217,6 +3236,19 @@
           "session_id": {
             "type": "string",
             "description": "New session id."
+          }
+        }
+      },
+      "CreateSessionRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/chat/sessions`.",
+        "properties": {
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional client-supplied session id. If omitted, the gateway mints one."
           }
         }
       },

@@ -13,6 +13,7 @@ import SwiftUI
 @MainActor
 final class ChatStore: ObservableObject {
     enum ConnState {
+        case draft
         case connecting
         case connected
         case offline
@@ -25,7 +26,7 @@ final class ChatStore: ObservableObject {
     static let maxAttachmentBytes = 100 * 1024 * 1024
 
     let sessionId: String
-    @Published private(set) var connState: ConnState = .connecting
+    @Published private(set) var connState: ConnState
     /// Transient composer notice (send failed / waiting for upload / too large).
     @Published var notice: String?
 
@@ -39,6 +40,8 @@ final class ChatStore: ObservableObject {
     /// matches), so a kill can never leave the cursor durably ahead of the
     /// transcript — the old localStorage blob had the same one-write property.
     private(set) var lastOrdinal: Int64?
+    private var remoteSessionEnsured: Bool
+    private var ensureRemoteSessionTask: Task<Void, Error>?
 
     /// Accepted floor: sinks below this are muted. Advanced when a dial
     /// actually REPLACES the pump (success) or on deliberate disconnect — NOT
@@ -51,12 +54,15 @@ final class ChatStore: ObservableObject {
     private var retryTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
     private var catchUpTask: Task<Void, Never>?
-    private var connectInFlight = false
+    private var connectTask: Task<Void, Error>?
     private weak var bridge: TranscriptBridge?
     private var bufferedFrames: [String] = []
 
     init(sessionId: String) {
         self.sessionId = sessionId
+        let listed = SessionIndex.shared.contains(sessionId: sessionId)
+        connState = listed ? .connecting : .draft
+        remoteSessionEnsured = false
         if let blob = TranscriptStore.read(sessionId: sessionId),
             let data = blob.data(using: .utf8),
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -68,18 +74,30 @@ final class ChatStore: ObservableObject {
     // MARK: - Connection lifecycle
 
     func connectIfNeeded() {
-        guard connState != .connected else { return }
+        guard connState != .connected, connState != .draft else { return }
         connect()
     }
 
     func connect() {
-        guard !connectInFlight else { return }
+        guard connState != .connected, connState != .draft else { return }
+        let task = startConnect()
+        Task {
+            do {
+                try await task.value
+            } catch {}
+        }
+    }
+
+    @discardableResult
+    private func startConnect() -> Task<Void, Error> {
+        if let connectTask {
+            return connectTask
+        }
         retryTask?.cancel()
         retryTask = nil
         catchUpTask?.cancel()
         catchUpTask = nil
         let sinceOrdinal = lastOrdinal
-        connectInFlight = true
         if connState != .connected {
             connState = .connecting
         }
@@ -87,8 +105,12 @@ final class ChatStore: ObservableObject {
         notice = nil
         issuedGeneration += 1
         let gen = issuedGeneration
-        Task {
-            defer { connectInFlight = false }
+        let task = Task {
+            defer {
+                if issuedGeneration == gen {
+                    connectTask = nil
+                }
+            }
             do {
                 try await Baybo.client.chatConnect(
                     sessionId: sessionId,
@@ -109,8 +131,11 @@ final class ChatStore: ObservableObject {
                 // The one place `offline` is set — a failed dial.
                 connState = .offline
                 scheduleRetry()
+                throw error
             }
         }
+        connectTask = task
+        return task
     }
 
     private func fetchCatchUp(sinceOrdinal: Int64, generation gen: Int) {
@@ -131,6 +156,7 @@ final class ChatStore: ObservableObject {
     /// Foreground / visibility signal: debounce, then redial (a no-op when the
     /// live session is healthy — the gateway replays only the gap).
     func scheduleReconnect() {
+        guard connState != .draft else { return }
         debounceTask?.cancel()
         debounceTask = Task {
             try? await Task.sleep(for: Self.foregroundDebounce)
@@ -164,10 +190,12 @@ final class ChatStore: ObservableObject {
         debounceTask = nil
         catchUpTask?.cancel()
         catchUpTask = nil
+        connectTask?.cancel()
+        connectTask = nil
         // Mute every sink, including one handed to a dial still in flight.
         issuedGeneration += 1
         generation = issuedGeneration
-        connState = .connecting
+        connState = remoteSessionEnsured ? .connecting : .draft
         await Baybo.client.chatDisconnect()
     }
 
@@ -236,15 +264,85 @@ final class ChatStore: ObservableObject {
     func send(text: String, attachments: [AttachmentRef]) {
         let msgId = UUID().uuidString
         bridge?.userSent(msgId: msgId, text: text, attachments: attachments)
-        SessionIndex.shared.recordUserSend(sessionId: sessionId, text: text)
         Task {
             do {
-                try await Baybo.client.chatSend(
-                    sessionId: sessionId, text: text, msgId: msgId, attachments: attachments)
+                try await ensureRemoteSession()
+                SessionIndex.shared.recordUserSend(sessionId: sessionId, text: text)
+                try await sendWhenReady(text: text, msgId: msgId, attachments: attachments)
             } catch {
                 notice = String(
                     format: Lang.shared.t("chat.sendFailed"), bayboErrorText(error))
             }
+        }
+    }
+
+    private func sendWhenReady(
+        text: String,
+        msgId: String,
+        attachments: [AttachmentRef]
+    ) async throws {
+        if connState == .connected {
+            try await Baybo.client.chatSend(
+                sessionId: sessionId, text: text, msgId: msgId, attachments: attachments)
+            return
+        }
+
+        retryTask?.cancel()
+        retryTask = nil
+        catchUpTask?.cancel()
+        catchUpTask = nil
+        connectTask?.cancel()
+        connectTask = nil
+
+        let sinceOrdinal = lastOrdinal
+        connState = .connecting
+        notice = nil
+        issuedGeneration += 1
+        let gen = issuedGeneration
+        do {
+            try await Baybo.client.chatSendAfterConnect(
+                sessionId: sessionId,
+                sinceOrdinal: sinceOrdinal,
+                sink: Sink(store: self, generation: gen),
+                text: text,
+                msgId: msgId,
+                attachments: attachments
+            )
+            guard gen >= generation else { return }
+            generation = gen
+            connEpoch += 1
+            connState = .connected
+            bridge?.setConnEpoch(connEpoch)
+            if let sinceOrdinal {
+                fetchCatchUp(sinceOrdinal: sinceOrdinal, generation: gen)
+            }
+        } catch {
+            guard gen >= generation else { throw error }
+            connState = .offline
+            scheduleRetry()
+            throw error
+        }
+    }
+
+    private func ensureRemoteSession() async throws {
+        if remoteSessionEnsured { return }
+        if let task = ensureRemoteSessionTask {
+            try await task.value
+            return
+        }
+
+        let sessionId = sessionId
+        let task = Task {
+            _ = try await Baybo.client.chatCreateSession(sessionId: sessionId)
+        }
+        ensureRemoteSessionTask = task
+        do {
+            try await task.value
+            remoteSessionEnsured = true
+            ensureRemoteSessionTask = nil
+        } catch {
+            ensureRemoteSessionTask = nil
+            throw error
         }
     }
 

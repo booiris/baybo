@@ -157,7 +157,11 @@ impl SessionManager {
             TriggerSource::User => "",
             TriggerSource::Cron { .. } => "cron-",
         };
-        let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
+        let id = if prefix.is_empty() {
+            SessionId::new()
+        } else {
+            SessionId::with_prefix(prefix)
+        };
         self.create_session_with_id(id, user, channel, trigger)
             .await
     }
@@ -176,7 +180,7 @@ impl SessionManager {
         let prefix = match lineage.kind {
             baybo_model::LineageKind::Subagent => "subagent-",
         };
-        let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
+        let id = SessionId::with_prefix(prefix);
         let now = Utc::now();
         let session = Session {
             id: id.clone(),

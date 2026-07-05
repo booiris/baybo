@@ -250,6 +250,66 @@ impl SessionRegistry {
         }
     }
 
+    /// Subscribe `session_id` and enqueue the first user message on the same
+    /// outbound pump, preserving Subscribe-before-Message ordering for draft
+    /// sessions that do not have a live subscription yet.
+    pub(crate) async fn connect_and_send<T: ChatTransport>(
+        &self,
+        transport: &T,
+        session_id: &str,
+        since_ordinal: Option<i64>,
+        sink: Arc<dyn FrameSink>,
+        text: String,
+        msg_id: String,
+        attachments: Vec<WireAttachment>,
+    ) -> Result<(), TransportError> {
+        self.sinks.lock().await.insert(session_id.to_string(), sink);
+
+        if self
+            .try_enqueue_all(subscribe_and_send_cmds(
+                session_id,
+                since_ordinal,
+                &text,
+                &msg_id,
+                &attachments,
+            ))
+            .await?
+        {
+            return Ok(());
+        }
+
+        let _connect = self.connect_lock.lock().await;
+        if self
+            .try_enqueue_all(subscribe_and_send_cmds(
+                session_id,
+                since_ordinal,
+                &text,
+                &msg_id,
+                &attachments,
+            ))
+            .await?
+        {
+            return Ok(());
+        }
+
+        self.establish_pump(transport, "chat connect+send").await?;
+
+        if self
+            .try_enqueue_all(subscribe_and_send_cmds(
+                session_id,
+                since_ordinal,
+                &text,
+                &msg_id,
+                &attachments,
+            ))
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(TransportError::SessionClosed)
+        }
+    }
+
     async fn has_live_pump(&self) -> bool {
         let mut slot = self.slot.lock().await;
         let Some(handle) = slot.handle.as_ref() else {
@@ -321,6 +381,25 @@ impl SessionRegistry {
         }
     }
 
+    async fn try_enqueue_all(
+        &self,
+        cmds: impl IntoIterator<Item = OutboundCmd>,
+    ) -> Result<bool, TransportError> {
+        let mut slot = self.slot.lock().await;
+        let Some(handle) = slot.handle.as_ref() else {
+            return Ok(false);
+        };
+        for cmd in cmds {
+            if handle.outbound_tx.send(cmd).is_err() {
+                if let Some(prev) = slot.handle.take() {
+                    prev.task.abort();
+                }
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Abort the live pump only if no teardown/install happened since
     /// `dial_epoch` was snapshotted (the failed-dial reset path).
     async fn abort_if_epoch(&self, dial_epoch: u64) {
@@ -372,6 +451,27 @@ impl SessionRegistry {
     }
 }
 
+fn subscribe_and_send_cmds(
+    session_id: &str,
+    since_ordinal: Option<i64>,
+    text: &str,
+    msg_id: &str,
+    attachments: &[WireAttachment],
+) -> [OutboundCmd; 2] {
+    [
+        OutboundCmd::Subscribe {
+            session_id: session_id.to_string(),
+            since_ordinal,
+        },
+        OutboundCmd::Send {
+            session_id: session_id.to_string(),
+            text: text.to_string(),
+            msg_id: msg_id.to_string(),
+            attachments: attachments.to_vec(),
+        },
+    ]
+}
+
 /// A chat leg, seen as "the thing that owns a [`SessionRegistry`]". Exposing the
 /// registry through one trait lets the generic session fns below
 /// ([`connect`]/[`send`]/[`disconnect`]) drive either leg, so
@@ -417,6 +517,31 @@ pub(crate) async fn send<L: SessionLeg>(
 ) -> Result<(), String> {
     leg.registry()
         .send(session_id, text, msg_id, attachments)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Subscribe `session_id` if needed and queue the user message behind that
+/// subscription on the same live pump.
+pub(crate) async fn connect_and_send<L: SessionLeg>(
+    leg: &L,
+    session_id: String,
+    since_ordinal: Option<i64>,
+    sink: Arc<dyn FrameSink>,
+    text: String,
+    msg_id: String,
+    attachments: Vec<WireAttachment>,
+) -> Result<(), String> {
+    leg.registry()
+        .connect_and_send(
+            leg,
+            &session_id,
+            since_ordinal,
+            sink,
+            text,
+            msg_id,
+            attachments,
+        )
         .await
         .map_err(|e| e.to_string())
 }

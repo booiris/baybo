@@ -1645,7 +1645,7 @@ async fn dispatch_user_message(ctx: &LoopCtx, text: String) {
 }
 
 fn mint_new_session_id() -> SessionId {
-    SessionId::from(Uuid::new_v4().to_string())
+    SessionId::new()
 }
 
 fn persist_history_entry(ctx: &LoopCtx, entry: String) {
