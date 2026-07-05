@@ -500,13 +500,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Agents"
+            "value" : "Pulse"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "智能体"
+            "value" : "动态"
           }
         }
       }

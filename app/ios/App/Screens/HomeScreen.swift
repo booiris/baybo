@@ -80,7 +80,7 @@ extension AppStore.HomeTab {
     /// A line-weight SF Symbol tuned for the tab bar.
     var icon: String {
         switch self {
-        case .agents: return "sparkles"
+        case .agents: return "waveform.path.ecg"
         case .projects: return "square.stack.3d.up"
         case .chats: return "message"
         case .settings: return "gearshape"
