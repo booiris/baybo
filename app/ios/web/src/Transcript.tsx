@@ -7,6 +7,7 @@ import {
   persistState,
   postJumpVisible,
   postOrdinal,
+  retrySend,
   subscribeTranscript,
   type UserSentPayload,
 } from "./bridge";
@@ -118,7 +119,10 @@ function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
     if (r.role === "work") {
       if (Array.isArray(r.steps) && r.steps.length > 0) out.push({ ...r, active: false });
     } else if (r.role === "user" || r.role === "assistant" || r.role === "notice") {
-      out.push(r);
+      // A send still "sending" when we persisted can't be in flight after a
+      // relaunch (the leg is gone) — drop the stale spinner. A "failed" state is
+      // a real outcome and survives, so its retry dot is there on the next open.
+      out.push(r.role === "user" && r.sendState === "sending" ? { ...r, sendState: undefined } : r);
     }
   }
   return out;
@@ -216,7 +220,16 @@ function AttachmentList({
 /// assistant replies render bubble-less at full thread width as markdown (the
 /// web chat's reading-band layout). Memoized so streaming ticks don't re-parse
 /// every settled message's markdown.
-const MessageRow = memo(function MessageRow({ m, connEpoch }: { m: ChatMsg; connEpoch: number }) {
+const MessageRow = memo(function MessageRow({
+  m,
+  connEpoch,
+  onRetry,
+}: {
+  m: ChatMsg;
+  connEpoch: number;
+  onRetry: (m: ChatMsg) => void;
+}) {
+  const { t } = useTranslation();
   if (m.role === "assistant") {
     return (
       <div className="msg assistant">
@@ -228,11 +241,17 @@ const MessageRow = memo(function MessageRow({ m, connEpoch }: { m: ChatMsg; conn
     );
   }
   return (
-    <div className={`bubble ${m.role}`}>
+    <div className={`bubble ${m.role}${m.sendState ? ` ${m.sendState}` : ""}`}>
       {m.attachments && m.attachments.length > 0 && (
         <AttachmentList attachments={m.attachments} connEpoch={connEpoch} />
       )}
       {m.content}
+      {m.sendState === "sending" && <span className="send-spinner" aria-hidden="true" />}
+      {m.sendState === "failed" && (
+        <button className="send-failed" onClick={() => onRetry(m)} aria-label={t("chat.retrySend")}>
+          <span aria-hidden="true">!</span>
+        </button>
+      )}
     </div>
   );
 });
@@ -422,6 +441,34 @@ export function Transcript({
 
   const appendNotice = useCallback((text: string) => {
     setMessages((m) => [...m, { id: uid(), role: "notice", content: text }]);
+  }, []);
+
+  // The server acknowledged our own send (its echo arrived by platform_msg_id) —
+  // clear the send-state chrome (spinner / retry dot) on that optimistic bubble.
+  const markSent = useCallback((msgId: string) => {
+    setMessages((rows) =>
+      rows.map((r) => (r.role === "user" && r.id === msgId && r.sendState ? { ...r, sendState: undefined } : r)),
+    );
+  }, []);
+
+  // Native's send Task errored — flip the still-sending bubble to the failed
+  // (red retry dot) state. Guarded on "sending" so a late failure can't stomp a
+  // bubble the echo already delivered.
+  const markFailed = useCallback((msgId: string) => {
+    setMessages((rows) =>
+      rows.map((r) =>
+        r.role === "user" && r.id === msgId && r.sendState === "sending" ? { ...r, sendState: "failed" } : r,
+      ),
+    );
+  }, []);
+
+  // Tap the red dot: re-post the payload native-side (same msgId → idempotent)
+  // and flip the bubble back to sending so the spinner returns while it retries.
+  const retryMessage = useCallback((m: ChatMsg) => {
+    retrySend({ msgId: m.id, text: m.content, attachments: m.attachments ?? [] });
+    setMessages((rows) =>
+      rows.map((r) => (r.role === "user" && r.id === m.id ? { ...r, sendState: "sending" } : r)),
+    );
   }, []);
 
   // ---- streaming answer (rAF-coalesced) ------------------------------------
@@ -707,7 +754,16 @@ export function Transcript({
           hasRowId(id) || renderedOrdinals.current.has(ordinal) || findMessageByOrdinal(ordinal) >= 0;
         if (alreadySent || alreadyRendered) {
           renderedOrdinals.current.add(ordinal);
-          if (role === "user" && platformMsgId) sentIds.current.add(platformMsgId);
+          if (role === "user" && platformMsgId) {
+            sentIds.current.add(platformMsgId);
+            // A send confirmed by reconnect merge instead of a live echo — clear
+            // its send-state chrome too (backgrounded right after sending).
+            const idx = next.findIndex((row) => row.role === "user" && row.id === platformMsgId);
+            const existing = idx >= 0 ? next[idx] : undefined;
+            if (existing && existing.role === "user" && existing.sendState) {
+              next[idx] = { ...existing, sendState: undefined };
+            }
+          }
           continue;
         }
         if (role === "assistant") closeTrailingWork();
@@ -748,6 +804,7 @@ export function Transcript({
         const role = frame.role === "user" ? "user" : "assistant";
         if (role === "user" && frame.platform_msg_id && sentIds.current.has(frame.platform_msg_id)) {
           if (ordinal !== null) renderedOrdinals.current.add(ordinal);
+          markSent(frame.platform_msg_id); // server confirmed the send — stop the spinner
           return; // our own message / already rendered
         }
         if (ordinal !== null && renderedOrdinals.current.has(ordinal)) {
@@ -936,6 +993,7 @@ export function Transcript({
         role: "user",
         content: payload.text,
         attachments: payload.attachments.length > 0 ? payload.attachments : undefined,
+        sendState: "sending",
       },
     ]);
   };
@@ -1017,6 +1075,7 @@ export function Transcript({
   const handlersRef = useRef({
     handleFrame,
     handleUserSent,
+    markFailed,
     handleConnEpoch,
     handleBottomInset,
     jumpToLatest,
@@ -1024,6 +1083,7 @@ export function Transcript({
   handlersRef.current = {
     handleFrame,
     handleUserSent,
+    markFailed,
     handleConnEpoch,
     handleBottomInset,
     jumpToLatest,
@@ -1034,6 +1094,7 @@ export function Transcript({
         frame: (frameJson) => handlersRef.current.handleFrame(frameJson),
         connEpoch: (epoch) => handlersRef.current.handleConnEpoch(epoch),
         userSent: (payload) => handlersRef.current.handleUserSent(payload),
+        sendFailed: (msgId) => handlersRef.current.markFailed(msgId),
         bottomInset: (px) => handlersRef.current.handleBottomInset(px),
         jumpToLatest: () => handlersRef.current.jumpToLatest(),
       }),
@@ -1091,7 +1152,7 @@ export function Transcript({
           m.role === "work" ? (
             <WorkBlockView key={m.id} row={m} />
           ) : (
-            <MessageRow key={m.id} m={m} connEpoch={connEpoch} />
+            <MessageRow key={m.id} m={m} connEpoch={connEpoch} onRetry={retryMessage} />
           ),
         )}
         {streaming && (

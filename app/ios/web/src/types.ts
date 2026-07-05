@@ -108,6 +108,12 @@ export type ChatMsg = {
   role: "user" | "assistant" | "notice";
   content: string;
   attachments?: WireAttachment[];
+  // Delivery state of an optimistic user send. "sending" (native minted the
+  // bubble, awaiting the server echo) drives the spinner; "failed" (native
+  // reported the send errored) drives the red retry dot. Cleared (undefined)
+  // when the server echoes the message back. On restore a stale "sending" is
+  // stripped (the leg is gone), but "failed" persists so the retry dot survives.
+  sendState?: "sending" | "failed";
 };
 
 /// One entry in a turn's work block — the agent's process (thinking, tool

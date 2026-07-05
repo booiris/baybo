@@ -8,6 +8,7 @@ export const en = {
       tapToLoad: "Tap to load image",
       imageAlt: "image",
       recoverFailed: "Couldn't reload history: {{error}}",
+      retrySend: "Send failed — tap to retry",
       working: "Working",
       worked: "Worked",
       workedFor: "Worked {{dur}}",

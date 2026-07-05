@@ -125,6 +125,57 @@ button {
   word-break: break-word;
 }
 .bubble.user { align-self: flex-end; background: var(--color-ink); color: var(--color-paper); border-color: var(--color-ink); }
+/* Optimistic-send status: both indicators sit to the LEFT of the (right-aligned)
+   bubble, vertically centered. Centered via top + negative margin (NOT
+   translateY) so the spinner's transform stays free for its rotation. */
+.bubble.sending,
+.bubble.failed { position: relative; }
+/* "sending": a black ring with a rotating gap, spinning until the server echoes
+   the message back. */
+.send-spinner {
+  position: absolute;
+  left: -1.25rem;
+  top: 50%;
+  margin-top: -0.4rem;
+  width: 0.8rem;
+  height: 0.8rem;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-ink-soft);
+  border-top-color: transparent;
+  animation: send-spin 0.7s linear infinite;
+  pointer-events: none;
+}
+@keyframes send-spin { to { transform: rotate(360deg); } }
+/* "failed": a red circled exclamation — the only non-monochrome hue, reserved
+   for errors. Tap it to retry. */
+.send-failed {
+  position: absolute;
+  left: -1.55rem;
+  top: 50%;
+  margin-top: -0.55rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--color-err);
+  color: var(--color-paper);
+  font-family: var(--font-sans);
+  font-size: 0.74rem;
+  font-weight: 700;
+  line-height: 1;
+  user-select: none;
+}
+/* Grow the tap target past the small glyph without moving it. */
+.send-failed::before {
+  content: "";
+  position: absolute;
+  inset: -0.5rem;
+}
+.send-failed:active { opacity: 0.6; }
 .bubble.assistant { align-self: flex-start; background: var(--color-paper); color: var(--color-ink); }
 .bubble.assistant.muted { color: var(--color-ink-soft); }
 .bubble.notice { align-self: center; background: none; border: 0; color: var(--color-ink-soft); font-size: 0.8rem; }

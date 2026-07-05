@@ -338,14 +338,30 @@ final class ChatStore: ObservableObject {
     func send(text: String, attachments: [AttachmentRef]) {
         let msgId = UUID().uuidString
         bridge?.userSent(msgId: msgId, text: text, attachments: attachments)
+        dispatchSend(msgId: msgId, text: text, attachments: attachments)
+    }
+
+    /// Retry a send the webview flagged failed (its red dot tap). Reuses the
+    /// original msgId as the idempotency key, so a resend that races a late
+    /// first delivery still lands as a single row. The optimistic bubble already
+    /// exists (the webview flipped it back to sending), so no fresh `userSent`.
+    func retrySend(msgId: String, text: String, attachments: [AttachmentRef]) {
+        dispatchSend(msgId: msgId, text: text, attachments: attachments)
+    }
+
+    /// Enqueue on the live leg (dialing first if needed); on any failure tell the
+    /// webview to flag that bubble failed (`sendFailed`) — its red retry dot is
+    /// the sole failure surface, no composer notice. `scheduleRetry` only redials
+    /// the leg — it never re-enqueues this message — so the send is genuinely
+    /// lost until the user taps retry.
+    private func dispatchSend(msgId: String, text: String, attachments: [AttachmentRef]) {
         Task {
             do {
                 try await ensureRemoteSession()
                 SessionIndex.shared.recordUserSend(sessionId: sessionId, text: text)
                 try await sendWhenReady(text: text, msgId: msgId, attachments: attachments)
             } catch {
-                notice = String(
-                    format: Lang.shared.t("chat.sendFailed"), bayboErrorText(error))
+                bridge?.sendFailed(msgId)
             }
         }
     }

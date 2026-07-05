@@ -30,6 +30,7 @@ type BayboGlobal = {
   pushFrame(frameJson: string): void;
   setConnEpoch(epoch: number): void;
   userSent(payload: UserSentPayload): void;
+  sendFailed(msgId: string): void;
   blobResult(payload: BlobResultPayload): void;
   setLanguage(lang: string): void;
   setBottomInset(px: number): void;
@@ -111,6 +112,13 @@ export function fetchHistory(beforeOrdinal: number | null, limit: number): void 
   post({ type: "fetchHistory", beforeOrdinal, limit });
 }
 
+// Retry a failed send: re-post the full payload (native reuses the msgId as the
+// idempotency key, so no duplicate lands). Web carries the payload — not native —
+// so the retry dot still works after an eviction/relaunch rebuilt the bubble.
+export function retrySend(payload: UserSentPayload): void {
+  post({ type: "retry", msgId: payload.msgId, text: payload.text, attachments: payload.attachments });
+}
+
 // ---- persistence -----------------------------------------------------------
 
 const PERSIST_DEBOUNCE_MS = 500;
@@ -190,6 +198,9 @@ export type TranscriptEvents = {
   frame(frameJson: string): void;
   connEpoch(epoch: number): void;
   userSent(payload: UserSentPayload): void;
+  /// Native's send Task errored — mark that optimistic bubble failed (red
+  /// retry dot). Keyed by the msgId native minted in `userSent`.
+  sendFailed(msgId: string): void;
   /// Native chrome covering the webview's bottom edge (composer + ridden
   /// keyboard), in CSS px. Streams per layout tick through keyboard
   /// animations.
@@ -202,6 +213,7 @@ type Buffered =
   | { kind: "frame"; frameJson: string }
   | { kind: "epoch"; epoch: number }
   | { kind: "userSent"; payload: UserSentPayload }
+  | { kind: "sendFailed"; msgId: string }
   | { kind: "bottomInset"; px: number }
   | { kind: "jumpToLatest" };
 
@@ -242,6 +254,7 @@ function deliver(e: TranscriptEvents, item: Buffered): void {
   if (item.kind === "frame") e.frame(item.frameJson);
   else if (item.kind === "epoch") e.connEpoch(item.epoch);
   else if (item.kind === "userSent") e.userSent(item.payload);
+  else if (item.kind === "sendFailed") e.sendFailed(item.msgId);
   else if (item.kind === "bottomInset") e.bottomInset(item.px);
   else e.jumpToLatest();
 }
@@ -269,6 +282,9 @@ window.baybo = {
   },
   userSent(payload) {
     dispatch({ kind: "userSent", payload });
+  },
+  sendFailed(msgId) {
+    dispatch({ kind: "sendFailed", msgId });
   },
   blobResult(payload) {
     settleBlob(payload);

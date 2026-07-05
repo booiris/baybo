@@ -72,6 +72,12 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("userSent", jsonObjectLiteral(payload))
     }
 
+    /// A send Task errored — flag that optimistic bubble failed (red retry dot),
+    /// keyed by the msgId minted in the matching `userSent`.
+    func sendFailed(_ msgId: String) {
+        call("sendFailed", jsonLiteral(msgId))
+    }
+
     func blobResult(id: Int, dataBase64: String?, mimeType: String, error: String?) {
         let payload: [String: Any] = [
             "id": id,
@@ -271,6 +277,16 @@ extension TranscriptBridge: WKScriptMessageHandler {
             {
                 store?.requestBlob(id: id, blobId: blobId)
             }
+        case "retry":
+            // The failed-bubble dot was tapped. The webview carries the payload
+            // (so retry survives an eviction/relaunch that rebuilt the bubble);
+            // reuse the msgId so the resend is idempotent.
+            if let msgId = body["msgId"] as? String,
+                let text = body["text"] as? String
+            {
+                store?.retrySend(
+                    msgId: msgId, text: text, attachments: parseAttachments(body["attachments"]))
+            }
         case "jumpVisible":
             jumpVisible = (body["visible"] as? Bool) ?? false
         case "openUrl":
@@ -289,6 +305,32 @@ extension TranscriptBridge: WKScriptMessageHandler {
             NSLog("baybo[web:%@]: %@", level, message)
         default:
             break
+        }
+    }
+
+    /// Reconstruct `[AttachmentRef]` from the webview's wire attachments (the
+    /// snake_case shape `userSent` posts) for a retry. Drops any entry missing
+    /// its blob id / mime — a malformed item can't be re-enqueued.
+    private func parseAttachments(_ raw: Any?) -> [AttachmentRef] {
+        guard let items = raw as? [[String: Any]] else { return [] }
+        return items.compactMap { item in
+            guard let blobId = item["blob_id"] as? String,
+                let mimeType = item["mime_type"] as? String
+            else { return nil }
+            return AttachmentRef(
+                kind: attachmentKind(item["kind"] as? String),
+                blobId: blobId,
+                mimeType: mimeType,
+                size: (item["size"] as? NSNumber)?.uint32Value ?? 0,
+                filename: item["filename"] as? String)
+        }
+    }
+
+    private func attachmentKind(_ raw: String?) -> AttachmentKind {
+        switch raw {
+        case "image": return .image
+        case "audio": return .audio
+        default: return .file
         }
     }
 }
