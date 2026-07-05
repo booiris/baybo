@@ -38,6 +38,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         NSLog("baybo: APNs registration failed: %@", error.localizedDescription)
     }
 
+    /// Under memory pressure, drop every idle (offscreen, not-pushed) chat store
+    /// ahead of the normal LRU cap, freeing their buffers + gateway sinks.
+    func applicationDidReceiveMemoryWarning(_ application: UIApplication) {
+        Task { @MainActor in
+            await AppStore.shared?.evictAllIdleStores()
+        }
+    }
+
     /// Provisional auth (granted silently, so the mutable-content push lands in
     /// Notification Center / lock screen) + remote-notification registration.
     /// Idempotent; re-run on foreground while no token is held.

@@ -24,6 +24,12 @@ final class ChatStore: ObservableObject {
     /// Matches the gateway's 100 MiB blob cap (`MAX_BLOB_BYTES`) so an
     /// over-size pick is rejected up front instead of failing after upload.
     static let maxAttachmentBytes = 100 * 1024 * 1024
+    /// Ceiling on the offscreen frame buffer. A long agent turn on a
+    /// backgrounded session streams every delta as a JSON string into
+    /// `bufferedFrames`; past this the buffer is dropped and the transcript
+    /// refetched on re-attach (`overflowBufferedFrames`) instead of growing
+    /// without bound. Generous enough that a normal turn flushes intact.
+    static let maxBufferedFrames = 2000
 
     let sessionId: String
     @Published private(set) var connState: ConnState
@@ -57,19 +63,23 @@ final class ChatStore: ObservableObject {
     private var connectTask: Task<Void, Error>?
     private weak var bridge: TranscriptBridge?
     private var bufferedFrames: [String] = []
+    /// Set when the offscreen buffer overflowed and was dropped: the next
+    /// `attachBridge` refetches the gap instead of flushing a hole-punched
+    /// stream, and frames arriving meanwhile are dropped (not re-buffered) so
+    /// the rewound catch-up cursor stays put.
+    private var needsHistoryReset = false
 
     init(sessionId: String) {
         self.sessionId = sessionId
         let listed = SessionIndex.shared.contains(sessionId: sessionId)
         connState = listed ? .connecting : .draft
         remoteSessionEnsured = false
-        if let blob = TranscriptStore.read(sessionId: sessionId),
-            let data = blob.data(using: .utf8),
-            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        {
-            lastOrdinal = (obj["lastOrdinal"] as? NSNumber)?.int64Value
-        }
+        lastOrdinal = Self.persistedOrdinal(sessionId: sessionId)
     }
+
+    /// Whether a webview bridge is attached — i.e. this store is rendering on
+    /// screen. LRU eviction skips these (`AppStore.evictIdleStores`).
+    var hasBridge: Bool { bridge != nil }
 
     // MARK: - Connection lifecycle
 
@@ -199,10 +209,44 @@ final class ChatStore: ObservableObject {
         await Baybo.client.chatDisconnect()
     }
 
+    /// LRU eviction: this store is idle and offscreen. Cancel its timers and
+    /// drop its gateway sink WITHOUT tearing the shared leg down (unlike
+    /// `disconnect`, a binding-wide teardown) — every other subscribed session
+    /// stays live. With its timers cancelled the store can deallocate; re-opening
+    /// the session mints a fresh one that re-subscribes, and the transcript
+    /// mirror + gateway history replay make that a cheap catch-up. The generation
+    /// bump mutes any late sink callback that raced the unsubscribe.
+    func evict() async {
+        retryTask?.cancel()
+        retryTask = nil
+        debounceTask?.cancel()
+        debounceTask = nil
+        catchUpTask?.cancel()
+        catchUpTask = nil
+        connectTask?.cancel()
+        connectTask = nil
+        issuedGeneration += 1
+        generation = issuedGeneration
+        await Baybo.client.chatUnsubscribe(sessionId: sessionId)
+    }
+
     // MARK: - Bridge lifecycle
 
     func attachBridge(_ bridge: TranscriptBridge) {
         self.bridge = bridge
+        if needsHistoryReset {
+            needsHistoryReset = false
+            bufferedFrames.removeAll()
+            // The buffer was dropped while offscreen; refetch the gap above the
+            // rewound durable floor rather than flushing a hole-punched stream.
+            // When not connected, the reconnect (`connectIfNeeded` on appear)
+            // runs its own catch-up from the same cursor, so only fire here on a
+            // live leg to avoid a redundant fetch.
+            if connState == .connected {
+                fetchCatchUp(sinceOrdinal: lastOrdinal ?? 0, generation: generation)
+            }
+            return
+        }
         flushBufferedFrames(to: bridge)
     }
 
@@ -213,12 +257,42 @@ final class ChatStore: ObservableObject {
     }
 
     private func pushFrame(_ frameJson: String) {
+        // Already overflowed while offscreen: everything above the rewound floor
+        // is refetched on the next attach, so don't buffer or advance the cursor
+        // past the hole the dropped frames left.
+        if bridge == nil && needsHistoryReset { return }
         advanceLastOrdinal(fromFrameJson: frameJson)
         if let bridge {
             bridge.pushFrame(frameJson)
         } else {
             bufferedFrames.append(frameJson)
+            if bufferedFrames.count > Self.maxBufferedFrames {
+                overflowBufferedFrames()
+            }
         }
+    }
+
+    /// The offscreen buffer blew its cap (a long agent turn on a backgrounded
+    /// session). Streamed deltas aren't durable rows, so a truncated flush would
+    /// leave a hole — drop the buffer and rewind the catch-up cursor to the
+    /// durable floor the webview actually holds, so the next `attachBridge`
+    /// refetches the whole gap via catch-up/history instead.
+    private func overflowBufferedFrames() {
+        bufferedFrames.removeAll()
+        needsHistoryReset = true
+        lastOrdinal = Self.persistedOrdinal(sessionId: sessionId)
+    }
+
+    /// The newest ordinal in the durable transcript mirror — the safe catch-up
+    /// floor (≤ what the webview has actually rendered). `nil` when no mirror
+    /// exists yet. Read at init and again on a buffer-overflow reset, where the
+    /// in-memory `lastOrdinal` has advanced past the frames that were dropped.
+    private static func persistedOrdinal(sessionId: String) -> Int64? {
+        guard let blob = TranscriptStore.read(sessionId: sessionId),
+            let data = blob.data(using: .utf8),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return (obj["lastOrdinal"] as? NSNumber)?.int64Value
     }
 
     private func advanceLastOrdinal(fromFrameJson frameJson: String) {

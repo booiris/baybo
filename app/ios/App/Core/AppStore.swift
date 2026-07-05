@@ -54,6 +54,15 @@ final class AppStore: ObservableObject {
     /// the route; consumed once home is up.
     private var pendingPushSession: String?
     private var chatStores: [String: ChatStore] = [:]
+    /// Session ids in least→most recently used order, bounding the resident
+    /// `chatStores` working set (`evictIdleStores`). Kept in sync with the map:
+    /// `chatStore(for:)` promotes, eviction/reset removes.
+    private var chatStoreLRU: [String] = []
+    /// The resident `chatStores` cap. Beyond it, the least-recently-used idle
+    /// (offscreen, not-pushed) stores are evicted so a long run that opens many
+    /// conversations doesn't keep every store — and its buffer + timers —
+    /// resident forever.
+    static let maxResidentStores = 12
 
     init() {
         AppStore.shared = self
@@ -264,12 +273,19 @@ final class AppStore: ObservableObject {
     // MARK: - Chat navigation
 
     func chatStore(for sessionId: String) -> ChatStore {
+        noteStoreUsed(sessionId)
         if let store = chatStores[sessionId] {
             return store
         }
         let store = ChatStore(sessionId: sessionId)
         chatStores[sessionId] = store
         return store
+    }
+
+    /// Promote a session to most-recently-used in the LRU ordering.
+    private func noteStoreUsed(_ sessionId: String) {
+        chatStoreLRU.removeAll { $0 == sessionId }
+        chatStoreLRU.append(sessionId)
     }
 
     /// Open an existing session from the list.
@@ -319,11 +335,51 @@ final class AppStore: ObservableObject {
         // must land on the list, whatever tab launched the compose/push.
         homeTab = .chats
         chatPath = [sessionId]
+        await evictIdleStores()
+    }
+
+    /// Bound the resident `chatStores` working set: evict the least-recently-used
+    /// stores beyond `maxResidentStores` that are safe to drop — offscreen (no
+    /// attached bridge) and not the pushed session. Runs after each activation,
+    /// where the set has just grown.
+    private func evictIdleStores() async {
+        guard chatStores.count > Self.maxResidentStores else { return }
+        var overflow = chatStores.count - Self.maxResidentStores
+        // Least→most recently used: evict from the front (Array iterates a value
+        // snapshot, so removing inside the loop is safe).
+        for sessionId in chatStoreLRU where overflow > 0 {
+            guard let store = chatStores[sessionId], isEvictable(sessionId, store) else { continue }
+            await evictStore(sessionId, store)
+            overflow -= 1
+        }
+    }
+
+    /// Drop every idle store regardless of the working-set cap — the
+    /// memory-warning response. Keeps only the pushed session and any store
+    /// still rendering on screen (an attached bridge).
+    func evictAllIdleStores() async {
+        for sessionId in chatStoreLRU {
+            guard let store = chatStores[sessionId], isEvictable(sessionId, store) else { continue }
+            await evictStore(sessionId, store)
+        }
+    }
+
+    /// A store is safe to evict only when it is neither the pushed conversation
+    /// nor rendering on screen.
+    private func isEvictable(_ sessionId: String, _ store: ChatStore) -> Bool {
+        sessionId != chatPath.last && !store.hasBridge
+    }
+
+    private func evictStore(_ sessionId: String, _ store: ChatStore) async {
+        chatStores.removeValue(forKey: sessionId)
+        chatStoreLRU.removeAll { $0 == sessionId }
+        await store.evict()
     }
 
     private func resetChatStores() async {
         let stores = Array(chatStores.values)
         chatStores.removeAll()
+        chatStoreLRU.removeAll()
         for store in stores {
             await store.disconnect()
         }

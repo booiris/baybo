@@ -148,17 +148,28 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   pump and parked pairing sessions live inside it between calls. Frames cross
   the FFI as JSON on a `FrameSink` callback; `onDisconnected` fires ONLY on
   unsolicited pump death (deliberate disconnect aborts first) — the reconnect
-  state machine in `ChatStore` depends on that contract. `AppStore` owns one
-  cached `ChatStore` per opened session. The FFI transport owns one global chat
-  leg per binding (relay content or direct channel WS); opening a session sends a
-  `Subscribe` on that leg and registers/replaces that session's sink. Backing out
-  to the list only detaches the `TranscriptBridge`; frames that arrive while no
-  webview is attached buffer in the store and flush in order on the next attach.
-  Switching sessions does not redial or disconnect the old subscription. Relay
-  bindings also call `relay_preconnect()` on launch/foreground to warm the
-  content leg before a chat is opened; it dials + handshakes but sends no
-  `Subscribe`. Logout, rebind, or explicit app teardown calls `chat_disconnect`,
-  which drops the global leg and all registered sinks.
+  state machine in `ChatStore` depends on that contract. `AppStore` owns a
+  cached `ChatStore` per opened session, LRU-bounded to `maxResidentStores` (12):
+  after each activation, the least-recently-used stores beyond the cap that are
+  idle (offscreen — no attached bridge — and not the pushed session) are evicted
+  via `ChatStore.evict()`, which cancels the store's timers so it can deallocate
+  and calls `chat_unsubscribe` to drop just that session's sink. A memory warning
+  (`AppDelegate.applicationDidReceiveMemoryWarning` → `evictAllIdleStores`) evicts
+  every idle store regardless of the cap. Re-opening an evicted session mints a
+  fresh store that re-subscribes and catches up from gateway history. The FFI
+  transport owns one global chat leg per binding (relay content or direct channel
+  WS); opening a session sends a `Subscribe` on that leg and registers/replaces
+  that session's sink. Backing out to the list only detaches the
+  `TranscriptBridge`; frames that arrive while no webview is attached buffer in
+  the store (capped at `maxBufferedFrames`; on overflow the buffer is dropped and
+  the transcript refetched from the durable floor on re-attach rather than flushed
+  with a hole) and flush in order on the next attach. Switching sessions does not
+  redial or disconnect the old subscription. Relay bindings also call
+  `relay_preconnect()` on launch/foreground to warm the content leg before a chat
+  is opened; it dials + handshakes but sends no `Subscribe`. `chat_unsubscribe`
+  drops one session's sink without touching the leg; logout, rebind, or explicit
+  app teardown calls `chat_disconnect`, which drops the global leg and all
+  registered sinks.
 - **Frame ordering**: sink callbacks hop to the main queue via GCD (FIFO), not
   `Task` — reordered `answer_delta`s would corrupt the transcript.
 - **connState** has exactly one `offline` trigger: a failed dial. Unsolicited

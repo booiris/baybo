@@ -462,6 +462,18 @@ impl SessionRegistry {
         self.sinks.lock().await.clear();
     }
 
+    /// Drop `session_id`'s sink from the global leg WITHOUT tearing the leg down
+    /// (unlike [`disconnect`](Self::disconnect), a binding-wide teardown). Used by
+    /// the client's LRU eviction of an idle, offscreen session: the shared pump
+    /// and every other subscribed session stay live, while this session's inbound
+    /// frames stop being delivered (dispatch drops them with a debug log). There
+    /// is no wire-level unsubscribe, so the gateway keeps the subscription until
+    /// the leg next cycles — a reconnect re-subscribes only sessions that still
+    /// hold a sink, so an evicted one lapses on its own.
+    pub(crate) async fn unsubscribe(&self, session_id: &str) {
+        self.sinks.lock().await.remove(session_id);
+    }
+
     /// Install (or clear) the connection-global session-activity sink. Idempotent;
     /// both legs point at the same foreign sink.
     pub(crate) fn set_list_sink(&self, sink: Option<Arc<dyn SessionListSink>>) {
@@ -566,6 +578,12 @@ pub(crate) async fn connect_and_send<L: SessionLeg>(
 /// Tear down `leg`'s live pump (if any).
 pub(crate) async fn disconnect<L: SessionLeg>(leg: &L) {
     leg.registry().disconnect().await;
+}
+
+/// Drop one session's sink from `leg`'s global chat connection without tearing
+/// the leg down — the client's LRU eviction of an idle, offscreen session.
+pub(crate) async fn unsubscribe<L: SessionLeg>(leg: &L, session_id: &str) {
+    leg.registry().unsubscribe(session_id).await;
 }
 
 /// Point `leg`'s registry at the connection-global session-activity sink.

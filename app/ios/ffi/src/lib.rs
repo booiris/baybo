@@ -449,6 +449,22 @@ impl BayboClient {
         .await;
     }
 
+    /// Drop one session's sink from the active binding's global chat leg without
+    /// tearing the leg down — the client's LRU eviction of an idle, offscreen
+    /// session. The shared pump and every other subscribed session stay live;
+    /// re-opening the session re-subscribes and gateway history replay catches it
+    /// up. Both legs are unsubscribed unconditionally (only one is live; the
+    /// other's map simply lacks the id), so it needn't resolve the active binding.
+    pub async fn chat_unsubscribe(self: Arc<Self>, session_id: String) {
+        let this = self;
+        let _ = runtime::run(async move {
+            transport::unsubscribe(&this.relay, &session_id).await;
+            transport::unsubscribe(&this.direct, &session_id).await;
+            Ok(())
+        })
+        .await;
+    }
+
     /// Upload a picked attachment's raw bytes over the active binding's blob
     /// transport. Relay sends `POST /v1/blobs` over a dedicated E2E API tunnel
     /// blob leg; direct POSTs to plain `/v1/blobs` (Bearer + device id).
