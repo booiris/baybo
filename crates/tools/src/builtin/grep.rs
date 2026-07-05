@@ -13,26 +13,20 @@
 //! non-sensitive `/tmp/work` and leak the secret line.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 use super::paths::require_absolute;
+use super::rg;
 use crate::{ResourceAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput};
 
 const MAX_HITS: usize = 500;
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_FILE_MIB: u64 = MAX_FILE_BYTES / 1024 / 1024;
-/// Cap on raw `rg` stdout we will buffer in-process. Past this we stop
-/// reading and let `rg` exit on EPIPE.
-const MAX_RG_STDOUT_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_RG_STDERR_BYTES: u64 = 64 * 1024;
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
@@ -149,92 +143,39 @@ impl Tool for GrepTool {
 }
 
 async fn run_rg(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
-    let mut cmd = Command::new("rg");
-    cmd.arg("--no-config")
-        .arg("--no-messages")
-        .arg("--color=never")
-        .arg("--hidden")
-        .arg(format!("--max-filesize={MAX_FILE_BYTES}"));
+    let cap = rg::capture(ctx, rg::MAX_STDOUT_BYTES, |cmd| {
+        cmd.arg("--hidden")
+            .arg(format!("--max-filesize={MAX_FILE_BYTES}"));
 
-    if p.case_insensitive {
-        cmd.arg("--ignore-case");
-    }
-    if let Some(g) = &p.glob {
-        cmd.arg("--glob").arg(g);
-    }
-
-    match p.output_mode.as_str() {
-        "files_with_matches" => {
-            cmd.arg("--files-with-matches").arg("--null");
+        if p.case_insensitive {
+            cmd.arg("--ignore-case");
         }
-        "count" => {
-            cmd.arg("--count").arg("--null");
+        if let Some(g) = &p.glob {
+            cmd.arg("--glob").arg(g);
         }
-        "content" => {
-            cmd.arg("--json");
+
+        match p.output_mode.as_str() {
+            "files_with_matches" => {
+                cmd.arg("--files-with-matches").arg("--null");
+            }
+            "count" => {
+                cmd.arg("--count").arg("--null");
+            }
+            "content" => {
+                cmd.arg("--json");
+            }
+            _ => unreachable!(),
         }
-        _ => unreachable!(),
-    }
 
-    cmd.arg("--regexp").arg(&p.pattern).arg("--").arg(&p.path);
-
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = cmd.spawn().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => ToolError::Execution(
-            "ripgrep (`rg`) not found on PATH; install it (e.g. `apt install ripgrep`, \
-             `brew install ripgrep`, `pacman -S ripgrep`)"
-                .into(),
-        ),
-        _ => ToolError::Execution(format!("spawn rg: {e}")),
-    })?;
-
-    let stdout_pipe = child
-        .stdout
-        .take()
-        .ok_or_else(|| ToolError::Execution("rg stdout pipe missing".into()))?;
-    let stderr_pipe = child
-        .stderr
-        .take()
-        .ok_or_else(|| ToolError::Execution("rg stderr pipe missing".into()))?;
-
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let mut limited = stdout_pipe.take(MAX_RG_STDOUT_BYTES);
-        let _ = limited.read_to_end(&mut buf).await;
-        buf
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let mut limited = stderr_pipe.take(MAX_RG_STDERR_BYTES);
-        let _ = limited.read_to_end(&mut buf).await;
-        buf
-    });
-
-    let exit = tokio::select! {
-        _ = ctx.cancellation_token.cancelled() => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(ToolError::Execution("cancelled".into()));
-        }
-        wait = child.wait() => wait,
-    };
-    let exit_status = exit.map_err(|e| ToolError::Execution(format!("rg wait: {e}")))?;
-    let stdout = stdout_task.await.unwrap_or_default();
-    let stderr = stderr_task.await.unwrap_or_default();
+        cmd.arg("--regexp").arg(&p.pattern).arg("--").arg(&p.path);
+    })
+    .await?;
 
     // rg exit codes: 0 = matches, 1 = no matches, 2+ = real error.
-    let code = exit_status.code().unwrap_or(-1);
-    if code >= 2 {
-        let stderr_str = String::from_utf8_lossy(&stderr);
-        return Err(ToolError::Execution(format!(
-            "rg exited with code {code}: {}",
-            stderr_str.trim()
-        )));
+    if cap.code >= 2 {
+        return Err(cap.into_error());
     }
+    let stdout = cap.stdout;
 
     let mut kept: Vec<String> = Vec::new();
     let mut hits_truncated = false;
@@ -250,7 +191,7 @@ async fn run_rg(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
 
     match p.output_mode.as_str() {
         "files_with_matches" => {
-            for path in iter_null_paths(&stdout) {
+            for path in rg::iter_null_paths(&stdout) {
                 if baybo_security::is_sensitive_path(Path::new(&path)) {
                     continue;
                 }
@@ -288,17 +229,6 @@ async fn run_rg(p: &Params, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         body.push_str(&format!("\n… [truncated to {MAX_HITS} results]"));
     }
     Ok(ToolOutput::Text(body))
-}
-
-/// Decode `path1\0path2\0…` records from `rg --files-with-matches --null`.
-/// Non-UTF-8 paths are dropped — we can't safely round-trip them through
-/// the JSON tool result anyway, and a sensitive non-UTF-8 path would
-/// otherwise have no way of being matched against [`is_sensitive_path`].
-fn iter_null_paths(stdout: &[u8]) -> impl Iterator<Item = String> + '_ {
-    stdout
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| std::str::from_utf8(s).ok().map(String::from))
 }
 
 /// Decode `path\0count\n` records from `rg --count --null`. Uses `\n`
