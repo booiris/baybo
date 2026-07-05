@@ -548,7 +548,8 @@
                 "$ref": "#/components/schemas/CreateSessionRequest"
               }
             }
-          }
+          },
+          "required": true
         },
         "responses": {
           "200": {
@@ -3239,19 +3240,6 @@
           }
         }
       },
-      "CreateSessionRequest": {
-        "type": "object",
-        "description": "Request body for `POST /v1/chat/sessions`.",
-        "properties": {
-          "session_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Optional client-supplied session id. If omitted, the gateway mints one."
-          }
-        }
-      },
       "ChatSessionDetail": {
         "type": "object",
         "required": [
@@ -3550,6 +3538,19 @@
               "null"
             ],
             "description": "Parent folder id (`null`/absent = top-level)."
+          }
+        }
+      },
+      "CreateSessionRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/chat/sessions`.",
+        "properties": {
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional client-supplied session id. If omitted, the gateway mints one."
           }
         }
       },

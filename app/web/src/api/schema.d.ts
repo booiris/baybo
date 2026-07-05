@@ -869,11 +869,6 @@ export interface components {
             /** @description New session id. */
             session_id: string;
         };
-        /** @description Request body for `POST /v1/chat/sessions`. */
-        CreateSessionRequest: {
-            /** @description Optional client-supplied session id. If omitted, the gateway mints one. */
-            session_id?: string | null;
-        };
         ChatSessionDetail: {
             /** Format: date-time */
             created_at: string;
@@ -1090,6 +1085,11 @@ export interface components {
             name: string;
             /** @description Parent folder id (`null`/absent = top-level). */
             parent_id?: string | null;
+        };
+        /** @description Request body for `POST /v1/chat/sessions`. */
+        CreateSessionRequest: {
+            /** @description Optional client-supplied session id. If omitted, the gateway mints one. */
+            session_id?: string | null;
         };
         /** @description Mirror of [`baybo_cron::CronJob`]. */
         CronJob: {
@@ -2057,7 +2057,7 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody?: {
+        requestBody: {
             content: {
                 "application/json": components["schemas"]["CreateSessionRequest"];
             };

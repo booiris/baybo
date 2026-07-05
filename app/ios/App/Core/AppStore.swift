@@ -49,6 +49,7 @@ final class AppStore: ObservableObject {
 
     private var restoring = false
     private var relayPreconnectInFlight = false
+    private var directPreconnectInFlight = false
     /// A push-notification tap that arrived before the launch restore resolved
     /// the route; consumed once home is up.
     private var pendingPushSession: String?
@@ -56,6 +57,9 @@ final class AppStore: ObservableObject {
 
     init() {
         AppStore.shared = self
+        // The chat list's live unread/recency source: connection-global
+        // `SessionActivity` pings land here for ANY session, subscribed or not.
+        Baybo.client.setSessionListSink(sink: SessionActivityHandler())
         #if DEBUG
         // UI-verification hooks: land straight on interaction-gated screens so
         // they are screenshotable/log-verifiable headlessly on the simulator.
@@ -115,6 +119,7 @@ final class AppStore: ObservableObject {
             }
             if directBound {
                 await registerPushBestEffort()
+                preconnectDirectBestEffort()
             } else if paired != nil {
                 preconnectRelayBestEffort()
             }
@@ -133,6 +138,7 @@ final class AppStore: ObservableObject {
         }
         if directBound {
             Task { await registerPushBestEffort() }
+            preconnectDirectBestEffort()
         } else if Baybo.client.pairedDevice() != nil {
             preconnectRelayBestEffort()
         }
@@ -154,6 +160,22 @@ final class AppStore: ObservableObject {
                 try await Baybo.client.relayPreconnect()
             } catch {
                 NSLog("baybo: relay preconnect: %@", String(describing: error))
+            }
+        }
+    }
+
+    /// Warm the direct device leg so the list receives live `SessionActivity`
+    /// while parked on it with no chat open (the direct analogue of relay's
+    /// preconnect). Best-effort; the core coalesces a redundant dial.
+    private func preconnectDirectBestEffort() {
+        guard !directPreconnectInFlight else { return }
+        directPreconnectInFlight = true
+        Task { @MainActor in
+            defer { directPreconnectInFlight = false }
+            do {
+                try await Baybo.client.directPreconnect()
+            } catch {
+                NSLog("baybo: direct preconnect: %@", String(describing: error))
             }
         }
     }

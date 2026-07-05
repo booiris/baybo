@@ -123,6 +123,19 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   `Application Support/baybo/transcripts/<id>.json`
   (pruned to the ~10 most recent); the legacy single-session UserDefaults keys
   (`ChatDefaults`) are migrated once and retired.
+- **Live list unread**: the gateway broadcasts a throttled `Frame::SessionActivity`
+  (per-session ping, no content) to EVERY connection on the `device` channel —
+  subscribed or not — when a session's turn completes (`SessionPulse`, now
+  installed on `device` as well as `http`; TUI is excluded). The FFI transport
+  special-cases that frame in `dispatch_inbound_frame`, routing it to a
+  connection-global `SessionListSink` (set once via `set_session_list_sink`)
+  instead of the per-session `FrameSink` — so a session the device never opened
+  still updates the list. `SessionActivityHandler` → `SessionIndex.noteActivity`
+  bumps `SessionRow.unread` (local-only, persisted; ignored for the foreground
+  session and for unknown ids) and recency; `ChatScreen` enter/leave marks the
+  foreground session and clears its badge. Relay warms the leg via
+  `relay_preconnect`; direct via `direct_preconnect` (both best-effort on
+  launch/foreground) so the pings arrive while parked on the list.
 - **Push tap routing**: the gateway embeds `session_id` INSIDE the encrypted
   preview plaintext (never the outer APNs payload — C stays blind, matching the
   hashed collapse-id invariant). The NSE decodes it (optional field; the pinned

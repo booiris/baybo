@@ -34,7 +34,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::api::FrameSink;
+use crate::api::{FrameSink, SessionListSink};
 use crate::core::{Frame, MobileError, WireAttachment, subscribe_frame};
 
 /// The concrete client socket both legs dial.
@@ -168,6 +168,12 @@ struct HandleSlot {
     epoch: u64,
 }
 
+/// The connection-global session-activity sink, shared by both legs (only one is
+/// active at a time). Set once at init; the pump reads it live so registration
+/// order vs. leg establish doesn't matter. `parking_lot` (sync) because it's a
+/// plain slot read on the frame path, never held across an await.
+pub(crate) type SharedListSink = Arc<parking_lot::Mutex<Option<Arc<dyn SessionListSink>>>>;
+
 /// The single live chat leg for one binding. The socket itself is global, while
 /// `sinks` maps each subscribed session to the Swift owner that should receive
 /// that session's frames.
@@ -175,6 +181,8 @@ pub(crate) struct SessionRegistry {
     slot: Mutex<HandleSlot>,
     connect_lock: Mutex<()>,
     sinks: Arc<Mutex<HashMap<String, Arc<dyn FrameSink>>>>,
+    /// Connection-global `SessionActivity` pings (chat-list unread) land here.
+    list_sink: SharedListSink,
 }
 
 impl Default for SessionRegistry {
@@ -183,6 +191,7 @@ impl Default for SessionRegistry {
             slot: Mutex::new(HandleSlot::default()),
             connect_lock: Mutex::new(()),
             sinks: Arc::new(Mutex::new(HashMap::new())),
+            list_sink: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 }
@@ -259,9 +268,7 @@ impl SessionRegistry {
         session_id: &str,
         since_ordinal: Option<i64>,
         sink: Arc<dyn FrameSink>,
-        text: String,
-        msg_id: String,
-        attachments: Vec<WireAttachment>,
+        message: OutboundMessage,
     ) -> Result<(), TransportError> {
         self.sinks.lock().await.insert(session_id.to_string(), sink);
 
@@ -269,9 +276,9 @@ impl SessionRegistry {
             .try_enqueue_all(subscribe_and_send_cmds(
                 session_id,
                 since_ordinal,
-                &text,
-                &msg_id,
-                &attachments,
+                &message.text,
+                &message.msg_id,
+                &message.attachments,
             ))
             .await?
         {
@@ -283,9 +290,9 @@ impl SessionRegistry {
             .try_enqueue_all(subscribe_and_send_cmds(
                 session_id,
                 since_ordinal,
-                &text,
-                &msg_id,
-                &attachments,
+                &message.text,
+                &message.msg_id,
+                &message.attachments,
             ))
             .await?
         {
@@ -298,9 +305,9 @@ impl SessionRegistry {
             .try_enqueue_all(subscribe_and_send_cmds(
                 session_id,
                 since_ordinal,
-                &text,
-                &msg_id,
-                &attachments,
+                &message.text,
+                &message.msg_id,
+                &message.attachments,
             ))
             .await?
         {
@@ -357,7 +364,12 @@ impl SessionRegistry {
             return Err(TransportError::SessionClosed);
         }
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(pump(conn, self.sinks.clone(), outbound_rx));
+        let task = tokio::spawn(pump(
+            conn,
+            self.sinks.clone(),
+            self.list_sink.clone(),
+            outbound_rx,
+        ));
         if let Some(prev) = slot.handle.take() {
             prev.task.abort();
         }
@@ -449,6 +461,21 @@ impl SessionRegistry {
         drop(slot);
         self.sinks.lock().await.clear();
     }
+
+    /// Install (or clear) the connection-global session-activity sink. Idempotent;
+    /// both legs point at the same foreign sink.
+    pub(crate) fn set_list_sink(&self, sink: Option<Arc<dyn SessionListSink>>) {
+        *self.list_sink.lock() = sink;
+    }
+}
+
+/// The user message payload `connect_and_send` enqueues right after the
+/// `Subscribe` — grouped so the connect+send signatures stay under the arg
+/// limit and the trio can't drift apart.
+pub(crate) struct OutboundMessage {
+    pub text: String,
+    pub msg_id: String,
+    pub attachments: Vec<WireAttachment>,
 }
 
 fn subscribe_and_send_cmds(
@@ -528,20 +555,10 @@ pub(crate) async fn connect_and_send<L: SessionLeg>(
     session_id: String,
     since_ordinal: Option<i64>,
     sink: Arc<dyn FrameSink>,
-    text: String,
-    msg_id: String,
-    attachments: Vec<WireAttachment>,
+    message: OutboundMessage,
 ) -> Result<(), String> {
     leg.registry()
-        .connect_and_send(
-            leg,
-            &session_id,
-            since_ordinal,
-            sink,
-            text,
-            msg_id,
-            attachments,
-        )
+        .connect_and_send(leg, &session_id, since_ordinal, sink, message)
         .await
         .map_err(|e| e.to_string())
 }
@@ -549,6 +566,11 @@ pub(crate) async fn connect_and_send<L: SessionLeg>(
 /// Tear down `leg`'s live pump (if any).
 pub(crate) async fn disconnect<L: SessionLeg>(leg: &L) {
     leg.registry().disconnect().await;
+}
+
+/// Point `leg`'s registry at the connection-global session-activity sink.
+pub(crate) fn set_list_sink<L: SessionLeg>(leg: &L, sink: Option<Arc<dyn SessionListSink>>) {
+    leg.registry().set_list_sink(sink);
 }
 
 /// Own the socket for the binding's lifetime: fan inbound frames to per-session
@@ -562,9 +584,10 @@ pub(crate) async fn disconnect<L: SessionLeg>(leg: &L) {
 async fn pump(
     conn: Connection,
     sinks: Arc<Mutex<HashMap<String, Arc<dyn FrameSink>>>>,
+    list_sink: SharedListSink,
     outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
 ) {
-    run_pump(conn, sinks.clone(), outbound_rx).await;
+    run_pump(conn, sinks.clone(), list_sink, outbound_rx).await;
     let sinks: Vec<(String, Arc<dyn FrameSink>)> = sinks
         .lock()
         .await
@@ -581,6 +604,7 @@ async fn pump(
 async fn run_pump(
     conn: Connection,
     sinks: Arc<Mutex<HashMap<String, Arc<dyn FrameSink>>>>,
+    list_sink: SharedListSink,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundCmd>,
 ) {
     let Connection {
@@ -625,7 +649,7 @@ async fn run_pump(
                             // The sink is a foreign callback and can't signal a
                             // dropped consumer (unlike the old webview channel);
                             // session lifetime is owned by explicit disconnects.
-                            dispatch_inbound_frame(&sinks, frame).await;
+                            dispatch_inbound_frame(&sinks, &list_sink, frame).await;
                         }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
@@ -710,7 +734,34 @@ async fn run_pump(
     let _ = sink_ws.close().await;
 }
 
-async fn dispatch_inbound_frame(sinks: &Mutex<HashMap<String, Arc<dyn FrameSink>>>, frame: Frame) {
+async fn dispatch_inbound_frame(
+    sinks: &Mutex<HashMap<String, Arc<dyn FrameSink>>>,
+    list_sink: &SharedListSink,
+    frame: Frame,
+) {
+    // A connection-global activity ping for ANY session (subscribed or not): it
+    // drives the chat-list unread/recency, not a per-session sink. Special-cased
+    // before routing so it isn't dropped for a session with no sink.
+    if let Frame::SessionActivity {
+        session_id,
+        source,
+        at,
+    } = &frame
+    {
+        let sink = list_sink.lock().clone();
+        if let Some(sink) = sink {
+            let source = match source {
+                wire::ActivityKind::User => "user",
+                wire::ActivityKind::Assistant => "assistant",
+            };
+            sink.on_activity(
+                session_id.as_str().to_owned(),
+                source.to_owned(),
+                at.timestamp_millis(),
+            );
+        }
+        return;
+    }
     let target = frame
         .routing_session_id()
         .map(|session_id| session_id.as_str().to_owned());

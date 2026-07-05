@@ -82,22 +82,25 @@ pub fn install_channels(
     Ok(())
 }
 
-/// Install one channel with its approval gate. For the `http` channel
-/// the [`SessionPulse`] observer is attached too: a `UserEcho` or a
-/// *completed* agent emission (terminal `Message`/`Notice`) then emits a
-/// throttled `Frame::SessionActivity` so sidebar tabs not subscribed to
-/// the affected session still get the unread signal.
+/// Install one channel with its approval gate. For the `http` (web) and
+/// `device` (mobile) chat surfaces the [`SessionPulse`] observer is attached
+/// too: a `UserEcho` or a *completed* agent emission (terminal
+/// `Message`/`Notice`) then emits a throttled `Frame::SessionActivity` so
+/// clients not subscribed to the affected session still get the unread signal.
+/// TUI is `Subscribed` as well but is deliberately excluded — it ignores
+/// `SessionActivity`, and its post-`Subscribe` handshake expects
+/// `HistorySnapshot` as the very next frame, which a broadcast pulse could race.
 pub(crate) fn install_channel(
     registry: &Arc<ChannelRegistry>,
     channel_type: ChannelType,
 ) -> ChannelResult<()> {
     let kind = kind_for(&channel_type);
     let channel = build_channel(channel_type.clone(), kind);
-    let is_http = channel_type == ChannelType::http();
+    let wants_pulse = channel_type == ChannelType::http() || channel_type == ChannelType::device();
     registry.install(channel)?;
-    if is_http
-        && let Some(http) = registry.get(&channel_type)
-        && let Some(sub) = http.as_subscribed()
+    if wants_pulse
+        && let Some(chan) = registry.get(&channel_type)
+        && let Some(sub) = chan.as_subscribed()
     {
         SessionPulse::new().install(sub);
     }

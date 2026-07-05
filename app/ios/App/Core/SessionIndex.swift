@@ -11,6 +11,33 @@ struct SessionRow: Codable, Identifiable, Equatable {
     /// session without a user turn yet.
     var lastUserText: String?
     var pinned: Bool
+    /// Local-only unread counter — the server never surfaces it. Bumped by a
+    /// `SessionActivity` ping for a backgrounded session, cleared on open.
+    var unread: Int
+
+    init(
+        id: String, createdAt: Date, lastActive: Date, lastUserText: String?,
+        pinned: Bool, unread: Int = 0
+    ) {
+        self.id = id
+        self.createdAt = createdAt
+        self.lastActive = lastActive
+        self.lastUserText = lastUserText
+        self.pinned = pinned
+        self.unread = unread
+    }
+
+    /// `unread` post-dates the first shipped schema, so an older `sessions.json`
+    /// won't carry the key — default it instead of failing the whole decode.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        lastActive = try c.decode(Date.self, forKey: .lastActive)
+        lastUserText = try c.decodeIfPresent(String.self, forKey: .lastUserText)
+        pinned = try c.decode(Bool.self, forKey: .pinned)
+        unread = try c.decodeIfPresent(Int.self, forKey: .unread) ?? 0
+    }
 }
 
 /// The device-local session registry backing the chat list on BOTH legs. Remote
@@ -32,6 +59,9 @@ final class SessionIndex: ObservableObject {
     @Published private(set) var rows: [SessionRow] = []
 
     private let fileURL: URL
+    /// The session whose `ChatScreen` is on top. A `SessionActivity` ping for it
+    /// is not counted as unread (the user is looking at it); `nil` on the list.
+    private var foregroundSessionId: String?
 
     private init() {
         fileURL = Self.supportDirectory().appendingPathComponent("sessions.json")
@@ -85,6 +115,49 @@ final class SessionIndex: ObservableObject {
         save()
     }
 
+    // MARK: - Live activity (SessionActivity pings)
+
+    /// A connection-global `SessionActivity` ping (see `SessionActivityHandler`):
+    /// bump the row's recency and, unless it's the foreground session, its unread
+    /// count. Unknown ids (drafts / cron / sessions created on another device) are
+    /// ignored — a later REST merge surfaces them. Both `user` and `assistant`
+    /// sources count, matching the web sidebar.
+    func noteActivity(sessionId: String, source: String, atMillis: Int64) {
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
+        let at = Date(timeIntervalSince1970: Double(atMillis) / 1000)
+        var changed = false
+        if at > rows[idx].lastActive {
+            rows[idx].lastActive = at
+            changed = true
+        }
+        if sessionId != foregroundSessionId {
+            rows[idx].unread += 1
+            changed = true
+        }
+        if changed { save() }
+    }
+
+    /// A `ChatScreen` came to the foreground: mark it current and clear its badge.
+    func enterSession(_ sessionId: String) {
+        foregroundSessionId = sessionId
+        clearUnread(sessionId)
+    }
+
+    /// The foreground `ChatScreen` went away (pop / switch). Only clears the
+    /// marker if it still points at `sessionId` (a fast switch may have moved it).
+    func leaveSession(_ sessionId: String) {
+        if foregroundSessionId == sessionId {
+            foregroundSessionId = nil
+        }
+    }
+
+    func clearUnread(_ sessionId: String) {
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }), rows[idx].unread != 0
+        else { return }
+        rows[idx].unread = 0
+        save()
+    }
+
     /// Merge the direct leg's REST list (the full non-hidden truth). Remote wins
     /// for existence — a local row missing remotely was hidden/deleted from
     /// another client — and for row fields, unless the local row saw activity
@@ -108,12 +181,13 @@ final class SessionIndex: ObservableObject {
                         id: summary.sessionId, createdAt: createdAt,
                         lastActive: mine.lastActive,
                         lastUserText: mine.lastUserText ?? summary.lastUserText,
-                        pinned: summary.pinned))
+                        pinned: summary.pinned, unread: mine.unread))
             } else {
                 merged.append(
                     SessionRow(
                         id: summary.sessionId, createdAt: createdAt, lastActive: lastActive,
-                        lastUserText: summary.lastUserText, pinned: summary.pinned))
+                        lastUserText: summary.lastUserText, pinned: summary.pinned,
+                        unread: mine?.unread ?? 0))
             }
         }
         rows = merged
@@ -196,6 +270,24 @@ final class SessionIndex: ObservableObject {
         let dir = base.appendingPathComponent("baybo", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+}
+
+/// Bridges the core's connection-global `SessionActivity` pings onto the
+/// device-local list. Registered once at launch (`AppStore` →
+/// `setSessionListSink`). `@unchecked Sendable`: it holds no mutable state and
+/// all work hops to the main actor before touching `SessionIndex`. NOT named
+/// `SessionListSinkImpl` — UniFFI generates a class by that exact name for the
+/// `with_foreign` trait, so a same-named class here collides (cf. `Sink` /
+/// `PairAbortHandler`, which dodge the generated `*Impl` names the same way).
+final class SessionActivityHandler: SessionListSink, @unchecked Sendable {
+    func onActivity(sessionId: String, source: String, atMillis: Int64) {
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                SessionIndex.shared.noteActivity(
+                    sessionId: sessionId, source: source, atMillis: atMillis)
+            }
+        }
     }
 }
 

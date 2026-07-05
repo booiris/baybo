@@ -30,7 +30,7 @@ use crate::core::WireAttachment;
 
 pub use api::{
     ApnsEnvironment, AttachmentKind, AttachmentRef, BayboError, ChatSessionSummary, ClientConfig,
-    FrameSink, PairAbortListener, PairChallenge, PairTarget, PairedSummary,
+    FrameSink, PairAbortListener, PairChallenge, PairTarget, PairedSummary, SessionListSink,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -86,6 +86,16 @@ impl BayboClient {
     /// relay token-refresh API call, and direct push registration.
     pub fn set_apns_token(&self, token_hex: String) {
         self.apns.set_token(token_hex);
+    }
+
+    /// Install the chat list's session-activity sink: the connection-global
+    /// `Frame::SessionActivity` pings (for ANY session, subscribed or not) land
+    /// here so the list can bump unread + recency without subscribing every
+    /// session. Set once at launch; both legs share it (only one is live at a
+    /// time), so warming a leg later still delivers to this sink.
+    pub fn set_session_list_sink(&self, sink: Arc<dyn SessionListSink>) {
+        transport::set_list_sink(&self.relay, Some(sink.clone()));
+        transport::set_list_sink(&self.direct, Some(sink));
     }
 
     /// The device id of a persisted relay pairing, if any — so a relaunch shows
@@ -200,7 +210,9 @@ impl BayboClient {
                     let client = self.direct.http_client()?;
                     gateway_api::create_session(&client, &session_id).await
                 }
-                ActiveLeg::Relay => gateway_api::create_session(&relay::GatewayApi, &session_id).await,
+                ActiveLeg::Relay => {
+                    gateway_api::create_session(&relay::GatewayApi, &session_id).await
+                }
             }?;
             if created != requested {
                 return Err(format!(
@@ -244,6 +256,21 @@ impl BayboClient {
                     transport::preconnect(&this.relay).await
                 }
                 ActiveLeg::Direct => Ok(()),
+            }
+        })
+        .await
+    }
+
+    /// Warm the direct device leg without subscribing a session — the direct
+    /// analogue of [`Self::relay_preconnect`]. Lets the chat list receive live
+    /// `SessionActivity` while parked on the list with no chat open. Relay
+    /// bindings no-op (they warm via `relay_preconnect`).
+    pub async fn direct_preconnect(self: Arc<Self>) -> Result<(), BayboError> {
+        let this = self;
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => transport::preconnect(&this.direct).await,
+                ActiveLeg::Relay => Ok(()),
             }
         })
         .await
@@ -328,9 +355,11 @@ impl BayboClient {
                         session_id,
                         since_ordinal,
                         sink,
-                        text,
-                        msg_id,
-                        attachments,
+                        transport::OutboundMessage {
+                            text,
+                            msg_id,
+                            attachments,
+                        },
                     )
                     .await
                 }
@@ -340,9 +369,11 @@ impl BayboClient {
                         session_id,
                         since_ordinal,
                         sink,
-                        text,
-                        msg_id,
-                        attachments,
+                        transport::OutboundMessage {
+                            text,
+                            msg_id,
+                            attachments,
+                        },
                     )
                     .await
                 }
@@ -392,8 +423,7 @@ impl BayboClient {
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => {
-                    gateway_api::fetch_catch_up(&relay::GatewayApi, session_id, since_ordinal)
-                        .await
+                    gateway_api::fetch_catch_up(&relay::GatewayApi, session_id, since_ordinal).await
                 }
                 ActiveLeg::Direct => {
                     let client = self.direct.http_client()?;
@@ -505,8 +535,8 @@ async fn refresh_relay_apns_best_effort(apns: &ApnsState) {
         log::info!("connecting without an APNs token; relay push binding not refreshed");
         return;
     };
-    if let Err(e) = gateway_api::update_apns_token(&relay::GatewayApi, &token, apns.env().as_str())
-        .await
+    if let Err(e) =
+        gateway_api::update_apns_token(&relay::GatewayApi, &token, apns.env().as_str()).await
     {
         log::warn!("relay APNs token refresh failed: {e}");
     }

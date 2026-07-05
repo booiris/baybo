@@ -27,7 +27,7 @@
      header (status bar + the 42pt glass bar), not under its icons. The
      status-bar part is device-correct via env() (the webview is full-bleed,
      viewport-fit=cover); the 54px covers the native bar height + breathing. */
-  --thread-top-inset: calc(env(safe-area-inset-top) + 56px);
+  --thread-top-inset: calc(env(safe-area-inset-top) + 58px);
   /* Height of the webview's bottom edge covered by native chrome (composer +
      the keyboard it rides). The webview is full-bleed and NEVER resizes with
      the keyboard — native streams this per layout tick over the bridge and

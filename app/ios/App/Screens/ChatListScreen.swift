@@ -118,26 +118,47 @@ struct SessionRowView: View {
     private static let absoluteTimeThreshold: TimeInterval = 24 * 60 * 60
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(verbatim: row.lastUserText ?? Lang.shared.t("list.previewPlaceholder"))
-                .font(Theme.mono(15))
-                .foregroundStyle(row.lastUserText == nil ? Theme.inkSoft : Theme.ink)
-                .lineLimit(2)
-                .multilineTextAlignment(.leading)
-            HStack(spacing: 6) {
-                if row.pinned {
-                    Image(systemName: "pin.fill")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(Theme.inkSoft)
-                }
-                Text(verbatim: Self.age(of: row.lastActive, locale: langCode, justNow: justNow))
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(verbatim: row.lastUserText ?? Lang.shared.t("list.previewPlaceholder"))
+                    .font(Theme.mono(15))
+                    .foregroundStyle(row.lastUserText == nil ? Theme.inkSoft : Theme.ink)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                HStack(spacing: 6) {
+                    if row.pinned {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(Theme.inkSoft)
+                    }
+                    Text(
+                        verbatim: Self.age(
+                            of: row.lastActive, locale: langCode, justNow: justNow)
+                    )
                     .font(Theme.mono(12))
                     .foregroundStyle(Theme.inkSoft)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if row.unread > 0 {
+                unreadBadge
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 14)
         .contentShape(Rectangle())
+    }
+
+    /// The unread count for a backgrounded session: an ink capsule with paper
+    /// digits, matching the ink CTA pill (`99+` past the cap). Cleared on open,
+    /// so it never shows on the row the user is currently viewing.
+    private var unreadBadge: some View {
+        Text(verbatim: row.unread > 99 ? "99+" : String(row.unread))
+            .font(Theme.mono(11, weight: .medium))
+            .foregroundStyle(Theme.paper)
+            .padding(.horizontal, 6)
+            .frame(minWidth: 18, minHeight: 18)
+            .background(Theme.ink, in: Capsule())
+            .accessibilityLabel(Text(verbatim: "\(row.unread)"))
     }
 
     private static func age(

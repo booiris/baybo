@@ -75,6 +75,7 @@ struct ChatScreen: View {
         .onAppear {
             bridge.attach()
             store.connectIfNeeded()
+            SessionIndex.shared.enterSession(store.sessionId)
             #if DEBUG
                 store.startDemoFramesIfRequested()
                 bridge.startDemoJumpIfRequested()
@@ -83,6 +84,7 @@ struct ChatScreen: View {
         }
         .onDisappear {
             bridge.detach()
+            SessionIndex.shared.leaveSession(store.sessionId)
         }
     }
 

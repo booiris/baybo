@@ -2,8 +2,8 @@
 
 use std::future::Future;
 
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::api::ChatSessionSummary;
 
@@ -154,9 +154,7 @@ pub(crate) async fn create_session<C: GatewayJsonClient + Sync>(
 ) -> Result<String, String> {
     let body = serde_json::to_vec(&CreateSessionRequest { session_id })
         .map_err(|e| format!("encode create session request: {e}"))?;
-    let created: ChatSessionCreated = client
-        .post_json(PATH_CHAT_SESSIONS, body)
-        .await?;
+    let created: ChatSessionCreated = client.post_json(PATH_CHAT_SESSIONS, body).await?;
     Ok(created.session_id)
 }
 
@@ -233,12 +231,7 @@ pub(crate) async fn fetch_catch_up<C: GatewayJsonClient + Sync>(
     validate_path_segment(&session_id, "session_id")?;
     let mut path = format!("{PATH_CHAT_SESSIONS}/{session_id}/catch-up");
     let mut first_query = true;
-    append_query(
-        &mut path,
-        &mut first_query,
-        "since_ordinal",
-        since_ordinal,
-    );
+    append_query(&mut path, &mut first_query, "since_ordinal", since_ordinal);
     append_query(&mut path, &mut first_query, "limit", CATCH_UP_LIMIT);
     let response: ChatCatchUpResponse = client.get_json(&path).await?;
     let frame = CatchUpFrame {

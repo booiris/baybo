@@ -185,6 +185,20 @@ pub trait FrameSink: Send + Sync {
     fn on_disconnected(&self, session_id: String);
 }
 
+/// Where connection-global session-activity pings land. The gateway broadcasts a
+/// throttled `Frame::SessionActivity` for ANY session on the binding's leg —
+/// subscribed or not — so the chat list can bump unread + recency without
+/// subscribing every session. One sink per client, registered once via
+/// [`BayboClient::set_session_list_sink`]; both legs share it (only one is live
+/// at a time). Calls arrive on the core's tokio workers, so the Swift impl must
+/// be thread-safe (hop to the main actor before touching UI).
+#[uniffi::export(with_foreign)]
+pub trait SessionListSink: Send + Sync {
+    /// `source` is the lowercase `ActivityKind` (`"user"` / `"assistant"`);
+    /// `at_millis` is the activity's unix-epoch milliseconds.
+    fn on_activity(&self, session_id: String, source: String, at_millis: i64);
+}
+
 /// Gateway-side cancellation of an in-flight pairing (the operator declined or
 /// the link dropped) while the confirm screen is up — dismiss it instead of
 /// hanging until the user taps.
