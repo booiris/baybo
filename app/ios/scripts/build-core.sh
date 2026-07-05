@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the Rust core into BayboCore.xcframework + generated Swift bindings.
 #
-#   scripts/build-xcframework.sh [--release] [--sim-only]
+#   scripts/build-core.sh [--release] [--sim-only]
 #
 # Produces:
 #   Generated/BayboCore.swift          — the UniFFI Swift bindings (add to the app target)

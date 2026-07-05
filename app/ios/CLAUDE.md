@@ -21,46 +21,46 @@ App/                  — SwiftUI sources + resources
 NotificationExtension/ — NSE Swift sources (copied from app/mobile/apple;
                         dedupe when app/mobile retires)
 web/                  — the transcript-only Vite/React bundle
-scripts/              — build-xcframework.sh, build.sh, install.mjs
+scripts/              — build-core.sh, build-app.sh, install.mjs
 Generated/ Externals/ — build products (gitignored): BayboCore.swift + .xcframework
 ```
 
 ## Build
 
 ```bash
-scripts/build.sh                 # web → rust xcframework → xcodegen → sim build
-scripts/build.sh --device --release
+scripts/build-app.sh             # web → rust xcframework → xcodegen → sim build
+scripts/build-app.sh --device --release
 node scripts/install.mjs         # archive + export + devicectl install (USB)
 cargo clippy --workspace --all-targets --all-features   # zero warnings
 cargo test --workspace           # host tests (QR parser etc.)
 (cd web && pnpm build)           # tsc --noEmit + vite build
 ```
 
-The Rust core is built OUTSIDE Xcode (no shell build phase): `build.sh` runs
-`build-xcframework.sh` (cargo per-target + uniffi-bindgen + create-xcframework)
+The Rust core is built OUTSIDE Xcode (no shell build phase): `build-app.sh` runs
+`build-core.sh` (cargo per-target + uniffi-bindgen + create-xcframework)
 before `xcodegen generate`, so the project always references fresh products.
 `generate_context!`-style staleness does not exist here, but the ORDER still
 matters: web bundle → `App/Resources/transcript/` → xcodegen → xcodebuild.
 
-**Device builds need the device slice AND a signed xcframework.** `build.sh`
+**Device builds need the device slice AND a signed xcframework.** `build-app.sh`
 defaults to sim-only (`XCF_FLAGS=(--sim-only)`), so a plain run produces a
 sim-only `BayboCore.xcframework`; switching Xcode's destination to a physical
 device then fails with *"no library for this platform was found."* Pass
-`--device` (or run `build-xcframework.sh` with no flags) to add the `ios-arm64`
+`--device` (or run `build-core.sh` with no flags) to add the `ios-arm64`
 slice. Xcode 15+/26 also rejects any xcframework referenced by a device build
 that isn't code-signed (*"The Framework … is unsigned"*) — `-create-xcframework`
-emits an unsigned bundle, so `build-xcframework.sh` now `codesign`s it for
+emits an unsigned bundle, so `build-core.sh` now `codesign`s it for
 non-sim-only builds (identity via `BAYBO_IOS_CODESIGN_IDENTITY`, default
 `Apple Development`). Run the signing build from an interactive Terminal in your
 GUI login session: codesign needs the unlocked login keychain, and a headless
 shell fails with `errSecInternalComponent` / "User interaction is not allowed."
 
 **Sim-verification loops must not clobber the device xcframework.** A plain
-`build.sh` run overwrites `Externals/BayboCore.xcframework` with a sim-only
+`build-app.sh` run overwrites `Externals/BayboCore.xcframework` with a sim-only
 unsigned bundle, and the next Xcode device Run fails with exactly the two
 errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 `--skip-rust`; after a full run does clobber it, restore with
-`scripts/build-xcframework.sh` (no flags).
+`scripts/build-core.sh` (no flags).
 
 ## Continuity contract (do not change — existing installs depend on it)
 
@@ -195,7 +195,7 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   `-baybo-demo-keyboard` raises the keyboard 2s in and drops
   it at 5s (record with `simctl io recordVideo`, extract frames with ffmpeg);
   the software keyboard only appears with Simulator.app running and hardware
-  keyboard disconnected. `scripts/build.sh` pins products at
+  keyboard disconnected. `scripts/build-app.sh` pins products at
   `build/DerivedData/Build/Products/<config>-<sdk>/Baybo.app` for
   `simctl install`.
 - **Send path**: native mints the msgId, seeds the webview's optimistic bubble

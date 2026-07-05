@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Build a development-signed IPA of the SwiftUI app and install + launch it on
 // a USB-connected device via `xcrun devicectl` — the successor of app/mobile's
-// ios-install.mjs, minus Tauri. Assumes scripts/build.sh --device --release
+// ios-install.mjs, minus Tauri. Assumes scripts/build-app.sh --device --release
 // inputs (web bundle + xcframework) are already in place, or run with
 // --prepare to build them first.
 //
@@ -41,7 +41,7 @@ const run = (cmd, cmdArgs, cwd = root) =>
   execFileSync(cmd, cmdArgs, { cwd, stdio: "inherit" });
 
 if (has("--prepare")) {
-  run("bash", ["scripts/build.sh", "--device", ...(has("--debug") ? [] : ["--release"]), "--skip-web"]);
+  run("bash", ["scripts/build-app.sh", "--device", ...(has("--debug") ? [] : ["--release"]), "--skip-web"]);
   run("bash", ["-c", "cd web && pnpm install --silent && pnpm build"], root);
   run("bash", ["-c", "rm -rf App/Resources/transcript && mkdir -p App/Resources/transcript && cp -R web/dist/. App/Resources/transcript/"], root);
   run("xcodegen", ["generate"]);

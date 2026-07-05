@@ -18,7 +18,7 @@
 # `com.apple.security.get-task-allow` entitlement or the sim refuses to launch.
 #
 # Differences from the app/mobile original (behavior, not intent):
-#   * Build: scripts/build-xcframework.sh --sim-only (DEBUG profile — the seed
+#   * Build: scripts/build-core.sh --sim-only (DEBUG profile — the seed
 #     hook is compiled out otherwise) → web transcript bundle if missing →
 #     xcodegen → xcodebuild with CODE_SIGNING_ALLOWED=NO and a deterministic
 #     -derivedDataPath (build/DerivedData), instead of `cargo tauri ios build`.
@@ -101,7 +101,7 @@ fi
 # the entitlement this script signs below.
 XCLOG="$(mktemp -t baybo-xcodebuild).log"
 ( cd "$IOS_DIR" \
-    && BAYBO_IOS_KEYCHAIN_ACCESS_GROUP="$KEYCHAIN_GROUP" scripts/build-xcframework.sh --sim-only \
+    && BAYBO_IOS_KEYCHAIN_ACCESS_GROUP="$KEYCHAIN_GROUP" scripts/build-core.sh --sim-only \
     && xcodegen generate \
     && xcodebuild -project Baybo.xcodeproj -scheme Baybo -configuration Debug \
          -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
@@ -164,7 +164,7 @@ if ! SIMCTL_CHILD_BAYBO_SEED_PUSH_KEY="$BID:$KEY" xcrun simctl launch "$UDID" co
   App Group; only Xcode automatic signing can, and App Groups are a paid Apple
   Developer capability. The reliable path:
 
-    1. run scripts/build.sh once (regenerates Baybo.xcodeproj via xcodegen),
+    1. run scripts/build-app.sh once (regenerates Baybo.xcodeproj via xcodegen),
        then open app/ios/Baybo.xcodeproj in Xcode
     2. for BOTH targets (Baybo + NotificationExtension), Signing & Capabilities:
        pick your Team (Xcode registers group.com.baybo.app + provisions; you may

@@ -4,7 +4,7 @@
 # references Generated/BayboCore.swift, Externals/BayboCore.xcframework, and
 # App/Resources/transcript/, all produced here.
 #
-#   scripts/build.sh [--release] [--device|--sim] [--skip-web] [--skip-rust]
+#   scripts/build-app.sh [--release] [--device|--sim] [--skip-web] [--skip-rust]
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -35,7 +35,7 @@ if [[ "$SKIP_WEB" != 1 ]]; then
 fi
 
 if [[ "$SKIP_RUST" != 1 ]]; then
-  scripts/build-xcframework.sh ${XCF_FLAGS[@]+"${XCF_FLAGS[@]}"} ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"}
+  scripts/build-core.sh ${XCF_FLAGS[@]+"${XCF_FLAGS[@]}"} ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"}
 fi
 
 xcodegen generate

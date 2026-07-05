@@ -1,7 +1,7 @@
 # The hand-written Xcode project (xcodegen spec) for the SwiftUI Baybo app.
-# Regenerate with `xcodegen generate` (or scripts/build.sh, which also builds
+# Regenerate with `xcodegen generate` (or scripts/build-app.sh, which also builds
 # the Rust core first — the Generated/ + Externals/ inputs below come from
-# scripts/build-xcframework.sh).
+# scripts/build-core.sh).
 #
 # CONTINUITY CONTRACT with installs made by the Tauri shell (app/mobile) — do
 # not change any of these or existing users silently lose their device
@@ -58,7 +58,7 @@ targets:
       - path: NotificationExtension/PushPayloadKeys.swift
         createIntermediateGroups: false
       # The transcript web bundle (built by `pnpm build` in web/, copied here by
-      # scripts/build.sh) ships as a folder reference so index.html + hashed
+      # scripts/build-app.sh) ships as a folder reference so index.html + hashed
       # assets load via loadFileURL.
       - path: App/Resources/transcript
         type: folder
