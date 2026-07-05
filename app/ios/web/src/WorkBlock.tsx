@@ -1,5 +1,5 @@
 import type { TFunction } from "i18next";
-import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { MarkdownBody } from "./Markdown";
 import type { WorkRow, WorkStep } from "./types";
@@ -31,7 +31,7 @@ function WorkStepView({ step }: { step: WorkStep }) {
       return (
         <div className="step reasoning">
           <span className="step-glyph">✻</span>
-          <span className="step-text">{step.text}</span>
+          <MarkdownBody text={step.text} />
         </div>
       );
     case "prose":
@@ -66,13 +66,6 @@ function WorkStepView({ step }: { step: WorkStep }) {
 export const WorkBlockView = memo(function WorkBlockView({ row }: { row: WorkRow }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
-  const stepsRef = useRef<HTMLDivElement>(null);
-
-  // The capped step feed follows its own tail while the turn streams.
-  useLayoutEffect(() => {
-    const el = stepsRef.current;
-    if (row.active && el) el.scrollTop = el.scrollHeight;
-  }, [row.active, row.steps]);
 
   if (row.active) {
     return (
@@ -83,7 +76,7 @@ export const WorkBlockView = memo(function WorkBlockView({ row }: { row: WorkRow
           <LiveElapsed startedAt={row.startedAt} />
         </div>
         {row.steps.length > 0 && (
-          <div className="work-steps" ref={stepsRef}>
+          <div className="work-steps">
             {row.steps.map((s, i) => (
               <WorkStepView key={i} step={s} />
             ))}

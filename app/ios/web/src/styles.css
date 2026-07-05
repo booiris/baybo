@@ -256,10 +256,6 @@ html::-webkit-scrollbar { display: none; }
    with a spinner header; closed: a dim tappable "Worked Xs ›" summary. */
 .work { width: 100%; font-family: var(--font-mono); }
 .work.active {
-  border: 1px solid var(--color-line);
-  border-radius: var(--radius);
-  background: var(--color-surface);
-  padding: 0.6rem 0.75rem;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
@@ -301,11 +297,7 @@ html::-webkit-scrollbar { display: none; }
   display: flex;
   flex-direction: column;
   gap: 0.45rem;
-  max-height: 45dvh;
-  overflow-y: auto;
-  scrollbar-width: none;
 }
-.work-steps::-webkit-scrollbar { display: none; }
 .step {
   display: flex;
   align-items: flex-start;
@@ -316,7 +308,9 @@ html::-webkit-scrollbar { display: none; }
 }
 .step .step-glyph { flex: 0 0 auto; }
 .step .step-text { white-space: pre-wrap; word-break: break-word; min-width: 0; }
-.step.reasoning .step-text { font-style: italic; }
+/* Reasoning is the model's own markdown; render it as a soft prose trace beside
+   the ✻ marker (sans, dim), distinct from the answer prose below. */
+.step.reasoning .md { flex: 1; min-width: 0; font-family: var(--font-sans); }
 .step.tool { color: var(--color-ink); }
 .step.tool.failed { color: var(--color-err); }
 .work.active .step.tool.running .step-glyph { animation: glyph-pulse 1s ease-in-out infinite; }
