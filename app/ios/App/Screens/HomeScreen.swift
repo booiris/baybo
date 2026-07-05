@@ -104,6 +104,10 @@ extension AppStore.HomeTab {
 struct HomeHeaderView: View {
     var notice: String? = nil
     var onCompose: (() -> Void)? = nil
+    /// Chats only: pull-to-refresh feedback rendered BESIDE the wordmark (as an
+    /// overlay, so it never shifts it). Shown only while the refresh runs — after
+    /// the pull rebounds — never during the drag.
+    var isRefreshing: Bool = false
 
     private static let barHeight: CGFloat = 46
 
@@ -116,6 +120,10 @@ struct HomeHeaderView: View {
                     .kerning(5)
                     .padding(.leading, 5)
                     .foregroundStyle(Theme.ink)
+                    .overlay(alignment: .trailing) {
+                        RefreshRing(isRefreshing: isRefreshing)
+                            .offset(x: 18)
+                    }
 
                 if let onCompose {
                     HStack {
@@ -150,5 +158,38 @@ struct HomeHeaderView: View {
         LinearGradient(stops: ChatHeaderView.veilStops, startPoint: .top, endPoint: .bottom)
             .ignoresSafeArea(edges: .top)
             .allowsHitTesting(false)
+    }
+}
+
+/// The pull-to-refresh indicator beside the wordmark: a rotating open ring
+/// (not the system spokes). It appears ONLY once the refresh is running — after
+/// the pull is released and the list rebounds — never during the drag itself.
+/// The spin only runs while refreshing so an idle list isn't animating.
+private struct RefreshRing: View {
+    var isRefreshing: Bool
+    @State private var angle: Double = 0
+
+    var body: some View {
+        Circle()
+            .trim(from: 0, to: 0.72)
+            .stroke(Theme.inkSoft, style: StrokeStyle(lineWidth: 1, lineCap: .round))
+            .frame(width: 10, height: 10)
+            .rotationEffect(.degrees(angle))
+            .opacity(isRefreshing ? 1 : 0)
+            .animation(.easeOut(duration: 0.2), value: isRefreshing)
+            .onChange(of: isRefreshing) { _, on in spin(on) }
+            .accessibilityLabel(Text(verbatim: Lang.shared.t("list.refresh")))
+            .accessibilityHidden(!isRefreshing)
+    }
+
+    private func spin(_ on: Bool) {
+        if on {
+            angle = 0
+            withAnimation(.linear(duration: 0.8).repeatForever(autoreverses: false)) {
+                angle = 360
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.15)) { angle = 0 }
+        }
     }
 }

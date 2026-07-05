@@ -12,10 +12,19 @@ struct ChatListScreen: View {
     @Environment(\.scenePhase) private var scenePhase
     /// Transient compose-failure line (localized, already resolved).
     @State private var notice: String?
+    /// Self-drawn pull-to-refresh. The native List spinner is suppressed (we
+    /// don't use `.refreshable`); the header ring is shown instead, only once the
+    /// pull is released and the refresh starts. `pullPeak` is the max top-overscroll
+    /// within the current drag and `dragging` gates the on-release threshold check.
+    @State private var isRefreshing = false
+    @State private var pullPeak: CGFloat = 0
+    @State private var dragging = false
 
     /// Clearance for the overlaid header: bar height + a breath. (The native tab
     /// bar's bottom inset is handled by the system, so no bottom margin here.)
     private static let topContentMargin: CGFloat = 58
+    /// Top-overscroll (points) that, once released past it, fires a refresh.
+    private static let pullThreshold: CGFloat = 72
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -28,7 +37,11 @@ struct ChatListScreen: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            HomeHeaderView(notice: notice, onCompose: compose)
+            HomeHeaderView(
+                notice: notice,
+                onCompose: compose,
+                isRefreshing: isRefreshing
+            )
         }
         .background(Theme.paper)
         .task {
@@ -39,6 +52,13 @@ struct ChatListScreen: View {
                 Task { await refresh() }
             }
         }
+        #if DEBUG
+            .task {
+                if ProcessInfo.processInfo.arguments.contains("-baybo-demo-refresh") {
+                    isRefreshing = true
+                }
+            }
+        #endif
     }
 
     private var sessionList: some View {
@@ -61,8 +81,25 @@ struct ChatListScreen: View {
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .contentMargins(.top, Self.topContentMargin, for: .scrollContent)
-        .refreshable {
-            await refresh()
+        .scrollBounceBehavior(.always)
+        .onScrollGeometryChange(for: CGFloat.self) { geo in
+            max(0, -(geo.contentOffset.y + geo.contentInsets.top))
+        } action: { _, overscroll in
+            if dragging && overscroll > pullPeak { pullPeak = overscroll }
+        }
+        .onScrollPhaseChange { _, phase in
+            switch phase {
+            case .tracking, .interacting:
+                if !isRefreshing {
+                    dragging = true
+                    pullPeak = 0
+                }
+            default:
+                if dragging {
+                    dragging = false
+                    if pullPeak >= Self.pullThreshold { triggerRefresh() }
+                }
+            }
         }
     }
 
@@ -91,6 +128,21 @@ struct ChatListScreen: View {
         notice = nil
         Task {
             notice = await appStore.startNewChat()
+        }
+    }
+
+    /// Fire a refresh from a completed pull. Spin for at least one full turn even
+    /// when the round-trip is near-instant, so the gesture always reads as
+    /// feedback rather than a flicker.
+    private func triggerRefresh() {
+        guard !isRefreshing else { return }
+        Haptics.tap()
+        isRefreshing = true
+        Task {
+            async let minimum: Void = Task.sleep(for: .milliseconds(800))
+            await refresh()
+            try? await minimum
+            isRefreshing = false
         }
     }
 

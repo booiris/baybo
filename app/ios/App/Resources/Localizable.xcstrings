@@ -681,6 +681,23 @@
         }
       }
     },
+    "list.refresh" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Refresh"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "刷新"
+          }
+        }
+      }
+    },
     "pair.cancel" : {
       "extractionState" : "stale",
       "localizations" : {
