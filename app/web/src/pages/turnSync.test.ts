@@ -126,7 +126,7 @@ function makeTab() {
     turn: () => views[SID]?.turn ?? null,
     hasActiveWork: () => (views[SID]?.transcript ?? []).some((r) => r.kind === 'work' && r.workActive),
     feed(frame: Frame) {
-      routeInboundFrame(frame, setViews, setSessions, 0);
+      routeInboundFrame(frame, setViews, setSessions);
     },
   };
 }

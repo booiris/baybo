@@ -168,22 +168,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/chat/sessions/{session_id}/catch-up": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["catch_up_session"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/chat/sessions/{session_id}/folder": {
         parameters: {
             query?: never;
@@ -193,6 +177,22 @@ export interface paths {
         };
         get?: never;
         put: operations["set_session_folder"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["lookup_session_message"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -225,6 +225,22 @@ export interface paths {
         };
         get?: never;
         put: operations["set_session_pin"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["sync_session"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -748,12 +764,6 @@ export interface components {
             jobs: components["schemas"]["BackgroundJob"][];
         };
         /**
-         * @description Discriminator for [`ChatCatchUpItem`] — serialized as
-         *     `"message"` / `"work"`.
-         * @enum {string}
-         */
-        CatchUpItemKind: "message" | "work";
-        /**
          * @description Admin-surface mirror of [`baybo_model::ChannelType`]. Transparent
          *     wrapper around a snake_case string so the OpenAPI surface stays
          *     stable while the core type is open-ended (runtime-registered
@@ -768,51 +778,6 @@ export interface components {
             mime_type: string;
             /** Format: int32 */
             size: number;
-        };
-        /**
-         * @description Forward reconnect item for native device clients. The sequence is ordered by
-         *     persisted ordinal; a completed tool-using assistant reply appears as a
-         *     `work` item followed by the matching `message` item with the same `ordinal`.
-         */
-        ChatCatchUpItem: {
-            attachments?: components["schemas"]["ChatAttachment"][];
-            content: string;
-            kind: components["schemas"]["CatchUpItemKind"];
-            /** Format: int64 */
-            ordinal: number;
-            platform_msg_id?: string;
-            role?: string;
-            steps?: components["schemas"]["ChatCatchUpWorkStep"][];
-        };
-        ChatCatchUpResponse: {
-            items: components["schemas"]["ChatCatchUpItem"][];
-            /**
-             * Format: int64
-             * @description Newest visible message ordinal included in `items`. Internal tool /
-             *     thinking rows are deliberately not exposed as the cursor, because a
-             *     later final answer may still need them to reconstruct its completed work
-             *     block.
-             */
-            newest_ordinal?: number | null;
-            /**
-             * @description True when the requested gap exceeds the catch-up cap. The client should
-             *     discard this partial answer and rebuild from the normal history API.
-             */
-            truncated: boolean;
-        };
-        /**
-         * @description One work step in the forward catch-up API. This intentionally mirrors
-         *     `wire::WireWorkStep`'s JSON field names (not the REST transcript's
-         *     `tool_label` / `tool_status` names) because the device transcript reuses the
-         *     live `WorkSnapshot` renderer for catch-up work blocks.
-         */
-        ChatCatchUpWorkStep: {
-            kind: components["schemas"]["WorkStepKind"];
-            label?: string | null;
-            status?: string | null;
-            summary?: string | null;
-            text?: string;
-            tool?: string | null;
         };
         /**
          * @description One entry in the cron-messages list. Each row corresponds to a
@@ -863,6 +828,21 @@ export interface components {
         };
         ChatCronMessagesList: {
             items: components["schemas"]["ChatCronMessage"][];
+        };
+        /**
+         * @description Response from `GET /v1/chat/sessions/{session_id}/messages` — the
+         *     per-`platform_msg_id` durability probe. `found: false` is a provable
+         *     absence (the key was never persisted for this session), which lets
+         *     the client outbox resume its retry machine; `found: true` confirms
+         *     durability without consuming a retry transmission.
+         */
+        ChatMessageLookup: {
+            found: boolean;
+            /**
+             * Format: int64
+             * @description Ordinal of the newest persisted row carrying the key, when found.
+             */
+            ordinal?: number | null;
         };
         /** @description Response from `POST /v1/chat/sessions`. */
         ChatSessionCreated: {
@@ -946,6 +926,48 @@ export interface components {
             items: components["schemas"]["ChatSessionSummary"][];
         };
         /**
+         * @description Response from `GET /v1/chat/sessions/{session_id}/sync` — the one
+         *     forward-recovery pull. Full-fidelity on every path: rows carry work
+         *     blocks and notices exactly like the history surface.
+         */
+        ChatSyncResponse: {
+            /**
+             * @description Whether older history exists below `oldest_ordinal` (REPLACE
+             *     responses only; always `false` on a difference response).
+             */
+            has_more_older: boolean;
+            /**
+             * Format: int64
+             * @description Coverage watermark: the highest persisted ordinal the scan
+             *     covered, visible or not — it may exceed every row in `rows`
+             *     (invisible tool/system tail). This, not any row's ordinal, is
+             *     what advances the client cursor (`max`-wins). `null` iff the
+             *     session has no persisted rows.
+             */
+            next_cursor?: number | null;
+            /**
+             * Format: int64
+             * @description Page floor for lazy backfill after a REPLACE (baseline /
+             *     rebase). Absent on a difference response — the client keeps its
+             *     own floor when merging.
+             */
+            oldest_ordinal?: number | null;
+            /**
+             * @description `true` ⇒ `rows` is the NEWEST page, not the requested difference
+             *     (the difference exceeded `limit` in emitted rows, or the raw
+             *     scan bound). The client REPLACEs its thread with the page and
+             *     treats its cursor as rebase-dirty until one non-rebased sync
+             *     completes.
+             */
+            rebased: boolean;
+            /**
+             * @description Transcript rows (message | work | notice), ascending. On a
+             *     baseline / rebased response this is the newest page and REPLACEs
+             *     the client's thread; on a difference response it appends/merges.
+             */
+            rows: components["schemas"]["ChatTranscriptItem"][];
+        };
+        /**
          * @description One transcript row, flattened from `ChatMessage` into a shape the
          *     web client can render without re-implementing the content-block
          *     matcher. Two shapes ride this struct, discriminated by [`Self::kind`]:
@@ -983,6 +1005,13 @@ export interface components {
              *     file). The web client currently shows a placeholder.
              */
             has_attachments: boolean;
+            /**
+             * @description Stable row id, unique within the session and identical on every
+             *     redelivery (sync, backfill): `m<ordinal>` for a message,
+             *     `w<ordinal>` for a work block, `n<seq>` for a control-event row.
+             *     This is the client's render key AND redelivery dedup key.
+             */
+            id: string;
             /** @description Message bubble vs. reconstructed work block. */
             kind: components["schemas"]["TranscriptItemKind"];
             /**
@@ -992,15 +1021,25 @@ export interface components {
             notice_level?: string | null;
             /**
              * Format: int64
-             * @description React key for the row. For `message` / `work` items it is the
-             *     `session_messages.ordinal` (a `work` item carries the turn's first
-             *     intermediate ordinal so it sorts just after the user turn). For a
-             *     `notice` / control-echo item it is a **synthetic negative value** in a
-             *     key space disjoint from real ordinals — so the client must NOT use it for
-             *     pagination / cursor seeding; see `ChatSessionDetail::oldest_ordinal` /
-             *     `newest_ordinal`.
+             * @description `session_messages.ordinal` for ordinal-addressed rows: a
+             *     `message` carries its own; a `work` item carries the turn's
+             *     first intermediate ordinal so it sorts just after the user turn.
+             *     **Absent for `notice` / control-echo items** — control events
+             *     are not ordinal-addressed (they anchor at an ordinal and are
+             *     keyed by their own per-session `seq`, baked into [`Self::id`]).
+             *     Clients must not use this for pagination / cursor seeding; see
+             *     `ChatSessionDetail::oldest_ordinal` / `newest_ordinal` and
+             *     `ChatSyncResponse::next_cursor`.
              */
-            ordinal: number;
+            ordinal?: number | null;
+            /**
+             * @description Client-generated send idempotency key for a user `message` row,
+             *     when the send carried one. Every redelivery (sync, backfill)
+             *     carries it so the client outbox can match durability
+             *     confirmations and dedup redelivered rows against the live echo.
+             *     Empty for rows without one (assistant replies, work, notices).
+             */
+            platform_msg_id?: string;
             /**
              * @description `"user"` or `"assistant"` (or `"system"`). String rather than
              *     enum to keep the wire forgiving. Empty for `work` items.
@@ -2194,56 +2233,6 @@ export interface operations {
             };
         };
     };
-    catch_up_session: {
-        parameters: {
-            query: {
-                /** @description Newest durable ordinal the client has already rendered. */
-                since_ordinal: number;
-                /**
-                 * @description Maximum rows to scan. Defaults to [`DEFAULT_CATCH_UP_LIMIT`], clamped to
-                 *     [`MAX_HISTORY_LIMIT`]. If the gap is larger, the response is marked
-                 *     `truncated` and carries no partial middle slice.
-                 */
-                limit?: number | null;
-            };
-            header?: never;
-            path: {
-                /** @description Session id to catch up */
-                session_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Forward transcript catch-up for device reconnect merge */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ChatCatchUpResponse"];
-                };
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Session not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
     set_session_folder: {
         parameters: {
             query?: never;
@@ -2277,6 +2266,59 @@ export interface operations {
                 };
             };
             /** @description Session or folder not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    lookup_session_message: {
+        parameters: {
+            query: {
+                /** @description Client-generated send idempotency key to probe. */
+                platform_msg_id: string;
+            };
+            header?: never;
+            path: {
+                /** @description Session id to probe */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Durability point lookup for one send idempotency key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatMessageLookup"];
+                };
+            };
+            /** @description Empty platform_msg_id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2363,6 +2405,60 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    sync_session: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Highest coverage watermark the client holds for this session.
+                 *     Omit for the newest-page baseline (cold start, fresh install,
+                 *     no local cursor).
+                 */
+                since_ordinal?: number | null;
+                /**
+                 * @description Maximum transcript rows to return, counted in *emitted* rows.
+                 *     Defaults to [`DEFAULT_HISTORY_LIMIT`], clamped to
+                 *     [`MAX_HISTORY_LIMIT`]. A difference larger than this rebases.
+                 */
+                limit?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description Session id to sync */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Forward-recovery pull: the difference after the cursor, or a newest-page baseline (rebased / no cursor) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSyncResponse"];
+                };
             };
             /** @description Unauthorized */
             401: {

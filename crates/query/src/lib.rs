@@ -1521,8 +1521,10 @@ mod tests {
             id: &SessionId,
             after_ordinal: i64,
             limit: usize,
-        ) -> std::result::Result<Vec<(i64, baybo_model::ChatMessage)>, baybo_store::StorageError>
-        {
+        ) -> std::result::Result<
+            Vec<(i64, chrono::DateTime<chrono::Utc>, baybo_model::ChatMessage)>,
+            baybo_store::StorageError,
+        > {
             if limit == 0 {
                 return Ok(Vec::new());
             }
@@ -1534,10 +1536,25 @@ mod tests {
                     log.iter()
                         .filter(|m| m.superseded_by.is_none() && m.ordinal > after_ordinal)
                         .take(limit)
-                        .map(|m| (m.ordinal, m.message.clone()))
+                        .map(|m| (m.ordinal, m.created_at, m.message.clone()))
                         .collect()
                 })
                 .unwrap_or_default())
+        }
+        async fn find_message_ordinal_by_platform_msg_id(
+            &self,
+            id: &SessionId,
+            platform_msg_id: &str,
+        ) -> std::result::Result<Option<i64>, baybo_store::StorageError> {
+            if platform_msg_id.is_empty() {
+                return Ok(None);
+            }
+            Ok(self.messages.lock().get(id).and_then(|log| {
+                log.iter()
+                    .filter(|m| m.message.platform_msg_id() == platform_msg_id)
+                    .max_by_key(|m| m.ordinal)
+                    .map(|m| m.ordinal)
+            }))
         }
         async fn load_last_user_message(
             &self,

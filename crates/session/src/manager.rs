@@ -344,11 +344,10 @@ impl SessionManager {
             .map_err(SessionError::from)
     }
 
-    /// Forward catch-up slice: at most `limit` active rows with
-    /// `ordinal > after_ordinal`, ascending. Powers the WS
-    /// `Subscribe { since_ordinal }` cursor — the gateway streams the
-    /// result back as `Frame::Message` to a reconnecting client that
-    /// missed some persisted rows. `SessionError::NotFound` when the
+    /// Forward difference slice: at most `limit` active rows with
+    /// `ordinal > after_ordinal`, ascending, each paired with its
+    /// ordinal and persisted `created_at`. Powers the REST sync
+    /// endpoint's cursor scan. `SessionError::NotFound` when the
     /// session itself does not exist; an empty slice is the legitimate
     /// "nothing missed" answer.
     pub async fn history_since(
@@ -356,12 +355,27 @@ impl SessionManager {
         session_id: &SessionId,
         after_ordinal: i64,
         limit: usize,
-    ) -> Result<Vec<(i64, ChatMessage)>> {
+    ) -> Result<Vec<(i64, DateTime<Utc>, ChatMessage)>> {
         if self.store.get(session_id).await?.is_none() {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
         self.store
             .load_active_session_messages_since(session_id, after_ordinal, limit)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    /// Ordinal of the newest persisted row carrying `platform_msg_id`,
+    /// or `None`. The durability point lookup behind the chat outbox's
+    /// rebase-floor resolution — see
+    /// [`baybo_store::SessionStore::find_message_ordinal_by_platform_msg_id`].
+    pub async fn find_message_ordinal_by_platform_msg_id(
+        &self,
+        session_id: &SessionId,
+        platform_msg_id: &str,
+    ) -> Result<Option<i64>> {
+        self.store
+            .find_message_ordinal_by_platform_msg_id(session_id, platform_msg_id)
             .await
             .map_err(SessionError::from)
     }

@@ -10,7 +10,6 @@ use crate::api::ChatSessionSummary;
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
 const PATH_MOBILE_APNS_TOKEN: &str = "/v1/mobile/apns-token";
 pub(crate) const PATH_BLOBS: &str = "/v1/blobs";
-const CATCH_UP_LIMIT: u32 = 200;
 
 pub(crate) trait GatewayJsonClient {
     fn get_json<'a, T>(
@@ -73,9 +72,14 @@ struct SessionSummary {
     pinned: bool,
 }
 
+/// Backward page of the transcript (`GET /v1/chat/sessions/{id}`). The rows
+/// are the gateway's full-fidelity `ChatTranscriptItem` DTOs (message | work |
+/// notice, keyed by their stable `id`); they pass through to the webview
+/// verbatim — NO client-side filtering (v2 contract: fidelity is a property
+/// of the data, never of the path that fetched it).
 #[derive(Deserialize)]
 struct ChatSessionDetail {
-    transcript: Vec<ChatTranscriptItem>,
+    transcript: Vec<serde_json::Value>,
     has_more: bool,
     #[serde(default)]
     oldest_ordinal: Option<i64>,
@@ -83,63 +87,53 @@ struct ChatSessionDetail {
     newest_ordinal: Option<i64>,
 }
 
-#[derive(Deserialize)]
-struct ChatTranscriptItem {
-    ordinal: i64,
-    kind: String,
-    role: String,
-    text: String,
-    #[serde(default)]
-    attachments: Vec<HistoryAttachment>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-struct HistoryAttachment {
-    kind: String,
-    blob_id: String,
-    mime_type: String,
-    size: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    filename: Option<String>,
-}
-
+/// Native-synthesized frame for the web transcript bridge: one backward
+/// history page. `rows` are verbatim `ChatTranscriptItem`s.
 #[derive(Serialize)]
 struct HistoryPageFrame {
     kind: &'static str,
-    messages: Vec<HistoryMessage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rows: Vec<serde_json::Value>,
     oldest_ordinal: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     newest_ordinal: Option<i64>,
     has_more: bool,
 }
 
+/// `GET /v1/chat/sessions/{id}/sync` — the one forward-recovery pull.
 #[derive(Deserialize)]
-struct ChatCatchUpResponse {
-    items: Vec<serde_json::Value>,
+struct ChatSyncResponse {
+    rows: Vec<serde_json::Value>,
     #[serde(default)]
-    newest_ordinal: Option<i64>,
-    truncated: bool,
+    next_cursor: Option<i64>,
+    rebased: bool,
+    #[serde(default)]
+    oldest_ordinal: Option<i64>,
+    has_more_older: bool,
 }
 
+/// Native-synthesized frame for the web transcript bridge: one sync page.
+/// `since_ordinal` echoes the request's cursor so the web side can tell a
+/// baseline REPLACE (`null`) from a difference merge without extra state.
+/// Option fields serialize as explicit `null` on purpose — the web handler
+/// reads them directly.
 #[derive(Serialize)]
-struct CatchUpFrame {
+struct SyncPageFrame {
     kind: &'static str,
-    items: Vec<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    newest_ordinal: Option<i64>,
-    truncated: bool,
+    rows: Vec<serde_json::Value>,
+    since_ordinal: Option<i64>,
+    next_cursor: Option<i64>,
+    rebased: bool,
+    oldest_ordinal: Option<i64>,
+    has_more_older: bool,
 }
 
-#[derive(Serialize)]
-struct HistoryMessage {
-    content: String,
-    role: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    platform_msg_id: String,
-    ordinal: i64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    attachments: Vec<HistoryAttachment>,
+/// `GET /v1/chat/sessions/{id}/messages?platform_msg_id=…` — the per-send
+/// durability point lookup (outbox rule 4: resolve a rebase-floor entry
+/// without consuming a retry transmission).
+#[derive(Deserialize)]
+pub(crate) struct ChatMessageLookupResponse {
+    pub(crate) found: bool,
+    #[serde(default)]
+    pub(crate) ordinal: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -191,31 +185,9 @@ pub(crate) async fn fetch_history_page<C: GatewayJsonClient + Sync>(
         append_query(&mut path, &mut first_query, "limit", limit);
     }
     let detail: ChatSessionDetail = client.get_json(&path).await?;
-    let messages = detail
-        .transcript
-        .into_iter()
-        .filter_map(|item| {
-            if item.kind != "message" {
-                return None;
-            }
-            if item.ordinal < 0 {
-                return None;
-            }
-            if item.role != "user" && item.role != "assistant" {
-                return None;
-            }
-            Some(HistoryMessage {
-                content: item.text,
-                role: item.role,
-                platform_msg_id: String::new(),
-                ordinal: item.ordinal,
-                attachments: item.attachments,
-            })
-        })
-        .collect();
     let page = HistoryPageFrame {
         kind: "history_page",
-        messages,
+        rows: detail.transcript,
         oldest_ordinal: detail.oldest_ordinal,
         newest_ordinal: detail.newest_ordinal,
         has_more: detail.has_more,
@@ -223,24 +195,67 @@ pub(crate) async fn fetch_history_page<C: GatewayJsonClient + Sync>(
     serde_json::to_string(&page).map_err(|e| format!("encode history page: {e}"))
 }
 
-pub(crate) async fn fetch_catch_up<C: GatewayJsonClient + Sync>(
+/// The one forward-recovery pull (sync-v2): fetch the difference after
+/// `since_ordinal` (or the newest-page baseline when `None`) and synthesize a
+/// `sync_page` frame for the web transcript bridge, rows verbatim.
+pub(crate) async fn fetch_sync<C: GatewayJsonClient + Sync>(
     client: &C,
     session_id: String,
-    since_ordinal: i64,
+    since_ordinal: Option<i64>,
+    limit: u32,
 ) -> Result<String, String> {
     validate_path_segment(&session_id, "session_id")?;
-    let mut path = format!("{PATH_CHAT_SESSIONS}/{session_id}/catch-up");
+    let mut path = format!("{PATH_CHAT_SESSIONS}/{session_id}/sync");
     let mut first_query = true;
-    append_query(&mut path, &mut first_query, "since_ordinal", since_ordinal);
-    append_query(&mut path, &mut first_query, "limit", CATCH_UP_LIMIT);
-    let response: ChatCatchUpResponse = client.get_json(&path).await?;
-    let frame = CatchUpFrame {
-        kind: "catch_up",
-        items: response.items,
-        newest_ordinal: response.newest_ordinal,
-        truncated: response.truncated,
+    if let Some(since) = since_ordinal {
+        append_query(&mut path, &mut first_query, "since_ordinal", since);
+    }
+    append_query(&mut path, &mut first_query, "limit", limit);
+    let response: ChatSyncResponse = client.get_json(&path).await?;
+    let frame = SyncPageFrame {
+        kind: "sync_page",
+        rows: response.rows,
+        since_ordinal,
+        next_cursor: response.next_cursor,
+        rebased: response.rebased,
+        oldest_ordinal: response.oldest_ordinal,
+        has_more_older: response.has_more_older,
     };
-    serde_json::to_string(&frame).map_err(|e| format!("encode catch-up page: {e}"))
+    serde_json::to_string(&frame).map_err(|e| format!("encode sync page: {e}"))
+}
+
+/// Per-send durability point lookup: does a persisted row carry this
+/// `platform_msg_id`? Consumed natively by the outbox (never the webview).
+pub(crate) async fn lookup_message<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_id: String,
+    platform_msg_id: &str,
+) -> Result<ChatMessageLookupResponse, String> {
+    validate_path_segment(&session_id, "session_id")?;
+    if platform_msg_id.trim().is_empty() {
+        return Err("invalid platform_msg_id".to_string());
+    }
+    let path = format!(
+        "{PATH_CHAT_SESSIONS}/{session_id}/messages?platform_msg_id={}",
+        percent_encode_query(platform_msg_id)
+    );
+    client.get_json(&path).await
+}
+
+/// Percent-encode a query value (everything outside RFC 3986 unreserved).
+/// `platform_msg_id`s are native-minted UUIDs today, but a retry payload
+/// round-trips through the webview — encode defensively.
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 pub(crate) async fn update_apns_token<C: GatewayJsonClient + Sync>(

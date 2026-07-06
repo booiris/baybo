@@ -1000,20 +1000,20 @@ impl SessionStore for LibsqlSessionStore {
         session_id: &SessionId,
         after_ordinal: i64,
         limit: usize,
-    ) -> Result<Vec<(i64, baybo_model::ChatMessage)>> {
+    ) -> Result<Vec<(i64, DateTime<Utc>, baybo_model::ChatMessage)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let conn = self.pool.conn();
-        // Forward catch-up: rows with ordinal strictly greater than the
+        // Forward difference: rows with ordinal strictly greater than the
         // client's cursor, capped at `limit`. The partial active index
         // bites the front of the range (`ordinal > N`) so a session
         // with hundreds of older rows pays nothing for them — only the
-        // catch-up window is read.
+        // difference window is read.
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut rows = conn
             .query(
-                "SELECT ordinal, role, content, source, platform_msg_id FROM session_messages \
+                "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages \
                  WHERE session_id = ?1 AND superseded_by IS NULL \
                    AND ordinal > ?2 \
                  ORDER BY ordinal ASC \
@@ -1025,7 +1025,7 @@ impl SessionStore for LibsqlSessionStore {
                 StorageError::Internal(anyhow::anyhow!("libsql query active since: {e}"))
             })?;
 
-        let mut out: Vec<(i64, baybo_model::ChatMessage)> = Vec::new();
+        let mut out: Vec<(i64, DateTime<Utc>, baybo_model::ChatMessage)> = Vec::new();
         while let Some(row) = rows
             .next()
             .await
@@ -1043,17 +1043,64 @@ impl SessionStore for LibsqlSessionStore {
             let source_str: String = row
                 .get(3)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
-            let platform_msg_id: String = row.get(4).map_err(|e| {
+            let created_us: i64 = row.get(4).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}"))
+            })?;
+            let platform_msg_id: String = row.get(5).map_err(|e| {
                 StorageError::Internal(anyhow::anyhow!("libsql get platform_msg_id: {e}"))
+            })?;
+            let created_at = super::time::from_us(created_us).ok_or_else(|| {
+                StorageError::Storage(format!(
+                    "session_messages.created_at out of range: {created_us}"
+                ))
             })?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
             out.push((
                 ordinal,
+                created_at,
                 rehydrate_message(&role, content, &source_str, platform_msg_id)?,
             ));
         }
         Ok(out)
+    }
+
+    async fn find_message_ordinal_by_platform_msg_id(
+        &self,
+        session_id: &SessionId,
+        platform_msg_id: &str,
+    ) -> Result<Option<i64>> {
+        if platform_msg_id.is_empty() {
+            // Empty is the "no idempotency key" opt-out on the write
+            // side; matching it would return an arbitrary keyless row.
+            return Ok(None);
+        }
+        let conn = self.pool.conn();
+        // No superseded filter: a compacted-away row still proves the
+        // send was durably persisted, which is all the outbox needs.
+        let mut rows = conn
+            .query(
+                "SELECT ordinal FROM session_messages \
+                 WHERE session_id = ?1 AND platform_msg_id = ?2 \
+                 ORDER BY ordinal DESC \
+                 LIMIT 1",
+                libsql::params![session_id.as_str().to_string(), platform_msg_id.to_string(),],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql query platform_msg_id: {e}"))
+            })?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let ordinal: i64 = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ord: {e}")))?;
+        Ok(Some(ordinal))
     }
 
     async fn load_last_user_message(
@@ -1928,8 +1975,8 @@ mod tests {
     #[tokio::test]
     async fn load_active_session_messages_since_forward_pages_above_cursor() {
         // Same 7-row fixture as the `_tail` test, but exercising the
-        // catch-up cursor path the WS `Subscribe { since_ordinal }`
-        // route uses to replay missed rows to a reconnecting client.
+        // forward difference scan the REST sync endpoint uses to
+        // deliver missed rows to a client presenting its cursor.
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlSessionStore::new(pool);
         let session = make_root_session("catch-up-me");
@@ -1950,7 +1997,7 @@ mod tests {
             .load_active_session_messages_since(&session.id, 3, 10)
             .await
             .unwrap();
-        let ords: Vec<i64> = after_3.iter().map(|(o, _)| *o).collect();
+        let ords: Vec<i64> = after_3.iter().map(|(o, _, _)| *o).collect();
         assert_eq!(ords, vec![4, 5, 6]);
 
         // `limit` is the cap: from cursor 0, ask for 2 — the first
@@ -1959,12 +2006,12 @@ mod tests {
             .load_active_session_messages_since(&session.id, 0, 2)
             .await
             .unwrap();
-        let cap_ords: Vec<i64> = cap.iter().map(|(o, _)| *o).collect();
+        let cap_ords: Vec<i64> = cap.iter().map(|(o, _, _)| *o).collect();
         assert_eq!(cap_ords, vec![1, 2]);
 
         // Caught up: the cursor is at (or past) the latest row, so
         // the slice is empty. `limit + 1` over-fetch sees zero ⇒
-        // server's "no catch-up needed" branch.
+        // server's "nothing missed" branch.
         let none = store
             .load_active_session_messages_since(&session.id, 6, 10)
             .await
@@ -1976,7 +2023,7 @@ mod tests {
             .load_active_session_messages_since(&session.id, -1, 10)
             .await
             .unwrap();
-        let all_ords: Vec<i64> = all.iter().map(|(o, _)| *o).collect();
+        let all_ords: Vec<i64> = all.iter().map(|(o, _, _)| *o).collect();
         assert_eq!(all_ords, vec![0, 1, 2, 3, 4, 5, 6]);
     }
 }

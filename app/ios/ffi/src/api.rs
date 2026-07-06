@@ -132,6 +132,18 @@ pub struct ChatSessionSummary {
     pub pinned: bool,
 }
 
+/// Result of the per-send durability point lookup
+/// (`GET /v1/chat/sessions/{id}/messages?platform_msg_id=…`), consumed by the
+/// native outbox: `found: false` is a provable absence (the key was never
+/// persisted for this session) that lets the retry machine resume; `found:
+/// true` confirms durability without consuming a retry transmission.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MessageLookup {
+    pub found: bool,
+    /// Ordinal of the newest persisted row carrying the key, when found.
+    pub ordinal: Option<i64>,
+}
+
 /// A content-addressed attachment reference on an outbound message (already
 /// uploaded via `blob_upload_bytes`).
 #[derive(Debug, Clone, uniffi::Record)]

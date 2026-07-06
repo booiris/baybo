@@ -787,9 +787,9 @@ impl PushDispatcher {
             .await
             .ok()?;
         rows.into_iter()
-            .find(|(ord, _)| *ord == ordinal)
-            .filter(|(_, m)| m.role == Role::Assistant)
-            .and_then(|(_, m)| {
+            .find(|(ord, _, _)| *ord == ordinal)
+            .filter(|(_, _, m)| m.role == Role::Assistant)
+            .and_then(|(_, _, m)| {
                 m.content.iter().find_map(|cb| match cb {
                     ContentBlock::Text(t) => Some(t.clone()),
                     _ => None,

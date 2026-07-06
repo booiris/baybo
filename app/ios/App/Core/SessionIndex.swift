@@ -200,6 +200,7 @@ final class SessionIndex: ObservableObject {
         rows = []
         save()
         TranscriptStore.deleteAll()
+        OutboxStore.deleteAll()
     }
 
     // MARK: - Persistence

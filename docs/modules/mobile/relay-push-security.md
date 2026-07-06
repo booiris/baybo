@@ -419,11 +419,12 @@ Noise and frame loop:
 1. P starts the IK handshake and sends msg1 over the spliced leg.
 2. A authenticates P by approved static public key and sends msg2.
 3. Both sides enter Noise transport mode.
-4. P sends `Frame::Subscribe { session_id, since_ordinal }`.
+4. P sends `Frame::Subscribe { session_id }`.
 5. A wraps the Noise transport in the normal channel `FrameSource`/`FrameSink`
    path and reuses the same channel frame loop as TUI and web chat.
-6. A replays catch-up rows above `since_ordinal` and streams live
-   `SessionEvent`s.
+6. A answers with one `Frame::SubscribeState` bundle and streams live
+   `SessionEvent`s; transcript recovery is P's REST sync call over the API
+   tunnel (see `docs/sync-protocol.md`).
 7. P sends user `Frame::Message` values with a client-generated
    `platform_msg_id` for idempotency.
 8. A routes inbound frames into the normal gateway router, agent execution, and

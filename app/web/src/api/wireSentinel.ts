@@ -30,7 +30,8 @@ type Assert<T extends true> = T;
 /** Server → client frames the page consumes. */
 type InboundKind =
   | 'register_ack'
-  | 'reset'
+  | 'subscribe_state'
+  | 'gap'
   | 'message'
   | 'messages'
   | 'attachment'
@@ -44,7 +45,6 @@ type InboundKind =
   | 'notice'
   | 'approval_requested'
   | 'approval_resolved'
-  | 'pending_approvals_snapshot'
   | 'history_append'
   | 'history_snapshot'
   | 'bot_status'
@@ -97,8 +97,8 @@ export type OutboundContractHolds = Assert<[OutboundDrift] extends [never] ? tru
  *  field the mirror declares optional (inbound reads silently become
  *  `undefined`), and a dead field the client still encodes (excess properties
  *  are ignored in type-to-type checks; the server silently drops it — e.g. a
- *  renamed `since_ordinal` would break catch-up with no error anywhere). So
- *  additionally: every key the hand-written mirror declares, in either
+ *  renamed `platform_msg_id` would break send dedup with no error anywhere).
+ *  So additionally: every key the hand-written mirror declares, in either
  *  direction, must still exist on the generated shape. */
 type DroppedKeys = {
   [K in InboundKind | OutboundKind]: Exclude<

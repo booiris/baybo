@@ -156,10 +156,11 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   that session's sink. A memory warning
   (`AppDelegate.applicationDidReceiveMemoryWarning` → `evictAllIdleStores`) evicts
   every idle store regardless of the cap. Re-opening an evicted session mints a
-  fresh store that re-subscribes and catches up from gateway history. The FFI
-  transport owns one global chat leg per binding (relay content or direct channel
-  WS); opening a session sends a `Subscribe` on that leg and registers/replaces
-  that session's sink. Backing out to the list only detaches the
+  fresh store that re-subscribes and re-syncs from the gateway (the webview's
+  mount-edge sync). The FFI transport owns one global chat leg per binding
+  (relay content or direct channel WS); opening a session sends a `Subscribe` on
+  that leg and registers/replaces that session's sink. Backing out to the list
+  only detaches the
   `TranscriptBridge`; frames that arrive while no webview is attached buffer in
   the store (capped at `maxBufferedFrames`; on overflow the buffer is dropped and
   the transcript refetched from the durable floor on re-attach rather than flushed
@@ -202,11 +203,14 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   400ms; the core coalesces concurrent dials.
 - **Bridge** (`App/Web/TranscriptBridge.swift` ⇄ `web/src/bridge.ts`):
   native→web
-  `init/pushFrame/setConnEpoch/userSent/blobResult/setLanguage/setBottomInset/jumpToLatest`;
+  `init/pushFrame/setConnEpoch/userSent/blobResult/setLanguage/setBottomInset/jumpToLatest/requestSync`;
   web→native
-  `ready/ordinal/persist/fetchHistory/requestBlob/openUrl/log/jumpVisible`.
-  Transcript persistence lives in UserDefaults (`ChatDefaults.*`), NOT webview
-  localStorage (file:// storage is unreliable and upgrade-fragile).
+  `ready/sync/persist/fetchHistory/requestBlob/openUrl/log/jumpVisible`. The
+  `sync` message carries the webview's cursor (`sinceOrdinal`, null = baseline)
+  + elected page size; native answers with a synthesized `sync_page` frame (or
+  `sync_failed`). Transcript persistence is the per-session mirror file, a pure
+  `{rows, cursor}` cache (NOT webview localStorage — file:// storage is
+  unreliable and upgrade-fragile).
 - **Keyboard**: the transcript webview is FULL-BLEED and its frame never
   tracks the keyboard — a keyboard-resized WKWebView relayouts once, async,
   at the final size, so content sits still through the slide and snaps at the
@@ -255,7 +259,8 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   `build/DerivedData/Build/Products/<config>-<sdk>/Baybo.app` for
   `simctl install`.
 - **Send path**: native mints the msgId, seeds the webview's optimistic bubble
-  + echo-dedup FIRST, then enqueues on the leg.
+  + echo-dedup FIRST, enrols the persisted outbox entry, then enqueues on the
+  leg (see "Send outbox" below).
 - **Liquid Glass (iOS 26)**: the bottom tab bar is the NATIVE `TabView` Liquid
   Glass bar — its selection-capsule morph (the glass that slides + stretches
   between tabs) is the SYSTEM's, and getting that authentic morph is exactly why
@@ -289,67 +294,77 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   native taps call `jumpToLatest` back; the composer-top geometry is measured
   on the ComposerView alone so the button never inflates the web inset.
 
-## Transcript hydration matrix (read BEFORE touching hydration/lifecycle)
+## Transcript hydration (sync-protocol v2 — read BEFORE touching hydration/lifecycle)
 
-**Invariant: an opened LISTED session must converge to rendering its recent
-transcript from EVERY cell below, on BOTH legs (identical here — same web
-bundle, same `GatewayJsonClient` history endpoint). A compose DRAFT stays empty
-until its first send.** This invariant is emergent — no single mechanism covers
-all cells, which is exactly how the blank-transcript bug family happened
-(logout wipes mirrors; list prune deletes them; a resident store fires no
-reconnect). Any change touching mirrors, prune, store eviction, conn epochs,
-subscribe cursors, or backfill MUST state which cells it affects and re-verify
-the flows at the bottom.
+The old seven-cell hydration matrix is **retired**. Transcript hydration and
+forward recovery are now **one loop** (`docs/sync-protocol.md`), identical on
+both legs (same web bundle, same `GatewayJsonClient` API surface):
 
-Mechanisms: (1) **mirror restore** — `deliverInit` hands the `TranscriptStore`
-blob to the page as `restoredState`; (2) **Subscribe replay** — the gateway
-replays persisted rows ONLY when `since_ordinal` is `Some`
-(`crates/gateway/src/channel/route.rs`); a mirror-less open subscribes with
-`None` and gets NOTHING; (3) **REST catch-up** — native `fetchCatchUp`, only
-when a persisted cursor exists; (4) **initial backfill** —
-`ensureBackfilled()` in `web/src/Transcript.tsx`, the SINGLE OWNER of the
-"pull the newest page" decision; (5) **Reset recovery / scroll-up paging** —
-the shared `requestHistory` machinery.
+```
+on open / reconnect / gap / buffer-overflow re-attach / safety tick:
+  page = sync(since = cursor)          # cursor null → newest-page baseline
+  if page.rebased or cursor == null:
+      REPLACE thread with page.rows    # keep the open work block + optimistic sends
+  else:
+      APPEND/merge page.rows           # dedup by row id / platform_msg_id
+  cursor = max(cursor, page.next_cursor)   # frozen while rebase-dirty
+```
 
-| cell | state on open | what hydrates |
-|---|---|---|
-| A | draft (compose), any | nothing until first send (by design) |
-| B | listed, mirror has rows, fresh store | mirror paints; connect(sinceOrdinal) + catch-up fill the gap |
-| C | listed, mirror has rows, resident store | mirror paints; buffered frames flush on attach |
-| D | listed, NO mirror, fresh store (logout→re-pair; session created on another client; relaunch after prune) | backfill on the connect edge (`handleConnEpoch`) |
-| E | listed, NO mirror, resident CONNECTED store (open → back to list → prune → re-enter) | backfill on mount (no epoch edge will ever come) |
-| F | listed, mirror exists but ZERO rows (an earlier failed backfill's empty persist) | backfill — the decision keys on RENDERED ROWS, not mirror existence |
-| G | offscreen frame buffer overflowed | `needsHistoryReset` → catch-up refetch on attach (independent of backfill) |
+- **The webview drives sync.** `Transcript.tsx`'s `runSync()` posts
+  `{type:"sync", sinceOrdinal, limit}` over the bridge; native
+  (`ChatStore.requestSync`) fetches `GET …/sync` over the active leg and pushes
+  a synthesized `sync_page` frame back. Clock edges: mount (resident re-entry),
+  the `connEpoch` bump (`handleConnEpoch` — reconnect), a `gap` frame, the
+  offscreen-buffer-overflow re-attach (native `bridge.requestSync()`), and the
+  3-minute safety tick. `syncInFlight` coalesces a burst to one pull.
+- **The server replays NOTHING on Subscribe** — it answers with one
+  `SubscribeState` bundle (turn/work state) and live frames. `Subscribe` lost
+  its `since_ordinal` field; `Frame::Reset` / `WorkSnapshot` /
+  `PendingApprovalsSnapshot` are gone.
+- **The mirror stays a pure `{rows, cursor}` cache**, written atomically. It is
+  never a source of truth — a mirror-less open just syncs a baseline. The
+  cursor is `number | null` (`null` = no baseline, never a sentinel); it lives
+  in the persisted mirror blob (`lastOrdinal`), advanced from the sync coverage
+  watermark and live final-reply ordinals, frozen while **rebase-dirty**.
+- **Draft vs listed.** A compose draft stays empty until its first send:
+  `ChatStore.requestSync` skips the fetch until the session exists remotely
+  (`listed || remoteSessionEnsured`). The webview no longer needs a `listed`
+  flag — its loop runs the same on every open.
+- **Backward paging (scroll-up)** is unchanged in role: `fetchHistory(before)`
+  → `history_page` frame, full-fidelity rows (message/work/notice) keyed by
+  their stable server `id`, no client-side filtering.
 
-Rules:
+Re-verify after touching any of this: (a) logout → re-pair the same gateway →
+open an old session; (b) open an old (unpinned, outside top-10) session → back
+to list → re-enter; (c) kill the app → relaunch → open a session; (d) open A
+mid-stream → back → open B → back → A shows A (not B), B's mirror is not
+overwritten by A's late flush.
 
-- The backfill decision lives in ONE function (`ensureBackfilled`). Its ground
-  truth is rendered rows (`messages.length`), NOT mirror existence — a mirror
-  can exist with zero rows (cell F), and only the web side knows what actually
-  rendered. Never add a second decision site; when a new timing gap appears,
-  add a CALL (clock edge) to the same function.
-- Mirror prune keeps the top-`maxMirroredTranscripts` sessions by `lastActive`,
-  and OPENING a session does not bump `lastActive` (visits ≠ activity) — so
-  viewing an old session and returning to the list deletes its just-written
-  mirror. Cell E is a NORMAL path, not an edge case.
-- Re-verify after touching any of this: (a) logout → re-pair the same gateway →
-  open an old session; (b) open an old (unpinned, outside top-10) session →
-  back to list → re-enter; (c) kill the app → relaunch → open a session.
-- **The single reused webview (`TranscriptHost`) changes WHEN the transcript is
-  (re)mounted, never the hydration mechanisms.** Returning to the SAME session the
-  webview still holds reuses the LIVE React tree (rows persist in memory
-  independent of the mirror — a strict plus for cells C and E: no re-hydration,
-  and E survives even a mirror prune because the tree never unmounted). Opening a
-  DIFFERENT session remounts `<Transcript key={sessionId}>` from that session's
-  `restoredState`, then hydrates through the normal mechanisms exactly as a first
-  open — so every cell still converges. A jetsam of the shared webview silently
-  reloads → `ready` re-fires → re-hydrates the current session from its mirror
-  (existing jetsam path). Cell A (draft) is unchanged: the prewarmed draft mounts
-  an EMPTY tree and stays empty until first send. Cross-session safety rests on
-  `bridge.ts` clearing `buffer`/`blobPending`/`pendingPersist` on `init` and
-  `persist` writes being session-tagged — a change to either can leak or corrupt
-  across sessions, so re-verify (d): open A mid-stream → back → open B → back →
-  A shows A (not B), and B's mirror is not overwritten by A's late flush.
+**The single reused webview (`TranscriptHost`) changes WHEN the transcript is
+(re)mounted, never the sync loop.** Returning to the SAME session reuses the
+LIVE React tree; opening a DIFFERENT session remounts
+`<Transcript key={sessionId}>` from that session's `restoredState`, then its
+mount effect runs one sync. A jetsam silently reloads → `ready` re-fires →
+re-mounts and re-syncs. Cross-session safety rests on `bridge.ts` clearing
+`buffer`/`blobPending`/`pendingPersist` on `init` and `persist` writes being
+session-tagged.
+
+## Send outbox (sync-v2)
+
+The one-shot "red dot, human retries" send is replaced by a **persisted outbox**
+(`App/Core/OutboxStore.swift`, a JSON file per session under
+`Application Support/baybo/outbox/`, wiped with the mirrors on logout). Entries
+are keyed by `platform_msg_id` with a two-stage confirmation: the server's Echo
+(ordinal-less user message, same key) proves transport (`sending` → `sent`,
+observed in `ChatStore.outboxObserveFrame`); an ordinal-stamped row with the
+same key (from a `sync_page`, scanned in `reconcileOutboxAfterSync` before the
+frame reaches the webview) proves durability and releases the entry. No echo
+within 10 s → one blind resend, capped at 3 transmissions, then `failed` + the
+manual red-dot retry (`resetForManualRetry`). On the reconnect edge the sync
+runs first (the reconciliation gate), then unconfirmed entries resend. A
+**rebased** sync hides the floor, so each unconfirmed entry goes `unknown` and
+resolves via the per-key point lookup (`chatLookupMessage`) — found → released,
+absent → retry resumes.
 
 ## Known gaps / follow-ups
 
@@ -381,7 +396,8 @@ see the device checklist below.
 2. Pairing: scan → confirm code matches → pair; decline + gateway-side abort
    both dismiss cleanly.
 3. Direct login incl. `invalid_token` rendering; push binding after foreground.
-4. Chat: streaming, history paging at top, reset recovery, image send/receive,
-   background >45s → foreground catch-up (no duplicates).
+4. Chat: streaming, history paging at top, image send/receive, background >45s
+   → foreground sync (no duplicates), a `gap`/reconnect sync run, and the
+   outbox (send offline → red dot / auto-retry → reconnect resend confirms).
 5. Keyboard: composer rides the keyboard, header never moves, transcript holds
    the newest edge through the resize.

@@ -30,12 +30,11 @@ platform_msg_id?: string,
 role: MessageRole, 
 /**
  * Persisted `session_messages.ordinal` of this row, when known.
- * Server-side **catch-up replays** (emitted in response to a
- * `Subscribe { since_ordinal }`) set this so clients can advance
- * their cursor; live emissions (inbound echo, agent reply at
- * emit-time) leave it `None` because persistence happens out of
- * band from the channel fan-out. Clients track the highest
- * `Some(ordinal)` they've ever seen per `session_id` and replay it
- * on the next Subscribe.
+ * The final assistant reply carries its persisted ordinal so
+ * clients can advance their sync cursor past live emissions; the
+ * server's pre-persist echo of inbound (role=User) leaves it
+ * `None` by design — durability for a send is confirmed by an
+ * ordinal-stamped row from the REST sync/backfill surface, keyed
+ * by `platform_msg_id`.
  */
 ordinal?: bigint, };

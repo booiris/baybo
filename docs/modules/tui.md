@@ -321,7 +321,7 @@ Argv mode keeps the old stdout layer — one-shot commands don't own the termina
 
 ## Constraints
 
-- The streamed deltas and the final `AgentEvent::Message` are **not** redundant: deltas commit the body to scrollback line-by-line as it streams, and the final Message only finalises it (trailing partial + non-text extras). The Message re-renders the body from its blocks **only** when nothing streamed (`delta_tx = None`: cron / subagent-notification, or reconnect catch-up of persisted rows) — so the body is never both streamed and re-rendered.
+- The streamed deltas and the final `AgentEvent::Message` are **not** redundant: deltas commit the body to scrollback line-by-line as it streams, and the final Message only finalises it (trailing partial + non-text extras). The Message re-renders the body from its blocks **only** when nothing streamed (`delta_tx = None`: cron / subagent-notification) — so the body is never both streamed and re-rendered.
 - Renderer state (`AppState`) is mutated only on the event-loop task. External code uses the mpsc event channel; there is no shared `Mutex<AppState>`.
 - Input/state mutation in `app.rs` and key translation in `keymap.rs` are pure — unit tests exercise them without a terminal. Line-rendering helpers (e.g. `finalize_lines`, the `render_*` functions) are pure too — they return `Vec<Line>`, so tests assert on them directly; the one buffer-level fixup (`elide_wide_char_continuations`) is tested against a ratatui `Buffer`.
 - Dashboard providers must not block; the `DashboardProvider` trait method is `async` and the bundled `TuiDashboardProvider` returns synchronously without I/O.

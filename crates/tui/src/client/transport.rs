@@ -222,7 +222,6 @@ impl WsTransport {
         self.client
             .send_raw(&Frame::Subscribe {
                 session_id: new_id.clone(),
-                since_ordinal: None,
             })
             .await
             .map_err(|e| ChannelError::Send(format!("tui ws subscribe: {e}")))?;
@@ -363,11 +362,33 @@ fn map_frame(
             // Reasoning; the web dashboard is its consumer.
             None
         }
-        Frame::WorkSnapshot { .. } => {
-            // The in-flight work-block snapshot recovers the reasoning/tool
-            // steps a reconnecting work-block client missed. The TUI drops
-            // Reasoning already, so it has nothing to render here either.
-            None
+        Frame::SubscribeState {
+            session_id,
+            pending_approvals,
+            ..
+        } => {
+            // The subscribe-time state bundle. The TUI tracks turn
+            // activity locally and renders neither work steps nor the
+            // task checklist, so only the pending-approval half matters:
+            // mirror each card into the local queue (drop-then-enqueue
+            // keeps a re-subscribe idempotent) so a prompt raised while
+            // this client was away still renders.
+            if &session_id != target_session || pending_approvals.is_empty() {
+                return None;
+            }
+            for card in pending_approvals {
+                queue.drop_call(&card.call_id);
+                queue.enqueue_mirror(ApprovalRequest {
+                    call_id: card.call_id,
+                    session_id: session_id.clone(),
+                    user_id: card.user_id,
+                    tool: card.tool,
+                    accesses: card.accesses,
+                    params_preview: card.params_preview,
+                    description: card.description,
+                });
+            }
+            Some(TransportEvent::ApprovalRequested)
         }
         Frame::ToolStarted {
             session_id,
@@ -417,12 +438,11 @@ fn map_frame(
             // than warning.
             None
         }
-        Frame::PendingApprovalsSnapshot { .. } => {
-            // Web reconciles stale ApprovalCard state against this;
-            // the TUI's `ApprovalQueue` is already keyed by the live
-            // `ApprovalRequested` / `ApprovalResolved` fan-out and
-            // doesn't keep cards across disconnects, so the snapshot
-            // is redundant here.
+        Frame::Gap { .. } => {
+            // The server dropped frames it owed this connection. The
+            // TUI renders live-only (it never syncs a transcript), so
+            // there is nothing to recover — the durable record is
+            // intact server-side and a reload shows it.
             None
         }
         Frame::Ping | Frame::Pong => {
@@ -453,7 +473,6 @@ fn map_frame(
         | Frame::RegisterAck { .. }
         | Frame::Subscribe { .. }
         | Frame::Unsubscribe { .. }
-        | Frame::Reset { .. }
         | Frame::ResolveApproval { .. }
         | Frame::HistoryAppend { .. }
         | Frame::StartBot { .. }

@@ -283,8 +283,9 @@ keyed by `ChannelType`), with a second **session-level** tier
 falls back to the fail-closed `AutoDenyGate` (`crates/tools/src/
 approval.rs`). Because the gate lives on the long-lived channel rather
 than on a connection, a sidecar reconnecting does not lose pending
-approvals — a resubscribe replays them (see the `Frame::Subscribe`
-handler).
+approvals — a resubscribe re-delivers the full card set in the
+`SubscribeState` bundle's `pending_approvals` half (see the
+`Frame::Subscribe` handler).
 
 ### Gateway owns its own DTOs — utoipa stays in the gateway
 
@@ -569,7 +570,9 @@ GET    /v1/llm/usage                    ?since=&until=  per-entry usage aggregat
 
 POST   /v1/chat/sessions                create http session
 GET    /v1/chat/sessions                ?include_hidden=&include_cron=  newest-first list
-GET    /v1/chat/sessions/:id            ?before_ordinal=&limit=  detail + transcript slice (+ last_llm pin)
+GET    /v1/chat/sessions/:id            ?before_ordinal=&limit=  detail + transcript slice (+ last_llm pin); backward paging (backfill)
+GET    /v1/chat/sessions/:id/sync       ?since_ordinal=&limit=  the one forward-recovery pull (difference after cursor, or newest-page baseline / rebase)
+GET    /v1/chat/sessions/:id/messages   ?platform_msg_id=  per-send durability point lookup for the client outbox
 PUT    /v1/chat/sessions/:id/model      pin this session's LLM (re-pins live actor; null ⇒ default-llm)
 PUT    /v1/chat/sessions/:id/pin        pin/unpin (lifts to the sidebar's Pinned block)
 PUT    /v1/chat/sessions/:id/folder     file into a folder (null ⇒ Uncategorized)
@@ -601,25 +604,37 @@ device header and may use either the admin token or its approved device
 token.
 
 `GET /v1/chat/sessions/:id` returns a typed transcript: each
-`ChatTranscriptItem` is either a `message` (user / final-assistant bubble)
-or a `work` item — a reconstructed collapsed work block for a tool-using
-turn. `reconstruct_transcript` folds the turn's persisted intermediate rows
-(`Thinking` → reasoning, `ToolUse` + paired `ToolResult` → a tool step with
-a re-derived summary and `ok`/`error`/`denied` status, mid-turn `Text` →
-prose) into one item before the final answer, so a reload shows the same
-`Worked Xs ›` block the live view did even though turn-progress events are
-never persisted. The sidebar preview (`GET /v1/chat/sessions`) uses a single
-indexed `load_last_user_message` lookup, so a prompt buried under a long
-tool loop is still found. See `docs/turn-progress-events.md` for the
-operator-only raw-tool-output disclosure and the message-only WS catch-up
-caveat.
+`ChatTranscriptItem` is a `message` (user / final-assistant bubble), a
+`work` item — a reconstructed collapsed work block for a tool-using turn
+— or a `notice` (persisted control event). `reconstruct_transcript` folds
+the turn's persisted intermediate rows (`Thinking` → reasoning, `ToolUse`
++ paired `ToolResult` → a tool step with a re-derived summary and
+`ok`/`error`/`denied` status, mid-turn `Text` → prose) into one item
+before the final answer, so a reload shows the same `Worked Xs ›` block
+the live view did even though turn-progress events are never persisted.
+Every item carries a stable row `id` (`m<ordinal>` / `w<ordinal>` /
+`n<seq>`) — the client's render key and redelivery dedup key — and
+message rows carry their send's `platform_msg_id`. Control-event items
+are not ordinal-addressed (`ordinal` is absent; they anchor at an
+ordinal server-side). The sidebar preview (`GET /v1/chat/sessions`) uses
+a single indexed `load_last_user_message` lookup, so a prompt buried
+under a long tool loop is still found. See `docs/sync-protocol.md` for
+the full sync model and `docs/turn-progress-events.md` for the
+operator-only raw-tool-output disclosure.
 
-`GET /v1/chat/sessions/:id/catch-up?since_ordinal=N` is the forward reconnect
-companion for device clients. It scans active rows above the cursor with the
-same cap as WS replay, returns no partial slice when truncated, and interleaves
-closed `work` items immediately before the matching final-assistant `message`.
-The WS `Subscribe { since_ordinal }` path remains message-only; native merges
-this API result into the same transcript stream after subscribe.
+`GET /v1/chat/sessions/:id/sync?since_ordinal=N&limit=M` is the one
+forward-recovery pull (see `docs/sync-protocol.md`): full-fidelity rows
+strictly after the cursor, or — when `since_ordinal` is absent, or the
+difference would exceed `limit` in emitted rows (or the raw scan bound,
+10×limit) — the newest page with `rebased: true`, which the client
+REPLACEs its thread with. `next_cursor` is the coverage watermark (the
+highest persisted ordinal the scan covered, visible or not; `null` iff
+the session is empty); control events are selected at `>=` the cursor so
+anchored-at-cursor rows re-deliver and dedup client-side by `n<seq>`.
+`GET /v1/chat/sessions/:id/messages?platform_msg_id=…` is the per-send
+durability point lookup backing the client outbox's rebase-floor
+resolution. The WS never replays history — `Subscribe` answers with one
+`SubscribeState` bundle and live frames follow.
 
 **Channel listener (loopback TCP, vault-issued tokens)** —
 `auth::channel::require_channel_auth`:
@@ -655,33 +670,48 @@ rejected outright (tool sidecars don't register channels). The validator returns
 per-session interest is negotiated **after** the handshake via
 `Subscribe`, so `Register` carries no `session_id`.
 
-The full frame set (see `crates/channels/src/wire.rs`):
+The full frame set (see `crates/wire/src/lib.rs`):
 
 - **Handshake / lifecycle:** `Register`, `RegisterAck { ok, reason? }`,
-  `Reset { reason }`, `Ping`, `Pong`.
-- **Subscription (Subscribed-kind only):** `Subscribe { session_id,
-  since_ordinal? }`, `Unsubscribe { session_id }`. `Multiplexed`
-  channels (telegram/weixin/discord) auto-wildcard and ignore these.
+  `Ping`, `Pong`.
+- **Subscription (Subscribed-kind only):** `Subscribe { session_id }`,
+  `Unsubscribe { session_id }`. `Multiplexed` channels
+  (telegram/weixin/discord) auto-wildcard and ignore these. The
+  Subscribe handler rejects sessions outside the connection's channel
+  universe (same boundary the REST layer enforces) and answers with
+  exactly one `SubscribeState` bundle — it never replays history
+  (forward recovery is the REST sync call).
+- **State plane (server → client):** `SubscribeState { session_id,
+  as_of_ordinal?, turn, work_steps, pending_approvals, tasks }` — the
+  one atomic REPLACE bundle sent per Subscribe: turn activity (from the
+  job store), the in-flight work block's buffered steps, the
+  authoritative pending-approval card set (one atomic queue read), and
+  the planning checklist, stamped with the session's newest persisted
+  ordinal. Staleness of the turn/work halves is judged by turn identity
+  (`started_at`), never by ordinal arithmetic.
+- **Loss signalling (server → client):** `Gap { session_id? }` — the
+  server dropped frames it owed this connection (slow-consumer drop).
+  `Some(id)` → the client syncs that session; `None` → it syncs every
+  subscribed session and refetches the session list + folders.
 - **Messages:** `Message` (user input in; agent's final response or an
   echo of inbound to other subscribers out), `Messages { messages }` (a
   client → server **atomic batch** — the web "send all queued at once"
   path, coalesced into one turn), `AnswerDelta` (incremental answer text,
   server → client), `Notice` (out-of-band warn/error), `Attachment
   { session_id, user_id, attachments }` (mid-turn tool-emitted media).
-- **Turn progress (server → client):** `Reasoning` (incremental thinking),
-  `ToolStarted` / `ToolCompleted` (tool-call lifecycle), `TaskList { items }`
-  (the agent's live task-checklist), `TurnState
-  { active, started_at? }` (is a turn in flight). Both edges are projected
-  from the job store by `spawn_turn_state_projector` (subscribed to the job
-  lifecycle bus, which carries the `start` edge and the terminal edges), and
-  one snapshot is sent per `Subscribe` from the same `active_turn_started_at`
-  read — so a late-joining tab learns about a turn whose progress frames it
-  missed, and the actor never emits this frame. Streaming clients (TUI / web)
+- **Turn progress (server → client, live-update only):** `Reasoning`
+  (incremental thinking), `ToolStarted` / `ToolCompleted` (tool-call
+  lifecycle), `TaskList { items }` (the agent's live task-checklist),
+  `TurnState { active, started_at? }` (is a turn in flight). Both edges
+  are projected from the job store by `spawn_turn_state_projector`
+  (subscribed to the job lifecycle bus, which carries the `start` edge
+  and the terminal edges); a late joiner learns the in-flight turn from
+  the `SubscribeState` bundle instead. Streaming clients (TUI / web)
   render these live; clients without a partial surface drop them.
   See [`docs/turn-progress-events.md`](../turn-progress-events.md).
 - **Approvals:** `ApprovalRequested` / `ApprovalResolved` (server →
-  client), `ResolveApproval` (client → server), `PendingApprovalsSnapshot
-  { session_id, call_ids }` (server → client, on Subscribe).
+  client), `ResolveApproval` (client → server); the on-subscribe
+  authoritative set rides `SubscribeState.pending_approvals`.
 - **TUI history:** `HistorySnapshot { session_id, entries }`,
   `HistoryAppend { session_id, entry }`.
 - **Bot multiplexing (Multiplexed channels):** `StartBot`, `StopBot`
@@ -717,8 +747,8 @@ Session resolution is **not** "create on first message via
 For TUI clients only, the input-history ring rides two frames:
 `HistorySnapshot { session_id, entries }` is sent **inside the
 `Frame::Subscribe` handler**, gated on `channel_type == "tui"` (it must
-be the next frame after the per-session subscribe, before any catch-up
-replay), and `HistoryAppend { session_id, entry }` is sent by the
+be the next frame after the per-session subscribe, before the
+`SubscribeState` bundle), and `HistoryAppend { session_id, entry }` is sent by the
 client after every accepted submission. The gateway owns the encrypted
 ring via `channel::TuiHistoryStore` (vault key `baybo.tui.input_history`,
 500-entry cap, consecutive-duplicate dedup); concurrent appends from

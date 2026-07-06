@@ -264,7 +264,8 @@ C's blind relay, which only matches two legs by key and copies opaque frames
 The app stores its `PairedRecord` (auth token, gateway static key, routing
 candidates, relay node id, Noise static secret) in the App Group keychain and
 shows a "remembered" view on launch. The chat survives a background round-trip,
-and the content session reconnects (with catch-up) on every iOS foreground. It
+and the content session reconnects (then runs the sync loop —
+`docs/sync-protocol.md`) on every iOS foreground. It
 also reconnects on its own when a live leg drops mid-session: the Rust pump emits
 a `content-disconnected` event on any unsolicited exit (socket close, the
 inbound-liveness lapse, a remote-host restart) — but not on a deliberate

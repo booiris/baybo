@@ -168,14 +168,7 @@ impl WsClient {
     }
 
     async fn subscribe(&self, session_id: SessionId) -> Result<(), WsClientError> {
-        // TUI doesn't track ordinals client-side — every connect builds
-        // its in-memory state from `HistorySnapshot` + live frames, so
-        // there's no cursor to advance.
-        self.send_frame(&Frame::Subscribe {
-            session_id,
-            since_ordinal: None,
-        })
-        .await
+        self.send_frame(&Frame::Subscribe { session_id }).await
     }
 
     /// Read the one-shot `HistorySnapshot` frame the gateway sends right

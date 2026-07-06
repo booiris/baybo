@@ -6,7 +6,7 @@ import {
   log,
   persistState,
   postJumpVisible,
-  postOrdinal,
+  postSyncRequest,
   retrySend,
   subscribeTranscript,
   type UserSentPayload,
@@ -15,19 +15,18 @@ import { MarkdownBody } from "./MarkdownBody";
 import { WorkBlockView } from "./WorkBlock";
 import {
   uid,
-  type CatchUpItem,
   type ChatMsg,
   type PersistedState,
   type Row,
+  type TranscriptRowItem,
   type WireAttachment,
   type WireFrame,
-  type WireMessage,
   type WireWorkStepFrame,
   type WorkRow,
   type WorkStep,
 } from "./types";
 
-// Map a `Frame::WorkSnapshot` wire step onto the transcript's rendered
+// Map a `Frame::SubscribeState` wire work step onto the transcript's rendered
 // WorkStep. A `tool` step keeps its `call_id` so a later live `ToolCompleted`
 // still pairs by id; `status` defaults to "running" until the call finished
 // within the buffered turn.
@@ -44,10 +43,74 @@ function wireStepToWork(s: WireWorkStepFrame): WorkStep {
   return { kind: s.kind, text: s.text ?? "" };
 }
 
-/// Rows per transcript-history fetch — both the reset-recovery refetch (newest
-/// page) and a scroll-up older page. Matches the gateway's default page size
-/// (server-clamped to 1..200), so one fetch recovers/loads up to 50 rows.
+/// Map a REST `ChatWorkStep` (the `work` transcript row's step — snake_case
+/// `tool_label` / `tool_status` / `tool_summary`, no `call_id`) onto a rendered
+/// WorkStep. A reconstructed step's tool call is already closed, so `status`
+/// falls back to "ok" when the persisted result didn't carry one.
+function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number]): WorkStep {
+  if (s.kind === "tool") {
+    return {
+      kind: "tool",
+      callId: "",
+      label: s.tool_label || s.tool || "",
+      status: s.tool_status ?? "ok",
+      summary: s.tool_summary || undefined,
+    };
+  }
+  return { kind: s.kind, text: s.text ?? "" };
+}
+
+/// Translate one full-fidelity transcript row (`ChatTranscriptItem`, carried
+/// verbatim by the `sync_page` / `history_page` frames) into a rendered Row,
+/// keyed by the server's stable `id` (`m<ordinal>` / `w<ordinal>` / `n<seq>`)
+/// — the render key AND redelivery dedup key. `null` for a shape we don't
+/// render (an empty/unknown row).
+function transcriptItemToRow(item: TranscriptRowItem): Row | null {
+  if (item.kind === "work") {
+    const steps = (item.steps ?? []).map(restStepToWork);
+    return {
+      id: item.id,
+      role: "work",
+      steps,
+      active: false,
+      elapsedMs:
+        item.work_started_at && item.work_ended_at
+          ? Math.max(0, Date.parse(item.work_ended_at) - Date.parse(item.work_started_at))
+          : undefined,
+    };
+  }
+  if (item.kind === "notice") {
+    return { id: item.id, role: "notice", content: item.text ?? "" };
+  }
+  const role = item.role === "user" ? "user" : "assistant";
+  // A user row keeps its send's `platform_msg_id` as the render id (the live
+  // echo path's key), so an optimistic bubble reconciles by id; an assistant
+  // row uses the stable `m<ordinal>` id.
+  const id = role === "user" && item.platform_msg_id ? item.platform_msg_id : item.id;
+  return {
+    id,
+    role,
+    content: item.text ?? "",
+    attachments: item.attachments,
+  };
+}
+
+/// Rows per backward-history (scroll-up) page. Matches the gateway's default
+/// page size (server-clamped to 1..200), so one fetch loads up to 50 rows.
 const HISTORY_PAGE_LIMIT = 50;
+
+/// Sync page size, elected per call site (docs/sync-protocol.md): one UI page
+/// for a baseline / cold open (`since` absent — a newest-page REPLACE by
+/// definition), the server hard cap when merging a difference into an
+/// already-rendered thread (a rebase is a REPLACE under a reading user, so
+/// incremental merge is preferred all the way to the cap).
+const SYNC_BASELINE_LIMIT = 50;
+const SYNC_MERGE_LIMIT = 200;
+
+/// Safety-net pull cadence: run the sync loop for the foreground transcript
+/// every 3 minutes, skipped when any frame arrived within the interval.
+/// Backstops a lost `gap` nudge and suspended-app windows.
+const SAFETY_TICK_MS = 180_000;
 
 /// How close to the top of the chat log (px) triggers a scroll-up fetch of the
 /// next older page. A small band so the load fires just before the user hits the
@@ -77,37 +140,11 @@ function scrollEl(): HTMLElement | null {
   return document.scrollingElement as HTMLElement | null;
 }
 
-/// Rebuild `ChatMsg[]` from a native history API page's message rows. Mirrors
-/// the live `case "message"` mapping; each row carries real `attachments` (blob
-/// refs), so images render inline. Keyed by `platform_msg_id` (the live-path key)
-/// when present, else the ordinal, so a row keeps a stable React key across a
-/// scroll-up prepend.
-function historyMessagesToChatMsgs(messages: WireMessage[]): ChatMsg[] {
-  return messages.map((m) => ({
-    id: m.platform_msg_id || (typeof m.ordinal === "number" ? `m${m.ordinal}` : uid()),
-    role: m.role === "user" ? "user" : "assistant",
-    content: m.content,
-    attachments: m.attachments,
-  }));
-}
-
 function ordinalFromMessageId(id: string): number | null {
   const match = /^m(\d+)$/.exec(id);
   if (!match) return null;
   const n = Number(match[1]);
   return Number.isSafeInteger(n) ? n : null;
-}
-
-function stableWorkId(ordinal: number): string {
-  return `w${ordinal}`;
-}
-
-function stableMessageId(ordinal: number): string {
-  return `m${ordinal}`;
-}
-
-function isStableWorkId(id: string): boolean {
-  return /^w\d+$/.test(id);
 }
 
 /// Restored rows re-enter with live-turn state INTACT: a work block that was
@@ -285,17 +322,21 @@ const MessageRow = memo(function MessageRow({
 /// the scroll/follow model.
 export function Transcript({
   restored,
-  listed,
   initialConnEpoch,
 }: {
   restored: PersistedState | null;
-  listed: boolean;
   initialConnEpoch: number;
 }) {
   const { t } = useTranslation();
   const [messages, setMessages] = useState<Row[]>(() => sanitizeRestoredRows(restored?.messages));
   const [streaming, setStreaming] = useState("");
   const [turnActive, setTurnActive] = useState(false);
+  // Latest turn-active value readable synchronously from the sync-apply
+  // callbacks (a rebase/baseline REPLACE must not wipe a live streaming reply).
+  const turnActiveRef = useRef(false);
+  useEffect(() => {
+    turnActiveRef.current = turnActive;
+  }, [turnActive]);
   // The full streamed answer so far. State updates are coalesced through one
   // rAF per frame burst — every push crosses the bridge as its own JS task, so
   // without this each delta would re-render (and re-parse markdown) alone.
@@ -306,13 +347,13 @@ export function Transcript({
   const [connEpoch, setConnEpoch] = useState(initialConnEpoch);
   const connEpochRef = useRef(initialConnEpoch);
   // platform_msg_ids already rendered (our optimistic sends + anything
-  // restored), so the server's echo or a catch-up replay doesn't render twice.
+  // restored), so the server's echo or a sync redelivery doesn't render twice.
   const sentIds = useRef<Set<string>>(
     new Set((restored?.messages ?? []).filter((m) => m.role === "user").map((m) => m.id)),
   );
   // Durable ordinals already rendered. This catches the network-race where an
-  // old leg delivers a final Message just before a reconnect's Subscribe replay
-  // sends the same row again.
+  // old leg delivers a final Message just before a sync redelivery carries the
+  // same row again.
   const renderedOrdinals = useRef<Set<number>>(
     new Set(
       (restored?.messages ?? [])
@@ -321,28 +362,41 @@ export function Transcript({
         .filter((n): n is number => n !== null),
     ),
   );
-  // Highest durable ordinal rendered — the newest-edge cursor. Native uses it
-  // as sinceOrdinal on reconnect, so every advance is posted over the bridge.
-  const lastOrdinal = useRef<number | null>(restored?.lastOrdinal ?? 0);
+  // The sync cursor: the highest coverage watermark this client holds for the
+  // session (docs/sync-protocol.md). `null` = no baseline yet — the next sync
+  // omits `since_ordinal` and REPLACEs on the newest page. Advanced max-wins
+  // from a sync `next_cursor` and from ordinal-stamped live final replies —
+  // except while `rebaseDirty`, when only a sync `next_cursor` advances it.
+  const lastOrdinal = useRef<number | null>(restored?.lastOrdinal ?? null);
+  // True after applying a rebased page, until one non-rebased sync completes:
+  // live ordinals render but do not advance the cursor (a row persisted after
+  // the page was built but before the turn's final reply would otherwise be
+  // leapfrogged forever by the strictly-`>` select). The follow-up sync fires
+  // on turn end and on the safety tick.
+  const rebaseDirty = useRef(false);
+  // Started-at epoch-ms of turns this client has already seen END — the
+  // turn-identity staleness test for a `subscribe_state` bundle's turn/work
+  // halves (never cursor-vs-`as_of_ordinal` arithmetic). Bounded FIFO.
+  const endedTurnStarts = useRef<number[]>([]);
+  // Started-at epoch-ms of the currently-active turn (from a live
+  // `turn_state`/`subscribe_state`), so its END can be recorded by identity.
+  const activeTurnStart = useRef<number | null>(null);
+  // Epoch-ms of the last frame seen for this session — the safety tick skips
+  // when the stream proved itself live within the interval.
+  const lastFrameAt = useRef(0);
+  // Guards one in-flight sync request (the `sync_page`/`sync_failed` reply
+  // clears it) so a burst of triggers coalesces to one pull.
+  const syncInFlight = useRef(false);
   // Lowest durable ordinal loaded — the scroll-up paging cursor
   // (`before_ordinal`). `null` = unknown / nothing older to page to.
   const oldestOrdinal = useRef<number | null>(restored?.oldestOrdinal ?? null);
   const [hasMoreOlder, setHasMoreOlder] = useState<boolean>(restored?.hasMoreOlder ?? false);
   const [loadingOlder, setLoadingOlder] = useState(false);
-  // True while a `Frame::Reset` recovery is in flight, so a burst of Resets
-  // (back-pressure) doesn't stack concurrent refetches.
-  const recovering = useRef(false);
-  // Serializes native history API requests AND tags the pushed `history_page`
-  // reply so its handler knows whether to REPLACE (reset recovery) or PREPEND
-  // (scroll-up). The epoch captured at request time lets a reply that arrives
-  // under a different connection epoch be dropped as stale. `null` = no history
-  // request in flight.
-  const relayHistory = useRef<{ mode: "reset" | "page"; epoch: number } | null>(null);
-  // A reset recovery that arrived while a request was already in flight, so
-  // it's queued to run when that request's `history_page` lands (rather than
-  // being dropped — which would leave the stale cursor and re-arm the reset
-  // loop).
-  const pendingReset = useRef(false);
+  // Tags the in-flight backward-history (scroll-up) request so its pushed
+  // `history_page` reply is matched: the epoch captured at request time lets a
+  // reply that arrives under a superseded connection epoch be dropped as stale.
+  // `null` = no history page in flight.
+  const relayHistory = useRef<{ epoch: number } | null>(null);
   // In-flight guard for an older-page load, so a scroll-event burst fires one
   // fetch. `loadingOlder` (state) drives the spinner; this ref is the race-free
   // gate.
@@ -577,20 +631,42 @@ export function Transcript({
     });
   }, []);
 
-  // Recover the in-flight turn's work block on a mid-turn (re)subscribe (an iOS
-  // relay leg resuming after backgrounding). The snapshot is the whole coalesced
-  // turn — a superset of anything shown live — so REPLACE the open block's steps
-  // rather than append (appending would double-render the head already on screen
-  // before we backgrounded). The trailing prose step is the CURRENT answer tail,
-  // which the live view renders as the streaming reply below the block, not as a
-  // work step — route it to the stream so the recovered shape matches live and
-  // the terminal Message replaces it cleanly.
-  const applyWorkSnapshot = useCallback(
-    (wireSteps: WireWorkStepFrame[]) => {
+  // Remember a turn we've seen END (turn_state{active:false} or its final
+  // Message), so a later `subscribe_state` bundle for the SAME turn — matched by
+  // started_at — is judged stale by turn identity and its turn/work halves are
+  // discarded. Bounded FIFO; the exact size is unimportant (a client rarely
+  // holds more than one live turn's identity at a time).
+  const recordEndedTurn = useCallback((startedMs: number | null) => {
+    if (startedMs === null) return;
+    const seen = endedTurnStarts.current;
+    if (seen.includes(startedMs)) return;
+    seen.push(startedMs);
+    if (seen.length > 8) seen.shift();
+  }, []);
+
+  // Apply one `subscribe_state` bundle's turn/work halves. The bundle is the
+  // whole coalesced turn — a superset of anything shown live — so REPLACE the
+  // open block's steps rather than append (appending would double-render the
+  // head already on screen before we backgrounded). The trailing prose step is
+  // the CURRENT answer tail, which the live view renders as the streaming reply
+  // below the block, not as a work step — route it to the stream. Staleness is
+  // judged by turn identity (`startedMs` already seen END), never by cursor
+  // arithmetic; a stale bundle leaves the transcript untouched.
+  const applySubscribeState = useCallback(
+    (turn: { active: boolean; started_at?: string }, wireSteps: WireWorkStepFrame[]) => {
+      const startedMs = turn.started_at ? Date.parse(turn.started_at) : null;
+      if (startedMs !== null && endedTurnStarts.current.includes(startedMs)) return;
+      if (!turn.active) {
+        // No turn in flight at snapshot time — close any block we're holding
+        // open (e.g. a restored mid-turn block whose turn actually finished).
+        setTurnActive(false);
+        closeWork();
+        return;
+      }
+      setTurnActive(true);
       const steps = wireSteps.map(wireStepToWork);
-      if (steps.length === 0) return;
       const tail = steps[steps.length - 1];
-      const tailProse = tail.kind === "prose";
+      const tailProse = tail?.kind === "prose";
       const workSteps = tailProse ? steps.slice(0, -1) : steps;
       // Drive the live reply to the recovered answer tail (or clear it) in one
       // shot, batched with the block replace below — so the reply grows in place
@@ -615,14 +691,13 @@ export function Transcript({
     [setStreamingText],
   );
 
-  // Fire a transcript-history request through native. The API result is pushed
-  // later as a local `history_page` frame; `mode` tags it for that handler
-  // (REPLACE for a reset, PREPEND for scroll-up), and the current epoch tags it
+  // Fire a backward-history (scroll-up) request through native. The API result
+  // is pushed later as a local `history_page` frame; the current epoch tags it
   // against late delivery across a reconnect. One at a time — returns `false`
   // if a request is already in flight (the caller then unwinds its own guards).
-  const requestHistory = useCallback((mode: "reset" | "page", beforeOrdinal: number | null): boolean => {
+  const requestHistory = useCallback((beforeOrdinal: number | null): boolean => {
     if (relayHistory.current) return false;
-    relayHistory.current = { mode, epoch: connEpochRef.current };
+    relayHistory.current = { epoch: connEpochRef.current };
     try {
       fetchHistory(beforeOrdinal, HISTORY_PAGE_LIMIT);
       return true;
@@ -637,7 +712,7 @@ export function Transcript({
   // updates). Paged rows are strictly older than the current oldest, so they
   // can't overlap — the id-set filter is just a safety net. Re-seeds `sentIds`
   // so a later live echo of an own message doesn't double-render.
-  const prependOlder = useCallback((older: ChatMsg[], newOldest: number | null, more: boolean) => {
+  const prependOlder = useCallback((older: Row[], newOldest: number | null, more: boolean) => {
     const anchorEl = scrollEl();
     if (older.length > 0 && anchorEl) {
       prependAnchor.current = {
@@ -664,28 +739,6 @@ export function Transcript({
   // outbound back-pressure). Left unhandled this *loops*: the stale pre-gap
   // cursor goes back out on the next reconnect and overflows again. One
   // native `fetchHistory` rebuilds the thread and reseeds the cursors — no
-  // reconnect needed. If a request is already in flight (`false`) — e.g. a
-  // scroll-up page — the reset can't ride it (that response is a
-  // PREPEND), so QUEUE it to run when that request completes; dropping it would
-  // leave the stale cursor in place and re-arm the very reset loop we're
-  // breaking. A re-entrancy guard keeps a burst of Resets from stacking
-  // concurrent refetches. `t` is deliberately not a dep: a language switch must
-  // not re-create the frame pipeline; the captured language is fine for these
-  // one-shot recovery strings.
-  const recoverFromReset = useCallback(() => {
-    if (recovering.current) return;
-    recovering.current = true;
-    try {
-      const fired = requestHistory("reset", null);
-      if (!fired) pendingReset.current = true;
-    } catch (e) {
-      log("warn", `history recover failed: ${String(e)}`);
-      appendNotice(t("chat.recoverFailed", { error: String(e) }));
-    } finally {
-      recovering.current = false;
-    }
-  }, [requestHistory, appendNotice]);
-
   // Load the next older page (scroll-up): fire a native fetchHistory whose
   // `history_page` reply prepends in the frame switch (and clears the guards
   // there). `pagingRef` gates re-entry.
@@ -696,7 +749,7 @@ export function Transcript({
     pagingRef.current = true;
     setLoadingOlder(true);
     try {
-      const fired = requestHistory("page", before);
+      const fired = requestHistory(before);
       // If a request was already in flight, unwind — the `history_page` handler
       // clears the guards only for the request it actually serves.
       if (!fired) {
@@ -711,136 +764,123 @@ export function Transcript({
     }
   }, [hasMoreOlder, requestHistory, appendNotice]);
 
-  // The single owner of the initial-backfill decision (hydration matrix:
-  // app/ios/CLAUDE.md). A LISTED session rendering zero rows on a live leg
-  // pulls its newest history page — nothing else fills that void: a mirror-less
-  // open subscribes with `since_ordinal` None, which the gateway replays
-  // nothing for (route.rs). Ground truth is RENDERED ROWS, not mirror
-  // existence — a mirror can exist with zero rows (an earlier failed backfill's
-  // empty persist), and only this side knows what rendered. Callers are the
-  // clock edges where "listed + empty + connected" can newly hold; add a new
-  // edge as another CALL, never as a second decision site. Safe to re-call:
-  // `requestHistory` dedups in-flight, a landed page makes `messages`
-  // non-empty, and a draft (listed=false) never fires.
-  const ensureBackfilled = () => {
-    if (!listed || messages.length > 0) return;
-    if (connEpochRef.current === 0) return; // leg not live yet — the connect edge re-calls
+  // The one forward-recovery pull (docs/sync-protocol.md "The one client
+  // algorithm"): session open, reconnect, gap nudge and the safety tick all
+  // land here. Posts the current cursor to native, which fetches
+  // `GET …/sync?since_ordinal=<cursor>&limit=…` over the active leg and pushes
+  // the result back as a local `sync_page` frame. `null` cursor → baseline
+  // REPLACE; a rebased response also REPLACEs. `syncInFlight` coalesces a
+  // burst of triggers to one pull (cleared by the reply).
+  const runSync = useCallback(() => {
+    if (syncInFlight.current) return;
+    const cursor = lastOrdinal.current;
+    const limit = cursor === null ? SYNC_BASELINE_LIMIT : SYNC_MERGE_LIMIT;
+    syncInFlight.current = true;
     try {
-      requestHistory("reset", null);
+      postSyncRequest(cursor, limit);
     } catch (e) {
-      log("warn", `initial history load failed: ${String(e)}`);
+      syncInFlight.current = false;
+      log("warn", `sync request failed: ${String(e)}`);
     }
-  };
-
-  // Clock edge: resident re-entry (matrix cell E). The store stays cached and
-  // CONNECTED across back-out → re-enter, so no `connEpoch` edge will come —
-  // and the list visit in between pruned this session's mirror if it fell
-  // outside the most-recently-active set (opening doesn't bump `lastActive`).
-  // On a fresh store this no-ops (epoch still 0); the connect edge takes over.
-  useEffect(() => {
-    ensureBackfilled();
   }, []);
 
-  const setNewestOrdinal = (value: number | null) => {
-    lastOrdinal.current = value;
-    postOrdinal(value);
-  };
-
-  const applyCatchUp = (items: CatchUpItem[], newestOrdinal: number | null | undefined, truncated: boolean) => {
-    if (truncated) {
-      recoverFromReset();
-      return;
+  // Advance the cursor from a completed sync (docs/sync-protocol.md): the
+  // coverage watermark `next_cursor` feeds the max even on a rebased page (it
+  // is a sync watermark), and `rebased` sets the dirty flag — cleared by any
+  // non-rebased sync — so a live ordinal can't leapfrog the rebase window.
+  const advanceCursorFromSync = useCallback((nextCursor: number | null, rebased: boolean) => {
+    if (nextCursor !== null && (lastOrdinal.current === null || nextCursor > lastOrdinal.current)) {
+      lastOrdinal.current = nextCursor;
     }
-    const hasAssistantMessage = items.some((item) => item.kind === "message" && item.role === "assistant");
-    if (hasAssistantMessage) clearStreaming();
+    rebaseDirty.current = rebased;
+  }, []);
 
-    setMessages((rows) => {
-      const next = [...rows];
-      const hasRowId = (id: string) => next.some((row) => row.id === id);
-      const findMessageByOrdinal = (ordinal: number) =>
-        next.findIndex((row) => {
-          if (row.role !== "user" && row.role !== "assistant") return false;
-          return ordinalFromMessageId(row.id) === ordinal;
-        });
-      const closeTrailingWork = () => {
-        const last = next[next.length - 1];
-        if (!last || last.role !== "work" || !last.active) return;
-        if (last.steps.length === 0) {
-          next.pop();
-          return;
-        }
-        next[next.length - 1] = {
-          ...last,
-          active: false,
-          elapsedMs: last.startedAt !== undefined ? Date.now() - last.startedAt : last.elapsedMs,
-        };
-      };
+  // Advance from an ordinal-stamped live final reply — max-wins, but a
+  // rebase-dirty cursor is frozen against live advances until one non-rebased
+  // sync completes.
+  const advanceCursorFromLive = useCallback((ordinal: number) => {
+    if (rebaseDirty.current) return;
+    if (lastOrdinal.current === null || ordinal > lastOrdinal.current) lastOrdinal.current = ordinal;
+  }, []);
 
-      for (const item of items) {
-        const ordinal = item.ordinal;
-        if (!Number.isSafeInteger(ordinal)) continue;
-        if (item.kind === "work") {
-          const steps = item.steps.map(wireStepToWork);
-          if (steps.length === 0) continue;
-          const id = stableWorkId(ordinal);
-          if (hasRowId(id)) continue;
-          const block: WorkRow = { id, role: "work", steps, active: false };
-          const msgIndex = findMessageByOrdinal(ordinal);
-          if (msgIndex >= 0) {
-            const prev = next[msgIndex - 1];
-            if (prev && prev.role === "work" && !isStableWorkId(prev.id)) {
-              next[msgIndex - 1] = block;
-            } else {
-              next.splice(msgIndex, 0, block);
-            }
-            continue;
-          }
-          const last = next[next.length - 1];
-          if (last && last.role === "work" && !isStableWorkId(last.id)) {
-            next[next.length - 1] = block;
-          } else {
-            next.push(block);
-          }
-          continue;
+  // Apply one `sync_page` frame. REPLACE (rebased, or baseline `since === null`)
+  // swaps the durable thread wholesale — keeping the in-flight turn's open work
+  // block and any optimistic user rows the page can't carry yet (the
+  // REPLACE-overlay rule) — while a difference merge appends the rows above the
+  // cursor, reconciling an optimistic send against its persisted row by
+  // `platform_msg_id`. Rows arrive ascending; each carries its stable id.
+  const applySyncPage = useCallback(
+    (frame: Extract<WireFrame, { kind: "sync_page" }>) => {
+      syncInFlight.current = false;
+      const replace = frame.rebased || frame.since_ordinal === null;
+      const pageRows = frame.rows
+        .map(transcriptItemToRow)
+        .filter((r): r is Row => r !== null);
+      // Reseed the redelivery-dedup sets from the page (idempotent Set adds).
+      for (const item of frame.rows) {
+        if (item.kind === "message") {
+          if (typeof item.ordinal === "number") renderedOrdinals.current.add(item.ordinal);
+          if (item.platform_msg_id) sentIds.current.add(item.platform_msg_id);
         }
-
-        const role = item.role === "user" ? "user" : "assistant";
-        const platformMsgId = item.platform_msg_id || "";
-        const id = platformMsgId || stableMessageId(ordinal);
-        const alreadySent = role === "user" && platformMsgId !== "" && sentIds.current.has(platformMsgId);
-        const alreadyRendered =
-          hasRowId(id) || renderedOrdinals.current.has(ordinal) || findMessageByOrdinal(ordinal) >= 0;
-        if (alreadySent || alreadyRendered) {
-          renderedOrdinals.current.add(ordinal);
-          if (role === "user" && platformMsgId) {
-            sentIds.current.add(platformMsgId);
-            // A send confirmed by reconnect merge instead of a live echo — clear
-            // its send-state chrome too (backgrounded right after sending).
-            const idx = next.findIndex((row) => row.role === "user" && row.id === platformMsgId);
-            const existing = idx >= 0 ? next[idx] : undefined;
-            if (existing && existing.role === "user" && existing.sendState) {
-              next[idx] = { ...existing, sendState: undefined };
-            }
-          }
-          continue;
-        }
-        if (role === "assistant") closeTrailingWork();
-        if (role === "user" && platformMsgId) sentIds.current.add(platformMsgId);
-        renderedOrdinals.current.add(ordinal);
-        next.push({
-          id,
-          role,
-          content: item.content,
-          attachments: item.attachments,
-        });
       }
-      return next;
-    });
-
-    if (typeof newestOrdinal === "number" && (lastOrdinal.current === null || newestOrdinal > lastOrdinal.current)) {
-      setNewestOrdinal(newestOrdinal);
-    }
-  };
+      if (replace) {
+        const pageIds = new Set(pageRows.map((r) => r.id));
+        setMessages((prev) => {
+          // Keep the in-flight turn's open work block and any optimistic user
+          // sends still awaiting their durable row (echoed-but-unpersisted, or
+          // below a rebase floor) — the page can't carry either.
+          const openWork = prev.filter((r) => r.role === "work" && r.active);
+          const keptSends = prev.filter(
+            (r) => r.role === "user" && r.sendState !== undefined && !pageIds.has(r.id),
+          );
+          return [...pageRows, ...keptSends, ...openWork];
+        });
+        oldestOrdinal.current = frame.oldest_ordinal;
+        setHasMoreOlder(frame.has_more_older);
+        // The rebuilt thread IS the newest page — pre-sync scroll position is
+        // meaningless, so snap to the newest edge.
+        followRef.current = true;
+        if (!turnActiveRef.current) clearStreaming();
+      } else {
+        setMessages((prev) => {
+          const next = [...prev];
+          const byId = new Map(next.map((r, i) => [r.id, i] as const));
+          const closeTrailingWork = () => {
+            const last = next[next.length - 1];
+            if (!last || last.role !== "work" || !last.active) return;
+            if (last.steps.length === 0) {
+              next.pop();
+              return;
+            }
+            next[next.length - 1] = {
+              ...last,
+              active: false,
+              elapsedMs: last.startedAt !== undefined ? Date.now() - last.startedAt : last.elapsedMs,
+            };
+          };
+          for (const row of pageRows) {
+            const existingIdx = byId.get(row.id);
+            if (existingIdx !== undefined) {
+              // A redelivery of a row already on screen — reconcile an
+              // optimistic send's chrome (drop the spinner), otherwise a no-op.
+              const existing = next[existingIdx];
+              if (existing.role === "user" && existing.sendState !== undefined) {
+                next[existingIdx] = { ...existing, sendState: undefined };
+              }
+              continue;
+            }
+            if (row.role === "assistant") closeTrailingWork();
+            next.push(row);
+            byId.set(row.id, next.length - 1);
+          }
+          return next;
+        });
+        if (pageRows.some((r) => r.role === "assistant")) clearStreaming();
+      }
+      advanceCursorFromSync(frame.next_cursor, frame.rebased);
+    },
+    [advanceCursorFromSync],
+  );
 
   const handleFrame = (frameJson: string) => {
     let frame: WireFrame;
@@ -850,15 +890,13 @@ export function Transcript({
       log("warn", `unparseable frame: ${String(e)}`);
       return;
     }
+    lastFrameAt.current = Date.now();
     switch (frame.kind) {
       case "message": {
         const ordinal = typeof frame.ordinal === "number" ? frame.ordinal : null;
-        // Advance the cursor first — even for our own echo we dedup below — so
-        // a later reconnect doesn't re-replay this row. A `null` cursor (post
-        // reset) takes the first real ordinal that lands.
-        if (ordinal !== null && (lastOrdinal.current === null || ordinal > lastOrdinal.current)) {
-          setNewestOrdinal(ordinal);
-        }
+        // Advance the cursor from the ordinal-stamped final reply (max-wins,
+        // frozen while rebase-dirty), then dedup below.
+        if (ordinal !== null) advanceCursorFromLive(ordinal);
         const role = frame.role === "user" ? "user" : "assistant";
         if (role === "user" && frame.platform_msg_id && sentIds.current.has(frame.platform_msg_id)) {
           if (ordinal !== null) renderedOrdinals.current.add(ordinal);
@@ -874,9 +912,14 @@ export function Transcript({
         }
         if (role === "assistant") {
           // The terminal message is authoritative: it replaces the streamed
-          // text and ends the turn's work block.
+          // text and ends the turn's work block. It is also a turn-END signal
+          // (record its identity), and — if the cursor is rebase-dirty — the
+          // trigger for the follow-up sync that closes the dirty window.
           closeWork();
           clearStreaming();
+          recordEndedTurn(activeTurnStart.current);
+          activeTurnStart.current = null;
+          if (rebaseDirty.current) runSync();
         }
         if (ordinal !== null) renderedOrdinals.current.add(ordinal);
         setMessages((m) => [
@@ -949,10 +992,30 @@ export function Transcript({
         break;
       case "turn_state":
         setTurnActive(frame.active);
-        if (!frame.active) closeWork();
+        if (frame.active) {
+          activeTurnStart.current = frame.started_at ? Date.parse(frame.started_at) : null;
+        } else {
+          closeWork();
+          recordEndedTurn(activeTurnStart.current);
+          activeTurnStart.current = null;
+          // A turn ending on a rebase-dirty cursor triggers the follow-up sync
+          // that closes the dirty window (mirrors the final-Message path).
+          if (rebaseDirty.current) runSync();
+        }
         break;
-      case "work_snapshot":
-        applyWorkSnapshot(frame.steps);
+      case "subscribe_state":
+        // The one atomic state-plane bundle. iOS surfaces only the turn/work
+        // halves (no approvals/tasks UI); staleness is judged by turn identity.
+        if (frame.turn.active && frame.turn.started_at) {
+          activeTurnStart.current = Date.parse(frame.turn.started_at);
+        }
+        applySubscribeState(frame.turn, frame.work_steps ?? []);
+        break;
+      case "gap":
+        // Server-declared loss on this connection — run the one forward-recovery
+        // pull. (`session_id` scoping is native's concern; the webview holds one
+        // session, so any gap means "sync me".)
+        runSync();
         break;
       case "notice":
         if (frame.transient) {
@@ -963,73 +1026,37 @@ export function Transcript({
           appendNotice(frame.text);
         }
         break;
-      case "reset":
-        // Native only forwards frames from its live leg, so unlike the old
-        // per-dial channel there's no per-frame generation to check here;
-        // `recoverFromReset` still self-guards a Reset burst.
-        recoverFromReset();
+      case "sync_page":
+        applySyncPage(frame);
         break;
-      case "catch_up":
-        applyCatchUp(frame.items, frame.newest_ordinal ?? null, frame.truncated);
+      case "sync_failed":
+        // The native chatFetchSync API call failed — unwind the in-flight
+        // guard so the next trigger retries; the durable record is intact.
+        syncInFlight.current = false;
+        log("warn", `sync fetch failed: ${frame.error}`);
         break;
       case "history_page": {
-        // `relayHistory.current` (set when we fired the request) says whether
-        // this is a reset rebuild (REPLACE) or a scroll-up page (PREPEND). A
-        // page with no matching in-flight request (`null`) is stale/duplicate,
-        // and one whose request was tagged under a superseded connection epoch
-        // belongs to a dead leg — drop both; neither may fall through to the
-        // REPLACE path and wipe the thread.
+        // Backward paging (scroll-up) only — the reset-rebuild REPLACE is gone
+        // (baseline/rebase now ride `sync_page`). A page with no matching
+        // in-flight request (`null`), or one tagged under a superseded
+        // connection epoch (a dead leg), is stale — drop it.
         const pending = relayHistory.current;
         relayHistory.current = null;
         if (pending === null || pending.epoch !== connEpochRef.current) break;
-        const rows = historyMessagesToChatMsgs(frame.messages);
-        if (pending.mode === "page") {
-          prependOlder(rows, frame.oldest_ordinal ?? null, frame.has_more);
-        } else {
-          // Reset rebuild: REPLACE the thread with the newest page, reseed both
-          // cursors.
-          for (const m of frame.messages) {
-            if (m.role === "user" && m.platform_msg_id) sentIds.current.add(m.platform_msg_id);
-          }
-          renderedOrdinals.current = new Set(
-            rows
-              .map((m) => ordinalFromMessageId(m.id))
-              .filter((n): n is number => n !== null),
-          );
-          setNewestOrdinal(frame.newest_ordinal ?? 0);
-          oldestOrdinal.current = frame.oldest_ordinal ?? null;
-          setHasMoreOlder(frame.has_more);
-          clearStreaming();
-          // The rebuilt thread IS the newest page — the pre-reset scroll
-          // position is meaningless, so snap to the newest edge.
-          followRef.current = true;
-          setMessages(rows);
-        }
-        // This request is done; clear any paging guards a coincident scroll-up
-        // left set.
+        const rows = frame.rows.map(transcriptItemToRow).filter((r): r is Row => r !== null);
+        prependOlder(rows, frame.oldest_ordinal ?? null, frame.has_more);
         pagingRef.current = false;
         setLoadingOlder(false);
-        // A reset queued behind this request (it couldn't ride a page response)
-        // now runs — unless this WAS the reset, in which case the queue is
-        // moot.
-        if (pendingReset.current) {
-          pendingReset.current = false;
-          if (pending.mode === "page") recoverFromReset();
-        }
         break;
       }
       case "history_failed": {
-        // Native couldn't enqueue the request — unwind the guards the fire
-        // sites armed, exactly like the old invoke() rejection paths did.
+        // Native couldn't enqueue the paging request — unwind the guards the
+        // fire site armed.
         const pending = relayHistory.current;
         relayHistory.current = null;
         if (pending === null || pending.epoch !== connEpochRef.current) break;
         pagingRef.current = false;
         setLoadingOlder(false);
-        // Deliberately no retry: on a dead leg the reconnect's Subscribe
-        // re-fires Reset if the cursor is still stale (the same self-heal the
-        // connEpoch bump relies on); re-firing here would loop fail→retry.
-        pendingReset.current = false;
         log("warn", `history fetch failed: ${frame.error}`);
         appendNotice(t("chat.recoverFailed", { error: frame.error }));
         break;
@@ -1087,25 +1114,44 @@ export function Transcript({
     requestAnimationFrame(step);
   };
 
-  // Native (re)connected. Any history request in flight belongs to the old
-  // epoch and is abandoned (its late `history_page` is dropped by the epoch tag)
-  // — clear the guards so a future fetch isn't blocked / the spinner isn't
-  // stuck / a queued reset isn't stranded. The reconnect's own subscribe
-  // re-triggers a Reset if the cursor is still stale, so a dropped queued reset
-  // self-heals.
+  // Native (re)connected. Any paging request in flight belongs to the old
+  // epoch and is abandoned (its late `history_page` is dropped by the epoch
+  // tag) — clear the guards so a future fetch isn't blocked / the spinner isn't
+  // stuck. Then run the one forward-recovery pull: this is the reconnect edge
+  // of the sync loop (the server replays nothing on Subscribe).
   const handleConnEpoch = (epoch: number) => {
     connEpochRef.current = epoch;
     relayHistory.current = null;
-    pendingReset.current = false;
     pagingRef.current = false;
     setLoadingOlder(false);
     setConnEpoch(epoch);
-    // Clock edge: the leg (re)connected (matrix cell D — first connect of a
-    // fresh store — plus the re-fire after an epoch bump abandoned an earlier
-    // attempt, relayHistory cleared just above). Fired after the ref update so
-    // the request's epoch tag matches when its `history_page` lands.
-    ensureBackfilled();
+    runSync();
   };
+
+  // Native asked for a sync run (offscreen-buffer-overflow re-attach, or any
+  // native-side "go sync" edge). Same one forward-recovery pull.
+  const handleSyncRequested = useCallback(() => {
+    runSync();
+  }, [runSync]);
+
+  // The one client loop's OPEN edge: run sync on mount (a resident re-entry —
+  // hydration-matrix cell E in the retired scheme — that fires no connEpoch
+  // edge still hydrates here). Safe to double with the connEpoch edge:
+  // `syncInFlight` coalesces, and an empty difference is a no-op.
+  useEffect(() => {
+    runSync();
+  }, [runSync]);
+
+  // Safety-net pull: run sync every 3 minutes for the foreground transcript,
+  // skipped when any frame arrived within the interval. Backstops a lost `gap`
+  // nudge and suspended-app windows.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (Date.now() - lastFrameAt.current < SAFETY_TICK_MS) return;
+      runSync();
+    }, SAFETY_TICK_MS);
+    return () => window.clearInterval(id);
+  }, [runSync]);
 
   // The document (main frame) is the scroller, so follow/jump/paging state is
   // driven by the window scroll event, not a div's onScroll. Passive; fires on
@@ -1142,6 +1188,7 @@ export function Transcript({
     handleConnEpoch,
     handleBottomInset,
     jumpToLatest,
+    handleSyncRequested,
   });
   handlersRef.current = {
     handleFrame,
@@ -1150,6 +1197,7 @@ export function Transcript({
     handleConnEpoch,
     handleBottomInset,
     jumpToLatest,
+    handleSyncRequested,
   };
   useEffect(
     () =>
@@ -1160,6 +1208,7 @@ export function Transcript({
         sendFailed: (msgId) => handlersRef.current.markFailed(msgId),
         bottomInset: (px) => handlersRef.current.handleBottomInset(px),
         jumpToLatest: () => handlersRef.current.jumpToLatest(),
+        syncRequested: () => handlersRef.current.handleSyncRequested(),
       }),
     [],
   );

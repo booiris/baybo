@@ -1,14 +1,18 @@
 # Chat Sync Protocol v2 — One Cursor, One Sync
 
-**Status:** 🚧 Proposal, design-complete (2026-07-06) — reviewed (codex +
-code-grounded verification) and all launch open questions resolved (see the
-Decision log). Nothing here is built. This doc
-distills a full-codebase audit of the current web/iOS message-sync paths plus a
-survey of how production IM systems (WeChat, Telegram, Matrix, DingTalk,
-RongCloud) solve the same problem, and proposes collapsing baybo's five
-overlapping catch-up mechanisms into one cursor + one sync call + three
-explicit data planes. Current-state file references are as of branch
-`feat/ios-swiftui` @ `811a9847`.
+**Status:** ✅ Built (2026-07-06, branch `docs/chat-sync-protocol-v2`) —
+designed the same day, reviewed (codex + code-grounded verification) with all
+launch open questions resolved (see the Decision log), then implemented as one
+atomic cut-over series: the `sync` endpoint + `platform_msg_id` point lookup,
+`Frame::SubscribeState` / `Frame::Gap`, the Subscribe scoping fix and
+channel-scoped patch broadcasts, and deletion of the WS replay, REST catch-up,
+`Frame::Reset` / `WorkSnapshot` / `PendingApprovalsSnapshot`, and the client
+sentinel/hydration machinery. This doc distills a full-codebase audit of the
+v1 web/iOS message-sync paths plus a survey of how production IM systems
+(WeChat, Telegram, Matrix, DingTalk, RongCloud) solve the same problem.
+**Current-state file references below describe the retired v1 code** as of
+branch `feat/ios-swiftui` @ `811a9847` — read them as the audit record that
+motivated the design, not as live pointers.
 
 Related docs: [`docs/web-chat.md`](web-chat.md) (current web data flow),
 [`docs/turn-progress-events.md`](turn-progress-events.md) (streaming frames +

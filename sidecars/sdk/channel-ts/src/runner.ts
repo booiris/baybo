@@ -751,20 +751,17 @@ function dispatchFrame(
     case "unsubscribe":
       logger.warn("unexpected subscribe/unsubscribe on sidecar", frame.kind);
       return;
-    // PendingApprovalsSnapshot is the server's reply to a Subscribe;
+    // SubscribeState is the server's reply to a Subscribe;
     // broadcast-kind sidecars don't subscribe so they never see it.
-    case "pending_approvals_snapshot":
-      logger.warn("unexpected pending_approvals_snapshot on sidecar", frame.kind);
+    case "subscribe_state":
+      logger.warn("unexpected subscribe_state on sidecar", frame.kind);
       return;
-    // Reset means "your live stream is stale". For a broadcast
-    // sidecar the right reaction is to log and rely on auto-reconnect
-    // (subsequent server output will flow normally after the WS
-    // re-handshakes).
-    case "reset": {
-      logger.warn("server requested reset", frame.reason);
-      safeClose(ws);
+    // Gap means the server dropped frames it owed this connection.
+    // Sidecars render live-only (no transcript to sync), so log and
+    // carry on — the durable record is intact server-side.
+    case "gap":
+      logger.warn("server declared a frame gap", frame.session_id ?? "(global)");
       return;
-    }
     case "ping": {
       // Forward-compat: a future server-initiated keepalive should
       // still see a Pong from the sidecar so its own watchdog can
