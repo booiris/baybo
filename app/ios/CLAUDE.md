@@ -151,9 +151,9 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   state machine in `ChatStore` depends on that contract. `AppStore` owns a
   cached `ChatStore` per opened session, LRU-bounded to `maxResidentStores` (12):
   after each activation, the least-recently-used stores beyond the cap that are
-  idle (offscreen — no attached bridge — and not the pushed session) are evicted
-  via `ChatStore.evict()`, which cancels the store's timers so it can deallocate
-  and calls `chat_unsubscribe` to drop just that session's sink. A memory warning
+  idle (not the pushed session, `chatPath.last`) are evicted via `ChatStore.evict()`, which cancels the
+  store's timers so it can deallocate and calls `chat_unsubscribe` to drop just
+  that session's sink. A memory warning
   (`AppDelegate.applicationDidReceiveMemoryWarning` → `evictAllIdleStores`) evicts
   every idle store regardless of the cap. Re-opening an evicted session mints a
   fresh store that re-subscribes and catches up from gateway history. The FFI
@@ -170,6 +170,31 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   drops one session's sink without touching the leg; logout, rebind, or explicit
   app teardown calls `chat_disconnect`, which drops the global leg and all
   registered sinks.
+- **Single persistent transcript webview**: there is ONE transcript `WKWebView`
+  + `TranscriptBridge`, reused across EVERY conversation — held by a single
+  `TranscriptHost` (`App/Core/TranscriptHost.swift`) on `AppStore`
+  (`transcriptHost`), booted once (prewarm / first open) and torn down only on
+  logout/rebind. The bundle is parsed and the web-content process spun up exactly
+  once for the app's bound lifetime; opening a chat never re-boots the runtime.
+  `ChatScreen.onAppear` calls `TranscriptBridge.retarget(to:)`: a return to the
+  SAME conversation the webview still holds just re-attaches + flushes buffered
+  frames (React tree intact → instant, no remount, no fade); a DIFFERENT session
+  flushes the old mirror, then `deliverInit` re-renders the transcript (main.tsx
+  keys `<Transcript>` on sessionId → React unmounts the old tree and mounts the
+  new from its own `restoredState`), then flushes the new store's buffered frames
+  after `init`, and replays the inset/jump/reveal the `ready` handler would have
+  (no page reload fires). Cross-session isolation is enforced on the WEB side
+  because the webview is shared: (a) `bridge.ts`'s `init` clears the per-session
+  `buffer`/`blobPending`/`pendingPersist` so nothing leaks into the new tree;
+  (b) `persist` messages carry their originating `sessionId` (native writes under
+  THAT id, never the current store) so a late debounced flush can't corrupt the
+  session now on screen; (c) `key={sessionId}` fully resets the React tree
+  (`Transcript.tsx` has no module state; blob object URLs are revoked on
+  unmount). `TranscriptWebView` is a reparenting shim (`makeUIView` returns the
+  host's webview, `dismantleUIView` only unparents). `prewarmTranscriptHost`
+  boots the webview at home so the first open is warm; `startNewChat` adopts that
+  prewarmed draft. `ChatScreen.onDisappear` calls `detachCurrent` (flush mirror +
+  detach), so the offscreen frame-buffering contract below is unchanged.
 - **Frame ordering**: sink callbacks hop to the main queue via GCD (FIFO), not
   `Task` — reordered `answer_delta`s would corrupt the transcript.
 - **connState** has exactly one `offline` trigger: a failed dial. Unsolicited
@@ -219,7 +244,14 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   `-baybo-demo-keyboard` raises the keyboard 2s in and drops
   it at 5s (record with `simctl io recordVideo`, extract frames with ffmpeg);
   the software keyboard only appears with Simulator.app running and hardware
-  keyboard disconnected. `scripts/build-app.sh` pins products at
+  keyboard disconnected. `-baybo-demo-switch` (DEBUG) opens session `demo-a`
+  with a session-tagged turn, then switches `chatPath` to `demo-b` at 5s —
+  exercising the single reused webview's cross-session remount so a content
+  leak is screenshot-verifiable (each thread must show ONLY its own tag; the
+  `demo-b` screenshot showing any `demo-a` text is a cross-session bleed). NOTE:
+  the demo ids are fixed, so the persisted transcript mirror ACCUMULATES across
+  runs — `simctl uninstall com.baybo.app` (wipes the data container) before a
+  clean single-turn check. `scripts/build-app.sh` pins products at
   `build/DerivedData/Build/Products/<config>-<sdk>/Baybo.app` for
   `simctl install`.
 - **Send path**: native mints the msgId, seeds the webview's optimistic bubble
@@ -303,6 +335,21 @@ Rules:
 - Re-verify after touching any of this: (a) logout → re-pair the same gateway →
   open an old session; (b) open an old (unpinned, outside top-10) session →
   back to list → re-enter; (c) kill the app → relaunch → open a session.
+- **The single reused webview (`TranscriptHost`) changes WHEN the transcript is
+  (re)mounted, never the hydration mechanisms.** Returning to the SAME session the
+  webview still holds reuses the LIVE React tree (rows persist in memory
+  independent of the mirror — a strict plus for cells C and E: no re-hydration,
+  and E survives even a mirror prune because the tree never unmounted). Opening a
+  DIFFERENT session remounts `<Transcript key={sessionId}>` from that session's
+  `restoredState`, then hydrates through the normal mechanisms exactly as a first
+  open — so every cell still converges. A jetsam of the shared webview silently
+  reloads → `ready` re-fires → re-hydrates the current session from its mirror
+  (existing jetsam path). Cell A (draft) is unchanged: the prewarmed draft mounts
+  an EMPTY tree and stays empty until first send. Cross-session safety rests on
+  `bridge.ts` clearing `buffer`/`blobPending`/`pendingPersist` on `init` and
+  `persist` writes being session-tagged — a change to either can leak or corrupt
+  across sessions, so re-verify (d): open A mid-stream → back → open B → back →
+  A shows A (not B), and B's mirror is not overwritten by A's late flush.
 
 ## Known gaps / follow-ups
 

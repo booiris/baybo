@@ -31,21 +31,31 @@ final class TranscriptBridge: NSObject, ObservableObject {
     init(store: ChatStore) {
         self.store = store
         super.init()
-        attach()
+        store.attachBridge(self)
     }
 
-    func attach() {
-        store?.attachBridge(self)
+    func retarget(to newStore: ChatStore) {
+        if store === newStore {
+            newStore.attachBridge(self)
+            return
+        }
+        if let old = store {
+            call("flushPersist", "")
+            old.detachBridge(self)
+        }
+        store = newStore
+        // Hiding here can pause WebKit rAF and strand the `shown` callback.
+        contentVisible = true
+        deliverInit()
+        newStore.attachBridge(self)
+        lastBottomInset = Int.min
+        pushBottomInset()
+        jumpVisible = false
     }
 
-    func detach() {
-        // Flush the web side's debounced transcript mirror before the webview
-        // can tear down. Frames delivered while attached go straight to the
-        // webview (never the native buffer), so any work steps rendered since
-        // the last debounce would otherwise be in neither the mirror nor the
-        // buffer — and a same-session re-entry has no reconnect to backfill them
-        // from the server, so they'd drop out of the work block. The pop
-        // animation keeps the webview alive long enough for this to land.
+    func detachCurrent(_ leaving: ChatStore) {
+        // SwiftUI can run the next screen's `onAppear` before this `onDisappear`.
+        guard store === leaving else { return }
         call("flushPersist", "")
         store?.detachBridge(self)
     }
@@ -156,7 +166,6 @@ final class TranscriptBridge: NSObject, ObservableObject {
         // the same source the native chrome renders from, so the two can't
         // diverge.
         let language = Lang.shared.code
-        // restoredState is already a JSON object string — splice it in raw.
         let payload = """
             {"language":\(jsonLiteral(language)),\
             "sessionId":\(jsonLiteral(store.sessionId)),\
@@ -248,20 +257,11 @@ extension TranscriptBridge: WKScriptMessageHandler {
             ready = true
             deliverInit()
             flushPending()
-            // Fresh page (first load or silent reload after a web-process
-            // kill): its inset var is at the 0px default — replay the inset
-            // past the dedup. Also the cold-launch delivery: the composer
-            // geometry usually fires before the webview joins a window, and
-            // by page-load time it has one.
+            // Fresh pages reset CSS vars, so replay inset past the dedup.
             lastBottomInset = Int.min
             pushBottomInset()
-            // Same fresh-page reasoning: the new page opens pinned to the
-            // newest edge, so a jetsam reload must not strand a stale button.
             jumpVisible = false
-            // A fresh page hasn't painted its transcript yet — re-hide the
-            // webview so it fades in on the next `shown` (covers a jetsam
-            // reload as well as the first load).
-            contentVisible = false
+            contentVisible = store?.listed == false
         case "shown":
             // The transcript painted its first frame — fade the webview in.
             contentVisible = true
@@ -269,7 +269,8 @@ extension TranscriptBridge: WKScriptMessageHandler {
             let ordinal = (body["lastOrdinal"] as? NSNumber)?.int64Value
             store?.ordinalAdvanced(ordinal)
         case "persist":
-            if let sessionId = store?.sessionId,
+            // Persist is async and may arrive after the bridge retargets.
+            if let sessionId = (body["sessionId"] as? String) ?? store?.sessionId,
                 let state = body["state"],
                 let data = try? JSONSerialization.data(withJSONObject: state),
                 let json = String(data: data, encoding: .utf8)

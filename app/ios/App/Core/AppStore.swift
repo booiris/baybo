@@ -69,6 +69,8 @@ final class AppStore: ObservableObject {
     /// conversations doesn't keep every store — and its buffer + timers —
     /// resident forever.
     static let maxResidentStores = 12
+    private var transcriptHost: TranscriptHost?
+    private var prewarmedDraftId: String?
 
     init() {
         AppStore.shared = self
@@ -90,6 +92,15 @@ final class AppStore: ObservableObject {
         if ProcessInfo.processInfo.arguments.contains("-baybo-open-chat") {
             route = .home
             chatPath = ["debug-session"]
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("-baybo-demo-switch") {
+            route = .home
+            chatPath = ["demo-a"]
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(5))
+                chatPath = ["demo-b"]
+            }
             return
         }
         // `-baybo-open-home` lands on the tabbed home shell (chat list + bottom
@@ -145,6 +156,7 @@ final class AppStore: ObservableObject {
             }
             route = .home
             consumePendingPushRoute()
+            prewarmTranscriptHost()
         }
     }
 
@@ -164,6 +176,9 @@ final class AppStore: ObservableObject {
         }
         for store in chatStores.values {
             store.scheduleReconnect()
+        }
+        if route == .home {
+            prewarmTranscriptHost()
         }
     }
 
@@ -299,6 +314,15 @@ final class AppStore: ObservableObject {
         chatStoreLRU.append(sessionId)
     }
 
+    func transcriptHost(for sessionId: String) -> TranscriptHost {
+        if let host = transcriptHost {
+            return host
+        }
+        let host = TranscriptHost(store: chatStore(for: sessionId))
+        transcriptHost = host
+        return host
+    }
+
     /// Open an existing session from the list.
     func openSession(_ sessionId: String) {
         Task {
@@ -306,12 +330,20 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// Compose: mint a local draft id and enter it. The durable gateway row is
+    /// Compose: mint or reuse a local draft id. The durable gateway row is
     /// created on first send, so abandoned drafts do not pollute the session list.
     func startNewChat() async -> String? {
-        let sessionId = newChatSessionId()
+        let sessionId = prewarmedDraftId ?? newChatSessionId()
+        prewarmedDraftId = nil
         await activateSession(sessionId, ensureListed: false)
         return nil
+    }
+
+    private func prewarmTranscriptHost() {
+        guard route == .home, transcriptHost == nil else { return }
+        let sessionId = newChatSessionId()
+        prewarmedDraftId = sessionId
+        _ = transcriptHost(for: sessionId)
     }
 
     /// A push-notification tap targeting `sessionId`: route straight into that
@@ -341,7 +373,7 @@ final class AppStore: ObservableObject {
         if ensureListed {
             SessionIndex.shared.touch(sessionId: sessionId)
         }
-        _ = chatStore(for: sessionId)
+        _ = transcriptHost(for: sessionId)
         // A conversation always belongs to the Chats section — backing out of it
         // must land on the list, whatever tab launched the compose/push.
         homeTab = .chats
@@ -366,8 +398,7 @@ final class AppStore: ObservableObject {
     }
 
     /// Drop every idle store regardless of the working-set cap — the
-    /// memory-warning response. Keeps only the pushed session and any store
-    /// still rendering on screen (an attached bridge).
+    /// memory-warning response. Keeps only the pushed session.
     func evictAllIdleStores() async {
         for sessionId in chatStoreLRU {
             guard let store = chatStores[sessionId], isEvictable(sessionId, store) else { continue }
@@ -375,10 +406,8 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// A store is safe to evict only when it is neither the pushed conversation
-    /// nor rendering on screen.
-    private func isEvictable(_ sessionId: String, _ store: ChatStore) -> Bool {
-        sessionId != chatPath.last && !store.hasBridge
+    private func isEvictable(_ sessionId: String, _: ChatStore) -> Bool {
+        sessionId != chatPath.last
     }
 
     private func evictStore(_ sessionId: String, _ store: ChatStore) async {
@@ -391,6 +420,9 @@ final class AppStore: ObservableObject {
         let stores = Array(chatStores.values)
         chatStores.removeAll()
         chatStoreLRU.removeAll()
+        transcriptHost?.teardown()
+        transcriptHost = nil
+        prewarmedDraftId = nil
         for store in stores {
             await store.disconnect()
         }

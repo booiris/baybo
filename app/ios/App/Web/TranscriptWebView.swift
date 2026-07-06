@@ -1,49 +1,17 @@
 import SwiftUI
 import WebKit
 
-/// The transcript WKWebView: renders the slim web bundle
-/// (`App/Resources/transcript/`, built from `web/`) and wires the bridge. The
-/// webview owns only the message thread — screens, header, and composer are
-/// SwiftUI, so the keyboard never attaches to web content (the entire point of
-/// this architecture). It renders full-bleed and its frame NEVER tracks the
-/// keyboard; the thread clears the overlaying chrome via the bridge-fed
-/// `--thread-top-inset` / `--thread-bottom-inset` instead (see ChatScreen).
 struct TranscriptWebView: UIViewRepresentable {
-    @ObservedObject var bridge: TranscriptBridge
+    let webView: WKWebView
 
     func makeUIView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.userContentController.add(bridge, name: TranscriptBridge.messageHandlerName)
-        // The bundle is served over a custom scheme, NOT file:// — Vite's
-        // module scripts fail CORS from a file origin (see the handler's doc).
-        config.setURLSchemeHandler(
-            TranscriptSchemeHandler(), forURLScheme: TranscriptSchemeHandler.scheme)
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.isOpaque = false
-        webView.backgroundColor = .white
-        webView.scrollView.backgroundColor = .white
-        // The bundle lays out its own insets (`--thread-top-inset` under the
-        // native header veil, `--thread-bottom-inset` under the composer);
-        // automatic adjustment would double them.
-        webView.scrollView.contentInsetAdjustmentBehavior = .never
-        // Dragging down over the thread lowers the keyboard (chat convention;
-        // the old web app's overflow scroll behaved the same way).
-        webView.scrollView.keyboardDismissMode = .interactive
-        #if DEBUG
-        webView.isInspectable = true
-        #endif
-        bridge.webView = webView
-
-        if let url = TranscriptSchemeHandler.indexURL {
-            webView.load(URLRequest(url: url))
-        }
+        webView.removeFromSuperview()
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {}
 
     static func dismantleUIView(_ webView: WKWebView, coordinator: ()) {
-        webView.configuration.userContentController
-            .removeScriptMessageHandler(forName: TranscriptBridge.messageHandlerName)
+        // Host-owned. Removing it here can race the next screen's reparenting.
     }
 }

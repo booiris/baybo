@@ -85,10 +85,6 @@ final class ChatStore: ObservableObject {
         lastOrdinal = Self.persistedOrdinal(sessionId: sessionId)
     }
 
-    /// Whether a webview bridge is attached — i.e. this store is rendering on
-    /// screen. LRU eviction skips these (`AppStore.evictIdleStores`).
-    var hasBridge: Bool { bridge != nil }
-
     // MARK: - Connection lifecycle
 
     func connectIfNeeded() {

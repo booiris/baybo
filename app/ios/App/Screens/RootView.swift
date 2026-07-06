@@ -29,10 +29,13 @@ struct RootView: View {
                     HomeTabView()
                         .toolbar(.hidden, for: .navigationBar)
                         .navigationDestination(for: String.self) { sessionId in
-                            ChatScreen(store: store.chatStore(for: sessionId))
-                                .id(sessionId)  // a new session gets a fresh webview
-                                .toolbar(.hidden, for: .navigationBar)
-                                .navigationBarBackButtonHidden(true)
+                            ChatScreen(
+                                host: store.transcriptHost(for: sessionId),
+                                store: store.chatStore(for: sessionId)
+                            )
+                            .id(sessionId)
+                            .toolbar(.hidden, for: .navigationBar)
+                            .navigationBarBackButtonHidden(true)
                         }
                 }
             }

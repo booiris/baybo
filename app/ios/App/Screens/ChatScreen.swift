@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 /// The chat screen: transcript webview filling the space, native header veil
 /// pinned over its top, native composer docked below. Because the composer is
@@ -7,12 +8,16 @@ import SwiftUI
 /// holds the newest edge through that resize.
 struct ChatScreen: View {
     @ObservedObject private var store: ChatStore
-    @StateObject private var bridge: TranscriptBridge
+    @ObservedObject private var bridge: TranscriptBridge
+    private let host: TranscriptHost
+    private let webView: WKWebView
     @Environment(\.dismiss) private var dismiss
 
-    init(store: ChatStore) {
+    init(host: TranscriptHost, store: ChatStore) {
         _store = ObservedObject(wrappedValue: store)
-        _bridge = StateObject(wrappedValue: TranscriptBridge(store: store))
+        _bridge = ObservedObject(wrappedValue: host.bridge)
+        self.host = host
+        webView = host.webView
     }
 
     var body: some View {
@@ -24,14 +29,12 @@ struct ChatScreen: View {
             // fixed; the thread instead pads its bottom by the measured
             // composer/keyboard obstruction fed over the bridge, and animates
             // that padding web-side so content slides with the keyboard.
-            TranscriptWebView(bridge: bridge)
+            TranscriptWebView(webView: webView)
                 .ignoresSafeArea(.all, edges: [.top, .bottom])
                 // Fade the transcript in once it has painted (bridge `shown`),
                 // rather than popping the content in as the screen slides on.
-                // Opacity 0 shows the paper background behind it, seamless with
-                // the slide-in; the content emerges as it settles.
                 .opacity(bridge.contentVisible ? 1 : 0)
-                .animation(.easeOut(duration: 0.3), value: bridge.contentVisible)
+                .animation(.easeOut(duration: 0.15), value: bridge.contentVisible)
 
             ChatHeaderView(connState: store.connState) {
                 dismiss()
@@ -73,17 +76,18 @@ struct ChatScreen: View {
         }
         .background(Theme.paper)
         .onAppear {
-            bridge.attach()
+            host.bridge.retarget(to: store)
             store.connectIfNeeded()
             SessionIndex.shared.enterSession(store.sessionId)
             #if DEBUG
                 store.startDemoFramesIfRequested()
+                store.startDemoSwitchIfRequested()
                 bridge.startDemoJumpIfRequested()
                 startDemoBackIfRequested()
             #endif
         }
         .onDisappear {
-            bridge.detach()
+            host.bridge.detachCurrent(store)
             SessionIndex.shared.leaveSession(store.sessionId)
         }
     }

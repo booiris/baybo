@@ -9,6 +9,7 @@
     /// harmless.
     extension ChatStore {
         private static let demoFramesArg = "-baybo-demo-frames"
+        @MainActor private static var demoSwitchSeeded = Set<String>()
 
         func startDemoFramesIfRequested() {
             guard ProcessInfo.processInfo.arguments.contains(Self.demoFramesArg) else { return }
@@ -71,6 +72,31 @@
                 pushDemo([
                     "kind": "message", "role": "assistant", "content": answer,
                     "platform_msg_id": "demo-a-1", "ordinal": 1,
+                ])
+                pushDemo(["kind": "turn_state", "active": false])
+            }
+        }
+
+        func startDemoSwitchIfRequested() {
+            guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-switch") else { return }
+            guard Self.demoSwitchSeeded.insert(sessionId).inserted else { return }
+            let tag = sessionId.uppercased()
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(350))
+                pushDemoUserSent(
+                    msgId: "u-\(sessionId)",
+                    text: "Conversation \(tag): only \(tag) content belongs in this thread.")
+                pushDemo(["kind": "turn_state", "active": true])
+                try? await Task.sleep(for: .milliseconds(250))
+                let answer =
+                    "Reply for **\(tag)**. Seeing \(tag) alone (no other session's text) proves the reused webview kept sessions isolated across the retarget."
+                for chunk in Self.chunked(answer, size: 12) {
+                    pushDemo(["kind": "answer_delta", "text": chunk])
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                pushDemo([
+                    "kind": "message", "role": "assistant", "content": answer,
+                    "platform_msg_id": "m-\(sessionId)", "ordinal": 1,
                 ])
                 pushDemo(["kind": "turn_state", "active": false])
             }

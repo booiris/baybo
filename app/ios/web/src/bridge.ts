@@ -133,22 +133,25 @@ export function retrySend(payload: UserSentPayload): void {
 const PERSIST_DEBOUNCE_MS = 500;
 
 let persistTimer: ReturnType<typeof setTimeout> | undefined;
-let pendingPersist: PersistedState | null = null;
+// A delayed flush must write to the session that produced it, not the current one.
+let pendingPersist: { sessionId: string; state: PersistedState } | null = null;
 
 function flushPersist(): void {
   clearTimeout(persistTimer);
   persistTimer = undefined;
   if (pendingPersist === null) return;
-  const state = pendingPersist;
+  const { sessionId, state } = pendingPersist;
   pendingPersist = null;
-  postSafe({ type: "persist", state });
+  postSafe({ type: "persist", sessionId, state });
 }
 
 /// Replaces the old localStorage saveChatState: debounced so a catch-up burst
 /// collapses into one write; native owns the durable copy. localStorage is not
 /// used at all (file:// storage is unreliable, and native restores via init).
 export function persistState(state: PersistedState): void {
-  pendingPersist = state;
+  const sessionId = initPayload?.sessionId;
+  if (sessionId === undefined) return;
+  pendingPersist = { sessionId, state };
   clearTimeout(persistTimer);
   persistTimer = setTimeout(flushPersist, PERSIST_DEBOUNCE_MS);
 }
@@ -278,6 +281,12 @@ function dispatch(item: Buffered): void {
 
 window.baybo = {
   init(payload) {
+    // Native flushes the old mirror before retargeting; do not post stale state here.
+    buffer.length = 0;
+    blobPending.clear();
+    clearTimeout(persistTimer);
+    persistTimer = undefined;
+    pendingPersist = null;
     connEpoch = payload.connEpoch;
     initPayload = payload;
     onInitCb?.(payload);

@@ -41,7 +41,7 @@ const COMPONENTS: Components = {
 /// The assistant-prose renderer. Memoized: during a stream the parent
 /// re-renders per animation frame, and without this every finalized message in
 /// the log would re-parse its markdown on each tick.
-export const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
+const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
   return (
     <div className="md">
       <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={COMPONENTS}>
@@ -50,3 +50,5 @@ export const MarkdownBody = memo(function MarkdownBody({ text }: { text: string 
     </div>
   );
 });
+
+export default MarkdownBody;
