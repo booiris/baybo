@@ -177,8 +177,21 @@ button {
 }
 .send-failed:active { opacity: 0.6; }
 .bubble.assistant { align-self: flex-start; background: var(--color-paper); color: var(--color-ink); }
-.bubble.assistant.muted { color: var(--color-ink-soft); }
 .bubble.notice { align-self: center; background: none; border: 0; color: var(--color-ink-soft); font-size: 0.8rem; }
+/* Older-page paging: a small monochrome ring centered at the top of the log
+   while the fetch is in flight — the send/work-spinner idiom, not a stray
+   assistant bubble with a static ellipsis. */
+.older-spinner {
+  align-self: center;
+  width: 0.9rem;
+  height: 0.9rem;
+  margin: 0.15rem 0;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-ink-soft);
+  border-top-color: transparent;
+  animation: send-spin 0.7s linear infinite;
+  pointer-events: none;
+}
 
 /* Assistant replies: NO bubble — full-thread-width markdown prose (the web
    chat's reading band), Inter for the long read. */

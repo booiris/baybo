@@ -26,7 +26,11 @@ onInit((payload) => {
     .then(() => {
       ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
         <React.StrictMode>
-          <Transcript restored={payload.restoredState} initialConnEpoch={payload.connEpoch} />
+          <Transcript
+            restored={payload.restoredState}
+            listed={payload.listed}
+            initialConnEpoch={payload.connEpoch}
+          />
         </React.StrictMode>,
       );
       // Two frames after the first render commits the transcript has painted —
@@ -41,5 +45,11 @@ postReady();
 // Dev browser (pnpm dev, no WKWebView): native never replies to ready, so
 // synthesize an empty init to render the bare transcript.
 if (!hasNativeBridge) {
-  window.baybo.init({ language: "en", sessionId: "dev", restoredState: null, connEpoch: 0 });
+  window.baybo.init({
+    language: "en",
+    sessionId: "dev",
+    restoredState: null,
+    listed: false,
+    connEpoch: 0,
+  });
 }

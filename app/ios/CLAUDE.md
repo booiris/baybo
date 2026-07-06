@@ -257,6 +257,53 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   native taps call `jumpToLatest` back; the composer-top geometry is measured
   on the ComposerView alone so the button never inflates the web inset.
 
+## Transcript hydration matrix (read BEFORE touching hydration/lifecycle)
+
+**Invariant: an opened LISTED session must converge to rendering its recent
+transcript from EVERY cell below, on BOTH legs (identical here — same web
+bundle, same `GatewayJsonClient` history endpoint). A compose DRAFT stays empty
+until its first send.** This invariant is emergent — no single mechanism covers
+all cells, which is exactly how the blank-transcript bug family happened
+(logout wipes mirrors; list prune deletes them; a resident store fires no
+reconnect). Any change touching mirrors, prune, store eviction, conn epochs,
+subscribe cursors, or backfill MUST state which cells it affects and re-verify
+the flows at the bottom.
+
+Mechanisms: (1) **mirror restore** — `deliverInit` hands the `TranscriptStore`
+blob to the page as `restoredState`; (2) **Subscribe replay** — the gateway
+replays persisted rows ONLY when `since_ordinal` is `Some`
+(`crates/gateway/src/channel/route.rs`); a mirror-less open subscribes with
+`None` and gets NOTHING; (3) **REST catch-up** — native `fetchCatchUp`, only
+when a persisted cursor exists; (4) **initial backfill** —
+`ensureBackfilled()` in `web/src/Transcript.tsx`, the SINGLE OWNER of the
+"pull the newest page" decision; (5) **Reset recovery / scroll-up paging** —
+the shared `requestHistory` machinery.
+
+| cell | state on open | what hydrates |
+|---|---|---|
+| A | draft (compose), any | nothing until first send (by design) |
+| B | listed, mirror has rows, fresh store | mirror paints; connect(sinceOrdinal) + catch-up fill the gap |
+| C | listed, mirror has rows, resident store | mirror paints; buffered frames flush on attach |
+| D | listed, NO mirror, fresh store (logout→re-pair; session created on another client; relaunch after prune) | backfill on the connect edge (`handleConnEpoch`) |
+| E | listed, NO mirror, resident CONNECTED store (open → back to list → prune → re-enter) | backfill on mount (no epoch edge will ever come) |
+| F | listed, mirror exists but ZERO rows (an earlier failed backfill's empty persist) | backfill — the decision keys on RENDERED ROWS, not mirror existence |
+| G | offscreen frame buffer overflowed | `needsHistoryReset` → catch-up refetch on attach (independent of backfill) |
+
+Rules:
+
+- The backfill decision lives in ONE function (`ensureBackfilled`). Its ground
+  truth is rendered rows (`messages.length`), NOT mirror existence — a mirror
+  can exist with zero rows (cell F), and only the web side knows what actually
+  rendered. Never add a second decision site; when a new timing gap appears,
+  add a CALL (clock edge) to the same function.
+- Mirror prune keeps the top-`maxMirroredTranscripts` sessions by `lastActive`,
+  and OPENING a session does not bump `lastActive` (visits ≠ activity) — so
+  viewing an old session and returning to the list deletes its just-written
+  mirror. Cell E is a NORMAL path, not an edge case.
+- Re-verify after touching any of this: (a) logout → re-pair the same gateway →
+  open an old session; (b) open an old (unpinned, outside top-10) session →
+  back to list → re-enter; (c) kill the app → relaunch → open a session.
+
 ## Known gaps / follow-ups
 
 - ~~Native chrome uses SF Mono~~ — Space Mono is bundled

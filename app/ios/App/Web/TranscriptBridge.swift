@@ -161,6 +161,7 @@ final class TranscriptBridge: NSObject, ObservableObject {
             {"language":\(jsonLiteral(language)),\
             "sessionId":\(jsonLiteral(store.sessionId)),\
             "restoredState":\(restored ?? "null"),\
+            "listed":\(store.listed),\
             "connEpoch":\(store.connEpoch)}
             """
         call("init", payload)

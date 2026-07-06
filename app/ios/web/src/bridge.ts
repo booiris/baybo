@@ -9,6 +9,10 @@ export type InitPayload = {
   language: string;
   sessionId: string;
   restoredState: PersistedState | null;
+  /// True when the session already existed in the registry (opened from the list
+  /// or a push), false for a fresh compose draft. A listed session that mounts
+  /// with an empty transcript pulls its history from the gateway once connected.
+  listed: boolean;
   connEpoch: number;
 };
 

@@ -32,6 +32,13 @@ final class ChatStore: ObservableObject {
     static let maxBufferedFrames = 2000
 
     let sessionId: String
+    /// Whether this session already existed in the registry when opened — an
+    /// existing conversation (tapped from the list or a push), as opposed to a
+    /// fresh compose draft. Handed to the web transcript so a listed session with
+    /// no local mirror pulls its history straight from the gateway: a cold
+    /// Subscribe (`since_ordinal` nil) replays nothing, so without this the
+    /// transcript would sit blank. A draft stays empty until its first send.
+    let listed: Bool
     @Published private(set) var connState: ConnState
     /// Transient composer notice (send failed / waiting for upload / too large).
     @Published var notice: String?
@@ -72,6 +79,7 @@ final class ChatStore: ObservableObject {
     init(sessionId: String) {
         self.sessionId = sessionId
         let listed = SessionIndex.shared.contains(sessionId: sessionId)
+        self.listed = listed
         connState = listed ? .connecting : .draft
         remoteSessionEnsured = false
         lastOrdinal = Self.persistedOrdinal(sessionId: sessionId)

@@ -285,9 +285,11 @@ const MessageRow = memo(function MessageRow({
 /// the scroll/follow model.
 export function Transcript({
   restored,
+  listed,
   initialConnEpoch,
 }: {
   restored: PersistedState | null;
+  listed: boolean;
   initialConnEpoch: number;
 }) {
   const { t } = useTranslation();
@@ -709,6 +711,36 @@ export function Transcript({
     }
   }, [hasMoreOlder, requestHistory, appendNotice]);
 
+  // The single owner of the initial-backfill decision (hydration matrix:
+  // app/ios/CLAUDE.md). A LISTED session rendering zero rows on a live leg
+  // pulls its newest history page — nothing else fills that void: a mirror-less
+  // open subscribes with `since_ordinal` None, which the gateway replays
+  // nothing for (route.rs). Ground truth is RENDERED ROWS, not mirror
+  // existence — a mirror can exist with zero rows (an earlier failed backfill's
+  // empty persist), and only this side knows what rendered. Callers are the
+  // clock edges where "listed + empty + connected" can newly hold; add a new
+  // edge as another CALL, never as a second decision site. Safe to re-call:
+  // `requestHistory` dedups in-flight, a landed page makes `messages`
+  // non-empty, and a draft (listed=false) never fires.
+  const ensureBackfilled = () => {
+    if (!listed || messages.length > 0) return;
+    if (connEpochRef.current === 0) return; // leg not live yet — the connect edge re-calls
+    try {
+      requestHistory("reset", null);
+    } catch (e) {
+      log("warn", `initial history load failed: ${String(e)}`);
+    }
+  };
+
+  // Clock edge: resident re-entry (matrix cell E). The store stays cached and
+  // CONNECTED across back-out → re-enter, so no `connEpoch` edge will come —
+  // and the list visit in between pruned this session's mirror if it fell
+  // outside the most-recently-active set (opening doesn't bump `lastActive`).
+  // On a fresh store this no-ops (epoch still 0); the connect edge takes over.
+  useEffect(() => {
+    ensureBackfilled();
+  }, []);
+
   const setNewestOrdinal = (value: number | null) => {
     lastOrdinal.current = value;
     postOrdinal(value);
@@ -1068,6 +1100,11 @@ export function Transcript({
     pagingRef.current = false;
     setLoadingOlder(false);
     setConnEpoch(epoch);
+    // Clock edge: the leg (re)connected (matrix cell D — first connect of a
+    // fresh store — plus the re-fire after an epoch bump abandoned an earlier
+    // attempt, relayHistory cleared just above). Fired after the ref update so
+    // the request's epoch tag matches when its `history_page` lands.
+    ensureBackfilled();
   };
 
   // The document (main frame) is the scroller, so follow/jump/paging state is
@@ -1166,7 +1203,7 @@ export function Transcript({
   return (
     <>
       <div className="chat-log" ref={logRef}>
-        {loadingOlder && <div className="bubble assistant muted">…</div>}
+        {loadingOlder && <div className="older-spinner" aria-hidden="true" />}
         {hasMoreOlder && !loadingOlder && (
           // Affordance for short threads that don't scroll (the onScroll path
           // covers the rest). Tapping pages the next older slice.
