@@ -1,6 +1,6 @@
 //! User-managed agent profiles ("multi agents"): DB-backed chat personas
-//! bundling a display identity, system prompt, skill/tool allow-lists, an
-//! execution framework, and an optional LLM pin.
+//! bundling a display identity, system prompt, an execution framework, and
+//! an optional LLM pin.
 //!
 //! This module carries only the value types shared across layers; the row
 //! shape and store port live in `baybo-store`, the libsql impl in

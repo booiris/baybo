@@ -55,6 +55,10 @@ fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
 /// Map a libsql write error to [`StorageError::Conflict`] when it tripped
 /// the case-insensitive `UNIQUE` on `agent_profiles.name`, else a generic
 /// internal error. Same message-sniff as the device store.
+///
+/// The sniff assumes a constraint trip is the name `UNIQUE`: the only other
+/// constraint on the table is `PRIMARY KEY(id)`, and ids are freshly-minted
+/// ULIDs, so a PK collision is astronomically unlikely.
 fn name_conflict_err(ctx: &str, name: &str, e: impl std::fmt::Display) -> StorageError {
     let msg = e.to_string();
     if msg.contains("constraint") || msg.contains("UNIQUE") {

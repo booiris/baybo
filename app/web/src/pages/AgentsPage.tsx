@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   RiAddLine,
   RiDeleteBinLine,
@@ -123,15 +123,25 @@ export function AgentsPage() {
     };
   }, [client, logout, refreshKey, isMock]);
 
-  // Keep the selection honest against the loaded list: default to the
-  // first agent (the builtin sorts first), and recover when the selected
-  // row disappears (deleted elsewhere).
+  // Holds a just-created agent id whose row hasn't landed in `agents` yet,
+  // so the selection-honesty effect below doesn't yank the detail pane back
+  // to the builtin during the post-create refresh.
+  const pendingSelectRef = useRef<string | null>(null);
+
+  // Keep the selection honest against the loaded list: default to the first
+  // agent (the builtin sorts first), and recover when the selected row
+  // disappears (deleted elsewhere).
   useEffect(() => {
     if (selected === 'new') return;
     if (agents.length === 0) return;
-    if (selected === null || !agents.some((a) => a.id === selected)) {
-      setSelected(agents[0].id);
+    if (selected !== null && agents.some((a) => a.id === selected)) {
+      pendingSelectRef.current = null; // selection resolved to a real row
+      return;
     }
+    // `selected` is null or not (yet) in the list. If it's a just-created id
+    // still in flight, wait for the refresh instead of resetting.
+    if (selected !== null && selected === pendingSelectRef.current) return;
+    setSelected(agents[0].id);
   }, [agents, selected]);
 
   const refresh = useCallback(() => setRefreshKey((k) => k + 1), []);
@@ -236,7 +246,10 @@ export function AgentsPage() {
             registeredSkills={registeredSkills}
             llmNames={llmNames}
             onSaved={(createdId) => {
-              if (createdId) setSelected(createdId);
+              if (createdId) {
+                pendingSelectRef.current = createdId;
+                setSelected(createdId);
+              }
               refresh();
             }}
           />
