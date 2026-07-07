@@ -414,10 +414,13 @@ button {
 }
 .load-older:active { opacity: 0.7; transform: scale(0.98); }
 
-/* Image attachments rendered inside a chat bubble. */
+/* Image attachments rendered inside a chat bubble. `flex-start` so a shorter
+   image sharing a wrap-row with a taller one keeps its own height instead of
+   stretching to match (which would pad it with whitespace). */
 .attachments {
   display: flex;
   flex-wrap: wrap;
+  align-items: flex-start;
   gap: 0.4rem;
   margin-bottom: 0.35rem;
 }
@@ -428,17 +431,43 @@ button {
   border-radius: var(--radius);
   object-fit: contain;
 }
-.attachment-loading { font-size: 0.85rem; color: inherit; opacity: 0.85; }
+/* An image not yet scrolled near the viewport is a reserved box, not a fetched
+   blob (see AttachmentImage) — a history page full of images then costs nothing
+   until each row approaches the screen, instead of every blob crossing the
+   bridge at once and stalling the transcript. The loading frame and the retry
+   tile share that box, so nothing resizes as those states swap; the frame
+   releases to the image's natural size only once it decodes. */
+.attachment-placeholder,
+.attachment-frame:not(.loaded),
 .attachment-retry {
-  flex: 0 0 auto;
-  padding: 0.4rem 0.8rem;
-  font-size: 0.85rem;
-  font-weight: 400;
-  letter-spacing: 0;
-  color: var(--color-ink);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 12rem;
+  max-width: 100%;
+  height: 12rem;
   background: var(--color-surface);
   border: 1px solid var(--color-line);
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+/* The reserved box holds the monochrome ring spinner (the send/older-spinner
+   idiom) until the image decodes; the decoding image is invisible underneath. */
+.attachment-spinner {
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-ink-soft);
+  border-top-color: transparent;
+  animation: send-spin 0.7s linear infinite;
+  pointer-events: none;
+}
+.attachment-frame:not(.loaded) .attachment-img { opacity: 0; }
+/* A failed fetch keeps the same tile, centering only the ↻ retry glyph (tap to
+   refetch) — no text label. */
+.attachment-retry {
+  font-size: 1.6rem;
+  color: var(--color-ink-soft);
 }
 .attachment-retry:active { opacity: 0.7; transform: none; }
 .attachment-file {

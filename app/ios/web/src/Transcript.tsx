@@ -130,6 +130,12 @@ const FOLLOW_BOTTOM_THRESHOLD_PX = 96;
 /// follow/button state again instead of staying pinned by the in-flight flag.
 const GLIDE_SETTLE_CAP_MS = 1200;
 
+/// How far outside the viewport (px, top + bottom) an image attachment begins
+/// loading its blob — a preload band so an image is usually ready by the time it
+/// scrolls in, while a back-history page's off-screen images stay unfetched. See
+/// AttachmentImage.
+const LAZY_IMAGE_ROOT_MARGIN = "400px 0px";
+
 /// The transcript scrolls the WKWebView's MAIN FRAME (the document), not an
 /// inner `overflow:auto` div. A nested overflow scroller inside WKWebView owns
 /// an async scroll node that stays asleep until the first touch — a cold-start
@@ -189,11 +195,19 @@ function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
   return out;
 }
 
-/// One image attachment in a bubble: downloads the blob via the bridge (cached
-/// on device), wraps it in an object URL, shows a spinner while loading and a
-/// tap-to-retry on failure. The old in-session previewUrl short-circuit is
-/// gone — native previews don't cross the bridge, so a just-sent image renders
-/// by fetching its own bytes back over requestBlob (device-cached, so fast).
+/// One image attachment in a bubble: lazily downloads the blob via the bridge
+/// (cached on device) once its row scrolls near the viewport, wraps it in an
+/// object URL, shows a spinner while loading and a tap-to-retry on failure. The
+/// lazy gate is load-bearing for history: a back-page can carry dozens of
+/// images, and fetching every blob on mount floods the bridge — each image
+/// crosses as a large base64 string plus a main-thread `atob` decode
+/// (bridge.ts) — which stalls the whole transcript until they all settle (the
+/// whole page fails to appear while paging history). An IntersectionObserver
+/// defers each fetch to when its row actually approaches the screen, so
+/// off-screen history images cost nothing until scrolled to. The old in-session
+/// previewUrl short-circuit is gone — native previews don't cross the bridge, so
+/// a just-sent image renders by fetching its own bytes back over requestBlob
+/// (device-cached, so fast).
 function AttachmentImage({
   attachment,
   connEpoch,
@@ -202,19 +216,56 @@ function AttachmentImage({
   connEpoch: number;
 }) {
   const { t } = useTranslation();
+  // Load-once gate — flips true when the placeholder nears the viewport and
+  // never falls back, so scrolling past a loaded image doesn't refetch it.
+  const [visible, setVisible] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  // True once the fetched image has actually decoded — the frame reserves a box
+  // and holds the spinner until then, so the swap to the natural size happens in
+  // one step (no 0-height flash mid-decode).
+  const [loaded, setLoaded] = useState(false);
   const [attempt, setAttempt] = useState(0);
   // Mirrors `failed` for the connEpoch retry effect to read without taking
   // `failed` as a dep (which would refetch in a tight loop the instant a fetch
   // fails).
   const failedRef = useRef(false);
+  // The reserved placeholder box the observer watches until the row nears the
+  // viewport.
+  const holderRef = useRef<HTMLDivElement | null>(null);
+
+  // Arm the lazy gate: observe the placeholder and load once it enters the
+  // preload band. Disconnects on the first intersection. Without
+  // IntersectionObserver (not expected on WKWebView; a dev-browser guard) load
+  // eagerly rather than never showing the image.
+  useEffect(() => {
+    if (visible) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setVisible(true);
+      return;
+    }
+    const el = holderRef.current;
+    if (!el) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisible(true);
+          io.disconnect();
+        }
+      },
+      { rootMargin: LAZY_IMAGE_ROOT_MARGIN },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [visible]);
 
   useEffect(() => {
+    if (!visible) return;
     let owned: string | null = null;
     let cancelled = false;
     failedRef.current = false;
     setFailed(false);
+    setLoaded(false);
     setUrl(null);
     blobObjectUrl(attachment.blob_id, attachment.mime_type)
       .then((u) => {
@@ -235,24 +286,54 @@ function AttachmentImage({
       cancelled = true;
       if (owned) URL.revokeObjectURL(owned);
     };
-  }, [attachment.blob_id, attachment.mime_type, attempt]);
+  }, [attachment.blob_id, attachment.mime_type, attempt, visible]);
 
   // A restored image can race ahead of its leg going live, so an early fetch
   // fails before native has a live session. Retry the moment a (re)connect
-  // lands instead of stranding it on tap-to-load.
+  // lands instead of stranding it on tap-to-load. Only bites once visible (an
+  // unfetched off-screen image has no failure to retry).
   useEffect(() => {
     if (failedRef.current) setAttempt((a) => a + 1);
   }, [connEpoch]);
 
+  if (!visible) {
+    return <div ref={holderRef} className="attachment-placeholder" aria-hidden="true" />;
+  }
   if (failed) {
     return (
-      <button className="attachment-retry" onClick={() => setAttempt((a) => a + 1)}>
-        ↻ {t("chat.tapToLoad")}
+      <button
+        className="attachment-retry"
+        onClick={() => setAttempt((a) => a + 1)}
+        aria-label={t("chat.tapToLoad")}
+      >
+        ↻
       </button>
     );
   }
-  if (!url) return <div className="attachment-loading">{t("chat.loadingImage")}</div>;
-  return <img className="attachment-img" src={url} alt={attachment.filename ?? t("chat.imageAlt")} />;
+  // Reserved box → spinner while the blob is fetched and the image decodes
+  // underneath (invisible until `loaded`), then the box releases to the image's
+  // natural size in one step — no 0-height flash between the loading box and the
+  // painted image. That release is a small, bounded height change; WKWebView has
+  // no scroll anchoring to absorb it if it lands above the fold while reading
+  // history, an accepted tradeoff of not knowing image dimensions up front.
+  return (
+    <div
+      className={`attachment-frame${loaded ? " loaded" : ""}`}
+      aria-label={loaded ? undefined : t("chat.loadingImage")}
+    >
+      {!loaded && <span className="attachment-spinner" aria-hidden="true" />}
+      {url && (
+        <img
+          className="attachment-img"
+          src={url}
+          alt={attachment.filename ?? t("chat.imageAlt")}
+          decoding="async"
+          onLoad={() => setLoaded(true)}
+          onError={() => setFailed(true)}
+        />
+      )}
+    </div>
+  );
 }
 
 function AttachmentList({
