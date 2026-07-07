@@ -315,8 +315,13 @@ button {
 }
 
 /* The turn's work block (thinking trace + tool progress). Active: a soft card
-   with a spinner header; closed: a dim tappable "Worked Xs ›" summary. */
-.work { width: 100%; font-family: var(--font-mono); }
+   with a spinner header; closed: a dim tappable "Worked Xs ›" summary.
+   `overflow-wrap: anywhere` (inherited by every step — reasoning markdown, tool
+   label/summary, status text) breaks a long unbroken token (a path, URL, id) so
+   a wide work step wraps instead of overflowing the viewport and scrolling the
+   whole document sideways. `<pre>` is exempt (white-space: pre) and keeps its
+   own overflow-x scroll. */
+.work { width: 100%; font-family: var(--font-mono); overflow-wrap: anywhere; }
 .work.active {
   display: flex;
   flex-direction: column;
@@ -414,16 +419,23 @@ button {
 }
 .load-older:active { opacity: 0.7; transform: scale(0.98); }
 
-/* Image attachments rendered inside a chat bubble. `flex-start` so a shorter
-   image sharing a wrap-row with a taller one keeps its own height instead of
-   stretching to match (which would pad it with whitespace). */
-.attachments {
+/* A message renders as a GROUP of stacked bubbles — each attachment on its own
+   bubble, the text on its own, never merged — grouped so they still read as one
+   message: a tight intra-message gap (the wider --chat-row-gap stays between
+   messages), aligned as a unit (right for the user, left for the agent). */
+.msg-group {
   display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 0.4rem;
-  margin-bottom: 0.35rem;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 0;
 }
+.msg-group.user { align-items: flex-end; }
+.msg-group.assistant { align-items: flex-start; }
+/* Each attachment stands on its own bubble: the image tile / file chip alone,
+   no text-bubble background. */
+.attachment-bubble { max-width: 100%; min-width: 0; }
+.attachment-bubble.sending,
+.attachment-bubble.failed { position: relative; }
 .attachment-img {
   display: block;
   max-width: 100%;
@@ -476,4 +488,5 @@ button {
   background: var(--color-surface);
   border: 1px solid var(--color-line);
   border-radius: var(--radius);
+  overflow-wrap: anywhere;
 }

@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import {
   blobObjectUrl,
@@ -336,32 +336,38 @@ function AttachmentImage({
   );
 }
 
-function AttachmentList({
-  attachments,
+/// One attachment on its OWN bubble — a lazy-loaded image tile or a named file
+/// chip, never sharing the text bubble. `children` carries the send-state chrome
+/// when this is a user message's last bubble (an image-only send).
+function AttachmentBubble({
+  attachment,
   connEpoch,
+  className,
+  children,
 }: {
-  attachments: WireAttachment[];
+  attachment: WireAttachment;
   connEpoch: number;
+  className?: string;
+  children?: ReactNode;
 }) {
   return (
-    <div className="attachments">
-      {attachments.map((a, i) =>
-        a.kind === "image" ? (
-          <AttachmentImage key={`${a.blob_id}-${i}`} attachment={a} connEpoch={connEpoch} />
-        ) : (
-          <div key={`${a.blob_id}-${i}`} className="attachment-file">
-            📎 {a.filename ?? a.mime_type}
-          </div>
-        ),
+    <div className={`attachment-bubble${className ? ` ${className}` : ""}`}>
+      {attachment.kind === "image" ? (
+        <AttachmentImage attachment={attachment} connEpoch={connEpoch} />
+      ) : (
+        <div className="attachment-file">📎 {attachment.filename ?? attachment.mime_type}</div>
       )}
+      {children}
     </div>
   );
 }
 
-/// One finalized transcript row. User messages and notices keep their bubbles;
-/// assistant replies render bubble-less at full thread width as markdown (the
-/// web chat's reading-band layout). Memoized so streaming ticks don't re-parse
-/// every settled message's markdown.
+/// One finalized transcript row, rendered as a GROUP of stacked bubbles: each
+/// image / file attachment is its OWN bubble, separate from the text bubble —
+/// never merged into one. User attachments + text stack right-aligned; assistant
+/// attachments stack left with the reply prose below. Notices keep their single
+/// centered bubble. Memoized so streaming ticks don't re-parse every settled
+/// message's markdown.
 const MessageRow = memo(function MessageRow({
   m,
   connEpoch,
@@ -372,27 +378,62 @@ const MessageRow = memo(function MessageRow({
   onRetry: (m: ChatMsg) => void;
 }) {
   const { t } = useTranslation();
+
+  if (m.role === "notice") {
+    return <div className="bubble notice">{m.content}</div>;
+  }
+
+  const attachments = m.attachments ?? [];
+
   if (m.role === "assistant") {
     return (
-      <div className="msg assistant">
-        {m.attachments && m.attachments.length > 0 && (
-          <AttachmentList attachments={m.attachments} connEpoch={connEpoch} />
+      <div className="msg-group assistant">
+        {attachments.map((a, i) => (
+          <AttachmentBubble key={`${a.blob_id}-${i}`} attachment={a} connEpoch={connEpoch} />
+        ))}
+        {m.content && (
+          <div className="msg assistant">
+            <MarkdownBody text={m.content} />
+          </div>
         )}
-        {m.content && <MarkdownBody text={m.content} />}
       </div>
     );
   }
+
+  // A user send: the send indicator (spinner / retry dot) rides the message's
+  // LAST bubble — the text bubble, or the last attachment bubble when the send
+  // carries no text.
+  const sendClass = m.sendState ? ` ${m.sendState}` : "";
+  const sendChrome =
+    m.sendState === "sending" ? (
+      <span className="send-spinner" aria-hidden="true" />
+    ) : m.sendState === "failed" ? (
+      <button className="send-failed" onClick={() => onRetry(m)} aria-label={t("chat.retrySend")}>
+        <span aria-hidden="true">!</span>
+      </button>
+    ) : null;
+  const hasText = m.content.length > 0;
+
   return (
-    <div className={`bubble ${m.role}${m.sendState ? ` ${m.sendState}` : ""}`}>
-      {m.attachments && m.attachments.length > 0 && (
-        <AttachmentList attachments={m.attachments} connEpoch={connEpoch} />
-      )}
-      {m.content}
-      {m.sendState === "sending" && <span className="send-spinner" aria-hidden="true" />}
-      {m.sendState === "failed" && (
-        <button className="send-failed" onClick={() => onRetry(m)} aria-label={t("chat.retrySend")}>
-          <span aria-hidden="true">!</span>
-        </button>
+    <div className="msg-group user">
+      {attachments.map((a, i) => {
+        const carriesSend = !hasText && i === attachments.length - 1;
+        return (
+          <AttachmentBubble
+            key={`${a.blob_id}-${i}`}
+            attachment={a}
+            connEpoch={connEpoch}
+            className={carriesSend && m.sendState ? m.sendState : undefined}
+          >
+            {carriesSend ? sendChrome : null}
+          </AttachmentBubble>
+        );
+      })}
+      {hasText && (
+        <div className={`bubble user${sendClass}`}>
+          {m.content}
+          {sendChrome}
+        </div>
       )}
     </div>
   );
