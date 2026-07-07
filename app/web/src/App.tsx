@@ -9,6 +9,7 @@ import { TraceSessionPage } from './pages/TraceSessionPage';
 import { CronPage } from './pages/CronPage';
 import { JobsPage } from './pages/JobsPage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
+import { AgentsPage } from './pages/AgentsPage';
 import { LlmPage } from './pages/LlmPage';
 import { ChatPage } from './pages/ChatPage';
 import { useAuth } from './api/auth';
@@ -78,6 +79,7 @@ export default function App() {
           <Route path="/cron" element={<CronPage />} />
           <Route path="/jobs" element={<JobsPage />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
+          <Route path="/agents" element={<AgentsPage />} />
           <Route path="/llm" element={<LlmPage />} />
           <Route path="*" element={<Navigate to="/chat" replace />} />
         </Routes>

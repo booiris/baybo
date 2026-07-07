@@ -8,9 +8,9 @@ pub mod test_support;
 // their row/DTO types live in the `baybo-store` ports crate; consumers
 // import them from `baybo_store` directly, not via this adapter.
 use baybo_store::{
-    BlobStore, ChannelBotStore, ChannelPairingStore, ChannelSessionStore, CostStore, CronStore,
-    DeviceStore, JobStore, SecretStore, SessionFolderStore, SessionStore, SessionSummaryStore,
-    SkillRiskStore, TaskStore, TraceStore,
+    AgentProfileStore, BlobStore, ChannelBotStore, ChannelPairingStore, ChannelSessionStore,
+    CostStore, CronStore, DeviceStore, JobStore, SecretStore, SessionFolderStore, SessionStore,
+    SessionSummaryStore, SkillRiskStore, TaskStore, TraceStore,
 };
 
 /// Bundles all store implementations into a single container
@@ -36,6 +36,7 @@ pub struct Store {
     pub channel_bot: std::sync::Arc<dyn ChannelBotStore>,
     pub channel_pairing: std::sync::Arc<dyn ChannelPairingStore>,
     pub device: std::sync::Arc<dyn DeviceStore>,
+    pub agent_profile: std::sync::Arc<dyn AgentProfileStore>,
     pub blob: std::sync::Arc<dyn BlobStore>,
 }
 
@@ -63,6 +64,7 @@ impl Store {
         let blob_root = parent_dir.join("blobs");
         let pool = libsql::LibsqlPool::open(path).await?;
         let blob = libsql::LibsqlBlobStore::open(pool.clone(), &blob_root).await?;
+        let agent_profile = libsql::LibsqlAgentProfileStore::open(pool.clone()).await?;
         Ok(Self {
             session: std::sync::Arc::new(libsql::LibsqlSessionStore::new(pool.clone())),
             session_summary: std::sync::Arc::new(libsql::LibsqlSessionSummaryStore::new(
@@ -86,6 +88,7 @@ impl Store {
                 pool.clone(),
             )),
             device: std::sync::Arc::new(libsql::LibsqlDeviceStore::new(pool.clone())),
+            agent_profile: std::sync::Arc::new(agent_profile),
             blob: std::sync::Arc::new(blob),
         })
     }

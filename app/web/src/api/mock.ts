@@ -497,3 +497,41 @@ export function getMockJobTrace(sessionId: string, jobId: string): JobTrace | nu
 }
 
 
+// --- Agent profiles Mock Data ---
+
+type AgentProfileDto = components['schemas']['AgentProfileDto'];
+
+export const MOCK_AGENT_PROFILES: AgentProfileDto[] = import.meta.env.DEV
+  ? [
+      {
+        id: 'baybo',
+        name: 'baybo',
+        description:
+          "Baybo's default persona: workspace Soul prompt, default model, full skill and tool set.",
+        framework: 'baybo',
+        builtin: true,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+      },
+      {
+        id: '01JMOCKAGENTREVIEWER000000',
+        name: 'Code Reviewer',
+        description: 'Reviews diffs with a security-first eye. Terse, actionable findings only.',
+        system_prompt: 'You are a rigorous code reviewer. Report only defects.',
+        framework: 'claude',
+        builtin: false,
+        created_at: '2026-02-10T09:30:00Z',
+        updated_at: '2026-03-01T18:12:00Z',
+      },
+      {
+        id: '01JMOCKAGENTWRITER00000000',
+        name: 'Docs Writer',
+        description: 'Turns raw notes into polished documentation.',
+        llm: 'fast',
+        framework: 'baybo',
+        builtin: false,
+        created_at: '2026-02-20T14:00:00Z',
+        updated_at: '2026-02-21T10:45:00Z',
+      },
+    ]
+  : [];
