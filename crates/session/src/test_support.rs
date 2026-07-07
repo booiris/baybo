@@ -40,6 +40,7 @@ pub struct MemorySessionStore {
     data: Mutex<HashMap<SessionId, Session>>,
     transcripts: Mutex<HashMap<SessionId, Vec<StoredMessageRow>>>,
     control_events: Mutex<HashMap<SessionId, Vec<ControlEvent>>>,
+    read_cursors: Mutex<HashMap<SessionId, i64>>,
 }
 
 impl MemorySessionStore {
@@ -113,6 +114,22 @@ impl SessionStore for MemorySessionStore {
             }
             None => Ok(false),
         }
+    }
+
+    async fn set_read_cursor(&self, session_id: &SessionId, ordinal: i64) -> Result<bool> {
+        if !self.data.lock().contains_key(session_id) {
+            return Ok(false);
+        }
+        let mut cursors = self.read_cursors.lock();
+        let entry = cursors.entry(session_id.clone()).or_insert(ordinal);
+        if ordinal > *entry {
+            *entry = ordinal;
+        }
+        Ok(true)
+    }
+
+    async fn read_cursor(&self, session_id: &SessionId) -> Result<Option<i64>> {
+        Ok(self.read_cursors.lock().get(session_id).copied())
     }
 
     async fn set_last_llm(

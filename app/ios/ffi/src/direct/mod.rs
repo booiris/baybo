@@ -201,6 +201,24 @@ impl GatewayJsonClient for DirectHttp {
             parse_empty_response(resp).await
         }
     }
+
+    fn put_empty<'a>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
+        async move {
+            let resp = self
+                .client()
+                .put(self.url(path))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| format!("could not reach Baybo: {e}"))?;
+            parse_empty_response(resp).await
+        }
+    }
 }
 
 async fn parse_json_response<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T, String> {

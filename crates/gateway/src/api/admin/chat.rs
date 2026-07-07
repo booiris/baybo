@@ -69,6 +69,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(lookup_session_message))
         .routes(routes!(set_session_model))
         .routes(routes!(set_session_pin))
+        .routes(routes!(mark_session_read))
         .routes(routes!(set_session_folder))
         .routes(routes!(delete_session))
         .routes(routes!(unhide_session))
@@ -120,6 +121,11 @@ const SYNC_SCAN_BOUND_MULTIPLIER: usize = 10;
 /// session. Sized to fit a 260px-wide sidebar row at the web client's
 /// font without wrapping; the client may truncate further with CSS.
 const PREVIEW_MAX_CHARS: usize = 120;
+
+/// Ceiling for the chat-list unread badge. A session with more unread replies
+/// than this reports exactly this, and the client renders it as "N+". Bounds
+/// the per-session count scan (see `SessionManager::unread_reply_count`).
+const UNREAD_COUNT_CAP: usize = 99;
 
 /// Default page size for the cron-messages list. Tuned to roughly
 /// match what the right-side panel renders before the user scrolls.
@@ -539,6 +545,13 @@ pub struct ChatSessionSummary {
     /// sidebar groups rows by this id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<String>,
+    /// Number of unread assistant replies — final assistant messages persisted
+    /// with `ordinal` above this session's read cursor
+    /// (`PUT /v1/chat/sessions/{id}/read`), capped at [`UNREAD_COUNT_CAP`]
+    /// (the client renders the cap as "N+"). Server-computed, so it is
+    /// accurate across a cold restart / a device that missed the live
+    /// `SessionActivity` pings. `0` when caught up.
+    pub unread_count: i64,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -717,10 +730,26 @@ async fn list_sessions(
         async move { last_user_preview(&manager, &sid).await }
     }))
     .await;
+    // Fan out the per-session unread count the same way: bounded read-cursor
+    // scans, concurrent, each degrading to `0` on error so one bad row can't
+    // fail the whole list. Server-computed so it survives a cold restart and
+    // is consistent across devices (unlike a client-local ping counter).
+    let unread_counts = futures::future::join_all(visible.iter().map(|s| {
+        let manager = state.session_manager.clone();
+        let sid = s.id.clone();
+        async move {
+            manager
+                .unread_reply_count(&sid, UNREAD_COUNT_CAP)
+                .await
+                .unwrap_or(0)
+        }
+    }))
+    .await;
     let items: Vec<ChatSessionSummary> = visible
         .into_iter()
         .zip(previews)
-        .map(|(s, last_user_text)| ChatSessionSummary {
+        .zip(unread_counts)
+        .map(|((s, last_user_text), unread)| ChatSessionSummary {
             session_id: s.id.to_string(),
             created_at: s.created_at,
             last_active: s.last_active,
@@ -728,6 +757,7 @@ async fn list_sessions(
             pinned: s.pinned,
             last_user_text,
             folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
+            unread_count: unread as i64,
         })
         .collect();
     Ok(Json(ChatSessionsList { items }))
@@ -1218,6 +1248,49 @@ async fn set_session_pin(
             ..SessionPatch::default()
         },
     );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Request body for `PUT /v1/chat/sessions/{session_id}/read`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MarkReadRequest {
+    /// Highest `session_messages.ordinal` the viewer has now read. The read
+    /// cursor advances max-wins, so a stale/lower value is a no-op — a client
+    /// can safely fire this on open and after each new reply while foreground.
+    pub ordinal: i64,
+}
+
+#[utoipa::path(
+    put,
+    path = "/chat/sessions/{session_id}/read",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to mark read"),
+    ),
+    request_body = MarkReadRequest,
+    responses(
+        (status = 204, description = "Read cursor advanced; unread_count recomputes from it"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn mark_session_read(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    authed: Option<Extension<AuthedClient>>,
+    Json(req): Json<MarkReadRequest>,
+) -> Result<axum::http::StatusCode> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    // Targeted, max-wins flat-column write — survives a concurrent `touch`
+    // and can't regress on a reordered request. The list's `unread_count`
+    // derives from this on the next fetch; no live broadcast (unread is a
+    // per-viewer concern that converges on the next list pull).
+    state
+        .session_manager
+        .set_read_cursor(&sid, req.ordinal)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("mark session read: {e}")))?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

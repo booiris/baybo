@@ -96,6 +96,19 @@ pub trait SessionStore: Send + Sync {
         folder_id: Option<&FolderId>,
     ) -> Result<bool>;
 
+    /// Advance (max-wins) the session's chat-list read cursor to `ordinal` —
+    /// the highest `session_messages.ordinal` a viewer has read
+    /// (`PUT /v1/chat/sessions/:id/read`). Never regresses: a lower `ordinal`
+    /// is a no-op. Returns `Ok(true)` when the row existed, `Ok(false)` if no
+    /// row matched. Same flat-column discipline as [`Self::set_hidden`] — the
+    /// targeted UPDATE leaves the JSON `data` blob alone.
+    async fn set_read_cursor(&self, session_id: &SessionId, ordinal: i64) -> Result<bool>;
+
+    /// The session's chat-list read cursor, or `None` when nothing has been
+    /// read yet (or the row is missing). Backs the list endpoint's
+    /// `unread_count` derivation.
+    async fn read_cursor(&self, session_id: &SessionId) -> Result<Option<i64>>;
+
     /// Hard-delete the session.
     ///
     /// Returns `Ok(true)` if the row existed and was removed, `Ok(false)`

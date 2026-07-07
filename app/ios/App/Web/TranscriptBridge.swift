@@ -277,6 +277,12 @@ extension TranscriptBridge: WKScriptMessageHandler {
             let since = (body["sinceOrdinal"] as? NSNumber)?.int64Value
             let limit = (body["limit"] as? NSNumber)?.uint32Value ?? 50
             store?.requestSync(sinceOrdinal: since, limit: limit)
+        case "mark_read":
+            // The viewer has read up to `ordinal` — advance the server chat-list
+            // read cursor so the unread badge clears on the next list pull.
+            if let ordinal = (body["ordinal"] as? NSNumber)?.int64Value {
+                store?.markRead(ordinal: ordinal)
+            }
         case "persist":
             // Persist is async and may arrive after the bridge retargets.
             if let sessionId = (body["sessionId"] as? String) ?? store?.sessionId,

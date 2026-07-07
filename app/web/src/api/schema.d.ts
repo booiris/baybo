@@ -232,6 +232,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["mark_session_read"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/sync": {
         parameters: {
             query?: never;
@@ -921,6 +937,16 @@ export interface components {
              */
             pinned: boolean;
             session_id: string;
+            /**
+             * Format: int64
+             * @description Number of unread assistant replies — final assistant messages persisted
+             *     with `ordinal` above this session's read cursor
+             *     (`PUT /v1/chat/sessions/{id}/read`), capped at [`UNREAD_COUNT_CAP`]
+             *     (the client renders the cap as "N+"). Server-computed, so it is
+             *     accurate across a cold restart / a device that missed the live
+             *     `SessionActivity` pings. `0` when caught up.
+             */
+            unread_count: number;
         };
         ChatSessionsList: {
             items: components["schemas"]["ChatSessionSummary"][];
@@ -1434,6 +1460,16 @@ export interface components {
              *     for the full list.
              */
             total: number;
+        };
+        /** @description Request body for `PUT /v1/chat/sessions/{session_id}/read`. */
+        MarkReadRequest: {
+            /**
+             * Format: int64
+             * @description Highest `session_messages.ordinal` the viewer has now read. The read
+             *     cursor advances max-wins, so a stale/lower value is a no-op — a client
+             *     can safely fire this on open and after each new reply while foreground.
+             */
+            ordinal: number;
         };
         MoveFolderRequest: {
             /** @description New parent id, or `null` to promote the folder to top-level. */
@@ -2400,6 +2436,49 @@ export interface operations {
         };
         responses: {
             /** @description Pin state updated */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    mark_session_read: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id to mark read */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MarkReadRequest"];
+            };
+        };
+        responses: {
+            /** @description Read cursor advanced; unread_count recomputes from it */
             204: {
                 headers: {
                     [name: string]: unknown;

@@ -130,6 +130,11 @@ pub struct ChatSessionSummary {
     /// session without a user turn yet.
     pub last_user_text: Option<String>,
     pub pinned: bool,
+    /// Server-computed unread reply count (final assistant replies above this
+    /// session's read cursor), capped at 99. Accurate across a cold restart /
+    /// a device that missed the live `SessionActivity` pings — unlike a
+    /// client-local ping counter. `0` when caught up.
+    pub unread_count: i64,
 }
 
 /// Result of the per-send durability point lookup

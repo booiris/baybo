@@ -65,6 +65,23 @@ impl GatewayJsonClient for GatewayApi {
             Ok(())
         }
     }
+
+    fn put_empty<'a>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
+        async move {
+            let _body = request(
+                "PUT",
+                path,
+                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, "application/json")],
+                Some(body),
+            )
+            .await?;
+            Ok(())
+        }
+    }
 }
 
 async fn request(

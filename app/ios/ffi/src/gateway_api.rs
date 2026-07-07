@@ -32,6 +32,12 @@ pub(crate) trait GatewayJsonClient {
         path: &'a str,
         body: Vec<u8>,
     ) -> impl Future<Output = Result<(), String>> + Send + 'a;
+
+    fn put_empty<'a>(
+        &'a self,
+        path: &'a str,
+        body: Vec<u8>,
+    ) -> impl Future<Output = Result<(), String>> + Send + 'a;
 }
 
 pub(crate) trait GatewayBlobClient {
@@ -70,6 +76,13 @@ struct SessionSummary {
     #[serde(default)]
     last_user_text: Option<String>,
     pinned: bool,
+    #[serde(default)]
+    unread_count: i64,
+}
+
+#[derive(Serialize)]
+struct MarkReadRequest {
+    ordinal: i64,
 }
 
 /// Backward page of the transcript (`GET /v1/chat/sessions/{id}`). The rows
@@ -165,8 +178,24 @@ pub(crate) async fn list_sessions<C: GatewayJsonClient + Sync>(
             last_active: s.last_active,
             last_user_text: s.last_user_text,
             pinned: s.pinned,
+            unread_count: s.unread_count,
         })
         .collect())
+}
+
+/// Advance the session's chat-list read cursor (max-wins server-side) — the
+/// highest ordinal the viewer has read. Clears the unread badge on the next
+/// list pull. `PUT /v1/chat/sessions/{id}/read`.
+pub(crate) async fn mark_read<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_id: String,
+    ordinal: i64,
+) -> Result<(), String> {
+    validate_path_segment(&session_id, "session_id")?;
+    let body = serde_json::to_vec(&MarkReadRequest { ordinal })
+        .map_err(|e| format!("encode mark-read request: {e}"))?;
+    let path = format!("{PATH_CHAT_SESSIONS}/{session_id}/read");
+    client.put_empty(&path, body).await
 }
 
 pub(crate) async fn fetch_history_page<C: GatewayJsonClient + Sync>(

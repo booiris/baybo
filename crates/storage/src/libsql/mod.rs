@@ -172,6 +172,15 @@ impl LibsqlPool {
                     -- SQLite FKs are off (see set_wal_mode), so folder delete
                     -- nulls this column manually.
                     folder_id             TEXT,
+                    -- Per-session read cursor for the chat-list unread badge:
+                    -- the highest `session_messages.ordinal` a viewer has read.
+                    -- Set (max-wins) by PUT /v1/chat/sessions/:id/read; the
+                    -- list endpoint derives `unread_count` = visible replies
+                    -- with ordinal > read_cursor. Like the other chat-list flat
+                    -- columns it is owned by a targeted UPDATE (`set_read_cursor`)
+                    -- and omitted from the DO UPDATE in `save`, so a concurrent
+                    -- `touch` can't clobber it. NULL ⇒ nothing read yet.
+                    read_cursor           INTEGER,
                     data                  TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_root
@@ -559,6 +568,7 @@ impl LibsqlPool {
             "ALTER TABLE devices ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE devices ADD COLUMN remote_api_key TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE session_messages ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE sessions ADD COLUMN read_cursor INTEGER",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {

@@ -434,6 +434,20 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// Advance the server chat-list read cursor (max-wins) to `ordinal` — the
+    /// viewer has read up to here. Fire-and-forget: the badge clears on the next
+    /// list pull; a draft (no remote session yet) has nothing to mark.
+    func markRead(ordinal: Int64) {
+        guard listed || remoteSessionEnsured else { return }
+        Task {
+            do {
+                try await Baybo.client.chatMarkRead(sessionId: sessionId, ordinal: ordinal)
+            } catch {
+                NSLog("baybo: mark read: %@", bayboErrorText(error))
+            }
+        }
+    }
+
     func fetchHistory(beforeOrdinal: Int64?, limit: UInt32) {
         Task {
             do {

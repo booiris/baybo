@@ -106,6 +106,14 @@ export function postSyncRequest(sinceOrdinal: number | null, limit: number): voi
   post({ type: "sync", sinceOrdinal, limit });
 }
 
+/// Advance the server chat-list read cursor to `ordinal` — the viewer (looking
+/// at this transcript) has read up to here. Native forwards it to
+/// `chat_mark_read`; the unread badge clears on the next list pull. Best-effort
+/// (max-wins server-side), so a stale/duplicate marker is harmless.
+export function postMarkRead(ordinal: number): void {
+  postSafe({ type: "mark_read", ordinal });
+}
+
 // The jump-to-latest button is native (liquid glass, above the composer) —
 // the transcript mirrors its visibility state over; taps come back through
 // the `jumpToLatest` transcript event.

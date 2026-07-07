@@ -460,6 +460,28 @@ impl BayboClient {
         .await
     }
 
+    /// Advance the session's chat-list read cursor to `ordinal` (max-wins
+    /// server-side) — the viewer has read up to here. Clears the unread badge
+    /// on the next list pull. Called when the user opens/views a session.
+    pub async fn chat_mark_read(
+        self: Arc<Self>,
+        session_id: String,
+        ordinal: i64,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Relay => {
+                    gateway_api::mark_read(&relay::GatewayApi, session_id, ordinal).await
+                }
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::mark_read(&client, session_id, ordinal).await
+                }
+            }
+        })
+        .await
+    }
+
     /// Tear down the active binding's global chat leg. The relay leg reloads its
     /// pairing record on the next connect. At most one binding mode is live, but
     /// the binding may already be gone — a disconnect/unpair deletes the

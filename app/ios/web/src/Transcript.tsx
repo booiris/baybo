@@ -6,6 +6,7 @@ import {
   log,
   persistState,
   postJumpVisible,
+  postMarkRead,
   postSyncRequest,
   retrySend,
   subscribeTranscript,
@@ -387,6 +388,10 @@ export function Transcript({
   // Guards one in-flight sync request (the `sync_page`/`sync_failed` reply
   // clears it) so a burst of triggers coalesces to one pull.
   const syncInFlight = useRef(false);
+  // Highest ordinal already reported to native as read — dedupes the
+  // fire-and-forget `mark_read` posts (the cursor advances on every sync and
+  // every live reply while the transcript is on screen).
+  const lastMarkedRead = useRef(-1);
   // Lowest durable ordinal loaded — the scroll-up paging cursor
   // (`before_ordinal`). `null` = unknown / nothing older to page to.
   const oldestOrdinal = useRef<number | null>(restored?.oldestOrdinal ?? null);
@@ -803,6 +808,17 @@ export function Transcript({
     if (lastOrdinal.current === null || ordinal > lastOrdinal.current) lastOrdinal.current = ordinal;
   }, []);
 
+  // The transcript is on screen (native attaches the webview only for the open
+  // session), so a cursor advance means the viewer has read up to it — tell
+  // native to advance the server read cursor, deduped so it fires only when the
+  // cursor actually moved forward.
+  const markReadIfAdvanced = useCallback(() => {
+    const cursor = lastOrdinal.current;
+    if (cursor === null || cursor <= lastMarkedRead.current) return;
+    lastMarkedRead.current = cursor;
+    postMarkRead(cursor);
+  }, []);
+
   // Apply one `sync_page` frame. REPLACE (rebased, or baseline `since === null`)
   // swaps the durable thread wholesale — keeping the in-flight turn's open work
   // block and any optimistic user rows the page can't carry yet (the
@@ -878,8 +894,9 @@ export function Transcript({
         if (pageRows.some((r) => r.role === "assistant")) clearStreaming();
       }
       advanceCursorFromSync(frame.next_cursor, frame.rebased);
+      markReadIfAdvanced();
     },
-    [advanceCursorFromSync],
+    [advanceCursorFromSync, markReadIfAdvanced],
   );
 
   const handleFrame = (frameJson: string) => {
@@ -895,8 +912,12 @@ export function Transcript({
       case "message": {
         const ordinal = typeof frame.ordinal === "number" ? frame.ordinal : null;
         // Advance the cursor from the ordinal-stamped final reply (max-wins,
-        // frozen while rebase-dirty), then dedup below.
-        if (ordinal !== null) advanceCursorFromLive(ordinal);
+        // frozen while rebase-dirty), then dedup below. A reply while the
+        // transcript is on screen is read → advance the server read cursor.
+        if (ordinal !== null) {
+          advanceCursorFromLive(ordinal);
+          markReadIfAdvanced();
+        }
         const role = frame.role === "user" ? "user" : "assistant";
         if (role === "user" && frame.platform_msg_id && sentIds.current.has(frame.platform_msg_id)) {
           if (ordinal !== null) renderedOrdinals.current.add(ordinal);

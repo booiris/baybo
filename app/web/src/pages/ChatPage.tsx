@@ -407,6 +407,9 @@ export function ChatPage() {
   const outboxRef = useRef<OutboxStore | null>(null);
   if (outboxRef.current === null) outboxRef.current = new OutboxStore();
   const outbox = outboxRef.current;
+  // Late-bound `markRead` so the sync loop (defined earlier) can advance the
+  // server read cursor without a declaration-order cycle.
+  const markReadRef = useRef<(sid: string) => void>(() => {});
 
   // Bumped whenever the WS reports activity for a session_id we don't
   // track in the main `sessions` list — cron creates fresh sessions
@@ -792,6 +795,8 @@ export function ChatPage() {
               data.rebased,
             ),
           );
+          // Viewing this session and just synced it → it's read up to here.
+          if (sid === currentSessionIdRef.current) markReadRef.current(sid);
           if (data.rebased) {
             // The rebase floor makes "absent from the page" unknowable —
             // park unconfirmed entries `unknown` and resolve each via the
@@ -816,8 +821,9 @@ export function ChatPage() {
   );
 
   /** The session-list/folder plane has no cursor — pull is its only loss
-   *  recovery. Runs on every RE-connect edge and on `gap(None)`. Local
-   *  unread counters survive the merge (they're client-local). */
+   *  recovery. Runs on every RE-connect edge and on `gap(None)`. `unread` is
+   *  now server-computed (`unread_count`), so the pull reconciles the badge to
+   *  the truth — a cold restart / a missed live ping self-heals here. */
   const refetchSessionsAndFolders = useCallback(async () => {
     const [{ data: list, error: listError }, { data: folderList, error: folderError }] =
       await Promise.all([client.GET('/v1/chat/sessions'), client.GET('/v1/chat/folders')]);
@@ -835,13 +841,12 @@ export function ChatPage() {
       );
     }
     if (list) {
-      setSessions((prev) => {
-        const unreadById = new Map(prev.map((s) => [s.session_id, s.unread] as const));
+      setSessions(() => {
         return (list.items ?? []).map((s) => ({
           session_id: s.session_id,
           created_at: s.created_at,
           last_active: s.last_active,
-          unread: unreadById.get(s.session_id) ?? 0,
+          unread: s.unread_count ?? 0,
           pinned: s.pinned,
           last_user_text: s.last_user_text ?? undefined,
           folder_id: s.folder_id ?? undefined,
@@ -849,6 +854,31 @@ export function ChatPage() {
       });
     }
   }, [client, folderStore]);
+
+  /** Advance the server read cursor to the session's coverage watermark and
+   *  optimistically clear the local badge. Fire-and-forget (the cursor is
+   *  max-wins server-side); skipped when there's no cursor yet (nothing to
+   *  mark). Called when the user is viewing the session — on open, after a
+   *  sync completes for it, and on a live reply while it's foreground. */
+  const markRead = useCallback(
+    (sid: string) => {
+      const cursor = cursorsRef.current.get(sid)?.cursor;
+      if (cursor === null || cursor === undefined) return;
+      void client.PUT('/v1/chat/sessions/{session_id}/read', {
+        params: { path: { session_id: sid } },
+        body: { ordinal: cursor },
+      });
+      setSessions((prev) => {
+        const idx = prev.findIndex((s) => s.session_id === sid);
+        if (idx === -1 || prev[idx].unread === 0) return prev;
+        const next = prev.slice();
+        next[idx] = { ...prev[idx], unread: 0 };
+        return next;
+      });
+    },
+    [client],
+  );
+  markReadRef.current = markRead;
 
   /** Manual retry from the failed-row affordance: same
    *  `platform_msg_id`, automatic-transmission budget reset. */
@@ -919,7 +949,7 @@ export function ChatPage() {
         session_id: s.session_id,
         created_at: s.created_at,
         last_active: s.last_active,
-        unread: 0,
+        unread: s.unread_count ?? 0,
         pinned: s.pinned,
         last_user_text: s.last_user_text ?? undefined,
         folder_id: s.folder_id ?? undefined,
@@ -1093,6 +1123,11 @@ export function ChatPage() {
         if (frame.kind === 'message' && frame.ordinal !== undefined) {
           const cur = cursorsRef.current.get(frame.session_id) ?? INITIAL_CURSOR;
           cursorsRef.current.set(frame.session_id, advanceFromLive(cur, frame.ordinal));
+          // A reply while the user is looking at the session is already read —
+          // advance the server cursor so the badge stays 0 across a refetch.
+          if (frame.session_id === currentSessionIdRef.current) {
+            markReadRef.current(frame.session_id);
+          }
         }
         // Protect actively-streamed buckets from LRU eviction. Only
         // frames that actually mutate `views` bump recency — sidebar-
@@ -1341,6 +1376,10 @@ export function ChatPage() {
         next[idx] = { ...prev[idx], unread: 0 };
         return next;
       });
+      // Advance the server read cursor too (best-effort — no-op until the
+      // session's first sync sets a cursor, after which runSyncSession marks
+      // it read). Otherwise the badge would reappear on the next list refetch.
+      markReadRef.current(sessionId);
     }
   }, [sessionId]);
 

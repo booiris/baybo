@@ -175,19 +175,25 @@ final class SessionIndex: ObservableObject {
 
             let createdAt = Self.parseDate(summary.createdAt)
             let lastActive = Self.parseDate(summary.lastActive)
+            // `unread` is now server-computed (`unreadCount`), so the pull
+            // reconciles the badge to the truth — accurate across a cold
+            // restart / a device that missed the live `SessionActivity` pings.
+            // The live ping (`noteActivity`) still bumps it between pulls as a
+            // cheap accelerator.
+            let unread = Int(summary.unreadCount)
             if let mine, mine.lastActive > lastActive {
                 merged.append(
                     SessionRow(
                         id: summary.sessionId, createdAt: createdAt,
                         lastActive: mine.lastActive,
                         lastUserText: mine.lastUserText ?? summary.lastUserText,
-                        pinned: summary.pinned, unread: mine.unread))
+                        pinned: summary.pinned, unread: unread))
             } else {
                 merged.append(
                     SessionRow(
                         id: summary.sessionId, createdAt: createdAt, lastActive: lastActive,
                         lastUserText: summary.lastUserText, pinned: summary.pinned,
-                        unread: mine?.unread ?? 0))
+                        unread: unread))
             }
         }
         rows = merged

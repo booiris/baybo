@@ -462,6 +462,84 @@ async fn chat_message_point_lookup_probes_durability() {
 }
 
 #[tokio::test]
+async fn chat_list_unread_count_reflects_read_cursor() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    // user(0) → tool_use(1) → tool_result(2) → final assistant reply(3, "done").
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+
+    let unread_of = |list: &Value| -> i64 {
+        list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|i| i["session_id"] == json!(session_id))
+            .expect("session in list")["unread_count"]
+            .as_i64()
+            .expect("unread_count")
+    };
+
+    // Nothing read yet: one unread final reply (the intermediate tool-using
+    // assistant row at ordinal 1 does NOT count — only the tool-free reply).
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert_eq!(unread_of(&list), 1, "one unread assistant reply");
+
+    // Mark read up to the newest ordinal → caught up.
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/read"),
+        Body::from(json!({ "ordinal": 3 }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert_eq!(unread_of(&list), 0, "read cursor cleared the badge");
+
+    // A new reply after the read cursor bumps it back to unread.
+    let sid = SessionId::from(session_id.as_str());
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &sid,
+            &ChatMessage::user(vec![ContentBlock::Text("again".into())]),
+        )
+        .await
+        .expect("append user");
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &sid,
+            &ChatMessage::assistant(vec![ContentBlock::Text("sure".into())]),
+        )
+        .await
+        .expect("append reply");
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert_eq!(unread_of(&list), 1, "a reply above the cursor is unread");
+
+    // Max-wins: a stale lower ordinal must not regress the cursor / re-hide.
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/read"),
+        Body::from(json!({ "ordinal": 5 }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/read"),
+        Body::from(json!({ "ordinal": 2 }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert_eq!(unread_of(&list), 0, "read cursor never regresses");
+}
+
+#[tokio::test]
 async fn chat_list_uses_device_scope_when_forwarded_from_tunnel() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();

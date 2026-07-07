@@ -262,6 +262,46 @@ impl SessionStore for LibsqlSessionStore {
         Ok(affected > 0)
     }
 
+    async fn set_read_cursor(&self, session_id: &SessionId, ordinal: i64) -> Result<bool> {
+        let conn = self.pool.conn();
+        // Targeted, max-wins UPDATE on the flat column only — the `CASE`
+        // guards against a reordered/stale marker regressing the cursor (a
+        // background tab PUTting an older read position must not undo a newer
+        // one). The JSON `data` blob is untouched, like `set_pinned`.
+        let affected = conn
+            .execute(
+                "UPDATE sessions \
+                 SET read_cursor = CASE \
+                     WHEN read_cursor IS NULL OR ?2 > read_cursor THEN ?2 \
+                     ELSE read_cursor END \
+                 WHERE id = ?1",
+                libsql::params![session_id.as_str().to_string(), ordinal],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_read_cursor: {e}")))?;
+        Ok(affected > 0)
+    }
+
+    async fn read_cursor(&self, session_id: &SessionId) -> Result<Option<i64>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT read_cursor FROM sessions WHERE id = ?1",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql read_cursor: {e}")))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        else {
+            return Ok(None);
+        };
+        row.get::<Option<i64>>(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get read_cursor: {e}")))
+    }
+
     async fn delete(&self, session_id: &SessionId) -> Result<bool> {
         // The message-log cascade and the session-row delete must commit
         // as a unit (see below); BEGIN IMMEDIATE takes the write lock up

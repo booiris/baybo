@@ -1254,6 +1254,7 @@ mod tests {
         sessions: parking_lot::Mutex<HashMap<SessionId, Session>>,
         children: parking_lot::Mutex<HashMap<SessionId, Vec<(SessionId, LineageKind)>>>,
         messages: parking_lot::Mutex<HashMap<SessionId, Vec<StoredMessage>>>,
+        read_cursors: parking_lot::Mutex<HashMap<SessionId, i64>>,
     }
 
     #[async_trait::async_trait]
@@ -1328,6 +1329,27 @@ mod tests {
                 }
                 None => Ok(false),
             }
+        }
+        async fn set_read_cursor(
+            &self,
+            id: &SessionId,
+            ordinal: i64,
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
+            if !self.sessions.lock().contains_key(id) {
+                return Ok(false);
+            }
+            let mut cursors = self.read_cursors.lock();
+            let entry = cursors.entry(id.clone()).or_insert(ordinal);
+            if ordinal > *entry {
+                *entry = ordinal;
+            }
+            Ok(true)
+        }
+        async fn read_cursor(
+            &self,
+            id: &SessionId,
+        ) -> std::result::Result<Option<i64>, baybo_store::StorageError> {
+            Ok(self.read_cursors.lock().get(id).copied())
         }
         async fn delete(
             &self,

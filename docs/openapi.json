@@ -963,6 +963,60 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/read": {
+      "put": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "mark_session_read",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to mark read",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarkReadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Read cursor advanced; unread_count recomputes from it"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/sync": {
       "get": {
         "tags": [
@@ -3286,7 +3340,8 @@
           "session_id",
           "created_at",
           "last_active",
-          "pinned"
+          "pinned",
+          "unread_count"
         ],
         "properties": {
           "created_at": {
@@ -3321,6 +3376,11 @@
           },
           "session_id": {
             "type": "string"
+          },
+          "unread_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of unread assistant replies — final assistant messages persisted\nwith `ordinal` above this session's read cursor\n(`PUT /v1/chat/sessions/{id}/read`), capped at [`UNREAD_COUNT_CAP`]\n(the client renders the cap as \"N+\"). Server-computed, so it is\naccurate across a cold restart / a device that missed the live\n`SessionActivity` pings. `0` when caught up."
           }
         }
       },
@@ -4339,6 +4399,20 @@
             "type": "integer",
             "description": "Total number of records matching the filters — independent of\n`limit`/`offset`, so clients can size the pager without asking\nfor the full list.",
             "minimum": 0
+          }
+        }
+      },
+      "MarkReadRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/chat/sessions/{session_id}/read`.",
+        "required": [
+          "ordinal"
+        ],
+        "properties": {
+          "ordinal": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Highest `session_messages.ordinal` the viewer has now read. The read\ncursor advances max-wins, so a stale/lower value is a no-op — a client\ncan safely fire this on open and after each new reply while foreground."
           }
         }
       },
