@@ -70,7 +70,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm, pinned, folder_id FROM sessions WHERE id = ?1",
+                "SELECT data, hidden, last_llm, pinned, folder_id, title FROM sessions WHERE id = ?1",
                 libsql::params![session_id.as_str().to_string()],
             )
             .await
@@ -98,16 +98,18 @@ impl SessionStore for LibsqlSessionStore {
                 let folder_id_col: Option<String> = row
                     .get(4)
                     .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                let title_col: Option<String> = row
+                    .get(5)
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
                 let mut session: Session = serde_json::from_str(&data)
                     .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
-                // Flat columns are authoritative — `set_hidden` /
-                // `set_last_llm` / `set_pinned` / `set_folder` update them
-                // directly while leaving the JSON blob untouched, to avoid
-                // load/save races against `touch`.
+                // Flat columns are authoritative; targeted setters leave the
+                // JSON blob untouched to avoid load/save races.
                 session.hidden = hidden_col != 0;
                 session.state.last_llm = last_llm_col.map(LlmEntryName::from);
                 session.pinned = pinned_col != 0;
                 session.folder_id = folder_id_col.map(FolderId::from);
+                session.title = title_col;
                 Ok(Some(session))
             }
             None => Ok(None),
@@ -140,13 +142,11 @@ impl SessionStore for LibsqlSessionStore {
         let hidden_flag: i64 = if session.hidden { 1 } else { 0 };
         let pinned_flag: i64 = if session.pinned { 1 } else { 0 };
         // Upsert in place (NOT `INSERT OR REPLACE`, which delete+reinserts
-        // the row). The DO UPDATE clause deliberately omits `hidden` and
-        // `pinned`: those flat columns are owned by `set_hidden` /
-        // `set_pinned`, and `save` carries a possibly-stale in-memory
-        // `Session` (e.g. a background-subagent persist after the user hid
-        // or pinned the conversation). `?11` / `?12` only seed them on a
-        // brand-new row; `get` reads the columns as authoritative
-        // regardless of the blob's stale fields.
+        // the row). The DO UPDATE clause omits flat columns owned by targeted
+        // setters (`hidden`, `last_llm`, `pinned`, `folder_id`, `title`) so a
+        // stale in-memory `Session` cannot clobber them. `hidden` / `pinned`
+        // are seeded only on a brand-new row; `get` reads all flat columns as
+        // authoritative over the JSON blob.
         conn.execute(
             "INSERT INTO sessions \
              (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
@@ -302,6 +302,19 @@ impl SessionStore for LibsqlSessionStore {
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get read_cursor: {e}")))
     }
 
+    async fn set_title(&self, session_id: &SessionId, title: Option<&str>) -> Result<bool> {
+        let conn = self.pool.conn();
+        let value: Option<String> = title.map(|t| t.to_string());
+        let affected = conn
+            .execute(
+                "UPDATE sessions SET title = ?2 WHERE id = ?1",
+                libsql::params![session_id.as_str().to_string(), value],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_title: {e}")))?;
+        Ok(affected > 0)
+    }
+
     async fn delete(&self, session_id: &SessionId) -> Result<bool> {
         // The message-log cascade and the session-row delete must commit
         // as a unit (see below); BEGIN IMMEDIATE takes the write lock up
@@ -375,7 +388,7 @@ impl SessionStore for LibsqlSessionStore {
         // know) can be named in the skip warning.
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm, pinned, id, folder_id FROM sessions \
+                "SELECT data, hidden, last_llm, pinned, id, folder_id, title FROM sessions \
                  ORDER BY last_active DESC",
                 (),
             )
@@ -406,6 +419,9 @@ impl SessionStore for LibsqlSessionStore {
             let folder_id_col: Option<String> = row
                 .get(5)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let title_col: Option<String> = row
+                .get(6)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             // A single undeserializable row (e.g. one written by an older
             // build whose `lineage.kind` this build doesn't know) must
             // degrade to "silently absent from the listing", never fail
@@ -424,6 +440,7 @@ impl SessionStore for LibsqlSessionStore {
             session.state.last_llm = last_llm_col.map(LlmEntryName::from);
             session.pinned = pinned_col != 0;
             session.folder_id = folder_id_col.map(FolderId::from);
+            session.title = title_col;
             sessions.push(session);
         }
         Ok(sessions)
@@ -441,7 +458,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm, pinned, id, folder_id FROM sessions \
+                "SELECT data, hidden, last_llm, pinned, id, folder_id, title FROM sessions \
                  WHERE json_extract(data, '$.channel') = ?1 \
                  ORDER BY last_active DESC",
                 libsql::params![channel.as_str().to_string()],
@@ -473,6 +490,9 @@ impl SessionStore for LibsqlSessionStore {
             let folder_id_col: Option<String> = row
                 .get(5)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let title_col: Option<String> = row
+                .get(6)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             // Same skip-on-error discipline as `list_all`: a row whose
             // blob fails to deserialize drops out of the listing rather
             // than failing the whole chat-list query.
@@ -490,6 +510,7 @@ impl SessionStore for LibsqlSessionStore {
             session.state.last_llm = last_llm_col.map(LlmEntryName::from);
             session.pinned = pinned_col != 0;
             session.folder_id = folder_id_col.map(FolderId::from);
+            session.title = title_col;
             sessions.push(session);
         }
         Ok(sessions)
@@ -1286,6 +1307,7 @@ mod tests {
             hidden: false,
             pinned: false,
             folder_id: None,
+            title: None,
         }
     }
 
@@ -1850,6 +1872,112 @@ mod tests {
         let fid = baybo_model::FolderId::from("now-filed");
         assert!(store.set_folder(&id, Some(&fid)).await.unwrap());
         assert_eq!(store.get(&id).await.unwrap().unwrap().folder_id, Some(fid));
+    }
+
+    #[tokio::test]
+    async fn set_title_round_trips_and_clears() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+        let s = make_root_session("title-1");
+        store.save(&s).await.unwrap();
+
+        assert!(
+            store
+                .set_title(&s.id, Some("Fix login redirect"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.get(&s.id).await.unwrap().unwrap().title.as_deref(),
+            Some("Fix login redirect")
+        );
+
+        assert!(store.set_title(&s.id, None).await.unwrap());
+        assert_eq!(store.get(&s.id).await.unwrap().unwrap().title, None);
+
+        assert!(
+            !store
+                .set_title(&SessionId::from("nope"), Some("x"))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn save_does_not_clobber_title_set_by_set_title() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let s = make_root_session("title-then-save");
+        store.save(&s).await.unwrap();
+        assert!(store.set_title(&s.id, Some("Keep me")).await.unwrap());
+
+        store.save(&s).await.unwrap();
+
+        assert_eq!(
+            store.get(&s.id).await.unwrap().unwrap().title.as_deref(),
+            Some("Keep me"),
+            "save must preserve the title column owned by set_title"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_by_channel_reflects_title_column() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let mut s = make_root_session("title-list");
+        s.channel = ChannelType::http();
+        store.save(&s).await.unwrap();
+        assert!(store.set_title(&s.id, Some("Listed title")).await.unwrap());
+
+        let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].title.as_deref(),
+            Some("Listed title"),
+            "title must reflect the column in list projections (guards the index renumber)"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_sessions_table_without_title_is_migrated() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        pool.conn()
+            .execute("ALTER TABLE sessions DROP COLUMN title", libsql::params![])
+            .await
+            .unwrap();
+        let data = serde_json::to_string(&make_root_session("legacy-title")).unwrap();
+        pool.conn()
+            .execute(
+                "INSERT INTO sessions \
+                 (id, root_session_id, trigger_kind, created_at, last_active, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                libsql::params![
+                    "legacy-title".to_string(),
+                    "legacy-title".to_string(),
+                    "user".to_string(),
+                    super::super::time::to_us(Utc::now()),
+                    super::super::time::to_us(Utc::now()),
+                    data,
+                ],
+            )
+            .await
+            .unwrap();
+        pool.init_db().await.unwrap();
+
+        let store = LibsqlSessionStore::new(pool);
+        let id = SessionId::from("legacy-title");
+        let loaded = store.get(&id).await.unwrap().expect("legacy row present");
+        assert_eq!(
+            loaded.title, None,
+            "migrated legacy row defaults to no title"
+        );
+        assert!(store.set_title(&id, Some("Now titled")).await.unwrap());
+        assert_eq!(
+            store.get(&id).await.unwrap().unwrap().title.as_deref(),
+            Some("Now titled")
+        );
     }
 
     #[tokio::test]

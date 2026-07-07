@@ -85,6 +85,8 @@ export interface SessionPatch {
    *  change. `{ set: { id } }` files under a folder; `'uncategorized'`
    *  clears it. */
   folder_id?: FolderChange;
+  /** Generated conversation title; absent means no change. */
+  title?: string;
 }
 
 /** Source of a `Frame::SessionActivity` event — mirror of Rust

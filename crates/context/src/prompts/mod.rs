@@ -11,4 +11,5 @@ pub mod recalled_memory;
 pub mod soul;
 pub mod subagent;
 pub mod tasks;
+pub mod title;
 pub mod tool_output;

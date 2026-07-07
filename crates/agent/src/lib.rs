@@ -35,6 +35,7 @@ pub use runtime::compression;
 pub use runtime::error_recovery;
 pub use runtime::llm_pool;
 pub use runtime::sandbox;
+pub use runtime::title;
 pub use runtime::tool_executor;
 pub use runtime::virtual_read;
 
@@ -48,5 +49,6 @@ pub use router::{ActorSpawner, Router};
 pub use security::{LeakRuleSummary, SecretVaultSummary, SecurityAuditReport, SecurityGateway};
 pub use service::{ShutdownSignal, TaskTracker};
 pub use supervisor::AgentSupervisor;
+pub use title::SessionTitleSink;
 pub use tool_executor::ToolExecutor;
 pub use virtual_read::{SessionTranscript, SessionTranscriptReader};

@@ -66,14 +66,13 @@ impl SessionStore for MemorySessionStore {
     async fn save(&self, session: &Session) -> Result<()> {
         let mut data = self.data.lock();
         let mut to_store = session.clone();
-        // `hidden` / `pinned` / `folder_id` are owned by their targeted
-        // setters; preserve the existing row's values so a stale in-memory
-        // save can't un-hide, un-pin, or re-file it. Mirrors the libsql
-        // impl, whose upsert omits all three flat columns.
+        // Flat columns are owned by targeted setters; preserve them across
+        // stale full-blob saves.
         if let Some(existing) = data.get(&session.id) {
             to_store.hidden = existing.hidden;
             to_store.pinned = existing.pinned;
             to_store.folder_id = existing.folder_id.clone();
+            to_store.title = existing.title.clone();
         }
         data.insert(session.id.clone(), to_store);
         Ok(())
@@ -141,6 +140,17 @@ impl SessionStore for MemorySessionStore {
         match data.get_mut(session_id) {
             Some(s) => {
                 s.state.last_llm = llm.cloned();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn set_title(&self, session_id: &SessionId, title: Option<&str>) -> Result<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) => {
+                s.title = title.map(|t| t.to_string());
                 Ok(true)
             }
             None => Ok(false),

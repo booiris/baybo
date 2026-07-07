@@ -183,6 +183,8 @@ impl LibsqlPool {
                     -- and omitted from the DO UPDATE in `save`, so a concurrent
                     -- `touch` can't clobber it. NULL ⇒ nothing read yet.
                     read_cursor           INTEGER,
+                    -- Auto-generated conversation title; owned by set_title.
+                    title                 TEXT,
                     data                  TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_root
@@ -588,6 +590,7 @@ impl LibsqlPool {
             "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE cost_records ADD COLUMN reason TEXT",
             "ALTER TABLE sessions ADD COLUMN folder_id TEXT",
+            "ALTER TABLE sessions ADD COLUMN title TEXT",
             "ALTER TABLE devices ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE devices ADD COLUMN remote_api_key TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE session_messages ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",

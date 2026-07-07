@@ -100,6 +100,7 @@ impl SessionBuilder {
             hidden: false,
             pinned: false,
             folder_id: None,
+            title: None,
         }
     }
 }

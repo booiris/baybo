@@ -62,6 +62,7 @@ fn root_session(id: &str) -> Session {
         hidden: false,
         pinned: false,
         folder_id: None,
+        title: None,
     }
 }
 

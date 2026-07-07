@@ -242,6 +242,7 @@ mod tests {
             hidden: false,
             pinned: false,
             folder_id: None,
+            title: None,
         }
     }
 

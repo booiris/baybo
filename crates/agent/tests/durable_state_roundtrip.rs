@@ -53,6 +53,7 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
         hidden: false,
         pinned: false,
         folder_id: None,
+        title: None,
     };
 
     let original = DurableActorState::new(session);

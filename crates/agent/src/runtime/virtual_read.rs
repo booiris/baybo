@@ -362,6 +362,7 @@ mod tests {
             hidden: false,
             pinned: false,
             folder_id: None,
+            title: None,
         };
         let store = Arc::new(MemorySessionStore::new());
         store.seed_session(&session);

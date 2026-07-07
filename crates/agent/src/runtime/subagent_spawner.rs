@@ -1413,6 +1413,7 @@ mod resume_validation_tests {
             hidden: false,
             pinned: false,
             folder_id: None,
+            title: None,
         }
     }
 

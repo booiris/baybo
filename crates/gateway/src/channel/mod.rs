@@ -36,6 +36,7 @@ pub(crate) mod relay_pair;
 pub mod route;
 pub(crate) mod session_pulse;
 pub(crate) mod session_resolver;
+pub mod session_title;
 pub(crate) mod slash;
 pub mod state;
 pub(crate) mod tunnel_http;

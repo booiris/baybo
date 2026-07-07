@@ -733,6 +733,7 @@ mod tests {
             hidden: false,
             pinned: false,
             folder_id: None,
+            title: None,
         };
         sessions.store().save(&child).await.unwrap();
         SessionId::from(child_id)
