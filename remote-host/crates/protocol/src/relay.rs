@@ -17,26 +17,28 @@ pub const RELAY_LEG_CLASS_HEADER: &str = "x-relay-leg-class";
 
 /// The traffic class of a content leg, declared by the phone on its
 /// [`CONTENT_JOIN`] dial ([`RELAY_LEG_CLASS_HEADER`]) and relayed to the gateway
-/// in [`ControlSignal::OpenDataLeg`]. `Chat` is interactive; `Blob` is a bulk
-/// transfer that the relay bandwidth-throttles as a background class (it yields a
-/// headroom to chat) and that the gateway routes to its blob sub-protocol instead
-/// of the chat frame loop. Defaults to `Chat` for backward-compatible decode.
+/// in [`ControlSignal::OpenDataLeg`]. `Chat` runs the live frame loop, `Api` runs
+/// an interactive API tunnel, and `Blob` runs the same tunnel on background
+/// bandwidth for bulk transfer. Defaults to `Chat` for backward-compatible decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LegClass {
     /// Interactive chat traffic; the full `wire::Frame` loop.
     #[default]
     Chat,
-    /// Bulk blob traffic; the blob sub-protocol, background bandwidth.
+    /// Small API tunnel traffic; interactive bandwidth.
+    Api,
+    /// Bulk blob traffic; API tunnel over background bandwidth.
     Blob,
 }
 
 impl LegClass {
-    /// Parse the [`RELAY_LEG_CLASS_HEADER`] value; anything but `"blob"` (absent,
-    /// `"chat"`, unparseable) is `Chat` — the relay must never fail a join on a
-    /// bad class hint, and an unknown value is the safe interactive default.
+    /// Parse the [`RELAY_LEG_CLASS_HEADER`] value; absent or unknown values are
+    /// `Chat` — the relay must never fail a join on a bad class hint, and an
+    /// unknown value is the safe interactive default.
     pub fn from_header_value(value: &str) -> Self {
         match value {
+            "api" => LegClass::Api,
             "blob" => LegClass::Blob,
             _ => LegClass::Chat,
         }
@@ -46,6 +48,7 @@ impl LegClass {
     pub fn as_str(self) -> &'static str {
         match self {
             LegClass::Chat => "chat",
+            LegClass::Api => "api",
             LegClass::Blob => "blob",
         }
     }
@@ -78,8 +81,9 @@ pub struct ControlHello {
 pub enum ControlSignal {
     /// Tell the gateway to open a content data leg under `relay_key`. `class`
     /// (defaulted for a pre-class sender) tells the gateway whether to run the
-    /// chat frame loop ([`LegClass::Chat`]) or the blob sub-protocol
-    /// ([`LegClass::Blob`]) over the leg, and to meter it accordingly.
+    /// chat frame loop ([`LegClass::Chat`]) or the API tunnel
+    /// ([`LegClass::Api`] / [`LegClass::Blob`]) over the leg, and to meter it
+    /// accordingly.
     OpenDataLeg {
         relay_key: String,
         #[serde(default)]

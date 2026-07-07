@@ -15,9 +15,9 @@ use axum::extract::{DefaultBodyLimit, Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use baybo_model::ChannelType;
+use baybo_model::{BlobRef, ChannelType};
 use baybo_pairing::CheckOutcome;
-use baybo_store::StorageError;
+use baybo_store::{BlobReader, BlobStore, ByteStream, StorageError, blob::SHA256_PREFIX};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::Serialize;
@@ -25,6 +25,11 @@ use tokio_util::io::ReaderStream;
 
 use super::state::WsChannelState;
 use crate::auth::AuthedClient;
+
+pub(crate) const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024;
+const DEFAULT_BLOB_MIME: &str = "application/octet-stream";
+const HEADER_CONTENT_SHA256: &str = "x-baybo-content-sha256";
+const DEVICE_UPLOAD_IDENTITY_PREFIX: &str = "device:";
 
 /// Sidecar-supplied originator identity. The sidecar fills these in
 /// from the inbound platform event so the gateway can run the same
@@ -35,16 +40,8 @@ use crate::auth::AuthedClient;
 const HEADER_BOT_ID: &str = "x-baybo-bot-id";
 const HEADER_USER_ID: &str = "x-baybo-user-id";
 
-/// Hard cap on a single upload, matched against `DefaultBodyLimit`.
-/// Larger blobs would block the WS-paired connection's Tokio worker
-/// for the duration of a multi-second I/O — sidecars that need to
-/// transfer more than this should chunk on their side. Shared with the
-/// relay blob-leg upload path ([`super::blob_content`]).
-pub(crate) const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024;
-
-/// JSON returned on a successful upload. Mirrors the shape produced by
-/// `BlobStore::put`. Kept tiny by design — sidecars only need the id
-/// to embed in `WireAttachment`.
+/// JSON returned on a successful upload. Kept tiny by design — sidecars only
+/// need the id to embed in `WireAttachment`.
 #[derive(Debug, Serialize)]
 struct UploadResponse {
     blob_id: String,
@@ -74,6 +71,9 @@ enum UploadAuth {
         bot_id: String,
         user_id: String,
     },
+    /// Approved companion device. Device uploads are not per-bot/per-user, but
+    /// still carry a durable uploader marker for diagnostics.
+    Device { device_id: String },
     /// Subprocess sidecar; pairing not yet approved. Body contains the
     /// short code the user must run `baybo pair approve <code>` for.
     Pending(String),
@@ -91,12 +91,9 @@ async fn authorize_upload(
         // TUI, web chat, and tool-sidecar uploads are session-scoped
         // (not per-bot/per-user) — pairing doesn't apply.
         AuthedClient::Tui | AuthedClient::Tool { .. } | AuthedClient::Web => UploadAuth::Bypass,
-        // iOS devices may not upload through the HTTP blob side channel. Mobile
-        // attachment upload uses the E2E relay blob leg instead.
-        AuthedClient::Device { .. } => UploadAuth::Reject(
-            StatusCode::FORBIDDEN,
-            "device tokens may not upload via /v1/blobs",
-        ),
+        AuthedClient::Device { device_id } => UploadAuth::Device {
+            device_id: device_id.clone(),
+        },
         AuthedClient::Subprocess {
             channel_type: None, ..
         } => UploadAuth::Reject(
@@ -169,6 +166,9 @@ async fn upload(
             bot_id,
             user_id,
         } => Some(format!("{channel_type}:{bot_id}:{user_id}")),
+        UploadAuth::Device { device_id } => {
+            Some(format!("{}{}", DEVICE_UPLOAD_IDENTITY_PREFIX, device_id))
+        }
         UploadAuth::Pending(code) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -185,7 +185,7 @@ async fn upload(
     let mime = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
+        .unwrap_or(DEFAULT_BLOB_MIME)
         .to_owned();
 
     // Hand axum's body straight to the blob store as a `Stream<Bytes>`.
@@ -202,15 +202,25 @@ async fn upload(
         })
         .boxed();
 
-    match state
-        .blob_store
-        .put_stream(
-            stream,
-            &mime,
-            uploader_identity.as_deref(),
-            MAX_BLOB_BYTES as u64,
-        )
-        .await
+    let claimed_sha256 = match headers
+        .get(HEADER_CONTENT_SHA256)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(value) => match require_sha256_hex(Some(value)) {
+            Ok(value) => Some(value),
+            Err(err) => return service_error_response(err),
+        },
+        None => None,
+    };
+
+    match put_upload(
+        state.blob_store.as_ref(),
+        stream,
+        &mime,
+        uploader_identity.as_deref(),
+        claimed_sha256.as_deref(),
+    )
+    .await
     {
         Ok(blob_ref) => (
             StatusCode::CREATED,
@@ -219,51 +229,205 @@ async fn upload(
             }),
         )
             .into_response(),
-        Err(StorageError::TooLarge { limit, actual }) => {
-            tracing::debug!(limit, actual, "blob upload exceeded cap");
-            (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("blob exceeds {limit}-byte cap"),
-            )
-                .into_response()
+        Err(err) => service_error_response(err),
+    }
+}
+
+async fn download(
+    State(state): State<WsChannelState>,
+    Path(blob_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let offset = parse_range_start(
+        headers
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok()),
+    );
+    let download = match open_download(state.blob_store.as_ref(), &blob_id, offset).await {
+        Ok(download) => download,
+        Err(err) => return service_error_response(err),
+    };
+
+    let body = Body::from_stream(ReaderStream::new(download.reader));
+    let mut response = (download.status, body).into_response();
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&download.mime_type) {
+        headers.insert(header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&download.body_len.to_string()) {
+        headers.insert(header::CONTENT_LENGTH, value);
+    }
+    if let Some(content_range) = download.content_range
+        && let Ok(value) = HeaderValue::from_str(&content_range)
+    {
+        headers.insert(header::CONTENT_RANGE, value);
+    }
+    response
+}
+
+struct BlobDownload {
+    status: StatusCode,
+    mime_type: String,
+    body_len: u64,
+    content_range: Option<String>,
+    reader: BlobReader,
+}
+
+#[derive(Debug)]
+enum BlobServiceError {
+    BadRequest(&'static str),
+    NotFound,
+    RangeNotSatisfiable(&'static str),
+    PayloadTooLarge { limit: u64 },
+    ContentHashMismatch,
+    StoreFailure,
+}
+
+impl BlobServiceError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            Self::BadRequest(_) | Self::ContentHashMismatch => StatusCode::BAD_REQUEST,
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::RangeNotSatisfiable(_) => StatusCode::RANGE_NOT_SATISFIABLE,
+            Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::StoreFailure => StatusCode::INTERNAL_SERVER_ERROR,
         }
-        Err(e) => {
-            tracing::error!(error = %e, "blob upload persist failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "blob store failure").into_response()
+    }
+
+    fn client_message(&self) -> String {
+        match self {
+            Self::BadRequest(reason) | Self::RangeNotSatisfiable(reason) => reason.to_string(),
+            Self::NotFound => "blob not found".to_string(),
+            Self::PayloadTooLarge { limit } => format!("blob exceeds {limit}-byte cap"),
+            Self::ContentHashMismatch => "content hash mismatch".to_string(),
+            Self::StoreFailure => "blob store failure".to_string(),
         }
     }
 }
 
-async fn download(State(state): State<WsChannelState>, Path(blob_id): Path<String>) -> Response {
-    // `stat` first so missing rows surface as 404 before we hold a
-    // file handle; the open path itself also re-verifies, but ordering
-    // here lets us send Content-Length up front.
-    let meta = match state.blob_store.stat(&blob_id).await {
-        Ok(m) => m,
-        Err(StorageError::NotFound(_)) => return StatusCode::NOT_FOUND.into_response(),
+fn parse_range_start(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.strip_prefix("bytes="))
+        .and_then(|rest| {
+            rest.split_once('-')
+                .map_or(rest, |(start, _)| start)
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0)
+}
+
+fn require_sha256_hex(value: Option<&str>) -> Result<String, BlobServiceError> {
+    match value {
+        Some(value) if is_sha256_hex(value) => Ok(value.to_owned()),
+        _ => Err(BlobServiceError::BadRequest("missing content hash")),
+    }
+}
+
+async fn open_download(
+    blob_store: &dyn BlobStore,
+    blob_id: &str,
+    offset: u64,
+) -> Result<BlobDownload, BlobServiceError> {
+    let meta = match blob_store.stat(blob_id).await {
+        Ok(meta) => meta,
+        Err(StorageError::NotFound(_)) => return Err(BlobServiceError::NotFound),
         Err(e) => {
             tracing::error!(error = %e, blob_id, "blob stat failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return Err(BlobServiceError::StoreFailure);
         }
     };
-    let reader = match state.blob_store.open(&blob_id).await {
-        Ok(r) => r,
-        Err(StorageError::NotFound(_)) => return StatusCode::NOT_FOUND.into_response(),
+
+    if offset > meta.size {
+        return Err(BlobServiceError::RangeNotSatisfiable(
+            "range starts past end of blob",
+        ));
+    }
+
+    let reader = match blob_store.open_at(blob_id, offset).await {
+        Ok(reader) => reader,
+        Err(StorageError::NotFound(_)) => return Err(BlobServiceError::NotFound),
         Err(e) => {
             tracing::error!(error = %e, blob_id, "blob open failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return Err(BlobServiceError::StoreFailure);
         }
     };
-    let body = Body::from_stream(ReaderStream::new(reader));
-    let mut response = (StatusCode::OK, body).into_response();
-    let headers = response.headers_mut();
-    if let Ok(value) = HeaderValue::from_str(&meta.mime_type) {
-        headers.insert(header::CONTENT_TYPE, value);
+
+    let body_len = meta.size - offset;
+    let status = if offset > 0 {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let content_range = (offset > 0).then(|| {
+        format!(
+            "bytes {offset}-{}/{}",
+            meta.size.saturating_sub(1),
+            meta.size
+        )
+    });
+
+    Ok(BlobDownload {
+        status,
+        mime_type: meta.mime_type,
+        body_len,
+        content_range,
+        reader,
+    })
+}
+
+async fn put_upload(
+    blob_store: &dyn BlobStore,
+    stream: ByteStream,
+    mime_type: &str,
+    uploader_identity: Option<&str>,
+    claimed_sha256: Option<&str>,
+) -> Result<BlobRef, BlobServiceError> {
+    let blob_ref = match blob_store
+        .put_stream(stream, mime_type, uploader_identity, MAX_BLOB_BYTES as u64)
+        .await
+    {
+        Ok(blob_ref) => blob_ref,
+        Err(StorageError::TooLarge { limit, actual }) => {
+            tracing::debug!(limit, actual, "blob upload exceeded cap");
+            return Err(BlobServiceError::PayloadTooLarge { limit });
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "blob upload persist failed");
+            return Err(BlobServiceError::StoreFailure);
+        }
+    };
+
+    if let Some(claimed) = claimed_sha256 {
+        let got = blob_ref
+            .blob_id
+            .strip_prefix(SHA256_PREFIX)
+            .and_then(|rest| rest.split('.').next())
+            .unwrap_or_default();
+        if got != claimed {
+            if let Err(e) = blob_store.delete(&blob_ref.blob_id).await {
+                tracing::warn!(error = %e, "failed to delete hash-mismatched blob");
+            }
+            return Err(BlobServiceError::ContentHashMismatch);
+        }
     }
-    if let Ok(value) = HeaderValue::from_str(&meta.size.to_string()) {
-        headers.insert(header::CONTENT_LENGTH, value);
+
+    Ok(blob_ref)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn service_error_response(err: BlobServiceError) -> Response {
+    let status = err.status_code();
+    if status == StatusCode::NOT_FOUND {
+        return status.into_response();
     }
-    response
+    (status, err.client_message()).into_response()
 }
 
 #[cfg(test)]
@@ -320,6 +484,23 @@ mod tests {
         };
         let out = authorize_upload(&svc, &authed, &HeaderMap::new()).await;
         assert!(matches!(out, UploadAuth::Bypass));
+    }
+
+    #[tokio::test]
+    async fn device_upload_is_allowed_with_device_identity() {
+        let (_store, svc) = fresh_pairing().await;
+        let out = authorize_upload(
+            &svc,
+            &AuthedClient::Device {
+                device_id: "device-1".into(),
+            },
+            &HeaderMap::new(),
+        )
+        .await;
+        assert!(matches!(
+            out,
+            UploadAuth::Device { device_id } if device_id == "device-1"
+        ));
     }
 
     #[tokio::test]

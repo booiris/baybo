@@ -1,4 +1,4 @@
-//! `/v1/push/*` — admin-side direct-mode (web-identity) push registration.
+//! `/v1/push/*` — admin-side direct-mode device push registration.
 //!
 //! Scan-to-pair devices bootstrap their push binding over the Noise pairing
 //! handshake. The **direct** transport (URL + admin token, no pairing) has no
@@ -12,12 +12,13 @@
 //!    verifies the delegation and persists the binding ([`crate::push::web`]).
 //!
 //! The resulting binding is cryptographically identical to a paired device's, so
-//! the dispatcher, the remote host (C), and the iOS NSE are all unchanged. See
+//! the dispatcher, the remote host (C), and the APNs NSE path are unchanged. See
 //! `docs/modules/mobile/relay-push-security.md` for the (weaker, TLS-bearer)
 //! trust model versus the Noise path.
 
-use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::{Extension, Json};
 use device_proto::aead;
 use device_proto::delegation;
 use device_proto::pairing::ApnsEnv;
@@ -27,6 +28,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::api::dto::ErrorBody;
+use crate::auth::AuthedClient;
 use crate::push::{DEFAULT_PUSH_RELAY_URL, load_or_create_push_signing_key, web};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
@@ -35,6 +37,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     OpenApiRouter::new()
         .routes(routes!(push_params))
         .routes(routes!(register_push))
+        .routes(routes!(update_device_apns_token))
 }
 
 /// Response of `GET /v1/push/params`.
@@ -67,7 +70,7 @@ async fn push_params(State(state): State<AdminState>) -> Result<Json<PushParams>
 /// Request body for `POST /v1/push/register`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RegisterPushRequest {
-    /// The client's self-certifying `device_id` (`ios-<hex(ed25519 pub)>`); the
+    /// The client's self-certifying `device_id` (`device-<hex(ed25519 pub)>`); the
     /// gateway recovers the public key from it and re-derives the canonical id.
     pub device_id: String,
     /// The client's current APNs device token (hex).
@@ -86,8 +89,17 @@ pub struct RegisterPushRequest {
 /// Response of `POST /v1/push/register`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RegisterPushResponse {
-    /// The `ios-<hex(pub)>` id the binding was stored under (== the push `bid`).
+    /// The `device-<hex(pub)>` id the binding was stored under (== the push `bid`).
     pub device_id: String,
+}
+
+/// Request body for `POST /v1/mobile/apns-token`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateDeviceApnsTokenRequest {
+    /// The device's current APNs device token (hex).
+    pub apns_token: String,
+    /// APNs environment: `"sandbox"` (debug / TestFlight) or `"production"`.
+    pub apns_env: String,
 }
 
 /// Refuse a `POST /v1/push/register` with a 400, leaving a gateway-side record:
@@ -119,7 +131,7 @@ async fn register_push(
     let device_pub = delegation::device_pubkey_from_id(req.device_id.trim()).map_err(|_| {
         reject_register(
             &remote_host_protocol::device_id_log(req.device_id.trim()),
-            "device_id is not a valid ios-<hex> identity",
+            "device_id is not a valid device-<hex> identity",
         )
     })?;
     let device_id = delegation::device_id_for(&device_pub);
@@ -177,4 +189,57 @@ async fn register_push(
 
     tracing::info!(device = %device_id, "push: registered a direct-mode binding");
     Ok(Json(RegisterPushResponse { device_id }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/mobile/apns-token",
+    tag = "push",
+    request_body = UpdateDeviceApnsTokenRequest,
+    responses(
+        (status = 204, description = "Paired device APNs token refreshed"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 500, description = "Persist failed", body = ErrorBody),
+    )
+)]
+async fn update_device_apns_token(
+    State(state): State<AdminState>,
+    authed: Option<Extension<AuthedClient>>,
+    Json(req): Json<UpdateDeviceApnsTokenRequest>,
+) -> Result<StatusCode> {
+    let Some(Extension(AuthedClient::Device { device_id })) = authed else {
+        return Err(GatewayError::Unauthorized);
+    };
+
+    let apns_token = req.apns_token.trim();
+    if apns_token.is_empty() {
+        tracing::debug!(
+            device = %device_id,
+            "push: device sent empty APNs token; registration unchanged"
+        );
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let apns_env = match req.apns_env.trim() {
+        "production" => ApnsEnv::Production,
+        _ => ApnsEnv::Sandbox,
+    };
+    let reg = crate::push::DeviceApnsRegistration {
+        apns_token: apns_token.to_owned(),
+        apns_env,
+    };
+    let bytes = serde_json::to_vec(&reg)
+        .map_err(|e| GatewayError::Internal(format!("encode APNs registration: {e}")))?;
+    state
+        .secret_vault
+        .store_secret(&crate::push::device_apns_secret_name(&device_id), &bytes)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("persist APNs registration: {e}")))?;
+
+    tracing::info!(
+        device = %device_id,
+        apns_env = ?apns_env,
+        token_len = apns_token.len(),
+        "push: device APNs token updated via API"
+    );
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -14,7 +14,7 @@ use baybo_channels::{
     AgentEvent, AgentOutput, ChannelKind, MessageRole, OutgoingMessage, RouterInbound,
 };
 use baybo_config::ChannelsConfig;
-use baybo_gateway::auth::WEB_OPERATOR_USER_ID;
+use baybo_gateway::auth::{DEVICE_ID_HEADER, WEB_OPERATOR_USER_ID};
 use baybo_gateway::channel::boot;
 use baybo_gateway::server::{GatewayDeps, build_admin_router_for_tests};
 use baybo_gateway::test_support::build_test_deps;
@@ -24,6 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 async fn start_admin_ws_server(
     deps: &GatewayDeps,
@@ -49,10 +50,25 @@ async fn connect_register(
     channel_type: ChannelType,
 ) -> Result<tokio_tungstenite::WebSocketStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>>
 {
+    connect_register_with_device_header(port, token, channel_type, None).await
+}
+
+async fn connect_register_with_device_header(
+    port: u16,
+    token: &str,
+    channel_type: ChannelType,
+    device_id: Option<&str>,
+) -> Result<tokio_tungstenite::WebSocketStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>>
+{
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let stream = TcpStream::connect(addr).await?;
     let url = format!("ws://127.0.0.1:{port}/v1/channel-ws?token={token}");
-    let request = url.into_client_request()?;
+    let mut request = url.into_client_request()?;
+    if let Some(device_id) = device_id {
+        request
+            .headers_mut()
+            .insert(DEVICE_ID_HEADER, HeaderValue::from_str(device_id)?);
+    }
     let (mut ws, _) = client_async(request, stream).await?;
 
     let frame = Frame::Register {
@@ -101,7 +117,7 @@ async fn recv_frame(
 /// — the sidebar pulse broadcasts unconditionally to every `http`
 /// connection on dispatch, which would interpose itself before every
 /// expected content frame in tests that don't care about the pulse —
-/// and `Frame::TurnState`, the per-Subscribe in-flight-turn snapshot
+/// and `Frame::SubscribeState`, the per-Subscribe state bundle
 /// (asserted directly via [`recv_frame`] by the tests that care).
 async fn recv_frame_skip_activity(
     ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
@@ -116,7 +132,7 @@ async fn recv_frame_skip_activity(
         let frame = recv_frame(ws, remaining).await?;
         if !matches!(
             frame,
-            Frame::SessionActivity { .. } | Frame::TurnState { .. }
+            Frame::SessionActivity { .. } | Frame::SubscribeState { .. }
         ) {
             return Ok(frame);
         }
@@ -131,59 +147,40 @@ async fn send_frame(
     Ok(())
 }
 
-/// Consume the empty `PendingApprovalsSnapshot` the gateway sends to a
-/// connection right after a `Subscribe` is registered. The tests in
-/// this file set up sessions with no pre-existing pending approvals,
-/// so the snapshot is always empty — it's just noise that the
-/// "expect next frame to be X" assertions need to skip past.
-async fn expect_empty_pending_snapshot(
+/// Consume the one `SubscribeState` bundle the gateway sends to a
+/// connection right after a `Subscribe` is registered, asserting the
+/// idle shape most tests set up: no turn in flight, no work steps, no
+/// pending approvals, no tasks. Returns the bundle for tests that also
+/// want to look at `as_of_ordinal`.
+async fn expect_idle_subscribe_state(
     ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
     expected_session: &str,
-) {
+) -> Frame {
     let frame = recv_frame(ws, Duration::from_secs(1))
         .await
-        .expect("PendingApprovalsSnapshot after Subscribe");
-    match frame {
-        Frame::PendingApprovalsSnapshot {
+        .expect("SubscribeState after Subscribe");
+    match &frame {
+        Frame::SubscribeState {
             session_id,
-            call_ids,
-        } => {
-            assert_eq!(session_id.as_str(), expected_session);
-            assert!(
-                call_ids.is_empty(),
-                "no pending approvals expected in test setup; got {call_ids:?}"
-            );
-        }
-        other => panic!("expected PendingApprovalsSnapshot, got {other:?}"),
-    }
-}
-
-/// Consume the `TurnState` snapshot the gateway sends to a connection
-/// for every `Subscribe` (after the pending-approvals snapshot and any
-/// TaskList hydration). The sessions in these tests are idle unless the
-/// test says otherwise, so the snapshot is a definitive `active: false`
-/// — noise that tests doing raw `recv_frame` assertions next need to
-/// step past ([`recv_frame_skip_activity`] skips it automatically).
-async fn expect_idle_turn_state(
-    ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
-    expected_session: &str,
-) {
-    let frame = recv_frame(ws, Duration::from_secs(1))
-        .await
-        .expect("TurnState snapshot after Subscribe");
-    match frame {
-        Frame::TurnState {
-            session_id,
-            active,
-            started_at,
+            turn,
+            work_steps,
+            pending_approvals,
+            tasks,
             ..
         } => {
             assert_eq!(session_id.as_str(), expected_session);
-            assert!(!active, "test sessions are idle; got an active turn");
-            assert_eq!(started_at, None);
+            assert!(!turn.active, "test sessions are idle; got an active turn");
+            assert_eq!(turn.started_at, None);
+            assert!(work_steps.is_empty(), "idle session has no work steps");
+            assert!(
+                pending_approvals.is_empty(),
+                "no pending approvals expected in test setup; got {pending_approvals:?}"
+            );
+            assert!(tasks.is_empty(), "no tasks expected in test setup");
         }
-        other => panic!("expected TurnState, got {other:?}"),
+        other => panic!("expected SubscribeState, got {other:?}"),
     }
+    frame
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -217,7 +214,6 @@ async fn admin_token_attaches_web_chat_and_receives_dispatch() {
         &mut client,
         Frame::Subscribe {
             session_id: "sess-1".into(),
-            since_ordinal: None,
         },
     )
     .await
@@ -226,7 +222,7 @@ async fn admin_token_attaches_web_chat_and_receives_dispatch() {
     // Drain the snapshot frame the gateway sends right after Subscribe
     // and use it as the "subscribe processed" signal — `has_subscribers`
     // is true as soon as the snapshot lands on the wire.
-    expect_empty_pending_snapshot(&mut client, "sess-1").await;
+    expect_idle_subscribe_state(&mut client, "sess-1").await;
     assert!(http_channel.has_subscribers(&baybo_model::SessionId::from("sess-1")));
 
     // Server-side dispatch reaches the subscribed client.
@@ -263,10 +259,59 @@ async fn admin_token_attaches_web_chat_and_receives_dispatch() {
     let _ = server_handle.await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_token_with_device_header_registers_device_channel() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let cfg = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+
+    let shutdown = tg.shutdown.clone();
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
+
+    let device_key = device_proto::delegation::generate_signing_key();
+    let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
+    let mut client = connect_register_with_device_header(
+        port,
+        &tg.deps.admin_token,
+        ChannelType::device(),
+        Some(&device_id),
+    )
+    .await
+    .expect("device WS handshake");
+
+    let device_channel = tg
+        .deps
+        .channel_registry
+        .get(&ChannelType::device())
+        .expect("device channel installed");
+    assert_eq!(device_channel.kind(), ChannelKind::Subscribed);
+    assert_eq!(device_channel.connection_count(), 1);
+
+    let rejected = connect_register_with_device_header(
+        port,
+        &tg.deps.admin_token,
+        ChannelType::http(),
+        Some(&device_id),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        rejected.contains("device token must register as channel_type 'device'"),
+        "device identity must not be allowed to claim http: {rejected}",
+    );
+
+    client.close(None).await.expect("close client");
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
 /// A reconnecting / freshly-opening client recovers the durable planning
-/// checklist: the gateway ships a `TaskList` snapshot right after `Subscribe`
-/// (without waiting for an agent turn), so a reload / WS reset / cache eviction
-/// re-hydrates the list.
+/// checklist from the `SubscribeState` bundle's `tasks` half (without
+/// waiting for an agent turn), so a reload / cache eviction re-hydrates
+/// the list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscribe_hydrates_durable_task_list_snapshot() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
@@ -315,19 +360,17 @@ async fn subscribe_hydrates_durable_task_list_snapshot() {
         &mut client,
         Frame::Subscribe {
             session_id: session.id.clone(),
-            since_ordinal: None,
         },
     )
     .await
     .expect("send Subscribe");
 
-    // After the empty pending snapshot, the gateway hydrates the checklist.
-    expect_empty_pending_snapshot(&mut client, session.id.as_str()).await;
-    let frame = recv_frame_skip_activity(&mut client, Duration::from_secs(1))
+    // The one SubscribeState bundle carries the durable checklist.
+    let frame = recv_frame(&mut client, Duration::from_secs(1))
         .await
-        .expect("TaskList snapshot after Subscribe");
+        .expect("SubscribeState after Subscribe");
     match frame {
-        Frame::TaskList {
+        Frame::SubscribeState {
             session_id, tasks, ..
         } => {
             assert_eq!(session_id, session.id);
@@ -335,7 +378,7 @@ async fn subscribe_hydrates_durable_task_list_snapshot() {
             assert_eq!(tasks[0].subject, "write the table");
             assert_eq!(tasks[0].status, "in_progress");
         }
-        other => panic!("expected TaskList, got {other:?}"),
+        other => panic!("expected SubscribeState, got {other:?}"),
     }
 
     drop(client);
@@ -344,9 +387,10 @@ async fn subscribe_hydrates_durable_task_list_snapshot() {
 }
 
 /// A late joiner (new tab, reconnect) learns whether a turn is in flight
-/// from the `TurnState` snapshot the gateway derives from the job store on
-/// every `Subscribe` — `active: false` on an idle session, `active: true`
-/// with the start instant while a turn-kind job is non-terminal.
+/// from the `SubscribeState` bundle's `turn` half, derived from the job
+/// store on every `Subscribe` — `active: false` on an idle session,
+/// `active: true` with the start instant while a turn-kind job is
+/// non-terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscribe_hydrates_turn_state_snapshot() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
@@ -370,21 +414,22 @@ async fn subscribe_hydrates_turn_state_snapshot() {
         .await
         .expect("bind admin server");
 
-    let expect_turn_state = |frame: Frame, want_active: bool| match frame {
-        Frame::TurnState {
-            session_id,
-            active,
-            started_at,
-            ..
+    let expect_bundle_turn = |frame: Frame, want_active: bool| match frame {
+        Frame::SubscribeState {
+            session_id, turn, ..
         } => {
             assert_eq!(session_id, session.id);
-            assert_eq!(active, want_active);
-            assert_eq!(started_at.is_some(), want_active, "started_at iff active");
+            assert_eq!(turn.active, want_active);
+            assert_eq!(
+                turn.started_at.is_some(),
+                want_active,
+                "started_at iff active"
+            );
         }
-        other => panic!("expected TurnState, got {other:?}"),
+        other => panic!("expected SubscribeState, got {other:?}"),
     };
 
-    // Idle session: the snapshot is a definitive `active: false`.
+    // Idle session: the bundle's turn half is a definitive `active: false`.
     let mut tab_a = connect_register(port, &tg.deps.admin_token, ChannelType::http())
         .await
         .expect("WS handshake");
@@ -392,21 +437,17 @@ async fn subscribe_hydrates_turn_state_snapshot() {
         &mut tab_a,
         Frame::Subscribe {
             session_id: session.id.clone(),
-            since_ordinal: None,
         },
     )
     .await
     .expect("send Subscribe");
-    expect_empty_pending_snapshot(&mut tab_a, session.id.as_str()).await;
-    // No tasks were seeded, so the next frame after the pending snapshot
-    // is the TurnState snapshot itself.
     let frame = recv_frame(&mut tab_a, Duration::from_secs(1))
         .await
-        .expect("TurnState snapshot after Subscribe");
-    expect_turn_state(frame, false);
+        .expect("SubscribeState after Subscribe");
+    expect_bundle_turn(frame, false);
 
     // Turn in flight (a non-terminal UserChat job): a fresh tab's
-    // snapshot reports it active, with the start instant.
+    // bundle reports it active, with the start instant.
     let job = tg
         .deps
         .job_lifecycle
@@ -432,16 +473,14 @@ async fn subscribe_hydrates_turn_state_snapshot() {
         &mut tab_b,
         Frame::Subscribe {
             session_id: session.id.clone(),
-            since_ordinal: None,
         },
     )
     .await
     .expect("send Subscribe (tab b)");
-    expect_empty_pending_snapshot(&mut tab_b, session.id.as_str()).await;
     let frame = recv_frame(&mut tab_b, Duration::from_secs(1))
         .await
-        .expect("TurnState snapshot after Subscribe (tab b)");
-    expect_turn_state(frame, true);
+        .expect("SubscribeState after Subscribe (tab b)");
+    expect_bundle_turn(frame, true);
 
     drop(tab_a);
     drop(tab_b);
@@ -475,7 +514,6 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
         &mut tab_a,
         Frame::Subscribe {
             session_id: "shared".into(),
-            since_ordinal: None,
         },
     )
     .await
@@ -484,13 +522,12 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
         &mut tab_b,
         Frame::Subscribe {
             session_id: "shared".into(),
-            since_ordinal: None,
         },
     )
     .await
     .expect("tab B subscribe");
-    expect_empty_pending_snapshot(&mut tab_a, "shared").await;
-    expect_empty_pending_snapshot(&mut tab_b, "shared").await;
+    expect_idle_subscribe_state(&mut tab_a, "shared").await;
+    expect_idle_subscribe_state(&mut tab_b, "shared").await;
 
     http_channel.dispatch_agent(AgentOutput {
         session_id: "shared".into(),
@@ -542,13 +579,11 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
         &mut client,
         Frame::Subscribe {
             session_id: "interesting".into(),
-            since_ordinal: None,
         },
     )
     .await
     .expect("subscribe");
-    expect_empty_pending_snapshot(&mut client, "interesting").await;
-    expect_idle_turn_state(&mut client, "interesting").await;
+    expect_idle_subscribe_state(&mut client, "interesting").await;
 
     let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
     // Dispatch a content frame (Notice) to an unrelated session. The
@@ -630,13 +665,11 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
         &mut subscriber,
         Frame::Subscribe {
             session_id: "sess-x".into(),
-            since_ordinal: None,
         },
     )
     .await
     .expect("send Subscribe");
-    expect_empty_pending_snapshot(&mut subscriber, "sess-x").await;
-    expect_idle_turn_state(&mut subscriber, "sess-x").await;
+    expect_idle_subscribe_state(&mut subscriber, "sess-x").await;
 
     let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
     let created_at = chrono::Utc::now();
@@ -809,12 +842,11 @@ async fn duplicate_platform_msg_id_drops_retry_on_subscribed_channel() {
         &mut client,
         Frame::Subscribe {
             session_id: "sess-dedup".into(),
-            since_ordinal: None,
         },
     )
     .await
     .expect("send Subscribe");
-    expect_empty_pending_snapshot(&mut client, "sess-dedup").await;
+    expect_idle_subscribe_state(&mut client, "sess-dedup").await;
 
     let send_msg = |id: &str, content: &str| WireMessage {
         content: content.into(),
@@ -909,12 +941,11 @@ async fn messages_batch_reaches_router_as_one_ordered_intake() {
         &mut client,
         Frame::Subscribe {
             session_id: "sess-batch".into(),
-            since_ordinal: None,
         },
     )
     .await
     .expect("send Subscribe");
-    expect_empty_pending_snapshot(&mut client, "sess-batch").await;
+    expect_idle_subscribe_state(&mut client, "sess-batch").await;
 
     let msg = |id: &str, content: &str| WireMessage {
         content: content.into(),
@@ -975,15 +1006,12 @@ async fn messages_batch_reaches_router_as_one_ordered_intake() {
     shutdown.trigger();
     let _ = server_handle.await;
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subscribe_with_since_ordinal_replays_missed_messages() {
-    // Reconnect cursor model: a client that briefly lost the WS sends
-    // `Subscribe { since_ordinal: Some(N) }` on its next attach, and
-    // the gateway streams every persisted Message row with ordinal > N
-    // to that one connection. Agent-injected rows (skill reminders,
-    // tool calls, system frames) are filtered out — the catch-up has
-    // to match what a continuously-connected client would have seen.
+async fn subscribe_sends_one_state_bundle_and_replays_no_history() {
+    // v2 contract: Subscribe never replays transcript rows — forward
+    // recovery is the REST sync call. The only frame a subscriber gets
+    // is the one SubscribeState bundle, stamped with the session's
+    // newest persisted ordinal.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
@@ -999,17 +1027,12 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
         .await
         .expect("create session");
 
-    // Mix of rows: visible bubbles + agent-internal rows that the
-    // catch-up replay must skip.
     let rows: &[ChatMessage] = &[
-        ChatMessage::user(vec![ContentBlock::Text("hi".into())]),
-        // Agent-injected user-role reminder — must NOT replay.
-        ChatMessage::agent_context(vec![ContentBlock::Text("[skill reminder]".into())]),
+        ChatMessage::user(vec![ContentBlock::Text("hi".into())])
+            .with_platform_msg_id("device-msg-0"),
         ChatMessage::assistant(vec![ContentBlock::Text("hello there".into())]),
-        ChatMessage::user(vec![ContentBlock::Text("how are you".into())]),
-        // Tool-result row — must NOT replay.
-        ChatMessage::tool_result("t1".into(), "ok".into()),
-        ChatMessage::assistant(vec![ContentBlock::Text("doing well".into())]),
+        ChatMessage::user(vec![ContentBlock::Text("how are you".into())])
+            .with_platform_msg_id("device-msg-2"),
     ];
     for msg in rows {
         session_manager
@@ -1027,52 +1050,32 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
         .await
         .expect("handshake");
 
-    // Pretend the client only saw the first two visible bubbles (the
-    // first User and the first Assistant) — ordinals 0 and 2 in the
-    // append order, since the skill-reminder row took ordinal 1. The
-    // cursor it sends is the highest one it actually saw: 2.
     send_frame(
         &mut client,
         Frame::Subscribe {
             session_id: session.id.clone(),
-            since_ordinal: Some(2),
         },
     )
     .await
-    .expect("send Subscribe with cursor");
-    expect_empty_pending_snapshot(&mut client, session.id.as_str()).await;
+    .expect("send Subscribe");
 
-    // Catch-up should stream: row #3 (user "how are you", ord=3) and
-    // row #5 (assistant "doing well", ord=5). Row #4 (tool result) is
-    // skipped by the visibility filter.
-    let mut got: Vec<(i64, String, MessageRole)> = Vec::new();
-    for _ in 0..2 {
-        let frame = recv_frame(&mut client, Duration::from_secs(2))
-            .await
-            .expect("recv catch-up frame");
-        match frame {
-            Frame::Message(WireMessage {
-                content,
-                ordinal,
-                role,
-                ..
-            }) => {
-                got.push((
-                    ordinal.expect("catch-up frames carry ordinal"),
-                    content,
-                    role,
-                ));
-            }
-            other => panic!("expected Message, got {other:?}"),
+    let bundle = expect_idle_subscribe_state(&mut client, session.id.as_str()).await;
+    match bundle {
+        Frame::SubscribeState { as_of_ordinal, .. } => {
+            assert_eq!(
+                as_of_ordinal,
+                Some(2),
+                "bundle stamps the newest persisted ordinal"
+            );
         }
+        other => panic!("expected SubscribeState, got {other:?}"),
     }
-    assert_eq!(
-        got,
-        vec![
-            (3, "how are you".to_string(), MessageRole::User),
-            (5, "doing well".to_string(), MessageRole::Assistant),
-        ],
-        "catch-up replays UI-visible rows above cursor in ordinal order",
+
+    // Nothing else follows — history is never replayed on subscribe.
+    let extra = recv_frame(&mut client, Duration::from_millis(300)).await;
+    assert!(
+        extra.is_err(),
+        "subscribe must not replay history; got {extra:?}",
     );
 
     drop(client);
@@ -1080,13 +1083,12 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
     let _ = server_handle.await;
 }
 
-/// `Frame::FetchHistory` is the relay leg's REST-less backfill: a subscribed
-/// connection asks for a backward page and the gateway replies, on that
-/// connection only, with one `Frame::HistoryPage` of UI-visible bubbles (the same
-/// projection `Subscribe` catch-up uses — agent-internal rows filtered out), plus
-/// the raw `oldest`/`newest_ordinal` bounds and `has_more`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fetch_history_returns_backward_page_of_visible_rows() {
+async fn subscribe_outside_channel_universe_is_rejected() {
+    // The `http` (web) and `device` channels own disjoint session sets.
+    // A Subscribe naming a session that lives on the other channel is
+    // rejected with an error Notice and never registers — the same
+    // universe boundary the REST layer enforces.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
@@ -1100,106 +1102,58 @@ async fn fetch_history_returns_backward_page_of_visible_rows() {
     let session = session_manager
         .create_session(user, ChannelType::http())
         .await
-        .expect("create session");
-
-    // Same mix as the catch-up test: visible bubbles interleaved with
-    // agent-internal rows the history page must filter out.
-    let rows: &[ChatMessage] = &[
-        ChatMessage::user(vec![ContentBlock::Text("hi".into())]),
-        ChatMessage::agent_context(vec![ContentBlock::Text("[skill reminder]".into())]),
-        ChatMessage::assistant(vec![ContentBlock::Text("hello there".into())]),
-        ChatMessage::user(vec![ContentBlock::Text("how are you".into())]),
-        ChatMessage::tool_result("t1".into(), "ok".into()),
-        ChatMessage::assistant(vec![ContentBlock::Text("doing well".into())]),
-    ];
-    for msg in rows {
-        session_manager
-            .append_session_message(&session.id, msg)
-            .await
-            .expect("append");
-    }
+        .expect("create http session");
 
     let shutdown = tg.shutdown.clone();
     let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
         .await
         .expect("bind admin server");
 
-    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
-        .await
-        .expect("handshake");
+    // A device-channel connection tries to subscribe to the http session.
+    let device_key = device_proto::delegation::generate_signing_key();
+    let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
+    let mut device_client = connect_register_with_device_header(
+        port,
+        &tg.deps.admin_token,
+        ChannelType::device(),
+        Some(&device_id),
+    )
+    .await
+    .expect("device WS handshake");
 
-    // FetchHistory requires the connection to be subscribed to the session
-    // (parity with the inbound Message path), so Subscribe first (no catch-up).
     send_frame(
-        &mut client,
+        &mut device_client,
         Frame::Subscribe {
             session_id: session.id.clone(),
-            since_ordinal: None,
         },
     )
     .await
-    .expect("send Subscribe");
-    expect_empty_pending_snapshot(&mut client, session.id.as_str()).await;
+    .expect("send cross-universe Subscribe");
 
-    // Request the newest page (before_ordinal = None).
-    send_frame(
-        &mut client,
-        Frame::FetchHistory {
-            session_id: session.id.clone(),
-            before_ordinal: None,
-            limit: Some(50),
-        },
-    )
-    .await
-    .expect("send FetchHistory");
-
-    // Skip the post-Subscribe snapshots (TaskList / TurnState) until the page.
-    let page = loop {
-        let frame = recv_frame(&mut client, Duration::from_secs(2))
-            .await
-            .expect("recv frame");
-        if matches!(frame, Frame::HistoryPage { .. }) {
-            break frame;
+    let frame = recv_frame(&mut device_client, Duration::from_secs(1))
+        .await
+        .expect("rejection notice");
+    match frame {
+        Frame::Notice {
+            session_id, level, ..
+        } => {
+            assert_eq!(session_id, session.id);
+            assert_eq!(level, "error");
         }
-    };
-    let Frame::HistoryPage {
-        messages,
-        oldest_ordinal,
-        newest_ordinal,
-        has_more,
-        ..
-    } = page
-    else {
-        unreachable!()
-    };
+        other => panic!("expected error Notice, got {other:?}"),
+    }
 
-    let visible: Vec<(i64, String, MessageRole)> = messages
-        .into_iter()
-        .map(|m| {
-            (
-                m.ordinal.expect("history rows carry ordinal"),
-                m.content,
-                m.role,
-            )
-        })
-        .collect();
-    assert_eq!(
-        visible,
-        vec![
-            (0, "hi".to_string(), MessageRole::User),
-            (2, "hello there".to_string(), MessageRole::Assistant),
-            (3, "how are you".to_string(), MessageRole::User),
-            (5, "doing well".to_string(), MessageRole::Assistant),
-        ],
-        "history page carries UI-visible bubbles in ascending ordinal order",
+    let device_channel = tg
+        .deps
+        .channel_registry
+        .get(&ChannelType::device())
+        .expect("device channel installed");
+    assert!(
+        !device_channel.has_subscribers(&session.id),
+        "cross-universe subscribe must not register",
     );
-    // Raw page bounds span every row (incl. the filtered ones); 6 rows < limit,
-    // so nothing older remains.
-    assert_eq!(oldest_ordinal, Some(0));
-    assert_eq!(newest_ordinal, Some(5));
-    assert!(!has_more);
 
-    drop(client);
+    drop(device_client);
     shutdown.trigger();
     let _ = server_handle.await;
 }

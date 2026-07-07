@@ -1,20 +1,25 @@
 //! Admin TCP bearer-token auth.
 //!
 //! The admin listener hosts config / status / jobs / cron / memory /
-//! traces / skills / tools / llm and a read-only channel list — no chat
-//! content. A single bearer token stored in the secret vault under
-//! `gateway.admin_token` guards every `/v1/*` route.
+//! traces / skills / tools / llm, chat REST, and the co-hosted channel
+//! WS/blob routes. The admin bearer stored in the secret vault under
+//! `gateway.admin_token` guards ordinary Web requests. When
+//! `x-baybo-device-id` is present, the presented bearer must either be that
+//! admin token or the matching approved device `auth_token` from the device
+//! store; only then is the request tagged as `AuthedClient::Device`.
 
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Request, StatusCode, Uri};
+use axum::http::{HeaderMap, Request, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
 use baybo_security::SecretVault;
+use baybo_store::DeviceStore;
 use rand::Rng;
 
+use super::channel::{AuthedClient, DEVICE_ID_HEADER};
 use crate::{GatewayError, Result};
 
 const TOKEN_SECRET_NAME: &str = "gateway.admin_token";
@@ -80,44 +85,107 @@ fn generate_token() -> String {
 #[derive(Clone)]
 pub struct AdminAuthState {
     expected: Arc<String>,
+    device_store: Option<Arc<dyn DeviceStore>>,
 }
 
 impl AdminAuthState {
     pub fn new(token: String) -> Self {
         Self {
             expected: Arc::new(token),
+            device_store: None,
         }
     }
 
-    /// Validate the admin bearer on `req` and strip a `?token=...` query
-    /// parameter before downstream layers can log the URI.
-    pub fn authenticate_request(&self, req: &mut Request<Body>) -> bool {
+    pub fn with_device_store(mut self, device_store: Arc<dyn DeviceStore>) -> Self {
+        self.device_store = Some(device_store);
+        self
+    }
+
+    /// Validate the bearer on `req`, resolve the downstream caller identity, and
+    /// strip a `?token=...` query parameter before downstream layers can log the
+    /// URI.
+    pub async fn authenticate_request(
+        &self,
+        req: &mut Request<Body>,
+    ) -> std::result::Result<AuthedClient, StatusCode> {
         let Some(presented) = extract_token(req) else {
-            return false;
+            return Err(StatusCode::UNAUTHORIZED);
         };
-        if !super::token::constant_time_eq(self.expected.as_bytes(), presented.as_bytes()) {
-            return false;
-        }
+        let device_id = device_id_claim(req.headers())?;
+        let is_admin_token =
+            super::token::constant_time_eq(self.expected.as_bytes(), presented.as_bytes());
+
+        let authed = match device_id {
+            Some(device_id) if is_admin_token => AuthedClient::Device { device_id },
+            Some(device_id) => {
+                self.authenticate_device_token(&presented, device_id)
+                    .await?
+            }
+            None if is_admin_token => AuthedClient::Web,
+            None => return Err(StatusCode::UNAUTHORIZED),
+        };
+
         if let Some(sanitised) = sanitise_uri(req.uri()) {
             *req.uri_mut() = sanitised;
         }
-        true
+        Ok(authed)
+    }
+
+    async fn authenticate_device_token(
+        &self,
+        presented: &str,
+        claimed_device_id: String,
+    ) -> std::result::Result<AuthedClient, StatusCode> {
+        let Some(device_store) = &self.device_store else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        match device_store.lookup_approved_by_auth_token(presented).await {
+            Ok(Some(row)) if row.device_id == claimed_device_id => Ok(AuthedClient::Device {
+                device_id: claimed_device_id,
+            }),
+            Ok(Some(row)) => {
+                tracing::warn!(
+                    claimed_device_id = %claimed_device_id,
+                    token_device_id = %row.device_id,
+                    "admin auth: device header does not match bearer token"
+                );
+                Err(StatusCode::UNAUTHORIZED)
+            }
+            Ok(None) => Err(StatusCode::UNAUTHORIZED),
+            Err(e) => {
+                tracing::warn!(error = %e, "admin auth: device token lookup failed");
+                Err(StatusCode::UNAUTHORIZED)
+            }
+        }
     }
 }
 
 /// Axum middleware: extracts the token (Authorization header preferred,
-/// `?token=` query fallback), constant-time compares against the
-/// vault-stored value, and strips `token` from the URI before passing
-/// the request on so `tower_http::trace::TraceLayer` does not log it.
+/// `?token=` query fallback), resolves Web vs. Device identity, and strips
+/// `token` from the URI before passing the request on so
+/// `tower_http::trace::TraceLayer` does not log it.
 pub async fn require_admin_token(
     State(state): State<AdminAuthState>,
     mut req: Request<Body>,
     next: Next,
 ) -> std::result::Result<Response, StatusCode> {
-    if !state.authenticate_request(&mut req) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    let authed = state.authenticate_request(&mut req).await?;
+    req.extensions_mut().insert(authed);
     Ok(next.run(req).await)
+}
+
+fn device_id_claim(headers: &HeaderMap) -> std::result::Result<Option<String>, StatusCode> {
+    let Some(value) = headers.get(DEVICE_ID_HEADER) else {
+        return Ok(None);
+    };
+    let device_id = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?.trim();
+    if device_id.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if device_proto::delegation::device_pubkey_from_id(device_id).is_err() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(Some(device_id.to_owned()))
 }
 
 fn extract_token(req: &Request<Body>) -> Option<String> {

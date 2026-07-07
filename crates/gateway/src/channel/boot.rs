@@ -36,7 +36,7 @@ pub(crate) const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// process per view = `Subscribed`), not from operator preference.
 fn kind_for(channel_type: &ChannelType) -> ChannelKind {
     match channel_type.as_str() {
-        ChannelType::HTTP | ChannelType::TUI | ChannelType::IOS => ChannelKind::Subscribed,
+        ChannelType::HTTP | ChannelType::TUI | ChannelType::DEVICE => ChannelKind::Subscribed,
         ChannelType::TELEGRAM | ChannelType::DISCORD | ChannelType::WEIXIN => {
             ChannelKind::Multiplexed
         }
@@ -74,30 +74,33 @@ pub fn install_channels(
     // [`install_channel`] so the lazy-install fallback in
     // [`super::adapter::Sidecar::build`] can never miss it either.
     install_channel(registry, ChannelType::http())?;
-    // The iOS companion is a `Subscribed` channel like `http`: paired devices
-    // register as `ios` and self-pull threads via `Frame::Subscribe`. Always
+    // The mobile companion device channel is `Subscribed` like `http`: paired
+    // devices register as `device` and self-pull threads via `Frame::Subscribe`. Always
     // installed — the device-auth gate (an approved `auth_token`) is what
     // actually admits a connection, so the waiting channel costs nothing.
-    install_channel(registry, ChannelType::ios())?;
+    install_channel(registry, ChannelType::device())?;
     Ok(())
 }
 
-/// Install one channel with its approval gate. For the `http` channel
-/// the [`SessionPulse`] observer is attached too: a `UserEcho` or a
-/// *completed* agent emission (terminal `Message`/`Notice`) then emits a
-/// throttled `Frame::SessionActivity` so sidebar tabs not subscribed to
-/// the affected session still get the unread signal.
+/// Install one channel with its approval gate. For the `http` (web) and
+/// `device` (mobile) chat surfaces the [`SessionPulse`] observer is attached
+/// too: a `UserEcho` or a *completed* agent emission (terminal
+/// `Message`/`Notice`) then emits a throttled `Frame::SessionActivity` so
+/// clients not subscribed to the affected session still get the unread signal.
+/// TUI is `Subscribed` as well but is deliberately excluded — it ignores
+/// `SessionActivity`, and its post-`Subscribe` handshake expects
+/// `HistorySnapshot` as the very next frame, which a broadcast pulse could race.
 pub(crate) fn install_channel(
     registry: &Arc<ChannelRegistry>,
     channel_type: ChannelType,
 ) -> ChannelResult<()> {
     let kind = kind_for(&channel_type);
     let channel = build_channel(channel_type.clone(), kind);
-    let is_http = channel_type == ChannelType::http();
+    let wants_pulse = channel_type == ChannelType::http() || channel_type == ChannelType::device();
     registry.install(channel)?;
-    if is_http
-        && let Some(http) = registry.get(&channel_type)
-        && let Some(sub) = http.as_subscribed()
+    if wants_pulse
+        && let Some(chan) = registry.get(&channel_type)
+        && let Some(sub) = chan.as_subscribed()
     {
         SessionPulse::new().install(sub);
     }
@@ -173,7 +176,7 @@ mod tests {
     fn kind_for_known_types() {
         assert!(kind_for(&ChannelType::http()).is_subscribed());
         assert!(kind_for(&ChannelType::tui()).is_subscribed());
-        assert!(kind_for(&ChannelType::ios()).is_subscribed());
+        assert!(kind_for(&ChannelType::device()).is_subscribed());
         assert!(kind_for(&ChannelType::telegram()).is_multiplexed());
         assert!(kind_for(&ChannelType::weixin()).is_multiplexed());
         assert!(kind_for(&ChannelType::discord()).is_multiplexed());

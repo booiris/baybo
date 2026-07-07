@@ -25,8 +25,12 @@ use ulid::Ulid;
 pub struct SessionId(String);
 
 impl SessionId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    pub fn with_prefix(prefix: &str) -> Self {
+        Self(format!("{prefix}{}", uuid::Uuid::new_v4()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -35,6 +39,12 @@ impl SessionId {
 
     pub fn into_inner(self) -> String {
         self.0
+    }
+}
+
+impl Default for SessionId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

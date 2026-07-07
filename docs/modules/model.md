@@ -6,7 +6,7 @@
 
 Contents:
 
-- **Content models**: `ContentBlock`, `BlobRef`, `ChatMessage`, `Role`, `MessageSource`, `ThinkingContent`, `MessageMetadata` (now an empty struct), plus the `TOOL_OUTPUT_OPEN_PREFIX` / `TOOL_OUTPUT_CLOSE_PREFIX` marker constants
+- **Content models**: `ContentBlock`, `BlobRef`, `ChatMessage` (including the persisted `platform_msg_id` idempotency key for channel-originated user rows), `Role`, `MessageSource`, `ThinkingContent`, `MessageMetadata` (now an empty struct), plus the `TOOL_OUTPUT_OPEN_PREFIX` / `TOOL_OUTPUT_CLOSE_PREFIX` marker constants
 - **Session types**: `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `Lineage`, `LineageKind`, `BackgroundCompressionPayload`
 - **Memory types**: `MessageSource::RecalledMemory` (the framed recall-injection marker) + the `ChatMessage::recalled_memory` constructor
 - **Governance types**: `TrustLevel`, `ArtifactSource`, `ExtensionManifest`, `ExtensionKind`

@@ -70,7 +70,7 @@ shared blind relay and is **not** bound 1:1.
   single `PairedRecord`; the UI offers **Replace** (re-pair, overwrite on success)
   and **Forget** (`forget_pairing` — drops the record + push key). The app's
   Noise static identity lives under its own account (`baybo.device-identity`) and
-  is **stable** across re-pairings, so the derived `device_id` (`ios-<pubkey[..8]>`)
+  is **stable** across re-pairings, so the derived `device_id` (`device-<pubkey[..8]>`)
   is stable; *Forget* deliberately keeps it.
 
 ## Components
@@ -149,7 +149,7 @@ static in the device row. The gateway runs a **Noise IK responder**
 first handshake message, authenticates the device by matching its static to an
 *approved* row (`DeviceStore::lookup_approved_by_pubkey` — **no token rides the
 content leg**), then Noise-wraps the *same* channel frame loop the TUI / web chat
-use (`ChannelType::ios`, `Subscribe` + self-pull). Frames are chunked
+use (`ChannelType::device`, `Subscribe` + self-pull). Frames are chunked
 (`write_chunked` / `FrameReassembler`). The transport is generic
 (`BinarySink` / `BinarySource`), so the responder can be tested in memory and
 runs in production over the outbound relay data leg.
@@ -184,14 +184,11 @@ for this device. Before the first push to a device in a gateway run, A
 best-effort POSTs a signed `/register` carrying `{device_id, apns_token, env,
 gateway_pubkey, delegation, sig, counter}` from the persisted material, so a
 restarted/pruned C can recover before `/notify`. If iOS delivers or rotates the
-APNs token after pairing, P sends it to A over the sealed content channel
-(`Frame::UpdateApnsToken`) on every connect; the gateway persists it and
-re-registers on the next push. The phone never POSTs C's `/register` directly and
-never holds the APNs `.p8` or any push provider credential; it only holds its APNs
-device token, relay admission key, device identity, and `push_key`. The token is
-captured at launch by hooking the Tauri/wry-owned `UIApplicationDelegate`
-(`push_register.rs`, `class_addMethod` on
-`didRegisterForRemoteNotificationsWithDeviceToken`).
+APNs token after pairing, P sends it to A through the device API
+`POST /v1/mobile/apns-token`; the gateway persists it and re-registers on the
+next push. The phone never POSTs C's `/register` directly and never holds the
+APNs `.p8` or any push provider credential; it only holds its APNs device token,
+relay admission key, device identity, and `push_key`.
 
 **Direct-mode push (no pairing):** the direct transport has no pairing handshake,
 so it provisions the *same* binding over the admin-token REST surface instead.
@@ -267,20 +264,30 @@ C's blind relay, which only matches two legs by key and copies opaque frames
 The app stores its `PairedRecord` (auth token, gateway static key, routing
 candidates, relay node id, Noise static secret) in the App Group keychain and
 shows a "remembered" view on launch. The chat survives a background round-trip,
-and the content session reconnects (with catch-up) on every iOS foreground. It
+and the content session reconnects (then runs the sync loop —
+`docs/sync-protocol.md`) on every iOS foreground. It
 also reconnects on its own when a live leg drops mid-session: the Rust pump emits
 a `content-disconnected` event on any unsolicited exit (socket close, the
 inbound-liveness lapse, a remote-host restart) — but not on a deliberate
-reconnect/disconnect, which aborts the task first — and the webview retries on a
-short backoff, so chat recovers without waiting for the next foreground. A failed
-dial backs off and retries the same way instead of stranding on "Connect failed".
+reconnect/disconnect, which aborts the task first — and the native chat store
+retries on a short backoff, so chat recovers without waiting for the next
+foreground. In the SwiftUI app `AppStore` caches a `ChatStore` per opened
+session, while the Rust FFI keeps one global chat leg per binding and sends
+per-session `Subscribe` frames on that leg. Backing out to the list detaches the
+webview but leaves the session sink registered, buffering frames until the
+session view attaches again; switching sessions adds/reuses a subscription
+instead of redialing. Relay bindings warm that global content leg on
+launch/foreground before any session is selected; the warm-up performs the
+relay/Noise handshake and APNs refresh but sends no `Subscribe`. A failed dial
+backs off and retries the same way instead of stranding on "Connect failed".
 `push_key` is persisted to the App Group keychain on a successful pair so the NSE
 can read it on-device.
 
 ## Attachments
 
-Mobile attachments use dedicated relay blob legs rather than the chat leg. The
-blob path, token gate, bandwidth class, and upload quota are documented in
+Mobile attachments use dedicated relay blob legs rather than the chat leg, with
+blob bytes carried as API tunnel requests over those background legs. The blob
+path, token gate, bandwidth class, and upload quota are documented in
 [`blob-transfer.md`](blob-transfer.md).
 
 ## Status & open items

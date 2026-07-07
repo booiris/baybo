@@ -50,9 +50,9 @@ const PREVIEW_MAX_CHARS: usize = 200;
 /// margin tolerates an interleaved row without a second round-trip.
 const PREVIEW_READ_LIMIT: usize = 4;
 
-/// Remote host (C) that direct-mode (web-identity) push bindings register +
+/// Remote host (C) that direct-mode device push bindings register +
 /// notify through. Hardcoded to the public proxy the app already defaults to for
-/// pairing, so direct/web sessions get push out of the box; not yet operator-
+/// pairing, so direct device sessions get push out of the box; not yet operator-
 /// configurable (a `[push]` config block can override this later).
 pub(crate) const DEFAULT_PUSH_RELAY_URL: &str = "wss://proxy.baybo.space";
 
@@ -343,8 +343,8 @@ pub struct PushDispatcher {
     apns_registrar: Option<Arc<dyn ApnsRegistrar>>,
     /// The APNs token last registered with C per device this run, so we register
     /// at most once per (device, token): a token that **changed** (APNs rotation,
-    /// pushed to A over the content channel via `Frame::UpdateApnsToken`) differs
-    /// from the cached one and re-registers; an unchanged token is skipped.
+    /// pushed to A via `POST /v1/mobile/apns-token`) differs from the cached one
+    /// and re-registers; an unchanged token is skipped.
     registered: Mutex<HashMap<String, String>>,
     /// A's gateway Ed25519 push-signing key, lazily loaded from the vault and
     /// cached for the dispatcher's lifetime.
@@ -487,10 +487,10 @@ impl PushDispatcher {
                 return;
             }
         }
-        // Fan out to every approved paired device AND every direct-mode (web)
-        // push binding — one gateway = one user, so there is no per-user scoping.
-        // A web binding is cryptographically identical to a device binding, so
-        // both ride the same dispatch path (see [`web`]).
+        // Fan out to every approved paired device AND every direct-mode device push
+        // binding — one gateway = one user, so there is no per-user scoping.
+        // A direct binding is cryptographically identical to a paired-device
+        // binding, so both ride the same dispatch path (see [`web`]).
         let device_rows = match self.device_store.list(Some(DeviceStatus::Approved)).await {
             Ok(rows) => rows,
             Err(e) => {
@@ -787,9 +787,9 @@ impl PushDispatcher {
             .await
             .ok()?;
         rows.into_iter()
-            .find(|(ord, _)| *ord == ordinal)
-            .filter(|(_, m)| m.role == Role::Assistant)
-            .and_then(|(_, m)| {
+            .find(|(ord, _, _)| *ord == ordinal)
+            .filter(|(_, _, m)| m.role == Role::Assistant)
+            .and_then(|(_, _, m)| {
                 m.content.iter().find_map(|cb| match cb {
                     ContentBlock::Text(t) => Some(t.clone()),
                     _ => None,
@@ -1266,9 +1266,9 @@ mod tests {
         }
     }
 
-    /// End-to-end for the direct-mode path: a registered web push binding is a
+    /// End-to-end for the direct-mode path: a registered direct push binding is a
     /// valid [`PushTarget`] whose dispatched `/notify` decrypts under the
-    /// client's push key — proving the web binding reuses the device notify
+    /// client's push key — proving the direct binding reuses the device notify
     /// pipeline byte-for-byte.
     #[tokio::test]
     async fn web_binding_dispatch_yields_decryptable_notify() {

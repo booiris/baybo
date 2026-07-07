@@ -199,9 +199,10 @@ choose your own up front with `--session`) when you intend to resume.
 Resume with `baybo prompt --session <id> "next turn"`: the agent rehydrates
 that session's context (server-side under a gateway, from the durable row
 in-process) and only the new turn's output is printed — the prior
-transcript is not replayed (the client subscribes with `since_ordinal:
-None`). This mirrors Claude Code's `claude -p --output-format json` →
-`--resume <id>`, except Baybo's client (not the server) assigns the id.
+transcript is not replayed (Subscribe never replays history; the durable
+transcript is a REST concern). This mirrors Claude Code's
+`claude -p --output-format json` → `--resume <id>`, except Baybo's client
+(not the server) assigns the id.
 
 **Tool approvals** have no human to answer them. Default is `Deny`
 (fail-closed — the turn continues and the model adapts to the denial);

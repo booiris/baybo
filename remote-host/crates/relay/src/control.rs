@@ -101,8 +101,8 @@ impl ControlRegistry {
     }
 
     /// Signal a registered gateway to open a data leg under `relay_key` of the
-    /// given `class` (so the gateway runs the chat loop or the blob sub-protocol
-    /// and meters accordingly). Returns the gateway's `remote_api_key` on success
+    /// given `class` (so the gateway runs the chat loop or API tunnel and meters
+    /// accordingly). Returns the gateway's `remote_api_key` on success
     /// (so the caller can meter the resulting leg against it), or `None` if the
     /// gateway isn't connected (the phone's relay attempt then fails fast rather
     /// than hanging) or its control channel is closed.
@@ -195,6 +195,13 @@ mod tests {
         assert_eq!(v["t"], "open_data_leg");
         assert_eq!(v["relay_key"], "k");
         assert_eq!(v["class"], "blob");
+
+        let v = serde_json::to_value(ControlSignal::OpenDataLeg {
+            relay_key: "k".into(),
+            class: LegClass::Api,
+        })
+        .unwrap();
+        assert_eq!(v["class"], "api");
     }
 
     #[tokio::test]

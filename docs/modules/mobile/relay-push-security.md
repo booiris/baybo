@@ -307,7 +307,7 @@ Push has three separate protections:
 - P authenticates preview content locally with the `push_key` AEAD tag.
 
 The binding is owned by the device's Ed25519 identity: `device_id ==
-ios-<hex(device_pubkey)>`, so it self-certifies at C. At pairing the device signs
+device-<hex(device_pubkey)>`, so it self-certifies at C. At pairing the device signs
 a **delegation** authorizing A's gateway push key, and A signs every `/register`
 and `/notify`. The signed byte layout is pinned in `device-proto`'s `delegation`
 module; C re-implements verification against it.
@@ -327,7 +327,7 @@ Registration:
 
 ```json
 {
-  "device_id": "ios-<hex(ed25519 pubkey)>",
+  "device_id": "device-<hex(ed25519 pubkey)>",
   "apns_token": "...",
   "env": "sandbox",
   "gateway_pubkey": "base64(gateway ed25519 pub)",
@@ -337,16 +337,16 @@ Registration:
 }
 ```
 
-   C verifies `device_id == ios-<hex(device_pubkey)>`, the delegation under the
+   C verifies `device_id == device-<hex(device_pubkey)>`, the delegation under the
    device key, the register signature under `gateway_pubkey`, and that `counter`
    strictly exceeds the device's last accepted one; then it stores `device_id ->
    { apns_token, env, gateway_pubkey, last_counter }`. The app no longer registers
    directly with C (it holds no gateway push key). Instead the app sends its
-   current APNs token to the gateway on every content connect (a sealed
-   `Frame::UpdateApnsToken` over the Noise IK leg); the gateway persists it and
-   re-registers (signed) on its next push when the token changed — so a token that
-   arrived after pairing, or rotated later (reinstall / restore / new device), is
-   bound on the next connect with no re-pair.
+   current APNs token to the gateway through the device API
+   `POST /v1/mobile/apns-token`; the gateway persists it and re-registers
+   (signed) on its next push when the token changed — so a token that arrived
+   after pairing, or rotated later (reinstall / restore / new device), is bound
+   without a re-pair.
 
 Notification:
 
@@ -419,11 +419,12 @@ Noise and frame loop:
 1. P starts the IK handshake and sends msg1 over the spliced leg.
 2. A authenticates P by approved static public key and sends msg2.
 3. Both sides enter Noise transport mode.
-4. P sends `Frame::Subscribe { session_id, since_ordinal }`.
+4. P sends `Frame::Subscribe { session_id }`.
 5. A wraps the Noise transport in the normal channel `FrameSource`/`FrameSink`
    path and reuses the same channel frame loop as TUI and web chat.
-6. A replays catch-up rows above `since_ordinal` and streams live
-   `SessionEvent`s.
+6. A answers with one `Frame::SubscribeState` bundle and streams live
+   `SessionEvent`s; transcript recovery is P's REST sync call over the API
+   tunnel (see `docs/sync-protocol.md`).
 7. P sends user `Frame::Message` values with a client-generated
    `platform_msg_id` for idempotency.
 8. A routes inbound frames into the normal gateway router, agent execution, and
@@ -472,7 +473,7 @@ Registration is gateway-mediated and signed end to end; the app never POSTs C's
 Keys (all established at pairing — see
 [Shared relay key tenancy](#shared-relay-key-tenancy-and-push-binding-authentication)):
 
-- Device Ed25519 identity `D` — `device_id == ios-<hex(D_pub)>` — in P's private
+- Device Ed25519 identity `D` — `device_id == device-<hex(D_pub)>` — in P's private
   keychain.
 - Gateway Ed25519 push key `G`, vault-persisted on A (`gateway.push_signing_key`),
   one per gateway.
@@ -496,7 +497,7 @@ Keys (all established at pairing — see
 
    ```json
    {
-     "device_id": "ios-<hex(D_pub)>",
+     "device_id": "device-<hex(D_pub)>",
      "apns_token": "...",
      "env": "sandbox",
      "gateway_pubkey": "base64(G_pub)",
@@ -506,7 +507,7 @@ Keys (all established at pairing — see
    }
    ```
 
-   C verifies `device_id == ios-<hex(D_pub)>`, the delegation under `D_pub`, the
+   C verifies `device_id == device-<hex(D_pub)>`, the delegation under `D_pub`, the
    register signature under `G_pub`, and `counter` strictly above the device's last
    accepted; on success it stores `device_id -> { apns_token, env, gateway_pubkey,
    last_counter }`. Any failure → `403`, binding untouched. A caches the
@@ -519,11 +520,11 @@ Keys (all established at pairing — see
    the device is still unknown after that re-register (missing delegation/APNs
    material), A logs a warning rather than failing silently.
 4. **Token refresh.** A token that missed `DeviceHello`, or rotated after pairing,
-   reaches A over the content channel: P sends its current token in a sealed
-   `Frame::UpdateApnsToken { apns_token, apns_env }` over the Noise IK content leg
-   on every connect. A intercepts it before the generic router and persists it
-   (`device.<device_id>.apns`); because the cached token now differs, the
-   dispatcher re-registers (signed, as in step 3) on its next push — no re-pair.
+   reaches A through the device API: P sends its current token with
+   `POST /v1/mobile/apns-token`. A authenticates the device principal and
+   persists it (`device.<device_id>.apns`); because the cached token now differs,
+   the dispatcher re-registers (signed, as in step 3) on its next push — no
+   re-pair.
 5. **Pruning.** When APNs rejects a token (`400`/`410`), C unbinds it (the device
    row on A is never touched); a later push re-registers from A's persisted material.
 
@@ -565,9 +566,9 @@ Encryption and `/notify`:
 
 ```json
 {
-  "device_id": "ios-<hex(ed25519 pubkey)>",
+  "device_id": "device-<hex(ed25519 pubkey)>",
   "collapse_id": "<hex(sha256(device_id || ':' || session_id))[..16]>",
-  "bid": "ios-...",
+  "bid": "device-...",
   "enc": "base64(ciphertext||tag)",
   "n": "base64(nonce)",
   "sig": "base64(gateway signature over this notify)",
@@ -592,7 +593,7 @@ C to APNs:
   },
   "enc": "...",
   "n": "...",
-  "bid": "ios-..."
+  "bid": "device-..."
 }
 ```
 
@@ -634,7 +635,7 @@ Relevant code:
 
 1. The app reuses its long-term **Ed25519 push identity** (`baybo.device-sign-key`,
    the *same* key the relay path uses, so a phone keeps one `device_id ==
-   ios-<hex(pub)>` whichever way it connects).
+   device-<hex(pub)>` whichever way it connects).
 2. `GET /v1/push/params` (admin Bearer) returns the gateway's Ed25519 push public
    key `G_pub`.
 3. The app **load-or-creates** a stable 32-byte `push_key` in the **shared App
@@ -785,7 +786,7 @@ The binding is authenticated to its **device key**, independent of the relay
 admission key:
 
 - The device holds an Ed25519 identity key `D`. Its `device_id` *is* that public
-  key (`ios-<hex(D_pub)>`), so the binding self-certifies — C re-derives
+  key (`device-<hex(D_pub)>`), so the binding self-certifies — C re-derives
   `device_id` from the key carried in the request.
 - At pairing the device signs a delegation authorizing the gateway's Ed25519 push
   key `G` (carried in `GatewayWelcome`); it sends the delegation as the sealed 6th
@@ -794,7 +795,7 @@ admission key:
   strictly-increasing `counter`.
 
 C verifies, with **no stored secret and no trust-on-first-use**: `device_id ==
-ios-<hex(D_pub)>`, the delegation under `D_pub`, the request signature under
+device-<hex(D_pub)>`, the delegation under `D_pub`, the request signature under
 `G_pub` (stored at register), and `counter` strictly greater than the device's
 last accepted. Only the holder of `D` can authorize a `G`, and only the holder of
 `G` can mutate or notify the binding.
@@ -811,10 +812,9 @@ last accepted. Only the holder of `D` can authorize a `G`, and only the holder o
   two against drift.
 - The gateway is the **only** registrar (it holds `G`). A token that missed
   `DeviceHello`, or rotated after pairing (APNs tokens are not stable across
-  reinstall / restore / new device), reaches the gateway over the content channel:
-  the app sends its current token in a sealed `Frame::UpdateApnsToken` on every
-  connect, and the gateway persists it and re-registers (signed) on its next push
-  when it changed — no re-pair needed.
+  reinstall / restore / new device), reaches the gateway through
+  `POST /v1/mobile/apns-token`, and the gateway persists it and re-registers
+  (signed) on its next push when it changed — no re-pair needed.
 - This protects binding *integrity and delivery routing*, not the existence or
   timing of a push, nor preview confidentiality (which `push_key` already covers).
 
@@ -956,8 +956,8 @@ not from C admission.
 - `/register` is sent only by A (it holds the gateway push signing key the binding
   is authenticated with); P cannot register directly, and never holds APNs
   provider credentials. P keeps the binding current by sending its APNs token to A
-  over the content channel (`Frame::UpdateApnsToken`) on every connect, so a token
-  that missed `DeviceHello` or rotated later is re-registered without a re-pair.
+  via `POST /v1/mobile/apns-token`, so a token that missed `DeviceHello` or
+  rotated later is re-registered without a re-pair.
 - A retries push registration (signed) from non-empty APNs material persisted in
   the vault before its first push in a run, which self-heals a missing C-side
   token binding when the token was available to A. A `/notify` answered `404`

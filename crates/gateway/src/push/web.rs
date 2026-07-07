@@ -1,17 +1,18 @@
-//! Direct-mode (web-identity) push bindings.
+//! Direct-mode device push bindings.
 //!
 //! A scan-to-pair device gets its push material — Ed25519 identity, `push_key`,
 //! delegation, APNs token, and a remote-host endpoint — bootstrapped by the Noise
 //! pairing handshake and recorded on the device row. The **direct** transport has
-//! no pairing, so a web client bootstraps the *same* material over the
-//! authenticated admin-token REST channel (`POST /v1/push/register`) instead: it
-//! mints its own Ed25519 identity (so `device_id == ios-<hex(pub)>` self-certifies
-//! to C exactly like a device), a random `push_key`, and a delegation authorizing
-//! the gateway push key — then the gateway persists it here.
+//! no pairing, so the app bootstraps the *same* material over the authenticated
+//! admin-token REST channel (`POST /v1/push/register`) plus
+//! `x-baybo-device-id` instead: it mints its own Ed25519 identity (so
+//! `device_id == device-<hex(pub)>` self-certifies to C exactly like a device), a
+//! random `push_key`, and a delegation authorizing the gateway push key — then
+//! the gateway persists it here.
 //!
 //! The binding is cryptographically **identical** to a device binding, so the
 //! dispatcher's `/register` + `/notify` builders, the remote host (C), and the
-//! iOS NSE are all unchanged. The only divergences are (a) the `push_key` rides
+//! APNs NSE path is unchanged. The only divergences are (a) the `push_key` rides
 //! TLS + the admin bearer token rather than a Noise handshake hash — a weaker
 //! (but still endpoint-to-endpoint) trust model, see
 //! `docs/modules/mobile/relay-push-security.md`; and (b) the remote-host endpoint
@@ -34,12 +35,12 @@ use super::{
     device_push_key_secret_name,
 };
 
-/// Prefix for a web-binding meta record's vault key. Disjoint from the
+/// Prefix for a direct-binding meta record's vault key. Disjoint from the
 /// `device.{id}.*` push-material keys so [`list_bindings`] enumerates only the
-/// meta records (one per web binding).
+/// meta records (one per direct binding).
 const WEB_BINDING_PREFIX: &str = "web_push.";
 
-/// Vault key holding a web binding's meta record.
+/// Vault key holding a direct binding's meta record.
 fn web_binding_secret_name(device_id: &str) -> String {
     format!("{WEB_BINDING_PREFIX}{device_id}")
 }
@@ -50,7 +51,7 @@ fn web_binding_secret_name(device_id: &str) -> String {
 /// dispatcher reads it the same way it reads a paired device's.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct WebPushBinding {
-    /// `ios-<hex(ed25519 pub)>` — the web client's self-certifying identity.
+    /// `device-<hex(ed25519 pub)>` — the app's self-certifying identity.
     pub device_id: String,
     /// Remote-host base WS URL (the built-in [`super::DEFAULT_PUSH_RELAY_URL`]).
     /// The dispatcher maps `wss→https` for the keyless `/register` + `/notify` POSTs.
@@ -156,7 +157,7 @@ mod tests {
     #[tokio::test]
     async fn store_then_list_round_trips_and_writes_push_material() {
         let vault = vault();
-        let b = binding("ios-aa");
+        let b = binding("device-aa");
         store_binding(
             &vault,
             &b,
@@ -175,13 +176,13 @@ mod tests {
         // Push material is under the shared device.{id}.* names the dispatcher reads.
         assert!(
             vault
-                .get_secret(&device_push_key_secret_name("ios-aa"))
+                .get_secret(&device_push_key_secret_name("device-aa"))
                 .await
                 .unwrap()
                 .is_some()
         );
         let apns: DeviceApnsRegistration = vault
-            .get_typed(&device_apns_secret_name("ios-aa"))
+            .get_typed(&device_apns_secret_name("device-aa"))
             .await
             .unwrap()
             .unwrap();
@@ -192,7 +193,7 @@ mod tests {
     async fn list_skips_non_web_keys() {
         let vault = vault();
         vault
-            .store_secret("device.ios-x.push_key", &[0u8; 32])
+            .store_secret("device.device-x.push_key", &[0u8; 32])
             .await
             .unwrap();
         vault
@@ -201,7 +202,7 @@ mod tests {
             .unwrap();
         store_binding(
             &vault,
-            &binding("ios-cc"),
+            &binding("device-cc"),
             &[0u8; aead::KEY_LEN],
             "t",
             ApnsEnv::Sandbox,
@@ -211,6 +212,6 @@ mod tests {
         .unwrap();
         let listed = list_bindings(&vault).await;
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].device_id, "ios-cc");
+        assert_eq!(listed[0].device_id, "device-cc");
     }
 }

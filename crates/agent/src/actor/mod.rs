@@ -10,7 +10,7 @@ pub mod state;
 pub mod subagent;
 pub mod supervisor;
 
-use crate::runtime::agent_loop::InterjectionSource;
+use crate::runtime::agent_loop::{InterjectionSource, UserInterjectionInput};
 use baybo_channels::{
     AgentEvent, AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage,
 };
@@ -181,12 +181,15 @@ struct MailboxInterjections<'a> {
 }
 
 impl crate::runtime::agent_loop::InterjectionSource for MailboxInterjections<'_> {
-    fn drain_injectable(&mut self) -> Vec<Vec<ContentBlock>> {
+    fn drain_injectable(&mut self) -> Vec<UserInterjectionInput> {
         let mut out = Vec::new();
         while let Some(AgentMessage::UserInput(inc)) =
             self.rx.try_recv_if(is_coalescable_user_input)
         {
-            out.push(inc.message.content);
+            out.push(UserInterjectionInput {
+                content: inc.message.content,
+                platform_msg_id: inc.platform_msg_id,
+            });
         }
         out
     }
@@ -557,6 +560,7 @@ impl AgentActor {
 
     async fn handle_user_input(&mut self, incoming: IncomingMessage) -> anyhow::Result<()> {
         let sent_at = incoming.message.timestamp;
+        let platform_msg_id = incoming.platform_msg_id;
         let content = incoming.message.content;
         if is_compact_command(&content) {
             return self
@@ -574,7 +578,7 @@ impl AgentActor {
         let response_tx = self.volatile.response_tx.clone();
         self.volatile
             .agent_loop
-            .append_user_message(content.clone())
+            .append_user_message_with_platform_msg_id(content.clone(), platform_msg_id)
             .await?;
         // Single slash-command turn (the non-slash common path is handled by
         // `handle_merged_user_turn`). Slash turns do not drain mid-turn
@@ -623,12 +627,15 @@ impl AgentActor {
         for incoming in batch {
             self.volatile
                 .agent_loop
-                .append_user_message(incoming.message.content)
+                .append_user_message_with_platform_msg_id(
+                    incoming.message.content,
+                    incoming.platform_msg_id,
+                )
                 .await?;
         }
         self.volatile
             .agent_loop
-            .append_user_message(last.message.content)
+            .append_user_message_with_platform_msg_id(last.message.content, last.platform_msg_id)
             .await?;
         let response_tx = self.volatile.response_tx.clone();
         // Let the loop drain user messages that arrive *during* this turn and
@@ -1231,8 +1238,8 @@ mod tests {
             src.drain_injectable()
         };
         assert_eq!(drained.len(), 2, "drains only the leading non-slash run");
-        assert!(matches!(&drained[0][0], ContentBlock::Text(t) if t == "first"));
-        assert!(matches!(&drained[1][0], ContentBlock::Text(t) if t == "second"));
+        assert!(matches!(&drained[0].content[0], ContentBlock::Text(t) if t == "first"));
+        assert!(matches!(&drained[1].content[0], ContentBlock::Text(t) if t == "second"));
 
         // The slash command stays at the head of the queue, undisturbed.
         match rx.try_recv() {

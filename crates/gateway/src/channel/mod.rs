@@ -19,7 +19,7 @@
 //! the streaming frames and render the final `Message`.
 
 pub(crate) mod adapter;
-pub(crate) mod blob_content;
+pub(crate) mod api_tunnel;
 pub(crate) mod blobs;
 pub mod boot;
 pub mod bot_reconciler;
@@ -38,6 +38,8 @@ pub(crate) mod session_pulse;
 pub(crate) mod session_resolver;
 pub(crate) mod slash;
 pub mod state;
+pub(crate) mod tunnel_http;
+pub(crate) mod work_steps;
 
 pub use bot_reconciler::ChannelBotReconciler;
 pub use control::{ChannelControlError, ChannelControlRegistry};

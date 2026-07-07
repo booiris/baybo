@@ -1,0 +1,11 @@
+/target
+/Generated
+/Externals
+*.xcodeproj
+!project.yml
+xcuserdata/
+build/
+DerivedData/
+web/dist/
+web/node_modules/
+App/Resources/transcript/

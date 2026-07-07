@@ -13,15 +13,12 @@ use axum::extract::{Extension, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use baybo_channels::wire::{
-    self, AttachmentKind, Frame, MAX_MESSAGE_BATCH_ATTACHMENTS, MAX_MESSAGE_BATCH_MESSAGES,
-    MAX_MESSAGE_BATCH_TEXT_BYTES, Message as WireMessage, TaskView, WireAttachment,
+    self, ApprovalCard, AttachmentKind, Frame, MAX_MESSAGE_BATCH_ATTACHMENTS,
+    MAX_MESSAGE_BATCH_MESSAGES, MAX_MESSAGE_BATCH_TEXT_BYTES, Message as WireMessage, TaskView,
+    TurnSnapshot, WireAttachment,
 };
-use baybo_channels::{
-    ChannelKind, IncomingMessage, Message as AgentMessage, MessageRole, RouterInbound,
-};
-use baybo_model::{
-    BlobRef, ChannelType, ChatMessage, ContentBlock, MessageMetadata, Role, SessionId, User,
-};
+use baybo_channels::{ChannelKind, IncomingMessage, Message as AgentMessage, RouterInbound};
+use baybo_model::{BlobRef, ChannelType, ContentBlock, MessageMetadata, SessionId, User};
 use chrono::Utc;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -29,7 +26,7 @@ use futures::{SinkExt, StreamExt};
 use super::adapter::Sidecar;
 use super::handshake::validate_register;
 use super::state::WsChannelState;
-use crate::api::admin::chat::{DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT};
+use super::work_steps;
 use crate::auth::AuthedClient;
 
 /// Maximum time to wait for the client's `Register` frame after the WS
@@ -41,13 +38,6 @@ const REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
 /// frames are control JSON/MessagePack plus blob references, so 256 KiB is enough
 /// for legitimate batched text while bounding decode memory.
 const MAX_CHANNEL_WS_FRAME_BYTES: usize = 256 * 1024;
-
-/// Hard cap on how many persisted Message rows the gateway will replay
-/// for a single `Subscribe { since_ordinal }`. A client that fell so
-/// far behind that the gap exceeds this is told to refetch via REST
-/// (`Frame::Reset`) rather than receive a multi-megabyte WS burst
-/// that competes with live traffic.
-const MAX_CATCHUP_REPLAY: usize = 200;
 
 pub fn routes() -> Router<WsChannelState> {
     Router::new()
@@ -291,10 +281,7 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
     let kind = sidecar.channel.kind();
     while let Some(frame) = source.next_frame().await {
         match frame {
-            Frame::Subscribe {
-                session_id,
-                since_ordinal,
-            } => {
+            Frame::Subscribe { session_id } => {
                 let Some(sub) = sidecar.channel.as_subscribed() else {
                     tracing::warn!(
                         %channel_type,
@@ -302,6 +289,40 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                     );
                     continue;
                 };
+                // Universe boundary: a session row that lives on another
+                // channel is invisible here — the WS layer enforces the
+                // same scoping the REST layer already does
+                // (`load_scoped_chat_session`). A session with no row yet
+                // passes (the TUI subscribes to a client-minted id before
+                // its first message creates the row); a storage error
+                // fails open like v1, which never checked at all.
+                match state.session_manager.get(&session_id).await {
+                    Ok(Some(session)) if session.channel != *channel_type => {
+                        tracing::warn!(
+                            %channel_type,
+                            %session_id,
+                            session_channel = %session.channel,
+                            "Subscribe for session outside this connection's channel; rejecting",
+                        );
+                        if let Err(e) = sidecar
+                            .send_frame(Frame::Notice {
+                                session_id: session_id.clone(),
+                                user_id: String::new(),
+                                level: "error".to_string(),
+                                text: "session does not belong to this channel".to_string(),
+                                transient: false,
+                            })
+                            .await
+                        {
+                            tracing::debug!(error = %e, "send subscribe rejection notice failed");
+                        }
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, %session_id, "subscribe channel check failed; proceeding");
+                    }
+                }
                 let conn_id = sidecar.connection_id();
                 if let Err(e) = sub.subscribe(conn_id, session_id.clone()) {
                     tracing::warn!(error = %e, %session_id, "subscribe failed");
@@ -335,159 +356,17 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                         tracing::warn!(error = %e, "failed to send HistorySnapshot");
                     }
                 }
-                // Recover any pending approvals the client
-                // missed (or lost to a reload) by replaying
-                // the originating `ApprovalRequested` for each.
-                // `Frame::ApprovalResolved` is fire-and-forget
-                // and the queue itself is the canonical record,
-                // so a reconnecting client can render the full
-                // prompt only if we resend the request data;
-                // shipping just the `call_id` list lets the
-                // tool call block until timeout. The follow-up
-                // `PendingApprovalsSnapshot` then handles the
-                // mirror case — dropping locally-cached cards
-                // whose approvals were resolved while this
-                // connection was down.
-                let pending = sidecar.channel.pending_approvals(&session_id);
-                let pending_call_ids: Vec<String> =
-                    pending.iter().map(|r| r.call_id.clone()).collect();
-                for req in pending {
-                    if let Err(e) = sidecar
-                        .send_frame(Frame::ApprovalRequested {
-                            call_id: req.call_id,
-                            session_id: req.session_id,
-                            user_id: req.user_id,
-                            tool: req.tool,
-                            accesses: req.accesses,
-                            params_preview: req.params_preview,
-                            description: req.description,
-                        })
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            %session_id,
-                            "failed to replay pending ApprovalRequested"
-                        );
-                        break;
-                    }
-                }
-                if let Err(e) = sidecar
-                    .send_frame(Frame::PendingApprovalsSnapshot {
-                        session_id: session_id.clone(),
-                        call_ids: pending_call_ids,
-                    })
-                    .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        %session_id,
-                        "failed to send PendingApprovalsSnapshot"
-                    );
-                }
-                // Catch-up: if the client carried a cursor,
-                // replay the persisted Messages it missed
-                // while disconnected. Sent to this connection
-                // only (not broadcast) so other tabs don't see
-                // the replay storm.
-                if let Some(since) = since_ordinal {
-                    replay_catch_up(state, sidecar, channel_type, &session_id, since).await;
-                }
-                // Hydrate the durable planning checklist for this
-                // connection — reload / reconnect / view-cache eviction
-                // all re-subscribe, so this is the single place a client
-                // recovers the list without waiting for the next turn.
-                // Sent only when non-empty and to this connection only;
-                // surfaces without a checklist (TUI) drop the frame.
-                match state.task_store.list(&session_id).await {
-                    Ok(tasks) if !tasks.is_empty() => {
-                        let tasks = tasks.into_iter().map(TaskView::from).collect();
-                        if let Err(e) = sidecar
-                            .send_frame(Frame::TaskList {
-                                session_id: session_id.clone(),
-                                user_id: String::new(),
-                                tasks,
-                            })
-                            .await
-                        {
-                            tracing::warn!(error = %e, %session_id, "failed to send TaskList snapshot");
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!(error = %e, %session_id, "failed to load tasks for snapshot");
-                    }
-                }
-                // Tell this connection whether a turn is in flight
-                // right now (and since when), derived from the job
-                // store. A new tab / reconnect missed the live
-                // `TurnState` broadcasts, and without a definitive
-                // answer it can neither run the in-flight work
-                // block's elapsed timer nor distinguish "agent
-                // still working" from "turn died without a reply".
-                // Always sent — `active: false` is load-bearing
-                // (it's what authorises the Cancelled indicator).
-                match state
-                    .job_lifecycle
-                    .active_turn_started_at(&session_id)
-                    .await
-                {
-                    Ok(started_at) => {
-                        if let Err(e) = sidecar
-                            .send_frame(Frame::TurnState {
-                                session_id: session_id.clone(),
-                                user_id: String::new(),
-                                active: started_at.is_some(),
-                                started_at,
-                            })
-                            .await
-                        {
-                            tracing::warn!(error = %e, %session_id, "failed to send TurnState snapshot");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, %session_id, "failed to derive TurnState snapshot");
-                    }
-                }
+                // The one atomic state-plane bundle — everything a
+                // client needs to know the moment it starts listening.
+                // History is NOT replayed here: transcript recovery is
+                // the client's REST sync call, always.
+                send_subscribe_state(state, sidecar, &session_id).await;
             }
             Frame::Unsubscribe { session_id } => {
                 let Some(sub) = sidecar.channel.as_subscribed() else {
                     continue;
                 };
                 sub.unsubscribe(sidecar.connection_id(), &session_id);
-            }
-            Frame::FetchHistory {
-                session_id,
-                before_ordinal,
-                limit,
-            } => {
-                // Backward transcript paging over the live (Noise-sealed) leg —
-                // the relay equivalent of REST GET /v1/chat/sessions/:id, for
-                // clients (the iOS relay leg) with no admin REST surface.
-                // Subscribed-kind only, and the connection must already be
-                // subscribed to the session — parity with the `Message` path
-                // below, not true per-device isolation (since `subscribe` itself
-                // is unchecked, a device can subscribe to any session first).
-                let Some(_sub) = sidecar.channel.as_subscribed() else {
-                    continue;
-                };
-                if !sidecar.connection.is_subscribed_to(&session_id) {
-                    tracing::warn!(
-                        %channel_type,
-                        %session_id,
-                        "FetchHistory for session not subscribed by this connection; dropping",
-                    );
-                    continue;
-                }
-                send_history_page(
-                    state,
-                    sidecar,
-                    channel_type,
-                    &session_id,
-                    before_ordinal,
-                    limit,
-                )
-                .await;
             }
             Frame::Message(wire_msg) => {
                 let Some(incoming) =
@@ -682,218 +561,90 @@ fn validate_message_batch(messages: &[WireMessage]) -> Result<(), String> {
     Ok(())
 }
 
-/// Replay persisted Message rows whose ordinal is strictly greater
-/// than the client's `since_ordinal` cursor — sent only to the
-/// connection that asked. Filters out rows that aren't user-visible
-/// (agent-injected skill reminders, tool calls, tool results,
-/// thinking, system messages); the surviving rows carry their
-/// absolute `ordinal` on the wire so the client advances its cursor.
-///
-/// On overflow (gap larger than [`MAX_CATCHUP_REPLAY`]) the gateway
-/// sends `Frame::Reset { reason }` instead of partial replay so the
-/// client falls back to a paged REST fetch and doesn't end up with
-/// an arbitrarily truncated middle slice.
-async fn replay_catch_up(
-    state: &WsChannelState,
-    sidecar: &Sidecar,
-    channel_type: &ChannelType,
-    session_id: &SessionId,
-    since_ordinal: i64,
-) {
-    let rows = match state
+/// Build and send the one atomic [`Frame::SubscribeState`] bundle to the
+/// subscribing connection: turn activity, the in-flight work block's
+/// buffered steps, the authoritative pending-approval set (full cards
+/// from one atomic queue read — closes the old snapshot's race window
+/// where a card could be neither listed nor broadcast), and the planning
+/// checklist, stamped with the session's newest persisted ordinal.
+/// Component reads degrade independently — a failed read logs and
+/// contributes its empty/idle shape rather than suppressing the bundle,
+/// and the next live frame or re-subscribe heals it.
+async fn send_subscribe_state(state: &WsChannelState, sidecar: &Sidecar, session_id: &SessionId) {
+    let as_of_ordinal = match state
         .session_manager
-        .history_since(session_id, since_ordinal, MAX_CATCHUP_REPLAY + 1)
+        .latest_session_ordinal(session_id)
         .await
     {
-        Ok(rows) => rows,
+        Ok(ordinal) => ordinal,
         Err(e) => {
-            tracing::warn!(
-                error = %e,
-                %channel_type,
-                %session_id,
-                since_ordinal,
-                "catch-up history fetch failed; client may miss messages",
-            );
-            return;
+            tracing::warn!(error = %e, %session_id, "subscribe-state: newest ordinal read failed");
+            None
         }
     };
-    if rows.len() > MAX_CATCHUP_REPLAY {
-        tracing::info!(
-            %channel_type,
-            %session_id,
-            since_ordinal,
-            cap = MAX_CATCHUP_REPLAY,
-            "catch-up slice exceeds cap; sending Reset for REST refetch",
-        );
-        if let Err(e) = sidecar
-            .send_frame(Frame::Reset {
-                reason: format!("catch-up gap exceeds {MAX_CATCHUP_REPLAY} rows; refetch via REST"),
-            })
-            .await
-        {
-            tracing::debug!(error = %e, "send catch-up Reset failed");
-        }
-        return;
-    }
-    for (ordinal, msg) in rows {
-        let Some(wire) = chat_to_visible_wire_message(
-            channel_type,
-            session_id,
-            ordinal,
-            msg,
-            &*state.blob_store,
-        )
-        .await
-        else {
-            continue;
-        };
-        if let Err(e) = sidecar.send_frame(Frame::Message(wire)).await {
-            tracing::debug!(
-                error = %e,
-                %channel_type,
-                %session_id,
-                ordinal,
-                "send catch-up Message failed; aborting replay",
-            );
-            return;
-        }
-    }
-}
-
-/// Serve one **backward** page of `session_id`'s persisted transcript to
-/// this connection only, in response to a [`Frame::FetchHistory`] — the
-/// Noise-sealed relay equivalent of REST `GET /v1/chat/sessions/:id` for
-/// clients (the iOS relay leg) that have no admin REST surface. Where
-/// [`replay_catch_up`] pages *forward* (rows above the cursor, streamed as
-/// individual [`Frame::Message`]s) this pages *backward* (rows below
-/// `before_ordinal`, or the newest page when `None`) and replies with a
-/// single [`Frame::HistoryPage`]. Reuses [`chat_to_visible_wire_message`]
-/// so the page carries the exact same UI-visible projection catch-up does.
-async fn send_history_page(
-    state: &WsChannelState,
-    sidecar: &Sidecar,
-    channel_type: &ChannelType,
-    session_id: &SessionId,
-    before_ordinal: Option<i64>,
-    limit: Option<u32>,
-) {
-    // Clamp to the same bounds as the REST endpoint; over-fetch by one so
-    // `has_more` is known without a separate COUNT (mirrors `get_session`).
-    let want = (limit.unwrap_or(DEFAULT_HISTORY_LIMIT as u32) as usize).clamp(1, MAX_HISTORY_LIMIT);
-    let mut rows = match state
-        .session_manager
-        .history_tail(session_id, before_ordinal, want + 1)
-        .await
-    {
-        Ok(rows) => rows,
+    let turn = match state.job_lifecycle.active_turn_started_at(session_id).await {
+        Ok(started_at) => TurnSnapshot {
+            active: started_at.is_some(),
+            started_at,
+        },
         Err(e) => {
-            // A bad/nonexistent session id is a client error, not a reason to
-            // tear the connection down — warn and drop the request.
-            tracing::warn!(
-                error = %e,
-                %channel_type,
-                %session_id,
-                ?before_ordinal,
-                "FetchHistory store read failed; dropping request",
-            );
-            return;
+            tracing::warn!(error = %e, %session_id, "subscribe-state: turn read failed");
+            TurnSnapshot {
+                active: false,
+                started_at: None,
+            }
         }
     };
-    let has_more = rows.len() > want;
-    if has_more {
-        // Rows are ascending, so the over-fetch overflow row is the oldest.
-        rows.remove(0);
-    }
-    // Page bounds come from the RAW rows (not the filtered visible set) so the
-    // client's paging cursor stays monotonic even across a page whose rows are
-    // all internal — matching the REST `oldest`/`newest_ordinal`.
-    let oldest_ordinal = rows.first().map(|(o, _, _)| *o);
-    let newest_ordinal = rows.last().map(|(o, _, _)| *o);
-    let mut messages = Vec::with_capacity(rows.len());
-    for (ordinal, _created_at, msg) in rows {
-        if let Some(wire) =
-            chat_to_visible_wire_message(channel_type, session_id, ordinal, msg, &*state.blob_store)
-                .await
-        {
-            messages.push(wire);
+    // Do every `.await` FIRST, then snapshot the REPLACE-sets (work steps +
+    // pending approvals) and send with NO suspension in between. These two are
+    // authoritative replacements on the client, so a live `ApprovalRequested` /
+    // `ApprovalResolved` / work frame broadcast during a suspension between the
+    // snapshot read and the send could reach the client first and then be
+    // overwritten by the stale bundle. Reading them adjacent to the send keeps
+    // the window to a non-await span and preserves the "live frame after the
+    // bundle wins by frame order" invariant.
+    let tasks: Vec<TaskView> = match state.task_store.list(session_id).await {
+        Ok(tasks) => tasks.into_iter().map(TaskView::from).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, %session_id, "subscribe-state: task read failed");
+            Vec::new()
         }
-    }
+    };
+    // The buffer is a superset of everything this connection could have
+    // seen live (`note_in_flight` runs before fan-out), so the client
+    // REPLACEs its open work block with these steps and lets subsequent
+    // live frames append.
+    let work_steps = if turn.active {
+        work_steps::in_flight_wire_steps(sidecar.channel.in_flight_events(session_id))
+    } else {
+        Vec::new()
+    };
+    let pending_approvals: Vec<ApprovalCard> = sidecar
+        .channel
+        .pending_approvals(session_id)
+        .into_iter()
+        .map(|req| ApprovalCard {
+            call_id: req.call_id,
+            user_id: req.user_id,
+            tool: req.tool,
+            accesses: req.accesses,
+            params_preview: req.params_preview,
+            description: req.description,
+        })
+        .collect();
     if let Err(e) = sidecar
-        .send_frame(Frame::HistoryPage {
+        .send_frame(Frame::SubscribeState {
             session_id: session_id.clone(),
-            messages,
-            oldest_ordinal,
-            newest_ordinal,
-            has_more,
+            as_of_ordinal,
+            turn,
+            work_steps,
+            pending_approvals,
+            tasks,
         })
         .await
     {
-        tracing::debug!(
-            error = %e,
-            %channel_type,
-            %session_id,
-            "send HistoryPage failed",
-        );
+        tracing::warn!(error = %e, %session_id, "failed to send SubscribeState");
     }
-}
-
-/// Project a persisted [`ChatMessage`] onto a UI-visible wire Message,
-/// or `None` for rows that should never have surfaced as a chat bubble
-/// (skill reminders the agent injected as Role::User, tool-call /
-/// tool-result rows, raw thinking blocks, system rows). Mirrors the
-/// REST transcript path's "what counts as a chat bubble" view so a
-/// reconnecting client doesn't see internal turns it wouldn't have
-/// seen if it had stayed connected.
-async fn chat_to_visible_wire_message(
-    channel_type: &ChannelType,
-    session_id: &SessionId,
-    ordinal: i64,
-    msg: ChatMessage,
-    blob_store: &dyn baybo_store::BlobStore,
-) -> Option<WireMessage> {
-    let role = match msg.role {
-        Role::User if msg.from_user() => MessageRole::User,
-        Role::Assistant => MessageRole::Assistant,
-        // Role::System rows are the leading prompt — never user-facing.
-        // Role::User with from_user=false is an agent-injected reminder.
-        // Role::Tool rows are tool results — internal.
-        _ => return None,
-    };
-    // Intermediate agentic iterations (assistant turns that issued tool
-    // calls) carry the model's working narration, which is live-only work
-    // progress — not a durable answer bubble. Drop them on catch-up replay
-    // so a reconnect agrees with the REST reload path (`api::admin::chat::
-    // chat_to_transcript_item`); only the final, tool-call-free reply
-    // surfaces.
-    if msg.role == Role::Assistant && msg.has_tool_use() {
-        return None;
-    }
-    // Mirror `adapter::split_content`'s text+attachments shape so a
-    // row with only Image/Audio/File blocks still surfaces as a wire
-    // Message — the REST transcript path keeps such rows visible via
-    // `has_attachments`, and dropping them on WS catch-up would let
-    // attachment-only messages vanish until a full REST refetch.
-    let (text, attachments) = super::adapter::split_content(&msg.content, blob_store).await;
-    // A row with neither text nor attachments is structurally an
-    // assistant tool-call-only turn or a thinking-only turn; render
-    // nothing.
-    if text.is_empty() && attachments.is_empty() {
-        return None;
-    }
-    Some(WireMessage {
-        content: text,
-        session_id: session_id.clone(),
-        // Catch-up replay isn't routed by user-id (the connection is
-        // already a particular tab); sidecars on Subscribed channels
-        // don't consult this field for fan-out.
-        user_id: String::new(),
-        channel_type: channel_type.clone(),
-        bot_id: String::new(),
-        attachments,
-        platform_msg_id: String::new(),
-        role,
-        ordinal: Some(ordinal),
-    })
 }
 
 /// Resolve a single inbound wire message to an `IncomingMessage` (session

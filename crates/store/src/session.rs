@@ -96,6 +96,19 @@ pub trait SessionStore: Send + Sync {
         folder_id: Option<&FolderId>,
     ) -> Result<bool>;
 
+    /// Advance (max-wins) the session's chat-list read cursor to `ordinal` —
+    /// the highest `session_messages.ordinal` a viewer has read
+    /// (`PUT /v1/chat/sessions/:id/read`). Never regresses: a lower `ordinal`
+    /// is a no-op. Returns `Ok(true)` when the row existed, `Ok(false)` if no
+    /// row matched. Same flat-column discipline as [`Self::set_hidden`] — the
+    /// targeted UPDATE leaves the JSON `data` blob alone.
+    async fn set_read_cursor(&self, session_id: &SessionId, ordinal: i64) -> Result<bool>;
+
+    /// The session's chat-list read cursor, or `None` when nothing has been
+    /// read yet (or the row is missing). Backs the list endpoint's
+    /// `unread_count` derivation.
+    async fn read_cursor(&self, session_id: &SessionId) -> Result<Option<i64>>;
+
     /// Hard-delete the session.
     ///
     /// Returns `Ok(true)` if the row existed and was removed, `Ok(false)`
@@ -264,19 +277,30 @@ pub trait SessionStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<(i64, DateTime<Utc>, ChatMessage)>>;
 
-    /// Forward catch-up slice: the next at most `limit` active rows
+    /// Forward difference slice: the next at most `limit` active rows
     /// whose `ordinal` is strictly **greater than** `after_ordinal`,
     /// returned in ascending order alongside each row's absolute
-    /// ordinal. Powers the WS `Subscribe { since_ordinal }` cursor —
-    /// when a client reconnects after a network dip the gateway uses
-    /// this to replay every persisted Message row the client missed
-    /// while disconnected, without forcing a REST round-trip.
+    /// ordinal and persisted `created_at`. Powers the REST sync
+    /// endpoint's cursor scan — the one forward-recovery pull a chat
+    /// client runs after any gap.
     async fn load_active_session_messages_since(
         &self,
         session_id: &SessionId,
         after_ordinal: i64,
         limit: usize,
-    ) -> Result<Vec<(i64, ChatMessage)>>;
+    ) -> Result<Vec<(i64, DateTime<Utc>, ChatMessage)>>;
+
+    /// Ordinal of the newest persisted row carrying this
+    /// `platform_msg_id` (the client-generated send idempotency key),
+    /// superseded rows included — a compacted-away row still proves the
+    /// send was durably persisted. `None` when no row matches. Powers
+    /// the outbox point lookup that resolves a rebase-floor entry
+    /// without consuming a retry transmission.
+    async fn find_message_ordinal_by_platform_msg_id(
+        &self,
+        session_id: &SessionId,
+        platform_msg_id: &str,
+    ) -> Result<Option<i64>>;
 
     /// The freshest **human-authored** active message — source `user` or
     /// `user_interjection` (i.e. [`ChatMessage::from_user`]) — paired with

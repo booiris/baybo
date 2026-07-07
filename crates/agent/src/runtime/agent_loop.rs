@@ -310,18 +310,24 @@ struct PendingMemoryWrite {
     final_output: Vec<ContentBlock>,
 }
 
+pub struct UserInterjectionInput {
+    pub content: Vec<ContentBlock>,
+    pub platform_msg_id: String,
+}
+
 /// Source of mid-turn user messages ("interjections") that arrived while the
 /// loop was running. Consulted at each tool boundary (after a tool batch, before
 /// the next LLM call) — never mid-call, so injection stays non-preemptive.
 /// Implemented by the actor over its mailbox (draining the leading run of
 /// non-slash `UserInput`s); a fake stands in for it in tests. Returns each
-/// injectable message's content in arrival order, or empty when nothing is
+/// injectable message in arrival order, including the channel idempotency key so
+/// reconnect/history replay can dedup its user bubble. Empty means nothing is
 /// queued. See `docs/mid-turn-user-interjection.md`.
 ///
 /// `Send` supertrait so the `&mut dyn InterjectionSource` the loop holds across
 /// `.await` points keeps the agent task `Send`.
 pub trait InterjectionSource: Send {
-    fn drain_injectable(&mut self) -> Vec<Vec<ContentBlock>>;
+    fn drain_injectable(&mut self) -> Vec<UserInterjectionInput>;
     /// Drop any queued injectable messages without running them. Used when a
     /// turn is `/stop`-cancelled so client-fired interjections still sitting in
     /// the mailbox don't run as follow-up turns once the actor resumes its loop.
@@ -1615,17 +1621,22 @@ impl AgentLoop {
             return Vec::new();
         }
         let count = drained.len();
-        for content in &drained {
+        let mut content = Vec::with_capacity(count);
+        for input in drained {
             // Budgeted at the framed wire size; see `append_user_interjection`.
             self.context_manager
-                .append_user_interjection(content.clone())
+                .append_user_interjection_with_platform_msg_id(
+                    input.content.clone(),
+                    input.platform_msg_id,
+                )
                 .await;
+            content.push(input.content);
         }
         info!(
             interjections = count,
             "injected mid-turn user interjection(s) before the next LLM call"
         );
-        drained
+        content
     }
 
     /// Recall memories relevant to `query` and inject each as a framed
@@ -1856,12 +1867,21 @@ impl AgentLoop {
     /// context's `messages_for_llm` collapses the consecutive rows for the
     /// provider call.
     pub async fn append_user_message(&mut self, content: Vec<ContentBlock>) -> anyhow::Result<()> {
+        self.append_user_message_with_platform_msg_id(content, String::new())
+            .await
+    }
+
+    pub async fn append_user_message_with_platform_msg_id(
+        &mut self,
+        content: Vec<ContentBlock>,
+        platform_msg_id: impl Into<String>,
+    ) -> anyhow::Result<()> {
         // A coalesced burst can be the first thing a fresh session ever
         // appends; seed the system prompt first so it never lands *after*
         // user content. `ensure_seeded` keys off `messages[0]`, so a leading
         // user row would otherwise make every later turn re-seed.
         self.context_manager.ensure_seeded().await;
-        let msg = ChatMessage::user(content);
+        let msg = ChatMessage::user(content).with_platform_msg_id(platform_msg_id);
         self.context_manager.append(&msg).await;
         Ok(())
     }

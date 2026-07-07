@@ -180,6 +180,10 @@ impl std::str::FromStr for MessageSource {
 pub struct ChatMessage {
     pub role: Role,
     pub content: Vec<ContentBlock>,
+    /// Client-supplied idempotency key for genuine channel input. Persisted so
+    /// reconnect/history replay can reconcile optimistic user bubbles.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    platform_msg_id: String,
     /// Where this row came from. Sealed (non-`pub`) so provenance is set once,
     /// at the typed constructor, never flipped by a raw literal:
     /// [`ChatMessage::user`] is the sole producer of [`MessageSource::User`],
@@ -202,6 +206,7 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content,
+            platform_msg_id: String::new(),
             source: MessageSource::User,
         }
     }
@@ -216,6 +221,7 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content,
+            platform_msg_id: String::new(),
             source: MessageSource::UserInterjection,
         }
     }
@@ -229,6 +235,7 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content,
+            platform_msg_id: String::new(),
             source: MessageSource::Cron,
         }
     }
@@ -244,6 +251,7 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content,
+            platform_msg_id: String::new(),
             source: MessageSource::RecalledMemory,
         }
     }
@@ -256,6 +264,7 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content,
+            platform_msg_id: String::new(),
             source: MessageSource::Agent,
         }
     }
@@ -265,6 +274,7 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content,
+            platform_msg_id: String::new(),
             source: MessageSource::Agent,
         }
     }
@@ -274,6 +284,7 @@ impl ChatMessage {
         Self {
             role: Role::System,
             content,
+            platform_msg_id: String::new(),
             source: MessageSource::Agent,
         }
     }
@@ -283,6 +294,7 @@ impl ChatMessage {
         Self {
             role: Role::Tool,
             content,
+            platform_msg_id: String::new(),
             source: MessageSource::Agent,
         }
     }
@@ -317,6 +329,15 @@ impl ChatMessage {
     /// even though all three are `Role::User`.
     pub fn source(&self) -> MessageSource {
         self.source
+    }
+
+    pub fn with_platform_msg_id(mut self, platform_msg_id: impl Into<String>) -> Self {
+        self.platform_msg_id = platform_msg_id.into();
+        self
+    }
+
+    pub fn platform_msg_id(&self) -> &str {
+        &self.platform_msg_id
     }
 
     /// `true` when this row came directly from a human channel input — a

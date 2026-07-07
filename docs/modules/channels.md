@@ -108,9 +108,12 @@ pub enum SendOutcome { Sent, Full, Closed }
 ```
 
 Sinks are **synchronous and non-blocking**: the fan-out path cannot
-afford to wait on a slow consumer. `Full` returns trigger a
-`Frame::Reset` for that connection (nudging the client to refetch
-history); `Closed` triggers `Channel::detach`.
+afford to wait on a slow consumer. A `Full` return means the server
+dropped a frame it owed that connection, so it nudges the client with a
+`Frame::Gap` — session-scoped (`Some(session_id)`) from the per-session
+`dispatch_event` path, session-less (`None`) from `broadcast_frame` —
+and the client recovers by running its REST sync; `Closed` triggers
+`Channel::detach`.
 
 ## Channel Kinds
 
@@ -166,8 +169,10 @@ doesn't need per-session keying — every tab maintains its full list).
 
 All five funnel into the same internal `dispatch_event` /
 `broadcast_frame` machinery: non-blocking, drops the frame for any
-connection whose sink reports `Full` (and sends it a `Reset`), and
-detaches connections whose sink reports `Closed`.
+connection whose sink reports `Full` (and nudges it with a
+`Frame::Gap` — session-scoped from `dispatch_event`, session-less from
+`broadcast_frame`), and detaches connections whose sink reports
+`Closed`.
 
 ### Dispatch observer
 
@@ -426,9 +431,10 @@ examples.
   (`Channel::detach`) when the WS closes; the channel's reverse index
   is cleaned up in the same call.
 - Outbound failures are non-retrying: `SendOutcome::Full` triggers a
-  `Frame::Reset` to nudge the client back to a known state via REST
-  history refetch (transcript is the canonical record; deltas / notices
-  / approval prompts are advisory). `SendOutcome::Closed` triggers
+  `Frame::Gap` nudge so the client recovers the dropped frames via its
+  REST sync (transcript is the canonical record; deltas / notices /
+  approval prompts are advisory — state heals on the next
+  `SubscribeState` bundle). `SendOutcome::Closed` triggers
   `Channel::detach` on the offending connection.
 
 ## Unified Message Mapping

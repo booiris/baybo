@@ -232,6 +232,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["lookup_session_message"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/model": {
         parameters: {
             query?: never;
@@ -257,6 +273,38 @@ export interface paths {
         };
         get?: never;
         put: operations["set_session_pin"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["mark_session_read"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["sync_session"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -536,6 +584,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/mobile/apns-token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["update_device_apns_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/push/params": {
         parameters: {
             query?: never;
@@ -799,6 +863,15 @@ export interface components {
          *     sidecars like `"slack"` pass through unchanged).
          */
         ChannelType: string;
+        /** @description A blob attachment embedded in a historical chat transcript item. */
+        ChatAttachment: {
+            blob_id: string;
+            filename?: string | null;
+            kind: string;
+            mime_type: string;
+            /** Format: int32 */
+            size: number;
+        };
         /**
          * @description One entry in the cron-messages list. Each row corresponds to a
          *     distinct cron fire (cron creates a fresh session per trigger, so
@@ -848,6 +921,21 @@ export interface components {
         };
         ChatCronMessagesList: {
             items: components["schemas"]["ChatCronMessage"][];
+        };
+        /**
+         * @description Response from `GET /v1/chat/sessions/{session_id}/messages` — the
+         *     per-`platform_msg_id` durability probe. `found: false` is a provable
+         *     absence (the key was never persisted for this session), which lets
+         *     the client outbox resume its retry machine; `found: true` confirms
+         *     durability without consuming a retry transmission.
+         */
+        ChatMessageLookup: {
+            found: boolean;
+            /**
+             * Format: int64
+             * @description Ordinal of the newest persisted row carrying the key, when found.
+             */
+            ordinal?: number | null;
         };
         /** @description Response from `POST /v1/chat/sessions`. */
         ChatSessionCreated: {
@@ -926,9 +1014,61 @@ export interface components {
              */
             pinned: boolean;
             session_id: string;
+            /**
+             * Format: int64
+             * @description Number of unread assistant replies — final assistant messages persisted
+             *     with `ordinal` above this session's read cursor
+             *     (`PUT /v1/chat/sessions/{id}/read`), capped at [`UNREAD_COUNT_CAP`]
+             *     (the client renders the cap as "N+"). Server-computed, so it is
+             *     accurate across a cold restart / a device that missed the live
+             *     `SessionActivity` pings. `0` when caught up.
+             */
+            unread_count: number;
         };
         ChatSessionsList: {
             items: components["schemas"]["ChatSessionSummary"][];
+        };
+        /**
+         * @description Response from `GET /v1/chat/sessions/{session_id}/sync` — the one
+         *     forward-recovery pull. Full-fidelity on every path: rows carry work
+         *     blocks and notices exactly like the history surface.
+         */
+        ChatSyncResponse: {
+            /**
+             * @description Whether older history exists below `oldest_ordinal` (REPLACE
+             *     responses only; always `false` on a difference response).
+             */
+            has_more_older: boolean;
+            /**
+             * Format: int64
+             * @description Coverage watermark: the highest persisted ordinal the scan
+             *     covered, visible or not — it may exceed every row in `rows`
+             *     (invisible tool/system tail). This, not any row's ordinal, is
+             *     what advances the client cursor (`max`-wins). `null` iff the
+             *     session has no persisted rows.
+             */
+            next_cursor?: number | null;
+            /**
+             * Format: int64
+             * @description Page floor for lazy backfill after a REPLACE (baseline /
+             *     rebase). Absent on a difference response — the client keeps its
+             *     own floor when merging.
+             */
+            oldest_ordinal?: number | null;
+            /**
+             * @description `true` ⇒ `rows` is the NEWEST page, not the requested difference
+             *     (the difference exceeded `limit` in emitted rows, or the raw
+             *     scan bound). The client REPLACEs its thread with the page and
+             *     treats its cursor as rebase-dirty until one non-rebased sync
+             *     completes.
+             */
+            rebased: boolean;
+            /**
+             * @description Transcript rows (message | work | notice), ascending. On a
+             *     baseline / rebased response this is the newest page and REPLACEs
+             *     the client's thread; on a difference response it appends/merges.
+             */
+            rows: components["schemas"]["ChatTranscriptItem"][];
         };
         /**
          * @description One transcript row, flattened from `ChatMessage` into a shape the
@@ -939,6 +1079,12 @@ export interface components {
          *     [`reconstruct_transcript`]).
          */
         ChatTranscriptItem: {
+            /**
+             * @description Blob attachments for message items. This mirrors the chat WS attachment
+             *     shape so native clients can rebuild historical image/file bubbles from
+             *     the REST transcript.
+             */
+            attachments?: components["schemas"]["ChatAttachment"][];
             /**
              * @description `true` when this `work` item belongs to a turn that was cancelled
              *     (e.g. `/stop`) rather than run to a normal reply — the client labels it
@@ -962,6 +1108,13 @@ export interface components {
              *     file). The web client currently shows a placeholder.
              */
             has_attachments: boolean;
+            /**
+             * @description Stable row id, unique within the session and identical on every
+             *     redelivery (sync, backfill): `m<ordinal>` for a message,
+             *     `w<ordinal>` for a work block, `n<seq>` for a control-event row.
+             *     This is the client's render key AND redelivery dedup key.
+             */
+            id: string;
             /** @description Message bubble vs. reconstructed work block. */
             kind: components["schemas"]["TranscriptItemKind"];
             /**
@@ -971,15 +1124,25 @@ export interface components {
             notice_level?: string | null;
             /**
              * Format: int64
-             * @description React key for the row. For `message` / `work` items it is the
-             *     `session_messages.ordinal` (a `work` item carries the turn's first
-             *     intermediate ordinal so it sorts just after the user turn). For a
-             *     `notice` / control-echo item it is a **synthetic negative value** in a
-             *     key space disjoint from real ordinals — so the client must NOT use it for
-             *     pagination / cursor seeding; see `ChatSessionDetail::oldest_ordinal` /
-             *     `newest_ordinal`.
+             * @description `session_messages.ordinal` for ordinal-addressed rows: a
+             *     `message` carries its own; a `work` item carries the turn's
+             *     first intermediate ordinal so it sorts just after the user turn.
+             *     **Absent for `notice` / control-echo items** — control events
+             *     are not ordinal-addressed (they anchor at an ordinal and are
+             *     keyed by their own per-session `seq`, baked into [`Self::id`]).
+             *     Clients must not use this for pagination / cursor seeding; see
+             *     `ChatSessionDetail::oldest_ordinal` / `newest_ordinal` and
+             *     `ChatSyncResponse::next_cursor`.
              */
-            ordinal: number;
+            ordinal?: number | null;
+            /**
+             * @description Client-generated send idempotency key for a user `message` row,
+             *     when the send carried one. Every redelivery (sync, backfill)
+             *     carries it so the client outbox can match durability
+             *     confirmations and dedup redelivered rows against the live echo.
+             *     Empty for rows without one (assistant replies, work, notices).
+             */
+            platform_msg_id?: string;
             /**
              * @description `"user"` or `"assistant"` (or `"system"`). String rather than
              *     enum to keep the wire forgiving. Empty for `work` items.
@@ -1084,6 +1247,11 @@ export interface components {
             name: string;
             /** @description Parent folder id (`null`/absent = top-level). */
             parent_id?: string | null;
+        };
+        /** @description Request body for `POST /v1/chat/sessions`. */
+        CreateSessionRequest: {
+            /** @description Optional client-supplied session id. If omitted, the gateway mints one. */
+            session_id?: string | null;
         };
         /** @description Mirror of [`baybo_cron::CronJob`]. */
         CronJob: {
@@ -1390,6 +1558,16 @@ export interface components {
              */
             total: number;
         };
+        /** @description Request body for `PUT /v1/chat/sessions/{session_id}/read`. */
+        MarkReadRequest: {
+            /**
+             * Format: int64
+             * @description Highest `session_messages.ordinal` the viewer has now read. The read
+             *     cursor advances max-wins, so a stale/lower value is a no-op — a client
+             *     can safely fire this on open and after each new reply while foreground.
+             */
+            ordinal: number;
+        };
         MoveFolderRequest: {
             /** @description New parent id, or `null` to promote the folder to top-level. */
             parent_id?: string | null;
@@ -1421,7 +1599,7 @@ export interface components {
              */
             delegation: string;
             /**
-             * @description The client's self-certifying `device_id` (`ios-<hex(ed25519 pub)>`); the
+             * @description The client's self-certifying `device_id` (`device-<hex(ed25519 pub)>`); the
              *     gateway recovers the public key from it and re-derives the canonical id.
              */
             device_id: string;
@@ -1434,7 +1612,7 @@ export interface components {
         };
         /** @description Response of `POST /v1/push/register`. */
         RegisterPushResponse: {
-            /** @description The `ios-<hex(pub)>` id the binding was stored under (== the push `bid`). */
+            /** @description The `device-<hex(pub)>` id the binding was stored under (== the push `bid`). */
             device_id: string;
         };
         /**
@@ -1583,6 +1761,13 @@ export interface components {
             llm?: string | null;
             name: string;
             system_prompt?: string | null;
+        };
+        /** @description Request body for `POST /v1/mobile/apns-token`. */
+        UpdateDeviceApnsTokenRequest: {
+            /** @description APNs environment: `"sandbox"` (debug / TestFlight) or `"production"`. */
+            apns_env: string;
+            /** @description The device's current APNs device token (hex). */
+            apns_token: string;
         };
         UpdateFolderRequest: {
             /** @description New name (absent = unchanged). */
@@ -2349,7 +2534,11 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateSessionRequest"];
+            };
+        };
         responses: {
             /** @description New session id */
             200: {
@@ -2358,6 +2547,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ChatSessionCreated"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description Unauthorized */
@@ -2516,6 +2714,59 @@ export interface operations {
             };
         };
     };
+    lookup_session_message: {
+        parameters: {
+            query: {
+                /** @description Client-generated send idempotency key to probe. */
+                platform_msg_id: string;
+            };
+            header?: never;
+            path: {
+                /** @description Session id to probe */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Durability point lookup for one send idempotency key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatMessageLookup"];
+                };
+            };
+            /** @description Empty platform_msg_id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     set_session_model: {
         parameters: {
             query?: never;
@@ -2592,6 +2843,103 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    mark_session_read: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id to mark read */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MarkReadRequest"];
+            };
+        };
+        responses: {
+            /** @description Read cursor advanced; unread_count recomputes from it */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    sync_session: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Highest coverage watermark the client holds for this session.
+                 *     Omit for the newest-page baseline (cold start, fresh install,
+                 *     no local cursor).
+                 */
+                since_ordinal?: number | null;
+                /**
+                 * @description Maximum transcript rows to return, counted in *emitted* rows.
+                 *     Defaults to [`DEFAULT_HISTORY_LIMIT`], clamped to
+                 *     [`MAX_HISTORY_LIMIT`]. A difference larger than this rebases.
+                 */
+                limit?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description Session id to sync */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Forward-recovery pull: the difference after the cursor, or a newest-page baseline (rebased / no cursor) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSyncResponse"];
+                };
             };
             /** @description Unauthorized */
             401: {
@@ -3541,6 +3889,46 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_device_apns_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateDeviceApnsTokenRequest"];
+            };
+        };
+        responses: {
+            /** @description Paired device APNs token refreshed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Persist failed */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

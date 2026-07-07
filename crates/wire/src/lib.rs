@@ -3,8 +3,8 @@
 //!
 //! These are the **pure wire types** — `Frame`, `Message`, `MessageRole`,
 //! the attachment / folder / task projections — plus the MessagePack codec.
-//! They were extracted from `baybo-channels` into their own crate so the iOS
-//! companion's `baybo-mobile-core` can speak the exact same protocol without
+//! They were extracted from `baybo-channels` into their own crate so the device
+//! companion core can speak the exact same protocol without
 //! pulling `baybo-channels → baybo-tools → { libsql, axum, reqwest, … }`, a
 //! chain that cannot cross-compile to iOS. `baybo-channels` re-exports this
 //! crate as its `wire` module, so server-side consumers are unchanged.
@@ -17,7 +17,7 @@
 //! entirely and see every session of their channel type.
 //!
 //! Consumers: the TypeScript SDK at `sidecars/sdk/channel-ts/`, the built-in
-//! TUI's WS client, the web chat page, and the iOS companion. All speak the
+//! TUI's WS client, the web chat page, and device companion clients. All speak the
 //! types below verbatim, both encode/decode via MessagePack with named
 //! fields.
 
@@ -163,13 +163,12 @@ pub struct Message {
     #[serde(default)]
     pub role: MessageRole,
     /// Persisted `session_messages.ordinal` of this row, when known.
-    /// Server-side **catch-up replays** (emitted in response to a
-    /// `Subscribe { since_ordinal }`) set this so clients can advance
-    /// their cursor; live emissions (inbound echo, agent reply at
-    /// emit-time) leave it `None` because persistence happens out of
-    /// band from the channel fan-out. Clients track the highest
-    /// `Some(ordinal)` they've ever seen per `session_id` and replay it
-    /// on the next Subscribe.
+    /// The final assistant reply carries its persisted ordinal so
+    /// clients can advance their sync cursor past live emissions; the
+    /// server's pre-persist echo of inbound (role=User) leaves it
+    /// `None` by design — durability for a send is confirmed by an
+    /// ordinal-stamped row from the REST sync/backfill surface, keyed
+    /// by `platform_msg_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub ordinal: Option<i64>,
@@ -277,6 +276,157 @@ impl From<baybo_model::Task> for TaskView {
     }
 }
 
+/// Kind discriminant for a [`WireWorkStep`] — serialized as `"reasoning"` /
+/// `"prose"` / `"tool"`. A typed enum (mirrors [`AttachmentKind`]) so the
+/// discriminant round-trips cleanly through ts-rs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub enum WireWorkStepKind {
+    /// A model reasoning ("thinking") chunk.
+    Reasoning,
+    /// Answer prose that streamed mid-turn but was superseded by more work.
+    Prose,
+    /// A tool call (started, and — if it finished within the buffered turn —
+    /// completed).
+    Tool,
+}
+
+/// One step inside a turn's in-flight work block, carried in the
+/// [`Frame::SubscribeState`] bundle. Mirrors the client's rendered work-step model:
+/// `reasoning` / `prose` bodies live in [`Self::text`]; a `tool` step carries
+/// the call's `call_id` (so a later live [`Frame::ToolCompleted`] still pairs by
+/// id), a display `tool` name + optional `label`, and — once the call finished
+/// within the buffered turn — a `status` (`"ok"` / `"error"` / `"denied"`, else
+/// the tool is still running) and a `summary`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub struct WireWorkStep {
+    pub kind: WireWorkStepKind,
+    /// Reasoning trace or superseded prose body. Empty for `tool` steps.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// Pairs a `tool` step with a later live [`Frame::ToolCompleted`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub call_id: Option<String>,
+    /// Tool name, set when `kind == Tool`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub tool: Option<String>,
+    /// Human preview for the call (path / command / url), when the live
+    /// `progress_label` was present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub label: Option<String>,
+    /// `"ok"` / `"error"` / `"denied"` once the call completed within the
+    /// buffered turn; `None` while it is still running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub status: Option<String>,
+    /// Short result summary, set alongside `status` on completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub summary: Option<String>,
+}
+
+impl WireWorkStep {
+    /// A reasoning ("thinking") step.
+    pub fn reasoning(text: String) -> Self {
+        Self {
+            kind: WireWorkStepKind::Reasoning,
+            text,
+            call_id: None,
+            tool: None,
+            label: None,
+            status: None,
+            summary: None,
+        }
+    }
+
+    /// A superseded mid-turn answer-prose step.
+    pub fn prose(text: String) -> Self {
+        Self {
+            kind: WireWorkStepKind::Prose,
+            text,
+            call_id: None,
+            tool: None,
+            label: None,
+            status: None,
+            summary: None,
+        }
+    }
+
+    /// A tool step (status / summary filled in later on completion). `call_id`
+    /// is `Some` for a still-running in-flight tool (so a later live
+    /// `ToolCompleted` can pair by id) and `None` for a completed-turn replay
+    /// (nothing live to pair with).
+    pub fn tool(call_id: Option<String>, tool: Option<String>, label: Option<String>) -> Self {
+        Self {
+            kind: WireWorkStepKind::Tool,
+            text: String::new(),
+            call_id,
+            tool,
+            label,
+            status: None,
+            summary: None,
+        }
+    }
+}
+
+/// Whether a turn (the session's in-flight reply) is being produced at
+/// snapshot time, carried in the [`Frame::SubscribeState`] bundle.
+/// `started_at` is `Some` iff `active` — it doubles as the turn's
+/// identity for the client-side staleness test: the snapshot's
+/// turn/work halves are discarded only when the client already holds a
+/// turn-end signal for the *same* turn, matched by `started_at`, never
+/// by comparing a sync cursor against `as_of_ordinal` (the cursor
+/// advances mid-turn as tool rows persist).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub struct TurnSnapshot {
+    pub active: bool,
+    /// `Some` iff `active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+/// One pending tool-approval prompt, carried in the
+/// [`Frame::SubscribeState`] bundle as part of the authoritative
+/// replacement set for the session. Field-compatible with the live
+/// [`Frame::ApprovalRequested`] (minus `session_id`, which the bundle
+/// carries once) so clients render both through the same card.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sidecars/sdk/channel-ts/src/generated/")
+)]
+pub struct ApprovalCard {
+    pub call_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub user_id: String,
+    pub tool: String,
+    pub accesses: Vec<ResourceAccess>,
+    pub params_preview: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub description: Option<String>,
+}
+
 /// Frame envelope. Tagged on the `kind` field so the receive side
 /// never has to guess. Encoded with
 /// [`rmp_serde::to_vec_named`](rmp_serde::to_vec_named) so field names
@@ -309,26 +459,18 @@ pub enum Frame {
     RegisterAck { ok: bool, reason: Option<String> },
     /// Client → server. Subscribe this connection to `session_id`.
     /// Server returns no per-Subscribe ack — the connection sees
-    /// outbound frames for that session start arriving. `Subscribed`-
-    /// kind only; `Multiplexed` clients sending Subscribe receive a
-    /// `Notice` (level=`"error"`) and the frame is dropped.
+    /// outbound frames for that session start arriving, led by one
+    /// [`Frame::SubscribeState`] bundle. `Subscribed`-kind only;
+    /// `Multiplexed` clients sending Subscribe receive a `Notice`
+    /// (level=`"error"`) and the frame is dropped.
     ///
-    /// `since_ordinal` is the highest `session_messages.ordinal` the
-    /// client has already seen for this session; on `Some(n)` the
-    /// server replays every persisted UI-visible row whose ordinal is
-    /// strictly greater than `n` as `Frame::Message` (with `ordinal`
-    /// set) to **this connection only**, so a tab that briefly lost
-    /// the WS doesn't have to refetch via REST to recover messages
-    /// that arrived during the gap. `None` is "fresh subscribe — no
-    /// catch-up". If the catch-up slice would exceed the server's
-    /// safety cap, the server sends a `Reset` instead so the client
-    /// falls back to a paged REST fetch.
+    /// The server replays no history on subscribe — transcript
+    /// recovery is the client's REST sync call
+    /// (`GET /v1/chat/sessions/{id}/sync`), the one forward-recovery
+    /// pull for every scenario.
     Subscribe {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "ts-export", ts(optional))]
-        since_ordinal: Option<i64>,
     },
     /// Client → server. Drop one subscription. Idempotent (no error if
     /// the connection wasn't subscribed).
@@ -336,72 +478,50 @@ pub enum Frame {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
     },
-    /// Client → server. Request one backward page of `session_id`'s
-    /// persisted transcript — the Noise-sealed relay equivalent of the
-    /// REST `GET /v1/chat/sessions/:id`, for clients (the iOS relay leg)
-    /// that have no admin REST surface. Where [`Subscribe`] catch-up
-    /// pages *forward* (rows above `since_ordinal`), this pages
-    /// *backward*: the server replies with a single [`HistoryPage`] of
-    /// UI-visible rows whose ordinal is below `before_ordinal` (or the
-    /// newest page when `None`), capped at `limit` (server-clamped to the
-    /// same bounds as the REST endpoint). The client pages further back
-    /// with `before_ordinal = HistoryPage.oldest_ordinal`. `Subscribed`-
-    /// kind only, and the connection must already be subscribed to
-    /// `session_id` (parity with the inbound `Message` path).
-    FetchHistory {
+    /// Server → client: the one atomic state-plane bundle, sent
+    /// immediately after a `Subscribe` registers. REPLACES the client's
+    /// prior view of the session's current state: whether a turn is in
+    /// flight (`turn`), the in-flight work block streamed so far
+    /// (`work_steps`, empty unless mid-turn), the authoritative pending
+    /// approval set (full cards from one atomic queue read), and the
+    /// planning checklist (`tasks`). `as_of_ordinal` is the session's
+    /// newest persisted ordinal at snapshot time — it orders the bundle
+    /// against sync pages, but staleness of the turn/work halves is
+    /// judged by turn identity ([`TurnSnapshot::started_at`]), never by
+    /// ordinal arithmetic. Live `TurnState` / `TaskList` /
+    /// `ApprovalRequested` / `ApprovalResolved` frames arriving after
+    /// this bundle win by normal frame order.
+    SubscribeState {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
+        /// Newest persisted `session_messages.ordinal` at snapshot
+        /// time; `None` for a session with no rows yet.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts-export", ts(optional))]
-        before_ordinal: Option<i64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "ts-export", ts(optional))]
-        limit: Option<u32>,
+        as_of_ordinal: Option<i64>,
+        turn: TurnSnapshot,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        work_steps: Vec<WireWorkStep>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending_approvals: Vec<ApprovalCard>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tasks: Vec<TaskView>,
     },
-    /// Server → client. One backward page of `session_id`'s persisted
-    /// transcript, in response to a [`FetchHistory`]. `messages` are the
-    /// same UI-visible projection [`Subscribe`] catch-up replays (user
-    /// prompts + final tool-free assistant replies, carrying real
-    /// attachment refs), ordered ascending by ordinal. `oldest_ordinal` /
-    /// `newest_ordinal` are the real `session_messages.ordinal` bounds of
-    /// the *raw* page (`None` for an empty page) — authoritative paging
-    /// cursors that stay monotonic even across a page whose visible-row
-    /// set is empty. The client pages older with `before_ordinal =
-    /// oldest_ordinal` and seeds its catch-up cursor from `newest_ordinal`;
-    /// `has_more` is true while older rows remain below this page.
-    HistoryPage {
-        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        session_id: SessionId,
-        messages: Vec<Message>,
+    /// Server → client: the server dropped one or more frames it owed
+    /// this connection (slow-consumer drop on the bounded per-connection
+    /// queue). `Some(id)` scopes the loss to one session — the client
+    /// runs sync for it. `None` means the loss couldn't be attributed
+    /// to a session (a dropped session-less broadcast such as
+    /// `SessionActivity` / `SessionUpdated` / `FoldersChanged`) — the
+    /// client syncs every subscribed session and refetches the session
+    /// list + folders. Best-effort by construction (it rides the same
+    /// queue it reports on); the client-side periodic safety-net sync
+    /// backstops a lost Gap.
+    Gap {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "ts-export", ts(optional))]
-        oldest_ordinal: Option<i64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "ts-export", ts(optional))]
-        newest_ordinal: Option<i64>,
-        has_more: bool,
+        #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+        session_id: Option<SessionId>,
     },
-    /// Client → server, **iOS only**. The device's current APNs token (+ env
-    /// `"sandbox"`/`"production"`), sent on every content connect so the gateway
-    /// can keep C's push binding fresh across APNs token rotation (reinstall,
-    /// restore-from-backup, new device — Apple does not guarantee a stable
-    /// token). The gateway persists it and re-registers (signed) with C when the
-    /// token changed. Handled on the device content leg before the generic
-    /// router; other channels never send it.
-    UpdateApnsToken {
-        apns_token: String,
-        apns_env: String,
-    },
-    /// Server → client. The connection's live stream is in an
-    /// indeterminate state (slow-consumer drop, server-side
-    /// reconfiguration, etc.); clients should re-subscribe and refetch
-    /// session history — via the REST `/v1/chat/sessions/:id` endpoint, or
-    /// (for clients with no REST surface, e.g. the iOS relay leg) via a
-    /// [`FetchHistory`] over this same connection. The connection stays
-    /// live, so a follow-up `FetchHistory` is answerable. Sent
-    /// best-effort; clients that ignore it may end up with a stale
-    /// transcript until the next reconnect.
-    Reset { reason: String },
     /// A user-visible message flowing in either direction. Inbound it
     /// is user input (role=User); outbound it is either the agent's
     /// final response for a turn (role=Assistant) or the server's
@@ -537,11 +657,10 @@ pub enum Frame {
     /// every job lifecycle transition — the `Pending → InProgress` start
     /// edge (`active: true` + start instant) and the terminal edges
     /// (`active: false`, so the close can't be skipped by an error or
-    /// crash). One snapshot is also sent to the subscribing connection on
-    /// every `Subscribe`, so a late joiner (new tab, reconnect) renders
-    /// the in-flight turn it never saw start: open work block, elapsed
-    /// timer seeded from `started_at`, and no "Cancelled" mislabel.
-    /// Clients that infer turn activity locally (TUI, sidecars) drop it.
+    /// crash). A late joiner (new tab, reconnect) learns the in-flight
+    /// turn from the [`Frame::SubscribeState`] bundle instead — this
+    /// frame is live-update only. Clients that infer turn activity
+    /// locally (TUI, sidecars) drop it.
     TurnState {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
@@ -585,28 +704,6 @@ pub enum Frame {
         call_id: String,
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         decision: ApprovalDecision,
-    },
-    /// Server → client: authoritative list of currently-pending approval
-    /// `call_id`s for `session_id`, sent once per [`Frame::Subscribe`]
-    /// right after the subscription registers. Clients use this to
-    /// reconcile locally-cached [`Frame::ApprovalRequested`] cards
-    /// against the server's truth: a card whose `call_id` is absent
-    /// from the snapshot was resolved while the connection was down
-    /// (the resulting [`Frame::ApprovalResolved`] is fire-and-forget
-    /// fan-out — not persisted, not replayed on catch-up). Empty
-    /// `call_ids` is a meaningful "nothing pending here" — not a
-    /// "no opinion" sentinel.
-    ///
-    /// Race note: an approval enqueued on the server between the
-    /// subscribe registration and the snapshot's queue read may
-    /// neither appear in `call_ids` nor have been broadcast through
-    /// this connection yet. The client side is expected to guard
-    /// against dropping locally-cached entries that arrived *after*
-    /// the subscribe-issuance moment.
-    PendingApprovalsSnapshot {
-        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        session_id: SessionId,
-        call_ids: Vec<String>,
     },
     /// Client → server: persist one submitted input line to the
     /// server-side history store. Used by the built-in TUI to get
@@ -737,6 +834,47 @@ pub enum Frame {
     Pong,
 }
 
+impl Frame {
+    /// Session id a client can use to route this frame into a per-session bucket.
+    /// Returns `None` for connection-global frames. `Messages` returns the first
+    /// message's session id; empty batches route nowhere.
+    pub fn routing_session_id(&self) -> Option<&SessionId> {
+        match self {
+            Frame::Subscribe { session_id }
+            | Frame::Unsubscribe { session_id }
+            | Frame::SubscribeState { session_id, .. }
+            | Frame::Attachment { session_id, .. }
+            | Frame::AnswerDelta { session_id, .. }
+            | Frame::Reasoning { session_id, .. }
+            | Frame::ToolStarted { session_id, .. }
+            | Frame::ToolCompleted { session_id, .. }
+            | Frame::Status { session_id, .. }
+            | Frame::Notice { session_id, .. }
+            | Frame::TaskList { session_id, .. }
+            | Frame::TurnState { session_id, .. }
+            | Frame::ApprovalRequested { session_id, .. }
+            | Frame::HistoryAppend { session_id, .. }
+            | Frame::HistorySnapshot { session_id, .. }
+            | Frame::SessionUpdated { session_id, .. }
+            | Frame::SessionActivity { session_id, .. } => Some(session_id),
+            Frame::Gap { session_id } => session_id.as_ref(),
+            Frame::Message(message) => Some(&message.session_id),
+            Frame::Messages { messages } => messages.first().map(|message| &message.session_id),
+            Frame::Register { .. }
+            | Frame::RegisterAck { .. }
+            | Frame::ApprovalResolved { .. }
+            | Frame::ResolveApproval { .. }
+            | Frame::StartBot { .. }
+            | Frame::StopBot { .. }
+            | Frame::BotStatus { .. }
+            | Frame::SlashManifest { .. }
+            | Frame::FoldersChanged { .. }
+            | Frame::Ping
+            | Frame::Pong => None,
+        }
+    }
+}
+
 /// Sparse mutation surface carried on [`Frame::SessionUpdated`].
 /// Every field is independently optional; producers populate only what
 /// changed. Receivers merge present fields onto their local view —
@@ -813,6 +951,81 @@ mod tests {
         }
     }
 
+    fn sample_message(session_id: &str) -> Message {
+        Message {
+            content: "hi".into(),
+            session_id: session_id.into(),
+            user_id: "u1".into(),
+            channel_type: ChannelType::from("http"),
+            bot_id: String::new(),
+            attachments: Vec::new(),
+            platform_msg_id: String::new(),
+            role: MessageRole::User,
+            ordinal: None,
+        }
+    }
+
+    #[test]
+    fn routing_session_id_reads_direct_session_fields() {
+        let subscribe = Frame::Subscribe {
+            session_id: "sess-x".into(),
+        };
+        assert_eq!(
+            subscribe.routing_session_id().map(|id| id.as_str()),
+            Some("sess-x")
+        );
+
+        let activity = Frame::SessionActivity {
+            session_id: "sess-y".into(),
+            source: ActivityKind::Assistant,
+            at: chrono::Utc::now(),
+        };
+        assert_eq!(
+            activity.routing_session_id().map(|id| id.as_str()),
+            Some("sess-y")
+        );
+    }
+
+    #[test]
+    fn routing_session_id_reads_message_payloads() {
+        let message = Frame::Message(sample_message("sess-message"));
+        assert_eq!(
+            message.routing_session_id().map(|id| id.as_str()),
+            Some("sess-message")
+        );
+
+        let batch = Frame::Messages {
+            messages: vec![sample_message("sess-first"), sample_message("sess-second")],
+        };
+        assert_eq!(
+            batch.routing_session_id().map(|id| id.as_str()),
+            Some("sess-first")
+        );
+
+        let empty_batch = Frame::Messages {
+            messages: Vec::new(),
+        };
+        assert!(empty_batch.routing_session_id().is_none());
+    }
+
+    #[test]
+    fn routing_session_id_ignores_connection_global_frames() {
+        assert!(Frame::Ping.routing_session_id().is_none());
+        assert!(
+            Frame::Gap { session_id: None }
+                .routing_session_id()
+                .is_none()
+        );
+        assert_eq!(
+            Frame::Gap {
+                session_id: Some("sess-g".into())
+            }
+            .routing_session_id()
+            .map(|id| id.as_str()),
+            Some("sess-g")
+        );
+    }
+
     #[test]
     fn round_trip_register() {
         let frame = sample_register();
@@ -823,16 +1036,6 @@ mod tests {
     fn round_trip_subscribe() {
         let frame = Frame::Subscribe {
             session_id: "sess-x".into(),
-            since_ordinal: None,
-        };
-        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-    }
-
-    #[test]
-    fn round_trip_subscribe_with_cursor() {
-        let frame = Frame::Subscribe {
-            session_id: "sess-x".into(),
-            since_ordinal: Some(42),
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
@@ -846,78 +1049,64 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_fetch_history() {
-        let frame = Frame::FetchHistory {
-            session_id: "sess-x".into(),
-            before_ordinal: Some(120),
-            limit: Some(50),
+    fn round_trip_gap_session_scoped_and_global() {
+        let scoped = Frame::Gap {
+            session_id: Some("sess-x".into()),
         };
-        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+        assert_eq!(scoped, decode(&encode(&scoped).unwrap()).unwrap());
+
+        let global = Frame::Gap { session_id: None };
+        assert_eq!(global, decode(&encode(&global).unwrap()).unwrap());
     }
 
     #[test]
-    fn round_trip_fetch_history_newest_page() {
-        // `before_ordinal`/`limit` both absent => the newest page at the
-        // server default. Their `skip_serializing_if` keeps them off the wire.
-        let frame = Frame::FetchHistory {
+    fn round_trip_subscribe_state_mid_turn() {
+        use std::path::PathBuf;
+        let frame = Frame::SubscribeState {
             session_id: "sess-x".into(),
-            before_ordinal: None,
-            limit: None,
-        };
-        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-    }
-
-    #[test]
-    fn round_trip_history_page() {
-        let frame = Frame::HistoryPage {
-            session_id: "s1".into(),
-            messages: vec![
-                Message {
-                    content: "first".into(),
-                    session_id: "s1".into(),
-                    user_id: String::new(),
-                    channel_type: ChannelType::from("ios"),
-                    bot_id: String::new(),
-                    attachments: Vec::new(),
-                    platform_msg_id: String::new(),
-                    role: MessageRole::User,
-                    ordinal: Some(3),
-                },
-                Message {
-                    content: "reply".into(),
-                    session_id: "s1".into(),
-                    user_id: String::new(),
-                    channel_type: ChannelType::from("ios"),
-                    bot_id: String::new(),
-                    attachments: Vec::new(),
-                    platform_msg_id: String::new(),
-                    role: MessageRole::Assistant,
-                    ordinal: Some(4),
-                },
+            as_of_ordinal: Some(41),
+            turn: TurnSnapshot {
+                active: true,
+                started_at: Some(chrono::Utc::now()),
+            },
+            work_steps: vec![
+                WireWorkStep::reasoning("weighing it".into()),
+                WireWorkStep::tool(Some("c1".into()), Some("edit".into()), None),
             ],
-            oldest_ordinal: Some(3),
-            newest_ordinal: Some(4),
-            has_more: true,
+            pending_approvals: vec![ApprovalCard {
+                call_id: "c1".into(),
+                user_id: "u1".into(),
+                tool: "fs.read".into(),
+                accesses: vec![ResourceAccess::ReadFile {
+                    path: PathBuf::from("/tmp/x"),
+                }],
+                params_preview: "{}".into(),
+                description: None,
+            }],
+            tasks: vec![TaskView {
+                id: "t1".into(),
+                subject: "do it".into(),
+                status: "pending".into(),
+                depends_on: Vec::new(),
+            }],
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }
 
     #[test]
-    fn round_trip_history_page_empty() {
-        let frame = Frame::HistoryPage {
-            session_id: "s1".into(),
-            messages: Vec::new(),
-            oldest_ordinal: None,
-            newest_ordinal: None,
-            has_more: false,
-        };
-        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
-    }
-
-    #[test]
-    fn round_trip_reset() {
-        let frame = Frame::Reset {
-            reason: "outbound queue full".into(),
+    fn round_trip_subscribe_state_idle_empty() {
+        // The idle shape: no turn, nothing pending, no rows yet. Empty
+        // vecs are skipped on the wire and must decode back to empty.
+        let frame = Frame::SubscribeState {
+            session_id: "sess-x".into(),
+            as_of_ordinal: None,
+            turn: TurnSnapshot {
+                active: false,
+                started_at: None,
+            },
+            work_steps: Vec::new(),
+            pending_approvals: Vec::new(),
+            tasks: Vec::new(),
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }

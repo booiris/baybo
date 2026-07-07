@@ -11,10 +11,13 @@ use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use baybo_channels::ChannelKind;
 use baybo_config::ChannelsConfig;
+use baybo_gateway::auth::{AuthedClient, DEVICE_ID_HEADER};
 use baybo_gateway::channel::boot;
+use baybo_gateway::server::build_admin_router_for_tests;
 use baybo_gateway::test_support::build_test_deps;
-use baybo_model::{ChatMessage, ContentBlock, SessionId};
-use serde_json::Value;
+use baybo_model::{ChannelType, ChatMessage, ContentBlock, SessionId, User};
+use baybo_store::{DeviceRow, DeviceStatus};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -148,6 +151,629 @@ async fn chat_api_round_trip() {
     );
 }
 
+#[tokio::test]
+async fn chat_create_accepts_client_supplied_session_id() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    let requested = "client-session-1";
+
+    let created = post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "session_id": requested }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(created["session_id"].as_str(), Some(requested));
+
+    let duplicate = post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "session_id": requested }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(duplicate["session_id"].as_str(), Some(requested));
+
+    let detail = get(
+        &router,
+        &format!("/v1/chat/sessions/{requested}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(detail["session_id"].as_str(), Some(requested));
+}
+
+/// Seed one session with a completed tool-using turn:
+/// user(0, "run it") → tool_use(1) → tool_result(2) → reply(3, "done").
+async fn seed_tool_turn_session(
+    tg: &baybo_gateway::test_support::TestGateway,
+    router: &axum::Router,
+) -> String {
+    let cred = post(router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+    let sid = SessionId::from(session_id.as_str());
+    let rows = [
+        ChatMessage::user(vec![ContentBlock::Text("run it".into())])
+            .with_platform_msg_id("client-msg-1"),
+        ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "c1".into(),
+            name: "Bash".into(),
+            input: json!({"command": "echo hi"}),
+            signature: None,
+        }]),
+        ChatMessage::tool_result("c1".to_owned(), "hi".to_owned()),
+        ChatMessage::assistant(vec![ContentBlock::Text("done".into())]),
+    ];
+    for msg in rows {
+        tg.deps
+            .session_manager
+            .append_session_message(&sid, &msg)
+            .await
+            .expect("append");
+    }
+    session_id
+}
+
+#[tokio::test]
+async fn chat_sync_difference_is_full_fidelity_with_coverage_watermark() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+
+    // Difference from a cursor below the whole turn: full fidelity —
+    // the user bubble, the reconstructed work block, and the reply.
+    let sync = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/sync?since_ordinal=-1"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(sync["rebased"].as_bool(), Some(false));
+    let rows = sync["rows"].as_array().expect("rows");
+    let kinds: Vec<&str> = rows
+        .iter()
+        .map(|item| item["kind"].as_str().expect("kind"))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["message", "work", "message"],
+        "sync difference carries work blocks like every other read path: {rows:?}",
+    );
+    assert_eq!(rows[0]["role"].as_str(), Some("user"));
+    assert_eq!(rows[0]["platform_msg_id"].as_str(), Some("client-msg-1"));
+    assert_eq!(rows[0]["id"].as_str(), Some("m0"));
+    assert_eq!(rows[1]["id"].as_str(), Some("w1"));
+    let steps = rows[1]["steps"].as_array().expect("work steps");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["tool"].as_str(), Some("Bash"));
+    assert_eq!(steps[0]["tool_status"].as_str(), Some("ok"));
+    assert_eq!(rows[2]["id"].as_str(), Some("m3"));
+    assert_eq!(rows[2]["text"].as_str(), Some("done"));
+    assert_eq!(
+        sync["next_cursor"].as_i64(),
+        Some(3),
+        "coverage watermark is the newest scanned ordinal"
+    );
+    // Difference responses carry no backfill floor — the client keeps its own.
+    assert!(sync["oldest_ordinal"].is_null());
+    assert_eq!(sync["has_more_older"].as_bool(), Some(false));
+
+    // A caught-up cursor returns an empty page but still reports the
+    // watermark, never null (null means "empty session").
+    let idle = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/sync?since_ordinal=3"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(idle["rows"].as_array().map(Vec::len), Some(0));
+    assert_eq!(idle["next_cursor"].as_i64(), Some(3));
+    assert_eq!(idle["rebased"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn chat_sync_watermark_covers_invisible_tail() {
+    // Rows persisted after the last visible reply (internal/tool rows)
+    // must still advance the coverage watermark — otherwise every sync
+    // re-scans the invisible tail forever.
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+    let sid = SessionId::from(session_id.as_str());
+    let rows = [
+        ChatMessage::user(vec![ContentBlock::Text("run it".into())]),
+        ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "c1".into(),
+            name: "Bash".into(),
+            input: json!({"command": "echo hi"}),
+            signature: None,
+        }]),
+        ChatMessage::tool_result("c1".to_owned(), "hi".to_owned()),
+    ];
+    for msg in rows {
+        tg.deps
+            .session_manager
+            .append_session_message(&sid, &msg)
+            .await
+            .expect("append");
+    }
+
+    let sync = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/sync?since_ordinal=-1"),
+        StatusCode::OK,
+    )
+    .await;
+    let rows = sync["rows"].as_array().expect("rows");
+    // The unfinished turn reconstructs partially: the user bubble plus
+    // the open work block (no reply yet).
+    assert_eq!(rows[0]["kind"].as_str(), Some("message"));
+    assert_eq!(
+        sync["next_cursor"].as_i64(),
+        Some(2),
+        "watermark covers the invisible tool tail, not just visible rows",
+    );
+}
+
+#[tokio::test]
+async fn chat_sync_baseline_and_rebase_replace_with_newest_page() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+
+    // No cursor → newest-page baseline, not marked rebased.
+    let baseline = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/sync"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(baseline["rebased"].as_bool(), Some(false));
+    assert_eq!(baseline["next_cursor"].as_i64(), Some(3));
+    assert_eq!(baseline["has_more_older"].as_bool(), Some(false));
+    assert_eq!(
+        baseline["rows"].as_array().map(Vec::len),
+        Some(3),
+        "baseline is the full-fidelity newest page"
+    );
+
+    // A difference wider than `limit` (counted in emitted rows: this
+    // turn emits 3) rebases onto the newest page instead.
+    let rebased = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/sync?since_ordinal=-1&limit=2"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(rebased["rebased"].as_bool(), Some(true));
+    assert_eq!(rebased["next_cursor"].as_i64(), Some(3));
+    let page = rebased["rows"].as_array().expect("rows");
+    assert!(!page.is_empty(), "rebase answers with the newest page");
+    assert_eq!(
+        rebased["oldest_ordinal"].as_i64(),
+        Some(2),
+        "REPLACE pages carry the backfill floor (limit=2 spans raw rows 2..3)"
+    );
+    assert_eq!(
+        rebased["has_more_older"].as_bool(),
+        Some(true),
+        "older history stays fetchable below the rebased baseline"
+    );
+}
+
+#[tokio::test]
+async fn chat_sync_redelivers_control_events_anchored_at_cursor() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+    let sid = SessionId::from(session_id.as_str());
+
+    // A notice written later, anchored at the newest ordinal (3) — an
+    // ordinal a caught-up client already holds.
+    tg.deps
+        .session_manager
+        .append_control_event(
+            &sid,
+            3,
+            baybo_model::ControlEventKind::NoticeInfo,
+            "compacted",
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("append control event");
+
+    // Sync from cursor 3 selects control events at `>=` the cursor, so
+    // the anchored-at-cursor notice is (re)delivered; the client dedups
+    // by its stable `n<seq>` id.
+    let sync = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/sync?since_ordinal=3"),
+        StatusCode::OK,
+    )
+    .await;
+    let rows = sync["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "the anchored notice re-delivers: {rows:?}");
+    assert_eq!(rows[0]["kind"].as_str(), Some("notice"));
+    assert_eq!(rows[0]["id"].as_str(), Some("n0"));
+    assert!(
+        rows[0]["ordinal"].is_null(),
+        "control events are not ordinal-addressed"
+    );
+    assert_eq!(rows[0]["text"].as_str(), Some("compacted"));
+}
+
+#[tokio::test]
+async fn chat_message_point_lookup_probes_durability() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+
+    let found = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/messages?platform_msg_id=client-msg-1"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(found["found"].as_bool(), Some(true));
+    assert_eq!(found["ordinal"].as_i64(), Some(0));
+
+    let absent = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/messages?platform_msg_id=never-sent"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(absent["found"].as_bool(), Some(false));
+    assert!(absent["ordinal"].is_null());
+
+    get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/messages?platform_msg_id="),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn chat_list_unread_count_reflects_read_cursor() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    // user(0) → tool_use(1) → tool_result(2) → final assistant reply(3, "done").
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+
+    let unread_of = |list: &Value| -> i64 {
+        list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|i| i["session_id"] == json!(session_id))
+            .expect("session in list")["unread_count"]
+            .as_i64()
+            .expect("unread_count")
+    };
+
+    // Nothing read yet: one unread final reply (the intermediate tool-using
+    // assistant row at ordinal 1 does NOT count — only the tool-free reply).
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert_eq!(unread_of(&list), 1, "one unread assistant reply");
+
+    // Mark read up to the newest ordinal → caught up.
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/read"),
+        Body::from(json!({ "ordinal": 3 }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert_eq!(unread_of(&list), 0, "read cursor cleared the badge");
+
+    // A new reply after the read cursor bumps it back to unread.
+    let sid = SessionId::from(session_id.as_str());
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &sid,
+            &ChatMessage::user(vec![ContentBlock::Text("again".into())]),
+        )
+        .await
+        .expect("append user");
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &sid,
+            &ChatMessage::assistant(vec![ContentBlock::Text("sure".into())]),
+        )
+        .await
+        .expect("append reply");
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert_eq!(unread_of(&list), 1, "a reply above the cursor is unread");
+
+    // Max-wins: a stale lower ordinal must not regress the cursor / re-hide.
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/read"),
+        Body::from(json!({ "ordinal": 5 }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/read"),
+        Body::from(json!({ "ordinal": 2 }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert_eq!(unread_of(&list), 0, "read cursor never regresses");
+}
+
+#[tokio::test]
+async fn chat_list_uses_device_scope_when_forwarded_from_tunnel() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let device_session = tg
+        .deps
+        .session_manager
+        .create_session(
+            User {
+                id: "device-1".into(),
+                name: None,
+                channel: ChannelType::device(),
+            },
+            ChannelType::device(),
+        )
+        .await
+        .unwrap();
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &device_session.id,
+            &ChatMessage::user(vec![ContentBlock::Text("from device".into())]),
+        )
+        .await
+        .unwrap();
+
+    let http = tg
+        .deps
+        .session_manager
+        .create_session(
+            User {
+                id: "web".into(),
+                name: None,
+                channel: ChannelType::http(),
+            },
+            ChannelType::http(),
+        )
+        .await
+        .unwrap();
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &http.id,
+            &ChatMessage::user(vec![ContentBlock::Text("from web".into())]),
+        )
+        .await
+        .unwrap();
+
+    let router = build_router(build_admin_state(&tg));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/chat/sessions")
+                .extension(AuthedClient::Device {
+                    device_id: "device-1".into(),
+                })
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("body bytes");
+    let list: Value = serde_json::from_slice(&bytes).expect("response is json");
+    let ids: Vec<&str> = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|row| row["session_id"].as_str().expect("session_id"))
+        .collect();
+    assert_eq!(ids, vec![device_session.id.as_str()]);
+}
+
+#[tokio::test]
+async fn admin_device_header_creates_and_lists_device_sessions() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let router = build_admin_router_for_tests(&tg.deps);
+    let device_key = device_proto::delegation::generate_signing_key();
+    let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
+
+    let created = authed_device_request(
+        &router,
+        "POST",
+        "/v1/chat/sessions",
+        &tg.deps.admin_token,
+        &device_id,
+        StatusCode::OK,
+    )
+    .await;
+    let session_id = created["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let session = tg
+        .deps
+        .session_manager
+        .get(&SessionId::from(session_id.as_str()))
+        .await
+        .unwrap()
+        .expect("created session");
+    assert_eq!(session.channel, ChannelType::device());
+    assert_eq!(session.user.id, device_id);
+    assert_eq!(session.user.channel, ChannelType::device());
+
+    let list = authed_device_request(
+        &router,
+        "GET",
+        "/v1/chat/sessions",
+        &tg.deps.admin_token,
+        &session.user.id,
+        StatusCode::OK,
+    )
+    .await;
+    let items = list["items"].as_array().expect("items");
+    assert!(
+        items
+            .iter()
+            .any(|row| row["session_id"].as_str() == Some(session_id.as_str())),
+        "device-scoped list should contain the created device session: {items:?}",
+    );
+
+    let detail = authed_device_request(
+        &router,
+        "GET",
+        &format!("/v1/chat/sessions/{session_id}"),
+        &tg.deps.admin_token,
+        &session.user.id,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(detail["session_id"].as_str(), Some(session_id.as_str()));
+
+    let web_response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/chat/sessions/{session_id}"))
+                .header("authorization", format!("Bearer {}", tg.deps.admin_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        web_response.status(),
+        StatusCode::NOT_FOUND,
+        "plain web identity must not see device-scoped sessions",
+    );
+}
+
+#[tokio::test]
+async fn device_apns_token_api_persists_registration() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_admin_router_for_tests(&tg.deps);
+    let device_key = device_proto::delegation::generate_signing_key();
+    let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/mobile/apns-token")
+                .header("authorization", format!("Bearer {}", tg.deps.admin_token))
+                .header(DEVICE_ID_HEADER, &device_id)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "apns_token": "new-token",
+                        "apns_env": "production",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let secret = tg
+        .deps
+        .secret_vault
+        .get_secret(&format!("device.{device_id}.apns"))
+        .await
+        .expect("vault read")
+        .expect("apns registration persisted");
+    let reg: Value = serde_json::from_slice(secret.as_bytes()).expect("registration json");
+    assert_eq!(reg["apns_token"].as_str(), Some("new-token"));
+    assert_eq!(reg["apns_env"].as_str(), Some("production"));
+}
+
+#[tokio::test]
+async fn approved_device_token_with_header_creates_device_session() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let device_key = device_proto::delegation::generate_signing_key();
+    let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
+    tg.deps
+        .stores
+        .device
+        .create(&approved_device(&device_id, "approved-device-token"))
+        .await
+        .expect("seed approved device");
+
+    let router = build_admin_router_for_tests(&tg.deps);
+    let created = authed_device_request(
+        &router,
+        "POST",
+        "/v1/chat/sessions",
+        "approved-device-token",
+        &device_id,
+        StatusCode::OK,
+    )
+    .await;
+    let session_id = created["session_id"].as_str().expect("session_id");
+    let session = tg
+        .deps
+        .session_manager
+        .get(&SessionId::from(session_id))
+        .await
+        .unwrap()
+        .expect("created session");
+    assert_eq!(session.channel, ChannelType::device());
+    assert_eq!(session.user.id, device_id);
+}
+
 // ── helpers ─────────────────────────────────────────────────────────
 
 fn build_admin_state(
@@ -186,6 +812,21 @@ fn build_admin_state(
 fn build_router(state: baybo_gateway::server::AdminState) -> axum::Router {
     let (router, _spec) = baybo_gateway::api::admin::v1_router_and_spec();
     router.with_state(state)
+}
+
+fn approved_device(device_id: &str, auth_token: &str) -> DeviceRow {
+    DeviceRow {
+        device_id: device_id.into(),
+        device_pubkey: vec![0u8; 32],
+        auth_token: auth_token.into(),
+        status: DeviceStatus::Approved,
+        rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
+        created_at: 1,
+        approved_at: Some(2),
+        last_seen_at: None,
+        relay_url: "wss://relay.test".into(),
+        remote_api_key: "inst-test".into(),
+    }
 }
 
 async fn post(router: &axum::Router, uri: &str, body: Body, expected: StatusCode) -> Value {
@@ -265,6 +906,42 @@ async fn get(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
     let bytes = body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .expect("body bytes");
+    serde_json::from_slice(&bytes).expect("response is json")
+}
+
+async fn authed_device_request(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    admin_token: &str,
+    device_id: &str,
+    expected: StatusCode,
+) -> Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {admin_token}"))
+                .header(DEVICE_ID_HEADER, device_id)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        response.status(),
+        expected,
+        "{method} {uri} expected {expected:?} got {:?}",
+        response.status(),
+    );
+    let bytes = body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("body bytes");
+    if bytes.is_empty() {
+        return Value::Null;
+    }
     serde_json::from_slice(&bytes).expect("response is json")
 }
 

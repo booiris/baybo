@@ -702,6 +702,15 @@ impl ContextManager {
         self.append(&ChatMessage::user_interjection(content)).await
     }
 
+    pub async fn append_user_interjection_with_platform_msg_id(
+        &mut self,
+        content: Vec<ContentBlock>,
+        platform_msg_id: impl Into<String>,
+    ) -> Option<i64> {
+        self.append(&ChatMessage::user_interjection(content).with_platform_msg_id(platform_msg_id))
+            .await
+    }
+
     /// Append a recalled-memory row as a persisted, framed context entry. The
     /// budget is charged the framed wire size (the row is sent wrapped in the
     /// `<recalled_memory>` envelope by [`Self::messages_for_llm`] /

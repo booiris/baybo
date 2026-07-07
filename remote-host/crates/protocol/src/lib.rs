@@ -22,7 +22,7 @@ pub fn key_tag(key: &str) -> String {
 }
 
 /// Max chars of an unvalidated `device_id` echoed into a log line — a well-formed
-/// id is 68 chars (`ios-` + 64 hex); a pre-validation reject carries an arbitrary
+/// id is 71 chars (`device-` + 64 hex); a pre-validation reject carries an arbitrary
 /// attacker-controlled string, so bound it. The gateway and the push host both log
 /// through [`device_id_log`] so the cap can't drift between the two records meant
 /// to correlate.
@@ -46,7 +46,7 @@ mod tests {
 
     #[test]
     fn device_id_log_bounds_an_arbitrary_string_on_a_char_boundary() {
-        assert_eq!(device_id_log("ios-abc"), "ios-abc");
+        assert_eq!(device_id_log("device-abc"), "device-abc");
         let long = "é".repeat(200);
         let logged = device_id_log(&long);
         assert_eq!(logged.chars().count(), super::DEVICE_ID_LOG_MAX_CHARS);

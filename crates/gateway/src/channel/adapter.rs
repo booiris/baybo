@@ -524,7 +524,7 @@ async fn agent_output_to_frame(
 /// dropped from the outbound — the agent's intent of "send this media"
 /// can't be honored without a known mime/size, and surfacing a partial
 /// payload would mislead the sidecar (and ultimately the user).
-pub(super) async fn split_content(
+pub(crate) async fn split_content(
     blocks: &[ContentBlock],
     blob_store: &dyn BlobStore,
 ) -> (String, Vec<WireAttachment>) {

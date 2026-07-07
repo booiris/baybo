@@ -149,7 +149,8 @@ pub struct AdminState {
     pub channel_bot_store: Arc<dyn ChannelBotStore>,
     pub agent_profile_store: Arc<dyn AgentProfileStore>,
     /// Blob metadata lookups (`stat`) so the agents endpoints can reject a
-    /// dangling or non-image `avatar_blob_id` at write time.
+    /// dangling or non-image `avatar_blob_id` at write time. Also used by the
+    /// chat transcript surface to attach persisted blob refs.
     pub blob_store: Arc<dyn BlobStore>,
     pub channel_control: Arc<crate::channel::ChannelControlRegistry>,
     pub secret_vault: Arc<SecretVault>,
@@ -172,7 +173,7 @@ pub struct ChannelState {
 }
 
 impl AdminState {
-    fn from_deps(deps: &GatewayDeps) -> Self {
+    pub(crate) fn from_deps(deps: &GatewayDeps) -> Self {
         let query_api = Arc::new(baybo_query::QueryApi::new(
             deps.session_manager.store(),
             Arc::clone(&deps.job_lifecycle),
@@ -286,21 +287,20 @@ pub fn spawn_relay_content(
 
 fn build_admin_router(deps: &GatewayDeps) -> Router {
     let state = AdminState::from_deps(deps);
-    let auth_state = AdminAuthState::new(deps.admin_token.clone());
+    let auth_state =
+        AdminAuthState::new(deps.admin_token.clone()).with_device_store(deps.stores.device.clone());
 
     let cors = build_cors(&deps.runtime_config.cors_allowed_origins);
 
     let (admin_router, _admin_spec) = api::admin::v1_router_and_spec();
     let admin_router = admin_router.with_state(state);
 
-    // Browser-facing `/v1/channel-ws` + `/v1/blobs`. Same handlers the
-    // loopback channel listener serves, but mounted here so the web
-    // chat page (which loads from this admin origin) can open its WS
-    // without discovering the ephemeral loopback port. The merged admin
-    // router below applies the admin bearer middleware to these routes too.
-    let channel_v1 = channel_auth::attach_web_identity(build_channel_v1_subrouter(
-        WsChannelState::from_deps(deps),
-    ));
+    // Browser/direct-device-facing `/v1/channel-ws` + `/v1/blobs`. Same handlers
+    // the loopback channel listener serves, but mounted here so the web chat page
+    // and direct device clients can reach them without discovering the ephemeral
+    // loopback port. The merged admin router below applies the admin/device bearer
+    // middleware to these routes too.
+    let channel_v1 = build_channel_v1_subrouter(WsChannelState::from_deps(deps));
 
     // TraceLayer goes *inside* the auth middleware so it sees the
     // URI AFTER `require_admin_token` has stripped `?token=…`. If

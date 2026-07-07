@@ -8,9 +8,10 @@
 //! tool sidecars via reserved labels, and stashes the matching
 //! [`AuthedClient`] on the request.
 //!
-//! The admin listener co-hosts `/v1/channel-ws` for browser web chat
-//! tabs. That route is authenticated by the admin bearer middleware
-//! before this module marks successful requests as [`AuthedClient::Web`].
+//! The admin listener co-hosts `/v1/channel-ws` and `/v1/blobs` for
+//! browser web chat tabs and direct device clients. Those routes are
+//! authenticated and tagged as [`AuthedClient::Web`] or
+//! [`AuthedClient::Device`] by [`crate::auth::admin`].
 //!
 //! The TUI token is minted by the gateway at startup, written to the
 //! secret vault under [`super::token::TUI_TOKEN_VAULT_KEY`], and
@@ -40,6 +41,7 @@ use axum::http::{Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use baybo_store::DeviceStore;
+pub use device_proto::DEVICE_ID_HEADER;
 
 /// Tag placed on the request after auth succeeds so downstream
 /// handlers know how the caller was authenticated.
@@ -71,13 +73,16 @@ pub enum AuthedClient {
     /// admin listener, then constrained by the Register handshake to
     /// `ChannelType::HTTP`.
     Web,
-    /// A paired, operator-approved iOS companion device. Resolved by its
-    /// persisted `auth_token` against the [`DeviceStore`] (not the in-memory
-    /// [`ChannelTokenTable`]) — only `approved` rows match, so a pending or
-    /// revoked device never authenticates. Scoped to the channel surface:
-    /// registers on `/v1/channel-ws` only as [`ChannelType::IOS`]
-    /// (a `Subscribed` channel). HTTP `/v1/blobs` upload is forbidden for device
-    /// tokens; mobile attachments upload over the E2E relay blob leg instead.
+    /// A paired, operator-approved companion device. On the channel
+    /// listener this is resolved by its persisted `auth_token` against the
+    /// [`DeviceStore`] (not the in-memory [`ChannelTokenTable`]) — only
+    /// `approved` rows match, so a pending or revoked device never
+    /// authenticates. On the admin listener, [`crate::auth::admin`] accepts
+    /// either the admin bearer or the matching approved device token when
+    /// [`DEVICE_ID_HEADER`] is present, then selects the same downstream
+    /// identity for direct device and relay API-tunnel requests. It registers on
+    /// `/v1/channel-ws` only as [`ChannelType::DEVICE`] and `/v1/blobs` uploads
+    /// are stamped with the device id for diagnostics.
     Device {
         device_id: String,
     },
@@ -119,7 +124,7 @@ impl ChannelAuthState {
         }
     }
 
-    /// Enable iOS-device auth: a token-table miss falls back to an
+    /// Enable device auth: a token-table miss falls back to an
     /// approved-device lookup against `device_store`. Set only on the listener
     /// that serves `/v1/channel-ws` for paired devices.
     pub fn with_device_store(mut self, device_store: Arc<dyn DeviceStore>) -> Self {
@@ -136,19 +141,6 @@ where
     S: Clone + Send + Sync + 'static,
 {
     router.layer(middleware::from_fn_with_state(state, require_channel_auth))
-}
-
-/// Mark the already-admin-authenticated co-hosted channel routes as web chat.
-pub fn attach_web_identity<S>(router: axum::Router<S>) -> axum::Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    router.layer(middleware::from_fn(mark_web_identity))
-}
-
-async fn mark_web_identity(mut req: Request<Body>, next: Next) -> Response {
-    req.extensions_mut().insert(AuthedClient::Web);
-    next.run(req).await
 }
 
 /// Middleware: validates the channel token header (or `?token=` query),
@@ -265,7 +257,7 @@ async fn resolve_token(
     if let Some(identity) = state.tokens.lookup(token) {
         return Ok(Some(AuthedClient::from_identity(identity)));
     }
-    // In-memory miss: a paired iOS device presents a persisted `auth_token`,
+    // In-memory miss: a paired device presents a persisted `auth_token`,
     // not an in-table token. Only `approved` rows resolve (the store filters
     // status), so pending/revoked devices fall through to the 401 below.
     if let Some(device_store) = &state.device_store {

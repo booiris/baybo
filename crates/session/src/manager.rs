@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use baybo_model::{
     ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId, FolderSummary,
-    LlmEntryName, MAX_FOLDER_NAME_LEN, Session, SessionId, SessionState, TriggerSource, User,
+    LlmEntryName, MAX_FOLDER_NAME_LEN, Role, Session, SessionId, SessionState, TriggerSource, User,
 };
 use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
@@ -13,6 +13,11 @@ use baybo_store::{SessionStore, StoredMessage};
 use baybo_store::{SessionSummaryRow, SessionSummaryStore};
 
 type Result<T> = std::result::Result<T, SessionError>;
+
+/// Raw-row scan headroom over the display cap for [`SessionManager::unread_reply_count`]:
+/// an agentic turn persists many invisible tool rows per visible reply, so the
+/// count scans up to `cap * this` rows to reach `cap` visible replies.
+const UNREAD_SCAN_MULTIPLIER: usize = 10;
 
 /// Map a store row into the domain summary.
 fn folder_row_to_summary(row: SessionFolderRow) -> FolderSummary {
@@ -157,7 +162,11 @@ impl SessionManager {
             TriggerSource::User => "",
             TriggerSource::Cron { .. } => "cron-",
         };
-        let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
+        let id = if prefix.is_empty() {
+            SessionId::new()
+        } else {
+            SessionId::with_prefix(prefix)
+        };
         self.create_session_with_id(id, user, channel, trigger)
             .await
     }
@@ -176,7 +185,7 @@ impl SessionManager {
         let prefix = match lineage.kind {
             baybo_model::LineageKind::Subagent => "subagent-",
         };
-        let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
+        let id = SessionId::with_prefix(prefix);
         let now = Utc::now();
         let session = Session {
             id: id.clone(),
@@ -340,11 +349,10 @@ impl SessionManager {
             .map_err(SessionError::from)
     }
 
-    /// Forward catch-up slice: at most `limit` active rows with
-    /// `ordinal > after_ordinal`, ascending. Powers the WS
-    /// `Subscribe { since_ordinal }` cursor — the gateway streams the
-    /// result back as `Frame::Message` to a reconnecting client that
-    /// missed some persisted rows. `SessionError::NotFound` when the
+    /// Forward difference slice: at most `limit` active rows with
+    /// `ordinal > after_ordinal`, ascending, each paired with its
+    /// ordinal and persisted `created_at`. Powers the REST sync
+    /// endpoint's cursor scan. `SessionError::NotFound` when the
     /// session itself does not exist; an empty slice is the legitimate
     /// "nothing missed" answer.
     pub async fn history_since(
@@ -352,12 +360,27 @@ impl SessionManager {
         session_id: &SessionId,
         after_ordinal: i64,
         limit: usize,
-    ) -> Result<Vec<(i64, ChatMessage)>> {
+    ) -> Result<Vec<(i64, DateTime<Utc>, ChatMessage)>> {
         if self.store.get(session_id).await?.is_none() {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
         self.store
             .load_active_session_messages_since(session_id, after_ordinal, limit)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    /// Ordinal of the newest persisted row carrying `platform_msg_id`,
+    /// or `None`. The durability point lookup behind the chat outbox's
+    /// rebase-floor resolution — see
+    /// [`baybo_store::SessionStore::find_message_ordinal_by_platform_msg_id`].
+    pub async fn find_message_ordinal_by_platform_msg_id(
+        &self,
+        session_id: &SessionId,
+        platform_msg_id: &str,
+    ) -> Result<Option<i64>> {
+        self.store
+            .find_message_ordinal_by_platform_msg_id(session_id, platform_msg_id)
             .await
             .map_err(SessionError::from)
     }
@@ -562,6 +585,48 @@ impl SessionManager {
         }
         debug!(session_id = %session_id, pinned, "toggled session pinned");
         Ok(())
+    }
+
+    /// Advance (max-wins) the session's chat-list read cursor — the highest
+    /// ordinal a viewer has read (`PUT /v1/chat/sessions/:id/read`). Targeted
+    /// flat-column write; see [`baybo_store::SessionStore::set_read_cursor`].
+    /// Returns `Err(NotFound)` when the session id is unknown.
+    pub async fn set_read_cursor(&self, session_id: &SessionId, ordinal: i64) -> Result<()> {
+        let updated = self.store.set_read_cursor(session_id, ordinal).await?;
+        if !updated {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        debug!(session_id = %session_id, ordinal, "advanced session read cursor");
+        Ok(())
+    }
+
+    /// Count the visible assistant replies a viewer hasn't read: final
+    /// assistant messages (`role == Assistant`, no `ToolUse` — intermediate
+    /// agentic iterations don't count as separate unread bubbles) with
+    /// `ordinal > read_cursor`, capped at `cap`. Powers the chat-list unread
+    /// badge; the caller renders `cap` as "N+".
+    ///
+    /// The scan is bounded at `cap * 10` raw rows so a never-read long session
+    /// doesn't walk its whole transcript: an agentic turn persists many
+    /// invisible tool rows per visible reply, so counting raw rows (as the
+    /// `since` limit does) would undercount replies in a tool-heavy slice —
+    /// the 10× headroom lets the count reach `cap` visible replies before the
+    /// scan bound bites in any realistic tool density.
+    pub async fn unread_reply_count(&self, session_id: &SessionId, cap: usize) -> Result<usize> {
+        if cap == 0 {
+            return Ok(0);
+        }
+        let read_cursor = self.store.read_cursor(session_id).await?.unwrap_or(-1);
+        let scan_bound = cap.saturating_mul(UNREAD_SCAN_MULTIPLIER);
+        let rows = self
+            .store
+            .load_active_session_messages_since(session_id, read_cursor, scan_bound)
+            .await?;
+        let count = rows
+            .into_iter()
+            .filter(|(_, _, msg)| msg.role == Role::Assistant && !msg.has_tool_use())
+            .count();
+        Ok(count.min(cap))
     }
 
     /// Move (or clear, with `None`) a session's chat-list folder

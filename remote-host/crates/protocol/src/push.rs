@@ -54,7 +54,7 @@ pub struct NotifyRequest {
 }
 
 /// JSON body of `POST /register` — bind/rebind a device's APNs token. The binding
-/// is owned by the device's Ed25519 identity (`device_id == ios-<hex(device_pubkey)>`):
+/// is owned by the device's Ed25519 identity (`device_id == device-<hex(device_pubkey)>`):
 /// the device delegates a gateway push key, and the gateway signs the binding. C
 /// verifies the chain with no stored secret, so no one can overwrite, redirect, or
 /// suppress another's binding even without a caller key. APNs provider credentials

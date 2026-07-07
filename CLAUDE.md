@@ -110,6 +110,7 @@ For non-module-crate topics, read the relevant doc before touching that area:
 
 - [`docs/webui.md`](docs/webui.md) — embedded React dashboard (`web/`), pnpm/Vite workflow, OpenAPI codegen, Tailwind v4 design tokens.
 - [`docs/web-chat.md`](docs/web-chat.md) — web chat UI **feature** reference (`app/web/src/pages/ChatPage.tsx` + `app/web/src/pages/chat/`): conversations/folders/pin, composer + attachments + model switch, slash-command completion, input-history ring, the interjection queue, thread/turn rendering, and the WS data-flow backbone.
+- [`docs/sync-protocol.md`](docs/sync-protocol.md) — chat sync protocol v2 (one cursor, one sync call, three data planes): the `sync`/point-lookup REST surface, the `SubscribeState`/`Gap` wire frames, the client sync loop + outbox, and rebase/gap handling. [`docs/CONTEXT.md`](docs/CONTEXT.md) is its terminology glossary (canonical names + retired-alias smells).
 - [`docs/bench-web.md`](docs/bench-web.md) — standalone read-only viewer (`bench/bench-web`) for bench `results/` + agent `trace/` artifacts; spine model + per-bench adapters, ts-rs gate.
 - [`docs/sidecars.md`](docs/sidecars.md) — embedded JS sidecars (`sidecars/channel/*`, `sidecars/tool/*`), bundling/install pipeline, domain registration, and the browser sidecar (CDDM wrapper, security trade-offs, docker mode).
 - [`docs/modules/storage.md`](docs/modules/storage.md) — libsql storage; all deletable tables use plain `DELETE` (no soft-delete tombstones).

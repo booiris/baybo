@@ -40,6 +40,7 @@ pub struct MemorySessionStore {
     data: Mutex<HashMap<SessionId, Session>>,
     transcripts: Mutex<HashMap<SessionId, Vec<StoredMessageRow>>>,
     control_events: Mutex<HashMap<SessionId, Vec<ControlEvent>>>,
+    read_cursors: Mutex<HashMap<SessionId, i64>>,
 }
 
 impl MemorySessionStore {
@@ -113,6 +114,22 @@ impl SessionStore for MemorySessionStore {
             }
             None => Ok(false),
         }
+    }
+
+    async fn set_read_cursor(&self, session_id: &SessionId, ordinal: i64) -> Result<bool> {
+        if !self.data.lock().contains_key(session_id) {
+            return Ok(false);
+        }
+        let mut cursors = self.read_cursors.lock();
+        let entry = cursors.entry(session_id.clone()).or_insert(ordinal);
+        if ordinal > *entry {
+            *entry = ordinal;
+        }
+        Ok(true)
+    }
+
+    async fn read_cursor(&self, session_id: &SessionId) -> Result<Option<i64>> {
+        Ok(self.read_cursors.lock().get(session_id).copied())
     }
 
     async fn set_last_llm(
@@ -368,7 +385,7 @@ impl SessionStore for MemorySessionStore {
         session_id: &SessionId,
         after_ordinal: i64,
         limit: usize,
-    ) -> Result<Vec<(i64, ChatMessage)>> {
+    ) -> Result<Vec<(i64, DateTime<Utc>, ChatMessage)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -385,10 +402,26 @@ impl SessionStore for MemorySessionStore {
                 active
                     .into_iter()
                     .take(limit)
-                    .map(|m| (m.ordinal as i64, m.message.clone()))
+                    .map(|m| (m.ordinal as i64, m.created_at, m.message.clone()))
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    async fn find_message_ordinal_by_platform_msg_id(
+        &self,
+        session_id: &SessionId,
+        platform_msg_id: &str,
+    ) -> Result<Option<i64>> {
+        if platform_msg_id.is_empty() {
+            return Ok(None);
+        }
+        Ok(self.transcripts.lock().get(session_id).and_then(|log| {
+            log.iter()
+                .filter(|m| m.message.platform_msg_id() == platform_msg_id)
+                .max_by_key(|m| m.ordinal)
+                .map(|m| m.ordinal as i64)
+        }))
     }
 
     async fn load_last_user_message(

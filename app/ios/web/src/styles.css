@@ -1,0 +1,450 @@
+/* Monochrome, light-only — SOFT LINE MINIMALISM (see app/mobile/CLAUDE.md; this
+   bundle inherits that system). Plain CSS: no Tailwind — only the transcript
+   renders here, everything else is native SwiftUI. Token names mirror app/web's
+   so the palettes read as one system. */
+:root {
+  --color-paper: #ffffff;
+  --color-surface: #fafafa;
+  --color-ink: #111111;
+  --color-ink-soft: #6b6b6b;
+  /* Incidental hairlines (bubbles, chips) stay light so the UI reads airy; ink
+     is reserved for text + deliberate line elements. */
+  --color-line: #e4e4e4;
+  --color-line-strong: #bcbcbc;
+
+  /* The one non-monochrome hue: destructive / error state only (never chrome). */
+  --color-err: #d40000;
+
+  --font-mono: "Space Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+
+  --radius: 14px;
+  --radius-pill: 9999px;
+  --chat-row-gap: 1.5rem;
+  --md-block-gap: 0.75rem;
+
+  /* Top inset so the thread's oldest visible row starts below the native
+     header (status bar + the 42pt glass bar), not under its icons. The
+     status-bar part is device-correct via env() (the webview is full-bleed,
+     viewport-fit=cover); the 54px covers the native bar height + breathing. */
+  --thread-top-inset: calc(env(safe-area-inset-top) + 58px);
+  /* Height of the webview's bottom edge covered by native chrome (composer +
+     the keyboard it rides). The webview is full-bleed and NEVER resizes with
+     the keyboard — native streams this per layout tick over the bridge and
+     the thread pads/pins itself, so content slides in lockstep. Includes the
+     home-indicator area (measured to the screen edge), so no extra env(). */
+  --thread-bottom-inset: 0px;
+
+  /* Light-only: pin the scheme so iOS scrollbars/controls never render a dark
+     variant the design doesn't define. */
+  color-scheme: light;
+  font-family: var(--font-mono);
+  color: var(--color-ink);
+  background: var(--color-paper);
+  -webkit-font-smoothing: antialiased;
+  /* Native-app feel: chrome carries no web-style text selection, iOS
+     long-press callout, or gray tap-highlight flash (all three inherit, so
+     :root covers the tree); the message content opts selection back in below
+     so it's copyable. */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+
+/* Don't let images be drag-ghosted out of the (otherwise native-feeling) app,
+   and keep the save/copy callout off even inside now-selectable message rows. */
+img {
+  -webkit-user-drag: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* Transcript content is selectable + carries the iOS long-press Copy callout
+   (the counterpart to :root's global off): user bubbles, assistant prose, and
+   the work-block step text. Chrome outside these — header, composer, the
+   "Worked Xs" toggle, buttons — stays inert. */
+.bubble,
+.msg,
+.work-steps {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+button {
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+
+/* The transcript IS the page. SINGLE SCROLLER: the WKWebView main frame (the
+   document) scrolls, NOT this div — an inner overflow:auto scroller inside
+   WKWebView owns an async scroll node that sleeps until the first touch
+   (cold-start "tap once to scroll") and lets an uncaptured drag rubber-band the
+   whole webview instead of moving history. `min-height` (not `height`) + NO
+   `overflow` makes this a plain growing block, so the always-live main frame is
+   the one scroller. The top inset clears the native header overlay; the bottom
+   inset clears the native composer (+ keyboard) over the full-bleed webview. */
+.chat-log {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  gap: var(--chat-row-gap);
+  padding: var(--thread-top-inset) 1.25rem calc(var(--thread-bottom-inset) + 4rem);
+  /* Fill from the TOP down. A fresh chat's first message rises to the top and
+     the reply streams below it; any thread shorter than the screen is
+     top-aligned with the empty space BELOW the last row (not above the first).
+     flex-start IS the flex default, but pin it explicitly — this replaced a
+     `:first-child{margin-top:auto}` bottom-hug and must not silently regress.
+     Once content overflows one screen the follow-bottom pin leads as usual. */
+  justify-content: flex-start;
+}
+/* Native reports the bottom obstruction only at keyboard-animation ENDPOINTS
+   (SwiftUI geometry callbacks don't stream interpolated layout), so the web
+   side animates the padding itself on a keyboard-like curve; the transcript
+   re-pins per frame while following (see handleBottomInset). Enabled after the
+   first inset lands so the launch layout doesn't visibly slide. */
+.chat-log.inset-animated {
+  transition: padding-bottom 250ms cubic-bezier(0.33, 1, 0.68, 1);
+}
+/* Chat MESSAGE bodies read as Inter sans (comfortable long-read); the chrome
+   stays monospace. Soft uniform rounded bubbles, hairline outlined. */
+.bubble {
+  max-width: 80%;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius);
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.bubble.user { align-self: flex-end; background: var(--color-ink); color: var(--color-paper); border-color: var(--color-ink); }
+/* Optimistic-send status: both indicators sit to the LEFT of the (right-aligned)
+   bubble, vertically centered. Centered via top + negative margin (NOT
+   translateY) so the spinner's transform stays free for its rotation. */
+.bubble.sending,
+.bubble.failed { position: relative; }
+/* "sending": a black ring with a rotating gap, spinning until the server echoes
+   the message back. */
+.send-spinner {
+  position: absolute;
+  left: -1.25rem;
+  top: 50%;
+  margin-top: -0.4rem;
+  width: 0.8rem;
+  height: 0.8rem;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-ink-soft);
+  border-top-color: transparent;
+  animation: send-spin 0.7s linear infinite;
+  pointer-events: none;
+}
+@keyframes send-spin { to { transform: rotate(360deg); } }
+/* "failed": a red circled exclamation — the only non-monochrome hue, reserved
+   for errors. Tap it to retry. */
+.send-failed {
+  position: absolute;
+  left: -1.55rem;
+  top: 50%;
+  margin-top: -0.55rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--color-err);
+  color: var(--color-paper);
+  font-family: var(--font-sans);
+  font-size: 0.74rem;
+  font-weight: 700;
+  line-height: 1;
+  user-select: none;
+}
+/* Grow the tap target past the small glyph without moving it. */
+.send-failed::before {
+  content: "";
+  position: absolute;
+  inset: -0.5rem;
+}
+.send-failed:active { opacity: 0.6; }
+.bubble.assistant { align-self: flex-start; background: var(--color-paper); color: var(--color-ink); }
+.bubble.notice { align-self: center; background: none; border: 0; color: var(--color-ink-soft); font-size: 0.8rem; }
+/* Older-page paging: a small monochrome ring centered at the top of the log
+   while the fetch is in flight — the send/work-spinner idiom, not a stray
+   assistant bubble with a static ellipsis. */
+.older-spinner {
+  align-self: center;
+  width: 0.9rem;
+  height: 0.9rem;
+  margin: 0.15rem 0;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-ink-soft);
+  border-top-color: transparent;
+  animation: send-spin 0.7s linear infinite;
+  pointer-events: none;
+}
+
+/* Assistant replies: NO bubble — full-thread-width markdown prose (the web
+   chat's reading band), Inter for the long read. */
+.msg.assistant {
+  width: 100%;
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  line-height: 1.6;
+  color: var(--color-ink);
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+/* Streaming caret: a pulsing block riding the last rendered markdown element
+   (skipped on boxes where an inline caret would look detached). */
+.msg.assistant.streaming .md > :last-child:not(pre):not(.md-table-wrap)::after {
+  content: "";
+  display: inline-block;
+  width: 0.45em;
+  height: 1em;
+  margin-left: 0.15em;
+  vertical-align: -0.15em;
+  background: var(--color-ink);
+  animation: caret-pulse 1s steps(2, start) infinite;
+}
+@keyframes caret-pulse { 50% { opacity: 0; } }
+
+/* Markdown body — monochrome soft-line rendering of the web chat's element
+   set (GFM: code, tables, quotes, lists, links). */
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md pre, .md blockquote, .md-table-wrap { margin: var(--md-block-gap) 0; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 0.9rem 0 0.4rem; line-height: 1.3; }
+.md h1 { font-size: 1.25rem; }
+.md h2 { font-size: 1.15rem; }
+.md h3 { font-size: 1.05rem; }
+.md h4, .md h5, .md h6 { font-size: 0.95rem; }
+.md code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: 5px;
+  padding: 0 0.25em;
+}
+.md pre {
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  padding: 0.6rem 0.7rem;
+  overflow-x: auto;
+}
+.md pre code {
+  display: block;
+  border: 0;
+  background: none;
+  padding: 0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+.md a { color: var(--color-ink); text-decoration: underline; text-underline-offset: 2px; }
+.md blockquote {
+  border-left: 2px solid var(--color-line-strong);
+  padding-left: 0.75rem;
+  color: var(--color-ink-soft);
+  font-style: italic;
+}
+.md hr { border: 0; border-top: 1px solid var(--color-line); margin: 0.75rem 0; }
+.md ul, .md ol { padding-left: 1.25rem; }
+.md li { margin: 0.15rem 0; }
+.md img { max-width: 100%; border-radius: 10px; }
+/* Tables: no fills — a light hairline under each row is the only structure.
+   Each column is capped (max-width) so one long cell can't dominate: content
+   wraps within the cap. The table sizes to its (capped) content, and when that
+   overflows the reading band it scrolls left/right inside the wrapper (its own
+   box, momentum scroll for the WKWebView) rather than squeezing to fit. */
+.md-table-wrap {
+  margin: var(--md-block-gap) 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.md-table-wrap table {
+  /* max-content = the table takes each column's own content width (capped by the
+     cell max-width below) instead of shrinking to fit the band — so a wide table
+     OVERFLOWS and scrolls. min-width:100% pulls a table NARROWER than the band up
+     to full width instead, stretching its columns to fill the screen. */
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+.md-table-wrap th,
+.md-table-wrap td {
+  /* Reset the prose's break-anywhere so tokens don't shatter mid-word; wrap on
+     natural boundaries only once the cell hits its max-width cap. */
+  overflow-wrap: normal;
+  word-break: normal;
+  max-width: 12rem;
+  padding: 0.4rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+  position: relative;
+}
+.md-table-wrap th { font-weight: 700; }
+/* Row divider as a device-thin hairline. A plain `0.5px` border VANISHES here:
+   in the collapsed-border model WebKit snaps each shared cell border onto the
+   physical pixel grid and rounds a sub-pixel width down to 0. Painting a 1px bar
+   and scaling it to half height instead keeps a crisp ~0.5px line at any DPR — a
+   filled box has area and can't be rounded away like a border edge can. */
+.md-table-wrap thead th::after,
+.md-table-wrap tbody tr:not(:last-child) td::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: var(--color-line);
+  transform: scaleY(0.5);
+  transform-origin: bottom;
+  pointer-events: none;
+}
+
+/* The turn's work block (thinking trace + tool progress). Active: a soft card
+   with a spinner header; closed: a dim tappable "Worked Xs ›" summary. */
+.work { width: 100%; font-family: var(--font-mono); }
+.work.active {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.work-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-ink);
+}
+.work-elapsed { color: var(--color-ink-soft); letter-spacing: 0; text-transform: none; }
+.work-spin {
+  display: inline-block;
+  color: var(--color-ink-soft);
+  animation: work-spin 1.2s linear infinite;
+}
+@keyframes work-spin { to { transform: rotate(360deg); } }
+.work.closed { display: flex; flex-direction: column; gap: 0.45rem; }
+.work-summary {
+  position: relative;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--color-ink-soft);
+  text-align: left;
+}
+/* Grow the tap target above/below without adding visible padding (which would
+   change the block's spacing): an invisible overlay extends the hit area. */
+.work-summary::before {
+  content: "";
+  position: absolute;
+  inset: -0.5rem 0;
+}
+.work-summary:active { opacity: 0.7; }
+.work-chevron { display: inline-block; flex: 0 0 auto; line-height: 1; transition: transform 120ms ease; }
+.work-chevron.open { transform: translateY(1px) rotate(90deg); }
+.work-divider { height: 1px; background: var(--color-line); transform: scaleY(0.5); }
+.work-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+.step {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--color-ink-soft);
+}
+.step .step-glyph { flex: 0 0 auto; }
+.step .step-text { white-space: pre-wrap; word-break: break-word; min-width: 0; }
+/* Reasoning is the model's own markdown; render it as a soft prose trace beside
+   the ✻ marker (sans, dim), distinct from the answer prose below. */
+.step.reasoning .md { flex: 1; min-width: 0; font-family: var(--font-sans); }
+.step.tool { color: var(--color-ink); }
+.step.tool.failed { color: var(--color-err); }
+.work.active .step.tool.running .step-glyph { animation: glyph-pulse 1s ease-in-out infinite; }
+@keyframes glyph-pulse { 50% { opacity: 0.25; } }
+.step.prose { display: block; font-family: var(--font-sans); font-size: 0.85rem; color: var(--color-ink); }
+.step.status { white-space: pre-wrap; }
+
+/* Pre-first-frame turn indicator (the web chat's "Working…" card, as a line). */
+.work-pending {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--color-ink-soft);
+}
+
+/* Scroll-up "load earlier" affordance: a centered hairline pill, monospace
+   chrome (it's chrome, not a message body), soft like the rest of the UI. */
+.load-older {
+  flex: 0 0 auto;
+  align-self: center;
+  padding: 0.3rem 0.9rem;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-pill);
+  background: var(--color-paper);
+  color: var(--color-ink-soft);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+.load-older:active { opacity: 0.7; transform: scale(0.98); }
+
+/* Image attachments rendered inside a chat bubble. */
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.35rem;
+}
+.attachment-img {
+  display: block;
+  max-width: 100%;
+  max-height: 16rem;
+  border-radius: var(--radius);
+  object-fit: contain;
+}
+.attachment-loading { font-size: 0.85rem; color: inherit; opacity: 0.85; }
+.attachment-retry {
+  flex: 0 0 auto;
+  padding: 0.4rem 0.8rem;
+  font-size: 0.85rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--color-ink);
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-pill);
+}
+.attachment-retry:active { opacity: 0.7; transform: none; }
+.attachment-file {
+  font-size: 0.85rem;
+  padding: 0.35rem 0.6rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius);
+}

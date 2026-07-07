@@ -21,10 +21,20 @@ use super::control::ChannelControlRegistry;
 use super::dedup::InboundDedup;
 use super::history::TuiHistoryStore;
 use super::session_resolver::ChannelSessionResolver;
-use crate::auth::ChannelTokenTable;
+use crate::auth::{AdminAuthState, ChannelTokenTable};
 use crate::log_buffer::LogBuffer;
 use crate::server::GatewayDeps;
 use dashmap::DashMap;
+
+/// State bundle used only by the relay API tunnel's in-process HTTP forwarder.
+#[derive(Clone)]
+pub struct TunnelHttpState {
+    /// Admin HTTP state reused by the API tunnel's in-process HTTP forwarder.
+    pub admin: crate::server::AdminState,
+    /// Admin/device bearer validator reused after the tunnel boundary injects
+    /// the device auth headers.
+    pub auth: AdminAuthState,
+}
 
 /// State passed to the `/v1/channel-ws` handler. Cheap to clone — every
 /// field is an `Arc` or a clone-cheap handle.
@@ -100,6 +110,8 @@ pub struct WsChannelState {
     /// the live `TurnState` broadcasts cover connected clients; this
     /// covers the late joiner who missed them.
     pub job_lifecycle: Arc<baybo_job::JobLifecycle>,
+    /// Internal HTTP dispatcher state for relay API-tunnel forwarding.
+    pub tunnel_http: TunnelHttpState,
     /// Recent-window dedup for sidecar-supplied
     /// `(channel_type, bot_id, platform_msg_id)` triples. Sidecars that
     /// replay their long-poll buffer after a restart hit this and the
@@ -138,6 +150,11 @@ impl WsChannelState {
             blob_store: deps.stores.blob.clone(),
             task_store: deps.stores.task.clone(),
             job_lifecycle: Arc::clone(&deps.job_lifecycle),
+            tunnel_http: TunnelHttpState {
+                admin: crate::server::AdminState::from_deps(deps),
+                auth: AdminAuthState::new(deps.admin_token.clone())
+                    .with_device_store(deps.stores.device.clone()),
+            },
             inbound_dedup: Arc::new(InboundDedup::new()),
         }
     }

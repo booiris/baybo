@@ -18,7 +18,7 @@
 //!
 //! So this module is just a Noise-wrapping transport ([`NoiseFrameSink`] /
 //! [`NoiseFrameSource`]) around the existing `Subscribed`-channel machinery: the
-//! device registers as [`ChannelType::ios`], `Subscribe`s a session, and
+//! device registers as [`ChannelType::device`], `Subscribe`s a session, and
 //! self-pulls / sends like any other subscribed connection.
 
 use std::sync::Arc;
@@ -26,7 +26,6 @@ use std::time::Duration;
 
 use baybo_channels::wire::{self, Frame};
 use baybo_model::ChannelType;
-use baybo_security::SecretVault;
 use device_proto::noise::{FrameReassembler, NOISE_MAX_MESSAGE, write_chunked};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -45,6 +44,11 @@ use crate::device::load_or_create_static_keypair;
 /// How long the responder waits for the initiator's first handshake message
 /// after the WS upgrade — a stalled peer must not pin a connection.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) struct AuthenticatedDevice {
+    pub(crate) device_id: String,
+    pub(crate) auth_token: String,
+}
 
 /// Run the content responder over an outbound **relay** data leg (the gateway
 /// dialed C's `/content/host/{relay_key}` after a control-plane signal). No
@@ -76,7 +80,8 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
 ) -> Result<(), String> {
     // Authenticate the device and bring up the Noise transport (shared with the
     // blob leg — both authenticate the same way before diverging).
-    let (transport, device_id) = responder_handshake(&mut sink, &mut source, state).await?;
+    let (transport, device) = responder_handshake(&mut sink, &mut source, state).await?;
+    let device_id = device.device_id;
     let transport = Arc::new(Mutex::new(transport));
 
     // Gateway-only device dedup: now that this leg has a viable Noise session, make
@@ -97,9 +102,9 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
     // just with a Noise-wrapped transport: reuse the channel registry + the
     // shared inbound loop so `Subscribe` catch-up, live fan-out, and inbound
     // `Message` routing all work exactly as they do for the TUI / web chat.
-    let channel_type = ChannelType::ios();
+    let channel_type = ChannelType::device();
     let channel = super::adapter::resolve_or_install_channel(&state.registry, &channel_type)
-        .map_err(|e| format!("resolve ios channel: {e}"))?;
+        .map_err(|e| format!("resolve device channel: {e}"))?;
 
     let sidecar = Sidecar::build(
         channel_type.clone(),
@@ -117,10 +122,6 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
             transport: Arc::clone(&transport),
             reassembler: FrameReassembler::new(),
             pending: std::collections::VecDeque::new(),
-            device_ctrl: DeviceControl {
-                device_id: device_id.clone(),
-                secret_vault: Arc::clone(&state.secret_vault),
-            },
         },
         state,
         &channel_type,
@@ -147,15 +148,16 @@ async fn recv_handshake<So: BinarySource>(
 
 /// Run the Noise IK responder handshake over the leg and authenticate the device
 /// by matching the initiator's static key to an *approved* device row, returning
-/// the established [`TransportState`] and the device's id. No prior channel-auth
-/// ran (the gateway dialed the relay data leg blind), so the static-key match is
-/// the sole gate — and C, a relay, can't MITM it. Shared by the chat content
-/// session and the blob leg, which authenticate identically before diverging.
+/// the established [`TransportState`] plus the approved device identity. No
+/// prior channel-auth ran (the gateway dialed the relay data leg blind), so the
+/// static-key match is the sole gate — and C, a relay, can't MITM it. Shared by
+/// the chat content session and the API/blob tunnel legs, which authenticate
+/// identically before diverging.
 pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
     sink: &mut Si,
     source: &mut So,
     state: &WsChannelState,
-) -> Result<(TransportState, String), String> {
+) -> Result<(TransportState, AuthenticatedDevice), String> {
     let gateway_static = load_or_create_static_keypair(&state.secret_vault)
         .await
         .map_err(|e| format!("gateway static key: {e}"))?;
@@ -181,7 +183,10 @@ pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
         .await
         .map_err(|e| format!("device lookup by pubkey: {e}"))?
         .ok_or_else(|| "no approved device for this static key".to_string())?;
-    let device_id = row.device_id;
+    let device = AuthenticatedDevice {
+        device_id: row.device_id,
+        auth_token: row.auth_token,
+    };
 
     let n = handshake
         .write_message(&[], &mut buf)
@@ -195,11 +200,15 @@ pub(crate) async fn responder_handshake<Si: BinarySink, So: BinarySource>(
 
     // Best-effort liveness bump for the operator's device list.
     let now = chrono::Utc::now().timestamp();
-    if let Err(e) = state.device_store.touch_last_seen(&device_id, now).await {
+    if let Err(e) = state
+        .device_store
+        .touch_last_seen(&device.device_id, now)
+        .await
+    {
         tracing::debug!(error = %e, "touch device last_seen failed");
     }
 
-    Ok((transport, device_id))
+    Ok((transport, device))
 }
 
 /// A binary-message duplex the content responder runs over: the outbound relay
@@ -287,79 +296,6 @@ impl<S: BinarySink> FrameSink for NoiseFrameSink<S> {
     }
 }
 
-/// Handles device-only control frames on the content leg — consumed *before* the
-/// generic channel router so they never need a variant in its routing. Currently
-/// just `UpdateApnsToken`: the device sends its current APNs token on every
-/// connect, and we persist it so the push dispatcher re-registers the fresh token
-/// with C on its next push (handling APNs token rotation without a re-pair).
-struct DeviceControl {
-    device_id: String,
-    secret_vault: Arc<SecretVault>,
-}
-
-impl DeviceControl {
-    /// Returns `true` if `frame` was a device-control frame (handled here, not
-    /// forwarded to the generic router).
-    async fn intercept(&self, frame: &Frame) -> bool {
-        let Frame::UpdateApnsToken {
-            apns_token,
-            apns_env,
-        } = frame
-        else {
-            return false;
-        };
-        let device = self.device_id.as_str();
-        if apns_token.is_empty() {
-            tracing::debug!(
-                device = %device,
-                "push: device sent empty APNs token; registration unchanged"
-            );
-            return true;
-        }
-        let apns_env = match apns_env.as_str() {
-            "production" => device_proto::pairing::ApnsEnv::Production,
-            _ => device_proto::pairing::ApnsEnv::Sandbox,
-        };
-        let reg = crate::push::DeviceApnsRegistration {
-            apns_token: apns_token.clone(),
-            apns_env,
-        };
-        match serde_json::to_vec(&reg) {
-            Ok(bytes) => {
-                if let Err(e) = self
-                    .secret_vault
-                    .store_secret(
-                        &crate::push::device_apns_secret_name(&self.device_id),
-                        &bytes,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        device = %device,
-                        error = %e,
-                        "push: failed to persist rotated APNs token; pushes will target the \
-                         stale token"
-                    );
-                } else {
-                    tracing::info!(
-                        device = %device,
-                        apns_env = ?apns_env,
-                        token_len = apns_token.len(),
-                        "push: device APNs token updated from content leg"
-                    );
-                }
-            }
-            Err(e) => tracing::warn!(
-                device = %device,
-                error = %e,
-                "push: failed to encode rotated APNs registration; pushes will target the \
-                 stale token"
-            ),
-        }
-        true
-    }
-}
-
 /// Inbound: Noise-decrypt each binary message into an encoded [`Frame`].
 pub(crate) struct NoiseFrameSource<R: BinarySource> {
     source: R,
@@ -368,8 +304,6 @@ pub(crate) struct NoiseFrameSource<R: BinarySource> {
     /// Frames reassembled from inbound messages but not yet handed out (the
     /// `FrameSource` returns them one at a time).
     pending: std::collections::VecDeque<Frame>,
-    /// Handles device-control frames inline (not forwarded to the router).
-    device_ctrl: DeviceControl,
 }
 
 #[async_trait::async_trait]
@@ -394,13 +328,7 @@ impl<R: BinarySource> FrameSource for NoiseFrameSource<R> {
             };
             for frame_bytes in reassembled {
                 match wire::decode(&frame_bytes) {
-                    // Device-control frames (e.g. an APNs token refresh) are handled
-                    // inline and never reach the generic router.
-                    Ok(frame) => {
-                        if !self.device_ctrl.intercept(&frame).await {
-                            self.pending.push_back(frame);
-                        }
-                    }
+                    Ok(frame) => self.pending.push_back(frame),
                     Err(e) => tracing::warn!(error = %e, "decode content frame failed"),
                 }
             }
@@ -482,11 +410,11 @@ mod tests {
         tg.deps
             .stores
             .device
-            .create(&device_row("ios-dev", device.public().to_vec()))
+            .create(&device_row("device-dev", device.public().to_vec()))
             .await
             .expect("seed approved device row");
-        crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::ios())
-            .expect("install ios channel");
+        crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::device())
+            .expect("install device channel");
         let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
             .await
             .expect("gateway static key");
@@ -515,7 +443,6 @@ mod tests {
                 &mut transport,
                 &Frame::Subscribe {
                     session_id: "sess-r".into(),
-                    since_ordinal: None,
                 },
             ))
             .await
@@ -524,7 +451,7 @@ mod tests {
             content: "via relay".into(),
             session_id: "sess-r".into(),
             user_id: "user-1".into(),
-            channel_type: ChannelType::ios(),
+            channel_type: ChannelType::device(),
             bot_id: String::new(),
             attachments: Vec::new(),
             platform_msg_id: "m1".into(),
@@ -561,70 +488,6 @@ mod tests {
             saw_echo,
             "phone never received the echo over the relay legs"
         );
-    }
-
-    /// An `UpdateApnsToken` frame on the content leg is intercepted (not routed)
-    /// and the new token is persisted to the vault, where the push dispatcher
-    /// reads it to re-register the rotated token with C.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn update_apns_token_frame_persists_to_vault() {
-        let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-        let device = StaticKeypair::generate().unwrap();
-        tg.deps
-            .stores
-            .device
-            .create(&device_row("ios-dev", device.public().to_vec()))
-            .await
-            .expect("seed approved device row");
-        crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::ios())
-            .expect("install ios channel");
-        let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
-            .await
-            .expect("gateway static key");
-        let gw_pub = gw_static.public();
-        let vault = tg.deps.secret_vault.clone();
-        let state = WsChannelState::from_deps(&tg.deps);
-
-        let (gw_tx, mut phone_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-        let (phone_tx, gw_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-        tokio::spawn(async move {
-            let _ = run_content_session(ChanSink(gw_tx), ChanSource(gw_rx), &state, None).await;
-        });
-
-        let mut hs: HandshakeState = device.ik_initiator(&gw_pub).unwrap();
-        let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
-        let n = hs.write_message(&[], &mut buf).unwrap();
-        phone_tx.send(buf[..n].to_vec()).await.unwrap();
-        let msg2 = phone_rx.recv().await.expect("gateway msg2");
-        hs.read_message(&msg2, &mut buf).unwrap();
-        let mut transport = hs.into_transport_mode().unwrap();
-
-        phone_tx
-            .send(seal(
-                &mut transport,
-                &Frame::UpdateApnsToken {
-                    apns_token: "new-token".into(),
-                    apns_env: "production".into(),
-                },
-            ))
-            .await
-            .unwrap();
-
-        // The interception persists asynchronously inside the pump; poll the vault.
-        let name = crate::push::device_apns_secret_name("ios-dev");
-        let mut stored = None;
-        for _ in 0..50 {
-            if let Ok(Some(secret)) = vault.get_secret(&name).await {
-                stored = Some(secret);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let secret = stored.expect("apns material persisted to vault");
-        let reg: crate::push::DeviceApnsRegistration =
-            serde_json::from_slice(secret.as_bytes()).unwrap();
-        assert_eq!(reg.apns_token, "new-token");
-        assert_eq!(reg.apns_env, device_proto::pairing::ApnsEnv::Production);
     }
 
     /// A static key with no approved device row is rejected at the handshake: the

@@ -353,12 +353,12 @@ fn unadmitted() -> Response {
 }
 
 /// Map a wire [`LegClass`] to its relay bandwidth class: a `Blob` leg meters as
-/// `Background` (yields the chat headroom on the shared bucket), a `Chat` leg as
-/// `Interactive`.
+/// `Background` (yields the chat headroom on the shared bucket), while `Chat`
+/// and small `Api` legs meter as `Interactive`.
 fn bandwidth_class(class: LegClass) -> BwClass {
     match class {
         LegClass::Blob => BwClass::Background,
-        LegClass::Chat => BwClass::Interactive,
+        LegClass::Chat | LegClass::Api => BwClass::Interactive,
     }
 }
 
@@ -1088,7 +1088,7 @@ async fn content_host_handler(
     let max_conns = entry.max_conns.map(|c| c as usize);
     let registered = match class {
         LegClass::Blob => state.conns.register_background(&key, max_conns),
-        LegClass::Chat => state.conns.register(&key, max_conns),
+        LegClass::Chat | LegClass::Api => state.conns.register(&key, max_conns),
     };
     let Some((guard, kick)) = registered else {
         state.broker.cancel(&relay_key);
