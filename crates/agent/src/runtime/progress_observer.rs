@@ -157,6 +157,9 @@ impl ProgressObserverRunner {
         } = self;
 
         let cancel_ctx = Some((&cancel_token, baybo_job::CancelReason::ParentCancelled));
+        // Owned handle so the call below can `select!` on cancellation: an
+        // undrainable last summary aborts instead of billing a discarded result.
+        let cancel_for_call = cancel_token.clone();
         let begin = LlmCallBegin {
             model_id: model_info.id.clone(),
             provider: model_info.provider.clone(),
@@ -190,7 +193,20 @@ impl ProgressObserverRunner {
                             span_id: span.span_id,
                             reason: baybo_llm::CallReason::ProgressObserver,
                         });
-                        match bound.chat(&request).await {
+                        let chat = tokio::select! {
+                            _ = cancel_for_call.cancelled() => None,
+                            r = bound.chat(&request) => Some(r),
+                        };
+                        let Some(chat) = chat else {
+                            // Cancelled before drain: return Err with the token
+                            // tripped so the span closes `Cancelled`, not left
+                            // `Pending` as an `abort()` would.
+                            return (
+                                LlmCallResult::default(),
+                                Err(anyhow::anyhow!("progress observer cancelled")),
+                            );
+                        };
+                        match chat {
                             Ok(billed) => {
                                 let mut response = billed.response;
                                 if let Err(e) =

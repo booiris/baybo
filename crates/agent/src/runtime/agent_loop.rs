@@ -784,12 +784,9 @@ impl AgentLoop {
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
         self.context_manager.ensure_seeded().await;
 
-        // Seed the conversation title from the user's first question NOW, at the
-        // start of the turn, so the (detached) title pass runs concurrently with
-        // this turn's answer instead of waiting for it — the title depends only
-        // on the question, which is already in context, not on the reply. Once
-        // per session; fire-and-forget, so it never blocks the turn.
-        self.maybe_generate_title(session, job_lifecycle, span_recorder, job_id, is_user_turn)
+        // Fire-and-forget at turn start so the title derives concurrently with
+        // the answer (it needs only the question, already in context).
+        self.maybe_generate_title(session, span_recorder, job_id, is_user_turn, &cancel_token)
             .await;
 
         // Tool-authored notices (`AgentEvent::Notice`) ride the job-wide
@@ -826,6 +823,11 @@ impl AgentLoop {
         let mut iterations = 0;
         let turn_started = std::time::Instant::now();
         let mut observer_state = ObserverState::default();
+        // Aborts an observer still in flight when the turn ends — the last
+        // summary can't be drained once the next iteration is the final answer.
+        // Drop guard fires on every exit; child token, so `/stop` reaches it.
+        let observer_cancel = cancel_token.child_token();
+        let _observer_cancel_guard = observer_cancel.clone().drop_guard();
         // Drives the per-turn planning-checklist reminder: load on the first
         // iteration (to surface tasks a prior turn persisted) and reload after
         // any iteration that ran a checklist-mutating tool, so the web checklist
@@ -917,20 +919,6 @@ impl AgentLoop {
             )
             .await?;
 
-            // Here (post-compression, between iterations) the context
-            // snapshot the observer reads is coherent — no dangling tool_use.
-            self.maybe_run_progress_observer(
-                session,
-                span_recorder,
-                job_id,
-                &cancel_token,
-                delta_tx.as_ref(),
-                iterations,
-                turn_started,
-                &mut observer_state,
-            )
-            .await;
-
             // Stream deltas on every iteration, not just the first. The
             // final answer can land on any iteration (it follows however
             // many tool-call rounds the model needs), and the TUI renders
@@ -998,6 +986,22 @@ impl AgentLoop {
                         // anchor: the model just touched the list, so don't nag.
                         self.last_task_management_turn = self.turn_counter;
                     }
+
+                    // Observe only after a resolved tool round: the snapshot is
+                    // coherent (no dangling tool_use) and never spawned for a
+                    // turn that just ended on the final answer.
+                    self.maybe_run_progress_observer(
+                        session,
+                        span_recorder,
+                        job_id,
+                        &cancel_token,
+                        &observer_cancel,
+                        delta_tx.as_ref(),
+                        iterations,
+                        turn_started,
+                        &mut observer_state,
+                    )
+                    .await;
                 }
             }
         }
@@ -2355,11 +2359,13 @@ impl AgentLoop {
     }
 
     /// Read-only out-of-band progress: summarize the in-flight turn with a
-    /// billed LLM call and ship it as a `Notice`. The call runs detached so
-    /// it never blocks the next iteration: at each boundary we first DRAIN
-    /// the previous call (emit its line if it finished), then SPAWN a fresh
-    /// one when the gate (`should_fire_observer`) passes and none is already
-    /// in flight. No-op unless the gate passes; throttled to one attempt per
+    /// billed LLM call and ship it as a `Notice`. Called only from the
+    /// `Continue` arm — after an iteration resolved as a tool round, never on
+    /// the final answer. The call runs detached so it never blocks the next
+    /// iteration: each time we first DRAIN the previous call (emit its line if
+    /// it finished), then SPAWN a fresh one when the gate
+    /// (`should_fire_observer`) passes and none is already in flight. No-op
+    /// unless the gate passes; throttled to one attempt per
     /// `OBSERVER_MIN_INTERVAL`. At most one call is in flight at a time.
     #[allow(clippy::too_many_arguments)]
     async fn maybe_run_progress_observer(
@@ -2368,6 +2374,9 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
         cancel_token: &CancellationToken,
+        // Bound to the spawned call (not the gate/drain checks) so it aborts on
+        // turn end even when the turn itself succeeded.
+        observer_cancel: &CancellationToken,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         iterations: usize,
         turn_started: std::time::Instant,
@@ -2445,13 +2454,12 @@ impl AgentLoop {
         observer_state.last_fired_at = Some(now);
 
         // Build the runner from `&self` first; it owns / Arc-clones every
-        // field, so the spawned future is `'static + Send` and borrows
-        // nothing from `self`. We detach on drop and never abort: aborting
-        // mid-`with_step` would leave a Pending step until boot recovery,
-        // whereas the runner already threads `cancel_token` through the step
-        // so a real stop closes it as Cancelled cleanly.
+        // field, so the spawned future is `'static + Send` and borrows nothing
+        // from `self`. Detached, never `abort()`ed (that would leak a Pending
+        // step) — the runner `select!`s on `observer_cancel` instead, closing
+        // as Cancelled when the loop trips it on turn end.
         let runner =
-            self.build_progress_observer_runner(session, span_recorder, job_id, cancel_token);
+            self.build_progress_observer_runner(session, span_recorder, job_id, observer_cancel);
         observer_state.in_flight = Some(tokio::spawn(async move {
             runner.run(request, input_marker).await
         }));
@@ -2704,12 +2712,20 @@ impl AgentLoop {
     /// LLM call), so the title pass runs **concurrently with this turn's
     /// answer** rather than after it — the title depends only on the user's
     /// first question, which is already in context, not on the reply. It
-    /// `tokio::spawn`s a DETACHED pass (own `Maintenance` job + a fresh
-    /// [`CancellationToken`], so an idle reap can't abort it — mirrors
-    /// [`Self::maybe_run_background_compression`]) that titles the session,
-    /// persists it via `SessionManager::set_title`, and notifies the
+    /// `tokio::spawn`s a DETACHED pass that records a
+    /// [`StepKind::TitleGeneration`] step + its `LlmCall` span **under this
+    /// turn's own job** (`current_job_id`) — so cost + trace attribute to the
+    /// triggering turn, exactly like [`Self::maybe_run_progress_observer`],
+    /// rather than spinning up a separate maintenance job. It titles the
+    /// session, persists it via `SessionManager::set_title`, and notifies the
     /// [`Self::title_sink`] to broadcast it. Fire-and-forget: the turn never
     /// blocks on it.
+    ///
+    /// The step rides the **turn's** `cancel_token`: `/stop` closes it as
+    /// `Cancelled`, a normal turn leaves it untripped so the pass finishes even
+    /// if it briefly outlives the reply. Unlike the background-summary pass it
+    /// needs no reap-surviving token — the title is cosmetic and self-heals on
+    /// a later turn (durable `session.title` stays `None` until one lands).
     ///
     /// **Gate (all must hold):** the turn is `UserChat`; a
     /// [`Self::title_sink`] is wired (the "a live title surface exists" signal
@@ -2724,10 +2740,10 @@ impl AgentLoop {
     async fn maybe_generate_title(
         &mut self,
         session: &Session,
-        job_lifecycle: &Arc<JobLifecycle>,
         span_recorder: &Arc<SpanRecorder>,
         current_job_id: JobId,
         is_user_turn: bool,
+        cancel_token: &CancellationToken,
     ) {
         if !is_user_turn || self.title_generation.is_some() {
             return;
@@ -2749,69 +2765,35 @@ impl AgentLoop {
         };
 
         let session_id = session.id.clone();
-        let origin = session.trigger.kind();
         let user_id = session.user.id.clone();
         let llm_client = self.llm_client.clone();
         let security_gateway = self.security_gateway.clone();
         let model_info = self.llm_client.model_info().clone();
         let recorder = Arc::clone(span_recorder);
-        let job_lifecycle = Arc::clone(job_lifecycle);
-
-        let cancel_token = CancellationToken::new();
+        let cancel_token = cancel_token.clone();
 
         let handle = tokio::spawn(async move {
-            let runner_session_id = session_id.clone();
-            let spec = JobSpec {
-                session_id,
-                origin,
-                shape: JobShape::Maintenance,
-                input: baybo_job::JobInput::System {
-                    payload: baybo_job::SystemJobPayload::TitleGeneration {},
-                },
-                parent_job_id: Some(current_job_id),
+            let runner = crate::runtime::title::TitleRunner {
+                llm_client,
+                recorder,
+                security_gateway,
+                job_id: current_job_id,
+                user_id,
+                session_id: session_id.clone(),
+                model_info,
+                cancel_token,
             };
-            let result = crate::runtime::scope::with_job(
-                &job_lifecycle,
-                cancel_token.clone(),
-                spec,
-                move |job_id| async move {
-                    let runner = crate::runtime::title::TitleRunner {
-                        llm_client,
-                        recorder,
-                        security_gateway,
-                        job_id,
-                        user_id,
-                        session_id: runner_session_id.clone(),
-                        model_info,
-                        cancel_token,
-                    };
-                    let title = runner.run(question).await?;
-                    let titled = match title {
-                        Some(title) => {
-                            match sessions.set_title(&runner_session_id, Some(&title)).await {
-                                Ok(()) => {
-                                    title_sink.title_updated(&runner_session_id, &title);
-                                    true
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        session_id = %runner_session_id,
-                                        error = %e,
-                                        "failed to persist session title"
-                                    );
-                                    false
-                                }
-                            }
-                        }
-                        None => false,
-                    };
-                    let value = serde_json::json!({ "titled": titled });
-                    Ok((baybo_job::JobOutput::Structured { value }, ()))
+            match runner.run(question).await {
+                Ok(Some(title)) => match sessions.set_title(&session_id, Some(&title)).await {
+                    Ok(()) => title_sink.title_updated(&session_id, &title),
+                    Err(e) => warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "failed to persist session title"
+                    ),
                 },
-            )
-            .await;
-            if let Err(e) = result {
-                warn!(error = %e, "title generation pass failed");
+                Ok(None) => {}
+                Err(e) => warn!(error = %e, "title generation pass failed"),
             }
         });
         self.title_generation = Some(handle);

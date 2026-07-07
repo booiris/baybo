@@ -33,14 +33,17 @@ pub enum JobInputKind {
 
 /// Provenance for [`JobInput::System`] maintenance jobs.
 ///
-/// This is persisted in `jobs.data`. Keep `#[serde(untagged)]` with
-/// `Compression` first so legacy `{"up_to_ordinal":N}` payloads still load.
+/// Persisted in `jobs.data` with `#[serde(untagged)]`, `Compression` first,
+/// so a `{"up_to_ordinal":N}` payload loads as `Compression` and an empty
+/// `{}` payload falls through to [`Self::TitleGeneration`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SystemJobPayload {
     /// Background transcript compression / summary pass.
     Compression(BackgroundCompressionPayload),
-    /// One-off pass that titles a conversation from its first user question.
+    /// Empty payload of a legacy standalone title-generation job. No longer
+    /// produced — the title pass now records a `StepKind::TitleGeneration` step
+    /// under its triggering turn's job — but retained so persisted rows load.
     TitleGeneration {},
 }
 
