@@ -1,3 +1,4 @@
+mod agent_profile;
 mod blob;
 mod channel_bot;
 mod channel_pairing;
@@ -15,6 +16,7 @@ mod task;
 mod time;
 mod trace;
 
+pub use agent_profile::LibsqlAgentProfileStore;
 pub use blob::LibsqlBlobStore;
 pub use channel_bot::LibsqlChannelBotStore;
 pub use channel_pairing::LibsqlChannelPairingStore;
@@ -497,6 +499,27 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_blobs_uploader_identity_size
                     ON blobs(uploader_identity, size)
                     WHERE uploader_identity IS NOT NULL;
+
+                -- User-managed agent profiles (chat personas). The seeded
+                -- built-in `baybo` row (builtin = 1) is read-only except its
+                -- avatar: update/delete run WHERE builtin = 0 in the store
+                -- impl and create never binds `builtin`, so the open()-time
+                -- seed is the only writer of 1. avatar_blob_id is a soft
+                -- reference into blobs (FKs are off — see set_wal_mode).
+                -- Skills are not stored here — they are read live from the
+                -- skill registry (see docs/modules/agent-profiles.md).
+                CREATE TABLE IF NOT EXISTS agent_profiles (
+                    id              TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    description     TEXT NOT NULL,
+                    avatar_blob_id  TEXT,
+                    system_prompt   TEXT,
+                    framework       TEXT NOT NULL,
+                    llm             TEXT,
+                    builtin         INTEGER NOT NULL DEFAULT 0,
+                    created_at      INTEGER NOT NULL,
+                    updated_at      INTEGER NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS channel_pairings (
                     channel_type TEXT    NOT NULL,

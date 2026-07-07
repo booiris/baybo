@@ -4,6 +4,54 @@
  */
 
 export interface paths {
+    "/v1/agents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_agents"];
+        put?: never;
+        post: operations["create_agent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/agents/{agent_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_agent"];
+        put: operations["update_agent"];
+        post?: never;
+        delete: operations["delete_agent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/agents/{agent_id}/avatar": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_agent_avatar"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/analytics": {
         parameters: {
             query?: never;
@@ -621,6 +669,35 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
+         * @description Mirror of [`baybo_model::AgentFramework`]; wire strings match the
+         *     spawn protocol's backend tags (`baybo`/`claude`/`codex`).
+         * @enum {string}
+         */
+        AgentFrameworkDto: "baybo" | "claude" | "codex";
+        /**
+         * @description One agent profile. Absent `system_prompt` = workspace Soul; absent
+         *     `llm` = follow `default-llm`. Skills are not part of the profile — they
+         *     are read live from the skill registry (`GET /v1/skills`).
+         */
+        AgentProfileDto: {
+            avatar_blob_id?: string | null;
+            /**
+             * @description The seeded built-in profile: read-only except its avatar,
+             *     cannot be deleted.
+             */
+            builtin: boolean;
+            /** Format: date-time */
+            created_at: string;
+            description: string;
+            framework: components["schemas"]["AgentFrameworkDto"];
+            id: string;
+            llm?: string | null;
+            name: string;
+            system_prompt?: string | null;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        /**
          * @description One bucket per UTC day for the analytics chart.
          *
          *     `cost_micro_usd` is integer micro-USD (USD × 10^6). Rendering layers
@@ -964,6 +1041,26 @@ export interface components {
              *     the live UI withheld — acceptable for the operator's own view.
              */
             tool_summary?: string | null;
+        };
+        /**
+         * @description Request body for `POST /v1/agents`. Absent nullable fields mean
+         *     "inherit the default" (see [`AgentProfileDto`]).
+         */
+        CreateAgentProfileRequest: {
+            /**
+             * @description Optional avatar (full blob id from `POST /v1/blobs`); validated
+             *     exactly like `PUT /v1/agents/{agent_id}/avatar`.
+             */
+            avatar_blob_id?: string | null;
+            description?: string;
+            framework?: components["schemas"]["AgentFrameworkDto"];
+            /**
+             * @description `baybo.json` LLM entry name; must match a configured entry — see
+             *     `GET /v1/llm/models`.
+             */
+            llm?: string | null;
+            name: string;
+            system_prompt?: string | null;
         };
         /**
          * @description `POST /v1/cron` body. Schedule format is the standard 5-field cron
@@ -1369,6 +1466,14 @@ export interface components {
          * @enum {string}
          */
         SessionKind: "user" | "cron" | "subagent";
+        /** @description Request body for `PUT /v1/agents/{agent_id}/avatar`. */
+        SetAgentAvatarRequest: {
+            /**
+             * @description Full blob id from `POST /v1/blobs`, or `null`/absent to clear
+             *     the avatar.
+             */
+            blob_id?: string | null;
+        };
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
             path: string;
@@ -1466,6 +1571,19 @@ export interface components {
         UnsetConfigRequest: {
             path: string;
         };
+        /**
+         * @description Request body for `PUT /v1/agents/{agent_id}` — the **complete** content
+         *     state (full replace). `name`/`description`/`framework` are required so
+         *     an omitted `framework` can't silently reset a profile to `baybo`;
+         *     absent nullable fields reset to the inherit-default state.
+         */
+        UpdateAgentProfileRequest: {
+            description: string;
+            framework: components["schemas"]["AgentFrameworkDto"];
+            llm?: string | null;
+            name: string;
+            system_prompt?: string | null;
+        };
         UpdateFolderRequest: {
             /** @description New name (absent = unchanged). */
             name?: string | null;
@@ -1515,6 +1633,290 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_agents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every agent profile, builtin first then by name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            avatar_blob_id?: string | null;
+                            /**
+                             * @description The seeded built-in profile: read-only except its avatar,
+                             *     cannot be deleted.
+                             */
+                            builtin: boolean;
+                            /** Format: date-time */
+                            created_at: string;
+                            description: string;
+                            framework: components["schemas"]["AgentFrameworkDto"];
+                            id: string;
+                            llm?: string | null;
+                            name: string;
+                            system_prompt?: string | null;
+                            /** Format: date-time */
+                            updated_at: string;
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAgentProfileRequest"];
+            };
+        };
+        responses: {
+            /** @description The created agent profile */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentProfileDto"];
+                };
+            };
+            /** @description Invalid/duplicate name, unknown LLM entry, or unknown/non-image avatar blob */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The agent profile */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentProfileDto"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAgentProfileRequest"];
+            };
+        };
+        responses: {
+            /** @description Agent profile replaced */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Built-in profile is read-only, invalid/duplicate name, or unknown LLM entry */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Agent profile deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Built-in profile cannot be deleted */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_agent_avatar: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAgentAvatarRequest"];
+            };
+        };
+        responses: {
+            /** @description Avatar set (or cleared) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unknown blob id or non-image mime */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_analytics: {
         parameters: {
             query?: {
@@ -3228,14 +3630,17 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Registered skill names */
+            /** @description Registered skills with descriptions */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": {
-                        items: string[];
+                        items: {
+                            description: string;
+                            name: string;
+                        }[];
                         next_cursor?: string | null;
                     };
                 };

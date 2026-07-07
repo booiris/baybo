@@ -1,3 +1,4 @@
+mod agent_profile;
 pub mod approval;
 mod control_event;
 mod cost;
@@ -17,6 +18,9 @@ mod session;
 pub mod spawn_protocol;
 mod task;
 
+pub use agent_profile::{
+    AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, MAX_AGENT_PROFILE_NAME_CHARS,
+};
 pub use approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
 pub use control_event::{ControlEvent, ControlEventKind};
 pub use cost::{CallReason, CostRecord, CostSummary, TimeRange};

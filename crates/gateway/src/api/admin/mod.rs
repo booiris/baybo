@@ -2,6 +2,7 @@
 //! traces/skills/tools/llm, a read-only channel list, and the web chat
 //! REST surface.
 
+pub mod agents;
 pub mod analytics;
 pub mod channels;
 pub mod chat;
@@ -17,12 +18,42 @@ pub mod tools;
 pub mod traces;
 
 use axum::Router;
+use baybo_model::LlmEntryName;
 use utoipa::OpenApi;
 use utoipa::openapi::OpenApi as OpenApiDoc;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::api::openapi;
 use crate::server::AdminState;
+use crate::{GatewayError, Result};
+
+/// Validate an optional LLM pin against the live pool. `None`/empty clears
+/// the pin; an unknown name is a 400 so the operator gets a crisp error at
+/// write time instead of a silent fallback later (`resolve` would fall back
+/// safely on a stranded name). Shared by the session model switch and the
+/// agent-profile endpoints so the contract and wording can't drift.
+pub(crate) fn validate_llm_pin(
+    state: &AdminState,
+    llm: Option<&str>,
+) -> Result<Option<LlmEntryName>> {
+    match llm.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(name) => {
+            let known = state
+                .llm_pool
+                .read()
+                .entry_names()
+                .iter()
+                .any(|e| e.as_str() == name);
+            if !known {
+                return Err(GatewayError::BadRequest(format!(
+                    "unknown LLM entry {name:?}; see GET /v1/llm/models for valid names"
+                )));
+            }
+            Ok(Some(LlmEntryName::from(name)))
+        }
+    }
+}
 
 /// Minimal top-level OpenAPI descriptor. Concrete paths and component
 /// schemas are folded in by merging the `OpenApiRouter` output from
@@ -47,6 +78,7 @@ use crate::server::AdminState;
         (name = "push", description = "Direct-mode (web-identity) push registration"),
         (name = "llm", description = "Configured LLM provider"),
         (name = "logs", description = "Recent tracing events (in-memory ring buffer)"),
+        (name = "agents", description = "User-managed agent profiles (chat personas)"),
     )
 )]
 pub struct AdminApiDoc;
@@ -71,7 +103,8 @@ pub fn v1_router_and_spec() -> (Router<AdminState>, OpenApiDoc) {
         .merge(chat::routes())
         .merge(push::routes())
         .merge(llm::routes())
-        .merge(logs::routes());
+        .merge(logs::routes())
+        .merge(agents::routes());
     let (router, spec) = OpenApiRouter::with_openapi(AdminApiDoc::openapi())
         .nest("/v1", v1)
         .split_for_parts();

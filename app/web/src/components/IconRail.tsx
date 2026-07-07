@@ -7,6 +7,7 @@ import {
   RiFileList3Line,
   RiGitMergeLine,
   RiLogoutBoxRLine,
+  RiRobot2Line,
   RiStackLine,
 } from 'react-icons/ri';
 import type { IconType } from 'react-icons';
@@ -30,6 +31,7 @@ const DESTINATIONS: { to: string; label: string; Icon: IconType }[] = [
   { to: '/cron', label: 'Cron', Icon: RiAlarmLine },
   { to: '/jobs', label: 'Jobs', Icon: RiStackLine },
   { to: '/analytics', label: 'Analytics', Icon: RiBarChartBoxLine },
+  { to: '/agents', label: 'Agents', Icon: RiRobot2Line },
   { to: '/llm', label: 'LLM', Icon: RiCpuLine },
 ];
 

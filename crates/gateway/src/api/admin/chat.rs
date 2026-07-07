@@ -708,26 +708,7 @@ async fn set_session_model(
     // persistence goes through the targeted `set_last_llm` below.
     let (sid, _) = load_web_chat_session(&state, &session_id).await?;
 
-    // Validate against the live pool; `None`/empty clears the pin.
-    // `resolve` would fall back safely on a stranded name, but a 400 here
-    // gives the operator a crisp error instead of a silent default.
-    let pin: Option<LlmEntryName> = match req.llm.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(name) => {
-            let known = state
-                .llm_pool
-                .read()
-                .entry_names()
-                .iter()
-                .any(|e| e.as_str() == name);
-            if !known {
-                return Err(GatewayError::BadRequest(format!(
-                    "unknown LLM entry {name:?}; see GET /v1/llm/models for valid names"
-                )));
-            }
-            Some(LlmEntryName::from(name))
-        }
-    };
+    let pin: Option<LlmEntryName> = super::validate_llm_pin(&state, req.llm.as_deref())?;
 
     // Persist the pin durably FIRST, via a targeted flat-column write
     // (`set_last_llm`). Unlike a full-session `save`, this can't be
