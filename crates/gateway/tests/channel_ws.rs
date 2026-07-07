@@ -684,6 +684,7 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
                 hidden: Some(false),
                 pinned: Some(false),
                 folder_id: None,
+                title: None,
             },
         );
 

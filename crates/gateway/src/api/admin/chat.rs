@@ -516,6 +516,9 @@ pub struct ChatSessionDetail {
     /// initial selection. Set via `PUT /v1/chat/sessions/{id}/model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_llm: Option<String>,
+    /// Auto-generated conversation title, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -552,6 +555,9 @@ pub struct ChatSessionSummary {
     /// accurate across a cold restart / a device that missed the live
     /// `SessionActivity` pings. `0` when caught up.
     pub unread_count: i64,
+    /// Auto-generated conversation title, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -672,6 +678,7 @@ async fn create_session(
             // no change, which a newly-constructed client row renders as
             // uncategorized.
             folder_id: None,
+            title: None,
         },
     );
     Ok(Json(ChatSessionCreated {
@@ -758,6 +765,7 @@ async fn list_sessions(
             last_user_text,
             folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
             unread_count: unread as i64,
+            title: s.title.clone(),
         })
         .collect();
     Ok(Json(ChatSessionsList { items }))
@@ -801,6 +809,7 @@ async fn get_session(
         oldest_ordinal: page.oldest_ordinal,
         newest_ordinal: page.newest_ordinal,
         last_llm: session.state.last_llm.as_ref().map(|n| n.to_string()),
+        title: session.title.clone(),
     }))
 }
 
@@ -1361,6 +1370,7 @@ async fn unhide_session(
             folder_id: session.folder_id.as_ref().map(|f| FolderChange::Set {
                 id: f.as_str().to_owned(),
             }),
+            title: session.title.clone(),
         },
     );
     Ok(axum::http::StatusCode::NO_CONTENT)

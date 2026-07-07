@@ -616,7 +616,9 @@ mod tests {
                 TriggerKind::System,
                 JobShape::Maintenance,
                 JobInput::System {
-                    payload: BackgroundCompressionPayload { up_to_ordinal: 7 },
+                    payload: crate::SystemJobPayload::Compression(BackgroundCompressionPayload {
+                        up_to_ordinal: 7,
+                    }),
                 },
                 None,
             )

@@ -370,6 +370,9 @@ export function ChatPage() {
   // the derived projection of the URL's sessionId.
   const [views, setViews] = useState<Record<string, SessionView>>({});
   const currentView = (sessionId && views[sessionId]) || EMPTY_VIEW;
+  const activeTitle = sessionId
+    ? sessions.find((s) => s.session_id === sessionId)?.title
+    : undefined;
   // A turn is "in flight" either optimistically (between send and the first
   // response) or per the server's authoritative TurnState. While busy the
   // composer's send button becomes a stop button and new sends are blocked.
@@ -850,6 +853,7 @@ export function ChatPage() {
           pinned: s.pinned,
           last_user_text: s.last_user_text ?? undefined,
           folder_id: s.folder_id ?? undefined,
+          title: s.title ?? undefined,
         }));
       });
     }
@@ -953,6 +957,7 @@ export function ChatPage() {
         pinned: s.pinned,
         last_user_text: s.last_user_text ?? undefined,
         folder_id: s.folder_id ?? undefined,
+        title: s.title ?? undefined,
       }));
       setSessions(existing);
       setSlashCommands(manifest?.items ?? []);
@@ -1321,6 +1326,15 @@ export function ChatPage() {
       .then(({ data }) => {
         if (!data) return;
         setViews((prev) => mergeView(prev, sessionId, { model: data.last_llm ?? null }));
+        // Seed the conversation title from the detail response so the header's
+        // `activeTitle` and the sidebar row converge even when the list fetch
+        // predated the title (or this tab was disconnected and missed the WS
+        // patch). Merge it like a live `SessionUpdated` patch — a title is only
+        // ever set, never cleared, so an absent `title` means "no change".
+        if (data.title) {
+          const title = data.title;
+          setSessions((prev) => applySessionPatch(prev, sessionId, { title }));
+        }
       })
       .catch((e) => console.warn('chat session meta load failed', sessionId, e));
     void runSyncSession(sessionId);
@@ -2599,15 +2613,27 @@ export function ChatPage() {
       <main className="flex-1 flex flex-col overflow-hidden relative">
         <CronInbox refreshSignal={cronInboxRefresh} />
         <header className="h-12 px-4 border-b-2 border-black flex items-center justify-between gap-3 bg-canvas">
-          <div className="flex items-baseline gap-2 min-w-0 flex-1">
+          <div className="flex items-center gap-2 min-w-0 flex-1">
             {sessionId ? (
-              <span
-                className="font-mono text-xs text-ink select-all break-all"
-                title={sessionId}
-              >
-                <span className="text-ink-soft select-none mr-1">session id:</span>
-                {sessionId}
-              </span>
+              <div className="flex flex-col min-w-0 leading-tight">
+                {activeTitle ? (
+                  <span
+                    className="font-bold text-sm text-ink truncate"
+                    title={activeTitle}
+                  >
+                    {activeTitle}
+                  </span>
+                ) : null}
+                <span
+                  className="font-mono text-[11px] text-ink-soft select-all break-all truncate"
+                  title={sessionId}
+                >
+                  <span className="select-none mr-1">
+                    {activeTitle ? 'id:' : 'session id:'}
+                  </span>
+                  {sessionId}
+                </span>
+              </div>
             ) : (
               <span className="font-bold text-sm text-ink-soft">No session</span>
             )}
@@ -4309,6 +4335,7 @@ function applySessionPatch(
         unread: 0,
         pinned: patch.pinned ?? false,
         folder_id: patchedFolder,
+        title: patch.title,
       },
       ...prev,
     ];
@@ -4324,12 +4351,14 @@ function applySessionPatch(
     pinned: patch.pinned ?? current.pinned,
     last_user_text: current.last_user_text,
     folder_id: nextFolderId,
+    title: patch.title ?? current.title,
   };
   if (
     merged.created_at === current.created_at &&
     merged.last_active === current.last_active &&
     merged.pinned === current.pinned &&
-    merged.folder_id === current.folder_id
+    merged.folder_id === current.folder_id &&
+    merged.title === current.title
   ) {
     return prev;
   }

@@ -16,5 +16,6 @@ pub mod progress_observer;
 pub mod sandbox;
 pub mod scope;
 pub mod subagent_spawner;
+pub mod title;
 pub mod tool_executor;
 pub mod virtual_read;

@@ -203,6 +203,7 @@ impl SessionManager {
             hidden: false,
             pinned: false,
             folder_id: None,
+            title: None,
         };
         self.store.save(&session).await?;
         debug!(
@@ -234,6 +235,7 @@ impl SessionManager {
             hidden: false,
             pinned: false,
             folder_id: None,
+            title: None,
         };
         self.store.save(&session).await?;
         debug!(session_id = %session.id, "created new session");
@@ -652,6 +654,16 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Set or clear the session's auto-generated conversation title.
+    pub async fn set_title(&self, session_id: &SessionId, title: Option<&str>) -> Result<()> {
+        let updated = self.store.set_title(session_id, title).await?;
+        if !updated {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        debug!(session_id = %session_id, "set session title");
+        Ok(())
+    }
+
     /// Every chat-list folder, sibling-ordered. Drives `GET /v1/chat/folders`
     /// and seeds the realtime folder snapshot broadcast.
     pub async fn list_folders(&self) -> Result<Vec<FolderSummary>> {
@@ -1038,6 +1050,45 @@ mod tests {
         );
         mgr.set_folder(&session.id, None).await.unwrap();
         assert_eq!(mgr.get(&session.id).await.unwrap().unwrap().folder_id, None);
+    }
+
+    #[tokio::test]
+    async fn set_title_round_trips_and_rejects_unknown_session() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
+        let session = mgr
+            .create_session(test_user(), ChannelType::http())
+            .await
+            .unwrap();
+
+        assert_eq!(mgr.get(&session.id).await.unwrap().unwrap().title, None);
+
+        mgr.set_title(&session.id, Some("Reset my password"))
+            .await
+            .unwrap();
+        assert_eq!(
+            mgr.get(&session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Reset my password")
+        );
+
+        mgr.set_title(&session.id, None).await.unwrap();
+        assert_eq!(mgr.get(&session.id).await.unwrap().unwrap().title, None);
+
+        assert!(matches!(
+            mgr.set_title(&SessionId::from("nope"), Some("x"))
+                .await
+                .unwrap_err(),
+            SessionError::NotFound(_)
+        ));
     }
 
     #[tokio::test]

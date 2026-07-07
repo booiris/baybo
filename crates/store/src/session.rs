@@ -109,6 +109,11 @@ pub trait SessionStore: Send + Sync {
     /// `unread_count` derivation.
     async fn read_cursor(&self, session_id: &SessionId) -> Result<Option<i64>>;
 
+    /// Set or clear the session's auto-generated title. Implementations
+    /// must update only the flat `title` column so stale `save` calls cannot
+    /// clobber it.
+    async fn set_title(&self, session_id: &SessionId, title: Option<&str>) -> Result<bool>;
+
     /// Hard-delete the session.
     ///
     /// Returns `Ok(true)` if the row existed and was removed, `Ok(false)`

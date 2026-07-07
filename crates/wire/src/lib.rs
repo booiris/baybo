@@ -928,6 +928,10 @@ pub struct SessionPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub folder_id: Option<FolderChange>,
+    /// Generated conversation title; absent means no change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+    pub title: Option<String>,
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
@@ -1334,6 +1338,7 @@ mod tests {
                 hidden: Some(false),
                 pinned: Some(false),
                 folder_id: Some(FolderChange::Set { id: "f1".into() }),
+                title: Some("Reset password flow".into()),
             },
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -1353,6 +1358,7 @@ mod tests {
                 hidden: None,
                 pinned: None,
                 folder_id: None,
+                title: None,
             },
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());

@@ -3783,6 +3783,13 @@
           "session_id": {
             "type": "string"
           },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Auto-generated conversation title, if available."
+          },
           "transcript": {
             "type": "array",
             "items": {
@@ -3834,6 +3841,13 @@
           },
           "session_id": {
             "type": "string"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Auto-generated conversation title, if available."
           },
           "unread_count": {
             "type": "integer",

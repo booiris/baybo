@@ -1351,6 +1351,20 @@ mod tests {
         ) -> std::result::Result<Option<i64>, baybo_store::StorageError> {
             Ok(self.read_cursors.lock().get(id).copied())
         }
+        async fn set_title(
+            &self,
+            id: &SessionId,
+            title: Option<&str>,
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
+            let mut data = self.sessions.lock();
+            match data.get_mut(id) {
+                Some(s) => {
+                    s.title = title.map(|t| t.to_string());
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
         async fn delete(
             &self,
             _id: &SessionId,
@@ -1613,6 +1627,7 @@ mod tests {
             hidden: false,
             pinned: false,
             folder_id: None,
+            title: None,
         }
     }
 

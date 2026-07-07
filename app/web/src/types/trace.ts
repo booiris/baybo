@@ -45,6 +45,7 @@ export type StepKind =
   | { kind: 'memory_write' }
   | { kind: 'skill_selection' }
   | { kind: 'progress_observer' }
+  | { kind: 'title_generation' }
   | { kind: 'subagent'; child_session_id: string };
 
 export type StepKindTag = StepKind['kind'];

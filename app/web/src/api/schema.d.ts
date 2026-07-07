@@ -972,6 +972,8 @@ export interface components {
              */
             oldest_ordinal?: number | null;
             session_id: string;
+            /** @description Auto-generated conversation title, if available. */
+            title?: string | null;
             /**
              * @description Active transcript slice, oldest-first within the page. Interleaves the
              *     real message rows with out-of-band control events (slash echoes /
@@ -1014,6 +1016,8 @@ export interface components {
              */
             pinned: boolean;
             session_id: string;
+            /** @description Auto-generated conversation title, if available. */
+            title?: string | null;
             /**
              * Format: int64
              * @description Number of unread assistant replies — final assistant messages persisted
