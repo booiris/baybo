@@ -32,29 +32,28 @@ final class ChatStore: ObservableObject {
     static let maxBufferedFrames = 2000
 
     let sessionId: String
-    /// Whether this session already existed in the registry when opened — an
-    /// existing conversation (tapped from the list or a push), as opposed to a
-    /// fresh compose draft. Handed to the web transcript so a listed session with
-    /// no local mirror pulls its history straight from the gateway: a cold
-    /// Subscribe (`since_ordinal` nil) replays nothing, so without this the
-    /// transcript would sit blank. A draft stays empty until its first send.
+    /// Whether this session already exists on the gateway — an existing
+    /// conversation (tapped from the list or a push), as opposed to a fresh
+    /// compose draft. Gates connecting (a draft stays offline until its first
+    /// send) and sync eligibility (a draft has nothing to pull). The webview no
+    /// longer needs this: its sync loop runs the same on every open, and a
+    /// draft's sync request is simply skipped native-side until the session
+    /// exists.
     let listed: Bool
     @Published private(set) var connState: ConnState
     /// Transient composer notice (send failed / waiting for upload / too large).
     @Published var notice: String?
 
     /// Increments on every successful dial; the webview uses it to retry
-    /// attachments that raced ahead of the leg going live, and to drop late
-    /// history frames from a superseded connection.
+    /// attachments that raced ahead of the leg going live, and — the sync-loop
+    /// reconnect edge — to run one forward-recovery pull (`handleConnEpoch`).
     private(set) var connEpoch = 0
-    /// Newest-edge ordinal reported by the webview — the reconnect catch-up
-    /// cursor (`sinceOrdinal`). In-memory only: the DURABLE cursor lives inside
-    /// the persisted transcript blob (written atomically with the messages it
-    /// matches), so a kill can never leave the cursor durably ahead of the
-    /// transcript — the old localStorage blob had the same one-write property.
-    private(set) var lastOrdinal: Int64?
     private var remoteSessionEnsured: Bool
     private var ensureRemoteSessionTask: Task<Void, Error>?
+    /// The persisted send outbox (survives relaunch alongside the transcript
+    /// mirror). Confirmation is two-stage: the echo proves transport, an
+    /// ordinal-stamped row (sync/backfill) proves durability. See sync-v2.
+    private let outbox: OutboxStore
 
     /// Accepted floor: sinks below this are muted. Advanced when a dial
     /// actually REPLACES the pump (success) or on deliberate disconnect — NOT
@@ -66,15 +65,17 @@ final class ChatStore: ObservableObject {
     private var issuedGeneration = 0
     private var retryTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
-    private var catchUpTask: Task<Void, Never>?
     private var connectTask: Task<Void, Error>?
+    /// Fires the outbox retry sweep (10 s no-echo → one blind resend, up to the
+    /// 3-transmission cap). Started lazily when the outbox is non-empty.
+    private var outboxTimer: Task<Void, Never>?
     private weak var bridge: TranscriptBridge?
     private var bufferedFrames: [String] = []
     /// Set when the offscreen buffer overflowed and was dropped: the next
-    /// `attachBridge` refetches the gap instead of flushing a hole-punched
-    /// stream, and frames arriving meanwhile are dropped (not re-buffered) so
-    /// the rewound catch-up cursor stays put.
-    private var needsHistoryReset = false
+    /// `attachBridge` asks the webview to run its sync loop (from its own
+    /// durable cursor) rather than flushing a hole-punched stream. Frames
+    /// arriving meanwhile are dropped, not re-buffered.
+    private var needsSyncOnAttach = false
 
     init(sessionId: String) {
         self.sessionId = sessionId
@@ -82,7 +83,7 @@ final class ChatStore: ObservableObject {
         self.listed = listed
         connState = listed ? .connecting : .draft
         remoteSessionEnsured = false
-        lastOrdinal = Self.persistedOrdinal(sessionId: sessionId)
+        outbox = OutboxStore(sessionId: sessionId)
     }
 
     // MARK: - Connection lifecycle
@@ -109,9 +110,6 @@ final class ChatStore: ObservableObject {
         }
         retryTask?.cancel()
         retryTask = nil
-        catchUpTask?.cancel()
-        catchUpTask = nil
-        let sinceOrdinal = lastOrdinal
         if connState != .connected {
             connState = .connecting
         }
@@ -128,18 +126,19 @@ final class ChatStore: ObservableObject {
             do {
                 try await Baybo.client.chatConnect(
                     sessionId: sessionId,
-                    sinceOrdinal: sinceOrdinal,
                     sink: Sink(store: self, generation: gen)
                 )
                 guard gen >= generation else { return }  // superseded by disconnect
-                // The subscribe is now accepted; only NOW mute older sinks.
+                // The subscribe is now accepted; only NOW mute older sinks. The
+                // server replays no history — the connEpoch bump drives the
+                // webview's sync loop (its `handleConnEpoch` → one forward pull).
                 generation = gen
                 connEpoch += 1
                 connState = .connected
                 bridge?.setConnEpoch(connEpoch)
-                if let sinceOrdinal {
-                    fetchCatchUp(sinceOrdinal: sinceOrdinal, generation: gen)
-                }
+                // Reconcile the outbox against the reconnect: entries still
+                // lacking durability confirmation resend (sync-v2 send path).
+                reconcileOutboxOnConnect()
             } catch {
                 guard gen >= generation else { return }
                 // The one place `offline` is set — a failed dial.
@@ -150,21 +149,6 @@ final class ChatStore: ObservableObject {
         }
         connectTask = task
         return task
-    }
-
-    private func fetchCatchUp(sinceOrdinal: Int64, generation gen: Int) {
-        catchUpTask?.cancel()
-        catchUpTask = Task {
-            do {
-                let frame = try await Baybo.client.chatCatchUp(
-                    sessionId: sessionId, sinceOrdinal: sinceOrdinal)
-                guard !Task.isCancelled, gen >= generation else { return }
-                pushFrame(frame)
-            } catch {
-                guard !Task.isCancelled else { return }
-                NSLog("baybo: catchUp: %@", bayboErrorText(error))
-            }
-        }
     }
 
     /// Foreground / visibility signal: debounce, then redial (a no-op when the
@@ -202,8 +186,8 @@ final class ChatStore: ObservableObject {
         retryTask = nil
         debounceTask?.cancel()
         debounceTask = nil
-        catchUpTask?.cancel()
-        catchUpTask = nil
+        outboxTimer?.cancel()
+        outboxTimer = nil
         connectTask?.cancel()
         connectTask = nil
         // Mute every sink, including one handed to a dial still in flight.
@@ -225,8 +209,8 @@ final class ChatStore: ObservableObject {
         retryTask = nil
         debounceTask?.cancel()
         debounceTask = nil
-        catchUpTask?.cancel()
-        catchUpTask = nil
+        outboxTimer?.cancel()
+        outboxTimer = nil
         connectTask?.cancel()
         connectTask = nil
         issuedGeneration += 1
@@ -238,17 +222,14 @@ final class ChatStore: ObservableObject {
 
     func attachBridge(_ bridge: TranscriptBridge) {
         self.bridge = bridge
-        if needsHistoryReset {
-            needsHistoryReset = false
+        if needsSyncOnAttach {
+            needsSyncOnAttach = false
             bufferedFrames.removeAll()
-            // The buffer was dropped while offscreen; refetch the gap above the
-            // rewound durable floor rather than flushing a hole-punched stream.
-            // When not connected, the reconnect (`connectIfNeeded` on appear)
-            // runs its own catch-up from the same cursor, so only fire here on a
-            // live leg to avoid a redundant fetch.
-            if connState == .connected {
-                fetchCatchUp(sinceOrdinal: lastOrdinal ?? 0, generation: generation)
-            }
+            // The buffer was dropped while offscreen; the webview re-hydrates by
+            // running its sync loop from its own durable cursor (which the
+            // dropped live frames never advanced) rather than flushing a
+            // hole-punched stream.
+            bridge.requestSync()
             return
         }
         flushBufferedFrames(to: bridge)
@@ -261,11 +242,12 @@ final class ChatStore: ObservableObject {
     }
 
     private func pushFrame(_ frameJson: String) {
-        // Already overflowed while offscreen: everything above the rewound floor
-        // is refetched on the next attach, so don't buffer or advance the cursor
-        // past the hole the dropped frames left.
-        if bridge == nil && needsHistoryReset { return }
-        advanceLastOrdinal(fromFrameJson: frameJson)
+        // Already overflowed while offscreen: the webview re-syncs on the next
+        // attach, so don't buffer past the hole the dropped frames left.
+        if bridge == nil && needsSyncOnAttach { return }
+        // The outbox observes the same frame stream: a user Echo (ordinal-less,
+        // matching platform_msg_id) flips its entry to `sent`.
+        outboxObserveFrame(frameJson)
         if let bridge {
             bridge.pushFrame(frameJson)
         } else {
@@ -278,42 +260,12 @@ final class ChatStore: ObservableObject {
 
     /// The offscreen buffer blew its cap (a long agent turn on a backgrounded
     /// session). Streamed deltas aren't durable rows, so a truncated flush would
-    /// leave a hole — drop the buffer and rewind the catch-up cursor to the
-    /// durable floor the webview actually holds, so the next `attachBridge`
-    /// refetches the whole gap via catch-up/history instead.
+    /// leave a hole — drop the buffer and mark the session for a sync on the
+    /// next `attachBridge`, where the webview pulls the whole gap from its own
+    /// cursor.
     private func overflowBufferedFrames() {
         bufferedFrames.removeAll()
-        needsHistoryReset = true
-        lastOrdinal = Self.persistedOrdinal(sessionId: sessionId)
-    }
-
-    /// The newest ordinal in the durable transcript mirror — the safe catch-up
-    /// floor (≤ what the webview has actually rendered). `nil` when no mirror
-    /// exists yet. Read at init and again on a buffer-overflow reset, where the
-    /// in-memory `lastOrdinal` has advanced past the frames that were dropped.
-    private static func persistedOrdinal(sessionId: String) -> Int64? {
-        guard let blob = TranscriptStore.read(sessionId: sessionId),
-            let data = blob.data(using: .utf8),
-            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return nil }
-        return (obj["lastOrdinal"] as? NSNumber)?.int64Value
-    }
-
-    private func advanceLastOrdinal(fromFrameJson frameJson: String) {
-        guard let data = frameJson.data(using: .utf8),
-            let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return }
-        if let ordinal = (frame["ordinal"] as? NSNumber)?.int64Value {
-            noteDurableOrdinal(ordinal)
-        }
-        if let newest = (frame["newest_ordinal"] as? NSNumber)?.int64Value {
-            noteDurableOrdinal(newest)
-        }
-    }
-
-    private func noteDurableOrdinal(_ ordinal: Int64) {
-        guard lastOrdinal == nil || ordinal > (lastOrdinal ?? 0) else { return }
-        lastOrdinal = ordinal
+        needsSyncOnAttach = true
     }
 
     private func flushBufferedFrames(to bridge: TranscriptBridge) {
@@ -338,10 +290,14 @@ final class ChatStore: ObservableObject {
     // MARK: - Sending
 
     /// Optimistic send: mint the idempotency key, seed the webview's bubble +
-    /// echo-dedup FIRST, then enqueue on the live leg.
+    /// echo-dedup FIRST, enrol the persisted outbox entry, then enqueue on the
+    /// live leg.
     func send(text: String, attachments: [AttachmentRef]) {
         let msgId = UUID().uuidString
         bridge?.userSent(msgId: msgId, text: text, attachments: attachments)
+        outbox.beginSend(
+            platformMsgId: msgId, text: text, attachments: attachments.map(Self.toOutboxAttachment))
+        startOutboxTimerIfNeeded()
         dispatchSend(msgId: msgId, text: text, attachments: attachments)
     }
 
@@ -349,15 +305,19 @@ final class ChatStore: ObservableObject {
     /// original msgId as the idempotency key, so a resend that races a late
     /// first delivery still lands as a single row. The optimistic bubble already
     /// exists (the webview flipped it back to sending), so no fresh `userSent`.
+    /// The manual retry resets the automatic-transmission budget.
     func retrySend(msgId: String, text: String, attachments: [AttachmentRef]) {
+        outbox.resetForManualRetry(
+            platformMsgId: msgId, text: text, attachments: attachments.map(Self.toOutboxAttachment))
+        startOutboxTimerIfNeeded()
         dispatchSend(msgId: msgId, text: text, attachments: attachments)
     }
 
-    /// Enqueue on the live leg (dialing first if needed); on any failure tell the
-    /// webview to flag that bubble failed (`sendFailed`) — its red retry dot is
-    /// the sole failure surface, no composer notice. `scheduleRetry` only redials
-    /// the leg — it never re-enqueues this message — so the send is genuinely
-    /// lost until the user taps retry.
+    /// Enqueue on the live leg (dialing first if needed); on any transport
+    /// failure tell the webview to flag that bubble failed (`sendFailed`) — its
+    /// red retry dot is the manual failure surface. The persisted outbox drives
+    /// automatic retry (10 s no-echo → one blind resend, capped at 3
+    /// transmissions) and resend-after-sync on reconnect.
     private func dispatchSend(msgId: String, text: String, attachments: [AttachmentRef]) {
         Task {
             do {
@@ -383,12 +343,9 @@ final class ChatStore: ObservableObject {
 
         retryTask?.cancel()
         retryTask = nil
-        catchUpTask?.cancel()
-        catchUpTask = nil
         connectTask?.cancel()
         connectTask = nil
 
-        let sinceOrdinal = lastOrdinal
         connState = .connecting
         notice = nil
         issuedGeneration += 1
@@ -396,7 +353,6 @@ final class ChatStore: ObservableObject {
         do {
             try await Baybo.client.chatSendAfterConnect(
                 sessionId: sessionId,
-                sinceOrdinal: sinceOrdinal,
                 sink: Sink(store: self, generation: gen),
                 text: text,
                 msgId: msgId,
@@ -407,9 +363,7 @@ final class ChatStore: ObservableObject {
             connEpoch += 1
             connState = .connected
             bridge?.setConnEpoch(connEpoch)
-            if let sinceOrdinal {
-                fetchCatchUp(sinceOrdinal: sinceOrdinal, generation: gen)
-            }
+            reconcileOutboxOnConnect()
         } catch {
             guard gen >= generation else { throw error }
             connState = .offline
@@ -442,8 +396,56 @@ final class ChatStore: ObservableObject {
 
     // MARK: - Bridge callbacks (webview → native)
 
-    func ordinalAdvanced(_ ordinal: Int64?) {
-        lastOrdinal = ordinal
+    /// The one forward-recovery pull. The webview posts its cursor (`nil` =
+    /// baseline); native fetches `GET …/sync?since_ordinal=…&limit=…` over the
+    /// active leg, reconciles the outbox against the returned rows, then pushes
+    /// the `sync_page` frame back for the webview to apply.
+    func requestSync(sinceOrdinal: Int64?, limit: UInt32) {
+        guard listed || remoteSessionEnsured else {
+            // A draft has nothing to pull yet — but the webview already flipped
+            // its in-flight guard, so we MUST reply. An empty baseline
+            // `sync_page` clears it (an empty REPLACE keeps the optimistic
+            // bubble intact); otherwise the guard would stay set forever and
+            // the connEpoch sync after the first send would be a no-op until
+            // reload.
+            pushSynthesizedFrame([
+                "kind": "sync_page",
+                "rows": [],
+                "since_ordinal": sinceOrdinal.map { NSNumber(value: $0) } ?? NSNull(),
+                "next_cursor": NSNull(),
+                "rebased": false,
+                "oldest_ordinal": NSNull(),
+                "has_more_older": false,
+            ])
+            return
+        }
+        Task {
+            do {
+                let frame = try await Baybo.client.chatFetchSync(
+                    sessionId: sessionId, sinceOrdinal: sinceOrdinal, limit: limit)
+                reconcileOutboxAfterSync(frameJson: frame)
+                pushFrame(frame)
+            } catch {
+                NSLog("baybo: sync: %@", bayboErrorText(error))
+                // Unwind the webview's in-flight sync guard so the next trigger
+                // retries; the durable record is intact server-side.
+                pushSynthesizedFrame(["kind": "sync_failed", "error": bayboErrorText(error)])
+            }
+        }
+    }
+
+    /// Advance the server chat-list read cursor (max-wins) to `ordinal` — the
+    /// viewer has read up to here. Fire-and-forget: the badge clears on the next
+    /// list pull; a draft (no remote session yet) has nothing to mark.
+    func markRead(ordinal: Int64) {
+        guard listed || remoteSessionEnsured else { return }
+        Task {
+            do {
+                try await Baybo.client.chatMarkRead(sessionId: sessionId, ordinal: ordinal)
+            } catch {
+                NSLog("baybo: mark read: %@", bayboErrorText(error))
+            }
+        }
     }
 
     func fetchHistory(beforeOrdinal: Int64?, limit: UInt32) {
@@ -454,20 +456,183 @@ final class ChatStore: ObservableObject {
                 pushFrame(frame)
             } catch {
                 NSLog("baybo: fetchHistory: %@", bayboErrorText(error))
-                // The web bundle's paging/reset guards armed for this request
-                // must unwind; a synthesized frame rides the ordered frame path
-                // just like a successful native history fetch.
-                let payload: [String: Any] = [
-                    "kind": "history_failed",
-                    "error": bayboErrorText(error),
-                ]
-                if let data = try? JSONSerialization.data(withJSONObject: payload),
-                    let json = String(data: data, encoding: .utf8)
-                {
-                    pushFrame(json)
-                }
+                // The web bundle's paging guards armed for this request must
+                // unwind; a synthesized frame rides the ordered frame path just
+                // like a successful native history fetch.
+                pushSynthesizedFrame(["kind": "history_failed", "error": bayboErrorText(error)])
             }
         }
+    }
+
+    private func pushSynthesizedFrame(_ payload: [String: Any]) {
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+            let json = String(data: data, encoding: .utf8)
+        {
+            pushFrame(json)
+        }
+    }
+
+    // MARK: - Outbox (persisted send reconciliation)
+
+    /// A frame flowing to the webview: a user Echo (role `user`, a
+    /// `platform_msg_id`, no `ordinal`) proves transport, flipping its outbox
+    /// entry to `sent`. Durability release happens on a sync/backfill row
+    /// instead (`reconcileOutboxAfterSync`).
+    private func outboxObserveFrame(_ frameJson: String) {
+        guard let data = frameJson.data(using: .utf8),
+            let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            (frame["kind"] as? String) == "message",
+            (frame["role"] as? String) == "user",
+            let pmid = frame["platform_msg_id"] as? String, !pmid.isEmpty,
+            frame["ordinal"] == nil || frame["ordinal"] is NSNull
+        else { return }
+        outbox.markEchoed(platformMsgId: pmid)
+    }
+
+    /// Native holds the `sync_page` it fetched, so it reconciles the outbox
+    /// against it before the webview applies it: an ordinal-stamped row with a
+    /// matching `platform_msg_id` proves DURABILITY and releases the entry. A
+    /// rebased page hides the floor, so each still-unconfirmed entry resolves via
+    /// the per-key point lookup (no retry transmission consumed).
+    private func reconcileOutboxAfterSync(frameJson: String) {
+        guard let data = frameJson.data(using: .utf8),
+            let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return }
+        let rows = (frame["rows"] as? [[String: Any]]) ?? []
+        for row in rows {
+            if let pmid = row["platform_msg_id"] as? String, !pmid.isEmpty {
+                outbox.confirmDurable(platformMsgId: pmid)
+            }
+        }
+        if (frame["rebased"] as? Bool) == true {
+            for entry in outbox.entries() where entry.state != .failed {
+                resolveUnknownEntry(platformMsgId: entry.platformMsgId)
+            }
+        }
+    }
+
+    /// After a rebased sync hid the floor: probe the key's durability directly.
+    /// Found → release; provably absent → the retry machine resumes.
+    private func resolveUnknownEntry(platformMsgId: String) {
+        outbox.markUnknown(platformMsgId: platformMsgId)
+        Task {
+            do {
+                let lookup = try await Baybo.client.chatLookupMessage(
+                    sessionId: sessionId, platformMsgId: platformMsgId)
+                if lookup.found {
+                    outbox.confirmDurable(platformMsgId: platformMsgId)
+                } else {
+                    outbox.resumeSending(platformMsgId: platformMsgId)
+                    startOutboxTimerIfNeeded()
+                }
+            } catch {
+                NSLog("baybo: point lookup: %@", bayboErrorText(error))
+            }
+        }
+    }
+
+    /// Reconnect edge: resend every outbox entry still lacking durability
+    /// confirmation (the loop's sync runs first as the reconciliation gate — the
+    /// webview drives it off the connEpoch bump). The gateway-restart crash
+    /// window (echoed, never persisted) is exactly what this recovers.
+    private func reconcileOutboxOnConnect() {
+        // Reconciliation gate: resolve each unconfirmed entry by a per-key
+        // durability point lookup BEFORE any resend. A blind resend here would
+        // double-run a send that IS durable when the gateway restarted and
+        // evicted its in-memory dedup — the lookup (served from the persisted
+        // column, which survives a restart) confirms it instead. Found →
+        // release; provably absent → the retry timer resends (or fails at the
+        // cap); a lookup error defers to the next reconnect (never a blind
+        // resend). This is the iOS analogue of the web loop's "sync first".
+        for entry in outbox.entries() {
+            guard entry.state == .sending || entry.state == .sent else { continue }
+            resolveUnknownEntry(platformMsgId: entry.platformMsgId)
+        }
+        startOutboxTimerIfNeeded()
+    }
+
+    /// One (re)transmission of an outbox entry on the live leg (same
+    /// `platform_msg_id`, safe inside the gateway's dedup window). Replays the
+    /// entry's attachments too, so a retried image/file send stays that message
+    /// rather than degrading to text-only.
+    private func resendOutboxEntry(_ entry: OutboxEntry) {
+        guard connState == .connected else { return }
+        outbox.recordTransmission(platformMsgId: entry.platformMsgId)
+        let attachments = entry.attachments.map(Self.toAttachmentRef)
+        Task {
+            do {
+                try await Baybo.client.chatSend(
+                    sessionId: sessionId, text: entry.text, msgId: entry.platformMsgId,
+                    attachments: attachments)
+            } catch {
+                NSLog("baybo: outbox resend: %@", bayboErrorText(error))
+            }
+        }
+    }
+
+    private nonisolated static func toOutboxAttachment(_ ref: AttachmentRef) -> OutboxAttachment {
+        let kind: String
+        switch ref.kind {
+        case .image: kind = "image"
+        case .audio: kind = "audio"
+        case .file: kind = "file"
+        }
+        return OutboxAttachment(
+            kind: kind, blobId: ref.blobId, mimeType: ref.mimeType, size: ref.size,
+            filename: ref.filename)
+    }
+
+    private nonisolated static func toAttachmentRef(_ att: OutboxAttachment) -> AttachmentRef {
+        let kind: AttachmentKind
+        switch att.kind {
+        case "image": kind = .image
+        case "audio": kind = .audio
+        default: kind = .file
+        }
+        return AttachmentRef(
+            kind: kind, blobId: att.blobId, mimeType: att.mimeType, size: att.size,
+            filename: att.filename)
+    }
+
+    private func failOutboxEntry(_ platformMsgId: String) {
+        outbox.markFailed(platformMsgId: platformMsgId)
+        bridge?.sendFailed(platformMsgId)
+    }
+
+    /// The retry sweep: while there are `sending`/`sent` entries, every ~3 s
+    /// resend one whose 10 s echo window lapsed, or fail one that exhausted the
+    /// 3-transmission cap. Self-stops when the outbox drains. The `Task` inherits
+    /// this store's `@MainActor` isolation, so the sweep touches state directly.
+    private func startOutboxTimerIfNeeded() {
+        guard outboxTimer == nil else { return }
+        outboxTimer = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: OutboxStore.retryTick)
+                guard let self else { return }
+                if self.sweepOutbox() { return }
+            }
+        }
+    }
+
+    /// One retry-sweep pass. Returns `true` when the outbox is idle (no
+    /// `sending`/`sent` entries left) so the timer can stop.
+    private func sweepOutbox() -> Bool {
+        var active = false
+        for entry in outbox.entries() {
+            guard entry.state == .sending || entry.state == .sent else { continue }
+            active = true
+            if entry.state != .sending { continue }
+            if outbox.dueForBlindResend(entry) {
+                resendOutboxEntry(entry)
+            } else if outbox.resendExhausted(entry) {
+                failOutboxEntry(entry.platformMsgId)
+            }
+        }
+        if !active {
+            outboxTimer = nil
+            return true
+        }
+        return false
     }
 
     func requestBlob(id: Int, blobId: String) {

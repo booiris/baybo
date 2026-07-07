@@ -10,6 +10,7 @@ import {
   RiCornerDownRightLine,
   RiCpuLine,
   RiLoader4Line,
+  RiPriceTag3Line,
   RiRefreshLine,
   RiSave3Line,
   RiSearchEyeLine,
@@ -92,6 +93,12 @@ const STEP_VISUALS: Record<StepKindTag, KindVisual> = {
     accent: 'text-info',
     bg: 'bg-info/10',
     label: 'Progress observer',
+  },
+  title_generation: {
+    icon: RiPriceTag3Line,
+    accent: 'text-ink-soft',
+    bg: 'bg-gray-100',
+    label: 'Title generation',
   },
   subagent: {
     icon: RiTeamLine,
@@ -248,6 +255,13 @@ function stepSummaryText(step: Step, spans: Span[]): string {
         return llm.kind.result.output_content.slice(0, 80);
       }
       return 'progress update';
+    }
+    case 'title_generation': {
+      const llm = spans.find((s) => s.kind.kind === 'llm_call');
+      if (llm && llm.kind.kind === 'llm_call' && llm.kind.result?.output_content) {
+        return llm.kind.result.output_content.slice(0, 80);
+      }
+      return 'conversation title';
     }
     case 'subagent':
       return `child ${step.kind.child_session_id}`;

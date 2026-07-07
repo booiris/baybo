@@ -40,6 +40,7 @@ pub struct MemorySessionStore {
     data: Mutex<HashMap<SessionId, Session>>,
     transcripts: Mutex<HashMap<SessionId, Vec<StoredMessageRow>>>,
     control_events: Mutex<HashMap<SessionId, Vec<ControlEvent>>>,
+    read_cursors: Mutex<HashMap<SessionId, i64>>,
 }
 
 impl MemorySessionStore {
@@ -65,15 +66,14 @@ impl SessionStore for MemorySessionStore {
     async fn save(&self, session: &Session) -> Result<()> {
         let mut data = self.data.lock();
         let mut to_store = session.clone();
-        // `hidden` / `pinned` / `archived` / `folder_id` are owned by their
-        // targeted setters; preserve the existing row's values so a stale
-        // in-memory save can't un-hide, un-pin, un-archive, or re-file it.
-        // Mirrors the libsql impl, whose upsert omits all four flat columns.
+        // Flat columns are owned by targeted setters; preserve them across
+        // stale full-blob saves.
         if let Some(existing) = data.get(&session.id) {
             to_store.hidden = existing.hidden;
             to_store.pinned = existing.pinned;
             to_store.archived = existing.archived;
             to_store.folder_id = existing.folder_id.clone();
+            to_store.title = existing.title.clone();
         }
         data.insert(session.id.clone(), to_store);
         Ok(())
@@ -127,6 +127,22 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
+    async fn set_read_cursor(&self, session_id: &SessionId, ordinal: i64) -> Result<bool> {
+        if !self.data.lock().contains_key(session_id) {
+            return Ok(false);
+        }
+        let mut cursors = self.read_cursors.lock();
+        let entry = cursors.entry(session_id.clone()).or_insert(ordinal);
+        if ordinal > *entry {
+            *entry = ordinal;
+        }
+        Ok(true)
+    }
+
+    async fn read_cursor(&self, session_id: &SessionId) -> Result<Option<i64>> {
+        Ok(self.read_cursors.lock().get(session_id).copied())
+    }
+
     async fn set_last_llm(
         &self,
         session_id: &SessionId,
@@ -136,6 +152,17 @@ impl SessionStore for MemorySessionStore {
         match data.get_mut(session_id) {
             Some(s) => {
                 s.state.last_llm = llm.cloned();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn set_title(&self, session_id: &SessionId, title: Option<&str>) -> Result<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) => {
+                s.title = title.map(|t| t.to_string());
                 Ok(true)
             }
             None => Ok(false),
@@ -380,7 +407,7 @@ impl SessionStore for MemorySessionStore {
         session_id: &SessionId,
         after_ordinal: i64,
         limit: usize,
-    ) -> Result<Vec<(i64, ChatMessage)>> {
+    ) -> Result<Vec<(i64, DateTime<Utc>, ChatMessage)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -397,10 +424,26 @@ impl SessionStore for MemorySessionStore {
                 active
                     .into_iter()
                     .take(limit)
-                    .map(|m| (m.ordinal as i64, m.message.clone()))
+                    .map(|m| (m.ordinal as i64, m.created_at, m.message.clone()))
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    async fn find_message_ordinal_by_platform_msg_id(
+        &self,
+        session_id: &SessionId,
+        platform_msg_id: &str,
+    ) -> Result<Option<i64>> {
+        if platform_msg_id.is_empty() {
+            return Ok(None);
+        }
+        Ok(self.transcripts.lock().get(session_id).and_then(|log| {
+            log.iter()
+                .filter(|m| m.message.platform_msg_id() == platform_msg_id)
+                .max_by_key(|m| m.ordinal)
+                .map(|m| m.ordinal as i64)
+        }))
     }
 
     async fn load_last_user_message(
@@ -628,6 +671,7 @@ mod tests {
             pinned: false,
             archived: false,
             folder_id: None,
+            title: None,
         }
     }
 

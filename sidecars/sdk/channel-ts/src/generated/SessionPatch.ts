@@ -56,4 +56,8 @@ archived?: boolean,
  * "the assignment changed to this value"; absent means "no change".
  * `Set { id }` files the session under `id`; `Uncategorized` clears it.
  */
-folder_id?: FolderChange, };
+folder_id?: FolderChange, 
+/**
+ * Generated conversation title; absent means no change.
+ */
+title?: string, };

@@ -443,7 +443,6 @@ mod tests {
                 &mut transport,
                 &Frame::Subscribe {
                     session_id: "sess-r".into(),
-                    since_ordinal: None,
                 },
             ))
             .await

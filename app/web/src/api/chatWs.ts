@@ -33,12 +33,13 @@ export interface WireMessage {
   attachments?: WireAttachment[];
   platform_msg_id?: string;
   role: WireRole;
-  /** Persisted `session_messages.ordinal`, set by the server so the
-   *  client can advance its per-session cursor. Present on catch-up
-   *  replays AND stamped onto the live final assistant reply at emit
-   *  time (see `OutgoingMessage::ordinal`), so it is NOT a reliable
-   *  live-vs-replay discriminator; a live user echo / streaming delta
-   *  leaves it `undefined`. */
+  /** Persisted `session_messages.ordinal`, stamped onto the live final
+   *  assistant reply at emit time so the client can advance its
+   *  per-session sync cursor past live emissions. The server's
+   *  pre-persist Echo of inbound (role=user) leaves it `undefined` by
+   *  design — durability for a send is confirmed by an ordinal-stamped
+   *  row from the REST sync/backfill surface, keyed by
+   *  `platform_msg_id`. */
   ordinal?: number;
 }
 
@@ -84,6 +85,8 @@ export interface SessionPatch {
    *  change. `{ set: { id } }` files under a folder; `'uncategorized'`
    *  clears it. */
   folder_id?: FolderChange;
+  /** Generated conversation title; absent means no change. */
+  title?: string;
 }
 
 /** Source of a `Frame::SessionActivity` event — mirror of Rust
@@ -105,12 +108,61 @@ export interface TaskView {
   depends_on?: string[];
 }
 
+/** One step inside a turn's in-flight work block, carried in the
+ *  `subscribe_state` bundle — mirror of Rust `WireWorkStep`. A `tool`
+ *  step carries the call's `call_id` (so a later live `tool_completed`
+ *  still pairs by id) plus `status`/`summary` once the call finished
+ *  within the buffered turn; `reasoning` / `prose` bodies live in
+ *  `text`. */
+export interface WireWorkStep {
+  kind: 'reasoning' | 'prose' | 'tool';
+  text?: string;
+  call_id?: string;
+  tool?: string;
+  label?: string;
+  status?: string;
+  summary?: string;
+}
+
+/** One pending tool-approval prompt in the `subscribe_state` bundle —
+ *  mirror of Rust `ApprovalCard`: field-compatible with the live
+ *  `approval_requested` frame minus `session_id` (the bundle carries it
+ *  once). */
+export interface WireApprovalCard {
+  call_id: string;
+  user_id?: string;
+  tool: string;
+  accesses: ResourceAccess[];
+  params_preview: string;
+  description?: string | null;
+}
+
 export type Frame =
   | { kind: 'register'; token: string; channel_type: string }
   | { kind: 'register_ack'; ok: boolean; reason: string | null }
-  | { kind: 'subscribe'; session_id: string; since_ordinal?: number }
+  | { kind: 'subscribe'; session_id: string }
   | { kind: 'unsubscribe'; session_id: string }
-  | { kind: 'reset'; reason: string }
+  /** Server → client, once, immediately after every Subscribe: the
+   *  atomic state-plane REPLACE bundle (turn activity + in-flight work
+   *  steps + pending approvals + task list). Empty arrays are OMITTED
+   *  on the wire (msgpack skip) — default them to `[]`. The turn/work
+   *  halves go stale by turn identity (`started_at`), never by
+   *  comparing a sync cursor against `as_of_ordinal`. */
+  | {
+      kind: 'subscribe_state';
+      session_id: string;
+      /** Session's newest persisted ordinal at snapshot time. */
+      as_of_ordinal?: number | null;
+      turn: { active: boolean; started_at?: string | null };
+      work_steps?: WireWorkStep[];
+      pending_approvals?: WireApprovalCard[];
+      tasks?: TaskView[];
+    }
+  /** Server → client gap nudge: the server dropped frames for this
+   *  connection. `session_id` set → run sync for that session;
+   *  absent → sync EVERY subscribed session and refetch the session
+   *  list + folders (that plane has no cursor). */
+  | { kind: 'gap'; session_id?: string | null }
   | ({ kind: 'message' } & WireMessage)
   /** Client → server. Several user messages for one session that the
    *  server runs as a single coalesced turn (the "send every queued
@@ -180,7 +232,6 @@ export type Frame =
     }
   | { kind: 'approval_resolved'; call_id: string; decision: string }
   | { kind: 'resolve_approval'; call_id: string; decision: string }
-  | { kind: 'pending_approvals_snapshot'; session_id: string; call_ids: string[] }
   | { kind: 'history_append'; session_id: string; entry: string }
   | { kind: 'history_snapshot'; session_id: string; entries: string[] }
   | { kind: 'start_bot'; bot_id: string; token: string }
@@ -230,32 +281,16 @@ export interface ChatWsOptions {
   onFrame: (frame: Frame) => void;
   /** Callback for connection state changes. */
   onStatus?: (status: ConnectionStatus) => void;
-  /** Fired when the server sends `Frame::Reset` — typically because
-   *  the client's `since_ordinal` cursor implied a catch-up gap
-   *  larger than the gateway's WS replay cap, or because the live
-   *  stream is otherwise in an indeterminate state (slow-consumer
-   *  drop, server-side reconfiguration, …). The caller is expected
-   *  to invalidate any cached transcript for affected sessions and
-   *  refetch via the REST `/v1/chat/sessions/:id` endpoint. The WS
-   *  client clears its own per-session cursors automatically before
-   *  firing this — the cursor itself is what triggered the Reset, so
-   *  reusing it on the post-reconnect Subscribe would just produce
-   *  another Reset. The socket is then torn down and the existing
-   *  reconnect path takes over. */
-  onReset?: (reason: string) => void;
 }
 
 export class ChatWs {
   private ws: WebSocket | null = null;
   private adminToken: string;
-  /** Per-session subscription state. The value is the highest
-   *  persisted `ordinal` the client has ever seen for that session;
-   *  `undefined` means "no persisted cursor yet" (fresh subscribe).
-   *  Sent back to the server as `Subscribe.since_ordinal` so a
-   *  reconnect after a network dip gets the messages that landed
-   *  during the gap streamed back as `Frame::Message` rather than
-   *  silently dropped. */
-  private subscriptions = new Map<string, number | undefined>();
+  /** Sessions this connection subscribes to. Replayed on every
+   *  (re)connect so the live stream resumes; transcript recovery is
+   *  NOT the subscription's job — the caller runs the REST sync loop
+   *  (`GET …/sync?since_ordinal`) on each reconnect edge. */
+  private subscriptions = new Set<string>();
   private retryAttempt = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
@@ -269,7 +304,7 @@ export class ChatWs {
   private lastFrameAt = 0;
   constructor(private readonly opts: ChatWsOptions) {
     this.adminToken = opts.adminToken;
-    for (const sid of opts.initialSessionIds ?? []) this.subscriptions.set(sid, undefined);
+    for (const sid of opts.initialSessionIds ?? []) this.subscriptions.add(sid);
     this.connect();
   }
 
@@ -277,47 +312,20 @@ export class ChatWs {
    *  on the next available WS open; persisted across reconnects. */
   subscribe(sessionId: string): void {
     if (this.subscriptions.has(sessionId)) return;
-    this.subscriptions.set(sessionId, undefined);
-    this.sendSubscribe(sessionId);
+    this.subscriptions.add(sessionId);
+    this.sendFrame({ kind: 'subscribe', session_id: sessionId });
   }
 
-  /** Tell the WS about a persisted `ordinal` the caller observed for
-   *  `sessionId` — typically from a REST history fetch or a catch-up
-   *  `Frame::Message`. Lifts the per-session cursor so the next
-   *  Subscribe after a reconnect tells the server what we've already
-   *  seen. Lower ordinals are ignored (cursor never goes backwards).
-   *
-   *  The sentinel `-1` is meaningful: callers seed it after the REST
-   *  history fetch settles (even when the transcript is empty) so a
-   *  brand-new session's reconnect carries `since_ordinal: -1`, which
-   *  tells the server to replay every persisted row. Without it the
-   *  next Subscribe would omit `since_ordinal` and miss messages
-   *  that landed during the disconnect.
-   *
-   *  No-op if the caller hasn't subscribed to this session — we
-   *  refuse to silently insert a phantom subscription entry that
-   *  would later cause `subscribe(sessionId)` to skip its `if
-   *  this.subscriptions.has(...)` early-return. */
-  recordOrdinal(sessionId: string, ordinal: number): void {
-    if (!this.subscriptions.has(sessionId)) return;
-    const current = this.subscriptions.get(sessionId);
-    if (current !== undefined && current >= ordinal) return;
-    this.subscriptions.set(sessionId, ordinal);
+  /** Sessions currently subscribed — the set the caller must sync on a
+   *  reconnect edge or a session-less `gap` nudge. */
+  subscribedSessions(): string[] {
+    return [...this.subscriptions];
   }
 
   /** Drop one subscription. */
   unsubscribe(sessionId: string): void {
     if (!this.subscriptions.delete(sessionId)) return;
     this.sendFrame({ kind: 'unsubscribe', session_id: sessionId });
-  }
-
-  private sendSubscribe(sessionId: string): void {
-    const cursor = this.subscriptions.get(sessionId);
-    this.sendFrame(
-      cursor === undefined
-        ? { kind: 'subscribe', session_id: sessionId }
-        : { kind: 'subscribe', session_id: sessionId, since_ordinal: cursor },
-    );
   }
 
   /** Send a user-authored Message frame for `sessionId`. The optional
@@ -506,11 +514,12 @@ export class ChatWs {
         }
         this.retryAttempt = 0;
         this.notifyStatus({ state: 'connected' });
-        // Replay every subscription. Cursor (if any) tells the server
-        // what we've already seen so it can stream catch-up frames for
-        // messages that landed while we were offline.
-        for (const sid of this.subscriptions.keys()) {
-          this.sendSubscribe(sid);
+        // Replay every subscription so the live stream resumes; each
+        // Subscribe is answered with a `subscribe_state` snapshot. The
+        // caller recovers missed transcript rows via the REST sync
+        // loop on the connected edge — the server replays nothing.
+        for (const sid of this.subscriptions) {
+          this.sendFrame({ kind: 'subscribe', session_id: sid });
         }
         this.startHeartbeat();
         return;
@@ -522,34 +531,6 @@ export class ChatWs {
       }
       case 'pong': {
         // Pure liveness signal — already bumped `lastFrameAt` above.
-        return;
-      }
-      case 'reset': {
-        // Server says our live stream is stale. The post-reconnect
-        // Subscribe must NOT re-send the cursor that triggered this
-        // Reset — that would just produce another Reset on a loop.
-        // Forget every per-session cursor; the consumer is expected
-        // to repopulate it via REST history fetch (see onReset
-        // contract in ChatWsOptions).
-        for (const sid of this.subscriptions.keys()) {
-          this.subscriptions.set(sid, undefined);
-        }
-        this.notifyStatus({
-          state: 'disconnected',
-          retryInMs: 0,
-          lastError: `reset: ${frame.reason}`,
-        });
-        // Notify the consumer before tearing the socket down so it
-        // can clear its transcript view in the same tick as the
-        // status flip, avoiding a visible flash of stale rows.
-        this.opts.onReset?.(frame.reason);
-        if (this.ws) {
-          try {
-            this.ws.close();
-          } catch {
-            /* ignore */
-          }
-        }
         return;
       }
       default:

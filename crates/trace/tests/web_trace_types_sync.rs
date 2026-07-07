@@ -47,6 +47,7 @@ fn web_trace_types_cover_every_step_kind() {
         StepKind::MemoryWrite,
         StepKind::SkillSelection,
         StepKind::ProgressObserver,
+        StepKind::TitleGeneration,
     ];
     for k in &kinds {
         // Exhaustiveness tripwire: a new `StepKind` fails to compile here until
@@ -59,7 +60,8 @@ fn web_trace_types_cover_every_step_kind() {
             | StepKind::MemoryRecall
             | StepKind::MemoryWrite
             | StepKind::SkillSelection
-            | StepKind::ProgressObserver => {}
+            | StepKind::ProgressObserver
+            | StepKind::TitleGeneration => {}
         }
         assert_kind_listed(&ts, "StepKind", k.tag());
     }

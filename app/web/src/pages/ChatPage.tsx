@@ -39,17 +39,36 @@ import {
   type ResourceAccess,
   type SessionPatch,
   type TaskView,
+  type WireApprovalCard,
   type WireAttachment,
+  type WireWorkStep,
 } from '../api/chatWs';
+import type { components } from '../api/schema';
 import { CronInbox } from '../components/CronInbox';
 import { TaskChecklist } from '../components/chat/TaskChecklist';
 import { AttachmentImage } from './chat/AttachmentImage';
 import { QueuePanel } from './chat/QueuePanel';
 import { SessionSidebar } from './chat/SessionSidebar';
+import {
+  MAX_AUTO_TRANSMISSIONS,
+  OutboxStore,
+  dueForBlindResend,
+  resendExhausted,
+  type OutboxEntry,
+} from './chat/outboxStore';
+import {
+  INITIAL_CURSOR,
+  advanceFromLive,
+  advanceFromSync,
+  type CursorState,
+} from './chat/syncCursor';
 import { useQueueStore, useSessionQueue, type QueuedItem } from './chat/queueStore';
 import { useFolderStore } from './chat/folderStore';
 import { useInputHistory } from './chat/inputHistory';
 import type { SessionSummary } from './chat/types';
+
+type ApiTranscriptItem = components['schemas']['ChatTranscriptItem'];
+type ApiAttachment = components['schemas']['ChatAttachment'];
 
 /** One progress entry inside a turn's work block. `reasoning`, `status`
  *  and `prose` carry `text`; `tool` carries the tool-call fields and is
@@ -86,19 +105,22 @@ export interface TranscriptRow {
    *  waiting for the server's UserEcho. Cleared when the echo arrives
    *  carrying the same `clientMsgId` in its `platform_msg_id`. */
   pending?: boolean;
-  /** Client-generated UUID for outbound user rows; doubles as both
-   *  the WS frame's `platform_msg_id` (idempotency key against the
-   *  gateway's InboundDedup) and the reconciliation key the inbound
-   *  echo matches against. Unset on rows that didn't originate from
-   *  this tab's composer. */
+  /** True once the outbox exhausted its automatic transmissions for
+   *  this row without an echo — renders the red retry affordance.
+   *  Cleared by a manual retry, a late echo, or durability confirm. */
+  failed?: boolean;
+  /** The row's `platform_msg_id` — the send idempotency key. Set on
+   *  optimistic sends from this tab (where it is the client-generated
+   *  UUID the echo reconciles against) AND on server rows that carried
+   *  one (sync / backfill redelivery), so redelivered rows dedup
+   *  against the optimistic row and adopt its server identity. */
   clientMsgId?: string;
   /** ISO timestamp the bubble renders next to the message. For
-   *  REST-loaded history rows this is the persisted
+   *  sync/backfill-loaded rows this is the persisted
    *  `session_messages.created_at`; for live WS frames (the wire
    *  shape doesn't carry it) it's the receive time, which is close
-   *  enough for genuine live emissions and drifts only on catch-up
-   *  replays — those rows are also reachable via the REST history
-   *  surface with the real value once the page refetches. */
+   *  enough for genuine live emissions and drifts only until the next
+   *  sync re-delivers the row with the real persisted value. */
   createdAt?: string;
   /** Set on the single "work" row that aggregates a turn's intermediate
    *  progress — reasoning, tool calls, status, and mid-turn prose — into
@@ -137,14 +159,6 @@ interface PendingApproval {
   description: string | null;
   paramsPreview: string;
   accesses: ResourceAccess[];
-  /** Wall-clock ms when this card was set. Used by the
-   *  `pending_approvals_snapshot` reconciliation to tell apart "stale
-   *  card from before reconnect" (older than the last reconnect, eligible
-   *  for drop if absent from the snapshot) from "live card that arrived
-   *  in the race window between subscribe and snapshot" (newer than the
-   *  last reconnect, must be preserved even if the snapshot's queue read
-   *  didn't observe it yet). */
-  receivedAt: number;
 }
 
 type ApprovalDecision = 'approve' | 'approve_always' | 'deny';
@@ -235,6 +249,27 @@ export const EMPTY_VIEW: SessionView = {
  *  casual session-switching stays free; bites only when the user has
  *  genuinely roamed across many conversations in one tab session. */
 const VIEW_CACHE_LIMIT = 20;
+
+/** Sync `limit` election (docs/sync-protocol.md, decided 2026-07-06): one
+ *  UI page for a baseline / cold open (`since` absent — a newest-page
+ *  REPLACE by definition), the server hard cap when merging into an
+ *  already-rendered thread (a rebase is a REPLACE under a reading user,
+ *  so incremental merge is preferred all the way to the cap). */
+const SYNC_BASELINE_LIMIT = 50;
+const SYNC_MERGE_LIMIT = 200;
+
+/** Safety-net pull cadence: every 3 minutes, the FOREGROUND visible
+ *  session only, skipped when any frame for it arrived within the last
+ *  interval. Backstop for a lost `gap` nudge / suspended-tab windows. */
+const SAFETY_TICK_MS = 180_000;
+
+/** Outbox retry sweep cadence — fine-grained enough to fire within a few
+ *  seconds of the 10s no-echo deadline without busy-spinning. */
+const OUTBOX_TICK_MS = 3_000;
+
+/** How many ended-turn `started_at` stamps to remember per session for
+ *  the SubscribeState turn-identity staleness test. */
+const ENDED_TURN_MEMORY = 8;
 
 /** A file the user picked in the composer. Uploaded to the blob store as
  *  soon as it's selected; `blobId` is filled once the upload lands, at which
@@ -335,6 +370,9 @@ export function ChatPage() {
   // the derived projection of the URL's sessionId.
   const [views, setViews] = useState<Record<string, SessionView>>({});
   const currentView = (sessionId && views[sessionId]) || EMPTY_VIEW;
+  const activeTitle = sessionId
+    ? sessions.find((s) => s.session_id === sessionId)?.title
+    : undefined;
   // A turn is "in flight" either optimistically (between send and the first
   // response) or per the server's authoritative TurnState. While busy the
   // composer's send button becomes a stop button and new sends are blocked.
@@ -345,22 +383,36 @@ export function ChatPage() {
   // WS on every nav. Kept in lockstep with the URL via the effect that
   // clears the current row's unread badge below.
   const currentSessionIdRef = useRef<string | undefined>(sessionId);
-  // Wall-clock ms of the most recent "WS reached connected state". Bumped
-  // each time the status flips to 'connected' (initial connect AND
-  // every reconnect). The `pending_approvals_snapshot` reconciliation
-  // consults this to decide whether a local card pre-dates the
-  // reconnect (eligible for drop if missing from the snapshot) or
-  // arrived after (must be kept — the server's queue read may have
-  // missed it in the race window between subscribe registration and
-  // snapshot send).
-  const lastConnectedAtRef = useRef<number>(0);
-  // Bumped when the server tells us our live stream is stale (Frame::
-  // Reset — typically because the catch-up gap exceeded the gateway's
-  // WS replay cap). The history-load effect picks the new value up
-  // through its dep array and re-fetches the active session via REST;
-  // background sessions get a cleared `historyLoaded` flag so they
-  // refetch lazily on next visit.
-  const [historyEpoch, setHistoryEpoch] = useState(0);
+
+  // ── Sync protocol v2 state ──────────────────────────────────────────
+  // Per-session sync cursor: advanced max-wins from sync `next_cursor`
+  // and from ordinal-stamped live Message frames (frozen against live
+  // advances while rebase-dirty). In-memory only — `null` on a fresh tab
+  // means the first sync is a newest-page baseline.
+  const cursorsRef = useRef<Map<string, CursorState>>(new Map());
+  // Epoch ms of the most recent inbound frame per session (ephemeral
+  // frames count). The safety tick skips a session whose stream was live
+  // within the interval.
+  const lastFrameAtRef = useRef<Map<string, number>>(new Map());
+  // `started_at` (epoch ms) of the turn currently known active per
+  // session, and the recent turn starts already seen ENDING — the
+  // SubscribeState turn-identity test discards the snapshot's turn/work
+  // halves only when their `started_at` is in the ended set.
+  const activeTurnStartRef = useRef<Map<string, number>>(new Map());
+  const endedTurnStartsRef = useRef<Map<string, number[]>>(new Map());
+  // One in-flight sync per session — open/gap/tick/reconnect triggers
+  // coalesce onto the same request instead of stacking.
+  const syncInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+  // False until the first 'connected' edge. The bootstrap already
+  // fetches the list/folders once, so only RE-connect edges refetch.
+  const hadConnectedRef = useRef(false);
+  // Persisted send outbox (localStorage-backed), stable for the tab.
+  const outboxRef = useRef<OutboxStore | null>(null);
+  if (outboxRef.current === null) outboxRef.current = new OutboxStore();
+  const outbox = outboxRef.current;
+  // Late-bound `markRead` so the sync loop (defined earlier) can advance the
+  // server read cursor without a declaration-order cycle.
+  const markReadRef = useRef<(sid: string) => void>(() => {});
 
   // Bumped whenever the WS reports activity for a session_id we don't
   // track in the main `sessions` list — cron creates fresh sessions
@@ -439,8 +491,8 @@ export function ChatPage() {
   // Auto-fire turn-dedup. A queued item fires at most once per turn. The token
   // is bumped only on a LIVE turn start (a user send into the session, or a
   // live `turn_state{active:true}`); a session with no token entry has had no
-  // live turn this page-load, so reload catch-up replays — which arrive before
-  // the turn_state snapshot — never spuriously drain the queue.
+  // live turn this page-load, so sync redeliveries applied on reload never
+  // spuriously drain the queue.
   const turnTokenRef = useRef<Map<string, number>>(new Map());
   const firedForTurnRef = useRef<Map<string, number>>(new Map());
   // Latest queue-frame handler (auto-fire + pause detection), kept current so
@@ -545,6 +597,13 @@ export function ChatPage() {
   const releaseSessionView = useCallback((sid: string) => {
     wsRef.current?.unsubscribe(sid);
     cancelPacer(sid);
+    // Cursor and turn trackers go with the transcript: a revisit
+    // re-baselines via sync(null) — keeping a cursor with no rendered
+    // rows would make the next sync a difference into an empty thread.
+    cursorsRef.current.delete(sid);
+    lastFrameAtRef.current.delete(sid);
+    activeTurnStartRef.current.delete(sid);
+    endedTurnStartsRef.current.delete(sid);
     setViews((prev) => {
       if (!(sid in prev)) return prev;
       const next = { ...prev };
@@ -553,6 +612,290 @@ export function ChatPage() {
     });
     recencyRef.current.delete(sid);
   }, [cancelPacer]);
+
+  // ── Sync loop + outbox plumbing (protocol v2) ───────────────────────
+
+  const recordEndedTurn = useCallback((sid: string, startedAtMs: number) => {
+    const ended = endedTurnStartsRef.current.get(sid) ?? [];
+    if (ended.includes(startedAtMs)) return;
+    endedTurnStartsRef.current.set(sid, [...ended, startedAtMs].slice(-ENDED_TURN_MEMORY));
+  }, []);
+
+  /** Patch the transcript row carrying `platformMsgId` (optimistic send
+   *  or adopted redelivery) — drives the pending/failed indicators. */
+  const markSendRow = useCallback(
+    (sid: string, platformMsgId: string, patch: Partial<TranscriptRow>) => {
+      setViews((prev) => {
+        const view = prev[sid];
+        if (!view) return prev;
+        const idx = view.transcript.findIndex((r) => r.clientMsgId === platformMsgId);
+        if (idx < 0) return prev;
+        const next = view.transcript.slice();
+        next[idx] = { ...next[idx], ...patch };
+        return { ...prev, [sid]: { ...view, transcript: next } };
+      });
+    },
+    [],
+  );
+
+  /** Re-transmit one outbox entry over the live WS (same
+   *  `platform_msg_id` — the gateway's InboundDedup absorbs a duplicate
+   *  inside its recency window). Counts toward the automatic cap. */
+  const resendOutboxEntry = useCallback(
+    (sid: string, entry: OutboxEntry): boolean => {
+      const ws = wsRef.current;
+      if (!ws || statusRef.current.state !== 'connected') return false;
+      ws.sendMessage({
+        sessionId: sid,
+        userId: 'web-operator',
+        content: entry.text,
+        clientMsgId: entry.platformMsgId,
+        attachments: entry.attachments,
+      });
+      outbox.recordTransmission(sid, entry.platformMsgId);
+      return true;
+    },
+    [outbox],
+  );
+
+  const failOutboxEntry = useCallback(
+    (sid: string, platformMsgId: string) => {
+      outbox.markFailed(sid, platformMsgId);
+      markSendRow(sid, platformMsgId, { pending: false, failed: true });
+    },
+    [outbox, markSendRow],
+  );
+
+  /** Resolve a rebase-floored (`unknown`) entry via the per-key point
+   *  lookup — durability confirmed releases it; provable absence resumes
+   *  the retry machine. Neither consumes a transmission. */
+  const resolveUnknownEntry = useCallback(
+    async (sid: string, platformMsgId: string) => {
+      const { data, error } = await client.GET('/v1/chat/sessions/{session_id}/messages', {
+        params: { path: { session_id: sid }, query: { platform_msg_id: platformMsgId } },
+      });
+      if (error || !data) return; // stays `unknown`; the next reconnect edge retries the probe
+      if (data.found) {
+        if (outbox.confirmDurable(sid, platformMsgId)) {
+          markSendRow(sid, platformMsgId, { pending: false, failed: false });
+        }
+      } else {
+        outbox.resumeSending(sid, platformMsgId);
+      }
+    },
+    [client, outbox, markSendRow],
+  );
+
+  /** Ordinal-stamped rows carrying a `platform_msg_id` (sync / backfill
+   *  pages) are durability confirmations — release their outbox entries. */
+  const confirmDurableFromItems = useCallback(
+    (sid: string, items: ApiTranscriptItem[]) => {
+      for (const item of items) {
+        if (item.kind !== 'message' || !item.platform_msg_id || item.ordinal == null) continue;
+        if (outbox.confirmDurable(sid, item.platform_msg_id)) {
+          markSendRow(sid, item.platform_msg_id, { pending: false, failed: false });
+        }
+      }
+    },
+    [outbox, markSendRow],
+  );
+
+  /** The one forward-recovery pull (docs/sync-protocol.md "The one client
+   *  algorithm"): session open, reconnect, gap nudge and the safety tick
+   *  all land here. `since = cursor` (absent on a fresh view → baseline
+   *  REPLACE); a rebased response also REPLACEs and dirties the cursor. */
+  const runSyncSession = useCallback(
+    (sid: string): Promise<void> => {
+      const inFlight = syncInFlightRef.current.get(sid);
+      if (inFlight) return inFlight;
+      const failBaseline = (reason: string) => {
+        setViews((prev) => {
+          const view = prev[sid] ?? EMPTY_VIEW;
+          if (view.historyLoaded) return prev;
+          return {
+            ...prev,
+            [sid]: {
+              ...view,
+              transcript: [
+                {
+                  key: `sync-err-${sid}-${Date.now()}`,
+                  role: 'system',
+                  text: '',
+                  notice: {
+                    level: 'warn',
+                    text: `Couldn't load conversation history: ${reason}. New messages will still arrive live.`,
+                  },
+                },
+              ],
+              historyLoaded: true,
+              historyLoading: false,
+            },
+          };
+        });
+      };
+      const task = (async () => {
+        const before = cursorsRef.current.get(sid) ?? INITIAL_CURSOR;
+        const baseline = before.cursor === null;
+        try {
+          const { data, error } = await client.GET('/v1/chat/sessions/{session_id}/sync', {
+            params: {
+              path: { session_id: sid },
+              query: {
+                ...(before.cursor === null ? {} : { since_ordinal: before.cursor }),
+                limit: baseline ? SYNC_BASELINE_LIMIT : SYNC_MERGE_LIMIT,
+              },
+            },
+          });
+          if (error || !data) {
+            console.warn('chat sync failed', sid, error);
+            if (baseline) failBaseline(formatHttpError(error));
+            return;
+          }
+          const replace = data.rebased || baseline;
+          const pageRows = data.rows.map((item) => transcriptItemToRow(sid, item));
+          confirmDurableFromItems(sid, data.rows);
+          // A work row is a turn-END signal for the SubscribeState
+          // turn-identity test ONLY when its turn is demonstrably complete —
+          // i.e. a message row follows it in the (ascending) page. The
+          // in-flight turn's trailing partial work row has no later message,
+          // so recording it as ended would wrongly discard a live
+          // SubscribeState for the SAME turn (its work block still active).
+          for (let i = 0; i < data.rows.length; i++) {
+            const item = data.rows[i];
+            if (item.kind !== 'work') continue;
+            const followedByMessage = data.rows.slice(i + 1).some((r) => r.kind === 'message');
+            if (!followedByMessage) continue;
+            const ms = parseEpochMs(item.work_started_at);
+            if (ms !== null) recordEndedTurn(sid, ms);
+          }
+          const unconfirmed = outbox.unconfirmedIds(sid);
+          setViews((prev) => {
+            const view = prev[sid] ?? EMPTY_VIEW;
+            const transcript = replace
+              ? applySyncReplace(view.transcript, pageRows, unconfirmed, view.turn)
+              : applySyncMerge(view.transcript, pageRows);
+            return {
+              ...prev,
+              [sid]: {
+                ...view,
+                transcript,
+                historyLoaded: true,
+                historyLoading: false,
+                ...(replace
+                  ? { oldestOrdinal: data.oldest_ordinal ?? null, hasMore: data.has_more_older }
+                  : {}),
+              },
+            };
+          });
+          // Advance against the CURRENT cursor (live final-reply
+          // ordinals may have raced this response), max-wins; a rebased
+          // page dirties it until one non-rebased sync completes.
+          cursorsRef.current.set(
+            sid,
+            advanceFromSync(
+              cursorsRef.current.get(sid) ?? INITIAL_CURSOR,
+              data.next_cursor ?? null,
+              data.rebased,
+            ),
+          );
+          // Viewing this session and just synced it → it's read up to here.
+          if (sid === currentSessionIdRef.current) markReadRef.current(sid);
+          if (data.rebased) {
+            // The rebase floor makes "absent from the page" unknowable —
+            // park unconfirmed entries `unknown` and resolve each via the
+            // point lookup instead of blind-resending (outbox rule 4).
+            for (const entry of outbox.entries(sid)) {
+              if (entry.state === 'failed') continue;
+              outbox.markUnknown(sid, entry.platformMsgId);
+              void resolveUnknownEntry(sid, entry.platformMsgId);
+            }
+          }
+        } catch (e) {
+          console.warn('chat sync threw', sid, e);
+          if (baseline) failBaseline(String(e));
+        }
+      })().finally(() => {
+        syncInFlightRef.current.delete(sid);
+      });
+      syncInFlightRef.current.set(sid, task);
+      return task;
+    },
+    [client, outbox, confirmDurableFromItems, recordEndedTurn, resolveUnknownEntry],
+  );
+
+  /** The session-list/folder plane has no cursor — pull is its only loss
+   *  recovery. Runs on every RE-connect edge and on `gap(None)`. `unread` is
+   *  now server-computed (`unread_count`), so the pull reconciles the badge to
+   *  the truth — a cold restart / a missed live ping self-heals here. */
+  const refetchSessionsAndFolders = useCallback(async () => {
+    const [{ data: list, error: listError }, { data: folderList, error: folderError }] =
+      await Promise.all([client.GET('/v1/chat/sessions'), client.GET('/v1/chat/folders')]);
+    if (listError) console.warn('chat refetch: list sessions failed', listError);
+    if (folderError) console.warn('chat refetch: list folders failed', folderError);
+    if (folderList) {
+      folderStore.replaceFolders(
+        (folderList.items ?? []).map((f) => ({
+          id: f.id,
+          parent_id: f.parent_id ?? undefined,
+          name: f.name,
+          position: f.position,
+          created_at: f.created_at,
+        })),
+      );
+    }
+    if (list) {
+      setSessions(() => {
+        return (list.items ?? []).map((s) => ({
+          session_id: s.session_id,
+          created_at: s.created_at,
+          last_active: s.last_active,
+          unread: s.unread_count ?? 0,
+          pinned: s.pinned,
+          last_user_text: s.last_user_text ?? undefined,
+          folder_id: s.folder_id ?? undefined,
+          title: s.title ?? undefined,
+        }));
+      });
+    }
+  }, [client, folderStore]);
+
+  /** Advance the server read cursor to the session's coverage watermark and
+   *  optimistically clear the local badge. Fire-and-forget (the cursor is
+   *  max-wins server-side); skipped when there's no cursor yet (nothing to
+   *  mark). Called when the user is viewing the session — on open, after a
+   *  sync completes for it, and on a live reply while it's foreground. */
+  const markRead = useCallback(
+    (sid: string) => {
+      const cursor = cursorsRef.current.get(sid)?.cursor;
+      if (cursor === null || cursor === undefined) return;
+      void client.PUT('/v1/chat/sessions/{session_id}/read', {
+        params: { path: { session_id: sid } },
+        body: { ordinal: cursor },
+      });
+      setSessions((prev) => {
+        const idx = prev.findIndex((s) => s.session_id === sid);
+        if (idx === -1 || prev[idx].unread === 0) return prev;
+        const next = prev.slice();
+        next[idx] = { ...prev[idx], unread: 0 };
+        return next;
+      });
+    },
+    [client],
+  );
+  markReadRef.current = markRead;
+
+  /** Manual retry from the failed-row affordance: same
+   *  `platform_msg_id`, automatic-transmission budget reset. */
+  const retryFailedSend = useCallback(
+    (sid: string, platformMsgId: string) => {
+      if (statusRef.current.state !== 'connected') return;
+      const entry = outbox.resetForManualRetry(sid, platformMsgId);
+      if (!entry) return;
+      markSendRow(sid, platformMsgId, { pending: true, failed: false });
+      resendOutboxEntry(sid, entry);
+    },
+    [outbox, markSendRow, resendOutboxEntry],
+  );
 
   // ── Bootstrap: load session list + slash manifest ──────────────────
   // Runs once on mount. Anchor selection priority:
@@ -610,10 +953,11 @@ export function ChatPage() {
         session_id: s.session_id,
         created_at: s.created_at,
         last_active: s.last_active,
-        unread: 0,
+        unread: s.unread_count ?? 0,
         pinned: s.pinned,
         last_user_text: s.last_user_text ?? undefined,
         folder_id: s.folder_id ?? undefined,
+        title: s.title ?? undefined,
       }));
       setSessions(existing);
       setSlashCommands(manifest?.items ?? []);
@@ -687,6 +1031,45 @@ export function ChatPage() {
         setStatus(s);
       },
       onFrame: (frame) => {
+        // ANY frame for a session proves its stream is live — ephemeral
+        // frames included — so the safety tick can skip its pull.
+        if ('session_id' in frame && typeof frame.session_id === 'string') {
+          lastFrameAtRef.current.set(frame.session_id, Date.now());
+        }
+        if (frame.kind === 'subscribe_state') {
+          // The atomic state-plane bundle, once per Subscribe. Tasks and
+          // approvals are latest-wins REPLACEs; the turn/work halves are
+          // discarded only by turn identity — this client already saw a
+          // turn-end signal for the SAME turn (matched by started_at),
+          // never by comparing the cursor against as_of_ordinal.
+          const sid = frame.session_id;
+          const startedAtMs = parseEpochMs(frame.turn.started_at);
+          const turnEnded =
+            startedAtMs !== null &&
+            (endedTurnStartsRef.current.get(sid) ?? []).includes(startedAtMs);
+          if (frame.turn.active && startedAtMs !== null && !turnEnded) {
+            activeTurnStartRef.current.set(sid, startedAtMs);
+          }
+          setViews((prev) => ({
+            ...prev,
+            [sid]: applySubscribeState(prev[sid] ?? EMPTY_VIEW, frame, turnEnded),
+          }));
+          return;
+        }
+        if (frame.kind === 'gap') {
+          // Server-declared loss. Scoped → sync that session; session-less
+          // → sync every subscribed session AND refetch the list/folder
+          // plane (no cursor there; pull is its only recovery).
+          if (frame.session_id) {
+            void runSyncSession(frame.session_id);
+          } else {
+            for (const sid of wsRef.current?.subscribedSessions() ?? []) {
+              void runSyncSession(sid);
+            }
+            void refetchSessionsAndFolders();
+          }
+          return;
+        }
         if (frame.kind === 'folders_changed') {
           // Full-snapshot convergence — replace the local folder tree
           // wholesale (folders are few, no patch-merge needed).
@@ -739,12 +1122,17 @@ export function ChatPage() {
           }
           return;
         }
-        // Catch-up replays carry an explicit ordinal — advance the WS
-        // cursor so a future reconnect doesn't ask for these rows
-        // again. Live frames have ordinal === undefined and don't
-        // shift the cursor.
+        // The live final assistant reply carries its persisted ordinal —
+        // advance the sync cursor (max-wins; frozen while rebase-dirty,
+        // when only a sync next_cursor may move it).
         if (frame.kind === 'message' && frame.ordinal !== undefined) {
-          wsRef.current?.recordOrdinal(frame.session_id, frame.ordinal);
+          const cur = cursorsRef.current.get(frame.session_id) ?? INITIAL_CURSOR;
+          cursorsRef.current.set(frame.session_id, advanceFromLive(cur, frame.ordinal));
+          // A reply while the user is looking at the session is already read —
+          // advance the server cursor so the badge stays 0 across a refetch.
+          if (frame.session_id === currentSessionIdRef.current) {
+            markReadRef.current(frame.session_id);
+          }
         }
         // Protect actively-streamed buckets from LRU eviction. Only
         // frames that actually mutate `views` bump recency — sidebar-
@@ -773,6 +1161,12 @@ export function ChatPage() {
           stoppedSessionsRef.current.delete(frame.session_id);
           // New turn — not in the final-reply phase yet.
           streamingAnswerRef.current.delete(frame.session_id);
+          // Remember the turn's identity for the SubscribeState
+          // staleness test (matched by started_at on re-subscribe).
+          const startedAtMs = parseEpochMs(frame.started_at);
+          if (startedAtMs !== null) {
+            activeTurnStartRef.current.set(frame.session_id, startedAtMs);
+          }
           // A live turn started — arm auto-fire for this session's next
           // completion (re-arm drops any prior fired mark).
           turnTokenRef.current.set(
@@ -783,6 +1177,18 @@ export function ChatPage() {
         }
         if (frame.kind === 'turn_state' && !frame.active) {
           streamingAnswerRef.current.delete(frame.session_id);
+          // Turn-end signal: record the ended turn's identity, and — on a
+          // rebase-dirty cursor — run the follow-up sync that closes the
+          // mid-turn interjection window (only a sync next_cursor may
+          // advance a dirty cursor).
+          const started = activeTurnStartRef.current.get(frame.session_id);
+          if (started !== undefined) {
+            recordEndedTurn(frame.session_id, started);
+            activeTurnStartRef.current.delete(frame.session_id);
+          }
+          if (cursorsRef.current.get(frame.session_id)?.rebaseDirty) {
+            void runSyncSession(frame.session_id);
+          }
         }
         // Route delta frames through the pacer instead of straight to
         // setViews — the pacer's rAF loop owns the bubble's text while
@@ -839,39 +1245,35 @@ export function ChatPage() {
           cancelPacer(frame.session_id);
           // Turn's answer is settled — leave the final-reply phase.
           streamingAnswerRef.current.delete(frame.session_id);
+          // The ordinal-stamped final reply is also a turn-end signal:
+          // record the turn identity, and heal a rebase-dirty cursor
+          // with the follow-up sync.
+          if (frame.ordinal !== undefined) {
+            const started = activeTurnStartRef.current.get(frame.session_id);
+            if (started !== undefined) recordEndedTurn(frame.session_id, started);
+            if (cursorsRef.current.get(frame.session_id)?.rebaseDirty) {
+              void runSyncSession(frame.session_id);
+            }
+          }
         }
-        routeInboundFrame(frame, setViews, setSessions, lastConnectedAtRef.current);
+        // The ordinal-less user echo is the transport ack for a send —
+        // flip its outbox entry `sending → sent` (in-connection retries
+        // stop; the entry is retained until an ordinal-stamped row with
+        // the same platform_msg_id confirms durability).
+        if (
+          frame.kind === 'message' &&
+          frame.role === 'user' &&
+          frame.ordinal === undefined &&
+          frame.platform_msg_id
+        ) {
+          if (outbox.markEchoed(frame.session_id, frame.platform_msg_id)) {
+            markSendRow(frame.session_id, frame.platform_msg_id, { failed: false });
+          }
+        }
+        routeInboundFrame(frame, setViews, setSessions);
         // Interjection queue: auto-fire the next parked item on a live normal
         // completion, and pause the pipeline on a /stop-cancel or error notice.
         queueFrameRef.current?.(frame);
-      },
-      onReset: (reason) => {
-        // Stream is stale (per Frame::Reset contract — see chatWs.ts
-        // onReset docs). The chatWs has already cleared its cursors;
-        // we clear each view's history flags so the load effect re-
-        // fetches via REST. Transcript / oldestOrdinal are wiped too:
-        // some rows in the slow-consumer gap may already be in the
-        // current transcript (echoed live before the disconnect) and
-        // we can't tell which, so the safe thing is to refill from
-        // the authoritative REST source. `pendingApproval` is left
-        // alone — it's a separate transport-independent state that
-        // the server's ApprovalResolved fan-out will clear when /
-        // if the call resolves.
-        console.warn('chat WS reset; refetching history via REST', reason);
-        // The REST refill will rebuild the streaming bubble's final
-        // text — any pacer state we hold is stale relative to that
-        // and must not flush after the wipe.
-        for (const sid of Object.keys(streamPacersRef.current)) {
-          cancelPacer(sid);
-        }
-        setViews((prev) => {
-          const next: Record<string, SessionView> = {};
-          for (const [sid, view] of Object.entries(prev)) {
-            next[sid] = { ...EMPTY_VIEW, pendingApproval: view.pendingApproval };
-          }
-          return next;
-        });
-        setHistoryEpoch((e) => e + 1);
       },
     });
     wsRef.current = ws;
@@ -887,111 +1289,57 @@ export function ChatPage() {
     cancelPacer,
     flushPacerKeepStreaming,
     folderStore,
+    outbox,
+    markSendRow,
+    recordEndedTurn,
+    runSyncSession,
+    refetchSessionsAndFolders,
   ]);
 
-  // ── Active session: subscribe + lazy-load history ───────────────────
+  // ── Active session: subscribe + sync ────────────────────────────────
   // Subscribe stays sticky once added: when the user switches away,
   // we keep the subscription so background sessions still accumulate
   // Delta/Message frames into their view bucket. The LRU eviction
   // effect above caps the per-tab bucket count at `VIEW_CACHE_LIMIT`
   // and drops the WS subscription alongside the freed transcript.
+  //
+  // The transcript itself comes from the one sync loop: a cold open runs
+  // a baseline sync (`since` absent → newest-page REPLACE), a revisit of
+  // a loaded view re-syncs from its cursor (merge). The GET-session call
+  // is kept only to read the session meta (`last_llm`) for the model
+  // picker — its transcript slice (limit 1) is ignored. Turn/work state
+  // arrives via the `subscribe_state` bundle, never from history.
   useEffect(() => {
     if (!sessionId || !wsRef.current) return;
     wsRef.current.subscribe(sessionId);
     const existing = views[sessionId];
-    if (existing && existing.historyLoaded) return;
     if (existing && existing.historyLoading) return;
-    let cancelled = false;
+    if (existing && existing.historyLoaded) {
+      void runSyncSession(sessionId);
+      return;
+    }
     setViews((prev) => mergeView(prev, sessionId, { historyLoading: true }));
-    void (async () => {
-      const failNotice = (reason: string): TranscriptRow => ({
-        key: `hist-err-${sessionId}-${Date.now()}`,
-        role: 'system',
-        text: '',
-        notice: {
-          level: 'warn',
-          text: `Couldn't load conversation history: ${reason}. New messages will still arrive live.`,
-        },
-      });
-      try {
-        const { data, error } = await client.GET('/v1/chat/sessions/{session_id}', {
-          params: { path: { session_id: sessionId } },
-        });
-        if (cancelled) return;
-        if (error) {
-          console.warn('chat history load failed', sessionId, error);
-          setViews((prev) =>
-            mergeView(prev, sessionId, {
-              transcript: [failNotice(formatHttpError(error))],
-              historyLoaded: true,
-              historyLoading: false,
-            }),
-          );
-          return;
+    void client
+      .GET('/v1/chat/sessions/{session_id}', {
+        params: { path: { session_id: sessionId }, query: { limit: 1 } },
+      })
+      .then(({ data }) => {
+        if (!data) return;
+        setViews((prev) => mergeView(prev, sessionId, { model: data.last_llm ?? null }));
+        // Seed the conversation title from the detail response so the header's
+        // `activeTitle` and the sidebar row converge even when the list fetch
+        // predated the title (or this tab was disconnected and missed the WS
+        // patch). Merge it like a live `SessionUpdated` patch — a title is only
+        // ever set, never cleared, so an absent `title` means "no change".
+        if (data.title) {
+          const title = data.title;
+          setSessions((prev) => applySessionPatch(prev, sessionId, { title }));
         }
-        if (data) {
-          const rows = data.transcript.map(historyRowToTranscript.bind(null, sessionId));
-          // Use the server's real message-ordinal bounds, NOT the transcript
-          // items: control-event items carry synthetic negative ordinals, so
-          // inferring from `transcript[0]` / `transcript[last]` would seed a
-          // bogus cursor (a trailing `/stop` / `/compact` notice is the common
-          // case) — forcing a full replay and duplicating rows.
-          const oldestOrdinal = data.oldest_ordinal ?? null;
-          // Seed the WS cursor so a reconnect after a network dip asks
-          // the server for anything newer rather than dropping it on
-          // the floor. The `-1` sentinel handles a brand-new session
-          // whose transcript is empty: without it the cursor would
-          // stay `undefined`, the next Subscribe would omit
-          // `since_ordinal`, and the server would skip replay
-          // entirely — any messages persisted during the disconnect
-          // would be lost. `recordOrdinal` ignores backwards moves so
-          // the non-empty branch's higher ordinal still wins.
-          wsRef.current?.recordOrdinal(sessionId, -1);
-          if (data.newest_ordinal != null) {
-            wsRef.current?.recordOrdinal(sessionId, data.newest_ordinal);
-          }
-          setViews((prev) =>
-            // The reload replaces the transcript wholesale. Do NOT fold the
-            // cached `turn` back in here: the freshly-fetched REST history
-            // is the server's authoritative state (a finished/cancelled
-            // turn comes back collapsed), and the WS (re)subscribe that
-            // accompanies a reload always delivers a fresh `TurnState`
-            // snapshot which re-opens a genuinely in-flight turn's block
-            // (matched by start). Folding a possibly-stale cached `turn`
-            // over the reload could resurrect a finished turn as a phantom
-            // "Working" box, so the authoritative snapshot drives it.
-            mergeView(prev, sessionId, {
-              transcript: rows,
-              historyLoaded: true,
-              historyLoading: false,
-              oldestOrdinal,
-              hasMore: data.has_more,
-              model: data.last_llm ?? null,
-            }),
-          );
-        } else {
-          setViews((prev) =>
-            mergeView(prev, sessionId, { historyLoaded: true, historyLoading: false }),
-          );
-        }
-      } catch (e) {
-        if (!cancelled) {
-          console.warn('chat history load threw', sessionId, e);
-          setViews((prev) =>
-            mergeView(prev, sessionId, {
-              transcript: [failNotice(String(e))],
-              historyLoaded: true,
-              historyLoading: false,
-            }),
-          );
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+      })
+      .catch((e) => console.warn('chat session meta load failed', sessionId, e));
+    void runSyncSession(sessionId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, adminToken, historyEpoch]); // views intentionally excluded — we react to nav, WS readiness, and Reset-driven refetch via the epoch
+  }, [sessionId, adminToken, runSyncSession]); // views intentionally excluded — we react to nav; the sync loop self-guards
 
   // Auto-scroll on transcript append — but only if the user is already
   // parked at the bottom. Otherwise raise the "new messages" pill so
@@ -1042,6 +1390,10 @@ export function ChatPage() {
         next[idx] = { ...prev[idx], unread: 0 };
         return next;
       });
+      // Advance the server read cursor too (best-effort — no-op until the
+      // session's first sync sets a cursor, after which runSyncSession marks
+      // it read). Otherwise the badge would reappear on the next list refetch.
+      markReadRef.current(sessionId);
     }
   }, [sessionId]);
 
@@ -1064,16 +1416,89 @@ export function ChatPage() {
     for (const sid of toEvict) releaseSessionView(sid);
   }, [views, releaseSessionView]);
 
-  // Bump the reconnect cutoff each time we land on 'connected'. The
-  // snapshot reconciliation uses this as the "anything older than this
-  // is fair game to drop if the server says it's gone" boundary. Initial
-  // connect also bumps; no local cards exist that early so it's a no-op
-  // in practice.
+  // ── Connected edge: sync + outbox reconciliation ────────────────────
+  // On every RE-connect: sync each subscribed session (the reconciliation
+  // gate — the server replays nothing), refetch the session list +
+  // folders (that plane has no cursor), then resend outbox entries still
+  // lacking durability confirmation. The FIRST connected edge skips the
+  // refetch (the bootstrap just fetched both) and the subscribed sweep
+  // (the session-open effect already syncs the active session), but
+  // still runs the outbox pass so sends persisted by a previous
+  // page-load recover.
   useEffect(() => {
-    if (status.state === 'connected') {
-      lastConnectedAtRef.current = Date.now();
-    }
-  }, [status.state]);
+    if (status.state !== 'connected') return;
+    const isReconnect = hadConnectedRef.current;
+    hadConnectedRef.current = true;
+    void (async () => {
+      if (isReconnect) void refetchSessionsAndFolders();
+      const sids = new Set<string>([
+        ...(isReconnect ? (wsRef.current?.subscribedSessions() ?? []) : []),
+        ...outbox.sessionIds(),
+      ]);
+      for (const sid of sids) {
+        // Sync first: a send whose ack was lost but that DID persist is
+        // confirmed (and released) here instead of being re-sent.
+        await runSyncSession(sid);
+        for (const entry of outbox.entries(sid)) {
+          if (entry.state === 'unknown') await resolveUnknownEntry(sid, entry.platformMsgId);
+        }
+        for (const entry of outbox.entries(sid)) {
+          if (entry.state !== 'sending' && entry.state !== 'sent') continue;
+          if (entry.transmissions >= MAX_AUTO_TRANSMISSIONS) {
+            failOutboxEntry(sid, entry.platformMsgId);
+            continue;
+          }
+          resendOutboxEntry(sid, entry);
+        }
+      }
+    })();
+  }, [
+    status.state,
+    outbox,
+    refetchSessionsAndFolders,
+    runSyncSession,
+    resolveUnknownEntry,
+    failOutboxEntry,
+    resendOutboxEntry,
+  ]);
+
+  // ── Safety-net pull ─────────────────────────────────────────────────
+  // Every 3 minutes, sync the FOREGROUND visible session — skipped when
+  // any frame for it (ephemeral included) arrived within the interval,
+  // and while the tab is hidden. Backstops a lost `gap` nudge.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const sid = currentSessionIdRef.current;
+      if (!sid) return;
+      if (document.visibilityState !== 'visible') return;
+      const last = lastFrameAtRef.current.get(sid) ?? 0;
+      if (Date.now() - last < SAFETY_TICK_MS) return;
+      void runSyncSession(sid);
+    }, SAFETY_TICK_MS);
+    return () => window.clearInterval(id);
+  }, [runSyncSession]);
+
+  // ── Outbox retry sweep ──────────────────────────────────────────────
+  // While connected: a `sending` entry with no echo for 10s gets ONE
+  // blind in-connection resend (same platform_msg_id — the gateway's
+  // dedup absorbs a duplicate); past the 3-transmission cap it flips to
+  // `failed` and surfaces the manual retry affordance.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (statusRef.current.state !== 'connected') return;
+      const now = Date.now();
+      for (const sid of outbox.sessionIds()) {
+        for (const entry of outbox.entries(sid)) {
+          if (dueForBlindResend(entry, now)) {
+            resendOutboxEntry(sid, entry);
+          } else if (resendExhausted(entry, now)) {
+            failOutboxEntry(sid, entry.platformMsgId);
+          }
+        }
+      }
+    }, OUTBOX_TICK_MS);
+    return () => window.clearInterval(id);
+  }, [outbox, resendOutboxEntry, failOutboxEntry]);
 
   // Scroll-up pagination: when the user is within `topThresholdPx`
   // of the top *and* the current view still has older rows on the
@@ -1103,9 +1528,12 @@ export function ChatPage() {
         setViews((prev) => mergeView(prev, sessionId, { olderLoading: false }));
         return;
       }
-      const newRows = data.transcript.map(historyRowToTranscript.bind(null, sessionId));
+      const newRows = data.transcript.map((item) => transcriptItemToRow(sessionId, item));
+      // A backfill page is a durability surface too — release any outbox
+      // entry whose ordinal-stamped row shows up here.
+      confirmDurableFromItems(sessionId, data.transcript);
       // Real message-ordinal bound from the server (not the transcript items,
-      // which may include synthetic-ordinal control events).
+      // which may include control events without one).
       const newOldest = data.oldest_ordinal ?? view.oldestOrdinal;
       setViews((prev) => {
         const cur = prev[sessionId] ?? EMPTY_VIEW;
@@ -1132,7 +1560,7 @@ export function ChatPage() {
       console.warn('chat history older-page load threw', sessionId, e);
       setViews((prev) => mergeView(prev, sessionId, { olderLoading: false }));
     }
-  }, [client, sessionId, views]);
+  }, [client, sessionId, views, confirmDurableFromItems]);
 
   const handleTranscriptScroll = useCallback(() => {
     const scroller = transcriptScrollRef.current;
@@ -1248,6 +1676,17 @@ export function ChatPage() {
         pinnedToBottomRef.current = true;
         setHasNewBelow(false);
       }
+      // Enroll the send in the persisted outbox before it hits the wire.
+      // Slash commands stay one-shot: their durable trace is a control
+      // event that never carries platform_msg_id, so a durability
+      // confirmation can't exist and the entry would retry forever.
+      if (!isSlashText(trimmed)) {
+        outbox.beginSend(targetSessionId, {
+          platformMsgId: clientMsgId,
+          text: trimmed,
+          attachments: wireAttachments,
+        });
+      }
       wsRef.current.sendMessage({
         sessionId: targetSessionId,
         userId: 'web-operator',
@@ -1257,7 +1696,7 @@ export function ChatPage() {
       });
       return true;
     },
-    [],
+    [outbox],
   );
 
   // Fire several queued messages into a session as ONE batch frame — the
@@ -1318,6 +1757,16 @@ export function ChatPage() {
         pinnedToBottomRef.current = true;
         setHasNewBelow(false);
       }
+      // Same outbox enrollment as sendToSession (slash items can't reach
+      // here — the drain sends those individually — but guard anyway).
+      for (const m of prepared) {
+        if (isSlashText(m.text)) continue;
+        outbox.beginSend(targetSessionId, {
+          platformMsgId: m.clientMsgId,
+          text: m.text,
+          attachments: m.attachments,
+        });
+      }
       wsRef.current.sendMessages(
         targetSessionId,
         prepared.map((m) => ({
@@ -1328,7 +1777,7 @@ export function ChatPage() {
       );
       return true;
     },
-    [],
+    [outbox],
   );
 
   const sendText = useCallback(
@@ -1486,7 +1935,7 @@ export function ChatPage() {
         if (stoppedSessionsRef.current.has(sid)) return;
         const token = turnTokenRef.current.get(sid);
         // Fire only when a live turn armed this session (token set) — skips
-        // reload catch-up replays — and not already fired for this turn.
+        // sync redeliveries applied on reload — and not already fired this turn.
         if (token !== undefined && firedForTurnRef.current.get(sid) !== token) {
           const snap = store.queue(sid);
           if (snap.pauseReason !== null) return;
@@ -2164,15 +2613,27 @@ export function ChatPage() {
       <main className="flex-1 flex flex-col overflow-hidden relative">
         <CronInbox refreshSignal={cronInboxRefresh} />
         <header className="h-12 px-4 border-b-2 border-black flex items-center justify-between gap-3 bg-canvas">
-          <div className="flex items-baseline gap-2 min-w-0 flex-1">
+          <div className="flex items-center gap-2 min-w-0 flex-1">
             {sessionId ? (
-              <span
-                className="font-mono text-xs text-ink select-all break-all"
-                title={sessionId}
-              >
-                <span className="text-ink-soft select-none mr-1">session id:</span>
-                {sessionId}
-              </span>
+              <div className="flex flex-col min-w-0 leading-tight">
+                {activeTitle ? (
+                  <span
+                    className="font-bold text-sm text-ink truncate"
+                    title={activeTitle}
+                  >
+                    {activeTitle}
+                  </span>
+                ) : null}
+                <span
+                  className="font-mono text-[11px] text-ink-soft select-all break-all truncate"
+                  title={sessionId}
+                >
+                  <span className="select-none mr-1">
+                    {activeTitle ? 'id:' : 'session id:'}
+                  </span>
+                  {sessionId}
+                </span>
+              </div>
             ) : (
               <span className="font-bold text-sm text-ink-soft">No session</span>
             )}
@@ -2208,12 +2669,18 @@ export function ChatPage() {
                 </div>
               ) : null}
               {currentView.transcript.flatMap((row, i, arr) => {
+                const retryId = row.failed ? row.clientMsgId : undefined;
                 const nodes: React.ReactNode[] = [
                   <MessageBubble
                     key={row.key}
                     row={row}
                     adminToken={adminToken}
                     baseUrl={baseUrl}
+                    onRetry={
+                      retryId !== undefined && sessionId
+                        ? () => retryFailedSend(sessionId, retryId)
+                        : undefined
+                    }
                   />,
                 ];
                 if (isCancelledWorkAt(arr, i, currentView.turn)) {
@@ -2578,7 +3045,6 @@ export function routeInboundFrame(
   frame: Frame,
   setViews: React.Dispatch<React.SetStateAction<Record<string, SessionView>>>,
   setSessions: React.Dispatch<React.SetStateAction<SessionSummary[]>>,
-  lastConnectedAt: number,
 ): void {
   switch (frame.kind) {
     case 'answer_delta': {
@@ -2727,33 +3193,13 @@ export function routeInboundFrame(
           return { ...prev, [sid]: { ...view, transcript, awaitingReply: false } };
         });
       }
-      // Catch-up replay (ordinal set): key by ordinal so React
-      // reconciles against rows the REST history fetch already laid
-      // down with the same shape, and a duplicate replay is a no-op.
-      // Reconciles against locally-leftover rows from a WS drop in
-      // the window between local emit and the live frame:
-      // * a `streaming` assistant row (drop mid-Delta-stream) is
-      //   swallowed by the replay's finalized Message;
-      // * a `pending` user row (drop between handleSend and the
-      //   live UserEcho) is matched by text;
-      // * a *finalized* `msg-*` row (drop after the live frame was
-      //   already rendered — this is the common case when only the
-      //   assistant `Frame::Message` carries an ordinal and reconnect
-      //   replays the user echo that landed during the previous
-      //   session) is also matched by role+text within the recent
-      //   tail. The gateway zeros `platform_msg_id` on replay (see
-      //   `crates/gateway/src/channel/route.rs`), so text is the best
-      //   discriminator we have client-side — sending the same text
-      //   twice within the drop window would mis-match, but the
-      //   failure mode (one duplicate row) is no worse than the
-      //   pre-fix baseline. Without these paths the leftover row
-      //   would sit alongside the replay forever.
+      // Ordinal-stamped Message — the live final assistant reply carries
+      // its persisted ordinal. Key it by its stable row id (`m<ordinal>`)
+      // so the sync/backfill redelivery of the same row is a no-op, and
+      // reconcile by `platform_msg_id` equality (the server preserves it
+      // on every redelivery — the old text-match heuristics are gone).
       if (frame.ordinal !== undefined) {
-        const replayKey = `hist-${sid}-${frame.ordinal}`;
-        // Replays arrive ascending so iteratively overwriting the
-        // sidebar preview converges on the freshest user turn — the
-        // disconnect window may have hidden a sibling-tab send that
-        // the bootstrap snapshot also missed.
+        const rowKey = transcriptRowKey(sid, `m${frame.ordinal}`);
         if (role === 'user') {
           const preview = frame.content.trim().length > 0
             ? frame.content
@@ -2764,18 +3210,37 @@ export function routeInboundFrame(
         }
         setViews((prev) => {
           const view = prev[sid] ?? EMPTY_VIEW;
-          if (view.transcript.some((r) => r.key === replayKey)) return prev;
+          if (view.transcript.some((r) => r.key === rowKey)) return prev;
+          if (frame.platform_msg_id) {
+            const idx = view.transcript.findIndex(
+              (r) => r.clientMsgId === frame.platform_msg_id,
+            );
+            if (idx >= 0) {
+              // The optimistic row this ordinal-stamped delivery confirms
+              // — adopt the server identity in place.
+              const next = view.transcript.slice();
+              next[idx] = {
+                ...next[idx],
+                key: rowKey,
+                role,
+                text: frame.content,
+                pending: false,
+                failed: false,
+              };
+              return { ...prev, [sid]: { ...view, transcript: next } };
+            }
+          }
           if (role === 'assistant') {
             const lastIdx = view.transcript.length - 1;
             const last = view.transcript[lastIdx];
             if (last?.streaming && last.role === 'assistant') {
               const next = view.transcript.slice();
               // Preserve the streaming row's `createdAt` (stamped at
-              // first Delta) — the persisted Message replay is the
-              // same logical bubble, the user just saw it earlier.
+              // first Delta) — the persisted final is the same logical
+              // bubble, the user just saw it earlier.
               next[lastIdx] = {
                 ...last,
-                key: replayKey,
+                key: rowKey,
                 role: 'assistant',
                 text: frame.content,
                 streaming: false,
@@ -2783,57 +3248,8 @@ export function routeInboundFrame(
               return { ...prev, [sid]: { ...view, transcript: next } };
             }
           }
-          if (role === 'user') {
-            const matchIdx = view.transcript.findIndex(
-              (r) => r.pending && r.role === 'user' && r.text === frame.content,
-            );
-            if (matchIdx >= 0) {
-              const next = view.transcript.slice();
-              next[matchIdx] = {
-                ...view.transcript[matchIdx],
-                key: replayKey,
-                role: 'user',
-                text: frame.content,
-                pending: false,
-              };
-              return { ...prev, [sid]: { ...view, transcript: next } };
-            }
-          }
-          // Finalized live row from a prior connection: scan the
-          // tail for a non-keyed (`msg-*` / no `hist-` prefix), non-
-          // streaming, non-pending row of the same role+text. Window
-          // capped at the last 16 rows so we don't replay-walk a
-          // 10k-message scrollback.
-          //
-          // Iterate oldest→newest within the window. Replays arrive
-          // in ascending ordinal order, so the first un-claimed
-          // matching row is the one this replay belongs to. The
-          // newest-first walk we used before inverted the pairing
-          // when the same text appeared twice: replay N would claim
-          // the *later* row, then replay N+1 would claim the earlier
-          // one, leaving the earlier text rendered with the newer
-          // ordinal. Rows already re-keyed by a prior replay carry
-          // the `hist-` prefix and are skipped, so iterating forward
-          // can't re-claim them.
-          //
-          // `hasAttachments` is also part of the discriminator so an
-          // attachment-only row doesn't get re-keyed onto a text-only
-          // replay (and vice-versa) when their text happens to be
-          // empty for the attachment side.
-          const TAIL_WINDOW = 16;
-          const start = Math.max(0, view.transcript.length - TAIL_WINDOW);
-          const replayHasAttachments = (frame.attachments?.length ?? 0) > 0;
-          for (let i = start; i < view.transcript.length; i++) {
-            const row = view.transcript[i];
-            if (row.streaming || row.pending) continue;
-            if (row.key.startsWith('hist-')) continue;
-            if (row.role !== role) continue;
-            if (row.text !== frame.content) continue;
-            if (Boolean(row.hasAttachments) !== replayHasAttachments) continue;
-            const next = view.transcript.slice();
-            next[i] = { ...row, key: replayKey, text: frame.content };
-            return { ...prev, [sid]: { ...view, transcript: next } };
-          }
+          const frameAttachments =
+            (frame.attachments?.length ?? 0) > 0 ? frame.attachments : undefined;
           return {
             ...prev,
             [sid]: {
@@ -2841,9 +3257,12 @@ export function routeInboundFrame(
               transcript: [
                 ...view.transcript,
                 {
-                  key: replayKey,
+                  key: rowKey,
                   role,
                   text: frame.content,
+                  hasAttachments: frameAttachments !== undefined || undefined,
+                  attachments: frameAttachments,
+                  clientMsgId: frame.platform_msg_id || undefined,
                   createdAt: new Date().toISOString(),
                 },
               ],
@@ -2879,15 +3298,18 @@ export function routeInboundFrame(
         const clientMsgId = frame.platform_msg_id;
         setViews((prev) => {
           const view = prev[sid] ?? EMPTY_VIEW;
-          const idx = view.transcript.findIndex(
-            (r) => r.pending && r.clientMsgId === clientMsgId,
-          );
+          // Match by the idempotency key alone (not `pending`): a re-echo
+          // after a blind resend, or an echo landing on a row a sync page
+          // already delivered/adopted, must update that row in place
+          // rather than appending a duplicate bubble.
+          const idx = view.transcript.findIndex((r) => r.clientMsgId === clientMsgId);
           if (idx >= 0) {
             const next = view.transcript.slice();
             next[idx] = {
               ...view.transcript[idx],
               text: frame.content,
               pending: false,
+              failed: false,
               hasAttachments: hasAttachments || next[idx].hasAttachments,
             };
             return { ...prev, [sid]: { ...view, transcript: next } };
@@ -3019,7 +3441,6 @@ export function routeInboundFrame(
     }
     case 'approval_requested': {
       const sid = frame.session_id;
-      const receivedAt = Date.now();
       setViews((prev) => {
         const view = prev[sid] ?? EMPTY_VIEW;
         return {
@@ -3033,7 +3454,6 @@ export function routeInboundFrame(
               description: frame.description ?? null,
               paramsPreview: frame.params_preview,
               accesses: frame.accesses,
-              receivedAt,
             },
             // Agent has stopped to ask the user something — it's no
             // longer composing. The approval card is the activity
@@ -3042,28 +3462,6 @@ export function routeInboundFrame(
             awaitingReply: false,
           },
         };
-      });
-      return;
-    }
-    case 'pending_approvals_snapshot': {
-      // Server's authoritative list of pending approval call_ids for
-      // this session, sent once per Subscribe. Reconcile against our
-      // local card: drop if it (a) pre-dates the most recent
-      // reconnect — i.e. could plausibly be stale from before — AND
-      // (b) is missing from the snapshot. Cards stamped after the
-      // last reconnect came in through live broadcast and are
-      // protected from the race where a fresh approval arrives in
-      // the microsecond gap between the server's subscribe
-      // registration and snapshot send.
-      const sid = frame.session_id;
-      const callIds = new Set(frame.call_ids);
-      setViews((prev) => {
-        const view = prev[sid];
-        if (!view?.pendingApproval) return prev;
-        const pa = view.pendingApproval;
-        if (pa.receivedAt >= lastConnectedAt) return prev;
-        if (callIds.has(pa.callId)) return prev;
-        return { ...prev, [sid]: { ...view, pendingApproval: null } };
       });
       return;
     }
@@ -3087,9 +3485,11 @@ export function routeInboundFrame(
     }
     default:
       // history_snapshot / start_bot / stop_bot / slash_manifest /
-      // subscribe / unsubscribe / register / register_ack / reset are
-      // not expected on the web client (the SDK strips most of them
+      // subscribe / unsubscribe / register / register_ack are not
+      // expected on the web client (the SDK strips most of them
       // before they reach onFrame; the rest are debug noise).
+      // `subscribe_state` / `gap` are handled upstream in the WS
+      // onFrame closure — they need the sync loop, not the views map.
       return;
   }
 }
@@ -3591,60 +3991,46 @@ function roleFromString(role: string): 'user' | 'assistant' | 'system' {
   return 'assistant';
 }
 
-interface HistoryWorkStepDto {
-  kind: 'reasoning' | 'prose' | 'tool';
-  text?: string;
-  tool?: string | null;
-  tool_label?: string | null;
-  tool_status?: string | null;
-  tool_summary?: string | null;
+/** React key for a server transcript row, derived from its stable row id
+ *  (`m<ordinal>` message / `w<ordinal>` work / `n<seq>` control event) so
+ *  every redelivery — sync, backfill, the ordinal-stamped live final —
+ *  converges on the same node. Doubles as the redelivery dedup key. */
+function transcriptRowKey(sessionId: string, rowId: string): string {
+  return `row-${sessionId}-${rowId}`;
 }
 
-interface HistoryRowDto {
-  created_at: string;
-  ordinal: number;
-  /** `'message'` (default), `'work'`, or `'notice'` — see the gateway's
-   *  `ChatTranscriptItem`. A `work` row is the server's reconstruction of
-   *  a tool-using turn's collapsed work block; a `notice` row is a persisted
-   *  out-of-band notice (e.g. a `/compact` confirmation). */
-  kind?: 'message' | 'work' | 'notice';
-  role: string;
-  text: string;
-  has_attachments: boolean;
-  steps?: HistoryWorkStepDto[];
-  work_started_at?: string | null;
-  work_ended_at?: string | null;
-  /** True when a `work` row's turn was cancelled (`/stop`); the block then
-   *  collapses to a "Cancelled · Worked Xs" summary. */
-  cancelled?: boolean;
-  /** Severity of a `notice` row, so reload colors it like the live frame.
-   *  Normalized through `noticeLevel()` at the call site. */
-  notice_level?: string | null;
+function attachmentFromApi(a: ApiAttachment): WireAttachment {
+  const kind: WireAttachment['kind'] =
+    a.kind === 'image' || a.kind === 'audio' ? a.kind : 'file';
+  return {
+    kind,
+    blob_id: a.blob_id,
+    mime_type: a.mime_type,
+    size: a.size,
+    filename: a.filename ?? undefined,
+  };
 }
 
-/** Translate one server-side transcript row into the local
- *  [`TranscriptRow`] shape, keying on the absolute ordinal so the
- *  same logical message coming back from another page-fetch (or a
- *  hot-reload during dev) reuses the same React node identity. A
- *  `work` row maps to a finished (collapsed) work block, rendered by
- *  the same `WorkBlock` the live path produces. */
-function historyRowToTranscript(sessionId: string, row: HistoryRowDto): TranscriptRow {
-  if (row.kind === 'work') {
+/** Translate one server transcript row (the sync / get-session /
+ *  backfill DTO) into the local [`TranscriptRow`] shape, keyed by the
+ *  row's stable id so the same logical row from any surface reuses the
+ *  same React node identity. A `work` item maps to a finished
+ *  (collapsed) work block; a message row carries its `platform_msg_id`
+ *  as `clientMsgId` so it reconciles with the optimistic send row. */
+export function transcriptItemToRow(sessionId: string, item: ApiTranscriptItem): TranscriptRow {
+  const key = transcriptRowKey(sessionId, item.id);
+  if (item.kind === 'work') {
     return {
-      // A direct-answer turn's work block shares its ordinal with the answer
-      // bubble (both reconstructed from the same row), so suffix the key to
-      // keep React identities distinct and let the answer's ordinal-keyed
-      // replay dedup (`hist-<sid>-<ordinal>`) match the bubble, not this block.
-      key: `hist-${sessionId}-${row.ordinal}-work`,
+      key,
       role: 'system',
       text: '',
       kind: 'work',
       workActive: false,
-      workCancelled: row.cancelled ?? false,
-      workStartedAt: parseEpochMs(row.work_started_at) ?? undefined,
-      workEndedAt: parseEpochMs(row.work_ended_at) ?? undefined,
-      steps: (row.steps ?? []).map((s, i) => ({
-        key: `hist-${sessionId}-${row.ordinal}-${i}`,
+      workCancelled: item.cancelled ?? false,
+      workStartedAt: parseEpochMs(item.work_started_at) ?? undefined,
+      workEndedAt: parseEpochMs(item.work_ended_at) ?? undefined,
+      steps: (item.steps ?? []).map((s, i) => ({
+        key: `${key}-${i}`,
         kind: s.kind,
         text: s.text,
         tool: s.tool ?? undefined,
@@ -3656,24 +4042,239 @@ function historyRowToTranscript(sessionId: string, row: HistoryRowDto): Transcri
       })),
     };
   }
-  if (row.kind === 'notice') {
-    // Persisted out-of-band notice (e.g. a `/compact` confirmation), rendered at
-    // the same severity the live frame carried (`notice_level`).
+  if (item.kind === 'notice') {
+    // Persisted control event (slash echo / out-of-band notice), rendered
+    // at the severity the live frame carried (`notice_level`).
     return {
-      key: `hist-${sessionId}-${row.ordinal}`,
+      key,
       role: 'system',
       text: '',
-      notice: { level: noticeLevel(row.notice_level ?? 'info'), text: row.text },
-      createdAt: row.created_at,
+      notice: { level: noticeLevel(item.notice_level ?? 'info'), text: item.text },
+      createdAt: item.created_at,
     };
   }
+  const attachments = (item.attachments ?? []).map(attachmentFromApi);
   return {
-    key: `hist-${sessionId}-${row.ordinal}`,
-    role: roleFromString(row.role),
-    text: row.text,
-    hasAttachments: row.has_attachments,
-    createdAt: row.created_at,
+    key,
+    role: roleFromString(item.role),
+    text: item.text,
+    hasAttachments: item.has_attachments,
+    attachments: attachments.length > 0 ? attachments : undefined,
+    createdAt: item.created_at,
+    clientMsgId: item.platform_msg_id || undefined,
   };
+}
+
+/** Index of the open work block matching `startedAt`, newest-first. */
+function findOpenWorkIndex(rows: TranscriptRow[], startedAt: number): number {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    if (row.kind === 'work' && row.workActive && row.workStartedAt === startedAt) return i;
+  }
+  return -1;
+}
+
+/** Merge a difference sync page into the rendered thread. Dedup is by
+ *  the stable row key (redelivery) and by `platform_msg_id` (a
+ *  redelivered user row reconciles with — and adopts the server
+ *  identity of — the optimistic row that produced it). A work row for a
+ *  turn this client was watching live replaces the matching open block
+ *  (same start) instead of duplicating it, and a final assistant row
+ *  lands in the trailing streaming bubble when the live final frame was
+ *  lost. Rows arrive ascending and strictly above the cursor, so plain
+ *  append preserves order. */
+export function applySyncMerge(prev: TranscriptRow[], page: TranscriptRow[]): TranscriptRow[] {
+  if (page.length === 0) return prev;
+  const next = prev.slice();
+  let changed = false;
+  const keys = new Set(prev.map((r) => r.key));
+  for (const row of page) {
+    if (keys.has(row.key)) continue;
+    keys.add(row.key);
+    if (row.clientMsgId !== undefined) {
+      const idx = next.findIndex((r) => r.clientMsgId === row.clientMsgId);
+      if (idx >= 0) {
+        const local = next[idx];
+        next[idx] = {
+          ...row,
+          // Optimistic rows carry full attachment details; keep whichever
+          // side has them.
+          attachments: row.attachments ?? local.attachments,
+          hasAttachments: row.hasAttachments || local.hasAttachments,
+        };
+        changed = true;
+        continue;
+      }
+    }
+    if (row.kind === 'work' && row.workStartedAt !== undefined) {
+      const idx = findOpenWorkIndex(next, row.workStartedAt);
+      if (idx >= 0) {
+        // The server's reconstruction of the turn we were watching live —
+        // its closed work row supersedes the open block.
+        next[idx] = row;
+        changed = true;
+        continue;
+      }
+    }
+    if (row.role === 'assistant' && row.kind === undefined && row.notice === undefined) {
+      const last = next[next.length - 1];
+      if (last?.streaming === true && last.role === 'assistant') {
+        // The live final frame was lost (that's why we're syncing) — the
+        // persisted final lands in the streaming bubble it finalizes.
+        next[next.length - 1] = { ...row, createdAt: last.createdAt ?? row.createdAt };
+        changed = true;
+        continue;
+      }
+    }
+    next.push(row);
+    changed = true;
+  }
+  return changed ? next : prev;
+}
+
+/** REPLACE the thread with a baseline / rebased page, then re-overlay
+ *  the local state the page cannot carry:
+ *  * optimistic send rows whose `platform_msg_id` is still in the outbox
+ *    and absent from the page — their content lives only client-side
+ *    until durability confirms (the REPLACE-overlay rule);
+ *  * the in-flight turn's open work block — re-opened from the page's
+ *    own partial fold when the starts match (`applyTurnState`), else
+ *    carried over from the previous thread;
+ *  * a trailing streaming answer bubble (the pacer keeps writing it). */
+export function applySyncReplace(
+  prev: TranscriptRow[],
+  page: TranscriptRow[],
+  unconfirmedSendIds: ReadonlySet<string>,
+  turn: SessionView['turn'],
+): TranscriptRow[] {
+  const pageSendIds = new Set<string>();
+  for (const row of page) {
+    if (row.clientMsgId !== undefined) pageSendIds.add(row.clientMsgId);
+  }
+  const keptSends = prev.filter(
+    (r) =>
+      r.clientMsgId !== undefined &&
+      unconfirmedSendIds.has(r.clientMsgId) &&
+      !pageSendIds.has(r.clientMsgId),
+  );
+  let rows = [...page, ...keptSends];
+  if (turn?.active && turn.startedAt !== null) {
+    let inherited: WorkStep[] | undefined;
+    for (let i = prev.length - 1; i >= 0; i--) {
+      const row = prev[i];
+      if (row.kind === 'work' && row.workActive) {
+        inherited = row.steps;
+        break;
+      }
+    }
+    rows = applyTurnState(rows, true, turn.startedAt);
+    const tail = rows[rows.length - 1];
+    if (
+      tail?.kind === 'work' &&
+      tail.workActive &&
+      (tail.steps?.length ?? 0) === 0 &&
+      inherited !== undefined &&
+      inherited.length > 0
+    ) {
+      // applyTurnState opened a fresh empty block (the page carried no
+      // fold for this turn) — keep the steps we already rendered live.
+      rows = [...rows.slice(0, -1), { ...tail, steps: inherited }];
+    }
+  }
+  const last = prev[prev.length - 1];
+  if (last?.streaming === true && last.role === 'assistant') rows = [...rows, last];
+  return rows;
+}
+
+function approvalFromCard(sessionId: string, card: WireApprovalCard): PendingApproval {
+  return {
+    callId: card.call_id,
+    sessionId,
+    tool: card.tool,
+    description: card.description ?? null,
+    paramsPreview: card.params_preview,
+    accesses: card.accesses,
+  };
+}
+
+function workStepFromWire(step: WireWorkStep, i: number): WorkStep {
+  if (step.kind === 'tool') {
+    return {
+      // Same key shape as the live `tool_started` path so a later live
+      // `tool_completed` pairs with the snapshot step by call id.
+      key: `tool-${step.call_id ?? `snap-${i}`}`,
+      kind: 'tool',
+      toolCallId: step.call_id,
+      tool: step.tool ?? 'tool',
+      toolLabel: step.label ?? null,
+      toolStatus:
+        step.status === 'error'
+          ? 'error'
+          : step.status === 'denied'
+            ? 'denied'
+            : step.status === 'ok'
+              ? 'ok'
+              : 'running',
+      toolSummary: step.summary,
+    };
+  }
+  return { key: `snap-${i}-${step.kind}`, kind: step.kind, text: step.text };
+}
+
+/** REPLACE the steps of the transcript's open work block wholesale (the
+ *  `subscribe_state` work-steps half — the shape the retired on-subscribe
+ *  WorkSnapshot apply had). No-op when no block is open. */
+function replaceOpenWorkSteps(prev: TranscriptRow[], steps: WorkStep[]): TranscriptRow[] {
+  for (let i = prev.length - 1; i >= 0; i--) {
+    const row = prev[i];
+    if (row.kind !== 'work' || !row.workActive) continue;
+    const next = prev.slice();
+    next[i] = { ...row, steps };
+    return next;
+  }
+  return prev;
+}
+
+/** Apply one `subscribe_state` bundle to a session view: REPLACE the
+ *  task list and the pending-approval card set wholesale (they are
+ *  latest-wins — live frames arriving after the snapshot win by normal
+ *  frame order), and apply the turn/work halves unless the caller
+ *  determined they are stale by turn identity (`turnEnded`: this client
+ *  already holds a turn-end signal for the SAME turn, matched by
+ *  `started_at` — never by ordinal arithmetic, since the coverage
+ *  watermark advances mid-turn). */
+export function applySubscribeState(
+  view: SessionView,
+  frame: Extract<Frame, { kind: 'subscribe_state' }>,
+  turnEnded: boolean,
+): SessionView {
+  const cards = frame.pending_approvals ?? [];
+  let next: SessionView = {
+    ...view,
+    tasks: frame.tasks ?? [],
+    // The view renders one card at a time; the queue's head is the call
+    // the turn is blocked on.
+    pendingApproval: cards.length > 0 ? approvalFromCard(frame.session_id, cards[0]) : null,
+  };
+  if (turnEnded) return next;
+  const startedAt = parseEpochMs(frame.turn.started_at);
+  if (frame.turn.active && startedAt !== null) {
+    let transcript = applyTurnState(view.transcript, true, startedAt);
+    transcript = replaceOpenWorkSteps(transcript, (frame.work_steps ?? []).map(workStepFromWire));
+    next = {
+      ...next,
+      transcript,
+      turn: { active: true, startedAt },
+      awaitingReply: false,
+    };
+  } else if (!frame.turn.active) {
+    next = {
+      ...next,
+      transcript: applyTurnState(view.transcript, false, null),
+      turn: { active: false, startedAt: null },
+    };
+  }
+  return next;
 }
 
 /** Pull a one-line, human-readable reason from an openapi-fetch error
@@ -3734,6 +4335,7 @@ function applySessionPatch(
         unread: 0,
         pinned: patch.pinned ?? false,
         folder_id: patchedFolder,
+        title: patch.title,
       },
       ...prev,
     ];
@@ -3749,12 +4351,14 @@ function applySessionPatch(
     pinned: patch.pinned ?? current.pinned,
     last_user_text: current.last_user_text,
     folder_id: nextFolderId,
+    title: patch.title ?? current.title,
   };
   if (
     merged.created_at === current.created_at &&
     merged.last_active === current.last_active &&
     merged.pinned === current.pinned &&
-    merged.folder_id === current.folder_id
+    merged.folder_id === current.folder_id &&
+    merged.title === current.title
   ) {
     return prev;
   }
@@ -4007,10 +4611,14 @@ function MessageBubble({
   row,
   adminToken,
   baseUrl,
+  onRetry,
 }: {
   row: TranscriptRow;
   adminToken: string | null;
   baseUrl: string;
+  /** Set on a `failed` send row: fires the manual outbox retry (same
+   *  platform_msg_id, transmission budget reset). */
+  onRetry?: () => void;
 }) {
   if (row.kind === 'work') {
     return <WorkBlock row={row} />;
@@ -4118,7 +4726,18 @@ function MessageBubble({
               </>
             )}
           </div>
-          {row.pending ? (
+          {row.failed ? (
+            <button
+              type="button"
+              onClick={onRetry}
+              disabled={!onRetry}
+              className="absolute -bottom-1.5 -right-1.5 flex items-center justify-center bg-white text-err rounded-full border-2 border-err cursor-pointer disabled:cursor-not-allowed"
+              title="Send failed — click to retry"
+              aria-label="Retry send"
+            >
+              <RiErrorWarningLine className="text-sm" />
+            </button>
+          ) : row.pending ? (
             <RiLoader4Line
               className="absolute -bottom-1.5 -right-1.5 text-sm bg-white text-ink rounded-full border-2 border-black animate-spin"
               title="Sending…"

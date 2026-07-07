@@ -33,7 +33,9 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
                     action_payload: serde_json::json!({}),
                 },
                 TriggerKind::System => JobInput::System {
-                    payload: baybo_model::BackgroundCompressionPayload { up_to_ordinal: 0 },
+                    payload: baybo_job::SystemJobPayload::Compression(
+                        baybo_model::BackgroundCompressionPayload { up_to_ordinal: 0 },
+                    ),
                 },
                 TriggerKind::Spawned => JobInput::Spawned {
                     initial_prompt: vec![ContentBlock::Text("task".into())],
@@ -75,8 +77,9 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
         config_reloader: tg.deps.config_reloader.clone(),
         log_buffer: std::sync::Arc::clone(&tg.deps.log_buffer),
         channel_bot_store: tg.deps.stores.channel_bot.clone(),
-        channel_control: std::sync::Arc::clone(&tg.deps.channel_control),
+        agent_profile_store: tg.deps.stores.agent_profile.clone(),
         blob_store: tg.deps.stores.blob.clone(),
+        channel_control: std::sync::Arc::clone(&tg.deps.channel_control),
         secret_vault: std::sync::Arc::clone(&tg.deps.secret_vault),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     };

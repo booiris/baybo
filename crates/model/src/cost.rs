@@ -37,6 +37,8 @@ pub enum CallReason {
     Compression,
     /// The out-of-band progress observer that narrates long turns.
     ProgressObserver,
+    /// Conversation-title generation.
+    Title,
     /// Memory subsystem sub-calls (recall, extraction).
     Memory,
     /// Platform-internal overhead no end user triggered (skill risk
@@ -55,6 +57,7 @@ impl CallReason {
             CallReason::Tool(name) => Cow::Owned(format!("{TOOL_TOKEN_PREFIX}{name}")),
             CallReason::Compression => Cow::Borrowed("compression"),
             CallReason::ProgressObserver => Cow::Borrowed("progress_observer"),
+            CallReason::Title => Cow::Borrowed("title"),
             CallReason::Memory => Cow::Borrowed("memory"),
             CallReason::System => Cow::Borrowed("system"),
         }
@@ -73,6 +76,7 @@ impl CallReason {
             "chat" => CallReason::Chat,
             "compression" => CallReason::Compression,
             "progress_observer" => CallReason::ProgressObserver,
+            "title" => CallReason::Title,
             "memory" => CallReason::Memory,
             "system" => CallReason::System,
             _ => return None,
@@ -154,6 +158,7 @@ mod tests {
             CallReason::Tool("WebFetch".to_string()),
             CallReason::Compression,
             CallReason::ProgressObserver,
+            CallReason::Title,
             CallReason::Memory,
             CallReason::System,
         ] {

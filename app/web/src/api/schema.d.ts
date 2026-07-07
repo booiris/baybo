@@ -4,6 +4,54 @@
  */
 
 export interface paths {
+    "/v1/agents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_agents"];
+        put?: never;
+        post: operations["create_agent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/agents/{agent_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_agent"];
+        put: operations["update_agent"];
+        post?: never;
+        delete: operations["delete_agent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/agents/{agent_id}/avatar": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_agent_avatar"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/analytics": {
         parameters: {
             query?: never;
@@ -184,22 +232,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/chat/sessions/{session_id}/catch-up": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["catch_up_session"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/chat/sessions/{session_id}/folder": {
         parameters: {
             query?: never;
@@ -209,6 +241,22 @@ export interface paths {
         };
         get?: never;
         put: operations["set_session_folder"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["lookup_session_message"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -241,6 +289,38 @@ export interface paths {
         };
         get?: never;
         put: operations["set_session_pin"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["mark_session_read"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["sync_session"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -669,6 +749,35 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
+         * @description Mirror of [`baybo_model::AgentFramework`]; wire strings match the
+         *     spawn protocol's backend tags (`baybo`/`claude`/`codex`).
+         * @enum {string}
+         */
+        AgentFrameworkDto: "baybo" | "claude" | "codex";
+        /**
+         * @description One agent profile. Absent `system_prompt` = workspace Soul; absent
+         *     `llm` = follow `default-llm`. Skills are not part of the profile — they
+         *     are read live from the skill registry (`GET /v1/skills`).
+         */
+        AgentProfileDto: {
+            avatar_blob_id?: string | null;
+            /**
+             * @description The seeded built-in profile: read-only except its avatar,
+             *     cannot be deleted.
+             */
+            builtin: boolean;
+            /** Format: date-time */
+            created_at: string;
+            description: string;
+            framework: components["schemas"]["AgentFrameworkDto"];
+            id: string;
+            llm?: string | null;
+            name: string;
+            system_prompt?: string | null;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        /**
          * @description One bucket per UTC day for the analytics chart.
          *
          *     `cost_micro_usd` is integer micro-USD (USD × 10^6). Rendering layers
@@ -764,12 +873,6 @@ export interface components {
             jobs: components["schemas"]["BackgroundJob"][];
         };
         /**
-         * @description Discriminator for [`ChatCatchUpItem`] — serialized as
-         *     `"message"` / `"work"`.
-         * @enum {string}
-         */
-        CatchUpItemKind: "message" | "work";
-        /**
          * @description Admin-surface mirror of [`baybo_model::ChannelType`]. Transparent
          *     wrapper around a snake_case string so the OpenAPI surface stays
          *     stable while the core type is open-ended (runtime-registered
@@ -784,51 +887,6 @@ export interface components {
             mime_type: string;
             /** Format: int32 */
             size: number;
-        };
-        /**
-         * @description Forward reconnect item for native device clients. The sequence is ordered by
-         *     persisted ordinal; a completed tool-using assistant reply appears as a
-         *     `work` item followed by the matching `message` item with the same `ordinal`.
-         */
-        ChatCatchUpItem: {
-            attachments?: components["schemas"]["ChatAttachment"][];
-            content: string;
-            kind: components["schemas"]["CatchUpItemKind"];
-            /** Format: int64 */
-            ordinal: number;
-            platform_msg_id?: string;
-            role?: string;
-            steps?: components["schemas"]["ChatCatchUpWorkStep"][];
-        };
-        ChatCatchUpResponse: {
-            items: components["schemas"]["ChatCatchUpItem"][];
-            /**
-             * Format: int64
-             * @description Newest visible message ordinal included in `items`. Internal tool /
-             *     thinking rows are deliberately not exposed as the cursor, because a
-             *     later final answer may still need them to reconstruct its completed work
-             *     block.
-             */
-            newest_ordinal?: number | null;
-            /**
-             * @description True when the requested gap exceeds the catch-up cap. The client should
-             *     discard this partial answer and rebuild from the normal history API.
-             */
-            truncated: boolean;
-        };
-        /**
-         * @description One work step in the forward catch-up API. This intentionally mirrors
-         *     `wire::WireWorkStep`'s JSON field names (not the REST transcript's
-         *     `tool_label` / `tool_status` names) because the device transcript reuses the
-         *     live `WorkSnapshot` renderer for catch-up work blocks.
-         */
-        ChatCatchUpWorkStep: {
-            kind: components["schemas"]["WorkStepKind"];
-            label?: string | null;
-            status?: string | null;
-            summary?: string | null;
-            text?: string;
-            tool?: string | null;
         };
         /**
          * @description One entry in the cron-messages list. Each row corresponds to a
@@ -880,6 +938,21 @@ export interface components {
         ChatCronMessagesList: {
             items: components["schemas"]["ChatCronMessage"][];
         };
+        /**
+         * @description Response from `GET /v1/chat/sessions/{session_id}/messages` — the
+         *     per-`platform_msg_id` durability probe. `found: false` is a provable
+         *     absence (the key was never persisted for this session), which lets
+         *     the client outbox resume its retry machine; `found: true` confirms
+         *     durability without consuming a retry transmission.
+         */
+        ChatMessageLookup: {
+            found: boolean;
+            /**
+             * Format: int64
+             * @description Ordinal of the newest persisted row carrying the key, when found.
+             */
+            ordinal?: number | null;
+        };
         /** @description Response from `POST /v1/chat/sessions`. */
         ChatSessionCreated: {
             /** @description New session id. */
@@ -915,6 +988,8 @@ export interface components {
              */
             oldest_ordinal?: number | null;
             session_id: string;
+            /** @description Auto-generated conversation title, if available. */
+            title?: string | null;
             /**
              * @description Active transcript slice, oldest-first within the page. Interleaves the
              *     real message rows with out-of-band control events (slash echoes /
@@ -964,9 +1039,63 @@ export interface components {
              */
             pinned: boolean;
             session_id: string;
+            /** @description Auto-generated conversation title, if available. */
+            title?: string | null;
+            /**
+             * Format: int64
+             * @description Number of unread assistant replies — final assistant messages persisted
+             *     with `ordinal` above this session's read cursor
+             *     (`PUT /v1/chat/sessions/{id}/read`), capped at [`UNREAD_COUNT_CAP`]
+             *     (the client renders the cap as "N+"). Server-computed, so it is
+             *     accurate across a cold restart / a device that missed the live
+             *     `SessionActivity` pings. `0` when caught up.
+             */
+            unread_count: number;
         };
         ChatSessionsList: {
             items: components["schemas"]["ChatSessionSummary"][];
+        };
+        /**
+         * @description Response from `GET /v1/chat/sessions/{session_id}/sync` — the one
+         *     forward-recovery pull. Full-fidelity on every path: rows carry work
+         *     blocks and notices exactly like the history surface.
+         */
+        ChatSyncResponse: {
+            /**
+             * @description Whether older history exists below `oldest_ordinal` (REPLACE
+             *     responses only; always `false` on a difference response).
+             */
+            has_more_older: boolean;
+            /**
+             * Format: int64
+             * @description Coverage watermark: the highest persisted ordinal the scan
+             *     covered, visible or not — it may exceed every row in `rows`
+             *     (invisible tool/system tail). This, not any row's ordinal, is
+             *     what advances the client cursor (`max`-wins). `null` iff the
+             *     session has no persisted rows.
+             */
+            next_cursor?: number | null;
+            /**
+             * Format: int64
+             * @description Page floor for lazy backfill after a REPLACE (baseline /
+             *     rebase). Absent on a difference response — the client keeps its
+             *     own floor when merging.
+             */
+            oldest_ordinal?: number | null;
+            /**
+             * @description `true` ⇒ `rows` is the NEWEST page, not the requested difference
+             *     (the difference exceeded `limit` in emitted rows, or the raw
+             *     scan bound). The client REPLACEs its thread with the page and
+             *     treats its cursor as rebase-dirty until one non-rebased sync
+             *     completes.
+             */
+            rebased: boolean;
+            /**
+             * @description Transcript rows (message | work | notice), ascending. On a
+             *     baseline / rebased response this is the newest page and REPLACEs
+             *     the client's thread; on a difference response it appends/merges.
+             */
+            rows: components["schemas"]["ChatTranscriptItem"][];
         };
         /**
          * @description One transcript row, flattened from `ChatMessage` into a shape the
@@ -1006,6 +1135,13 @@ export interface components {
              *     file). The web client currently shows a placeholder.
              */
             has_attachments: boolean;
+            /**
+             * @description Stable row id, unique within the session and identical on every
+             *     redelivery (sync, backfill): `m<ordinal>` for a message,
+             *     `w<ordinal>` for a work block, `n<seq>` for a control-event row.
+             *     This is the client's render key AND redelivery dedup key.
+             */
+            id: string;
             /** @description Message bubble vs. reconstructed work block. */
             kind: components["schemas"]["TranscriptItemKind"];
             /**
@@ -1015,15 +1151,25 @@ export interface components {
             notice_level?: string | null;
             /**
              * Format: int64
-             * @description React key for the row. For `message` / `work` items it is the
-             *     `session_messages.ordinal` (a `work` item carries the turn's first
-             *     intermediate ordinal so it sorts just after the user turn). For a
-             *     `notice` / control-echo item it is a **synthetic negative value** in a
-             *     key space disjoint from real ordinals — so the client must NOT use it for
-             *     pagination / cursor seeding; see `ChatSessionDetail::oldest_ordinal` /
-             *     `newest_ordinal`.
+             * @description `session_messages.ordinal` for ordinal-addressed rows: a
+             *     `message` carries its own; a `work` item carries the turn's
+             *     first intermediate ordinal so it sorts just after the user turn.
+             *     **Absent for `notice` / control-echo items** — control events
+             *     are not ordinal-addressed (they anchor at an ordinal and are
+             *     keyed by their own per-session `seq`, baked into [`Self::id`]).
+             *     Clients must not use this for pagination / cursor seeding; see
+             *     `ChatSessionDetail::oldest_ordinal` / `newest_ordinal` and
+             *     `ChatSyncResponse::next_cursor`.
              */
-            ordinal: number;
+            ordinal?: number | null;
+            /**
+             * @description Client-generated send idempotency key for a user `message` row,
+             *     when the send carried one. Every redelivery (sync, backfill)
+             *     carries it so the client outbox can match durability
+             *     confirmations and dedup redelivered rows against the live echo.
+             *     Empty for rows without one (assistant replies, work, notices).
+             */
+            platform_msg_id?: string;
             /**
              * @description `"user"` or `"assistant"` (or `"system"`). String rather than
              *     enum to keep the wire forgiving. Empty for `work` items.
@@ -1085,6 +1231,26 @@ export interface components {
              *     the live UI withheld — acceptable for the operator's own view.
              */
             tool_summary?: string | null;
+        };
+        /**
+         * @description Request body for `POST /v1/agents`. Absent nullable fields mean
+         *     "inherit the default" (see [`AgentProfileDto`]).
+         */
+        CreateAgentProfileRequest: {
+            /**
+             * @description Optional avatar (full blob id from `POST /v1/blobs`); validated
+             *     exactly like `PUT /v1/agents/{agent_id}/avatar`.
+             */
+            avatar_blob_id?: string | null;
+            description?: string;
+            framework?: components["schemas"]["AgentFrameworkDto"];
+            /**
+             * @description `baybo.json` LLM entry name; must match a configured entry — see
+             *     `GET /v1/llm/models`.
+             */
+            llm?: string | null;
+            name: string;
+            system_prompt?: string | null;
         };
         /**
          * @description `POST /v1/cron` body. Schedule format is the standard 5-field cron
@@ -1419,6 +1585,16 @@ export interface components {
              */
             total: number;
         };
+        /** @description Request body for `PUT /v1/chat/sessions/{session_id}/read`. */
+        MarkReadRequest: {
+            /**
+             * Format: int64
+             * @description Highest `session_messages.ordinal` the viewer has now read. The read
+             *     cursor advances max-wins, so a stale/lower value is a no-op — a client
+             *     can safely fire this on open and after each new reply while foreground.
+             */
+            ordinal: number;
+        };
         MoveFolderRequest: {
             /** @description New parent id, or `null` to promote the folder to top-level. */
             parent_id?: string | null;
@@ -1495,6 +1671,14 @@ export interface components {
          * @enum {string}
          */
         SessionKind: "user" | "cron" | "subagent";
+        /** @description Request body for `PUT /v1/agents/{agent_id}/avatar`. */
+        SetAgentAvatarRequest: {
+            /**
+             * @description Full blob id from `POST /v1/blobs`, or `null`/absent to clear
+             *     the avatar.
+             */
+            blob_id?: string | null;
+        };
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
             path: string;
@@ -1600,6 +1784,19 @@ export interface components {
         UnsetConfigRequest: {
             path: string;
         };
+        /**
+         * @description Request body for `PUT /v1/agents/{agent_id}` — the **complete** content
+         *     state (full replace). `name`/`description`/`framework` are required so
+         *     an omitted `framework` can't silently reset a profile to `baybo`;
+         *     absent nullable fields reset to the inherit-default state.
+         */
+        UpdateAgentProfileRequest: {
+            description: string;
+            framework: components["schemas"]["AgentFrameworkDto"];
+            llm?: string | null;
+            name: string;
+            system_prompt?: string | null;
+        };
         /** @description Request body for `POST /v1/mobile/apns-token`. */
         UpdateDeviceApnsTokenRequest: {
             /** @description APNs environment: `"sandbox"` (debug / TestFlight) or `"production"`. */
@@ -1656,6 +1853,290 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_agents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every agent profile, builtin first then by name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            avatar_blob_id?: string | null;
+                            /**
+                             * @description The seeded built-in profile: read-only except its avatar,
+                             *     cannot be deleted.
+                             */
+                            builtin: boolean;
+                            /** Format: date-time */
+                            created_at: string;
+                            description: string;
+                            framework: components["schemas"]["AgentFrameworkDto"];
+                            id: string;
+                            llm?: string | null;
+                            name: string;
+                            system_prompt?: string | null;
+                            /** Format: date-time */
+                            updated_at: string;
+                        }[];
+                        next_cursor?: string | null;
+                    };
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAgentProfileRequest"];
+            };
+        };
+        responses: {
+            /** @description The created agent profile */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentProfileDto"];
+                };
+            };
+            /** @description Invalid/duplicate name, unknown LLM entry, or unknown/non-image avatar blob */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The agent profile */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentProfileDto"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAgentProfileRequest"];
+            };
+        };
+        responses: {
+            /** @description Agent profile replaced */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Built-in profile is read-only, invalid/duplicate name, or unknown LLM entry */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Agent profile deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Built-in profile cannot be deleted */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_agent_avatar: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAgentAvatarRequest"];
+            };
+        };
+        responses: {
+            /** @description Avatar set (or cleared) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unknown blob id or non-image mime */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such agent profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_analytics: {
         parameters: {
             query?: {
@@ -2268,56 +2749,6 @@ export interface operations {
             };
         };
     };
-    catch_up_session: {
-        parameters: {
-            query: {
-                /** @description Newest durable ordinal the client has already rendered. */
-                since_ordinal: number;
-                /**
-                 * @description Maximum rows to scan. Defaults to [`DEFAULT_CATCH_UP_LIMIT`], clamped to
-                 *     [`MAX_HISTORY_LIMIT`]. If the gap is larger, the response is marked
-                 *     `truncated` and carries no partial middle slice.
-                 */
-                limit?: number | null;
-            };
-            header?: never;
-            path: {
-                /** @description Session id to catch up */
-                session_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Forward transcript catch-up for device reconnect merge */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ChatCatchUpResponse"];
-                };
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Session not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
     set_session_folder: {
         parameters: {
             query?: never;
@@ -2351,6 +2782,59 @@ export interface operations {
                 };
             };
             /** @description Session or folder not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    lookup_session_message: {
+        parameters: {
+            query: {
+                /** @description Client-generated send idempotency key to probe. */
+                platform_msg_id: string;
+            };
+            header?: never;
+            path: {
+                /** @description Session id to probe */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Durability point lookup for one send idempotency key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatMessageLookup"];
+                };
+            };
+            /** @description Empty platform_msg_id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2437,6 +2921,103 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    mark_session_read: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id to mark read */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MarkReadRequest"];
+            };
+        };
+        responses: {
+            /** @description Read cursor advanced; unread_count recomputes from it */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    sync_session: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Highest coverage watermark the client holds for this session.
+                 *     Omit for the newest-page baseline (cold start, fresh install,
+                 *     no local cursor).
+                 */
+                since_ordinal?: number | null;
+                /**
+                 * @description Maximum transcript rows to return, counted in *emitted* rows.
+                 *     Defaults to [`DEFAULT_HISTORY_LIMIT`], clamped to
+                 *     [`MAX_HISTORY_LIMIT`]. A difference larger than this rebases.
+                 */
+                limit?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description Session id to sync */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Forward-recovery pull: the difference after the cursor, or a newest-page baseline (rebased / no cursor) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSyncResponse"];
+                };
             };
             /** @description Unauthorized */
             401: {
@@ -3515,14 +4096,17 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Registered skill names */
+            /** @description Registered skills with descriptions */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": {
-                        items: string[];
+                        items: {
+                            description: string;
+                            name: string;
+                        }[];
                         next_cursor?: string | null;
                     };
                 };

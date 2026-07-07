@@ -70,6 +70,13 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("setConnEpoch", String(epoch))
     }
 
+    /// Ask the webview to run its sync loop (from its own cursor) — the
+    /// offscreen-buffer-overflow re-attach edge, where native dropped the live
+    /// frames and the durable record must be re-pulled.
+    func requestSync() {
+        call("requestSync", "")
+    }
+
     func userSent(msgId: String, text: String, attachments: [AttachmentRef]) {
         let payload: [String: Any] = [
             "msgId": msgId,
@@ -170,7 +177,6 @@ final class TranscriptBridge: NSObject, ObservableObject {
             {"language":\(jsonLiteral(language)),\
             "sessionId":\(jsonLiteral(store.sessionId)),\
             "restoredState":\(restored ?? "null"),\
-            "listed":\(store.listed),\
             "connEpoch":\(store.connEpoch)}
             """
         call("init", payload)
@@ -265,9 +271,18 @@ extension TranscriptBridge: WKScriptMessageHandler {
         case "shown":
             // The transcript painted its first frame — fade the webview in.
             contentVisible = true
-        case "ordinal":
-            let ordinal = (body["lastOrdinal"] as? NSNumber)?.int64Value
-            store?.ordinalAdvanced(ordinal)
+        case "sync":
+            // The one forward-recovery pull: the webview posts its cursor
+            // (`sinceOrdinal` null = baseline) and the page size it elected.
+            let since = (body["sinceOrdinal"] as? NSNumber)?.int64Value
+            let limit = (body["limit"] as? NSNumber)?.uint32Value ?? 50
+            store?.requestSync(sinceOrdinal: since, limit: limit)
+        case "mark_read":
+            // The viewer has read up to `ordinal` — advance the server chat-list
+            // read cursor so the unread badge clears on the next list pull.
+            if let ordinal = (body["ordinal"] as? NSNumber)?.int64Value {
+                store?.markRead(ordinal: ordinal)
+            }
         case "persist":
             // Persist is async and may arrive after the bridge retargets.
             if let sessionId = (body["sessionId"] as? String) ?? store?.sessionId,

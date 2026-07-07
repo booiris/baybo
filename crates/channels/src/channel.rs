@@ -170,15 +170,11 @@ impl Channel {
     }
 
     /// Snapshot the full pending [`ApprovalRequest`] entries scoped to
-    /// `session_id`. Used by route layers on (re)subscribe so a
-    /// reconnecting client can both
-    ///   * **recover** approval cards it never received (or lost to a
-    ///     full reload) by replaying the originating
-    ///     `Frame::ApprovalRequested`, and
-    ///   * **reconcile** locally-cached cards against the queue's
-    ///     truth via [`Self::pending_approval_call_ids`] — entries
-    ///     already resolved by another tab are absent from the list
-    ///     and so the stale card is dropped on the client side.
+    /// `session_id`, from one atomic queue read. The gateway's subscribe
+    /// path projects these into the `SubscribeState` bundle's
+    /// authoritative `pending_approvals` replacement set — a
+    /// reconnecting client both recovers cards it never received and
+    /// drops locally-cached cards that were resolved while it was down.
     ///
     /// Returns empty when this channel has no approval surface or no
     /// entries match the session.
@@ -191,15 +187,6 @@ impl Channel {
             .list()
             .into_iter()
             .filter(|req| req.session_id == *session_id)
-            .collect()
-    }
-
-    /// Just the `call_id`s of [`Self::pending_approvals`]. Kept for
-    /// the reconciliation-only path that ships `PendingApprovalsSnapshot`.
-    pub fn pending_approval_call_ids(&self, session_id: &SessionId) -> Vec<String> {
-        self.pending_approvals(session_id)
-            .into_iter()
-            .map(|req| req.call_id)
             .collect()
     }
 
@@ -329,10 +316,12 @@ impl Channel {
     /// / [`Self::dispatch_approval_requested`] /
     /// [`Self::dispatch_approval_resolved`] (kind-agnostic) or
     /// through [`SubscribedView::echo_inbound`]
-    /// (Subscribed-exclusive). Non-blocking. Drops the frame for any
-    /// connection whose outbound queue is full (and sends a `Reset`
-    /// frame to nudge the client to re-fetch history); connections
-    /// whose transport is gone are detached.
+    /// (Subscribed-exclusive). Non-blocking. Drops the event for any
+    /// connection whose outbound queue is full and nudges that
+    /// connection with a session-scoped `Frame::Gap` — the server knows
+    /// exactly which session it dropped frames for, so the client can
+    /// sync just that one; connections whose transport is gone are
+    /// detached.
     pub(crate) fn dispatch_event(&self, event: SessionEvent) {
         // Fire the pre-dispatch hook before fan-out so the observer
         // sees every event — including those that drop below because
@@ -355,7 +344,7 @@ impl Channel {
         // mid-turn as the first subscriber still catches up.
         self.note_in_flight(&event, &session_id);
         let mut to_drop = Vec::new();
-        let mut to_reset = Vec::new();
+        let mut to_gap = Vec::new();
 
         match self.kind {
             ChannelKind::Multiplexed => {
@@ -363,7 +352,7 @@ impl Channel {
                     let conn = entry.value();
                     match conn.sink().try_send_event(event.clone()) {
                         SendOutcome::Sent => {}
-                        SendOutcome::Full => to_reset.push(conn.id()),
+                        SendOutcome::Full => to_gap.push(conn.id()),
                         SendOutcome::Closed => to_drop.push(conn.id()),
                     }
                 }
@@ -386,15 +375,15 @@ impl Channel {
                     };
                     match conn.sink().try_send_event(event.clone()) {
                         SendOutcome::Sent => {}
-                        SendOutcome::Full => to_reset.push(id),
+                        SendOutcome::Full => to_gap.push(id),
                         SendOutcome::Closed => to_drop.push(id),
                     }
                 }
             }
         }
 
-        for id in to_reset {
-            self.send_reset(id, "outbound queue full");
+        for id in to_gap {
+            self.send_gap(id, Some(session_id.clone()));
         }
         for id in to_drop {
             self.detach(id);
@@ -407,22 +396,25 @@ impl Channel {
     /// [`SubscribedView::broadcast_session_patch`] /
     /// [`SubscribedView::broadcast_session_activity`] which encode
     /// the "this frame is meaningful on Subscribed channels only"
-    /// constraint in the type system. Connections whose outbound
-    /// queue is full are sent a `Reset`; closed transports are
-    /// detached.
+    /// constraint in the type system. A connection whose outbound
+    /// queue is full is nudged with `Frame::Gap { session_id: None }` —
+    /// the dropped frame is a session-less broadcast from the
+    /// connection's point of view, so the client resyncs every
+    /// subscribed session and refetches the session list + folders;
+    /// closed transports are detached.
     pub(crate) fn broadcast_frame(&self, frame: Frame) {
         let mut to_drop = Vec::new();
-        let mut to_reset = Vec::new();
+        let mut to_gap = Vec::new();
         for entry in self.connections.iter() {
             let conn = entry.value();
             match conn.sink().try_send_frame(frame.clone()) {
                 SendOutcome::Sent => {}
-                SendOutcome::Full => to_reset.push(conn.id()),
+                SendOutcome::Full => to_gap.push(conn.id()),
                 SendOutcome::Closed => to_drop.push(conn.id()),
             }
         }
-        for id in to_reset {
-            self.send_reset(id, "outbound queue full");
+        for id in to_gap {
+            self.send_gap(id, None);
         }
         for id in to_drop {
             self.detach(id);
@@ -448,14 +440,13 @@ impl Channel {
         self.connections.len()
     }
 
-    fn send_reset(&self, id: ConnectionId, reason: &str) {
+    fn send_gap(&self, id: ConnectionId, session_id: Option<SessionId>) {
         if let Some(conn) = self.connections.get(&id) {
-            // Best-effort: if the reset itself can't enqueue (transport
-            // dropped while we were iterating) we'll catch the close
-            // on the next dispatch round.
-            let _ = conn.sink().try_send_frame(Frame::Reset {
-                reason: reason.to_owned(),
-            });
+            // Best-effort: the Gap rides the same bounded queue it
+            // reports on. If it can't enqueue (queue still full, or the
+            // transport dropped while we were iterating), the client's
+            // periodic safety-net sync is the backstop.
+            let _ = conn.sink().try_send_frame(Frame::Gap { session_id });
         }
     }
 }

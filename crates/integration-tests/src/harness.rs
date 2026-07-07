@@ -498,6 +498,7 @@ impl AgentTestHarnessBuilder {
             sessions: Some(Arc::clone(&session_manager)),
             memory: self.memory,
             task_store: task_store.clone(),
+            title_sink: None,
         });
         let (mailbox_tx, mailbox_rx) = baybo_agent::mailbox::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);

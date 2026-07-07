@@ -30,10 +30,11 @@ export type WireMessage = {
   attachments?: WireAttachment[];
 };
 
-/// One in-flight work step in a `Frame::WorkSnapshot` — the wire mirror of the
-/// Rust `wire::WireWorkStep` (snake_case fields). `reasoning` / `prose` carry
-/// `text`; a `tool` step carries the call's id + display name/label and, once
-/// the call finished within the buffered turn, `status` + `summary`.
+/// One in-flight work step in a `Frame::SubscribeState` bundle — the wire
+/// mirror of the Rust `wire::WireWorkStep` (snake_case fields). `reasoning` /
+/// `prose` carry `text`; a `tool` step carries the call's id + display
+/// name/label and, once the call finished within the buffered turn, `status` +
+/// `summary`.
 export type WireWorkStepFrame = {
   kind: "reasoning" | "prose" | "tool";
   text?: string;
@@ -44,20 +45,39 @@ export type WireWorkStepFrame = {
   summary?: string;
 };
 
-export type CatchUpItem =
-  | {
-      kind: "message";
-      ordinal: number;
-      role: "user" | "assistant";
-      content: string;
-      platform_msg_id?: string;
-      attachments?: WireAttachment[];
-    }
-  | {
-      kind: "work";
-      ordinal: number;
-      steps: WireWorkStepFrame[];
-    };
+/// One reconstructed step inside a REST `work` transcript row — the gateway's
+/// `ChatWorkStep` DTO. Note the REST field names (`tool_label` / `tool_status`
+/// / `tool_summary`), unlike the wire `WireWorkStepFrame` above.
+export type RestWorkStep = {
+  kind: "reasoning" | "prose" | "tool";
+  text?: string;
+  tool?: string;
+  tool_label?: string;
+  tool_status?: string;
+  tool_summary?: string;
+};
+
+/// One full-fidelity transcript row — the gateway's `ChatTranscriptItem` DTO,
+/// carried verbatim (unfiltered) by the native-synthesized `sync_page` and
+/// `history_page` frames. `id` is the stable render + redelivery-dedup key
+/// (`m<ordinal>` / `w<ordinal>` / `n<seq>`); `ordinal` is absent for notice /
+/// control rows (they are not ordinal-addressed).
+export type TranscriptRowItem = {
+  id: string;
+  ordinal?: number | null;
+  kind: "message" | "work" | "notice";
+  role?: string;
+  text?: string;
+  platform_msg_id?: string;
+  attachments?: WireAttachment[];
+  has_attachments?: boolean;
+  created_at?: string;
+  steps?: RestWorkStep[];
+  work_started_at?: string;
+  work_ended_at?: string;
+  cancelled?: boolean;
+  notice_level?: string;
+};
 
 /// A decrypted wire `Frame`, arriving as JSON text via `window.baybo.pushFrame`.
 /// MessagePack field names round-trip as snake_case JSON; we only model the few
@@ -70,36 +90,59 @@ export type WireFrame =
   | { kind: "reasoning"; text: string }
   | { kind: "tool_started"; call_id: string; tool: string; label?: string | null }
   | { kind: "tool_completed"; call_id: string; status: string; summary: string }
-  | { kind: "turn_state"; active: boolean }
+  // `started_at` is present iff `active` — it is the turn's identity for the
+  // SubscribeState staleness test and for re-opening a restored work block.
+  | { kind: "turn_state"; active: boolean; started_at?: string }
   // `transient: true` marks mid-turn progress narration (folded into the work
   // block); absent/false is a terminal notice (its own centered row).
   | { kind: "notice"; level: string; text: string; transient?: boolean }
-  // The in-flight turn's whole work block, sent on a mid-turn (re)subscribe
-  // so a client that reconnected (after backgrounding) recovers the reasoning /
-  // tool steps it missed. Idempotent snapshot — REPLACES the open block.
-  | { kind: "work_snapshot"; steps: WireWorkStepFrame[] }
-  | { kind: "reset"; reason: string }
+  // The one atomic state-plane bundle, sent right after every Subscribe: turn
+  // activity + the in-flight work block streamed so far (plus approvals/tasks,
+  // which have no iOS surface — ignored). Staleness of the turn/work halves is
+  // judged by turn identity (`turn.started_at`), never by cursor arithmetic.
+  | {
+      kind: "subscribe_state";
+      session_id: string;
+      as_of_ordinal?: number;
+      turn: { active: boolean; started_at?: string };
+      work_steps?: WireWorkStepFrame[];
+      pending_approvals?: unknown[];
+      tasks?: unknown[];
+    }
+  // The server dropped frames it owed this connection — run sync. (`session_id`
+  // is absent for unattributable loss; native additionally refetches the
+  // session list for that case.)
+  | { kind: "gap"; session_id?: string }
+  // Synthesized NATIVE-side (not a wire frame): one backward history page,
+  // rows verbatim `ChatTranscriptItem`s (unfiltered, keyed by row id).
   | {
       kind: "history_page";
-      messages: WireMessage[];
+      rows: TranscriptRowItem[];
       oldest_ordinal?: number | null;
       newest_ordinal?: number | null;
       has_more: boolean;
     }
   // Server-pushed standalone media a tool produced mid-turn (its own bubble).
   | { kind: "attachment"; user_id?: string; attachments?: WireAttachment[] }
-  // Synthesized NATIVE-side (not a wire frame): forward reconnect API merge.
-  // Carries missed completed work blocks plus matching final message rows.
+  // Synthesized NATIVE-side (not a wire frame): one sync page — the one
+  // forward-recovery pull. `since_ordinal` echoes the request's cursor so a
+  // baseline (`null`) REPLACE is distinguishable from a difference merge.
   | {
-      kind: "catch_up";
-      items: CatchUpItem[];
-      newest_ordinal?: number | null;
-      truncated: boolean;
+      kind: "sync_page";
+      rows: TranscriptRowItem[];
+      since_ordinal: number | null;
+      next_cursor: number | null;
+      rebased: boolean;
+      oldest_ordinal: number | null;
+      has_more_older: boolean;
     }
+  // Synthesized NATIVE-side (not a wire frame): a chatFetchSync API call
+  // failed, so the in-flight sync guard must unwind (the next trigger retries).
+  | { kind: "sync_failed"; error: string }
   // Synthesized NATIVE-side (not a wire frame): a chatFetchHistory API call
-  // failed, so the paging/reset guards armed for it must unwind.
+  // failed, so the paging guards armed for it must unwind.
   | { kind: "history_failed"; error: string }
-  // Frames we don't render (reasoning, tool progress, ping/pong, …) arrive with
+  // Frames we don't render (task_list, approvals, ping/pong, …) arrive with
   // other `kind`s and fall through the switch's `default`.
   | { kind: "other" };
 
@@ -143,8 +186,9 @@ export type WorkRow = {
 export type Row = ChatMsg | WorkRow;
 
 /// The transcript state mirrored to native over `{type:"persist"}` and handed
-/// back on the next launch as `init.restoredState`. `lastOrdinal` is the
-/// newest-edge catch-up cursor; `oldestOrdinal` the scroll-up paging cursor.
+/// back on the next launch as `init.restoredState` — a pure `{rows, cursor}`
+/// cache. `lastOrdinal` is the sync cursor (`null` = no baseline yet, never a
+/// sentinel number); `oldestOrdinal` the scroll-up paging cursor.
 export type PersistedState = {
   messages: Row[];
   lastOrdinal: number | null;

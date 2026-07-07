@@ -267,16 +267,13 @@ async fn chat_create_accepts_client_supplied_session_id() {
     assert_eq!(detail["session_id"].as_str(), Some(requested));
 }
 
-#[tokio::test]
-async fn chat_catch_up_api_returns_completed_work_before_reply() {
-    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
-
-    let state = build_admin_state(&tg);
-    let router = build_router(state.clone());
-
-    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+/// Seed one session with a completed tool-using turn:
+/// user(0, "run it") → tool_use(1) → tool_result(2) → reply(3, "done").
+async fn seed_tool_turn_session(
+    tg: &baybo_gateway::test_support::TestGateway,
+    router: &axum::Router,
+) -> String {
+    let cred = post(router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
     let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
     let sid = SessionId::from(session_id.as_str());
     let rows = [
@@ -298,49 +295,75 @@ async fn chat_catch_up_api_returns_completed_work_before_reply() {
             .await
             .expect("append");
     }
+    session_id
+}
 
-    let catch_up = get(
+#[tokio::test]
+async fn chat_sync_difference_is_full_fidelity_with_coverage_watermark() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+
+    // Difference from a cursor below the whole turn: full fidelity —
+    // the user bubble, the reconstructed work block, and the reply.
+    let sync = get(
         &router,
-        &format!("/v1/chat/sessions/{session_id}/catch-up?since_ordinal=-1"),
+        &format!("/v1/chat/sessions/{session_id}/sync?since_ordinal=-1"),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(catch_up["truncated"].as_bool(), Some(false));
-    let items = catch_up["items"].as_array().expect("items");
-    let kinds: Vec<&str> = items
+    assert_eq!(sync["rebased"].as_bool(), Some(false));
+    let rows = sync["rows"].as_array().expect("rows");
+    let kinds: Vec<&str> = rows
         .iter()
         .map(|item| item["kind"].as_str().expect("kind"))
         .collect();
     assert_eq!(
         kinds,
         vec!["message", "work", "message"],
-        "catch-up should interleave completed work before the final reply: {items:?}",
+        "sync difference carries work blocks like every other read path: {rows:?}",
     );
-    assert_eq!(items[0]["role"].as_str(), Some("user"));
-    assert_eq!(items[0]["content"].as_str(), Some("run it"));
-    assert_eq!(items[0]["platform_msg_id"].as_str(), Some("client-msg-1"));
-    assert_eq!(items[2]["role"].as_str(), Some("assistant"));
-    assert_eq!(items[2]["content"].as_str(), Some("done"));
-    assert_eq!(
-        items[1]["ordinal"].as_i64(),
-        items[2]["ordinal"].as_i64(),
-        "work item is keyed to the final reply ordinal",
-    );
-    let steps = items[1]["steps"].as_array().expect("work steps");
+    assert_eq!(rows[0]["role"].as_str(), Some("user"));
+    assert_eq!(rows[0]["platform_msg_id"].as_str(), Some("client-msg-1"));
+    assert_eq!(rows[0]["id"].as_str(), Some("m0"));
+    assert_eq!(rows[1]["id"].as_str(), Some("w1"));
+    let steps = rows[1]["steps"].as_array().expect("work steps");
     assert_eq!(steps.len(), 1);
-    assert_eq!(steps[0]["kind"].as_str(), Some("tool"));
     assert_eq!(steps[0]["tool"].as_str(), Some("Bash"));
-    assert_eq!(steps[0]["label"].as_str(), Some("echo hi"));
-    assert_eq!(steps[0]["status"].as_str(), Some("ok"));
+    assert_eq!(steps[0]["tool_status"].as_str(), Some("ok"));
+    assert_eq!(rows[2]["id"].as_str(), Some("m3"));
+    assert_eq!(rows[2]["text"].as_str(), Some("done"));
     assert_eq!(
-        catch_up["newest_ordinal"].as_i64(),
-        items[2]["ordinal"].as_i64(),
-        "cursor advances to the newest visible message row",
+        sync["next_cursor"].as_i64(),
+        Some(3),
+        "coverage watermark is the newest scanned ordinal"
     );
+    // Difference responses carry no backfill floor — the client keeps its own.
+    assert!(sync["oldest_ordinal"].is_null());
+    assert_eq!(sync["has_more_older"].as_bool(), Some(false));
+
+    // A caught-up cursor returns an empty page but still reports the
+    // watermark, never null (null means "empty session").
+    let idle = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/sync?since_ordinal=3"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(idle["rows"].as_array().map(Vec::len), Some(0));
+    assert_eq!(idle["next_cursor"].as_i64(), Some(3));
+    assert_eq!(idle["rebased"].as_bool(), Some(false));
 }
 
 #[tokio::test]
-async fn chat_catch_up_cursor_does_not_skip_internal_rows_before_reply() {
+async fn chat_sync_watermark_covers_invisible_tail() {
+    // Rows persisted after the last visible reply (internal/tool rows)
+    // must still advance the coverage watermark — otherwise every sync
+    // re-scans the invisible tail forever.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
@@ -369,20 +392,230 @@ async fn chat_catch_up_cursor_does_not_skip_internal_rows_before_reply() {
             .expect("append");
     }
 
-    let catch_up = get(
+    let sync = get(
         &router,
-        &format!("/v1/chat/sessions/{session_id}/catch-up?since_ordinal=-1"),
+        &format!("/v1/chat/sessions/{session_id}/sync?since_ordinal=-1"),
         StatusCode::OK,
     )
     .await;
-    let items = catch_up["items"].as_array().expect("items");
-    assert_eq!(items.len(), 1, "only the visible user row is returned");
-    assert_eq!(items[0]["kind"].as_str(), Some("message"));
+    let rows = sync["rows"].as_array().expect("rows");
+    // The unfinished turn reconstructs partially: the user bubble plus
+    // the open work block (no reply yet).
+    assert_eq!(rows[0]["kind"].as_str(), Some("message"));
     assert_eq!(
-        catch_up["newest_ordinal"].as_i64(),
-        items[0]["ordinal"].as_i64(),
-        "cursor must not advance past internal tool rows needed to reconstruct the later final reply",
+        sync["next_cursor"].as_i64(),
+        Some(2),
+        "watermark covers the invisible tool tail, not just visible rows",
     );
+}
+
+#[tokio::test]
+async fn chat_sync_baseline_and_rebase_replace_with_newest_page() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+
+    // No cursor → newest-page baseline, not marked rebased.
+    let baseline = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/sync"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(baseline["rebased"].as_bool(), Some(false));
+    assert_eq!(baseline["next_cursor"].as_i64(), Some(3));
+    assert_eq!(baseline["has_more_older"].as_bool(), Some(false));
+    assert_eq!(
+        baseline["rows"].as_array().map(Vec::len),
+        Some(3),
+        "baseline is the full-fidelity newest page"
+    );
+
+    // A difference wider than `limit` (counted in emitted rows: this
+    // turn emits 3) rebases onto the newest page instead.
+    let rebased = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/sync?since_ordinal=-1&limit=2"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(rebased["rebased"].as_bool(), Some(true));
+    assert_eq!(rebased["next_cursor"].as_i64(), Some(3));
+    let page = rebased["rows"].as_array().expect("rows");
+    assert!(!page.is_empty(), "rebase answers with the newest page");
+    assert_eq!(
+        rebased["oldest_ordinal"].as_i64(),
+        Some(2),
+        "REPLACE pages carry the backfill floor (limit=2 spans raw rows 2..3)"
+    );
+    assert_eq!(
+        rebased["has_more_older"].as_bool(),
+        Some(true),
+        "older history stays fetchable below the rebased baseline"
+    );
+}
+
+#[tokio::test]
+async fn chat_sync_redelivers_control_events_anchored_at_cursor() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+    let sid = SessionId::from(session_id.as_str());
+
+    // A notice written later, anchored at the newest ordinal (3) — an
+    // ordinal a caught-up client already holds.
+    tg.deps
+        .session_manager
+        .append_control_event(
+            &sid,
+            3,
+            baybo_model::ControlEventKind::NoticeInfo,
+            "compacted",
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("append control event");
+
+    // Sync from cursor 3 selects control events at `>=` the cursor, so
+    // the anchored-at-cursor notice is (re)delivered; the client dedups
+    // by its stable `n<seq>` id.
+    let sync = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/sync?since_ordinal=3"),
+        StatusCode::OK,
+    )
+    .await;
+    let rows = sync["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "the anchored notice re-delivers: {rows:?}");
+    assert_eq!(rows[0]["kind"].as_str(), Some("notice"));
+    assert_eq!(rows[0]["id"].as_str(), Some("n0"));
+    assert!(
+        rows[0]["ordinal"].is_null(),
+        "control events are not ordinal-addressed"
+    );
+    assert_eq!(rows[0]["text"].as_str(), Some("compacted"));
+}
+
+#[tokio::test]
+async fn chat_message_point_lookup_probes_durability() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+
+    let found = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/messages?platform_msg_id=client-msg-1"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(found["found"].as_bool(), Some(true));
+    assert_eq!(found["ordinal"].as_i64(), Some(0));
+
+    let absent = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/messages?platform_msg_id=never-sent"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(absent["found"].as_bool(), Some(false));
+    assert!(absent["ordinal"].is_null());
+
+    get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/messages?platform_msg_id="),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn chat_list_unread_count_reflects_read_cursor() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    // user(0) → tool_use(1) → tool_result(2) → final assistant reply(3, "done").
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+
+    let unread_of = |list: &Value| -> i64 {
+        list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|i| i["session_id"] == json!(session_id))
+            .expect("session in list")["unread_count"]
+            .as_i64()
+            .expect("unread_count")
+    };
+
+    // Nothing read yet: one unread final reply (the intermediate tool-using
+    // assistant row at ordinal 1 does NOT count — only the tool-free reply).
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert_eq!(unread_of(&list), 1, "one unread assistant reply");
+
+    // Mark read up to the newest ordinal → caught up.
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/read"),
+        Body::from(json!({ "ordinal": 3 }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert_eq!(unread_of(&list), 0, "read cursor cleared the badge");
+
+    // A new reply after the read cursor bumps it back to unread.
+    let sid = SessionId::from(session_id.as_str());
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &sid,
+            &ChatMessage::user(vec![ContentBlock::Text("again".into())]),
+        )
+        .await
+        .expect("append user");
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &sid,
+            &ChatMessage::assistant(vec![ContentBlock::Text("sure".into())]),
+        )
+        .await
+        .expect("append reply");
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert_eq!(unread_of(&list), 1, "a reply above the cursor is unread");
+
+    // Max-wins: a stale lower ordinal must not regress the cursor / re-hide.
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/read"),
+        Body::from(json!({ "ordinal": 5 }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/read"),
+        Body::from(json!({ "ordinal": 2 }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    assert_eq!(unread_of(&list), 0, "read cursor never regresses");
 }
 
 #[tokio::test]
@@ -647,8 +880,9 @@ fn build_admin_state(
         config_reloader: tg.deps.config_reloader.clone(),
         log_buffer: Arc::clone(&tg.deps.log_buffer),
         channel_bot_store: tg.deps.stores.channel_bot.clone(),
-        channel_control: Arc::clone(&tg.deps.channel_control),
+        agent_profile_store: tg.deps.stores.agent_profile.clone(),
         blob_store: tg.deps.stores.blob.clone(),
+        channel_control: Arc::clone(&tg.deps.channel_control),
         secret_vault: Arc::clone(&tg.deps.secret_vault),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     }

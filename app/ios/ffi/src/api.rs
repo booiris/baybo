@@ -131,6 +131,23 @@ pub struct ChatSessionSummary {
     pub last_user_text: Option<String>,
     pub pinned: bool,
     pub archived: bool,
+    /// Server-computed unread reply count (final assistant replies above this
+    /// session's read cursor), capped at 99. Accurate across a cold restart /
+    /// a device that missed the live `SessionActivity` pings — unlike a
+    /// client-local ping counter. `0` when caught up.
+    pub unread_count: i64,
+}
+
+/// Result of the per-send durability point lookup
+/// (`GET /v1/chat/sessions/{id}/messages?platform_msg_id=…`), consumed by the
+/// native outbox: `found: false` is a provable absence (the key was never
+/// persisted for this session) that lets the retry machine resume; `found:
+/// true` confirms durability without consuming a retry transmission.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MessageLookup {
+    pub found: bool,
+    /// Ordinal of the newest persisted row carrying the key, when found.
+    pub ordinal: Option<i64>,
 }
 
 /// A content-addressed attachment reference on an outbound message (already

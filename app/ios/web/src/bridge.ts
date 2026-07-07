@@ -9,10 +9,6 @@ export type InitPayload = {
   language: string;
   sessionId: string;
   restoredState: PersistedState | null;
-  /// True when the session already existed in the registry (opened from the list
-  /// or a push), false for a fresh compose draft. A listed session that mounts
-  /// with an empty transcript pulls its history from the gateway once connected.
-  listed: boolean;
   connEpoch: number;
 };
 
@@ -39,6 +35,10 @@ type BayboGlobal = {
   setLanguage(lang: string): void;
   setBottomInset(px: number): void;
   jumpToLatest(): void;
+  /// Native asks the transcript to run the sync loop with its current cursor
+  /// (offscreen buffer overflow re-attach; any native-side "go sync" edge).
+  /// The web side answers by posting `{type:"sync"}` back with the cursor.
+  requestSync(): void;
   /// Native invokes this just before it detaches the bridge (back-out) so the
   /// debounced transcript mirror is written up to that instant — otherwise
   /// steps delivered live since the last debounce sit in neither the mirror nor
@@ -97,8 +97,21 @@ export function postContentReady(): void {
   postSafe({ type: "shown" });
 }
 
-export function postOrdinal(lastOrdinal: number | null): void {
-  postSafe({ type: "ordinal", lastOrdinal });
+/// Run the one forward-recovery pull: native fetches
+/// `GET /v1/chat/sessions/{id}/sync?since_ordinal=…&limit=…` over the active
+/// leg and pushes the result back as a local `sync_page` frame (or
+/// `sync_failed` on error). `sinceOrdinal` is the transcript's cursor —
+/// `null` means "baseline me on the newest page".
+export function postSyncRequest(sinceOrdinal: number | null, limit: number): void {
+  post({ type: "sync", sinceOrdinal, limit });
+}
+
+/// Advance the server chat-list read cursor to `ordinal` — the viewer (looking
+/// at this transcript) has read up to here. Native forwards it to
+/// `chat_mark_read`; the unread badge clears on the next list pull. Best-effort
+/// (max-wins server-side), so a stale/duplicate marker is harmless.
+export function postMarkRead(ordinal: number): void {
+  postSafe({ type: "mark_read", ordinal });
 }
 
 // The jump-to-latest button is native (liquid glass, above the composer) —
@@ -219,6 +232,8 @@ export type TranscriptEvents = {
   bottomInset(px: number): void;
   /// The native jump-to-latest button was tapped — run the glide.
   jumpToLatest(): void;
+  /// Native asked for a sync run (buffer-overflow re-attach etc.).
+  syncRequested(): void;
 };
 
 type Buffered =
@@ -227,7 +242,8 @@ type Buffered =
   | { kind: "userSent"; payload: UserSentPayload }
   | { kind: "sendFailed"; msgId: string }
   | { kind: "bottomInset"; px: number }
-  | { kind: "jumpToLatest" };
+  | { kind: "jumpToLatest" }
+  | { kind: "syncRequested" };
 
 let initPayload: InitPayload | null = null;
 let onInitCb: ((payload: InitPayload) => void) | null = null;
@@ -268,6 +284,7 @@ function deliver(e: TranscriptEvents, item: Buffered): void {
   else if (item.kind === "userSent") e.userSent(item.payload);
   else if (item.kind === "sendFailed") e.sendFailed(item.msgId);
   else if (item.kind === "bottomInset") e.bottomInset(item.px);
+  else if (item.kind === "syncRequested") e.syncRequested();
   else e.jumpToLatest();
 }
 
@@ -315,6 +332,9 @@ window.baybo = {
   },
   jumpToLatest() {
     dispatch({ kind: "jumpToLatest" });
+  },
+  requestSync() {
+    dispatch({ kind: "syncRequested" });
   },
   flushPersist() {
     flushPersist();

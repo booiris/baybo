@@ -833,6 +833,14 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         // below; `None` keeps the no-op path (every memory hook skipped,
         // nothing billed).
         let memory: Option<Arc<dyn Memory>> = graph.memory.clone();
+        // Shared across every actor: the title pass notifies this sink once it
+        // has persisted a generated title, and it fans a `SessionUpdated` patch
+        // out to every Subscribed channel so the owning surface updates live.
+        let title_sink: Option<Arc<dyn baybo_agent::SessionTitleSink>> = Some(Arc::new(
+            baybo_gateway::channel::session_title::SessionTitleBroadcaster::new(Arc::clone(
+                &graph.channels_registry,
+            )),
+        ));
         Arc::new(
             move |session: baybo_model::Session,
                   initial_llm: Option<LlmEntryName>,
@@ -876,6 +884,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     sessions: Some(Arc::clone(&sessions)),
                     memory: memory.clone(),
                     task_store: task_store.clone(),
+                    title_sink: title_sink.clone(),
                 });
 
                 let span_recorder = Arc::new(SpanRecorder::new(

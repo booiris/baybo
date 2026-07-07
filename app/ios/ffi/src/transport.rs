@@ -137,11 +137,9 @@ pub(crate) trait ChatTransport: Send + Sync {
 
 /// A request handed to the pump task to build + seal + send on the live leg.
 enum OutboundCmd {
-    /// Subscribe this global leg to a session and request forward catch-up.
-    Subscribe {
-        session_id: String,
-        since_ordinal: Option<i64>,
-    },
+    /// Subscribe this global leg to a session. The server replays no history —
+    /// transcript recovery is the client's REST sync call.
+    Subscribe { session_id: String },
     /// A user message to send.
     Send {
         session_id: String,
@@ -224,14 +222,12 @@ impl SessionRegistry {
         &self,
         transport: &T,
         session_id: &str,
-        since_ordinal: Option<i64>,
         sink: Arc<dyn FrameSink>,
     ) -> Result<(), TransportError> {
         self.sinks.lock().await.insert(session_id.to_string(), sink);
 
         let subscribe = OutboundCmd::Subscribe {
             session_id: session_id.to_string(),
-            since_ordinal,
         };
         if self.try_enqueue(subscribe).await? {
             return Ok(());
@@ -240,7 +236,6 @@ impl SessionRegistry {
         let _connect = self.connect_lock.lock().await;
         let subscribe = OutboundCmd::Subscribe {
             session_id: session_id.to_string(),
-            since_ordinal,
         };
         if self.try_enqueue(subscribe).await? {
             return Ok(());
@@ -250,7 +245,6 @@ impl SessionRegistry {
 
         let subscribe = OutboundCmd::Subscribe {
             session_id: session_id.to_string(),
-            since_ordinal,
         };
         if self.try_enqueue(subscribe).await? {
             Ok(())
@@ -266,7 +260,6 @@ impl SessionRegistry {
         &self,
         transport: &T,
         session_id: &str,
-        since_ordinal: Option<i64>,
         sink: Arc<dyn FrameSink>,
         message: OutboundMessage,
     ) -> Result<(), TransportError> {
@@ -275,7 +268,6 @@ impl SessionRegistry {
         if self
             .try_enqueue_all(subscribe_and_send_cmds(
                 session_id,
-                since_ordinal,
                 &message.text,
                 &message.msg_id,
                 &message.attachments,
@@ -289,7 +281,6 @@ impl SessionRegistry {
         if self
             .try_enqueue_all(subscribe_and_send_cmds(
                 session_id,
-                since_ordinal,
                 &message.text,
                 &message.msg_id,
                 &message.attachments,
@@ -304,7 +295,6 @@ impl SessionRegistry {
         if self
             .try_enqueue_all(subscribe_and_send_cmds(
                 session_id,
-                since_ordinal,
                 &message.text,
                 &message.msg_id,
                 &message.attachments,
@@ -492,7 +482,6 @@ pub(crate) struct OutboundMessage {
 
 fn subscribe_and_send_cmds(
     session_id: &str,
-    since_ordinal: Option<i64>,
     text: &str,
     msg_id: &str,
     attachments: &[WireAttachment],
@@ -500,7 +489,6 @@ fn subscribe_and_send_cmds(
     [
         OutboundCmd::Subscribe {
             session_id: session_id.to_string(),
-            since_ordinal,
         },
         OutboundCmd::Send {
             session_id: session_id.to_string(),
@@ -537,11 +525,10 @@ pub(crate) async fn preconnect<L: SessionLeg>(leg: &L) -> Result<(), String> {
 pub(crate) async fn connect<L: SessionLeg>(
     leg: &L,
     session_id: String,
-    since_ordinal: Option<i64>,
     sink: Arc<dyn FrameSink>,
 ) -> Result<(), String> {
     leg.registry()
-        .connect(leg, &session_id, since_ordinal, sink)
+        .connect(leg, &session_id, sink)
         .await
         .map_err(|e| e.to_string())
 }
@@ -565,12 +552,11 @@ pub(crate) async fn send<L: SessionLeg>(
 pub(crate) async fn connect_and_send<L: SessionLeg>(
     leg: &L,
     session_id: String,
-    since_ordinal: Option<i64>,
     sink: Arc<dyn FrameSink>,
     message: OutboundMessage,
 ) -> Result<(), String> {
     leg.registry()
-        .connect_and_send(leg, &session_id, since_ordinal, sink, message)
+        .connect_and_send(leg, &session_id, sink, message)
         .await
         .map_err(|e| e.to_string())
 }
@@ -704,9 +690,9 @@ async fn run_pump(
                 // encode + chunk + send path (the codec hides Noise vs raw msgpack).
                 // `cmd_kind` survives for the log lines below (never the text).
                 let (frame, cmd_kind) = match cmd {
-                    Some(OutboundCmd::Subscribe { session_id, since_ordinal }) => {
+                    Some(OutboundCmd::Subscribe { session_id }) => {
                         (
-                            subscribe_frame(&session_id, since_ordinal),
+                            subscribe_frame(&session_id),
                             format!("subscribe session={session_id}"),
                         )
                     }

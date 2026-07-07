@@ -26,7 +26,6 @@ onInit((payload) => {
       <Transcript
         key={payload.sessionId}
         restored={payload.restoredState}
-        listed={payload.listed}
         initialConnEpoch={payload.connEpoch}
       />
     </React.StrictMode>,
@@ -43,7 +42,6 @@ if (!hasNativeBridge) {
     language: "en",
     sessionId: "dev",
     restoredState: null,
-    listed: false,
     connEpoch: 0,
   });
 }

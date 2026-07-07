@@ -31,6 +31,19 @@ pub enum JobInputKind {
     SubagentNotification,
 }
 
+/// Provenance for [`JobInput::System`] maintenance jobs.
+///
+/// This is persisted in `jobs.data`. Keep `#[serde(untagged)]` with
+/// `Compression` first so legacy `{"up_to_ordinal":N}` payloads still load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SystemJobPayload {
+    /// Background transcript compression / summary pass.
+    Compression(BackgroundCompressionPayload),
+    /// One-off pass that titles a conversation from its first user question.
+    TitleGeneration {},
+}
+
 /// Whether a job runs a full agent-loop turn or a one-shot maintenance
 /// pass. A turn drives the LLM↔tool loop on behalf of its session; a
 /// maintenance job (background compression, `/compact`) does focused
@@ -62,11 +75,10 @@ pub enum JobInput {
     Cron {
         action_payload: Value,
     },
-    /// A maintenance task. Currently the only wired system task is
-    /// background compression; if another shape lands later, this
-    /// variant's payload becomes an enum.
+    /// A maintenance task. The payload is provenance; the spawning code path
+    /// decides behaviour.
     System {
-        payload: BackgroundCompressionPayload,
+        payload: SystemJobPayload,
     },
     Spawned {
         initial_prompt: Vec<ContentBlock>,
@@ -130,7 +142,13 @@ mod tests {
         assert_eq!(i.input_kind(), JobInputKind::Cron);
 
         let i = JobInput::System {
-            payload: BackgroundCompressionPayload { up_to_ordinal: 0 },
+            payload: SystemJobPayload::Compression(BackgroundCompressionPayload {
+                up_to_ordinal: 0,
+            }),
+        };
+        assert_eq!(i.input_kind(), JobInputKind::System);
+        let i = JobInput::System {
+            payload: SystemJobPayload::TitleGeneration {},
         };
         assert_eq!(i.input_kind(), JobInputKind::System);
 
@@ -146,11 +164,43 @@ mod tests {
     #[test]
     fn input_round_trips_through_serde() {
         let i = JobInput::System {
-            payload: BackgroundCompressionPayload { up_to_ordinal: 0 },
+            payload: SystemJobPayload::Compression(BackgroundCompressionPayload {
+                up_to_ordinal: 0,
+            }),
         };
         let s = serde_json::to_string(&i).unwrap();
         let back: JobInput = serde_json::from_str(&s).unwrap();
         assert_eq!(back.input_kind(), i.input_kind());
+
+        let i = JobInput::System {
+            payload: SystemJobPayload::TitleGeneration {},
+        };
+        let s = serde_json::to_string(&i).unwrap();
+        let back: JobInput = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.input_kind(), i.input_kind());
+    }
+
+    #[test]
+    fn legacy_system_payload_without_variant_tag_still_loads_as_compression() {
+        let legacy = r#"{"kind":"system","payload":{"up_to_ordinal":7}}"#;
+        let back: JobInput = serde_json::from_str(legacy).expect("legacy System payload loads");
+        assert_eq!(back.input_kind(), JobInputKind::System);
+        assert!(matches!(
+            back,
+            JobInput::System {
+                payload: SystemJobPayload::Compression(BackgroundCompressionPayload {
+                    up_to_ordinal: 7
+                })
+            }
+        ));
+        let title = r#"{"kind":"system","payload":{}}"#;
+        let back: JobInput = serde_json::from_str(title).expect("title System payload loads");
+        assert!(matches!(
+            back,
+            JobInput::System {
+                payload: SystemJobPayload::TitleGeneration {}
+            }
+        ));
     }
 
     #[test]

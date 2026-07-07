@@ -2,6 +2,8 @@
 
 #[path = "admin_has_no_channels.rs"]
 mod admin_has_no_channels;
+#[path = "agents_api.rs"]
+mod agents_api;
 #[path = "auth.rs"]
 mod auth;
 #[path = "channel_ws.rs"]

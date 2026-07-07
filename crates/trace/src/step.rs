@@ -73,6 +73,8 @@ pub enum StepKind {
     /// progress for the user (the progress-observer Notice). Read-only:
     /// it reuses the turn's context but never writes back to it.
     ProgressObserver,
+    /// Conversation-title generation.
+    TitleGeneration,
 }
 
 impl StepKind {
@@ -84,6 +86,7 @@ impl StepKind {
             StepKind::MemoryWrite => "memory_write",
             StepKind::SkillSelection => "skill_selection",
             StepKind::ProgressObserver => "progress_observer",
+            StepKind::TitleGeneration => "title_generation",
         }
     }
 }

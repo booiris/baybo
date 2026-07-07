@@ -439,6 +439,11 @@ pub struct AgentLoop {
     /// token can't kill an in-flight pass — mirrors
     /// [`Self::spawn_session_end_write`].
     bg_compression: Option<tokio::task::JoinHandle<()>>,
+    /// Once-per-actor title-generation guard. Durable `Session.title`
+    /// prevents repeats after rehydration.
+    title_generation: Option<tokio::task::JoinHandle<()>>,
+    /// Live-title broadcaster. `None` disables title generation.
+    title_sink: Option<Arc<dyn crate::runtime::title::SessionTitleSink>>,
     /// Read-before-write tracker for this session's `Edit`/`Write` tools.
     /// Lives for the actor's lifetime so a `Read` in one turn satisfies an
     /// `Edit` in a later turn, and is threaded into every tool call via
@@ -476,6 +481,8 @@ pub struct AgentLoopConfig {
     /// Durable per-session planning-checklist store backing the `Task*` tools
     /// and the per-turn reminder.
     pub task_store: Arc<dyn baybo_store::TaskStore>,
+    /// Live-title broadcaster. `None` disables title generation.
+    pub title_sink: Option<Arc<dyn crate::runtime::title::SessionTitleSink>>,
 }
 
 /// Task-reminder throttle (mirrors Claude Code's `TODO_REMINDER_CONFIG`): the
@@ -513,6 +520,7 @@ impl AgentLoop {
             sessions,
             memory,
             task_store,
+            title_sink,
         } = config;
         let (llm_client, _effective_name) = llm_pool.read().resolve(initial_llm.as_ref());
         let mut context_manager = context_manager;
@@ -536,6 +544,8 @@ impl AgentLoop {
             last_task_management_turn: 0,
             last_reminder_turn: 0,
             bg_compression: None,
+            title_generation: None,
+            title_sink,
             read_tracker: ReadTracker::default(),
         }
     }
@@ -691,6 +701,7 @@ impl AgentLoop {
         // Memory recall query (and write eligibility) for this job — `None`
         // for kinds that don't participate (System / Spawned / notification).
         let memory_query = memory_recall_query(&job_input);
+        let is_user_turn = matches!(job_input.input_kind(), baybo_job::JobInputKind::UserChat);
         let spec = JobSpec {
             session_id: session.id.clone(),
             origin: session.trigger.kind(),
@@ -727,6 +738,7 @@ impl AgentLoop {
                         cancel_token,
                         interjections,
                         memory_query,
+                        is_user_turn,
                     )
                     .await?;
                 let output = JobOutput::Message {
@@ -768,8 +780,17 @@ impl AgentLoop {
         cancel_token: CancellationToken,
         mut interjections: Option<&mut dyn InterjectionSource>,
         memory_query: Option<Vec<ContentBlock>>,
+        is_user_turn: bool,
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
         self.context_manager.ensure_seeded().await;
+
+        // Seed the conversation title from the user's first question NOW, at the
+        // start of the turn, so the (detached) title pass runs concurrently with
+        // this turn's answer instead of waiting for it — the title depends only
+        // on the question, which is already in context, not on the reply. Once
+        // per session; fire-and-forget, so it never blocks the turn.
+        self.maybe_generate_title(session, job_lifecycle, span_recorder, job_id, is_user_turn)
+            .await;
 
         // Tool-authored notices (`AgentEvent::Notice`) ride the job-wide
         // delta_tx directly, not the per-iteration `iter_delta_tx`: they
@@ -2641,7 +2662,7 @@ impl AgentLoop {
                 // A compression pass, not an agent-loop turn.
                 shape: JobShape::Maintenance,
                 input: baybo_job::JobInput::System {
-                    payload: payload.clone(),
+                    payload: baybo_job::SystemJobPayload::Compression(payload.clone()),
                 },
                 // Parent the maintenance job under the triggering turn's job.
                 parent_job_id: Some(current_job_id),
@@ -2676,6 +2697,209 @@ impl AgentLoop {
             }
         });
         self.bg_compression = Some(handle);
+    }
+
+    /// One-shot conversation-title seed. Called at the **start** of
+    /// `run_inner` (right after the system prompt is seeded, before the first
+    /// LLM call), so the title pass runs **concurrently with this turn's
+    /// answer** rather than after it — the title depends only on the user's
+    /// first question, which is already in context, not on the reply. It
+    /// `tokio::spawn`s a DETACHED pass (own `Maintenance` job + a fresh
+    /// [`CancellationToken`], so an idle reap can't abort it — mirrors
+    /// [`Self::maybe_run_background_compression`]) that titles the session,
+    /// persists it via `SessionManager::set_title`, and notifies the
+    /// [`Self::title_sink`] to broadcast it. Fire-and-forget: the turn never
+    /// blocks on it.
+    ///
+    /// **Gate (all must hold):** the turn is `UserChat`; a
+    /// [`Self::title_sink`] is wired (the "a live title surface exists" signal
+    /// — present in the running gateway, absent in tests / headless, so
+    /// titles are only generated where something renders them); the session is
+    /// a top-level user session (`TriggerSource::User`, no lineage — cron /
+    /// subagent skipped); it has no title yet (`session.title.is_none()`, the
+    /// durable once-only guard, self-healing across rehydration); this actor
+    /// hasn't already attempted one ([`Self::title_generation`] present, the
+    /// per-actor-lifetime guard); and the transcript has a text-bearing first
+    /// user question ([`first_user_question`]).
+    async fn maybe_generate_title(
+        &mut self,
+        session: &Session,
+        job_lifecycle: &Arc<JobLifecycle>,
+        span_recorder: &Arc<SpanRecorder>,
+        current_job_id: JobId,
+        is_user_turn: bool,
+    ) {
+        if !is_user_turn || self.title_generation.is_some() {
+            return;
+        }
+        if !matches!(session.trigger, baybo_model::TriggerSource::User)
+            || session.lineage.is_some()
+            || session.title.is_some()
+        {
+            return;
+        }
+        let Some(title_sink) = self.title_sink.clone() else {
+            return;
+        };
+        let Some(sessions) = self.sessions.clone() else {
+            return;
+        };
+        let Some(question) = first_user_question(self.context_manager.messages()) else {
+            return;
+        };
+
+        let session_id = session.id.clone();
+        let origin = session.trigger.kind();
+        let user_id = session.user.id.clone();
+        let llm_client = self.llm_client.clone();
+        let security_gateway = self.security_gateway.clone();
+        let model_info = self.llm_client.model_info().clone();
+        let recorder = Arc::clone(span_recorder);
+        let job_lifecycle = Arc::clone(job_lifecycle);
+
+        let cancel_token = CancellationToken::new();
+
+        let handle = tokio::spawn(async move {
+            let runner_session_id = session_id.clone();
+            let spec = JobSpec {
+                session_id,
+                origin,
+                shape: JobShape::Maintenance,
+                input: baybo_job::JobInput::System {
+                    payload: baybo_job::SystemJobPayload::TitleGeneration {},
+                },
+                parent_job_id: Some(current_job_id),
+            };
+            let result = crate::runtime::scope::with_job(
+                &job_lifecycle,
+                cancel_token.clone(),
+                spec,
+                move |job_id| async move {
+                    let runner = crate::runtime::title::TitleRunner {
+                        llm_client,
+                        recorder,
+                        security_gateway,
+                        job_id,
+                        user_id,
+                        session_id: runner_session_id.clone(),
+                        model_info,
+                        cancel_token,
+                    };
+                    let title = runner.run(question).await?;
+                    let titled = match title {
+                        Some(title) => {
+                            match sessions.set_title(&runner_session_id, Some(&title)).await {
+                                Ok(()) => {
+                                    title_sink.title_updated(&runner_session_id, &title);
+                                    true
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        session_id = %runner_session_id,
+                                        error = %e,
+                                        "failed to persist session title"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        None => false,
+                    };
+                    let value = serde_json::json!({ "titled": titled });
+                    Ok((baybo_job::JobOutput::Structured { value }, ()))
+                },
+            )
+            .await;
+            if let Err(e) = result {
+                warn!(error = %e, "title generation pass failed");
+            }
+        });
+        self.title_generation = Some(handle);
+    }
+}
+
+/// Extract the session's first genuine user question from the transcript:
+/// the first `MessageSource::User` row that actually carries text (a
+/// media-only opener — an uncaptioned image with no `Text` block — is
+/// skipped, so a session that opens with media then a real question still
+/// titles from the question). `None` when there is no text-bearing user row.
+fn first_user_question(messages: &[ChatMessage]) -> Option<String> {
+    messages
+        .iter()
+        .filter(|m| matches!(m.source(), baybo_model::MessageSource::User))
+        .find_map(|m| {
+            let text = m
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        })
+}
+
+#[cfg(test)]
+mod first_user_question_tests {
+    use super::first_user_question;
+    use baybo_model::{ChatMessage, ContentBlock};
+
+    #[test]
+    fn picks_first_genuine_user_row_over_injected_and_assistant() {
+        let msgs = vec![
+            ChatMessage::system(vec![ContentBlock::Text("system prompt".into())]),
+            ChatMessage::user(vec![ContentBlock::Text(
+                "How do I reset my password?".into(),
+            )]),
+            ChatMessage::assistant(vec![ContentBlock::Text("Sure…".into())]),
+            ChatMessage::user(vec![ContentBlock::Text("second question".into())]),
+        ];
+        assert_eq!(
+            first_user_question(&msgs).as_deref(),
+            Some("How do I reset my password?")
+        );
+    }
+
+    #[test]
+    fn skips_agent_injected_role_user_rows() {
+        let msgs = vec![
+            ChatMessage::agent_context(vec![ContentBlock::Text("injected context".into())]),
+            ChatMessage::user(vec![ContentBlock::Text("the real question".into())]),
+        ];
+        assert_eq!(
+            first_user_question(&msgs).as_deref(),
+            Some("the real question")
+        );
+    }
+
+    #[test]
+    fn none_when_no_user_row_or_media_only() {
+        let no_user = vec![ChatMessage::system(vec![ContentBlock::Text("s".into())])];
+        assert_eq!(first_user_question(&no_user), None);
+
+        let media_only = vec![ChatMessage::user(vec![ContentBlock::Text(String::new())])];
+        assert_eq!(first_user_question(&media_only), None);
+    }
+
+    #[test]
+    fn advances_past_a_media_only_opener_to_the_first_text_question() {
+        let msgs = vec![
+            ChatMessage::user(vec![ContentBlock::Text(String::new())]),
+            ChatMessage::user(vec![ContentBlock::Text(
+                "How do I reset my password?".into(),
+            )]),
+        ];
+        assert_eq!(
+            first_user_question(&msgs).as_deref(),
+            Some("How do I reset my password?")
+        );
     }
 }
 
@@ -3071,6 +3295,7 @@ mod session_end_gate_tests {
             pinned: false,
             archived: false,
             folder_id: None,
+            title: None,
         }
     }
 

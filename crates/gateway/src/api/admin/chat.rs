@@ -8,10 +8,14 @@
 //! * `GET /v1/chat/sessions` — list the request identity's chat sessions
 //!   (newest first). Hidden sessions are filtered out unless the
 //!   `include_hidden=true` query is set.
-//! * `GET /v1/chat/sessions/:id` — session detail + transcript history.
-//! * `GET /v1/chat/sessions/:id/catch-up` — forward reconnect catch-up for
-//!   device transcripts (`since_ordinal` → missed visible rows + completed work
-//!   blocks).
+//! * `GET /v1/chat/sessions/:id` — session detail + transcript history
+//!   (backward paging / backfill via `before_ordinal`).
+//! * `GET /v1/chat/sessions/:id/sync` — the one forward-recovery pull:
+//!   full-fidelity transcript rows after a cursor (or the newest-page
+//!   baseline when the cursor is absent), with rebase semantics when the
+//!   difference would exceed the requested limit.
+//! * `GET /v1/chat/sessions/:id/messages?platform_msg_id=…` — per-send
+//!   durability point lookup for the client outbox.
 //! * `DELETE /v1/chat/sessions/:id` — **hide** the session from the
 //!   chat list. The row and transcript stay live; admin / trace
 //!   surfaces still see it. Reversible via
@@ -65,10 +69,12 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(create_session))
         .routes(routes!(list_sessions))
         .routes(routes!(get_session))
-        .routes(routes!(catch_up_session))
+        .routes(routes!(sync_session))
+        .routes(routes!(lookup_session_message))
         .routes(routes!(set_session_model))
         .routes(routes!(set_session_pin))
         .routes(routes!(set_session_archive))
+        .routes(routes!(mark_session_read))
         .routes(routes!(set_session_folder))
         .routes(routes!(delete_session))
         .routes(routes!(unhide_session))
@@ -98,20 +104,33 @@ pub struct ListSessionsQuery {
 
 /// Default page size for reverse transcript pagination — large enough
 /// that a typical chat fits in one round-trip, small enough that a
-/// thousand-turn session doesn't ship in full on the initial GET.
+/// thousand-turn session doesn't ship in full on the initial GET. Also
+/// the default sync page: clients pass this for baseline/cold opens
+/// (where `since` is absent and the page is a REPLACE by definition).
 pub const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// Hard cap so a misbehaving (or curious) client can't ask for the
-/// whole transcript by passing `limit=999999`.
+/// whole transcript by passing `limit=999999`. Shared by history paging
+/// and sync — clients pass it explicitly when merging a sync difference
+/// into an already-rendered thread (a rebase is a REPLACE, so
+/// incremental merge is preferred all the way to the cap).
 pub const MAX_HISTORY_LIMIT: usize = 200;
-/// Default page size for forward reconnect catch-up. Kept aligned with
-/// reverse history so one reconnect fills the same row budget as one reset
-/// refetch.
-pub const DEFAULT_CATCH_UP_LIMIT: usize = DEFAULT_HISTORY_LIMIT;
+/// How many raw persisted rows a sync difference scan may cover per
+/// emitted-row `limit` before giving up and rebasing. The rebase test
+/// counts *emitted* transcript rows (an agentic turn persists hundreds
+/// of invisible tool rows per handful of visible ones), so the raw scan
+/// needs its own bound to keep a pathological gap from an unbounded
+/// walk; hitting the bound also rebases.
+const SYNC_SCAN_BOUND_MULTIPLIER: usize = 10;
 
 /// Maximum length of the truncated preview the sidebar shows for each
 /// session. Sized to fit a 260px-wide sidebar row at the web client's
 /// font without wrapping; the client may truncate further with CSS.
 const PREVIEW_MAX_CHARS: usize = 120;
+
+/// Ceiling for the chat-list unread badge. A session with more unread replies
+/// than this reports exactly this, and the client renders it as "N+". Bounds
+/// the per-session count scan (see `SessionManager::unread_reply_count`).
+const UNREAD_COUNT_CAP: usize = 99;
 
 /// Default page size for the cron-messages list. Tuned to roughly
 /// match what the right-side panel renders before the user scrolls.
@@ -143,18 +162,29 @@ pub struct GetSessionQuery {
     pub limit: Option<usize>,
 }
 
-/// Query string for `GET /v1/chat/sessions/{session_id}/catch-up`. Forward-
-/// paginates the active transcript for reconnect merge: the response contains
-/// rows whose persisted ordinal is strictly greater than `since_ordinal`.
+/// Query string for `GET /v1/chat/sessions/{session_id}/sync` — the one
+/// forward-recovery pull. `since_ordinal` is the client's cursor; absent
+/// means "baseline me on the newest page".
 #[derive(Debug, Default, Deserialize, IntoParams)]
-pub struct CatchUpSessionQuery {
-    /// Newest durable ordinal the client has already rendered.
-    pub since_ordinal: i64,
-    /// Maximum rows to scan. Defaults to [`DEFAULT_CATCH_UP_LIMIT`], clamped to
-    /// [`MAX_HISTORY_LIMIT`]. If the gap is larger, the response is marked
-    /// `truncated` and carries no partial middle slice.
+pub struct SyncSessionQuery {
+    /// Highest coverage watermark the client holds for this session.
+    /// Omit for the newest-page baseline (cold start, fresh install,
+    /// no local cursor).
+    #[serde(default)]
+    pub since_ordinal: Option<i64>,
+    /// Maximum transcript rows to return, counted in *emitted* rows.
+    /// Defaults to [`DEFAULT_HISTORY_LIMIT`], clamped to
+    /// [`MAX_HISTORY_LIMIT`]. A difference larger than this rebases.
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+/// Query string for `GET /v1/chat/sessions/{session_id}/messages` — the
+/// per-send durability point lookup.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct MessageLookupQuery {
+    /// Client-generated send idempotency key to probe.
+    pub platform_msg_id: String,
 }
 
 // ── DTOs ─────────────────────────────────────────────────────────────
@@ -226,14 +256,22 @@ pub enum WorkStepKind {
 /// [`reconstruct_transcript`]).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatTranscriptItem {
-    /// React key for the row. For `message` / `work` items it is the
-    /// `session_messages.ordinal` (a `work` item carries the turn's first
-    /// intermediate ordinal so it sorts just after the user turn). For a
-    /// `notice` / control-echo item it is a **synthetic negative value** in a
-    /// key space disjoint from real ordinals — so the client must NOT use it for
-    /// pagination / cursor seeding; see `ChatSessionDetail::oldest_ordinal` /
-    /// `newest_ordinal`.
-    pub ordinal: i64,
+    /// Stable row id, unique within the session and identical on every
+    /// redelivery (sync, backfill): `m<ordinal>` for a message,
+    /// `w<ordinal>` for a work block, `n<seq>` for a control-event row.
+    /// This is the client's render key AND redelivery dedup key.
+    pub id: String,
+    /// `session_messages.ordinal` for ordinal-addressed rows: a
+    /// `message` carries its own; a `work` item carries the turn's
+    /// first intermediate ordinal so it sorts just after the user turn.
+    /// **Absent for `notice` / control-echo items** — control events
+    /// are not ordinal-addressed (they anchor at an ordinal and are
+    /// keyed by their own per-session `seq`, baked into [`Self::id`]).
+    /// Clients must not use this for pagination / cursor seeding; see
+    /// `ChatSessionDetail::oldest_ordinal` / `newest_ordinal` and
+    /// `ChatSyncResponse::next_cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<i64>,
     /// Message bubble vs. reconstructed work block.
     pub kind: TranscriptItemKind,
     /// `"user"` or `"assistant"` (or `"system"`). String rather than
@@ -246,6 +284,13 @@ pub struct ChatTranscriptItem {
     /// `true` when this row had non-text content (image / audio /
     /// file). The web client currently shows a placeholder.
     pub has_attachments: bool,
+    /// Client-generated send idempotency key for a user `message` row,
+    /// when the send carried one. Every redelivery (sync, backfill)
+    /// carries it so the client outbox can match durability
+    /// confirmations and dedup redelivered rows against the live echo.
+    /// Empty for rows without one (assistant replies, work, notices).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub platform_msg_id: String,
     /// Blob attachments for message items. This mirrors the chat WS attachment
     /// shape so native clients can rebuild historical image/file bubbles from
     /// the REST transcript.
@@ -310,82 +355,49 @@ impl From<WireAttachment> for ChatAttachment {
     }
 }
 
-/// Discriminator for [`ChatCatchUpItem`] — serialized as
-/// `"message"` / `"work"`.
+/// Response from `GET /v1/chat/sessions/{session_id}/sync` — the one
+/// forward-recovery pull. Full-fidelity on every path: rows carry work
+/// blocks and notices exactly like the history surface.
 #[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CatchUpItemKind {
-    Message,
-    Work,
+pub struct ChatSyncResponse {
+    /// Transcript rows (message | work | notice), ascending. On a
+    /// baseline / rebased response this is the newest page and REPLACEs
+    /// the client's thread; on a difference response it appends/merges.
+    pub rows: Vec<ChatTranscriptItem>,
+    /// Coverage watermark: the highest persisted ordinal the scan
+    /// covered, visible or not — it may exceed every row in `rows`
+    /// (invisible tool/system tail). This, not any row's ordinal, is
+    /// what advances the client cursor (`max`-wins). `null` iff the
+    /// session has no persisted rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<i64>,
+    /// `true` ⇒ `rows` is the NEWEST page, not the requested difference
+    /// (the difference exceeded `limit` in emitted rows, or the raw
+    /// scan bound). The client REPLACEs its thread with the page and
+    /// treats its cursor as rebase-dirty until one non-rebased sync
+    /// completes.
+    pub rebased: bool,
+    /// Page floor for lazy backfill after a REPLACE (baseline /
+    /// rebase). Absent on a difference response — the client keeps its
+    /// own floor when merging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_ordinal: Option<i64>,
+    /// Whether older history exists below `oldest_ordinal` (REPLACE
+    /// responses only; always `false` on a difference response).
+    pub has_more_older: bool,
 }
 
-/// One work step in the forward catch-up API. This intentionally mirrors
-/// `wire::WireWorkStep`'s JSON field names (not the REST transcript's
-/// `tool_label` / `tool_status` names) because the device transcript reuses the
-/// live `WorkSnapshot` renderer for catch-up work blocks.
+/// Response from `GET /v1/chat/sessions/{session_id}/messages` — the
+/// per-`platform_msg_id` durability probe. `found: false` is a provable
+/// absence (the key was never persisted for this session), which lets
+/// the client outbox resume its retry machine; `found: true` confirms
+/// durability without consuming a retry transmission.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct ChatCatchUpWorkStep {
-    pub kind: WorkStepKind,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub text: String,
+pub struct ChatMessageLookup {
+    pub found: bool,
+    /// Ordinal of the newest persisted row carrying the key, when found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-}
-
-impl From<WireWorkStep> for ChatCatchUpWorkStep {
-    fn from(step: WireWorkStep) -> Self {
-        let kind = match step.kind {
-            WireWorkStepKind::Reasoning => WorkStepKind::Reasoning,
-            WireWorkStepKind::Prose => WorkStepKind::Prose,
-            WireWorkStepKind::Tool => WorkStepKind::Tool,
-        };
-        Self {
-            kind,
-            text: step.text,
-            tool: step.tool,
-            label: step.label,
-            status: step.status,
-            summary: step.summary,
-        }
-    }
-}
-
-/// Forward reconnect item for native device clients. The sequence is ordered by
-/// persisted ordinal; a completed tool-using assistant reply appears as a
-/// `work` item followed by the matching `message` item with the same `ordinal`.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ChatCatchUpItem {
-    pub kind: CatchUpItemKind,
-    pub ordinal: i64,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub role: String,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub platform_msg_id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<ChatAttachment>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub steps: Vec<ChatCatchUpWorkStep>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ChatCatchUpResponse {
-    pub items: Vec<ChatCatchUpItem>,
-    /// Newest visible message ordinal included in `items`. Internal tool /
-    /// thinking rows are deliberately not exposed as the cursor, because a
-    /// later final answer may still need them to reconstruct its completed work
-    /// block.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub newest_ordinal: Option<i64>,
-    /// True when the requested gap exceeds the catch-up cap. The client should
-    /// discard this partial answer and rebuild from the normal history API.
-    pub truncated: bool,
+    pub ordinal: Option<i64>,
 }
 
 /// One reconstructed step inside a `work` transcript item — the durable
@@ -509,6 +521,9 @@ pub struct ChatSessionDetail {
     /// initial selection. Set via `PUT /v1/chat/sessions/{id}/model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_llm: Option<String>,
+    /// Auto-generated conversation title, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -543,6 +558,16 @@ pub struct ChatSessionSummary {
     /// sidebar groups rows by this id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<String>,
+    /// Number of unread assistant replies — final assistant messages persisted
+    /// with `ordinal` above this session's read cursor
+    /// (`PUT /v1/chat/sessions/{id}/read`), capped at [`UNREAD_COUNT_CAP`]
+    /// (the client renders the cap as "N+"). Server-computed, so it is
+    /// accurate across a cold restart / a device that missed the live
+    /// `SessionActivity` pings. `0` when caught up.
+    pub unread_count: i64,
+    /// Auto-generated conversation title, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -645,12 +670,14 @@ async fn create_session(
     let user = chat_user(authed);
     let channel_type = chat_list_channel(authed);
     let session =
-        create_or_load_chat_session(&state, requested.session_id, user, channel_type).await?;
+        create_or_load_chat_session(&state, requested.session_id, user, channel_type.clone())
+            .await?;
     let session_id = session.id.clone();
     // Created emits a full patch — sibling tabs construct the row
     // straight from this without a list refetch.
     broadcast_session_patch(
         &state,
+        &channel_type,
         &session_id,
         SessionPatch {
             created_at: Some(session.created_at),
@@ -662,6 +689,7 @@ async fn create_session(
             // no change, which a newly-constructed client row renders as
             // uncategorized.
             folder_id: None,
+            title: None,
         },
     );
     Ok(Json(ChatSessionCreated {
@@ -720,10 +748,26 @@ async fn list_sessions(
         async move { last_user_preview(&manager, &sid).await }
     }))
     .await;
+    // Fan out the per-session unread count the same way: bounded read-cursor
+    // scans, concurrent, each degrading to `0` on error so one bad row can't
+    // fail the whole list. Server-computed so it survives a cold restart and
+    // is consistent across devices (unlike a client-local ping counter).
+    let unread_counts = futures::future::join_all(visible.iter().map(|s| {
+        let manager = state.session_manager.clone();
+        let sid = s.id.clone();
+        async move {
+            manager
+                .unread_reply_count(&sid, UNREAD_COUNT_CAP)
+                .await
+                .unwrap_or(0)
+        }
+    }))
+    .await;
     let items: Vec<ChatSessionSummary> = visible
         .into_iter()
         .zip(previews)
-        .map(|(s, last_user_text)| ChatSessionSummary {
+        .zip(unread_counts)
+        .map(|((s, last_user_text), unread)| ChatSessionSummary {
             session_id: s.id.to_string(),
             created_at: s.created_at,
             last_active: s.last_active,
@@ -732,6 +776,8 @@ async fn list_sessions(
             archived: s.archived,
             last_user_text,
             folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
+            unread_count: unread as i64,
+            title: s.title.clone(),
         })
         .collect();
     Ok(Json(ChatSessionsList { items }))
@@ -764,13 +810,53 @@ async fn get_session(
         .limit
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .clamp(1, MAX_HISTORY_LIMIT);
+    let page = build_history_page(&state, &sid, &session, query.before_ordinal, limit).await?;
+    Ok(Json(ChatSessionDetail {
+        session_id,
+        created_at: session.created_at,
+        last_active: session.last_active,
+        hidden: session.hidden,
+        transcript: page.transcript,
+        has_more: page.has_more,
+        oldest_ordinal: page.oldest_ordinal,
+        newest_ordinal: page.newest_ordinal,
+        last_llm: session.state.last_llm.as_ref().map(|n| n.to_string()),
+        title: session.title.clone(),
+    }))
+}
+
+/// One reconstructed transcript page plus its real bounds. Shared by the
+/// backward-paging `GET /chat/sessions/{id}` surface and sync's
+/// baseline / rebase path (which is the same newest page by definition).
+struct HistoryPage {
+    transcript: Vec<ChatTranscriptItem>,
+    has_more: bool,
+    oldest_ordinal: Option<i64>,
+    newest_ordinal: Option<i64>,
+}
+
+/// Rebuild one full-fidelity transcript page: user/assistant bubbles AND
+/// the collapsed per-turn work blocks (reasoning, tool calls + results,
+/// mid-turn narration) from the persisted messages, with out-of-band
+/// control events interleaved at their anchors. Internal turns
+/// (Role::System, agent-injected Role::User with `from_user=false`) are
+/// dropped; tool-use iterations are folded into a `work` item rather
+/// than surfaced as stray bubbles. Fidelity is a property of the data,
+/// not the path that fetched it — every read surface goes through here.
+async fn build_history_page(
+    state: &AdminState,
+    sid: &SessionId,
+    session: &Session,
+    before_ordinal: Option<i64>,
+    limit: usize,
+) -> Result<HistoryPage> {
     // Over-fetch by one row so we can answer `has_more` without an
     // extra COUNT — if the store returned `limit + 1` rows, there's at
     // least one older row beyond the window, and we drop the extra
     // before serialising.
     let mut tail = state
         .session_manager
-        .history_tail(&sid, query.before_ordinal, limit + 1)
+        .history_tail(sid, before_ordinal, limit + 1)
         .await
         .map_err(|e| GatewayError::Internal(format!("load history tail: {e}")))?;
     let has_more = tail.len() > limit;
@@ -780,17 +866,8 @@ async fn get_session(
         // (it would be the start of the next-older page).
         tail.remove(0);
     }
-    // Rebuild user/assistant bubbles AND the collapsed per-turn work
-    // blocks (reasoning, tool calls + results, mid-turn narration) from
-    // the persisted messages. Internal turns (Role::System, agent-
-    // injected Role::User with `from_user=false`) are dropped; tool-use
-    // iterations are folded into a `work` item rather than surfaced as
-    // stray bubbles. The WS catch-up path
-    // (`channel::route::chat_to_visible_wire_message`) still replays only
-    // the message bubbles — a full reload through here is what restores
-    // the work blocks.
-    // Real page bounds (control-event items carry synthetic negative ordinals,
-    // so the client can't infer these from the transcript — it gets them here).
+    // Real page bounds (control-event items carry no ordinal, so the
+    // client can't infer these from the transcript — it gets them here).
     let oldest_ordinal = tail.first().map(|(o, _, _)| *o);
     let newest_ordinal = tail.last().map(|(o, _, _)| *o);
     let attachment_map = transcript_attachments(&tail, state.blob_store.as_ref()).await;
@@ -802,7 +879,7 @@ async fn get_session(
     let control_events: Vec<ControlEvent> = match (oldest_ordinal, newest_ordinal) {
         (Some(first), Some(last)) => {
             let lower = if has_more { first } else { i64::MIN };
-            match state.session_manager.list_control_events(&sid).await {
+            match state.session_manager.list_control_events(sid).await {
                 Ok(events) => events
                     .into_iter()
                     .filter(|ev| ev.after_ordinal >= lower && ev.after_ordinal <= last)
@@ -819,10 +896,10 @@ async fn get_session(
     // turn, so only there does aligning the trailing work block's start with
     // the live `TurnState` matter. Best-effort: a lookup miss just leaves the
     // message-timestamp start (the worst case is the pre-existing split).
-    let active_turn_started = if query.before_ordinal.is_none() {
+    let active_turn_started = if before_ordinal.is_none() {
         state
             .job_lifecycle
-            .active_turn_started_at(&sid)
+            .active_turn_started_at(sid)
             .await
             .ok()
             .flatten()
@@ -838,7 +915,7 @@ async fn get_session(
         state
             .channel_registry
             .get(&session.channel)
-            .map(|ch| in_flight_work_steps(ch.in_flight_events(&sid)))
+            .map(|ch| in_flight_work_steps(ch.in_flight_events(sid)))
             .unwrap_or_default()
     } else {
         Vec::new()
@@ -850,88 +927,196 @@ async fn get_session(
         in_flight_steps,
         &attachment_map,
     );
-    Ok(Json(ChatSessionDetail {
-        session_id,
-        created_at: session.created_at,
-        last_active: session.last_active,
-        hidden: session.hidden,
+    Ok(HistoryPage {
         transcript,
         has_more,
         oldest_ordinal,
         newest_ordinal,
-        last_llm: session.state.last_llm.as_ref().map(|n| n.to_string()),
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/chat/sessions/{session_id}/sync",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to sync"),
+        SyncSessionQuery,
+    ),
+    responses(
+        (status = 200, description = "Forward-recovery pull: the difference after the cursor, or a newest-page baseline (rebased / no cursor)", body = ChatSyncResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn sync_session(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<SyncSessionQuery>,
+    authed: Option<Extension<AuthedClient>>,
+) -> Result<Json<ChatSyncResponse>> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT);
+
+    let rebased = if let Some(since) = query.since_ordinal {
+        match sync_difference(&state, &sid, since, limit).await? {
+            Some(response) => return Ok(Json(response)),
+            // Difference exceeded the limit (in emitted rows) or the raw
+            // scan bound — fall through to a newest-page rebase.
+            None => true,
+        }
+    } else {
+        // No cursor: the baseline IS a newest-page REPLACE by
+        // definition, so rebase semantics carry no extra meaning.
+        false
+    };
+
+    let page = build_history_page(&state, &sid, &session, None, limit).await?;
+    Ok(Json(ChatSyncResponse {
+        rows: page.transcript,
+        // The tail scan starts at the newest persisted row, so the
+        // page's newest ordinal IS the coverage watermark; `None` iff
+        // the session has no rows.
+        next_cursor: page.newest_ordinal,
+        rebased,
+        oldest_ordinal: page.oldest_ordinal,
+        has_more_older: page.has_more,
+    }))
+}
+
+/// Build the difference response for `sync(since)`, or `None` when the
+/// difference is too wide and the caller must rebase. The rebase test
+/// counts **emitted** transcript rows against `limit` — an agentic turn
+/// persists hundreds of invisible tool rows per handful of visible ones,
+/// and counting scanned rows would force a mid-stream REPLACE under a
+/// watching user — with a raw scan bound as the safety valve.
+async fn sync_difference(
+    state: &AdminState,
+    sid: &SessionId,
+    since: i64,
+    limit: usize,
+) -> Result<Option<ChatSyncResponse>> {
+    let scan_bound = limit.saturating_mul(SYNC_SCAN_BOUND_MULTIPLIER);
+    let raw = state
+        .session_manager
+        .history_since(sid, since, scan_bound + 1)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("load sync difference: {e}")))?;
+    if raw.len() > scan_bound {
+        return Ok(None);
+    }
+    // Coverage watermark. The scan ran to the end of the active log, so
+    // it covered everything up to the newest persisted row: the last raw
+    // ordinal, or — when nothing sits above the cursor — the session's
+    // newest ordinal overall (`None` only for a rowless session). This
+    // MUST be fixed before the control-event scan below: an event
+    // written between the two scans anchors at or above this watermark,
+    // so the next `>=` select still covers it; the reverse order would
+    // lose such an event permanently.
+    let next_cursor = match raw.last() {
+        Some((ordinal, _, _)) => Some(*ordinal),
+        None => state
+            .session_manager
+            .latest_session_ordinal(sid)
+            .await
+            .map_err(|e| GatewayError::Internal(format!("load newest ordinal: {e}")))?,
+    };
+    // Control events are selected at `>=` the cursor — a row anchored
+    // exactly at the cursor is re-delivered on purpose (a notice can be
+    // written later with an anchor at an ordinal the client already
+    // holds), and the client dedups by the stable `n<seq>` row id.
+    let upper = next_cursor.unwrap_or(i64::MIN);
+    let control_events: Vec<ControlEvent> = if upper >= since {
+        match state.session_manager.list_control_events(sid).await {
+            Ok(events) => events
+                .into_iter()
+                .filter(|ev| ev.after_ordinal >= since && ev.after_ordinal <= upper)
+                .collect(),
+            Err(e) => {
+                tracing::warn!(session_id = %sid, error = %e, "chat: list control events failed");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let attachment_map = transcript_attachments(&raw, state.blob_store.as_ref()).await;
+    // Durable rows only — the in-flight turn's live steps are the
+    // `SubscribeState` bundle's job, NOT sync's. But we DO align the trailing
+    // in-flight turn's reconstructed work block to the active turn's
+    // `started_at` (one indexed job read): a mid-turn difference reconstructs
+    // that turn's persisted tool rows into a partial `work` block, and without
+    // the alignment its `w<ordinal>`/start wouldn't match the live
+    // (SubscribeState-opened) block — the client would render TWO blocks for
+    // one turn. Aligning the start lets the client reconcile them into one.
+    let active_turn_started = state
+        .job_lifecycle
+        .active_turn_started_at(sid)
+        .await
+        .ok()
+        .flatten();
+    let transcript = reconstruct_transcript_with_attachments(
+        raw,
+        control_events,
+        active_turn_started,
+        Vec::new(),
+        &attachment_map,
+    );
+    if transcript.len() > limit {
+        return Ok(None);
+    }
+    Ok(Some(ChatSyncResponse {
+        rows: transcript,
+        next_cursor,
+        rebased: false,
+        // A difference merges into the client's rendered thread; the
+        // client keeps its own backfill floor.
+        oldest_ordinal: None,
+        has_more_older: false,
     }))
 }
 
 #[utoipa::path(
     get,
-    path = "/chat/sessions/{session_id}/catch-up",
+    path = "/chat/sessions/{session_id}/messages",
     tag = "chat",
     params(
-        ("session_id" = String, Path, description = "Session id to catch up"),
-        CatchUpSessionQuery,
+        ("session_id" = String, Path, description = "Session id to probe"),
+        MessageLookupQuery,
     ),
     responses(
-        (status = 200, description = "Forward transcript catch-up for device reconnect merge", body = ChatCatchUpResponse),
+        (status = 200, description = "Durability point lookup for one send idempotency key", body = ChatMessageLookup),
+        (status = 400, description = "Empty platform_msg_id", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Session not found", body = ErrorBody),
     )
 )]
-async fn catch_up_session(
+async fn lookup_session_message(
     State(state): State<AdminState>,
     Path(session_id): Path<String>,
-    Query(query): Query<CatchUpSessionQuery>,
+    Query(query): Query<MessageLookupQuery>,
     authed: Option<Extension<AuthedClient>>,
-) -> Result<Json<ChatCatchUpResponse>> {
+) -> Result<Json<ChatMessageLookup>> {
     let authed = authed.as_ref().map(|ext| &ext.0);
     let (sid, _session) = load_scoped_chat_session(&state, &session_id, authed).await?;
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_CATCH_UP_LIMIT)
-        .clamp(1, MAX_HISTORY_LIMIT);
-    let rows = state
+    let key = query.platform_msg_id.trim();
+    if key.is_empty() {
+        return Err(GatewayError::BadRequest(
+            "platform_msg_id must be non-empty".to_string(),
+        ));
+    }
+    let ordinal = state
         .session_manager
-        .history_since(&sid, query.since_ordinal, limit + 1)
+        .find_message_ordinal_by_platform_msg_id(&sid, key)
         .await
-        .map_err(|e| GatewayError::Internal(format!("load catch-up history: {e}")))?;
-    if rows.len() > limit {
-        return Ok(Json(ChatCatchUpResponse {
-            items: Vec::new(),
-            newest_ordinal: None,
-            truncated: true,
-        }));
-    }
-    let work_by_reply = reconstruct_catchup_work_steps(&rows);
-    let mut items = Vec::new();
-    let mut newest_ordinal = None;
-    for (ordinal, msg) in rows {
-        let Some(message) = catch_up_message_item(ordinal, msg, state.blob_store.as_ref()).await
-        else {
-            continue;
-        };
-        if let Some(steps) = work_by_reply.get(&ordinal) {
-            let steps = steps
-                .iter()
-                .cloned()
-                .map(ChatCatchUpWorkStep::from)
-                .collect();
-            items.push(ChatCatchUpItem {
-                kind: CatchUpItemKind::Work,
-                ordinal,
-                role: String::new(),
-                content: String::new(),
-                platform_msg_id: String::new(),
-                attachments: Vec::new(),
-                steps,
-            });
-        }
-        items.push(message);
-        newest_ordinal = Some(ordinal);
-    }
-    Ok(Json(ChatCatchUpResponse {
-        items,
-        newest_ordinal,
-        truncated: false,
+        .map_err(|e| GatewayError::Internal(format!("platform_msg_id lookup: {e}")))?;
+    Ok(Json(ChatMessageLookup {
+        found: ordinal.is_some(),
+        ordinal,
     }))
 }
 
@@ -983,26 +1168,7 @@ async fn set_session_model(
     // persistence goes through the targeted `set_last_llm` below.
     let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
 
-    // Validate against the live pool; `None`/empty clears the pin.
-    // `resolve` would fall back safely on a stranded name, but a 400 here
-    // gives the operator a crisp error instead of a silent default.
-    let pin: Option<LlmEntryName> = match req.llm.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(name) => {
-            let known = state
-                .llm_pool
-                .read()
-                .entry_names()
-                .iter()
-                .any(|e| e.as_str() == name);
-            if !known {
-                return Err(GatewayError::BadRequest(format!(
-                    "unknown LLM entry {name:?}; see GET /v1/llm/models for valid names"
-                )));
-            }
-            Some(LlmEntryName::from(name))
-        }
-    };
+    let pin: Option<LlmEntryName> = super::validate_llm_pin(&state, req.llm.as_deref())?;
 
     // Persist the pin durably FIRST, via a targeted flat-column write
     // (`set_last_llm`). Unlike a full-session `save`, this can't be
@@ -1065,7 +1231,7 @@ async fn set_session_pin(
     Json(req): Json<SetSessionPinRequest>,
 ) -> Result<axum::http::StatusCode> {
     let authed = authed.as_ref().map(|ext| &ext.0);
-    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
     // Targeted flat-column write — like `set_hidden`, it survives a
     // concurrent `touch` (full-blob save) so the pin can't be clobbered.
     state
@@ -1077,6 +1243,7 @@ async fn set_session_pin(
     // without a list refetch.
     broadcast_session_patch(
         &state,
+        &session.channel,
         &sid,
         SessionPatch {
             pinned: Some(req.pinned),
@@ -1092,6 +1259,15 @@ pub struct SetSessionArchiveRequest {
     /// `true` to move this session into the archived group, `false` to
     /// restore it to the main chat list.
     pub archived: bool,
+}
+
+/// Request body for `PUT /v1/chat/sessions/{session_id}/read`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MarkReadRequest {
+    /// Highest `session_messages.ordinal` the viewer has now read. The read
+    /// cursor advances max-wins, so a stale/lower value is a no-op — a client
+    /// can safely fire this on open and after each new reply while foreground.
+    pub ordinal: i64,
 }
 
 #[utoipa::path(
@@ -1115,7 +1291,7 @@ async fn set_session_archive(
     Json(req): Json<SetSessionArchiveRequest>,
 ) -> Result<axum::http::StatusCode> {
     let authed = authed.as_ref().map(|ext| &ext.0);
-    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
     // Targeted flat-column write — like `set_pinned`, it survives a
     // concurrent `touch` (full-blob save) so the flag can't be clobbered.
     state
@@ -1127,12 +1303,47 @@ async fn set_session_archive(
     // list and the archived group without a list refetch.
     broadcast_session_patch(
         &state,
+        &session.channel,
         &sid,
         SessionPatch {
             archived: Some(req.archived),
             ..SessionPatch::default()
         },
     );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    put,
+    path = "/chat/sessions/{session_id}/read",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to mark read"),
+    ),
+    request_body = MarkReadRequest,
+    responses(
+        (status = 204, description = "Read cursor advanced; unread_count recomputes from it"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn mark_session_read(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    authed: Option<Extension<AuthedClient>>,
+    Json(req): Json<MarkReadRequest>,
+) -> Result<axum::http::StatusCode> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    // Targeted, max-wins flat-column write — survives a concurrent `touch`
+    // and can't regress on a reordered request. The list's `unread_count`
+    // derives from this on the next fetch; no live broadcast (unread is a
+    // per-viewer concern that converges on the next list pull).
+    state
+        .session_manager
+        .set_read_cursor(&sid, req.ordinal)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("mark session read: {e}")))?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -1160,7 +1371,7 @@ async fn delete_session(
     // credential; users can restore via `POST .../unhide` or
     // `?include_hidden=true`.
     let authed = authed.as_ref().map(|ext| &ext.0);
-    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
     state
         .session_manager
         .set_hidden(&sid, true)
@@ -1168,6 +1379,7 @@ async fn delete_session(
         .map_err(|e| GatewayError::Internal(format!("hide session: {e}")))?;
     broadcast_session_patch(
         &state,
+        &session.channel,
         &sid,
         SessionPatch {
             hidden: Some(true),
@@ -1207,6 +1419,7 @@ async fn unhide_session(
     // re-add the row directly without a list refetch.
     broadcast_session_patch(
         &state,
+        &session.channel,
         &sid,
         SessionPatch {
             created_at: Some(session.created_at),
@@ -1221,6 +1434,7 @@ async fn unhide_session(
             folder_id: session.folder_id.as_ref().map(|f| FolderChange::Set {
                 id: f.as_str().to_owned(),
             }),
+            title: session.title.clone(),
         },
     );
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -1297,7 +1511,7 @@ async fn set_session_folder(
     Json(req): Json<SetSessionFolderRequest>,
 ) -> Result<axum::http::StatusCode> {
     let authed = authed.as_ref().map(|ext| &ext.0);
-    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
     let folder = req.folder_id.map(FolderId::from);
     state
         .session_manager
@@ -1312,6 +1526,7 @@ async fn set_session_folder(
     };
     broadcast_session_patch(
         &state,
+        &session.channel,
         &sid,
         SessionPatch {
             folder_id: Some(change),
@@ -1540,11 +1755,18 @@ async fn delete_folder(
         .map_err(folder_err)?;
     // Folder structure converges via the snapshot; the chats that fell
     // back to uncategorized converge via a per-session patch each, so a
-    // sibling tab moves them live without a list refetch.
+    // sibling tab moves them live without a list refetch. The patch is
+    // channel-scoped, so look up each affected session's home channel;
+    // a row that fails to load just skips its patch (the next list
+    // refetch converges it).
     broadcast_folders(&state).await?;
     for sid in affected {
+        let Ok(Some(session)) = state.session_manager.get(&sid).await else {
+            continue;
+        };
         broadcast_session_patch(
             &state,
+            &session.channel,
             &sid,
             SessionPatch {
                 folder_id: Some(FolderChange::Uncategorized),
@@ -1737,26 +1959,31 @@ async fn load_scoped_chat_session(
     Ok((sid, session))
 }
 
-/// Push a [`Frame::SessionUpdated`] patch to every open web or device chat client.
-/// The patch carries the truth (no refetch round-trip); see the variant's doc
-/// comment for receiver-side merge rules. No-op when subscribed chat channels
-/// are not installed (only possible in test fixtures that skipped
+/// Push a [`Frame::SessionUpdated`] patch to every open chat client on the
+/// session's own channel. Scoped to `channel` on purpose — the `http` (web)
+/// and `device` (iOS) channels own disjoint session universes, and fanning a
+/// patch across both plants clickable ghost rows for device sessions in web
+/// sidebars. The patch carries the truth (no refetch round-trip); see the
+/// variant's doc comment for receiver-side merge rules. No-op when the
+/// channel is not installed (only possible in test fixtures that skipped
 /// `install_channels`).
 pub(crate) fn broadcast_session_patch(
     state: &AdminState,
+    channel: &ChannelType,
     session_id: &SessionId,
     patch: SessionPatch,
 ) {
-    for channel_type in chat_broadcast_channels() {
-        let Some(channel) = state.channel_registry.get(&channel_type) else {
-            continue;
-        };
-        if let Some(sub) = channel.as_subscribed() {
-            sub.broadcast_session_patch(session_id.clone(), patch.clone());
-        }
+    let Some(channel) = state.channel_registry.get(channel) else {
+        return;
+    };
+    if let Some(sub) = channel.as_subscribed() {
+        sub.broadcast_session_patch(session_id.clone(), patch);
     }
 }
 
+/// The subscribed chat channels a folder-tree snapshot fans out to.
+/// Folders are not session-scoped, so — unlike [`broadcast_session_patch`]
+/// — both chat universes receive the (id-only, harmless) snapshot.
 fn chat_broadcast_channels() -> [ChannelType; 2] {
     [ChannelType::http(), ChannelType::device()]
 }
@@ -1864,36 +2091,6 @@ async fn transcript_attachments(
     attachments
 }
 
-async fn catch_up_message_item(
-    ordinal: i64,
-    msg: ChatMessage,
-    blob_store: &dyn baybo_store::BlobStore,
-) -> Option<ChatCatchUpItem> {
-    let role = match msg.role {
-        Role::User if msg.from_user() => "user",
-        Role::Assistant => "assistant",
-        _ => return None,
-    };
-    if msg.role == Role::Assistant && msg.has_tool_use() {
-        return None;
-    }
-    let platform_msg_id = msg.platform_msg_id().to_string();
-    let (content, attachments) =
-        crate::channel::adapter::split_content(&msg.content, blob_store).await;
-    if content.is_empty() && attachments.is_empty() {
-        return None;
-    }
-    Some(ChatCatchUpItem {
-        kind: CatchUpItemKind::Message,
-        ordinal,
-        role: role.to_owned(),
-        content,
-        platform_msg_id,
-        attachments: attachments.into_iter().map(ChatAttachment::from).collect(),
-        steps: Vec::new(),
-    })
-}
-
 /// Fetch the most-recent user-authored text for `session_id` and shape it
 /// into the sidebar preview the list endpoint serves. Returns `None` when
 /// the session has no user turn, when that turn is media-only, or when the
@@ -1952,12 +2149,15 @@ impl WorkAccumulator {
     fn flush(&mut self, items: &mut Vec<ChatTranscriptItem>, ended_at: Option<DateTime<Utc>>) {
         if !self.steps.is_empty() {
             let started = self.started;
+            let ordinal = self.ordinal.unwrap_or_default();
             items.push(ChatTranscriptItem {
-                ordinal: self.ordinal.unwrap_or_default(),
+                id: format!("w{ordinal}"),
+                ordinal: Some(ordinal),
                 kind: TranscriptItemKind::Work,
                 role: String::new(),
                 text: String::new(),
                 has_attachments: false,
+                platform_msg_id: String::new(),
                 attachments: Vec::new(),
                 created_at: started.unwrap_or_else(Utc::now),
                 steps: std::mem::take(&mut self.steps),
@@ -2012,96 +2212,6 @@ fn in_flight_work_steps(events: Vec<SessionEvent>) -> Vec<ChatWorkStep> {
         .into_iter()
         .map(ChatWorkStep::from)
         .collect()
-}
-
-/// Reconstruct each **completed** turn's collapsed work steps from a slice of
-/// persisted catch-up rows (ascending ordinal), keyed by the turn's reply
-/// `ordinal`. This powers the forward catch-up API's mobile work items and is
-/// the narrow counterpart of the web [`reconstruct_transcript`] work fold:
-/// thinking → reasoning, mid-turn text → prose, tool-use + paired tool-result →
-/// tool step, without the transcript-item / control-event / cancelled-timing
-/// machinery the full REST history path carries. A turn whose reply is off the
-/// slice, or that produced no steps, contributes nothing. `call_id` is left
-/// unset — a completed turn has no live `ToolCompleted` to pair with.
-pub(crate) fn reconstruct_catchup_work_steps(
-    rows: &[(i64, ChatMessage)],
-) -> HashMap<i64, Vec<WireWorkStep>> {
-    let mut out: HashMap<i64, Vec<WireWorkStep>> = HashMap::new();
-    let mut steps: Vec<WireWorkStep> = Vec::new();
-    let mut pending: HashMap<String, usize> = HashMap::new();
-    for (ordinal, msg) in rows {
-        match msg.role {
-            Role::User if msg.from_user() => {
-                // Turn boundary — start fresh.
-                steps.clear();
-                pending.clear();
-            }
-            // Intermediate agentic iteration: fold its thinking / narration /
-            // tool calls into the open block.
-            Role::Assistant if msg.has_tool_use() => {
-                for block in &msg.content {
-                    match block {
-                        ContentBlock::Thinking { content, .. } => {
-                            let text = thinking_text(content);
-                            if !text.is_empty() {
-                                steps.push(WireWorkStep::reasoning(text));
-                            }
-                        }
-                        ContentBlock::Text(t) if !t.trim().is_empty() => {
-                            steps.push(WireWorkStep::prose(t.clone()));
-                        }
-                        ContentBlock::ToolUse {
-                            id, name, input, ..
-                        } => {
-                            pending.insert(id.clone(), steps.len());
-                            steps.push(WireWorkStep::tool(
-                                None,
-                                Some(name.clone()),
-                                tool_label(input),
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            // Final reply row: a direct-answer turn carries its reasoning here
-            // (no intermediate rows), so fold this row's thinking when nothing
-            // accumulated. The turn's steps then attach to this reply ordinal.
-            Role::Assistant => {
-                if steps.is_empty() {
-                    for block in &msg.content {
-                        if let ContentBlock::Thinking { content, .. } = block {
-                            let text = thinking_text(content);
-                            if !text.is_empty() {
-                                steps.push(WireWorkStep::reasoning(text));
-                            }
-                        }
-                    }
-                }
-                if !steps.is_empty() {
-                    out.insert(*ordinal, std::mem::take(&mut steps));
-                }
-                pending.clear();
-            }
-            Role::Tool => {
-                for block in &msg.content {
-                    if let ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        ..
-                    } = block
-                        && let Some(&idx) = pending.get(tool_use_id)
-                        && let Some(step) = steps.get_mut(idx)
-                    {
-                        step.status = Some(tool_result_status(content));
-                        step.summary = Some(summarize_tool_result(content));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -2418,11 +2528,13 @@ fn message_item(
         return None;
     }
     Some(ChatTranscriptItem {
-        ordinal,
+        id: format!("m{ordinal}"),
+        ordinal: Some(ordinal),
         kind: TranscriptItemKind::Message,
         role: role.to_owned(),
         text,
         has_attachments,
+        platform_msg_id: msg.platform_msg_id().to_string(),
         attachments,
         created_at,
         steps: Vec::new(),
@@ -2435,11 +2547,13 @@ fn message_item(
 
 /// Map a [`ControlEvent`] (an out-of-band slash-command echo or notice, stored
 /// outside `session_messages`) into a transcript item: a `command` renders as a
-/// user bubble (what the user typed), a `notice_*` as a colored notice bar. The
-/// negative `ordinal` keeps these in a key space disjoint from real message
-/// ordinals (so React keys never collide); position comes from the
-/// `after_ordinal` anchor in `reconstruct_transcript`, not this field, and the
-/// client reads page bounds from `ChatSessionDetail::{oldest,newest}_ordinal`.
+/// user bubble (what the user typed), a `notice_*` as a colored notice bar.
+/// Control events are NOT ordinal-addressed — the item carries no `ordinal`
+/// and is keyed by its stable `n<seq>` row id, which is also the client's
+/// redelivery dedup key (sync re-delivers events anchored exactly at the
+/// cursor). Position comes from the `after_ordinal` anchor in
+/// `reconstruct_transcript`; the client reads page bounds from
+/// `ChatSessionDetail::{oldest,newest}_ordinal`.
 fn control_event_item(ev: ControlEvent) -> ChatTranscriptItem {
     // `notice_level()` is `Some` for a notice kind, `None` for a command echo.
     let level = ev.kind.notice_level();
@@ -2448,11 +2562,13 @@ fn control_event_item(ev: ControlEvent) -> ChatTranscriptItem {
         None => (TranscriptItemKind::Message, "user".to_owned()),
     };
     ChatTranscriptItem {
-        ordinal: -(ev.seq + 1),
+        id: format!("n{}", ev.seq),
+        ordinal: None,
         kind,
         role,
         text: ev.text,
         has_attachments: false,
+        platform_msg_id: String::new(),
         attachments: Vec::new(),
         created_at: ev.created_at,
         steps: Vec::new(),
@@ -2639,9 +2755,11 @@ mod tests {
         let work = &items[1];
         assert!(matches!(work.kind, TranscriptItemKind::Work));
         assert_eq!(
-            work.ordinal, 3,
+            work.ordinal,
+            Some(3),
             "work block inherits first intermediate ordinal"
         );
+        assert_eq!(work.id, "w3", "work row id derives from that ordinal");
         assert_eq!(
             work.work_started_at,
             Some(ts(2)),
@@ -2738,10 +2856,11 @@ mod tests {
         assert_eq!(items[4].text, stop_notice);
         assert_eq!(items[4].notice_level.as_deref(), Some("info"));
 
-        // Control items carry synthetic negative ordinals so they never collide
-        // with (or seed the cursor from) a real session_messages.ordinal.
-        for ctl_item in [&items[0], &items[3], &items[4]] {
-            assert!(ctl_item.ordinal < 0, "control items use negative ordinals");
+        // Control items are not ordinal-addressed: no ordinal, and a stable
+        // `n<seq>` row id that doubles as the redelivery dedup key.
+        for (ctl_item, want_id) in [(&items[0], "n0"), (&items[3], "n1"), (&items[4], "n2")] {
+            assert_eq!(ctl_item.ordinal, None, "control items carry no ordinal");
+            assert_eq!(ctl_item.id, want_id, "control row id is n<seq>");
         }
     }
 
@@ -2994,62 +3113,6 @@ mod tests {
     }
 
     #[test]
-    fn catchup_work_steps_fold_completed_turns_by_reply_ordinal() {
-        // A tool-using turn (user → intermediate assistant with thinking + tool
-        // call → tool result → final reply) and a direct-answer turn (thinking +
-        // text in one row). Each turn's steps attach to its reply ordinal.
-        let rows = vec![
-            (1, ChatMessage::user(vec![text("go")])),
-            (
-                2,
-                ChatMessage::assistant(vec![
-                    thinking("weighing it"),
-                    tool_use("c1", "Bash", serde_json::json!({"command": "ls"})),
-                ]),
-            ),
-            (
-                3,
-                ChatMessage::tool_result("c1".to_owned(), "file1\nfile2".to_owned()),
-            ),
-            (4, ChatMessage::assistant(vec![text("done")])),
-            (5, ChatMessage::user(vec![text("hi")])),
-            (
-                6,
-                ChatMessage::assistant(vec![thinking("ponder"), text("hello")]),
-            ),
-        ];
-        let out = reconstruct_catchup_work_steps(&rows);
-
-        // Only the two reply ordinals carry steps.
-        assert_eq!(out.len(), 2, "{out:?}");
-        let tool_turn = out
-            .get(&4)
-            .expect("tool turn steps keyed by reply ordinal 4");
-        assert_eq!(tool_turn.len(), 2);
-        assert_eq!(tool_turn[0].kind, WireWorkStepKind::Reasoning);
-        assert_eq!(tool_turn[0].text, "weighing it");
-        assert_eq!(tool_turn[1].kind, WireWorkStepKind::Tool);
-        assert_eq!(tool_turn[1].tool.as_deref(), Some("Bash"));
-        assert_eq!(tool_turn[1].label.as_deref(), Some("ls"));
-        assert_eq!(
-            tool_turn[1].status.as_deref(),
-            Some("ok"),
-            "tool result folded onto the step"
-        );
-        assert!(
-            tool_turn[1].call_id.is_none(),
-            "a completed turn has no live call_id to pair"
-        );
-
-        let direct = out
-            .get(&6)
-            .expect("direct-answer turn steps keyed by reply ordinal 6");
-        assert_eq!(direct.len(), 1);
-        assert_eq!(direct[0].kind, WireWorkStepKind::Reasoning);
-        assert_eq!(direct[0].text, "ponder");
-    }
-
-    #[test]
     fn reconstruct_turn_without_user_row_does_not_inherit_prior_start() {
         // A turn with no user row on the page (a cron fire, or a turn whose
         // user row fell off the page boundary) times its work block from its
@@ -3155,7 +3218,7 @@ mod tests {
 
         let work = &items[1];
         assert!(matches!(work.kind, TranscriptItemKind::Work));
-        assert_eq!(work.ordinal, 3, "shares the answer row's ordinal");
+        assert_eq!(work.ordinal, Some(3), "shares the answer row's ordinal");
         assert_eq!(
             work.work_started_at,
             Some(ts(2)),

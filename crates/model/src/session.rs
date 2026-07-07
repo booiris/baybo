@@ -238,6 +238,11 @@ pub struct Session {
     /// blobs deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<crate::FolderId>,
+
+    /// Auto-generated conversation title. Stored as a flat column; `get`
+    /// patches it from the column on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 impl Session {
@@ -580,6 +585,29 @@ mod tests {
             !s.contains("folder_id"),
             "unset folder_id must not serialize: {s}"
         );
+        let sess2: Session = serde_json::from_str(json).expect("legacy row without title loads");
+        assert_eq!(sess2.title, None);
+        assert!(!s.contains("title"), "unset title must not serialize: {s}");
+    }
+
+    #[test]
+    fn session_title_round_trips() {
+        let json = r#"{
+            "id":"s1",
+            "user":{"id":"u1","name":null,"channel":"http"},
+            "channel":"http",
+            "created_at":"2024-01-01T00:00:00Z",
+            "last_active":"2024-01-01T00:00:00Z",
+            "state":{},
+            "root_session_id":"s1",
+            "trigger":{"kind":"user"},
+            "title":"Fix the login redirect bug"
+        }"#;
+        let sess: Session = serde_json::from_str(json).expect("row with title loads");
+        assert_eq!(sess.title.as_deref(), Some("Fix the login redirect bug"));
+        let s = serde_json::to_string(&sess).unwrap();
+        let back: Session = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.title, sess.title);
     }
 
     #[test]

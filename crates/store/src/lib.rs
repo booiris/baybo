@@ -7,6 +7,7 @@
 //! low-level crates depend on a store interface without pulling the heavy
 //! libsql adapter, and keeps the dependency graph acyclic.
 
+pub mod agent_profile;
 pub mod blob;
 pub mod channel_bot;
 pub mod channel_pairing;
@@ -24,6 +25,7 @@ pub mod skill_risk;
 pub mod task;
 pub mod trace;
 
+pub use agent_profile::{AgentProfileRow, AgentProfileStore, AgentProfileUpdate};
 pub use blob::{BlobMeta, BlobReader, BlobStore, ByteStream, SHA256_PREFIX};
 pub use channel_bot::{ChannelBotRow, ChannelBotStore};
 pub use channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus};

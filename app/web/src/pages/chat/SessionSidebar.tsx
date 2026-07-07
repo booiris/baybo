@@ -154,14 +154,19 @@ function SessionRow({
           title="Pinned"
         />
       ) : null}
-      <span
-        className={`text-sm flex-1 truncate text-ink ${active ? 'font-bold' : ''} ${
-          session.last_user_text ? '' : 'italic opacity-70'
-        }`}
-        title={session.last_user_text ?? undefined}
-      >
-        {session.last_user_text ?? 'New conversation'}
-      </span>
+      {(() => {
+        const label = session.title ?? session.last_user_text;
+        return (
+          <span
+            className={`text-sm flex-1 truncate text-ink ${active ? 'font-bold' : ''} ${
+              label ? '' : 'italic opacity-70'
+            }`}
+            title={label ?? undefined}
+          >
+            {label ?? 'New conversation'}
+          </span>
+        );
+      })()}
       {/* Parked interjection-queue count — shown for ALL sessions (incl. the
           active row); reads the shared queue store, independent of WS subs. */}
       {queueCount > 0 ? (
@@ -241,7 +246,7 @@ function ChatDragPreview({ session }: { session: SessionSummary }) {
     <div className="flex items-center gap-2 px-3 py-1.5 rounded-md border-2 border-black bg-surface shadow-brutal-sm w-[240px]">
       <RiChat1Line className="text-[0.8rem] shrink-0 text-ink-soft" aria-hidden />
       <span className="text-sm flex-1 truncate text-ink">
-        {session.last_user_text ?? 'New conversation'}
+        {session.title ?? session.last_user_text ?? 'New conversation'}
       </span>
     </div>
   );

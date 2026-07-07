@@ -54,16 +54,21 @@ impl ContentSession {
     pub fn open(&mut self, message: &[u8]) -> Result<Vec<Frame>, MobileError> {
         let mut frames = Vec::new();
         for bytes in self.reassembler.read(&mut self.transport, message)? {
-            frames.push(decode(&bytes)?);
+            // A frame variant this client's `wire` version doesn't know fails to
+            // decode; skip it instead of ending the session, matching the direct
+            // codec's forward-compat posture (`direct/chat.rs`). A Noise decrypt
+            // desync (the `?` above) stays fatal.
+            if let Ok(frame) = decode(&bytes) {
+                frames.push(frame);
+            }
         }
         Ok(frames)
     }
 }
 
-pub fn subscribe_frame(session_id: &str, since_ordinal: Option<i64>) -> Frame {
+pub fn subscribe_frame(session_id: &str) -> Frame {
     Frame::Subscribe {
         session_id: SessionId::from(session_id),
-        since_ordinal,
     }
 }
 

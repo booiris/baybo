@@ -30,7 +30,8 @@ use crate::core::WireAttachment;
 
 pub use api::{
     ApnsEnvironment, AttachmentKind, AttachmentRef, BayboError, ChatSessionSummary, ClientConfig,
-    FrameSink, PairAbortListener, PairChallenge, PairTarget, PairedSummary, SessionListSink,
+    FrameSink, MessageLookup, PairAbortListener, PairChallenge, PairTarget, PairedSummary,
+    SessionListSink,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -339,15 +340,14 @@ impl BayboClient {
 
     /// Subscribe `session_id` on the active binding's global chat leg and stream
     /// frames to `sink`. Relay runs the Noise E2E content leg; direct runs the
-    /// raw-MessagePack `/v1/channel-ws` direct device leg. `since_ordinal`
-    /// is the highest ordinal already rendered — the gateway replays only the
-    /// gap above it (so a reconnect after a background catches up without re-sending the
-    /// whole thread); `None` is a fresh subscribe with no catch-up. Both legs
-    /// share one pump (see `transport`); only the establish/codec seam differs.
+    /// raw-MessagePack `/v1/channel-ws` direct device leg. The server replays no
+    /// history on subscribe (it answers with one `SubscribeState` bundle) —
+    /// transcript recovery is the REST sync call ([`Self::chat_fetch_sync`]).
+    /// Both legs share one pump (see `transport`); only the establish/codec seam
+    /// differs.
     pub async fn chat_connect(
         self: Arc<Self>,
         session_id: String,
-        since_ordinal: Option<i64>,
         sink: Arc<dyn FrameSink>,
     ) -> Result<(), BayboError> {
         let this = self;
@@ -355,11 +355,9 @@ impl BayboClient {
             match active_leg()? {
                 ActiveLeg::Relay => {
                     refresh_relay_apns_best_effort(&this.apns).await;
-                    transport::connect(&this.relay, session_id, since_ordinal, sink).await
+                    transport::connect(&this.relay, session_id, sink).await
                 }
-                ActiveLeg::Direct => {
-                    transport::connect(&this.direct, session_id, since_ordinal, sink).await
-                }
+                ActiveLeg::Direct => transport::connect(&this.direct, session_id, sink).await,
             }
         })
         .await
@@ -398,7 +396,6 @@ impl BayboClient {
     pub async fn chat_send_after_connect(
         self: Arc<Self>,
         session_id: String,
-        since_ordinal: Option<i64>,
         sink: Arc<dyn FrameSink>,
         text: String,
         msg_id: String,
@@ -414,7 +411,6 @@ impl BayboClient {
                     transport::connect_and_send(
                         &this.relay,
                         session_id,
-                        since_ordinal,
                         sink,
                         transport::OutboundMessage {
                             text,
@@ -428,7 +424,6 @@ impl BayboClient {
                     transport::connect_and_send(
                         &this.direct,
                         session_id,
-                        since_ordinal,
                         sink,
                         transport::OutboundMessage {
                             text,
@@ -473,22 +468,75 @@ impl BayboClient {
         .await
     }
 
-    /// Fetch the forward reconnect catch-up page over the active binding's API
-    /// surface and return a native-synthesized `catch_up` JSON frame for the web
-    /// transcript bridge.
-    pub async fn chat_catch_up(
+    /// Run the one forward-recovery pull (sync-v2) over the active binding's API
+    /// surface: rows strictly after `since_ordinal` (or the newest-page baseline
+    /// when `None`), full fidelity (message | work | notice), unfiltered. Returns
+    /// a native-synthesized `sync_page` JSON frame for the web transcript bridge.
+    pub async fn chat_fetch_sync(
         self: Arc<Self>,
         session_id: String,
-        since_ordinal: i64,
+        since_ordinal: Option<i64>,
+        limit: u32,
     ) -> Result<String, BayboError> {
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => {
-                    gateway_api::fetch_catch_up(&relay::GatewayApi, session_id, since_ordinal).await
+                    gateway_api::fetch_sync(&relay::GatewayApi, session_id, since_ordinal, limit)
+                        .await
                 }
                 ActiveLeg::Direct => {
                     let client = self.direct.http_client()?;
-                    gateway_api::fetch_catch_up(&client, session_id, since_ordinal).await
+                    gateway_api::fetch_sync(&client, session_id, since_ordinal, limit).await
+                }
+            }
+        })
+        .await
+    }
+
+    /// Per-send durability point lookup over the active binding's API surface:
+    /// whether a persisted row carries `platform_msg_id` (and its ordinal).
+    /// Resolves a rebase-floor outbox entry (`unknown`) without consuming a
+    /// retry transmission — consumed natively, never forwarded to the webview.
+    pub async fn chat_lookup_message(
+        self: Arc<Self>,
+        session_id: String,
+        platform_msg_id: String,
+    ) -> Result<MessageLookup, BayboError> {
+        runtime::run(async move {
+            let response = match active_leg()? {
+                ActiveLeg::Relay => {
+                    gateway_api::lookup_message(&relay::GatewayApi, session_id, &platform_msg_id)
+                        .await
+                }
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::lookup_message(&client, session_id, &platform_msg_id).await
+                }
+            }?;
+            Ok(MessageLookup {
+                found: response.found,
+                ordinal: response.ordinal,
+            })
+        })
+        .await
+    }
+
+    /// Advance the session's chat-list read cursor to `ordinal` (max-wins
+    /// server-side) — the viewer has read up to here. Clears the unread badge
+    /// on the next list pull. Called when the user opens/views a session.
+    pub async fn chat_mark_read(
+        self: Arc<Self>,
+        session_id: String,
+        ordinal: i64,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Relay => {
+                    gateway_api::mark_read(&relay::GatewayApi, session_id, ordinal).await
+                }
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::mark_read(&client, session_id, ordinal).await
                 }
             }
         })

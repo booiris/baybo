@@ -80,26 +80,22 @@ Two consequences worth knowing:
   live multi-channel fan-out), at the cost of possibly showing output bytes the
   live UI withheld. `tool_status` (ok/error/denied) is best-effort, keyed off the
   agent's result-formatting prefixes.
-- **WS in-flight work-block replay (relay/iOS).** A reconnect's
-  `chat_to_visible_wire_message` catch-up replays only the message *bubbles*,
-  but a (re)`Subscribe` on a live turn now also emits a `Frame::WorkSnapshot` —
-  the whole in-flight work block (reasoning / tool steps from the same
-  per-session buffer), folded once by
-  `channel::work_steps::in_flight_wire_steps` (the REST `ChatWorkStep` derives
-  from the same `WireWorkStep`). A relay client (iOS) that reconnects mid-turn
-  **replaces** its open block with it — never appends, since the buffer is a
-  superset of what it saw live — so the thinking it missed while backgrounded
-  reappears without a full reload. The **web** chat ignores the frame today (it
-  recovers the same steps via the REST reload above). A turn that **completed**
-  while the client was away is recovered by the device forward catch-up API
-  (`GET /v1/chat/sessions/:id/catch-up`): it reconstructs closed work items
-  from persisted rows with
-  `api::admin::chat::reconstruct_catchup_work_steps` and native merges the
-  synthesized `catch_up` frame with the message-only WS replay. Only the native
-  **backward** history bridge (scroll-up, and the post-`Reset` rebuild) stays
-  message-only — it reads the chat API and maps message rows into a local
-  `history_page`, so a turn can straddle a page boundary there (see the roadmap
-  below).
+- **Mid-turn join recovery (all chat clients).** The WS never replays
+  history. A (re)`Subscribe` on a live turn delivers the whole in-flight
+  work block inside the `Frame::SubscribeState` bundle's `work_steps`
+  half (reasoning / tool steps from the same per-session buffer), folded
+  once by `channel::work_steps::in_flight_wire_steps` (the REST
+  `ChatWorkStep` derives from the same `WireWorkStep`). A client that
+  (re)subscribes mid-turn **replaces** its open block with it — never
+  appends, since the buffer is a superset of what it saw live — so the
+  thinking it missed while backgrounded reappears without a full reload.
+  A turn that **completed** while the client was away is recovered by the
+  sync call (`GET /v1/chat/sessions/:id/sync`), which reconstructs closed
+  work items and notices at full fidelity on every path — see
+  [`docs/sync-protocol.md`](sync-protocol.md). Backward paging
+  (`before_ordinal`) returns the same full-fidelity rows; a turn
+  straddling a page boundary reconstructs partially until the older page
+  loads (accepted partiality, same as the web reload).
 
 ## `TurnState`: the in-flight turn survives a late join
 
@@ -130,9 +126,10 @@ of the live signal and one of the join snapshot, both reading the same store:
   job's transition fired it (the turn, a child subagent, a
   background-compression `System` job): each just means "recompute this session
   now", and the broadcast is whatever is currently true.
-- **Join snapshot** — the gateway sends one `TurnState` per `Subscribe`,
-  reading the same `active_turn_started_at`, so a late joiner (new tab,
-  reconnect) renders the in-flight turn it never saw start.
+- **Join snapshot** — the gateway sends one `SubscribeState` bundle per
+  `Subscribe`, whose `turn` half reads the same `active_turn_started_at`,
+  so a late joiner (new tab, reconnect) renders the in-flight turn it
+  never saw start.
 
 Because the start edge is the job's own `start()` transition (not a separate
 actor emission that raced the job-row insert), a `Subscribe` can no longer land
@@ -166,14 +163,14 @@ into the close edge — no special-case `TurnState` broadcast in the runner.
   the model's reasoning trace, and **drops `Reasoning` frames entirely** rather than
   rendering them. Other channels (e.g. the web UI) still consume `Reasoning`.
   See [`docs/modules/tui.md`](modules/tui.md#working-indicator--mid-turn-steering).
-- **Relay/iOS work recovery — remaining edges** — forward reconnect catch-up
-  now recovers both in-flight work (`WorkSnapshot` on the chat stream) and
-  completed work (the device `catch-up` API merged with WS message replay).
-  Still open: the native **backward history API bridge** (scroll-up + the
-  post-`Reset` rebuild) stays message-only — reconstructing a work block for a
-  turn split across a page boundary needs page-spanning state (or exposing the
-  REST `get_session` work items directly); and an optional **silent-push
-  pre-warm** to run catch-up before the next foreground.
+- **Relay/iOS work recovery — remaining edges** — reconnect recovery now
+  rides the v2 loop on every path: in-flight work via the
+  `SubscribeState` bundle, completed work + notices via the sync call,
+  and backward paging at the same full fidelity. Still open: a turn
+  split across a page boundary reconstructs partially until the older
+  page loads (page-spanning reconstruction would need cross-page state);
+  and an optional **silent-push pre-warm** to run sync before the next
+  foreground.
 - **Subagent → parent progress** — subagents run with `delta_tx = None`. Surfacing
   their progress to the parent ties into the planned `SubagentNotification` redesign.
 - **Fine-grained in-tool events** — forward a curated subset of `ToolEventSink`

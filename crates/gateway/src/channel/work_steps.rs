@@ -4,13 +4,15 @@
 //! snapshot (the reasoning / answer / tool events of the turn currently
 //! streaming) into a compact, coalesced step list. Two consumers share it:
 //!
-//! * the relay [`Frame::WorkSnapshot`] catch-up (`channel::route`), which ships
-//!   [`WireWorkStep`]s to a client that reconnected mid-turn, and
-//! * the web REST transcript reconstruction (`api::admin::chat`), which derives
-//!   its `ChatWorkStep` from the same fold via `From`.
+//! * the [`Frame::SubscribeState`] bundle (`channel::route`), whose
+//!   `work_steps` half ships [`WireWorkStep`]s to a client that
+//!   subscribed mid-turn, and
+//! * the REST transcript reconstruction (`api::admin::chat`), which folds
+//!   the same steps into the newest page's trailing work block (deriving
+//!   its `ChatWorkStep` via `From`).
 //!
 //! [`Channel::in_flight_events`]: baybo_channels::Channel::in_flight_events
-//! [`Frame::WorkSnapshot`]: baybo_channels::wire::Frame::WorkSnapshot
+//! [`Frame::SubscribeState`]: baybo_channels::wire::Frame::SubscribeState
 
 use baybo_channels::wire::WireWorkStep;
 use baybo_channels::{AgentEvent, SessionEvent, ToolStatus};

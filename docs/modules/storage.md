@@ -64,7 +64,7 @@ or rewritten — this is user-facing core data (see the never-delete rule in the
 repo `CLAUDE.md`). Columns: `role`, `content` (serialized `ContentBlock`s),
 `created_at`, `source` (`MessageSource`: `user` / `cron` / `agent` — tells a
 genuine prompt and a cron fire apart from the agent's own injected `user`-role
-rows), `platform_msg_id` (client idempotency key for replay/optimistic dedup),
+rows), `platform_msg_id` (client send idempotency key — sync-redelivery dedup, optimistic-row reconciliation, and the outbox durability point lookup),
 and `superseded_by`.
 
 **The ordinal is the load-bearing primitive.** Because it is stable, dense, and

@@ -29,6 +29,8 @@ export interface SessionSummary {
    *  kept in sync across tabs by `Frame::SessionUpdated` patches carrying
    *  a `folder_id` change. */
   folder_id?: string;
+  /** Auto-generated title used before falling back to `last_user_text`. */
+  title?: string;
 }
 
 /** A user-created chat-list folder. Two-level tree via `parent_id`

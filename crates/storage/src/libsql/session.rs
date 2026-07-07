@@ -70,7 +70,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm, pinned, folder_id, archived FROM sessions WHERE id = ?1",
+                "SELECT data, hidden, last_llm, pinned, folder_id, archived, title FROM sessions WHERE id = ?1",
                 libsql::params![session_id.as_str().to_string()],
             )
             .await
@@ -101,18 +101,19 @@ impl SessionStore for LibsqlSessionStore {
                 let archived_col: i64 = row
                     .get(5)
                     .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                let title_col: Option<String> = row
+                    .get(6)
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
                 let mut session: Session = serde_json::from_str(&data)
                     .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
-                // Flat columns are authoritative — `set_hidden` /
-                // `set_last_llm` / `set_pinned` / `set_folder` /
-                // `set_archived` update them directly while leaving the
-                // JSON blob untouched, to avoid load/save races against
-                // `touch`.
+                // Flat columns are authoritative; targeted setters leave the
+                // JSON blob untouched to avoid load/save races.
                 session.hidden = hidden_col != 0;
                 session.state.last_llm = last_llm_col.map(LlmEntryName::from);
                 session.pinned = pinned_col != 0;
                 session.folder_id = folder_id_col.map(FolderId::from);
                 session.archived = archived_col != 0;
+                session.title = title_col;
                 Ok(Some(session))
             }
             None => Ok(None),
@@ -146,14 +147,13 @@ impl SessionStore for LibsqlSessionStore {
         let pinned_flag: i64 = if session.pinned { 1 } else { 0 };
         let archived_flag: i64 = if session.archived { 1 } else { 0 };
         // Upsert in place (NOT `INSERT OR REPLACE`, which delete+reinserts
-        // the row). The DO UPDATE clause deliberately omits `hidden`,
-        // `pinned` and `archived`: those flat columns are owned by
-        // `set_hidden` / `set_pinned` / `set_archived`, and `save` carries
-        // a possibly-stale in-memory `Session` (e.g. a background-subagent
-        // persist after the user hid or pinned the conversation).
-        // `?11` / `?12` / `?13` only seed them on a brand-new row; `get`
-        // reads the columns as authoritative regardless of the blob's
-        // stale fields.
+        // the row). The DO UPDATE clause omits the flat columns owned by
+        // targeted setters (`hidden`, `last_llm`, `pinned`, `folder_id`,
+        // `archived`, `title`, `read_cursor`) so a stale in-memory `Session`
+        // (e.g. a background-subagent persist after the user hid, pinned or
+        // archived the conversation) cannot clobber them. `hidden` / `pinned` /
+        // `archived` are seeded only on a brand-new row (`?10`–`?12`); `get`
+        // reads all flat columns as authoritative over the JSON blob.
         conn.execute(
             "INSERT INTO sessions \
              (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
@@ -287,6 +287,59 @@ impl SessionStore for LibsqlSessionStore {
         Ok(affected > 0)
     }
 
+    async fn set_read_cursor(&self, session_id: &SessionId, ordinal: i64) -> Result<bool> {
+        let conn = self.pool.conn();
+        // Targeted, max-wins UPDATE on the flat column only — the `CASE`
+        // guards against a reordered/stale marker regressing the cursor (a
+        // background tab PUTting an older read position must not undo a newer
+        // one). The JSON `data` blob is untouched, like `set_pinned`.
+        let affected = conn
+            .execute(
+                "UPDATE sessions \
+                 SET read_cursor = CASE \
+                     WHEN read_cursor IS NULL OR ?2 > read_cursor THEN ?2 \
+                     ELSE read_cursor END \
+                 WHERE id = ?1",
+                libsql::params![session_id.as_str().to_string(), ordinal],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_read_cursor: {e}")))?;
+        Ok(affected > 0)
+    }
+
+    async fn read_cursor(&self, session_id: &SessionId) -> Result<Option<i64>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT read_cursor FROM sessions WHERE id = ?1",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql read_cursor: {e}")))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        else {
+            return Ok(None);
+        };
+        row.get::<Option<i64>>(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get read_cursor: {e}")))
+    }
+
+    async fn set_title(&self, session_id: &SessionId, title: Option<&str>) -> Result<bool> {
+        let conn = self.pool.conn();
+        let value: Option<String> = title.map(|t| t.to_string());
+        let affected = conn
+            .execute(
+                "UPDATE sessions SET title = ?2 WHERE id = ?1",
+                libsql::params![session_id.as_str().to_string(), value],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_title: {e}")))?;
+        Ok(affected > 0)
+    }
+
     async fn delete(&self, session_id: &SessionId) -> Result<bool> {
         // The message-log cascade and the session-row delete must commit
         // as a unit (see below); BEGIN IMMEDIATE takes the write lock up
@@ -360,7 +413,7 @@ impl SessionStore for LibsqlSessionStore {
         // know) can be named in the skip warning.
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm, pinned, id, folder_id, archived FROM sessions \
+                "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title FROM sessions \
                  ORDER BY last_active DESC",
                 (),
             )
@@ -394,6 +447,9 @@ impl SessionStore for LibsqlSessionStore {
             let archived_col: i64 = row
                 .get(6)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let title_col: Option<String> = row
+                .get(7)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             // A single undeserializable row (e.g. one written by an older
             // build whose `lineage.kind` this build doesn't know) must
             // degrade to "silently absent from the listing", never fail
@@ -413,6 +469,7 @@ impl SessionStore for LibsqlSessionStore {
             session.pinned = pinned_col != 0;
             session.folder_id = folder_id_col.map(FolderId::from);
             session.archived = archived_col != 0;
+            session.title = title_col;
             sessions.push(session);
         }
         Ok(sessions)
@@ -430,7 +487,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm, pinned, id, folder_id, archived FROM sessions \
+                "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title FROM sessions \
                  WHERE json_extract(data, '$.channel') = ?1 \
                  ORDER BY last_active DESC",
                 libsql::params![channel.as_str().to_string()],
@@ -465,6 +522,9 @@ impl SessionStore for LibsqlSessionStore {
             let archived_col: i64 = row
                 .get(6)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let title_col: Option<String> = row
+                .get(7)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             // Same skip-on-error discipline as `list_all`: a row whose
             // blob fails to deserialize drops out of the listing rather
             // than failing the whole chat-list query.
@@ -483,6 +543,7 @@ impl SessionStore for LibsqlSessionStore {
             session.pinned = pinned_col != 0;
             session.folder_id = folder_id_col.map(FolderId::from);
             session.archived = archived_col != 0;
+            session.title = title_col;
             sessions.push(session);
         }
         Ok(sessions)
@@ -1033,20 +1094,20 @@ impl SessionStore for LibsqlSessionStore {
         session_id: &SessionId,
         after_ordinal: i64,
         limit: usize,
-    ) -> Result<Vec<(i64, baybo_model::ChatMessage)>> {
+    ) -> Result<Vec<(i64, DateTime<Utc>, baybo_model::ChatMessage)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let conn = self.pool.conn();
-        // Forward catch-up: rows with ordinal strictly greater than the
+        // Forward difference: rows with ordinal strictly greater than the
         // client's cursor, capped at `limit`. The partial active index
         // bites the front of the range (`ordinal > N`) so a session
         // with hundreds of older rows pays nothing for them — only the
-        // catch-up window is read.
+        // difference window is read.
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut rows = conn
             .query(
-                "SELECT ordinal, role, content, source, platform_msg_id FROM session_messages \
+                "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages \
                  WHERE session_id = ?1 AND superseded_by IS NULL \
                    AND ordinal > ?2 \
                  ORDER BY ordinal ASC \
@@ -1058,7 +1119,7 @@ impl SessionStore for LibsqlSessionStore {
                 StorageError::Internal(anyhow::anyhow!("libsql query active since: {e}"))
             })?;
 
-        let mut out: Vec<(i64, baybo_model::ChatMessage)> = Vec::new();
+        let mut out: Vec<(i64, DateTime<Utc>, baybo_model::ChatMessage)> = Vec::new();
         while let Some(row) = rows
             .next()
             .await
@@ -1076,17 +1137,64 @@ impl SessionStore for LibsqlSessionStore {
             let source_str: String = row
                 .get(3)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
-            let platform_msg_id: String = row.get(4).map_err(|e| {
+            let created_us: i64 = row.get(4).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}"))
+            })?;
+            let platform_msg_id: String = row.get(5).map_err(|e| {
                 StorageError::Internal(anyhow::anyhow!("libsql get platform_msg_id: {e}"))
+            })?;
+            let created_at = super::time::from_us(created_us).ok_or_else(|| {
+                StorageError::Storage(format!(
+                    "session_messages.created_at out of range: {created_us}"
+                ))
             })?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
             out.push((
                 ordinal,
+                created_at,
                 rehydrate_message(&role, content, &source_str, platform_msg_id)?,
             ));
         }
         Ok(out)
+    }
+
+    async fn find_message_ordinal_by_platform_msg_id(
+        &self,
+        session_id: &SessionId,
+        platform_msg_id: &str,
+    ) -> Result<Option<i64>> {
+        if platform_msg_id.is_empty() {
+            // Empty is the "no idempotency key" opt-out on the write
+            // side; matching it would return an arbitrary keyless row.
+            return Ok(None);
+        }
+        let conn = self.pool.conn();
+        // No superseded filter: a compacted-away row still proves the
+        // send was durably persisted, which is all the outbox needs.
+        let mut rows = conn
+            .query(
+                "SELECT ordinal FROM session_messages \
+                 WHERE session_id = ?1 AND platform_msg_id = ?2 \
+                 ORDER BY ordinal DESC \
+                 LIMIT 1",
+                libsql::params![session_id.as_str().to_string(), platform_msg_id.to_string(),],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql query platform_msg_id: {e}"))
+            })?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let ordinal: i64 = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ord: {e}")))?;
+        Ok(Some(ordinal))
     }
 
     async fn load_last_user_message(
@@ -1233,6 +1341,7 @@ mod tests {
             pinned: false,
             archived: false,
             folder_id: None,
+            title: None,
         }
     }
 
@@ -1908,6 +2017,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_title_round_trips_and_clears() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+        let s = make_root_session("title-1");
+        store.save(&s).await.unwrap();
+
+        assert!(
+            store
+                .set_title(&s.id, Some("Fix login redirect"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.get(&s.id).await.unwrap().unwrap().title.as_deref(),
+            Some("Fix login redirect")
+        );
+
+        assert!(store.set_title(&s.id, None).await.unwrap());
+        assert_eq!(store.get(&s.id).await.unwrap().unwrap().title, None);
+
+        assert!(
+            !store
+                .set_title(&SessionId::from("nope"), Some("x"))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn save_does_not_clobber_title_set_by_set_title() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let s = make_root_session("title-then-save");
+        store.save(&s).await.unwrap();
+        assert!(store.set_title(&s.id, Some("Keep me")).await.unwrap());
+
+        store.save(&s).await.unwrap();
+
+        assert_eq!(
+            store.get(&s.id).await.unwrap().unwrap().title.as_deref(),
+            Some("Keep me"),
+            "save must preserve the title column owned by set_title"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_by_channel_reflects_title_column() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let mut s = make_root_session("title-list");
+        s.channel = ChannelType::http();
+        store.save(&s).await.unwrap();
+        assert!(store.set_title(&s.id, Some("Listed title")).await.unwrap());
+
+        let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].title.as_deref(),
+            Some("Listed title"),
+            "title must reflect the column in list projections (guards the index renumber)"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_sessions_table_without_title_is_migrated() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        pool.conn()
+            .execute("ALTER TABLE sessions DROP COLUMN title", libsql::params![])
+            .await
+            .unwrap();
+        let data = serde_json::to_string(&make_root_session("legacy-title")).unwrap();
+        pool.conn()
+            .execute(
+                "INSERT INTO sessions \
+                 (id, root_session_id, trigger_kind, created_at, last_active, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                libsql::params![
+                    "legacy-title".to_string(),
+                    "legacy-title".to_string(),
+                    "user".to_string(),
+                    super::super::time::to_us(Utc::now()),
+                    super::super::time::to_us(Utc::now()),
+                    data,
+                ],
+            )
+            .await
+            .unwrap();
+        pool.init_db().await.unwrap();
+
+        let store = LibsqlSessionStore::new(pool);
+        let id = SessionId::from("legacy-title");
+        let loaded = store.get(&id).await.unwrap().expect("legacy row present");
+        assert_eq!(
+            loaded.title, None,
+            "migrated legacy row defaults to no title"
+        );
+        assert!(store.set_title(&id, Some("Now titled")).await.unwrap());
+        assert_eq!(
+            store.get(&id).await.unwrap().unwrap().title.as_deref(),
+            Some("Now titled")
+        );
+    }
+
+    #[tokio::test]
     async fn load_active_session_messages_tail_paginates_reverse() {
         // Seven user messages on one session, ordinals 0..=6. The
         // tail loader is the path the chat REST surface uses to ship
@@ -2070,8 +2285,8 @@ mod tests {
     #[tokio::test]
     async fn load_active_session_messages_since_forward_pages_above_cursor() {
         // Same 7-row fixture as the `_tail` test, but exercising the
-        // catch-up cursor path the WS `Subscribe { since_ordinal }`
-        // route uses to replay missed rows to a reconnecting client.
+        // forward difference scan the REST sync endpoint uses to
+        // deliver missed rows to a client presenting its cursor.
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlSessionStore::new(pool);
         let session = make_root_session("catch-up-me");
@@ -2092,7 +2307,7 @@ mod tests {
             .load_active_session_messages_since(&session.id, 3, 10)
             .await
             .unwrap();
-        let ords: Vec<i64> = after_3.iter().map(|(o, _)| *o).collect();
+        let ords: Vec<i64> = after_3.iter().map(|(o, _, _)| *o).collect();
         assert_eq!(ords, vec![4, 5, 6]);
 
         // `limit` is the cap: from cursor 0, ask for 2 — the first
@@ -2101,12 +2316,12 @@ mod tests {
             .load_active_session_messages_since(&session.id, 0, 2)
             .await
             .unwrap();
-        let cap_ords: Vec<i64> = cap.iter().map(|(o, _)| *o).collect();
+        let cap_ords: Vec<i64> = cap.iter().map(|(o, _, _)| *o).collect();
         assert_eq!(cap_ords, vec![1, 2]);
 
         // Caught up: the cursor is at (or past) the latest row, so
         // the slice is empty. `limit + 1` over-fetch sees zero ⇒
-        // server's "no catch-up needed" branch.
+        // server's "nothing missed" branch.
         let none = store
             .load_active_session_messages_since(&session.id, 6, 10)
             .await
@@ -2118,7 +2333,7 @@ mod tests {
             .load_active_session_messages_since(&session.id, -1, 10)
             .await
             .unwrap();
-        let all_ords: Vec<i64> = all.iter().map(|(o, _)| *o).collect();
+        let all_ords: Vec<i64> = all.iter().map(|(o, _, _)| *o).collect();
         assert_eq!(all_ords, vec![0, 1, 2, 3, 4, 5, 6]);
     }
 }

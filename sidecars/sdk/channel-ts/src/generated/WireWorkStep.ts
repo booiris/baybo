@@ -2,8 +2,8 @@
 import type { WireWorkStepKind } from "./WireWorkStepKind";
 
 /**
- * One step inside a turn's in-flight work block, carried in a
- * [`Frame::WorkSnapshot`]. Mirrors the client's rendered work-step model:
+ * One step inside a turn's in-flight work block, carried in the
+ * [`Frame::SubscribeState`] bundle. Mirrors the client's rendered work-step model:
  * `reasoning` / `prose` bodies live in [`Self::text`]; a `tool` step carries
  * the call's `call_id` (so a later live [`Frame::ToolCompleted`] still pairs by
  * id), a display `tool` name + optional `label`, and — once the call finished

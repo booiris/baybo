@@ -9,6 +9,385 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/v1/agents": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "list_agents",
+        "responses": {
+          "200": {
+            "description": "Every agent profile, builtin first then by name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One agent profile. Absent `system_prompt` = workspace Soul; absent\n`llm` = follow `default-llm`. Skills are not part of the profile — they\nare read live from the skill registry (`GET /v1/skills`).",
+                        "required": [
+                          "id",
+                          "name",
+                          "description",
+                          "framework",
+                          "builtin",
+                          "created_at",
+                          "updated_at"
+                        ],
+                        "properties": {
+                          "avatar_blob_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "builtin": {
+                            "type": "boolean",
+                            "description": "The seeded built-in profile: read-only except its avatar,\ncannot be deleted."
+                          },
+                          "created_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "description": {
+                            "type": "string"
+                          },
+                          "framework": {
+                            "$ref": "#/components/schemas/AgentFrameworkDto"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "llm": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "system_prompt": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "updated_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "create_agent",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAgentProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The created agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentProfileDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid/duplicate name, unknown LLM entry, or unknown/non-image avatar blob",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{agent_id}": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "get_agent",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentProfileDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "update_agent",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAgentProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Agent profile replaced"
+          },
+          "400": {
+            "description": "Built-in profile is read-only, invalid/duplicate name, or unknown LLM entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "delete_agent",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Agent profile deleted"
+          },
+          "400": {
+            "description": "Built-in profile cannot be deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{agent_id}/avatar": {
+      "put": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "set_agent_avatar",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAgentAvatarRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Avatar set (or cleared)"
+          },
+          "400": {
+            "description": "Unknown blob id or non-image mime",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/analytics": {
       "get": {
         "tags": [
@@ -768,80 +1147,6 @@
         }
       }
     },
-    "/v1/chat/sessions/{session_id}/catch-up": {
-      "get": {
-        "tags": [
-          "chat"
-        ],
-        "operationId": "catch_up_session",
-        "parameters": [
-          {
-            "name": "session_id",
-            "in": "path",
-            "description": "Session id to catch up",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "since_ordinal",
-            "in": "query",
-            "description": "Newest durable ordinal the client has already rendered.",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "description": "Maximum rows to scan. Defaults to [`DEFAULT_CATCH_UP_LIMIT`], clamped to\n[`MAX_HISTORY_LIMIT`]. If the gap is larger, the response is marked\n`truncated` and carries no partial middle slice.",
-            "required": false,
-            "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
-              "minimum": 0
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Forward transcript catch-up for device reconnect merge",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ChatCatchUpResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Session not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/chat/sessions/{session_id}/folder": {
       "put": {
         "tags": [
@@ -885,6 +1190,76 @@
           },
           "404": {
             "description": "Session or folder not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/sessions/{session_id}/messages": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "lookup_session_message",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to probe",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "platform_msg_id",
+            "in": "query",
+            "description": "Client-generated send idempotency key to probe.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Durability point lookup for one send idempotency key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatMessageLookup"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty platform_msg_id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -997,6 +1372,137 @@
         "responses": {
           "204": {
             "description": "Pin state updated"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/sessions/{session_id}/read": {
+      "put": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "mark_session_read",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to mark read",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarkReadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Read cursor advanced; unread_count recomputes from it"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/sessions/{session_id}/sync": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "sync_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to sync",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since_ordinal",
+            "in": "query",
+            "description": "Highest coverage watermark the client holds for this session.\nOmit for the newest-page baseline (cold start, fresh install,\nno local cursor).",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum transcript rows to return, counted in *emitted* rows.\nDefaults to [`DEFAULT_HISTORY_LIMIT`], clamped to\n[`MAX_HISTORY_LIMIT`]. A difference larger than this rebases.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Forward-recovery pull: the difference after the cursor, or a newest-page baseline (rebased / no cursor)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSyncResponse"
+                }
+              }
+            }
           },
           "401": {
             "description": "Unauthorized",
@@ -2469,7 +2975,7 @@
         "operationId": "list_skills",
         "responses": {
           "200": {
-            "description": "Registered skill names",
+            "description": "Registered skills with descriptions",
             "content": {
               "application/json": {
                 "schema": {
@@ -2482,7 +2988,20 @@
                     "items": {
                       "type": "array",
                       "items": {
-                        "type": "string"
+                        "type": "object",
+                        "description": "One registered skill: its invocation name and a short blurb of what it\ndoes (the `SKILL.md` `description`).",
+                        "required": [
+                          "name",
+                          "description"
+                        ],
+                        "properties": {
+                          "description": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          }
+                        }
                       }
                     },
                     "next_cursor": {
@@ -2831,6 +3350,72 @@
   },
   "components": {
     "schemas": {
+      "AgentFrameworkDto": {
+        "type": "string",
+        "description": "Mirror of [`baybo_model::AgentFramework`]; wire strings match the\nspawn protocol's backend tags (`baybo`/`claude`/`codex`).",
+        "enum": [
+          "baybo",
+          "claude",
+          "codex"
+        ]
+      },
+      "AgentProfileDto": {
+        "type": "object",
+        "description": "One agent profile. Absent `system_prompt` = workspace Soul; absent\n`llm` = follow `default-llm`. Skills are not part of the profile — they\nare read live from the skill registry (`GET /v1/skills`).",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "framework",
+          "builtin",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "avatar_blob_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "builtin": {
+            "type": "boolean",
+            "description": "The seeded built-in profile: read-only except its avatar,\ncannot be deleted."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "description": {
+            "type": "string"
+          },
+          "framework": {
+            "$ref": "#/components/schemas/AgentFrameworkDto"
+          },
+          "id": {
+            "type": "string"
+          },
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "system_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "AnalyticsDayBucket": {
         "type": "object",
         "description": "One bucket per UTC day for the analytics chart.\n\n`cost_micro_usd` is integer micro-USD (USD × 10^6). Rendering layers\ndivide by 1_000_000 to get USD; on-wire arithmetic stays exact.",
@@ -3076,14 +3661,6 @@
           }
         }
       },
-      "CatchUpItemKind": {
-        "type": "string",
-        "description": "Discriminator for [`ChatCatchUpItem`] — serialized as\n`\"message\"` / `\"work\"`.",
-        "enum": [
-          "message",
-          "work"
-        ]
-      },
       "ChannelType": {
         "type": "string",
         "description": "Admin-surface mirror of [`baybo_model::ChannelType`]. Transparent\nwrapper around a snake_case string so the OpenAPI surface stays\nstable while the core type is open-ended (runtime-registered\nsidecars like `\"slack\"` pass through unchanged)."
@@ -3117,111 +3694,6 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
-          }
-        }
-      },
-      "ChatCatchUpItem": {
-        "type": "object",
-        "description": "Forward reconnect item for native device clients. The sequence is ordered by\npersisted ordinal; a completed tool-using assistant reply appears as a\n`work` item followed by the matching `message` item with the same `ordinal`.",
-        "required": [
-          "kind",
-          "ordinal",
-          "content"
-        ],
-        "properties": {
-          "attachments": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ChatAttachment"
-            }
-          },
-          "content": {
-            "type": "string"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/CatchUpItemKind"
-          },
-          "ordinal": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "platform_msg_id": {
-            "type": "string"
-          },
-          "role": {
-            "type": "string"
-          },
-          "steps": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ChatCatchUpWorkStep"
-            }
-          }
-        }
-      },
-      "ChatCatchUpResponse": {
-        "type": "object",
-        "required": [
-          "items",
-          "truncated"
-        ],
-        "properties": {
-          "items": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ChatCatchUpItem"
-            }
-          },
-          "newest_ordinal": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Newest visible message ordinal included in `items`. Internal tool /\nthinking rows are deliberately not exposed as the cursor, because a\nlater final answer may still need them to reconstruct its completed work\nblock."
-          },
-          "truncated": {
-            "type": "boolean",
-            "description": "True when the requested gap exceeds the catch-up cap. The client should\ndiscard this partial answer and rebuild from the normal history API."
-          }
-        }
-      },
-      "ChatCatchUpWorkStep": {
-        "type": "object",
-        "description": "One work step in the forward catch-up API. This intentionally mirrors\n`wire::WireWorkStep`'s JSON field names (not the REST transcript's\n`tool_label` / `tool_status` names) because the device transcript reuses the\nlive `WorkSnapshot` renderer for catch-up work blocks.",
-        "required": [
-          "kind"
-        ],
-        "properties": {
-          "kind": {
-            "$ref": "#/components/schemas/WorkStepKind"
-          },
-          "label": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "status": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "summary": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "text": {
-            "type": "string"
-          },
-          "tool": {
-            "type": [
-              "string",
-              "null"
-            ]
           }
         }
       },
@@ -3278,6 +3750,26 @@
             "items": {
               "$ref": "#/components/schemas/ChatCronMessage"
             }
+          }
+        }
+      },
+      "ChatMessageLookup": {
+        "type": "object",
+        "description": "Response from `GET /v1/chat/sessions/{session_id}/messages` — the\nper-`platform_msg_id` durability probe. `found: false` is a provable\nabsence (the key was never persisted for this session), which lets\nthe client outbox resume its retry machine; `found: true` confirms\ndurability without consuming a retry transmission.",
+        "required": [
+          "found"
+        ],
+        "properties": {
+          "found": {
+            "type": "boolean"
+          },
+          "ordinal": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Ordinal of the newest persisted row carrying the key, when found."
           }
         }
       },
@@ -3345,6 +3837,13 @@
           "session_id": {
             "type": "string"
           },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Auto-generated conversation title, if available."
+          },
           "transcript": {
             "type": "array",
             "items": {
@@ -3361,7 +3860,8 @@
           "created_at",
           "last_active",
           "pinned",
-          "archived"
+          "archived",
+          "unread_count"
         ],
         "properties": {
           "archived": {
@@ -3400,6 +3900,18 @@
           },
           "session_id": {
             "type": "string"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Auto-generated conversation title, if available."
+          },
+          "unread_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of unread assistant replies — final assistant messages persisted\nwith `ordinal` above this session's read cursor\n(`PUT /v1/chat/sessions/{id}/read`), capped at [`UNREAD_COUNT_CAP`]\n(the client renders the cap as \"N+\"). Server-computed, so it is\naccurate across a cold restart / a device that missed the live\n`SessionActivity` pings. `0` when caught up."
           }
         }
       },
@@ -3417,11 +3929,53 @@
           }
         }
       },
+      "ChatSyncResponse": {
+        "type": "object",
+        "description": "Response from `GET /v1/chat/sessions/{session_id}/sync` — the one\nforward-recovery pull. Full-fidelity on every path: rows carry work\nblocks and notices exactly like the history surface.",
+        "required": [
+          "rows",
+          "rebased",
+          "has_more_older"
+        ],
+        "properties": {
+          "has_more_older": {
+            "type": "boolean",
+            "description": "Whether older history exists below `oldest_ordinal` (REPLACE\nresponses only; always `false` on a difference response)."
+          },
+          "next_cursor": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Coverage watermark: the highest persisted ordinal the scan\ncovered, visible or not — it may exceed every row in `rows`\n(invisible tool/system tail). This, not any row's ordinal, is\nwhat advances the client cursor (`max`-wins). `null` iff the\nsession has no persisted rows."
+          },
+          "oldest_ordinal": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Page floor for lazy backfill after a REPLACE (baseline /\nrebase). Absent on a difference response — the client keeps its\nown floor when merging."
+          },
+          "rebased": {
+            "type": "boolean",
+            "description": "`true` ⇒ `rows` is the NEWEST page, not the requested difference\n(the difference exceeded `limit` in emitted rows, or the raw\nscan bound). The client REPLACEs its thread with the page and\ntreats its cursor as rebase-dirty until one non-rebased sync\ncompletes."
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatTranscriptItem"
+            },
+            "description": "Transcript rows (message | work | notice), ascending. On a\nbaseline / rebased response this is the newest page and REPLACEs\nthe client's thread; on a difference response it appends/merges."
+          }
+        }
+      },
       "ChatTranscriptItem": {
         "type": "object",
         "description": "One transcript row, flattened from `ChatMessage` into a shape the\nweb client can render without re-implementing the content-block\nmatcher. Two shapes ride this struct, discriminated by [`Self::kind`]:\na `Message` (user / final-assistant bubble) or a `Work` (reconstructed\ncollapsed work block for a tool-using turn — see\n[`reconstruct_transcript`]).",
         "required": [
-          "ordinal",
+          "id",
           "kind",
           "role",
           "text",
@@ -3449,6 +4003,10 @@
             "type": "boolean",
             "description": "`true` when this row had non-text content (image / audio /\nfile). The web client currently shows a placeholder."
           },
+          "id": {
+            "type": "string",
+            "description": "Stable row id, unique within the session and identical on every\nredelivery (sync, backfill): `m<ordinal>` for a message,\n`w<ordinal>` for a work block, `n<seq>` for a control-event row.\nThis is the client's render key AND redelivery dedup key."
+          },
           "kind": {
             "$ref": "#/components/schemas/TranscriptItemKind",
             "description": "Message bubble vs. reconstructed work block."
@@ -3461,9 +4019,16 @@
             "description": "Severity of a `notice` item (`\"info\"` / `\"warn\"` / `\"error\"`), so a reload\ncolors it the way the live frame did. `None` for `message` / `work` items."
           },
           "ordinal": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64",
-            "description": "React key for the row. For `message` / `work` items it is the\n`session_messages.ordinal` (a `work` item carries the turn's first\nintermediate ordinal so it sorts just after the user turn). For a\n`notice` / control-echo item it is a **synthetic negative value** in a\nkey space disjoint from real ordinals — so the client must NOT use it for\npagination / cursor seeding; see `ChatSessionDetail::oldest_ordinal` /\n`newest_ordinal`."
+            "description": "`session_messages.ordinal` for ordinal-addressed rows: a\n`message` carries its own; a `work` item carries the turn's\nfirst intermediate ordinal so it sorts just after the user turn.\n**Absent for `notice` / control-echo items** — control events\nare not ordinal-addressed (they anchor at an ordinal and are\nkeyed by their own per-session `seq`, baked into [`Self::id`]).\nClients must not use this for pagination / cursor seeding; see\n`ChatSessionDetail::oldest_ordinal` / `newest_ordinal` and\n`ChatSyncResponse::next_cursor`."
+          },
+          "platform_msg_id": {
+            "type": "string",
+            "description": "Client-generated send idempotency key for a user `message` row,\nwhen the send carried one. Every redelivery (sync, backfill)\ncarries it so the client outbox can match durability\nconfirmations and dedup redelivered rows against the live echo.\nEmpty for rows without one (assistant replies, work, notices)."
           },
           "role": {
             "type": "string",
@@ -3538,6 +4103,44 @@
               "null"
             ],
             "description": "One-line summary re-derived from the persisted tool result. `None`\nwhen the result for this call didn't land in the fetched window.\n\nDeliberately a snippet of the actual result, not a content-light\ncount: this surface is the bearer-gated, operator-only chat reload\n(never the live multi-channel fan-out), so it favors debugging\nusefulness. Unlike the live `ToolCompleted.summary` it is NOT run\nthrough `sanitize_stream_fragment`, so it can show raw tool output\nthe live UI withheld — acceptable for the operator's own view."
+          }
+        }
+      },
+      "CreateAgentProfileRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/agents`. Absent nullable fields mean\n\"inherit the default\" (see [`AgentProfileDto`]).",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "avatar_blob_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional avatar (full blob id from `POST /v1/blobs`); validated\nexactly like `PUT /v1/agents/{agent_id}/avatar`."
+          },
+          "description": {
+            "type": "string"
+          },
+          "framework": {
+            "$ref": "#/components/schemas/AgentFrameworkDto"
+          },
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`baybo.json` LLM entry name; must match a configured entry — see\n`GET /v1/llm/models`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "system_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -4368,6 +4971,20 @@
           }
         }
       },
+      "MarkReadRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/chat/sessions/{session_id}/read`.",
+        "required": [
+          "ordinal"
+        ],
+        "properties": {
+          "ordinal": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Highest `session_messages.ordinal` the viewer has now read. The read\ncursor advances max-wins, so a stale/lower value is a no-op — a client\ncan safely fire this on open and after each new reply while foreground."
+          }
+        }
+      },
       "MoveFolderRequest": {
         "type": "object",
         "properties": {
@@ -4523,6 +5140,19 @@
           "cron",
           "subagent"
         ]
+      },
+      "SetAgentAvatarRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/agents/{agent_id}/avatar`.",
+        "properties": {
+          "blob_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Full blob id from `POST /v1/blobs`, or `null`/absent to clear\nthe avatar."
+          }
+        }
       },
       "SetConfigRequest": {
         "type": "object",
@@ -4774,6 +5404,38 @@
           }
         }
       },
+      "UpdateAgentProfileRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/agents/{agent_id}` — the **complete** content\nstate (full replace). `name`/`description`/`framework` are required so\nan omitted `framework` can't silently reset a profile to `baybo`;\nabsent nullable fields reset to the inherit-default state.",
+        "required": [
+          "name",
+          "description",
+          "framework"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "framework": {
+            "$ref": "#/components/schemas/AgentFrameworkDto"
+          },
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "system_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "UpdateDeviceApnsTokenRequest": {
         "type": "object",
         "description": "Request body for `POST /v1/mobile/apns-token`.",
@@ -4941,6 +5603,10 @@
     {
       "name": "logs",
       "description": "Recent tracing events (in-memory ring buffer)"
+    },
+    {
+      "name": "agents",
+      "description": "User-managed agent profiles (chat personas)"
     }
   ]
 }

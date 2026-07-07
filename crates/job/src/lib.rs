@@ -25,7 +25,7 @@ pub use baybo_store::{JobRow, JobStore, JobTransitionRow};
 pub use cancel::CancelReason;
 pub use cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
 pub use error::JobError;
-pub use kind::{JobInput, JobInputKind, JobOutput, JobShape};
+pub use kind::{JobInput, JobInputKind, JobOutput, JobShape, SystemJobPayload};
 pub use lifecycle::{JobLifecycle, JobLifecycleEvent, JobPhase};
 
 pub type Result<T> = std::result::Result<T, JobError>;

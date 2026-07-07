@@ -44,7 +44,7 @@ use axum::middleware;
 use baybo_security::SecretVault;
 use baybo_skills::SkillRegistry;
 use baybo_storage::Store;
-use baybo_store::{BlobStore, ChannelBotStore};
+use baybo_store::{AgentProfileStore, BlobStore, ChannelBotStore};
 use baybo_tools::ToolRegistry;
 use baybo_trace::TraceStore;
 use tokio::sync::mpsc;
@@ -147,8 +147,12 @@ pub struct AdminState {
     pub config_reloader: Arc<dyn ConfigReloader>,
     pub log_buffer: Arc<LogBuffer>,
     pub channel_bot_store: Arc<dyn ChannelBotStore>,
-    pub channel_control: Arc<crate::channel::ChannelControlRegistry>,
+    pub agent_profile_store: Arc<dyn AgentProfileStore>,
+    /// Blob metadata lookups (`stat`) so the agents endpoints can reject a
+    /// dangling or non-image `avatar_blob_id` at write time. Also used by the
+    /// chat transcript surface to attach persisted blob refs.
     pub blob_store: Arc<dyn BlobStore>,
+    pub channel_control: Arc<crate::channel::ChannelControlRegistry>,
     pub secret_vault: Arc<SecretVault>,
     /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
@@ -193,8 +197,9 @@ impl AdminState {
             config_reloader: Arc::clone(&deps.config_reloader),
             log_buffer: Arc::clone(&deps.log_buffer),
             channel_bot_store: Arc::clone(&deps.stores.channel_bot),
+            agent_profile_store: Arc::clone(&deps.stores.agent_profile),
+            blob_store: Arc::clone(&deps.stores.blob),
             channel_control: Arc::clone(&deps.channel_control),
-            blob_store: deps.stores.blob.clone(),
             secret_vault: Arc::clone(&deps.secret_vault),
             bind_display: deps.runtime_config.admin_bind.to_string(),
         }

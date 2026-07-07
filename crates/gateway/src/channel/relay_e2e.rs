@@ -243,7 +243,6 @@ async fn real_relay_splices_gateway_responder_and_mock_app() {
             &mut transport,
             &Frame::Subscribe {
                 session_id: "sess-e2e".into(),
-                since_ordinal: None,
             },
         ),
     )
