@@ -547,6 +547,13 @@ export function Transcript({
   // (content grew below with pins suspended → catch up on lift). Without this,
   // any sub-threshold drag sprang back on release.
   const touchStartScrollTop = useRef(0);
+  // scrollHeight captured at touchstart, so touchend re-pins ONLY when content
+  // actually landed during the touch (a hold at the bottom during streaming) —
+  // not on a plain tap. A re-pin scrolls inside the touchend handler, which
+  // makes WebKit cancel the tap's synthetic `click`, so an unconditional re-pin
+  // eats taps on work blocks / buttons whenever `followRef` is set but the
+  // scroll isn't exactly at the bottom.
+  const touchStartScrollHeight = useRef(0);
   // Drives the jump-to-latest button — a render concern, unlike followRef
   // (a ref precisely so scrolling doesn't re-render).
   const [showJump, setShowJump] = useState(false);
@@ -610,18 +617,22 @@ export function Transcript({
   useEffect(() => {
     const down = () => {
       userTouchingRef.current = true;
-      touchStartScrollTop.current = scrollEl()?.scrollTop ?? 0;
+      const el = scrollEl();
+      touchStartScrollTop.current = el?.scrollTop ?? 0;
+      touchStartScrollHeight.current = el?.scrollHeight ?? 0;
     };
     const up = () => {
       userTouchingRef.current = false;
       const el = scrollEl();
       if (!el) return;
-      // Catch up to the newest edge on lift ONLY for a hold at the bottom
-      // (content grew while pins were suspended) — NOT for a deliberate upward
-      // drag, which must stay where the finger left it (the old unconditional
-      // re-pin sprang every sub-threshold drag back to the bottom).
+      // Catch up to the newest edge on lift ONLY for a hold at the bottom where
+      // content actually GREW while pins were suspended — NOT for a deliberate
+      // upward drag (must stay put), and NOT for a plain tap (re-pinning it
+      // scrolls inside the touchend handler, so WebKit cancels the tap's
+      // synthetic click — taps on work blocks / buttons then need several tries).
       const draggedUp = el.scrollTop < touchStartScrollTop.current - 2;
-      if (followRef.current && !draggedUp) el.scrollTop = el.scrollHeight;
+      const grew = el.scrollHeight - touchStartScrollHeight.current > 1;
+      if (followRef.current && !draggedUp && grew) el.scrollTop = el.scrollHeight;
     };
     window.addEventListener("touchstart", down, { passive: true });
     window.addEventListener("touchend", up, { passive: true });
@@ -647,6 +658,22 @@ export function Transcript({
 
   const appendNotice = useCallback((text: string) => {
     setMessages((m) => [...m, { id: uid(), role: "notice", content: text }]);
+  }, []);
+
+  // A user opened a collapsed work block: stop following the newest edge so the
+  // block grows DOWNWARD from its summary. Left following, the pin (ResizeObserver
+  // / layout effect) chases the bottom as the steps insert and shoves the summary
+  // up. Disengage synchronously so it beats the growth's pin; once the steps have
+  // painted, reflect whether the newest edge is now off-screen (jump button).
+  // Only on open — collapsing shrinks content and needs no change.
+  const handleWorkToggle = useCallback((open: boolean) => {
+    if (!open) return;
+    followRef.current = false;
+    requestAnimationFrame(() => {
+      const el = scrollEl();
+      if (!el) return;
+      setShowJump(el.scrollHeight - el.scrollTop - el.clientHeight > FOLLOW_BOTTOM_THRESHOLD_PX);
+    });
   }, []);
 
   // The server acknowledged our own send (its echo arrived by platform_msg_id) —
@@ -1405,7 +1432,7 @@ export function Transcript({
         )}
         {messages.map((m) =>
           m.role === "work" ? (
-            <WorkBlockView key={m.id} row={m} />
+            <WorkBlockView key={m.id} row={m} onToggle={handleWorkToggle} />
           ) : (
             <MessageRow key={m.id} m={m} connEpoch={connEpoch} onRetry={retryMessage} />
           ),

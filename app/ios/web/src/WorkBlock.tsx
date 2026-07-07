@@ -83,7 +83,17 @@ function WorkStepView({ step }: { step: WorkStep }) {
 /// header and the live step feed; once closed, a dim "Worked Xs ›" summary the
 /// user can tap open, followed by a hairline divider (the web chat's shape,
 /// restyled to the mobile line-minimal system).
-export const WorkBlockView = memo(function WorkBlockView({ row }: { row: WorkRow }) {
+export const WorkBlockView = memo(function WorkBlockView({
+  row,
+  onToggle,
+}: {
+  row: WorkRow;
+  /// Fired with the NEW expanded state on a user tap, so the transcript can
+  /// disengage follow-to-bottom when a block opens — otherwise the pin chases
+  /// the newest edge and the inserted steps shove the summary UP instead of
+  /// opening downward from it.
+  onToggle?: (expanded: boolean) => void;
+}) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
 
@@ -107,7 +117,15 @@ export const WorkBlockView = memo(function WorkBlockView({ row }: { row: WorkRow
   }
   return (
     <div className="work closed">
-      <button type="button" className="work-summary" onClick={() => setExpanded((e) => !e)}>
+      <button
+        type="button"
+        className="work-summary"
+        onClick={() => {
+          const next = !expanded;
+          setExpanded(next);
+          onToggle?.(next);
+        }}
+      >
         <span>{workedLabel(t, row.elapsedMs)}</span>
         <span className={`work-chevron${expanded ? " open" : ""}`}>›</span>
       </button>
