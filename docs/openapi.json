@@ -9,6 +9,385 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/v1/agents": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "list_agents",
+        "responses": {
+          "200": {
+            "description": "Every agent profile, builtin first then by name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "One agent profile. Absent `system_prompt` = workspace Soul; absent\n`llm` = follow `default-llm`. Skills are not part of the profile — they\nare read live from the skill registry (`GET /v1/skills`).",
+                        "required": [
+                          "id",
+                          "name",
+                          "description",
+                          "framework",
+                          "builtin",
+                          "created_at",
+                          "updated_at"
+                        ],
+                        "properties": {
+                          "avatar_blob_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "builtin": {
+                            "type": "boolean",
+                            "description": "The seeded built-in profile: read-only except its avatar,\ncannot be deleted."
+                          },
+                          "created_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "description": {
+                            "type": "string"
+                          },
+                          "framework": {
+                            "$ref": "#/components/schemas/AgentFrameworkDto"
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "llm": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "system_prompt": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "updated_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          }
+                        }
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "create_agent",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAgentProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The created agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentProfileDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid/duplicate name, unknown LLM entry, or unknown/non-image avatar blob",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{agent_id}": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "get_agent",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentProfileDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "update_agent",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAgentProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Agent profile replaced"
+          },
+          "400": {
+            "description": "Built-in profile is read-only, invalid/duplicate name, or unknown LLM entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "delete_agent",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Agent profile deleted"
+          },
+          "400": {
+            "description": "Built-in profile cannot be deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{agent_id}/avatar": {
+      "put": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "set_agent_avatar",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "Agent profile id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAgentAvatarRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Avatar set (or cleared)"
+          },
+          "400": {
+            "description": "Unknown blob id or non-image mime",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such agent profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/analytics": {
       "get": {
         "tags": [
@@ -2278,7 +2657,7 @@
         "operationId": "list_skills",
         "responses": {
           "200": {
-            "description": "Registered skill names",
+            "description": "Registered skills with descriptions",
             "content": {
               "application/json": {
                 "schema": {
@@ -2291,7 +2670,20 @@
                     "items": {
                       "type": "array",
                       "items": {
-                        "type": "string"
+                        "type": "object",
+                        "description": "One registered skill: its invocation name and a short blurb of what it\ndoes (the `SKILL.md` `description`).",
+                        "required": [
+                          "name",
+                          "description"
+                        ],
+                        "properties": {
+                          "description": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          }
+                        }
                       }
                     },
                     "next_cursor": {
@@ -2640,6 +3032,72 @@
   },
   "components": {
     "schemas": {
+      "AgentFrameworkDto": {
+        "type": "string",
+        "description": "Mirror of [`baybo_model::AgentFramework`]; wire strings match the\nspawn protocol's backend tags (`baybo`/`claude`/`codex`).",
+        "enum": [
+          "baybo",
+          "claude",
+          "codex"
+        ]
+      },
+      "AgentProfileDto": {
+        "type": "object",
+        "description": "One agent profile. Absent `system_prompt` = workspace Soul; absent\n`llm` = follow `default-llm`. Skills are not part of the profile — they\nare read live from the skill registry (`GET /v1/skills`).",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "framework",
+          "builtin",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "avatar_blob_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "builtin": {
+            "type": "boolean",
+            "description": "The seeded built-in profile: read-only except its avatar,\ncannot be deleted."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "description": {
+            "type": "string"
+          },
+          "framework": {
+            "$ref": "#/components/schemas/AgentFrameworkDto"
+          },
+          "id": {
+            "type": "string"
+          },
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "system_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "AnalyticsDayBucket": {
         "type": "object",
         "description": "One bucket per UTC day for the analytics chart.\n\n`cost_micro_usd` is integer micro-USD (USD × 10^6). Rendering layers\ndivide by 1_000_000 to get USD; on-wire arithmetic stays exact.",
@@ -3190,6 +3648,44 @@
               "null"
             ],
             "description": "One-line summary re-derived from the persisted tool result. `None`\nwhen the result for this call didn't land in the fetched window.\n\nDeliberately a snippet of the actual result, not a content-light\ncount: this surface is the bearer-gated, operator-only chat reload\n(never the live multi-channel fan-out), so it favors debugging\nusefulness. Unlike the live `ToolCompleted.summary` it is NOT run\nthrough `sanitize_stream_fragment`, so it can show raw tool output\nthe live UI withheld — acceptable for the operator's own view."
+          }
+        }
+      },
+      "CreateAgentProfileRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/agents`. Absent nullable fields mean\n\"inherit the default\" (see [`AgentProfileDto`]).",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "avatar_blob_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional avatar (full blob id from `POST /v1/blobs`); validated\nexactly like `PUT /v1/agents/{agent_id}/avatar`."
+          },
+          "description": {
+            "type": "string"
+          },
+          "framework": {
+            "$ref": "#/components/schemas/AgentFrameworkDto"
+          },
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`baybo.json` LLM entry name; must match a configured entry — see\n`GET /v1/llm/models`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "system_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -4163,6 +4659,19 @@
           "subagent"
         ]
       },
+      "SetAgentAvatarRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/agents/{agent_id}/avatar`.",
+        "properties": {
+          "blob_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Full blob id from `POST /v1/blobs`, or `null`/absent to clear\nthe avatar."
+          }
+        }
+      },
       "SetConfigRequest": {
         "type": "object",
         "description": "`PUT /v1/config` body.",
@@ -4400,6 +4909,38 @@
           }
         }
       },
+      "UpdateAgentProfileRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/agents/{agent_id}` — the **complete** content\nstate (full replace). `name`/`description`/`framework` are required so\nan omitted `framework` can't silently reset a profile to `baybo`;\nabsent nullable fields reset to the inherit-default state.",
+        "required": [
+          "name",
+          "description",
+          "framework"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "framework": {
+            "$ref": "#/components/schemas/AgentFrameworkDto"
+          },
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "system_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "UpdateFolderRequest": {
         "type": "object",
         "properties": {
@@ -4549,6 +5090,10 @@
     {
       "name": "logs",
       "description": "Recent tracing events (in-memory ring buffer)"
+    },
+    {
+      "name": "agents",
+      "description": "User-managed agent profiles (chat personas)"
     }
   ]
 }
