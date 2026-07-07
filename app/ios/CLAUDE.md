@@ -234,7 +234,10 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 - **Headless UI verification**: `-baybo-open-home` (DEBUG) lands on the tabbed
   home shell WITHOUT pushing a conversation (seeds a few demo list rows), so
   the menu bar / header / sections screenshot headlessly; add `-baybo-home-tab
-  <agents|projects|chats|settings>` to preselect a section. `-baybo-demo-tabs`
+  <agents|projects|chats|settings>` to preselect a section. `-baybo-demo-pin`
+  (with `-baybo-open-home`) seeds nothing pinned, then springs the bottom row
+  (demo-1) to the top ~2s in so the pin reorder glide is recordable in isolation
+  (`simctl io recordVideo` + ffmpeg montage of the transition window). `-baybo-demo-tabs`
   cycles the tab selection on a timer so the native Liquid Glass tab morph is
   recordable (`simctl io recordVideo` + ffmpeg montage). Launch with
   `-baybo-open-chat -baybo-demo-frames` (DEBUG) to feed one canned turn

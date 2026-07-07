@@ -12,7 +12,6 @@ import i18n from "./i18n";
 import "./styles.css";
 import { hasNativeBridge, onInit, onLanguage, postContentReady, postReady } from "./bridge";
 import { Transcript } from "./Transcript";
-import { prefetchMarkdown } from "./MarkdownBody";
 
 onLanguage((lang) => void i18n.changeLanguage(lang));
 
@@ -33,7 +32,6 @@ onInit((payload) => {
     </React.StrictMode>,
   );
   requestAnimationFrame(() => postContentReady());
-  prefetchMarkdown();
 });
 
 postReady();

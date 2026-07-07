@@ -197,6 +197,7 @@ impl SessionManager {
             lineage: Some(lineage),
             hidden: false,
             pinned: false,
+            archived: false,
             folder_id: None,
         };
         self.store.save(&session).await?;
@@ -228,6 +229,7 @@ impl SessionManager {
             lineage: None,
             hidden: false,
             pinned: false,
+            archived: false,
             folder_id: None,
         };
         self.store.save(&session).await?;
@@ -565,6 +567,19 @@ impl SessionManager {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
         debug!(session_id = %session_id, pinned, "toggled session pinned");
+        Ok(())
+    }
+
+    /// Flip the session's chat-list `archived` flag — the "move to
+    /// archive" affordance. Targeted flat-column write that survives a
+    /// concurrent `touch`; see [`baybo_store::SessionStore::set_archived`].
+    /// Returns `Err(NotFound)` when the session id is unknown.
+    pub async fn set_archived(&self, session_id: &SessionId, archived: bool) -> Result<()> {
+        let updated = self.store.set_archived(session_id, archived).await?;
+        if !updated {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        debug!(session_id = %session_id, archived, "toggled session archived");
         Ok(())
     }
 

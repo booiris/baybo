@@ -3069,6 +3069,7 @@ mod session_end_gate_tests {
             lineage,
             hidden: false,
             pinned: false,
+            archived: false,
             folder_id: None,
         }
     }

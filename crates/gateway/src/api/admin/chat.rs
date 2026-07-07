@@ -20,6 +20,10 @@
 //! * `PUT /v1/chat/sessions/:id/pin` — pin (or unpin) the session to
 //!   the top of the chat list. Presentation only; the row is otherwise
 //!   unchanged.
+//! * `PUT /v1/chat/sessions/:id/archive` — archive (or unarchive) the
+//!   session. Presentation only; the list endpoint keeps returning
+//!   archived rows (clients group them) and new activity never clears
+//!   the flag.
 //! * `GET /v1/chat/slash-manifest` — list of slash commands the input
 //!   composer's `/`-autocomplete should surface.
 //!
@@ -64,6 +68,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(catch_up_session))
         .routes(routes!(set_session_model))
         .routes(routes!(set_session_pin))
+        .routes(routes!(set_session_archive))
         .routes(routes!(set_session_folder))
         .routes(routes!(delete_session))
         .routes(routes!(unhide_session))
@@ -520,6 +525,11 @@ pub struct ChatSessionSummary {
     /// chat list. Always emitted so the sidebar can place every row in
     /// the right block; set via `PUT /v1/chat/sessions/{id}/pin`.
     pub pinned: bool,
+    /// True when the user has archived this session. Always emitted —
+    /// the list never filters on it, so clients with an archived view
+    /// group rows themselves and clients without one keep showing every
+    /// row; set via `PUT /v1/chat/sessions/{id}/archive`.
+    pub archived: bool,
     /// Preview text drawn from the session's most-recent user-authored
     /// message, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar
     /// renders this as the row label so users can scan past
@@ -647,6 +657,7 @@ async fn create_session(
             last_active: Some(session.last_active),
             hidden: Some(session.hidden),
             pinned: Some(session.pinned),
+            archived: Some(session.archived),
             // A freshly-created session is always uncategorized; absent =
             // no change, which a newly-constructed client row renders as
             // uncategorized.
@@ -718,6 +729,7 @@ async fn list_sessions(
             last_active: s.last_active,
             hidden: s.hidden,
             pinned: s.pinned,
+            archived: s.archived,
             last_user_text,
             folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
         })
@@ -1074,6 +1086,56 @@ async fn set_session_pin(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// Request body for `PUT /v1/chat/sessions/{session_id}/archive`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetSessionArchiveRequest {
+    /// `true` to move this session into the archived group, `false` to
+    /// restore it to the main chat list.
+    pub archived: bool,
+}
+
+#[utoipa::path(
+    put,
+    path = "/chat/sessions/{session_id}/archive",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to archive or unarchive"),
+    ),
+    request_body = SetSessionArchiveRequest,
+    responses(
+        (status = 204, description = "Archive state updated"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn set_session_archive(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    authed: Option<Extension<AuthedClient>>,
+    Json(req): Json<SetSessionArchiveRequest>,
+) -> Result<axum::http::StatusCode> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    // Targeted flat-column write — like `set_pinned`, it survives a
+    // concurrent `touch` (full-blob save) so the flag can't be clobbered.
+    state
+        .session_manager
+        .set_archived(&sid, req.archived)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("set session archive: {e}")))?;
+    // Broadcast so every open chat client moves the row between the main
+    // list and the archived group without a list refetch.
+    broadcast_session_patch(
+        &state,
+        &sid,
+        SessionPatch {
+            archived: Some(req.archived),
+            ..SessionPatch::default()
+        },
+    );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 #[utoipa::path(
     delete,
     path = "/chat/sessions/{session_id}",
@@ -1150,9 +1212,10 @@ async fn unhide_session(
             created_at: Some(session.created_at),
             last_active: Some(session.last_active),
             hidden: Some(false),
-            // Carry the live pin state so a sibling tab re-adding the
-            // row drops it straight into the correct block.
+            // Carry the live pin + archive state so a sibling tab
+            // re-adding the row drops it straight into the correct block.
             pinned: Some(session.pinned),
+            archived: Some(session.archived),
             // Carry the folder assignment too so the re-added row lands in
             // the right folder (absent ⇒ uncategorized).
             folder_id: session.folder_id.as_ref().map(|f| FolderChange::Set {

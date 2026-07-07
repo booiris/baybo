@@ -130,6 +130,7 @@ pub struct ChatSessionSummary {
     /// session without a user turn yet.
     pub last_user_text: Option<String>,
     pub pinned: bool,
+    pub archived: bool,
 }
 
 /// A content-addressed attachment reference on an outbound message (already

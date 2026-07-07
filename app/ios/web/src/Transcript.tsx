@@ -11,7 +11,7 @@ import {
   subscribeTranscript,
   type UserSentPayload,
 } from "./bridge";
-import { MarkdownBody } from "./MarkdownBody";
+import { MarkdownBody } from "./Markdown";
 import { WorkBlockView } from "./WorkBlock";
 import {
   uid,

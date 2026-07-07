@@ -162,6 +162,16 @@ impl LibsqlPool {
                     -- can't clobber a just-set pin; `get` patches
                     -- `Session.pinned` from this column on read.
                     pinned                INTEGER NOT NULL DEFAULT 0,
+                    -- User-facing chat-list archive flag, set by
+                    -- PUT /v1/chat/sessions/:id/archive. Presentation
+                    -- only — the chat list endpoint returns it on every
+                    -- row and never filters on it; clients group
+                    -- archived rows themselves. Like `pinned` it is a
+                    -- flat column owned by a targeted UPDATE
+                    -- (`set_archived`) and omitted from the DO UPDATE
+                    -- in `save`; `get` patches `Session.archived` from
+                    -- this column on read.
+                    archived              INTEGER NOT NULL DEFAULT 0,
                     -- User-facing chat-list folder assignment, set by
                     -- PUT /v1/chat/sessions/:id/folder. NULL ⇒ uncategorized.
                     -- Like `pinned` / `last_llm` it is a flat column owned by
@@ -559,6 +569,7 @@ impl LibsqlPool {
             "ALTER TABLE devices ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE devices ADD COLUMN remote_api_key TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE session_messages ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {

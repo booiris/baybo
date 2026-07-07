@@ -1,7 +1,7 @@
 import type { TFunction } from "i18next";
 import { memo, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { MarkdownBody } from "./MarkdownBody";
+import { MarkdownBody } from "./Markdown";
 import type { WorkRow, WorkStep } from "./types";
 
 /// Humanized duration: seconds under a minute, "Xm Ys" under an hour,

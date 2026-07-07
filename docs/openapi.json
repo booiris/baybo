@@ -714,6 +714,60 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/archive": {
+      "put": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "set_session_archive",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to archive or unarchive",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSessionArchiveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Archive state updated"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/catch-up": {
       "get": {
         "tags": [
@@ -3306,9 +3360,14 @@
           "session_id",
           "created_at",
           "last_active",
-          "pinned"
+          "pinned",
+          "archived"
         ],
         "properties": {
+          "archived": {
+            "type": "boolean",
+            "description": "True when the user has archived this session. Always emitted —\nthe list never filters on it, so clients with an archived view\ngroup rows themselves and clients without one keep showing every\nrow; set via `PUT /v1/chat/sessions/{id}/archive`."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -4491,6 +4550,19 @@
         "properties": {
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "SetSessionArchiveRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/chat/sessions/{session_id}/archive`.",
+        "required": [
+          "archived"
+        ],
+        "properties": {
+          "archived": {
+            "type": "boolean",
+            "description": "`true` to move this session into the archived group, `false` to\nrestore it to the main chat list."
           }
         }
       },

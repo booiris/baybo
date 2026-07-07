@@ -152,6 +152,85 @@ async fn chat_api_round_trip() {
 }
 
 #[tokio::test]
+async fn chat_archive_round_trip() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+
+    // The list ALWAYS serializes `archived` — even when false. Clients
+    // without an archived view rely on the field being present on every
+    // row; `archived: false` must not be dropped the way `hidden: false`
+    // is.
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("created session listed")
+        .clone();
+    assert_eq!(
+        row["archived"].as_bool(),
+        Some(false),
+        "archived must serialize as an explicit false, not be omitted: {row:?}",
+    );
+
+    // Archive → 204, and the row STAYS in the default list (no
+    // server-side filtering — clients group archived rows themselves).
+    let archived = put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/archive"),
+        Body::from(json!({ "archived": true }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert!(archived.is_null());
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("archived session must still be listed")
+        .clone();
+    assert_eq!(row["archived"].as_bool(), Some(true));
+
+    // Unarchive restores the flag.
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/archive"),
+        Body::from(json!({ "archived": false }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("session listed after unarchive")
+        .clone();
+    assert_eq!(row["archived"].as_bool(), Some(false));
+
+    // Unknown session → 404.
+    put(
+        &router,
+        "/v1/chat/sessions/no-such-session/archive",
+        Body::from(json!({ "archived": true }).to_string()),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn chat_create_accepts_client_supplied_session_id() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();

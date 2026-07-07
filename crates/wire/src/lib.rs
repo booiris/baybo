@@ -891,6 +891,13 @@ pub struct SessionPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub pinned: Option<bool>,
+    /// Flipped by `PUT /v1/chat/sessions/:id/archive`. `true` moves the
+    /// row into the client's archived group, `false` restores it to the
+    /// main list. Carried on Create / Unhide too so a sibling client
+    /// re-adding the row places it correctly immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub archived: Option<bool>,
     /// Set by `PUT /v1/chat/sessions/:id/folder` (and on folder delete,
     /// which clears every direct member to `Uncategorized`). Present means
     /// "the assignment changed to this value"; absent means "no change".
@@ -1253,6 +1260,7 @@ mod tests {
                 last_active: Some(now),
                 hidden: Some(false),
                 pinned: Some(false),
+                archived: Some(true),
                 folder_id: Some(FolderChange::Set { id: "f1".into() }),
             },
         };
@@ -1272,6 +1280,7 @@ mod tests {
                 last_active: Some(now),
                 hidden: None,
                 pinned: None,
+                archived: None,
                 folder_id: None,
             },
         };

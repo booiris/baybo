@@ -224,6 +224,67 @@ impl BayboClient {
         .await
     }
 
+    /// Archive or unarchive `session_id` for the active binding
+    /// (`PUT /v1/chat/sessions/{id}/archive`). Direct reaches it over REST,
+    /// relay through the Noise-protected API tunnel.
+    pub async fn chat_set_archived(
+        self: Arc<Self>,
+        session_id: String,
+        archived: bool,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::set_archived(&client, session_id, archived).await
+                }
+                ActiveLeg::Relay => {
+                    gateway_api::set_archived(&relay::GatewayApi, session_id, archived).await
+                }
+            }
+        })
+        .await
+    }
+
+    /// Pin or unpin `session_id` to the top of the list for the active binding
+    /// (`PUT /v1/chat/sessions/{id}/pin`). Direct reaches it over REST, relay
+    /// through the Noise-protected API tunnel.
+    pub async fn chat_set_pinned(
+        self: Arc<Self>,
+        session_id: String,
+        pinned: bool,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::set_pinned(&client, session_id, pinned).await
+                }
+                ActiveLeg::Relay => {
+                    gateway_api::set_pinned(&relay::GatewayApi, session_id, pinned).await
+                }
+            }
+        })
+        .await
+    }
+
+    /// Soft-hide `session_id` for the active binding (`DELETE
+    /// /v1/chat/sessions/{id}` — the gateway sets `hidden`, never deleting the
+    /// row or transcript). Direct reaches it over REST, relay through the
+    /// Noise-protected API tunnel.
+    pub async fn chat_hide_session(self: Arc<Self>, session_id: String) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::hide_session(&client, session_id).await
+                }
+                ActiveLeg::Relay => gateway_api::hide_session(&relay::GatewayApi, session_id).await,
+            }
+        })
+        .await
+    }
+
     /// List the gateway's chat sessions (newest first, hidden/cron filtered) for
     /// the active binding. Direct uses the admin REST surface; relay uses the
     /// Noise-protected API tunnel so a NAT'd gateway can still refresh the

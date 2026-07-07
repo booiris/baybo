@@ -44,6 +44,13 @@ hidden?: boolean,
  */
 pinned?: boolean, 
 /**
+ * Flipped by `PUT /v1/chat/sessions/:id/archive`. `true` moves the
+ * row into the client's archived group, `false` restores it to the
+ * main list. Carried on Create / Unhide too so a sibling client
+ * re-adding the row places it correctly immediately.
+ */
+archived?: boolean, 
+/**
  * Set by `PUT /v1/chat/sessions/:id/folder` (and on folder delete,
  * which clears every direct member to `Uncategorized`). Present means
  * "the assignment changed to this value"; absent means "no change".

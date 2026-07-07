@@ -65,13 +65,14 @@ impl SessionStore for MemorySessionStore {
     async fn save(&self, session: &Session) -> Result<()> {
         let mut data = self.data.lock();
         let mut to_store = session.clone();
-        // `hidden` / `pinned` / `folder_id` are owned by their targeted
-        // setters; preserve the existing row's values so a stale in-memory
-        // save can't un-hide, un-pin, or re-file it. Mirrors the libsql
-        // impl, whose upsert omits all three flat columns.
+        // `hidden` / `pinned` / `archived` / `folder_id` are owned by their
+        // targeted setters; preserve the existing row's values so a stale
+        // in-memory save can't un-hide, un-pin, un-archive, or re-file it.
+        // Mirrors the libsql impl, whose upsert omits all four flat columns.
         if let Some(existing) = data.get(&session.id) {
             to_store.hidden = existing.hidden;
             to_store.pinned = existing.pinned;
+            to_store.archived = existing.archived;
             to_store.folder_id = existing.folder_id.clone();
         }
         data.insert(session.id.clone(), to_store);
@@ -94,6 +95,17 @@ impl SessionStore for MemorySessionStore {
         match data.get_mut(session_id) {
             Some(s) => {
                 s.pinned = pinned;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn set_archived(&self, session_id: &SessionId, archived: bool) -> Result<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) => {
+                s.archived = archived;
                 Ok(true)
             }
             None => Ok(false),
@@ -588,5 +600,55 @@ impl SessionFolderStore for MemorySessionFolderStore {
         }
         rows.remove(id);
         Ok(Some(Vec::new()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use baybo_model::{SessionState, TriggerSource, User};
+
+    fn make_session(id: &str) -> Session {
+        let id = SessionId::from(id);
+        Session {
+            id: id.clone(),
+            user: User {
+                id: "u1".to_string(),
+                name: None,
+                channel: ChannelType::tui(),
+            },
+            channel: ChannelType::tui(),
+            created_at: Utc::now(),
+            last_active: Utc::now(),
+            state: SessionState::default(),
+            root_session_id: id,
+            trigger: TriggerSource::User,
+            lineage: None,
+            hidden: false,
+            pinned: false,
+            archived: false,
+            folder_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn save_preserves_flat_columns_like_libsql() {
+        // The fake must mirror the libsql upsert, whose DO UPDATE omits
+        // the flat columns owned by the targeted setters — a stale
+        // in-memory re-save must not un-hide, un-pin, or un-archive.
+        let store = MemorySessionStore::new();
+        let s = make_session("preserve-me");
+        store.save(&s).await.unwrap();
+        assert!(store.set_hidden(&s.id, true).await.unwrap());
+        assert!(store.set_pinned(&s.id, true).await.unwrap());
+        assert!(store.set_archived(&s.id, true).await.unwrap());
+
+        // Re-save the stale copy (all flags still false).
+        store.save(&s).await.unwrap();
+
+        let loaded = store.get(&s.id).await.unwrap().expect("row present");
+        assert!(loaded.hidden, "save must preserve hidden");
+        assert!(loaded.pinned, "save must preserve pinned");
+        assert!(loaded.archived, "save must preserve archived");
     }
 }

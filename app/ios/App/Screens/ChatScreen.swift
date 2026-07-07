@@ -116,7 +116,8 @@ struct ChatHeaderView: View {
     let onBack: () -> Void
 
     private static let veilPeakAlpha = 0.8
-    private static let barHeight: CGFloat = 46
+    /// Shared with `ArchivedScreen`, which reuses this header grammar.
+    static let barHeight: CGFloat = 46
     /// Solid → clear smoothstep the veil fades through, below its solid
     /// status-bar zone (the composer veil's grammar, mirrored to the top).
     private static let rampAlphas: [Double] = [1.0, 0.9, 0.65, 0.35, 0.1, 0.0]

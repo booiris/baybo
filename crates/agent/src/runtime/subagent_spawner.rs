@@ -1412,6 +1412,7 @@ mod resume_validation_tests {
             lineage: None,
             hidden: false,
             pinned: false,
+            archived: false,
             folder_id: None,
         }
     }

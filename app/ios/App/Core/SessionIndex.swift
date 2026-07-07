@@ -11,24 +11,29 @@ struct SessionRow: Codable, Identifiable, Equatable {
     /// session without a user turn yet.
     var lastUserText: String?
     var pinned: Bool
+    /// Server-side flag (like `pinned`): archived rows live under the Archived
+    /// screen instead of the main list, but keep accruing unread/recency.
+    var archived: Bool
     /// Local-only unread counter — the server never surfaces it. Bumped by a
     /// `SessionActivity` ping for a backgrounded session, cleared on open.
     var unread: Int
 
     init(
         id: String, createdAt: Date, lastActive: Date, lastUserText: String?,
-        pinned: Bool, unread: Int = 0
+        pinned: Bool, archived: Bool = false, unread: Int = 0
     ) {
         self.id = id
         self.createdAt = createdAt
         self.lastActive = lastActive
         self.lastUserText = lastUserText
         self.pinned = pinned
+        self.archived = archived
         self.unread = unread
     }
 
-    /// `unread` post-dates the first shipped schema, so an older `sessions.json`
-    /// won't carry the key — default it instead of failing the whole decode.
+    /// `unread` and `archived` post-date the first shipped schema, so an older
+    /// `sessions.json` won't carry the keys — default them instead of failing
+    /// the whole decode.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
@@ -36,6 +41,7 @@ struct SessionRow: Codable, Identifiable, Equatable {
         lastActive = try c.decode(Date.self, forKey: .lastActive)
         lastUserText = try c.decodeIfPresent(String.self, forKey: .lastUserText)
         pinned = try c.decode(Bool.self, forKey: .pinned)
+        archived = try c.decodeIfPresent(Bool.self, forKey: .archived) ?? false
         unread = try c.decodeIfPresent(Int.self, forKey: .unread) ?? 0
     }
 }
@@ -56,12 +62,40 @@ final class SessionIndex: ObservableObject {
     /// re-entry, so a pruned mirror only costs a fetch).
     static let maxMirroredTranscripts = 10
 
+    /// The latest user-intended archive/hide state for a session whose request
+    /// hasn't resolved yet. `merge(remote:)` consults it so a refresh racing an
+    /// in-flight mutation can't rewind the optimistic flip (or re-insert a row
+    /// an in-flight DELETE just removed).
+    enum PendingMutation: Equatable {
+        case archived(Bool)
+        case pinned(Bool)
+        case hidden
+    }
+
     @Published private(set) var rows: [SessionRow] = []
 
     private let fileURL: URL
     /// The session whose `ChatScreen` is on top. A `SessionActivity` ping for it
     /// is not counted as unread (the user is looking at it); `nil` on the list.
     private var foregroundSessionId: String?
+    /// In-memory only: a kill mid-flight loses the intent and the next merge
+    /// restores server truth, which is the honest fallback.
+    private var pendingMutations: [String: PendingMutation] = [:]
+    /// Rows removed by `beginHide`, kept for the failure rollback (the mirror
+    /// is prune-deleted and stays gone — the hydration matrix's mirror-less
+    /// listed path refetches history).
+    private var hiddenBackups: [String: SessionRow] = [:]
+    /// The archived value last acknowledged by the server, staged when a
+    /// session's FIRST pending mutation lands. A chained failure (archive →
+    /// undo, both dead offline) must roll back here — negating the failed
+    /// intent would re-archive a row the server never archived.
+    private var archiveBaselines: [String: Bool] = [:]
+    /// Same idea as `archiveBaselines`, for the pin toggle.
+    private var pinBaselines: [String: Bool] = [:]
+    /// Bumped on every mutation stage/resolve. A list fetch that STARTED
+    /// before a mutation resolved is a stale snapshot even after the pending
+    /// entry is gone — `merge` compares epochs and drops it.
+    private(set) var mutationEpoch = 0
 
     private init() {
         fileURL = Self.supportDirectory().appendingPathComponent("sessions.json")
@@ -158,21 +192,154 @@ final class SessionIndex: ObservableObject {
         save()
     }
 
+    // MARK: - Optimistic archive / hide (server mutations in flight)
+
+    /// Optimistic archive flip: the row moves between the main and archived
+    /// lists at once; the staged intent shields it from a racing merge until
+    /// the PUT resolves. No-ops for a row that is gone or has a delete in
+    /// flight — a stale undo toast must not overwrite a hide intent.
+    func beginArchive(_ sessionId: String, archived: Bool) {
+        guard pendingMutations[sessionId] != .hidden,
+            let idx = rows.firstIndex(where: { $0.id == sessionId })
+        else { return }
+        if pendingMutations[sessionId] == nil {
+            archiveBaselines[sessionId] = rows[idx].archived
+        }
+        pendingMutations[sessionId] = .archived(archived)
+        mutationEpoch += 1
+        setArchivedFlag(sessionId, archived: archived)
+    }
+
+    /// Optimistic pin flip: the row re-sorts to the top block at once; the
+    /// staged intent shields it from a racing merge until the PUT resolves.
+    /// No-ops for a gone row or one with a delete in flight.
+    func beginPin(_ sessionId: String, pinned: Bool) {
+        guard pendingMutations[sessionId] != .hidden,
+            let idx = rows.firstIndex(where: { $0.id == sessionId })
+        else { return }
+        if pendingMutations[sessionId] == nil {
+            pinBaselines[sessionId] = rows[idx].pinned
+        }
+        pendingMutations[sessionId] = .pinned(pinned)
+        mutationEpoch += 1
+        setPinnedFlag(sessionId, pinned: pinned)
+    }
+
+    /// Optimistic delete (soft-hide): remove the row now — `save()`'s prune
+    /// drops the transcript mirror — and suppress the row's remote existence
+    /// in `merge` until the DELETE resolves.
+    func beginHide(_ sessionId: String) {
+        pendingMutations[sessionId] = .hidden
+        mutationEpoch += 1
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
+        hiddenBackups[sessionId] = rows[idx]
+        rows.remove(at: idx)
+        save()
+    }
+
+    func pendingMutation(for sessionId: String) -> PendingMutation? {
+        pendingMutations[sessionId]
+    }
+
+    /// The staged intent reached the server (or was superseded and re-sent):
+    /// remote truth takes over again.
+    func finishMutation(_ sessionId: String) {
+        pendingMutations.removeValue(forKey: sessionId)
+        hiddenBackups.removeValue(forKey: sessionId)
+        archiveBaselines.removeValue(forKey: sessionId)
+        pinBaselines.removeValue(forKey: sessionId)
+        mutationEpoch += 1
+    }
+
+    /// Archive PUT failed with the intent still current: rewind to the last
+    /// server-acknowledged value (NOT the failed intent's negation — after a
+    /// failed archive→undo chain that negation would re-archive a row the
+    /// server never archived).
+    func rollBackArchive(_ sessionId: String) {
+        pendingMutations.removeValue(forKey: sessionId)
+        mutationEpoch += 1
+        guard let baseline = archiveBaselines.removeValue(forKey: sessionId) else { return }
+        setArchivedFlag(sessionId, archived: baseline)
+    }
+
+    /// Pin PUT failed: rewind to the last server-acknowledged value.
+    func rollBackPin(_ sessionId: String) {
+        pendingMutations.removeValue(forKey: sessionId)
+        mutationEpoch += 1
+        guard let baseline = pinBaselines.removeValue(forKey: sessionId) else { return }
+        setPinnedFlag(sessionId, pinned: baseline)
+    }
+
+    /// Hide DELETE failed: re-insert the removed row (its mirror stays gone;
+    /// re-entry refetches history).
+    func rollBackHide(_ sessionId: String) {
+        pendingMutations.removeValue(forKey: sessionId)
+        archiveBaselines.removeValue(forKey: sessionId)
+        mutationEpoch += 1
+        guard let row = hiddenBackups.removeValue(forKey: sessionId),
+            !rows.contains(where: { $0.id == row.id })
+        else { return }
+        rows.append(row)
+        save()
+    }
+
+    /// Plain local flip with no staged intent — rollback and the DEBUG demo
+    /// seed use it; user-driven flips go through `beginArchive`.
+    func setArchivedFlag(_ sessionId: String, archived: Bool) {
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }),
+            rows[idx].archived != archived
+        else { return }
+        rows[idx].archived = archived
+        save()
+    }
+
+    /// Plain local pin flip — rollback and the DEBUG demo seed use it;
+    /// user-driven flips go through `beginPin`.
+    func setPinnedFlag(_ sessionId: String, pinned: Bool) {
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }),
+            rows[idx].pinned != pinned
+        else { return }
+        rows[idx].pinned = pinned
+        save()
+    }
+
     /// Merge the direct leg's REST list (the full non-hidden truth). Remote wins
     /// for existence — a local row missing remotely was hidden/deleted from
     /// another client — and for row fields, unless the local row saw activity
     /// after the remote snapshot (a just-sent message racing the refetch).
     /// Empty remote rows that this device has never listed are draft sessions:
     /// keep them out of the chat list until a send records local activity, or
-    /// the gateway reports user-authored preview text.
-    func merge(remote: [ChatSessionSummary]) {
+    /// the gateway reports user-authored preview text. In-flight mutations
+    /// (`pendingMutations`) beat the fetched snapshot: a pending archive flip
+    /// wins over the remote value, and a pending hide suppresses the remote row
+    /// entirely (this rebuild would otherwise re-insert it). Callers capture
+    /// `mutationEpoch` BEFORE fetching: a snapshot older than the last mutation
+    /// stage/resolve is dropped whole (it could rewind a flip whose pending
+    /// entry has already cleared, or resurrect a just-deleted row); the next
+    /// refresh re-merges.
+    func merge(remote: [ChatSessionSummary], fetchEpoch: Int) {
+        guard fetchEpoch == mutationEpoch else { return }
         var merged: [SessionRow] = []
         let local = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
         for summary in remote {
+            let pending = pendingMutations[summary.sessionId]
+            if pending == .hidden { continue }
             let mine = local[summary.sessionId]
             let hasRemotePreview = !(summary.lastUserText ?? "").isEmpty
             guard mine != nil || hasRemotePreview || summary.pinned else { continue }
 
+            let archived: Bool
+            if case .archived(let flag)? = pending {
+                archived = flag
+            } else {
+                archived = summary.archived
+            }
+            let pinned: Bool
+            if case .pinned(let flag)? = pending {
+                pinned = flag
+            } else {
+                pinned = summary.pinned
+            }
             let createdAt = Self.parseDate(summary.createdAt)
             let lastActive = Self.parseDate(summary.lastActive)
             if let mine, mine.lastActive > lastActive {
@@ -181,23 +348,28 @@ final class SessionIndex: ObservableObject {
                         id: summary.sessionId, createdAt: createdAt,
                         lastActive: mine.lastActive,
                         lastUserText: mine.lastUserText ?? summary.lastUserText,
-                        pinned: summary.pinned, unread: mine.unread))
+                        pinned: pinned, archived: archived, unread: mine.unread))
             } else {
                 merged.append(
                     SessionRow(
                         id: summary.sessionId, createdAt: createdAt, lastActive: lastActive,
-                        lastUserText: summary.lastUserText, pinned: summary.pinned,
-                        unread: mine?.unread ?? 0))
+                        lastUserText: summary.lastUserText, pinned: pinned,
+                        archived: archived, unread: mine?.unread ?? 0))
             }
         }
         rows = merged
         save()
     }
 
-    /// Logout / rebind: the rows belong to the old gateway — drop them and
-    /// their transcript mirrors.
+    /// Logout / rebind: the rows belong to the old gateway — drop them, their
+    /// transcript mirrors, and any staged mutations against it.
     func removeAll() {
         rows = []
+        pendingMutations = [:]
+        hiddenBackups = [:]
+        archiveBaselines = [:]
+        pinBaselines = [:]
+        mutationEpoch += 1
         save()
         TranscriptStore.deleteAll()
     }

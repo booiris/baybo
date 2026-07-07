@@ -52,6 +52,7 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
         lineage: None,
         hidden: false,
         pinned: false,
+        archived: false,
         folder_id: None,
     };
 

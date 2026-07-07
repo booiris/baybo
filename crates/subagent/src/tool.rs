@@ -732,6 +732,7 @@ mod tests {
             }),
             hidden: false,
             pinned: false,
+            archived: false,
             folder_id: None,
         };
         sessions.store().save(&child).await.unwrap();
