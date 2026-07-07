@@ -264,23 +264,49 @@ struct ComposerView: View {
         }
         guard !body.isEmpty || !refs.isEmpty else { return }
         // Guard the write: an unconditional `store.notice = nil` publishes an
-        // objectWillChange every send even when already nil, forcing a
-        // ComposerView recompute in the same beat as the field reset — extra
-        // transaction churn in exactly the window the deferred clear dodges.
+        // objectWillChange every send even when already nil, forcing a needless
+        // ComposerView recompute in the same beat as the field reset.
         if store.notice != nil {
             store.notice = nil
         }
         store.send(text: body, attachments: refs)
         staged.removeAll()
-        // The multiline TextField(axis:) stays first responder through send, so
-        // a synchronous `text = ""` here can land inside the field's own
-        // in-flight edit transaction and be dropped — leftover glyphs, widened
-        // by a CJK IME's extra commit/predictive churn. Defer to the next
-        // runloop so the reset lands in a clean transaction after the edit
-        // commits.
-        DispatchQueue.main.async {
-            text = ""
+        clearField()
+    }
+
+    /// Clear the field deterministically, INCLUDING a live CJK IME composition.
+    /// The composing syllables (underlined marked text / inline candidates) live
+    /// in the focused text view's marked range — the UIKit input session — NOT
+    /// in the `text` binding, so a plain `text = ""` (sync or deferred) leaves
+    /// them to re-commit on the next input turn and re-materialize after send
+    /// (the intermittent "字没消失", worst under pinyin). Reach the focused input
+    /// over the responder chain, `unmarkText()` to finalize+drop the composition
+    /// FIRST (it commits, so ordering matters), then empty the document
+    /// imperatively so the reset can't lose a race with the field's own edit
+    /// up-sync; mirror `text` so `hasDraft`/send-gating stay in lockstep. No
+    /// responder is resigned — the keyboard stays up.
+    private func clearField() {
+        if let input = Self.focusedTextInput() {
+            input.unmarkText()
+            if let range = input.textRange(
+                from: input.beginningOfDocument, to: input.endOfDocument)
+            {
+                input.replace(range, withText: "")
+            }
         }
+        text = ""
+    }
+
+    /// The current first responder if it is a text input, found via the
+    /// responder chain (`sendAction(to: nil)` targets the first responder).
+    /// Keyed on the `UITextInput` PROTOCOL, never a concrete UITextView class,
+    /// so it survives SwiftUI's private multiline-field backing across iOS
+    /// versions.
+    private static func focusedTextInput() -> UITextInput? {
+        FirstResponderCapture.found = nil
+        UIApplication.shared.sendAction(
+            #selector(UIResponder.baybo_captureFirstResponder), to: nil, from: nil, for: nil)
+        return FirstResponderCapture.found as? UITextInput
     }
 
     private static func sniffMime(_ data: Data) -> String {
@@ -316,4 +342,17 @@ struct StagedAttachment: Identifiable {
     let thumbnail: UIImage
     let byteCount: Int
     var state: State = .uploading
+}
+
+/// One-shot sink for the responder-chain first-responder probe below.
+private enum FirstResponderCapture {
+    static weak var found: UIResponder?
+}
+
+extension UIResponder {
+    /// Action target for `sendAction(to: nil)`: only the current first
+    /// responder receives it, so it records itself for `focusedTextInput()`.
+    @objc fileprivate func baybo_captureFirstResponder() {
+        FirstResponderCapture.found = self
+    }
 }
