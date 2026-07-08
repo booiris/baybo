@@ -74,6 +74,10 @@ function transcriptItemToRow(item: TranscriptRowItem): Row | null {
       role: "work",
       steps,
       active: false,
+      // Server-anchored turn start — so a reopened/reconciled block's live ticker
+      // is `now − true start`, not `now − localOpen` (the latter inflates across
+      // app-close / re-entry into an absurd "Worked 7h").
+      startedAt: item.work_started_at ? Date.parse(item.work_started_at) : undefined,
       elapsedMs:
         item.work_started_at && item.work_ended_at
           ? Math.max(0, Date.parse(item.work_ended_at) - Date.parse(item.work_started_at))
@@ -154,36 +158,94 @@ function ordinalFromMessageId(id: string): number | null {
   return Number.isSafeInteger(n) ? n : null;
 }
 
+/// Identity of a work step for dedup when folding two representations of the
+/// same turn's block: a tool step is keyed by its call id (stable across the
+/// live vs reconstructed shapes); text steps by kind + text.
+function workStepKey(s: WorkStep): string {
+  return s.kind === "tool" ? `tool:${s.callId}` : `${s.kind}:${s.text}`;
+}
+
+/// Concatenate two work blocks' steps WITHOUT duplicating shared ones — so
+/// folding a torn turn's disjoint halves appends cleanly, while folding two
+/// overlapping representations of one turn (live + reconstructed) collapses to
+/// a single copy instead of doubling every step.
+function mergeWorkSteps(a: WorkStep[], b: WorkStep[]): WorkStep[] {
+  const seen = new Set(a.map(workStepKey));
+  const out = [...a];
+  for (const s of b) {
+    const k = workStepKey(s);
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/// Freeze EVERY work row still marked `active` into its "Worked Xs" — walk the
+/// whole thread, not just the tail. Called before appending/adopting a fresh
+/// live block so the transcript never holds two open "Working" cards at once:
+/// there is only ever one in-flight turn, hence one active block.
+function freezeActiveWork(rows: Row[]): Row[] {
+  return rows.map((r) =>
+    r.role === "work" && r.active
+      ? { ...r, active: false, elapsedMs: r.elapsedMs ?? (r.startedAt !== undefined ? Date.now() - r.startedAt : undefined) }
+      : r,
+  );
+}
+
+/// Fuse a client work block (`base` — live/restored: freshest streamed steps +
+/// active state) with the server's reconstruction of the SAME turn (`recon` —
+/// authoritative persisted steps + server-anchored timing). One block, not two:
+/// union the steps, anchor `startedAt` to the server's true turn start, and take
+/// the server's duration for the frozen label (while still active the live
+/// ticker rules, so `elapsedMs` stays unset). Keeps `base`'s id/active so a live
+/// block isn't remounted mid-stream.
+function reconcileWork(base: WorkRow, recon: WorkRow): WorkRow {
+  return {
+    ...base,
+    steps: mergeWorkSteps(base.steps, recon.steps),
+    startedAt: recon.startedAt ?? base.startedAt,
+    // Carry the server's authoritative duration even while active (the live
+    // ticker ignores it until the block closes) so the frozen "Worked Xs" is the
+    // server's number regardless of who closes the block first.
+    elapsedMs: recon.elapsedMs ?? base.elapsedMs,
+  };
+}
+
 /// Restored rows re-enter with live-turn state INTACT: a work block that was
 /// live at persist stays live ("working"), because exiting and re-entering
 /// mid-turn — or before the agent's final reply — must NOT collapse it to
-/// "worked". The buffered continuation frames extend that same block (keeping
-/// its real `startedAt`), and only its terminal reply / turn-end closes it with
-/// a real "Worked Xs". A block that persisted already-closed stays closed.
-/// Empty blocks have nothing to show; unknown future roles are dropped. Also
-/// folds back together any turn a pre-fix mirror split into two work cards.
+/// "worked". The buffered continuation frames extend that same block, and only
+/// its terminal reply / turn-end closes it. `startedAt` is STRIPPED here: a
+/// persisted client `Date.now()` anchor would make `now − startedAt` count all
+/// the time the app was closed (an absurd "Worked 7h"); the next SubscribeState
+/// / sync re-anchors it to the server's true turn start. A block that persisted
+/// already-closed stays closed. Empty blocks have nothing to show; unknown
+/// future roles are dropped. Also folds back a turn a mirror split in two.
 function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
   const out: Row[] = [];
   for (const r of rows ?? []) {
     if (r.role === "work") {
       if (!Array.isArray(r.steps) || r.steps.length === 0) continue;
-      // Heal a mirror already split by the old re-entry bug: a work block that
-      // never closed cleanly (no elapsedMs) directly followed by another work
-      // block is ONE turn torn in two — a healthy turn always has a message
-      // between its block and the next. Fold the pieces into one card, staying
-      // "working" if either half was still live (a turn with no final reply must
-      // not read as "worked"); the split's real duration was lost, so it stays
-      // untimed.
+      // Heal a mirror split by the re-entry bug: two work blocks directly
+      // adjacent (NO message row between) are ONE turn torn apart — a healthy
+      // turn always has a message between its block and the next, so adjacency
+      // alone marks the tear, whether or not either half already closed. Fold
+      // the whole run into one card, staying "working" if any piece was still
+      // live (a turn with no final reply must not read as "worked"); the split's
+      // real duration was lost, so it stays untimed.
       const prev = out[out.length - 1];
-      if (prev && prev.role === "work" && prev.elapsedMs === undefined) {
+      if (prev && prev.role === "work") {
         out[out.length - 1] = {
           ...prev,
-          steps: [...prev.steps, ...r.steps],
+          steps: mergeWorkSteps(prev.steps, r.steps),
           active: prev.active || r.active,
+          startedAt: undefined,
           elapsedMs: undefined,
         };
       } else {
-        out.push({ ...r });
+        out.push({ ...r, startedAt: undefined });
       }
     } else if (r.role === "user" || r.role === "assistant" || r.role === "notice") {
       // A send still "sending" when we persisted can't be in flight after a
@@ -751,8 +813,11 @@ export function Transcript({
       if (last && last.role === "work" && last.active) {
         return [...rows.slice(0, -1), mutate(last)];
       }
+      // Opening a NEW block: freeze EVERY still-`active` block anywhere in the
+      // thread first, so a stale open block can't linger as a second live
+      // "Working" card beside this one.
       const fresh: WorkRow = { id: uid(), role: "work", steps: [], active: true, startedAt: Date.now() };
-      return [...rows, mutate(fresh)];
+      return [...freezeActiveWork(rows), mutate(fresh)];
     });
   }, []);
 
@@ -780,7 +845,9 @@ export function Transcript({
       const last = rows[rows.length - 1];
       if (!last || last.role !== "work" || !last.active) return rows;
       if (last.steps.length === 0) return rows.slice(0, -1);
-      const elapsedMs = last.startedAt !== undefined ? Date.now() - last.startedAt : undefined;
+      // Prefer the server's authoritative duration (reconciled in) over the
+      // wall-clock fallback, which is only correct for a purely live-watched turn.
+      const elapsedMs = last.elapsedMs ?? (last.startedAt !== undefined ? Date.now() - last.startedAt : undefined);
       return [...rows.slice(0, -1), { ...last, active: false, elapsedMs }];
     });
   }, []);
@@ -834,12 +901,28 @@ export function Transcript({
           // stale empty/restored block if it's the tail.
           return openBlock && openBlock.steps.length === 0 ? rows.slice(0, -1) : rows;
         }
+        // A stale finalization-window bundle: this turn's answer already landed
+        // here (the tail is the committed reply) but the gateway still reports
+        // `turn.active` — its `active_turn_started_at` lingers through the job's
+        // post-answer finalization — and ships a rolling in-flight work window.
+        // Do NOT resurrect the ended turn's work as a second block under the
+        // reply (the [work][reply][work] split). A genuine next turn opens its
+        // block from the live turn_state / reasoning / tool frames that follow,
+        // not from this snapshot.
+        if (!openBlock && last && last.role === "assistant") return rows;
         // Re-open a block a prior restore froze (relaunch mid-turn) and replace
         // its steps; otherwise open a fresh one after the turn's user message.
+        // Anchor `startedAt` to the server turn start (`startedMs`) when the
+        // block has none (restore strips it) so the live ticker reads real
+        // elapsed, not `now − localReopen`.
         const rebuilt: WorkRow = openBlock
-          ? { ...openBlock, steps: workSteps, active: true, startedAt: openBlock.startedAt ?? Date.now(), elapsedMs: undefined }
-          : { id: uid(), role: "work", steps: workSteps, active: true, startedAt: Date.now() };
-        return openBlock ? [...rows.slice(0, -1), rebuilt] : [...rows, rebuilt];
+          ? { ...openBlock, steps: workSteps, active: true, startedAt: openBlock.startedAt ?? startedMs ?? Date.now(), elapsedMs: undefined }
+          : { id: uid(), role: "work", steps: workSteps, active: true, startedAt: startedMs ?? Date.now() };
+        // `rebuilt` is THE in-flight block — freeze any other still-active block
+        // above it so re-opening one never leaves two live "Working" cards.
+        return openBlock
+          ? [...freezeActiveWork(rows.slice(0, -1)), rebuilt]
+          : [...freezeActiveWork(rows), rebuilt];
       });
     },
     [setStreamingText],
@@ -994,11 +1077,36 @@ export function Transcript({
           // Keep the in-flight turn's open work block and any optimistic user
           // sends still awaiting their durable row (echoed-but-unpersisted, or
           // below a rebase floor) — the page can't carry either.
-          const openWork = prev.filter((r) => r.role === "work" && r.active);
+          // Carry only the SINGLE newest active in-flight block across the
+          // rebuild; any earlier still-active block is a stale fork — drop it so
+          // it can't re-appear beside the reconstructed thread.
+          const openWork = prev.filter((r): r is WorkRow => r.role === "work" && r.active).slice(-1);
           const keptSends = prev.filter(
             (r) => r.role === "user" && r.sendState !== undefined && !pageIds.has(r.id),
           );
-          return [...pageRows, ...keptSends, ...openWork];
+          // The page's reconstructed trailing `w<ordinal>` block and the live
+          // in-flight block are the SAME turn. Fuse them into ONE block — keep it
+          // active, adopt the server id + server-anchored timing, union the steps
+          // — instead of rendering both (duplicate/overlapping cards) or dropping
+          // either (losing steps or the correct duration).
+          let rows = pageRows;
+          let carried = openWork;
+          if (openWork.length > 0) {
+            const tail = rows[rows.length - 1];
+            if (tail && tail.role === "work") {
+              rows = [
+                ...rows.slice(0, -1),
+                {
+                  ...tail,
+                  steps: mergeWorkSteps(tail.steps, openWork[0].steps),
+                  active: true,
+                  startedAt: tail.startedAt ?? openWork[0].startedAt,
+                },
+              ];
+              carried = [];
+            }
+          }
+          return [...rows, ...keptSends, ...carried];
         });
         oldestOrdinal.current = frame.oldest_ordinal;
         setHasMoreOlder(frame.has_more_older);
@@ -1020,18 +1128,31 @@ export function Transcript({
             next[next.length - 1] = {
               ...last,
               active: false,
-              elapsedMs: last.startedAt !== undefined ? Date.now() - last.startedAt : last.elapsedMs,
+              elapsedMs: last.elapsedMs ?? (last.startedAt !== undefined ? Date.now() - last.startedAt : undefined),
             };
           };
           for (const row of pageRows) {
             const existingIdx = byId.get(row.id);
             if (existingIdx !== undefined) {
-              // A redelivery of a row already on screen — reconcile an
-              // optimistic send's chrome (drop the spinner), otherwise a no-op.
               const existing = next[existingIdx];
+              // A redelivery of a row already on screen: reconcile an optimistic
+              // send's chrome (drop the spinner), or fold a same-id work block's
+              // newer server steps + timing into what's rendered (else a no-op).
               if (existing.role === "user" && existing.sendState !== undefined) {
                 next[existingIdx] = { ...existing, sendState: undefined };
+              } else if (existing.role === "work" && row.role === "work") {
+                next[existingIdx] = reconcileWork(existing, row);
               }
+              continue;
+            }
+            // The in-flight turn's reconstructed `w<ordinal>` work block is the
+            // SAME turn as the live/restored block at the tail — RECONCILE into
+            // it (union steps + adopt server timing) rather than rendering a
+            // second card. A turn we don't have yet ends on a non-work tail, so
+            // its own work block is still appended.
+            const tail = next[next.length - 1];
+            if (row.role === "work" && tail && tail.role === "work") {
+              next[next.length - 1] = reconcileWork(tail, row);
               continue;
             }
             if (row.role === "assistant") closeTrailingWork();
