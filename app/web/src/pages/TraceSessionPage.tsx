@@ -730,6 +730,19 @@ function ToolEventRow({
       </div>
     );
   }
+  if (payload.type === 'parse_failure') {
+    return (
+      <div className="space-y-1 font-mono text-[0.85rem]">
+        <div className="flex items-baseline justify-between gap-3">
+          <span className="break-all">{action}</span>
+          <span className="font-bold shrink-0 text-warning">parse failed</span>
+        </div>
+        <pre className="mt-1 whitespace-pre-wrap break-all text-[0.75rem] text-ink-soft">
+          {payload.command}
+        </pre>
+      </div>
+    );
+  }
   return (
     <div className="space-y-1 font-mono text-[0.85rem]">
       <div className="flex items-baseline justify-between gap-3">

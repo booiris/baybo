@@ -6,7 +6,7 @@ The `config` crate owns the root `BayboConfig` struct, JSON loading, and the `va
 
 A single JSON file — typically `baybo.json` — maps 1:1 to `BayboConfig`. Consumers (`main.rs` and `baybo-agent`) map each section into the corresponding domain type.
 
-Top-level sections: `llm` (a `Vec<LlmEntry>`) plus `default-llm: LlmEntryName`, `agent`, `channels`, `security`, `skills`, `cost`, `workspace`, `gateway`, `browser`, `external_agents`, and an optional `proxy`.
+Top-level entries: `llm` (a `Vec<LlmEntry>`) plus `default-llm: LlmEntryName`, `agent`, `channels`, `security`, `skills`, `cost`, `workspace`, `gateway`, `browser`, `external_agents`, `permission`, and an optional `proxy`.
 
 > **Proxy.** `proxy` is an optional `{ url, no_proxy? }` block (omitted ⇒ direct
 > connections). When set, every outbound HTTP call — LLM providers, model
@@ -45,7 +45,7 @@ To compensate, `config` defines **mirror structs** for domain types it reference
 
 ### Defaults-first serde strategy (top-level only)
 
-Every **top-level** section carries `#[serde(default)]` and a matching `Default` impl. An empty JSON object `{}` deserializes into a fully valid `BayboConfig`; users only specify fields they want to override.
+Every **top-level** entry carries `#[serde(default)]` or is covered by the root default, with a matching `Default` impl. An empty JSON object `{}` deserializes into a fully valid `BayboConfig`; users only specify fields they want to override.
 
 This does **not** extend uniformly into nested structs. The following nested types have required serde fields — supplying the parent object without them fails at deserialization, not in `validate()`:
 
@@ -92,6 +92,7 @@ Sections mirror Baybo's real runtime concerns, not a 1:1 copy of any external re
 | `gateway`  | `baybo_gateway::RuntimeGatewayConfig`                        | Admin bind address + port, CORS allowlist, shutdown grace. See [`gateway.md`](gateway.md).                                                                                                          |
 | `browser`  | `baybo_tools::browser` configuration                         | Browser sidecar launch settings (docker mode, profile path).                                                                                                                                         |
 | `external_agents` | `baybo_agent::external_agent` registry                | Per-kind opt-in for the host-execution external agents — `claude`, `codex`, `gemini` (each `{ enabled, binary_path? }`), plus an optional `default_external_agent` that designates the primary when more than one is enabled. `enabled` defaults to `false`: an installed binary on PATH does not auto-grant access. |
+| `permission` | `baybo_tools::builtin::BashPermissionMode`                   | Shell-out permission policy: `auto` (default), `manual`, or `free` (`open`/`none` accepted as legacy aliases for `free`). Hot-reloadable through `LivePermissionMode`; see [`../permission.md`](../permission.md). |
 
 `registry` and `cron` currently have no top-level section. See §"Out-of-scope modules" for rationale and planned placement.
 
@@ -122,7 +123,7 @@ Principle: a module earns a config section when operators need to tune it in pro
 `baybo-config` ships the reload **primitives**, not the orchestration. As a leaf crate it owns two pure pieces in `reload.rs`: a live, swappable handle to the applied config (`ConfigHandle`) and the whitelist gate (`hot_reload_diff`). The fallible derived-state rebuilds (the LLM pool, cost limits) and the end-to-end reload flow live in consumer crates — see [`docs/config-hot-reload.md`](../config-hot-reload.md) before touching reload code. The contract below is the part `baybo-config` itself enforces.
 
 - **Live handle** — `ConfigHandle` wraps `Arc<parking_lot::RwLock<Arc<BayboConfig>>>`. `current()` clones out the applied `Arc`; `store()` is the infallible commit half that swaps a new `Arc` in. Reads happen per-turn / per-request (resolving the active model, dashboard reads), never per-token, so a plain `RwLock<Arc<_>>` is ample — no `ArcSwap` dependency. The previous `Arc` stays alive until its last in-flight reader drops it, which gives the "in-flight requests finish on the old config" behaviour below.
-- **Hot-updatable whitelist** — `hot_reload_diff(old, new)` enforces an explicit allowlist: `llm`, `default_llm`, `agent.model_tiers`, `cost.rate_limit`, `cost.spending_limits`. Any reload whose diff touches a field **outside** this set hard-rejects the entire reload (atomic — nothing swaps) with `ConfigError::NotHotReloadable { section }` naming the offending section. Not hot-updatable: `gateway.*`, `workspace.path`, `security.*`, `channels.*`, `external_agents.*`, and the rest of `agent` (`max_iterations`, `context`, `max_subagent_depth`, `max_subagents_per_root`). `new` is destructured field-by-field so adding a field to `BayboConfig` or `AgentConfig` forces a hot/non-hot classification here rather than silently defaulting to "hot, unchecked".
+- **Hot-updatable whitelist** — `hot_reload_diff(old, new)` enforces an explicit allowlist: `llm`, `default_llm`, `agent.model_tiers`, `cost.rate_limit`, `cost.spending_limits`, and `permission`. Any reload whose diff touches a field **outside** this set hard-rejects the entire reload (atomic — nothing swaps) with `ConfigError::NotHotReloadable { section }` naming the offending section. Not hot-updatable: `gateway.*`, `workspace.path`, `security.*`, `channels.*`, `external_agents.*`, and the rest of `agent` (`max_iterations`, `context`, `max_subagent_depth`, `max_subagents_per_root`). `new` is destructured field-by-field so adding a field to `BayboConfig` or `AgentConfig` forces a hot/non-hot classification here rather than silently defaulting to "hot, unchecked".
 - **Atomic swap** — a successful reload swaps a single `Arc<BayboConfig>` holding all whitelisted changes together. Partial application is forbidden.
 - **Validation rollback** — a reload that fails `validate()` leaves the running config untouched and returns `ConfigError` to the caller; no partial state is exposed.
 - **In-flight behavior** — requests already running against the old config continue with its values; only new requests pick up the new config. For LLM turns this is per-turn: a turn finishes on the client it resolved at turn start.

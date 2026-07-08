@@ -179,7 +179,7 @@ Per-tool `max_timeout()`:
 | Tool | `max_timeout` | Where |
 |------|--------------|-------|
 | trait default | 30s | `Tool::max_timeout` in `baybo-tools` (`tools/src/lib.rs`) |
-| Bash | 600s | `tools/src/builtin/bash.rs` — per-call `timeout_ms` and the sandbox spawn tighten further |
+| Bash | 600s | `tools/src/builtin/bash/mod.rs` — per-call `timeout_ms` and the sandbox spawn tighten further |
 | WebFetch | 120s | `tools/src/builtin/web_fetch.rs` — connect phase capped at 10s independently |
 | Grep / Glob | 60s | `tools/src/builtin/{grep,glob_tool}.rs` |
 | send_local_file | 60s | `tools/src/builtin/send_local_file.rs` |

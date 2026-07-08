@@ -2,8 +2,9 @@
 
 Runs the real `baybo` binary INSIDE each Harbor task container — the
 leaderboard-comparable way, graded by the task's own verifier. The container
-*is* the sandbox, so baybo runs with `sandbox.mode = none` (its Bash executes
-commands directly — no bwrap, no work-dir jail). Mirrors Harbor's bundled
+*is* the sandbox, so baybo runs with `permission = free`; with the
+bench-bash build, Bash executes commands directly — no bwrap, no work-dir jail.
+Mirrors Harbor's bundled
 installed agents (see harbor/agents/installed/codex.py); the baybo.json schema +
 install steps are ported verbatim from the tb/1.0 adapter
 (bench/terminal-bench-1.0/tb_adapter/baybo_agent.py).
@@ -107,7 +108,7 @@ class BayboAgent(BaseInstalledAgent):
             )
 
     def _baybo_config(self) -> dict:
-        """baybo.json rendered into the container — `none` sandbox, a
+        """baybo.json rendered into the container — `permission = free`, a
         self-contained state dir, and the provider/model under test."""
         entry = {
             "name": "agent",
@@ -129,7 +130,7 @@ class BayboAgent(BaseInstalledAgent):
             # Required to pass config validation even though `baybo prompt` runs
             # in-process and never binds.
             "gateway": {"bind_address": "127.0.0.1", "port": 8723},
-            "sandbox": {"mode": "none"},
+            "permission": "free",
             "cost": {"rate_limit": {"max_requests": 1_000_000}},
         }
 

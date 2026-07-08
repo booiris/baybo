@@ -305,9 +305,10 @@ pub struct RuntimeConfigReloader {
     reload_lock: tokio::sync::Mutex<()>,
     llm: LlmReloader,
     cost: CostReloader,
-    /// Shared Bash sandbox mode; a hot reload swaps it (see `commit` below) so
-    /// running `BashTool`s pick up the new isolation + description live.
-    sandbox_mode: Arc<baybo_tools::builtin::LiveSandboxMode>,
+    /// Shared Bash permission mode; a hot reload swaps it (see `commit` below) so
+    /// running `BashTool`s pick up the new isolation/approval behavior and
+    /// description live.
+    bash_permission: Arc<baybo_tools::builtin::LivePermissionMode>,
 }
 
 impl RuntimeConfigReloader {
@@ -316,7 +317,7 @@ impl RuntimeConfigReloader {
         handle: ConfigHandle,
         llm: LlmReloader,
         cost: CostReloader,
-        sandbox_mode: Arc<baybo_tools::builtin::LiveSandboxMode>,
+        bash_permission: Arc<baybo_tools::builtin::LivePermissionMode>,
     ) -> Self {
         Self {
             config_path,
@@ -324,7 +325,7 @@ impl RuntimeConfigReloader {
             reload_lock: tokio::sync::Mutex::new(()),
             llm,
             cost,
-            sandbox_mode,
+            bash_permission,
         }
     }
 }
@@ -380,10 +381,10 @@ impl ConfigReloader for RuntimeConfigReloader {
         // before the pool swap inside `llm.commit`.
         let outcome = self.llm.commit(prepared_llm);
         self.cost.commit(prepared_cost);
-        // Swap the Bash sandbox mode live: the next command (and the next tool
-        // description the LLM sees) observes the new isolation.
-        self.sandbox_mode
-            .set(crate::boot::to_bash_mode(new.sandbox.mode));
+        // Swap the Bash permission mode live: the next command (and the next tool
+        // description the LLM sees) observes the new isolation/approval policy.
+        self.bash_permission
+            .set(crate::boot::to_bash_permission(new.permission));
         self.handle.store(Arc::clone(&new));
 
         info!(

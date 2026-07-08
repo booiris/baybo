@@ -14,8 +14,8 @@ bench-readonly-memory = ["baybo-memory/bench-readonly-memory"]
 # already-disposable container — no uv shims, no work-dir jail, cwd inherited
 # from the process, and a dedicated prompt. Also skips the workspace
 # identity-repo `git init` (baybo-workspace) so a bench container needs no `git`
-# on PATH. Distinct from the `sandbox.mode = none` config (which only drops the
-# OS sandbox but keeps uv + the work/ jail). Off by default; absent in every
+# on PATH. Distinct from the `permission = free` config (which only drops
+# the OS sandbox but keeps uv + the work/ jail). Off by default; absent in every
 # prod build. For bench/swe + bench/terminal-bench-1.0.
 bench-bash = ["baybo-tools/bench-bash", "baybo-workspace/bench-bash"]
 

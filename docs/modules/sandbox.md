@@ -37,11 +37,14 @@ What gets wrapped:
   Rust tools (Read, Write, Edit, Glob, Grep, Now) are unchanged — their syscalls
   happen inside the gateway and there is nothing for the sandbox to enforce.
 
-If the backend binary is missing at startup, the gateway logs an error and
-runs with `sandbox_runner = None`; any subsequent `ExecCommand` tool call
-returns `ToolError::Execution("OS sandbox unavailable: …")`. Other tools
-continue to function. This is a deliberate refuse-don't-fall-back: silently
-running unsandboxed would defeat the whole point.
+If startup detects that Baybo is already running inside a common outer
+container/sandbox (Docker, Kubernetes, Podman/containerd, etc.), the gateway
+runs with `sandbox_runner = None` and Bash silently skips the inner OS sandbox
+while keeping the configured `permission` approval policy. If no sandbox
+backend is available on a non-container host, Bash emits a warning notice before
+it runs without the inner OS sandbox. Other tools continue to function. The
+outer-container detection is best-effort only; it is an optimization to avoid
+unsupported nested sandboxing, not a security proof.
 
 ## Design Decisions
 
@@ -58,8 +61,8 @@ on the `docker` feature, also default-on). All three features ship in
 the default set so the same build works whether the operator has
 `bwrap`, only `docker`, or — on a fresh macOS — only the OS-bundled
 `sandbox-exec`. If none are available the factory returns
-`SandboxError::NoBackendAvailable` and the gateway logs an error +
-refuses every `ExecCommand` call.
+`SandboxError::NoBackendAvailable`; the gateway logs the downgrade reason and
+Bash warns before running without the inner OS sandbox.
 
 The three backends have nothing meaningful in common at the syscall
 level — bwrap namespaces vs. SBPL rules vs. dockerd-managed cgroups —
@@ -388,12 +391,15 @@ some setups make it a dangling symlink.
 
 ### Bootstrap probe at startup, not per-call
 
-`baybo_sandbox::current_platform_runner()` is called once during gateway
-boot. The result is stored on `ToolExecutor`; per-call cost is just an
-`Arc::clone`. A missing backend at startup becomes a single error log
-plus `sandbox_runner: None`, which `ToolExecutor` checks per-tool: if the
-tool needs the sandbox and the runner is absent, the call is refused with
-an actionable error. This keeps the rest of the gateway running normally.
+`crates/baybo/src/sandbox_boot.rs` calls
+`baybo_sandbox::current_platform_runner()` once during gateway boot. The result
+is stored on `ToolExecutor`; per-call cost is just an `Arc::clone`. A
+best-effort outer-container detection becomes one warning log plus
+`sandbox_runner: None` and no user notice. A missing backend on a non-container
+host also sets `sandbox_runner: None`, but includes a `sandbox_bypass_reason`;
+Bash reads that reason from `ToolContext`, emits a notice, and runs without the
+inner OS sandbox under the configured approval policy. This keeps the rest of
+the gateway running normally.
 
 ### Runner injected via `ToolContext`, not interposed by the executor
 
@@ -432,8 +438,9 @@ backend binary is absent.
   `SandboxError::Unenforceable`; `SandboxAdapter` defers to the
   runner's `default_resource_limits()` so default-policy callers
   pick limits the backend can actually deliver.
-- ExecCommand tools refuse to run when the backend binary is missing —
-  no fallback to unsandboxed execution.
+- Bash falls back to unsandboxed execution with a notice when the runner is
+  absent; future ExecCommand tools must make their own downgrade/refusal
+  semantics explicit.
 - MCP stdio servers (`baybo-tools::mcp::McpReconciler`) currently spawn
   outside the sandbox. Wrapping them is on the deferred list.
 
@@ -442,9 +449,9 @@ backend binary is absent.
 | Module       | Role                                                                                          |
 |--------------|-----------------------------------------------------------------------------------------------|
 | `tools`      | Defines `ExecSandbox` trait + `SandboxedOutput` and adds `sandbox` / `workspace_root` to `ToolContext`. `BashTool` opts in to routing.   |
-| `agent`      | Builds `SandboxAdapter` per call; passes the runner into `ToolExecutor::new`; refuses ExecCommand tools when no runner is configured. |
+| `agent`      | Builds `SandboxAdapter` per call; passes the runner and any sandbox-bypass reason into `ToolExecutor::new`. |
 | `security`   | Hosts the decision-layer primitives (SSRF resolution in `WebFetch::validate_url_with`, leak detection, secret vault). The sandbox is the enforcement layer that makes those decisions real for ExecCommand tools. |
-| `bootstrap`  | `crates/baybo/src/runtime.rs` calls `current_platform_runner()` at startup and threads the result into `ToolExecutor`.                              |
+| `bootstrap`  | `crates/baybo/src/sandbox_boot.rs` calls `current_platform_runner()` at startup; `runtime.rs` threads the result into `ToolExecutor`.                 |
 
 ## Deferred (post-v1)
 
