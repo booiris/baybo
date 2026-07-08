@@ -1851,10 +1851,10 @@ export interface components {
         };
         /**
          * @description Kind of a reconstructed [`ChatWorkStep`] — serialized as
-         *     `"reasoning"` / `"prose"` / `"tool"`.
+         *     `"reasoning"` / `"prose"` / `"tool"` / `"status"`.
          * @enum {string}
          */
-        WorkStepKind: "reasoning" | "prose" | "tool";
+        WorkStepKind: "reasoning" | "prose" | "tool" | "status";
     };
     responses: never;
     parameters: never;

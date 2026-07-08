@@ -123,6 +123,7 @@ impl Channel {
             | AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolCompleted { .. }
             | AgentEvent::Status(_)
+            | AgentEvent::Progress(_)
             | AgentEvent::Attachment(_) => {
                 let mut buf = self.in_flight.entry(session_id.clone()).or_default();
                 // Coalesce a run of same-kind text deltas into the trailing
@@ -706,6 +707,27 @@ mod tests {
             a.event
         );
         assert!(matches!(&b.event, AgentEvent::ToolStarted { call_id, .. } if call_id == "c1"));
+    }
+
+    #[test]
+    fn in_flight_buffer_keeps_progress_narration() {
+        let channel = Channel::new(ChannelType::http(), ChannelKind::Subscribed, None);
+        let sid = "sess-progress";
+        channel.dispatch_event(agent_evt(
+            sid,
+            AgentEvent::TurnState {
+                active: true,
+                started_at: Some(Utc::now()),
+            },
+        ));
+        channel.dispatch_event(agent_evt(sid, AgentEvent::Progress("still working".into())));
+
+        let got = channel.in_flight_events(&SessionId::from(sid));
+        assert_eq!(got.len(), 1, "progress is buffered like reasoning: {got:?}");
+        let SessionEvent::Agent(a) = &got[0] else {
+            panic!("unexpected snapshot shape: {got:?}");
+        };
+        assert!(matches!(&a.event, AgentEvent::Progress(p) if p == "still working"));
     }
 
     #[test]

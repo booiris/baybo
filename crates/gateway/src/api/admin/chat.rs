@@ -251,13 +251,17 @@ pub enum TranscriptItemKind {
 }
 
 /// Kind of a reconstructed [`ChatWorkStep`] — serialized as
-/// `"reasoning"` / `"prose"` / `"tool"`.
-#[derive(Debug, Serialize, ToSchema)]
+/// `"reasoning"` / `"prose"` / `"tool"` / `"status"`.
+#[derive(Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkStepKind {
     Reasoning,
     Prose,
     Tool,
+    /// The progress observer's transient narration, reconstructed from a
+    /// persisted `progress` control event — the durable shadow of the live
+    /// `AgentEvent::Progress` line.
+    Status,
 }
 
 /// One transcript row, flattened from `ChatMessage` into a shape the
@@ -470,6 +474,17 @@ impl ChatWorkStep {
         }
     }
 
+    fn status(text: String) -> Self {
+        Self {
+            kind: WorkStepKind::Status,
+            text,
+            tool: None,
+            tool_label: None,
+            tool_status: None,
+            tool_summary: None,
+        }
+    }
+
     fn tool(tool: String, tool_label: Option<String>) -> Self {
         Self {
             kind: WorkStepKind::Tool,
@@ -491,6 +506,7 @@ impl From<WireWorkStep> for ChatWorkStep {
         match step.kind {
             WireWorkStepKind::Reasoning => Self::reasoning(step.text),
             WireWorkStepKind::Prose => Self::prose(step.text),
+            WireWorkStepKind::Status => Self::status(step.text),
             WireWorkStepKind::Tool => Self {
                 kind: WorkStepKind::Tool,
                 text: String::new(),
@@ -2381,6 +2397,22 @@ fn reconstruct_transcript_with_attachments(
     for (idx, (_, _, _, entry)) in entries.into_iter().enumerate() {
         let (ordinal, created_at, msg) = match entry {
             Entry::Control(ev) => {
+                // Progress narration is NOT a turn boundary: it folds INTO the
+                // open work block as a `status` step (the durable shadow of the
+                // live `notice { transient }` line) instead of flushing the
+                // block and emitting its own row. Seed the accumulator if this
+                // is the turn's first step (progress fired before any tool
+                // iteration persisted), inheriting the turn start so timing is
+                // consistent with the tool path.
+                if ev.kind == ControlEventKind::Progress {
+                    if work.started.is_none() {
+                        work.started = Some(turn_started.unwrap_or(ev.created_at));
+                        work.ordinal = Some(ev.after_ordinal);
+                    }
+                    work.last = Some(ev.created_at);
+                    work.steps.push(ChatWorkStep::status(ev.text));
+                    continue;
+                }
                 // A control event interrupting an open work block bounds it:
                 // for the common case — the `/stop` echo + notice right after
                 // a cancelled turn's partial rows — the event instant is when
@@ -2561,7 +2593,23 @@ fn reconstruct_transcript_with_attachments(
     // it joined. For a turn still in its first iteration there's no persisted
     // intermediate row, so seed the block's ordinal from the newest message.
     let has_in_flight = !in_flight_steps.is_empty();
-    work.steps.extend(in_flight_steps);
+    // A `status` step reaches the trailing block from TWO sources at once for
+    // the in-flight turn: the persisted `progress` control events (folded above,
+    // at their anchor positions) AND the live channel's in-flight buffer. Drop
+    // the buffered duplicates so the same narration line isn't rendered twice —
+    // the positioned control-event copy wins; any status line the buffer holds
+    // that hasn't persisted yet still appends.
+    let folded_status: std::collections::HashSet<String> = work
+        .steps
+        .iter()
+        .filter(|s| s.kind == WorkStepKind::Status)
+        .map(|s| s.text.clone())
+        .collect();
+    work.steps.extend(
+        in_flight_steps
+            .into_iter()
+            .filter(|s| s.kind != WorkStepKind::Status || !folded_status.contains(&s.text)),
+    );
     if has_in_flight && work.ordinal.is_none() {
         work.ordinal = Some(last_ordinal);
     }
@@ -2799,6 +2847,105 @@ mod tests {
             text: body.to_owned(),
             created_at: ts(secs),
         }
+    }
+
+    #[test]
+    fn reconstruct_folds_progress_control_event_into_work_block() {
+        use baybo_model::ControlEventKind::Progress;
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![
+                    thinking("planning"),
+                    tool_use("c1", "Bash", serde_json::json!({"command": "ls"})),
+                ]),
+            ),
+            (
+                4,
+                ts(5),
+                ChatMessage::tool_result(
+                    "c1".to_owned(),
+                    "<tool_output name=\"Bash\">ok</tool_output>".to_owned(),
+                ),
+            ),
+            (5, ts(7), ChatMessage::assistant(vec![text("done")])),
+        ];
+        // A progress line fired mid-turn, anchored after the tool iteration row.
+        let control = vec![ctl(1, 3, Progress, "Running ls", 4)];
+        let items = reconstruct_transcript(tail, control, None, Vec::new());
+
+        // Three items — the progress line folds INTO the work block, it is NOT
+        // its own row.
+        assert_eq!(items.len(), 3, "user + work + answer: {items:?}");
+        let work = &items[1];
+        assert!(matches!(work.kind, TranscriptItemKind::Work));
+        assert_eq!(
+            work.steps.len(),
+            3,
+            "reasoning + tool + status: {:?}",
+            work.steps
+        );
+        assert!(matches!(work.steps[0].kind, WorkStepKind::Reasoning));
+        assert!(matches!(work.steps[1].kind, WorkStepKind::Tool));
+        assert!(matches!(work.steps[2].kind, WorkStepKind::Status));
+        assert_eq!(work.steps[2].text, "Running ls");
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i.kind, TranscriptItemKind::Notice)),
+            "a progress control event must not surface as a notice row"
+        );
+    }
+
+    #[test]
+    fn reconstruct_dedups_progress_against_in_flight_status() {
+        use baybo_model::ControlEventKind::Progress;
+        // An in-flight turn: one persisted tool iteration, a progress line that
+        // BOTH persisted (control event) AND still sits in the live buffer.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![tool_use(
+                    "c1",
+                    "Bash",
+                    serde_json::json!({"command": "ls"}),
+                )]),
+            ),
+        ];
+        let control = vec![ctl(1, 3, Progress, "narrate", 4)];
+        // The channel's in-flight buffer still holds the same narration line
+        // plus a fresher reasoning step not yet persisted.
+        let in_flight = vec![
+            ChatWorkStep::status("narrate".to_owned()),
+            ChatWorkStep::reasoning("more".to_owned()),
+        ];
+        let items = reconstruct_transcript(tail, control, Some(ts(2)), in_flight);
+
+        let work = items
+            .iter()
+            .find(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .expect("a trailing work block");
+        let status_count = work
+            .steps
+            .iter()
+            .filter(|s| s.kind == WorkStepKind::Status && s.text == "narrate")
+            .count();
+        assert_eq!(
+            status_count, 1,
+            "the duplicate in-flight status is dropped: {:?}",
+            work.steps
+        );
+        assert!(
+            work.steps
+                .iter()
+                .any(|s| s.kind == WorkStepKind::Reasoning && s.text == "more"),
+            "a non-duplicate in-flight step still appends: {:?}",
+            work.steps
+        );
     }
 
     #[test]

@@ -32,11 +32,12 @@ export type WireMessage = {
 
 /// One in-flight work step in a `Frame::SubscribeState` bundle — the wire
 /// mirror of the Rust `wire::WireWorkStep` (snake_case fields). `reasoning` /
-/// `prose` carry `text`; a `tool` step carries the call's id + display
+/// `prose` / `status` carry `text` (`status` is the progress observer's
+/// transient narration line); a `tool` step carries the call's id + display
 /// name/label and, once the call finished within the buffered turn, `status` +
 /// `summary`.
 export type WireWorkStepFrame = {
-  kind: "reasoning" | "prose" | "tool";
+  kind: "reasoning" | "prose" | "tool" | "status";
   text?: string;
   call_id?: string;
   tool?: string;
@@ -47,9 +48,11 @@ export type WireWorkStepFrame = {
 
 /// One reconstructed step inside a REST `work` transcript row — the gateway's
 /// `ChatWorkStep` DTO. Note the REST field names (`tool_label` / `tool_status`
-/// / `tool_summary`), unlike the wire `WireWorkStepFrame` above.
+/// / `tool_summary`), unlike the wire `WireWorkStepFrame` above. `status` is
+/// the durable shadow of a progress-narration line (a persisted `progress`
+/// control event folded back into the block).
 export type RestWorkStep = {
-  kind: "reasoning" | "prose" | "tool";
+  kind: "reasoning" | "prose" | "tool" | "status";
   text?: string;
   tool?: string;
   tool_label?: string;

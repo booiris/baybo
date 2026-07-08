@@ -5549,11 +5549,12 @@
       },
       "WorkStepKind": {
         "type": "string",
-        "description": "Kind of a reconstructed [`ChatWorkStep`] — serialized as\n`\"reasoning\"` / `\"prose\"` / `\"tool\"`.",
+        "description": "Kind of a reconstructed [`ChatWorkStep`] — serialized as\n`\"reasoning\"` / `\"prose\"` / `\"tool\"` / `\"status\"`.",
         "enum": [
           "reasoning",
           "prose",
-          "tool"
+          "tool",
+          "status"
         ]
       }
     }

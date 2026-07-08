@@ -277,8 +277,8 @@ impl From<baybo_model::Task> for TaskView {
 }
 
 /// Kind discriminant for a [`WireWorkStep`] — serialized as `"reasoning"` /
-/// `"prose"` / `"tool"`. A typed enum (mirrors [`AttachmentKind`]) so the
-/// discriminant round-trips cleanly through ts-rs.
+/// `"prose"` / `"tool"` / `"status"`. A typed enum (mirrors [`AttachmentKind`])
+/// so the discriminant round-trips cleanly through ts-rs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
@@ -294,6 +294,11 @@ pub enum WireWorkStepKind {
     /// A tool call (started, and — if it finished within the buffered turn —
     /// completed).
     Tool,
+    /// The progress observer's transient narration (`AgentEvent::Progress`) —
+    /// the work block's dim "what's happening now" line. Carried in
+    /// [`WireWorkStep::text`]; the client folds it exactly like the live
+    /// `notice { transient: true }` frame it mirrors.
+    Status,
 }
 
 /// One step inside a turn's in-flight work block, carried in the
@@ -356,6 +361,19 @@ impl WireWorkStep {
     pub fn prose(text: String) -> Self {
         Self {
             kind: WireWorkStepKind::Prose,
+            text,
+            call_id: None,
+            tool: None,
+            label: None,
+            status: None,
+            summary: None,
+        }
+    }
+
+    /// A transient progress-narration step (the progress observer's line).
+    pub fn status(text: String) -> Self {
+        Self {
+            kind: WireWorkStepKind::Status,
             text,
             call_id: None,
             tool: None,

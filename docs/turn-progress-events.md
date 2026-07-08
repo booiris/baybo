@@ -54,21 +54,35 @@ progress is **opt-in per channel** — the TUI/web render it, sidecars ignore it
 
 ## Web: reconstructed on reload
 
-The progress **events** are live-only and never persisted — but the web chat
-still shows the collapsed `Worked Xs ›` work block after a page reload by
-**reconstructing** an equivalent view from the persisted *messages*. The
-gateway's `api::admin::chat::reconstruct_transcript` (REST `GET
+Most progress **events** are live-only and never persisted on their own — but
+the web chat still shows the collapsed `Worked Xs ›` work block after a page
+reload by **reconstructing** an equivalent view from the persisted *messages*.
+The gateway's `api::admin::chat::reconstruct_transcript` (REST `GET
 /v1/chat/sessions/:id`) folds each tool-using turn's intermediate rows
 (`Thinking` → reasoning, `ToolUse` + paired `ToolResult` → tool step, mid-turn
 `Text` → prose) into one `work` transcript item before the turn's final reply;
 the client maps it onto the same `WorkBlock` it builds live.
 
+The **one exception is the progress observer's narration** (`AgentEvent::Progress`,
+the transient "what's happening now" line). It has no message row to be rebuilt
+from, so it is persisted in its own right as a `ControlEventKind::Progress`
+control event (`AgentLoop::persist_progress_narration`, anchored after the
+session's newest ordinal). Unlike a notice, reconstruction does **not** give it
+its own row — it folds it INTO the turn's work block as a `status` step
+(`WorkStepKind::Status` / `WireWorkStepKind::Status`), the durable shadow of the
+live `notice { transient: true }` frame. So a reload / reopened conversation
+shows the same narration lines the live view did.
+
 For a tab that loads **mid-turn**, reconstruction has a second source: when the
-session has an active turn, `get_session` also folds the http channel's live,
+session has an active turn, `get_session` also folds the channel's live,
 **not-yet-persisted** in-flight progress buffer (reasoning / answer-delta / tool
-steps that streamed before this tab joined) into the trailing work block via
-`in_flight_work_steps()`, aligning its start with the live `TurnState` — so the
-late joiner sees the steps it missed rather than an empty in-progress block.
+/ progress-narration steps that streamed before this tab joined) into the
+trailing work block via `in_flight_work_steps()`, aligning its start with the
+live `TurnState` — so the late joiner sees the steps it missed rather than an
+empty in-progress block. A progress line reaches the active turn's block from
+both sources at once (its persisted control event AND the live buffer), so the
+fold drops the buffered `status` duplicates by text — the positioned
+control-event copy wins.
 
 Two consequences worth knowing:
 
@@ -83,12 +97,14 @@ Two consequences worth knowing:
 - **Mid-turn join recovery (all chat clients).** The WS never replays
   history. A (re)`Subscribe` on a live turn delivers the whole in-flight
   work block inside the `Frame::SubscribeState` bundle's `work_steps`
-  half (reasoning / tool steps from the same per-session buffer), folded
-  once by `channel::work_steps::in_flight_wire_steps` (the REST
-  `ChatWorkStep` derives from the same `WireWorkStep`). A client that
-  (re)subscribes mid-turn **replaces** its open block with it — never
-  appends, since the buffer is a superset of what it saw live — so the
-  thinking it missed while backgrounded reappears without a full reload.
+  half (reasoning / tool / progress-narration steps from the same
+  per-session buffer), folded once by
+  `channel::work_steps::in_flight_wire_steps` (the REST `ChatWorkStep`
+  derives from the same `WireWorkStep`). A client that (re)subscribes
+  mid-turn **replaces** its open block with it — never appends, since the
+  buffer is a superset of what it saw live (progress-narration `status`
+  steps included, so the REPLACE no longer drops them) — so the thinking
+  it missed while backgrounded reappears without a full reload.
   A turn that **completed** while the client was away is recovered by the
   sync call (`GET /v1/chat/sessions/:id/sync`), which reconstructs closed
   work items and notices at full fidelity on every path — see

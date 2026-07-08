@@ -16,7 +16,7 @@ use baybo_model::{
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use baybo_model::{LineageKind, Session, TriggerSource};
+use baybo_model::{ControlEventKind, LineageKind, Session, TriggerSource};
 use baybo_tools::{ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
 use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
@@ -2395,6 +2395,10 @@ impl AgentLoop {
                             // Record only what actually reaches the user, so the
                             // next tick dedupes against their real view.
                             observer_state.sent_notices.push(text.clone());
+                            // Durably shadow the line as a `progress` control
+                            // event so a reload reconstructs it into this turn's
+                            // work block (the live frame below is ephemeral).
+                            self.persist_progress_narration(session, &text).await;
                             self.emit_progress(delta_tx, session, text).await;
                         }
                     }
@@ -2504,6 +2508,36 @@ impl AgentLoop {
                 event: AgentEvent::Progress(text),
             })
             .await;
+    }
+
+    /// Persist one progress line as a `progress` control event, anchored after
+    /// the session's newest ordinal so the reconstruction folds it into the
+    /// in-flight turn's work block at the right spot. Best-effort: a missing
+    /// session store (test loops) or a write error just skips the durable
+    /// shadow — the live frame already reached the user.
+    async fn persist_progress_narration(&self, session: &Session, text: &str) {
+        let Some(sessions) = self.sessions.as_ref() else {
+            return;
+        };
+        let after_ordinal = match sessions.latest_session_ordinal(&session.id).await {
+            Ok(max) => max.unwrap_or(-1),
+            Err(e) => {
+                debug!(session_id = %session.id, error = %e, "progress: ordinal lookup failed; skipping persist");
+                return;
+            }
+        };
+        if let Err(e) = sessions
+            .append_control_event(
+                &session.id,
+                after_ordinal,
+                ControlEventKind::Progress,
+                text,
+                chrono::Utc::now(),
+            )
+            .await
+        {
+            debug!(session_id = %session.id, error = %e, "failed to persist progress narration");
+        }
     }
 
     /// Run an on-demand compression pass and return the confirmation
