@@ -394,7 +394,9 @@ button {
 .step.prose { display: block; font-family: var(--font-sans); font-size: 0.85rem; color: var(--color-ink); }
 .step.status { white-space: pre-wrap; }
 
-/* Pre-first-frame turn indicator (the web chat's "Working…" card, as a line). */
+/* Pre-first-frame turn indicator (the web chat's "Working…" card, as a line).
+   It renders only a fixed i18n label, but wrap it too so no future translation
+   string can overflow the document sideways. */
 .work-pending {
   display: flex;
   align-items: center;
@@ -402,6 +404,7 @@ button {
   font-family: var(--font-mono);
   font-size: 0.75rem;
   color: var(--color-ink-soft);
+  overflow-wrap: anywhere;
 }
 
 /* Scroll-up "load earlier" affordance: a centered hairline pill, monospace
@@ -409,6 +412,7 @@ button {
 .load-older {
   flex: 0 0 auto;
   align-self: center;
+  max-width: 100%;
   padding: 0.3rem 0.9rem;
   border: 1px solid var(--color-line);
   border-radius: var(--radius-pill);
@@ -416,6 +420,7 @@ button {
   color: var(--color-ink-soft);
   font-family: var(--font-mono);
   font-size: 0.75rem;
+  overflow-wrap: anywhere;
 }
 .load-older:active { opacity: 0.7; transform: scale(0.98); }
 
