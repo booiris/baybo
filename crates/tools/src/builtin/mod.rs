@@ -31,7 +31,6 @@ use crate::{Tool, ToolCapability, ToolManifest};
 
 pub mod background_jobs;
 pub mod bash;
-mod bash_judge;
 pub mod edit;
 pub mod glob_tool;
 pub mod grep;
@@ -49,7 +48,7 @@ pub mod write;
 pub mod echo;
 
 pub use background_jobs::{JobListTool, JobStopTool};
-pub use bash::{BashSandboxMode, BashTool, LiveSandboxMode};
+pub use bash::{BashPermissionMode, BashTool, LivePermissionMode};
 #[cfg(debug_assertions)]
 pub use echo::EchoTool;
 pub use edit::EditTool;
@@ -77,7 +76,7 @@ pub fn default_tools(
     blob_store: Arc<dyn BlobStore>,
     workspace_paths: WorkspacePaths,
     proxy: Option<reqwest::Proxy>,
-    sandbox_mode: Arc<bash::LiveSandboxMode>,
+    permission: Arc<bash::LivePermissionMode>,
 ) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     #[allow(unused_mut)]
     let mut tools: Vec<(Arc<dyn Tool>, ToolManifest)> = vec![
@@ -91,7 +90,7 @@ pub fn default_tools(
             vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
         trusted(
-            BashTool::new(workspace_paths).with_mode_handle(sandbox_mode),
+            BashTool::new(workspace_paths).with_permission_handle(permission),
             vec![ToolCapability::ExecCommand],
         ),
         trusted(GlobTool, vec![ToolCapability::ReadFile]),

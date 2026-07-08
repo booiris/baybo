@@ -22,8 +22,8 @@ TB task container there is no bwrap, and the container already *is* the isolatio
 boundary. So the binary is built `--features bench-bash` (the off-by-default
 bench profile: Bash runs raw — no OS sandbox, no work-dir jail, no uv shim, cwd
 inherited from the container's WORKDIR) and the rendered `baybo.json` also sets
-`sandbox.mode = none`. The feature is what lifts the uv shim + work jail; `none`
-alone would keep them.
+`permission = free`. The feature is what lifts the uv shim + work jail;
+`free` alone would keep them.
 
 ## Build the binary
 
@@ -92,7 +92,7 @@ confirm Docker + the harness work before pointing it at baybo.
 
 1. The harness builds/starts the task's container.
 2. `BayboAgent.perform_task` copies the `baybo` binary **and** a rendered
-   `baybo.json` (`none` sandbox, a self-contained state dir under
+   `baybo.json` (`permission = free`, a self-contained state dir under
    `/installed-agent/baybo-home`, the provider/model under test) into
    `/installed-agent`, then the base class sources the provider key and runs
    `baybo-setup.sh` — which installs the binary, mints a vault key, and (only when

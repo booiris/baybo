@@ -364,6 +364,7 @@ fn make_tool_context(workspace_paths: &WorkspacePaths, cancel: CancellationToken
         workspace_root: workspace_paths.root().to_path_buf(),
         workspace_paths: workspace_paths.clone(),
         sandbox: None,
+        sandbox_bypass_reason: None,
         approval: None,
         notifier: None,
         events: baybo_tools::noop_event_sink(),

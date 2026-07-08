@@ -75,10 +75,10 @@ pub fn hot_reload_diff(old: &BayboConfig, new: &BayboConfig) -> Result<()> {
         external_agents,
         proxy,
         memory,
-        // Hot: the runtime reloader swaps the live `BashTool` sandbox mode (and
-        // the tool description it advertises). Ignored here so a `sandbox`-only
-        // change is hot-reloadable rather than rejected.
-        sandbox: _,
+        // Hot: the runtime reloader swaps the live `BashTool` permission policy
+        // (and the tool description it advertises). Ignored here so a
+        // `permission`-only change is hot-reloadable rather than rejected.
+        permission: _,
     } = new;
 
     if &old.channels != channels {
@@ -193,6 +193,14 @@ mod tests {
         let mut new = base();
         new.cost.rate_limit.max_requests += 1;
         new.cost.spending_limits.daily_usd = Some(baybo_model::MicroUsd::from_micros(5_000_000));
+        assert!(hot_reload_diff(&old, &new).is_ok());
+    }
+
+    #[test]
+    fn permission_change_is_hot() {
+        let old = base();
+        let mut new = base();
+        new.permission = crate::PermissionPolicy::Manual;
         assert!(hot_reload_diff(&old, &new).is_ok());
     }
 

@@ -416,6 +416,7 @@ impl AgentTestHarnessBuilder {
             std::path::PathBuf::from("/tmp"),
             baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/tmp")),
             None,
+            None,
             virtual_reads,
             None,
             None,

@@ -46,7 +46,7 @@ use baybo_workspace::WorkspaceManager;
 use regex::Regex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::boot;
 
@@ -228,13 +228,13 @@ pub async fn build_managers(
     // stays free of per-tool-domain wiring (browser blob upload, etc).
     embedded_mcp_servers: Vec<EmbeddedMcpServer>,
 ) -> anyhow::Result<ManagerGraph> {
-    // Shared, hot-swappable Bash sandbox mode. A `sandbox` config reload swaps
-    // it live (see `reload.rs`); the handle is held by both the tool registry
-    // and the reloader.
-    let sandbox_mode = std::sync::Arc::new(baybo_tools::builtin::LiveSandboxMode::new(
-        boot::to_bash_mode(config.sandbox.mode),
+    // Shared, hot-swappable Bash permission mode. A `permission` config reload
+    // swaps it live (see `reload.rs`); the handle is held by both the tool
+    // registry and the reloader.
+    let bash_permission = std::sync::Arc::new(baybo_tools::builtin::LivePermissionMode::new(
+        boot::to_bash_permission(config.permission),
     ));
-    // --- minimal services shared by every mode
+    // --- minimal services shared by every boot path
     let workspace_paths =
         baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from(&config.workspace.path));
     let workspace_root = workspace_paths.root().to_path_buf();
@@ -401,7 +401,7 @@ pub async fn build_managers(
             baybo_config::ConfigHandle::new(Arc::clone(&config)),
             llm_reloader,
             cost_reloader,
-            Arc::clone(&sandbox_mode),
+            Arc::clone(&bash_permission),
         ))
     };
 
@@ -409,7 +409,7 @@ pub async fn build_managers(
         stores.blob.clone(),
         baybo_workspace::WorkspacePaths::new(workspace_root.clone()),
         tool_proxy,
-        Arc::clone(&sandbox_mode),
+        Arc::clone(&bash_permission),
     );
 
     let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
@@ -541,44 +541,7 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
     ));
     let gate_map = channels_registry.approval_gates();
-    let sandbox_runner = if matches!(config.sandbox.mode, baybo_config::SandboxMode::None) {
-        // `none` mode runs every command directly (no OS sandbox), so probing
-        // for a backend is pointless — and a disposable container usually has
-        // none. Skip it silently rather than logging a misleading
-        // "ExecCommand tools will be refused" error for tools that run fine.
-        // (A boot in `none` later hot-reloaded to a sandboxed mode would then
-        // find no backend and surface a clear "OS sandbox unavailable" error —
-        // acceptable, since such an environment has no sandbox to offer.)
-        None
-    } else {
-        match baybo_sandbox::current_platform_runner() {
-            Ok(r) => match r.warm().await {
-                Ok(()) => {
-                    info!(backend = ?r.backend(), "OS sandbox ready");
-                    Some(r)
-                }
-                Err(e) => {
-                    error!(
-                        error = %e,
-                        backend = ?r.backend(),
-                        "sandbox warm-up failed; ExecCommand tools will be refused",
-                    );
-                    None
-                }
-            },
-            Err(
-                e @ (baybo_sandbox::SandboxError::BackendMissing { .. }
-                | baybo_sandbox::SandboxError::BackendUnreachable { .. }
-                | baybo_sandbox::SandboxError::NoBackendAvailable),
-            ) => {
-                error!(error = %e, "OS sandbox unavailable; ExecCommand tools will be refused");
-                None
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
-        }
-    };
+    let sandbox_boot = crate::sandbox_boot::resolve_sandbox_runner(config.permission).await?;
 
     // --- pluggable memory backend. Constructed here while
     // `tool_registry` is still mutable so the impl's `tools()` can be
@@ -667,7 +630,8 @@ pub async fn build_managers(
         Arc::clone(&security_gateway),
         sandbox_root,
         workspace_paths.clone(),
-        sandbox_runner,
+        sandbox_boot.runner,
+        sandbox_boot.bypass_reason,
         virtual_reads,
         background_jobs,
         background_control,

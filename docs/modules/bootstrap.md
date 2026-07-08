@@ -13,6 +13,7 @@ It is **not** a reusable library. Alternative entry points (e.g. integration tes
 | `crates/baybo/src/main.rs` | Argv-mode dispatch. Parses the CLI, promotes `--config` into `BAYBO_CONFIG_PATH`, then either short-circuits to a subcommand entry (`gateway_cmd::run`, `setup_cmd::run`, `tui_cmd::run`) or builds a lightweight `CommandContext` and runs `baybo_cli::dispatch::run`. |
 | `crates/baybo/src/boot.rs` | Config → domain translation layer. Pure mappings and small loaders, unit-tested. No `Arc`, no channels, no actor spawning. |
 | `crates/baybo/src/runtime.rs` | Shared chat-loop assembly: `build_managers`, `wire_router`, `install_signal_handler`, `build_secret_vault`, `force_exit_watchdog`. Used by both the gateway boot path and the TUI's auto-spawn helper. Vault construction goes through `boot::load_encryption_key` directly. |
+| `crates/baybo/src/sandbox_boot.rs` | Boot-time Bash sandbox policy: bench skip, outer-container detection, backend warm-up, and downgrade reason selection. |
 | `crates/baybo/src/gateway_cmd.rs` | Long-running entry point for `baybo gateway start` and the supporting installer / token / status subcommands. |
 | `crates/baybo/src/setup_cmd.rs` | First-run wizard (`baybo setup`). |
 | `crates/baybo/src/tui_cmd.rs` | Interactive `baybo tui` entry point: connects to a running gateway over the channel WS. |

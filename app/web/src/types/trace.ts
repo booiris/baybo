@@ -226,6 +226,10 @@ export type ToolEventPayload =
       model: string;
       input: string;
       output: string;
+    }
+  | {
+      type: 'parse_failure';
+      command: string;
     };
 
 export type SpanEventKind =

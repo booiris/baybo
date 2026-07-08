@@ -8,9 +8,9 @@ task's own pytest. Mirrors the upstream Codex adapter
 Two things make baybo work in-container:
   * a one-shot `baybo prompt --json -y` runs the full agent loop to completion;
   * the container *is* the sandbox, so baybo is configured with
-    `sandbox.mode = none` (its Bash runs commands directly — no bwrap, no
-    work-dir jail). `none` is a regular config mode — no special build needed —
-    the analog of Codex's `--sandbox danger-full-access`.
+    `permission = free`; with the bench-bash build, Bash runs commands
+    directly — no bwrap, no work-dir jail — the analog of Codex's
+    `--sandbox danger-full-access`.
 
 Use it via the harness's custom-agent flag (no fork of terminal-bench). The env
 is uv-managed (see bench/terminal-bench-1.0/pyproject.toml); run from bench/terminal-bench-1.0/:
@@ -132,7 +132,7 @@ class BayboAgent(AbstractInstalledAgent):
         return self._get_templated_script_path("baybo-setup.sh.j2")
 
     def _baybo_config(self) -> dict:
-        """The baybo.json rendered into the container — `none` sandbox, a
+        """The baybo.json rendered into the container — `permission = free`, a
         self-contained state dir, and the provider/model under test."""
         entry = {
             "name": "agent",
@@ -154,7 +154,7 @@ class BayboAgent(AbstractInstalledAgent):
             # Required to pass config validation even though `baybo prompt` runs
             # in-process and never binds.
             "gateway": {"bind_address": "127.0.0.1", "port": 8723},
-            "sandbox": {"mode": "none"},
+            "permission": "free",
             "cost": {"rate_limit": {"max_requests": 1_000_000}},
         }
 

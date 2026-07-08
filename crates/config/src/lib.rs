@@ -22,9 +22,9 @@ pub mod external_agents;
 pub mod gateway;
 pub mod llm;
 pub mod memory;
+pub mod permission;
 pub mod proxy;
 pub mod reload;
-pub mod sandbox;
 pub mod security;
 pub mod skills;
 pub mod tools;
@@ -46,9 +46,9 @@ pub use crate::external_agents::{ClaudeConfig, CodexConfig, ExternalAgentsConfig
 pub use crate::gateway::GatewayConfig;
 pub use crate::llm::{LlmEntry, LlmPricingOverride};
 pub use crate::memory::{MemoryConfig, MemoryProvider};
+pub use crate::permission::PermissionPolicy;
 pub use crate::proxy::ProxyConfig;
 pub use crate::reload::{ConfigHandle, hot_reload_diff};
-pub use crate::sandbox::{SandboxConfig, SandboxMode};
 pub use crate::security::SecurityConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};
 pub use crate::tools::TrustLevelConfig;
@@ -57,7 +57,7 @@ pub use baybo_model::LlmEntryName;
 
 /// Root configuration object for Baybo.
 ///
-/// All sections have defaults, so deserializing an empty JSON object (`{}`)
+/// All fields have defaults, so deserializing an empty JSON object (`{}`)
 /// yields a fully valid config.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
@@ -84,13 +84,9 @@ pub struct BayboConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyConfig>,
     pub memory: MemoryConfig,
-    /// How shell-out tools are isolated. `auto` (default) wraps every command in
-    /// the OS sandbox and adds an LLM risk judge that can run a failed command
-    /// unsandboxed when judged safe (else asks); `sandboxed` is the stricter,
-    /// judge-free mode; `none` disables OS isolation entirely (for running baybo
-    /// inside an already-disposable environment). Hot-reloadable.
+    /// Permission policy for shell-out tools. Hot-reloadable.
     #[serde(default)]
-    pub sandbox: SandboxConfig,
+    pub permission: PermissionPolicy,
 }
 
 impl BayboConfig {

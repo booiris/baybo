@@ -230,17 +230,20 @@ pub fn to_assessment_mode(cfg: RiskCheckConfig) -> AssessmentMode {
     }
 }
 
-/// Map the config-layer sandbox mode onto the tool-layer one. The two are kept
-/// separate so `baybo-tools` needn't depend on `baybo-config`; this boot/wiring
-/// layer (which has both) is the one place that bridges them. Shared by initial
-/// wiring ([`crate::runtime`]) and hot-reload ([`crate::reload`]) so both map
-/// identically.
-pub fn to_bash_mode(mode: baybo_config::SandboxMode) -> baybo_tools::builtin::BashSandboxMode {
-    use baybo_tools::builtin::BashSandboxMode;
-    match mode {
-        baybo_config::SandboxMode::None => BashSandboxMode::None,
-        baybo_config::SandboxMode::Sandboxed => BashSandboxMode::Sandboxed,
-        baybo_config::SandboxMode::Auto => BashSandboxMode::Auto,
+/// Map config-layer permission onto the Bash permission enum. The two are
+/// kept separate so `baybo-tools` needn't depend on `baybo-config`; this
+/// boot/wiring layer (which has both) is the one place that bridges them.
+/// Shared by initial wiring ([`crate::runtime`]) and hot-reload
+/// ([`crate::reload`]) so both map identically.
+pub fn to_bash_permission(
+    permission: baybo_config::PermissionPolicy,
+) -> baybo_tools::builtin::BashPermissionMode {
+    use baybo_tools::builtin::BashPermissionMode;
+
+    match permission {
+        baybo_config::PermissionPolicy::Auto => BashPermissionMode::Auto,
+        baybo_config::PermissionPolicy::Manual => BashPermissionMode::Manual,
+        baybo_config::PermissionPolicy::Free => BashPermissionMode::Free,
     }
 }
 
