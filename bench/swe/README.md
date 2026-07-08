@@ -32,14 +32,14 @@ This is the faithful, leaderboard-comparable setup:
 Docker + grader pipeline **offline and unpriced** (oracle ≈100%, noop 0%) before
 the agent arm costs anything. Run them first.
 
-## Build with `--features bench-bash` + `sandbox.mode = none`
+## Build with `--features bench-bash` + `permission = free`
 
 The agent runs inside the eval container, where baybo's normal OS sandbox (bwrap)
 can't nest. Two knobs make Bash run raw there: the harness writes a
-`sandbox.mode = none` config (drops the OS sandbox) **and** the binary is built
+`permission = free` config (drops the OS sandbox) **and** the binary is built
 `--features bench-bash` (the bench profile — also no uv shim, no work-dir jail,
 cwd inherited from `/testbed`). `bench-bash` is off-by-default and compiled out
-of every prod build; `none` on its own (no feature) keeps uv + the work jail, so
+of every prod build; `free` on its own (no feature) keeps uv + the work jail, so
 the bench needs both.
 
 The binary is copied into Ubuntu-based eval images, so it must be **static
@@ -81,7 +81,7 @@ libsql's bundled SQLite requires. Point the bench at a prebuilt binary with
    swebench.harness.prepare_images`). The same `--namespace` goes to
    `swe_export.py` (so the image keys line up) and to the grader.
 3. **Agent** (agent arm) — per instance: `docker run` the image, copy in the
-   musl `baybo` + a `sandbox.mode = none` config (workspace `/baybo-home`, *outside*
+   musl `baybo` + a `permission = free` config (workspace `/baybo-home`, *outside*
    `/testbed` so baybo's own state never pollutes the diff), run `baybo prompt
    --json -y` with cwd `/testbed`, then capture `git diff <base_commit>` as the
    prediction and read the turn's cost from baybo's ledger. Containers run

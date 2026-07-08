@@ -172,6 +172,7 @@ rig = { package = "rig-core", version = "0.37", features = ["derive"] }
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 clap_complete = "4"
 shell-words = "1"
+brush-parser = "0.4"
 tiktoken-rs = "0.11"
 unicode-width = "0.2"
 tempfile = "3"

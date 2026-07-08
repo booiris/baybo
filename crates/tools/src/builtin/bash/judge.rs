@@ -1,4 +1,4 @@
-//! LLM risk judge for `SandboxMode::Auto` (see [`super::bash`]).
+//! LLM risk judge for `permission = auto` in the parent Bash module.
 //!
 //! Two judgments, both fail-CLOSED (any LLM/parse error → "risky", never an
 //! unprompted escape — the opposite of the skill assessor's availability-first
@@ -6,7 +6,8 @@
 //! sandbox with no check):
 //!
 //! - [`judge_pre_exec`] gates a destructive-token command *before* it runs:
-//!   safe → run sandboxed unprompted, risky → ask the user.
+//!   safe → run unprompted under the selected sandbox policy, risky → ask the
+//!   user.
 //! - [`judge_post_fail`] runs *after* a sandboxed command exits non-zero: it
 //!   decides whether the failure was the sandbox's fault and whether an
 //!   unsandboxed re-run is safe, yielding keep / unsandbox / prompt.
@@ -17,17 +18,26 @@
 //! risky.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use baybo_llm::{BilledChat, ChatRequest, extract_json_object};
 use baybo_model::{ChatMessage, ContentBlock};
+use baybo_trace::ToolEventPayload;
 use serde::Deserialize;
+
+use crate::{ToolEventSink, start_timer};
+
+/// Trace `action` label for the pre-execution risk judge's LLM round-trip.
+const PRE_EXEC_JUDGE_ACTION: &str = "risk_judge";
+/// Trace `action` label for the post-failure unsandbox judge's round-trip.
+const POST_FAIL_JUDGE_ACTION: &str = "unsandbox_judge";
 
 /// Max chars of stdout/stderr (tail) handed to the post-failure judge. The
 /// failure signal is almost always at the end of the stream, and the judge
 /// only needs the gist — not the whole capture.
 const MAX_JUDGE_OUTPUT_CHARS: usize = 2_000;
 
-/// Pre-execution decision for a destructive-token command in auto mode.
+/// Pre-execution decision for a destructive-token command under auto permission.
 pub(crate) enum PreExec {
     /// Run sandboxed without prompting.
     Proceed,
@@ -86,15 +96,22 @@ fn rationale_or(raw: String, fallback: &str) -> String {
 /// so the user still gets the today-equivalent approval gate.
 pub(crate) async fn judge_pre_exec(
     llm: &dyn BilledChat,
+    events: &Arc<dyn ToolEventSink>,
     command: &str,
     cwd: Option<&Path>,
+    sandboxed: bool,
 ) -> PreExec {
     let user = format!(
         "Command:\n{command}\n\nWorking directory: {}\n\nRespond with the JSON verdict only.",
         cwd.map(|p| p.display().to_string())
             .unwrap_or_else(|| "(default)".to_string()),
     );
-    let Some(verdict) = run_judge(llm, PRE_EXEC_SYSTEM, &user).await else {
+    let system = if sandboxed {
+        PRE_EXEC_SANDBOXED_SYSTEM
+    } else {
+        PRE_EXEC_UNSANDBOXED_SYSTEM
+    };
+    let Some(verdict) = run_judge(llm, events, PRE_EXEC_JUDGE_ACTION, system, &user).await else {
         return PreExec::Prompt("risk judge unavailable — approval required".to_string());
     };
     match parse_risk(&verdict.risk) {
@@ -111,6 +128,7 @@ pub(crate) async fn judge_pre_exec(
 /// returns [`PostFail::Prompt`] (treated as risky), never an unprompted escape.
 pub(crate) async fn judge_post_fail(
     llm: &dyn BilledChat,
+    events: &Arc<dyn ToolEventSink>,
     command: &str,
     cwd: Option<&Path>,
     exit_code: i32,
@@ -125,7 +143,9 @@ pub(crate) async fn judge_post_fail(
         tail(stderr_tail, MAX_JUDGE_OUTPUT_CHARS),
         tail(stdout_tail, MAX_JUDGE_OUTPUT_CHARS),
     );
-    let Some(verdict) = run_judge(llm, POST_FAIL_SYSTEM, &user).await else {
+    let Some(verdict) =
+        run_judge(llm, events, POST_FAIL_JUDGE_ACTION, POST_FAIL_SYSTEM, &user).await
+    else {
         return PostFail::Prompt("risk judge unavailable — approval required".to_string());
     };
     if !verdict.sandbox_related {
@@ -145,8 +165,16 @@ pub(crate) async fn judge_post_fail(
 
 /// Send the system+user pair at temperature 0 and parse the JSON verdict.
 /// Returns `None` on any provider error or unparseable reply (callers map
-/// `None` to their fail-closed branch).
-async fn run_judge(llm: &dyn BilledChat, system: &str, user: &str) -> Option<RawVerdict> {
+/// `None` to their fail-closed branch). Records two trace events under
+/// `action`: a `Phase` with the round-trip duration and an `LlmCall`
+/// carrying the judge's input (the command context) and raw output.
+async fn run_judge(
+    llm: &dyn BilledChat,
+    events: &Arc<dyn ToolEventSink>,
+    action: &str,
+    system: &str,
+    user: &str,
+) -> Option<RawVerdict> {
     let request = ChatRequest {
         messages: vec![
             ChatMessage::system(vec![ContentBlock::Text(system.to_string())]),
@@ -155,13 +183,29 @@ async fn run_judge(llm: &dyn BilledChat, system: &str, user: &str) -> Option<Raw
         temperature: Some(0.0),
         tools: vec![],
     };
-    let reply = match llm.chat(&request).await {
+    let outcome = {
+        let _timer = start_timer(events, action);
+        llm.chat(&request).await
+    };
+    let emit = |output: String| {
+        events.emit(
+            action,
+            ToolEventPayload::LlmCall {
+                model: llm.model_info().id.clone(),
+                input: user.to_string(),
+                output,
+            },
+        );
+    };
+    let reply = match outcome {
         Ok(resp) => resp.response.content,
         Err(e) => {
             tracing::warn!(target: "baybo::tools::bash", error = %e, "bash risk judge call failed");
+            emit(format!("<error: {e}>"));
             return None;
         }
     };
+    emit(reply.clone());
     let obj = extract_json_object(&reply)?;
     serde_json::from_str::<RawVerdict>(obj).ok()
 }
@@ -178,7 +222,16 @@ fn tail(s: &str, max: usize) -> String {
     format!("…(truncated)…{}", &s[start..])
 }
 
-const PRE_EXEC_SYSTEM: &str = r#"You are a safety judge for an autonomous coding agent. The command below is ABOUT TO RUN inside an OS sandbox (read+write to the project workspace and $HOME; credential directories and any path outside that union are hidden; network enabled). It was flagged because it contains a destructive operation — a file deletion (rm / rmdir / find -delete / …) or a history-rewriting git command (reset --hard, clean -f, push --force, branch -D, …).
+const PRE_EXEC_SANDBOXED_SYSTEM: &str = r#"You are a safety judge for an autonomous coding agent. The command below is ABOUT TO RUN inside an OS sandbox (read+write to the project workspace and $HOME; credential directories and any path outside that union are hidden; network enabled). It was flagged because it contains a destructive operation — a file deletion (rm / rmdir / find -delete / …) or a history-rewriting git command (reset --hard, clean -f, push --force, branch -D, …).
+
+Decide whether it is risky enough that a human should approve it before it runs:
+- "risky": could irreversibly destroy work that matters — recursive deletion of source, wiping a real repository's history or remote, deleting paths outside an obvious scratch/build area, or other serious irreversible harm.
+- "safe": a routine, low-stakes cleanup an agent should be free to do — removing build artifacts, temp files, generated output, or a clearly scratch directory.
+
+Respond with ONE JSON object and nothing else:
+{"risk": "safe"|"risky", "rationale": "one short sentence"}"#;
+
+const PRE_EXEC_UNSANDBOXED_SYSTEM: &str = r#"You are a safety judge for an autonomous coding agent. The command below is ABOUT TO RUN without an OS sandbox: it runs directly via `sh -c` on the host, with the tool-layer work-directory path guard still applied. It was flagged because it contains a destructive operation — a file deletion (rm / rmdir / find -delete / …) or a history-rewriting git command (reset --hard, clean -f, push --force, branch -D, …).
 
 Decide whether it is risky enough that a human should approve it before it runs:
 - "risky": could irreversibly destroy work that matters — recursive deletion of source, wiping a real repository's history or remote, deleting paths outside an obvious scratch/build area, or other serious irreversible harm.

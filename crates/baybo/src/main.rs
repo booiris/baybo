@@ -4,6 +4,7 @@ mod gateway_cmd;
 mod prompt_cmd;
 mod reload;
 mod runtime;
+mod sandbox_boot;
 mod setup_cmd;
 mod singleton;
 mod tracing_init;
@@ -180,10 +181,10 @@ async fn main() -> anyhow::Result<()> {
         stores.blob.clone(),
         workspace_paths.clone(),
         tool_proxy,
-        // argv one-shots (llm/doctor/status) barely touch Bash; a fresh
-        // sandboxed handle with no hot-reload wiring is the safe default.
-        Arc::new(baybo_tools::builtin::LiveSandboxMode::new(
-            baybo_tools::builtin::BashSandboxMode::Sandboxed,
+        // argv one-shots (llm/doctor/status) barely touch Bash; there is no
+        // config reloader on this path, so use the default Bash permission policy.
+        Arc::new(baybo_tools::builtin::LivePermissionMode::new(
+            baybo_tools::builtin::BashPermissionMode::default(),
         )),
     ));
     let workspace = Arc::new(baybo_workspace::WorkspaceManager::new(

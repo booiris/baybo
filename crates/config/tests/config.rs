@@ -1,6 +1,7 @@
 use baybo_config::{
     BayboConfig, ClaudeConfig, CodexConfig, ConfigError, DiscordChannelConfig,
-    ExternalAgentsConfig, GeminiConfig, LlmEntry, LlmEntryName, ProxyConfig, TelegramChannelConfig,
+    ExternalAgentsConfig, GeminiConfig, LlmEntry, LlmEntryName, PermissionPolicy, ProxyConfig,
+    TelegramChannelConfig,
 };
 use baybo_model::{ExternalAgentKind, ModelTier};
 
@@ -25,6 +26,57 @@ fn default_config_is_valid() {
 fn empty_json_uses_defaults() {
     let config = BayboConfig::load_from_str("{}").expect("empty object should parse");
     assert_eq!(config, BayboConfig::default());
+}
+
+#[test]
+fn permission_defaults_to_auto() {
+    let config = BayboConfig::default();
+    assert_eq!(config.permission, PermissionPolicy::Auto);
+}
+
+#[test]
+fn parses_permission_policy() {
+    let config = BayboConfig::load_from_str(
+        r#"{
+            "permission": "Manual"
+        }"#,
+    )
+    .expect("permission config should parse");
+
+    assert_eq!(config.permission, PermissionPolicy::Manual);
+}
+
+#[test]
+fn parses_free_permission_and_legacy_aliases() {
+    let free = BayboConfig::load_from_str(r#"{ "permission": "Free" }"#)
+        .expect("free permission should parse");
+    assert_eq!(free.permission, PermissionPolicy::Free);
+
+    let open = BayboConfig::load_from_str(r#"{ "permission": "open" }"#)
+        .expect("legacy open permission alias should parse");
+    assert_eq!(open.permission, PermissionPolicy::Free);
+
+    let legacy = BayboConfig::load_from_str(r#"{ "permission": "none" }"#)
+        .expect("legacy none permission alias should parse");
+    assert_eq!(legacy.permission, PermissionPolicy::Free);
+}
+
+#[test]
+fn example_config_uses_top_level_permission() {
+    let example = include_str!("../../../baybo.example.json");
+    let config = BayboConfig::load_from_str(example).expect("example config should parse");
+    assert_eq!(config.permission, PermissionPolicy::Auto);
+
+    let raw: serde_json::Value = serde_json::from_str(example).expect("example config is json");
+    assert_eq!(raw.get("permission").and_then(|v| v.as_str()), Some("auto"));
+    assert!(
+        raw.get("safety").is_none(),
+        "example config must not use the legacy safety wrapper"
+    );
+    assert!(
+        raw.get("sandbox").is_none(),
+        "example config must not use the legacy sandbox wrapper"
+    );
 }
 
 #[test]

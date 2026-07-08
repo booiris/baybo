@@ -66,7 +66,7 @@ call-site to keep consistent with the vault, for no real isolation win).
 |---|---|---|
 | `UserSecretManager`, `USER_SECRET_PREFIX` | `baybo-security` | next to `SecretVault`; reachable by `baybo-tools` (dep already exists) |
 | `secret_add` / `secret_list` / `secret_check` | `baybo-tools/builtin/secret.rs` | alongside `BashTool`; `Tool` impls cannot live in `baybo-security` (would close an `baybo-tools ↔ baybo-security` cycle) |
-| Bash change | `baybo-tools/builtin/bash.rs` | — |
+| Bash change | `baybo-tools/builtin/bash/mod.rs` | — |
 | CLI `secret` family | `crates/cli/src/commands/secret.rs` | — |
 | `SecretAccess` impl | `crates/agent` | only crate that sees both the trait (`baybo-tools`) and the manager (`baybo-security`) |
 

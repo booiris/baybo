@@ -24,7 +24,7 @@ Same rationale as 1.0. baybo normally wraps every shell command in an OS sandbox
 (bwrap/docker); inside a task container there is no bwrap and the container already
 *is* the isolation boundary, so the binary is built `--features bench-bash` (Bash
 runs raw — no OS sandbox, no work-dir jail, no uv shim) and the rendered
-`baybo.json` sets `sandbox.mode = none`. A **static musl** build runs in any task
+`baybo.json` sets `permission = free`. A **static musl** build runs in any task
 container regardless of glibc:
 
 ```bash
@@ -86,7 +86,7 @@ the denominator is the true attempted-task count, not just the graded ones.
 1. Harbor builds/starts the task's container (the `docker_image` in its
    `task.toml`).
 2. `BayboAgent.install()` `environment.upload_file`s the musl binary + a rendered
-   `baybo.json` (`none` sandbox, self-contained state dir, the provider/model under
+   `baybo.json` (`permission = free`, self-contained state dir, the provider/model under
    test), installs it to `/usr/local/bin/baybo`, mints a vault key, and ensures
    ca-certificates.
 3. `BayboAgent.run()` runs `baybo prompt --json -y` to completion (a non-zero exit

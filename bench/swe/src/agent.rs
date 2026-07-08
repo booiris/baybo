@@ -2,13 +2,13 @@
 //! image** — the faithful, leaderboard-comparable way to measure issue
 //! resolution. Per instance we `docker run` the eval image (the repo checked out
 //! at `base_commit` at `/testbed`, all deps installed), copy in a static-musl
-//! `baybo` binary configured with `sandbox.mode = none`, run `baybo prompt` with
+//! `baybo` binary configured with `permission = free`, run `baybo prompt` with
 //! cwd `/testbed`, then capture `git diff` as the prediction and read the turn's
 //! cost from baybo's ledger.
 //!
-//! `mode = none` (no OS sandbox) is mandatory here: baybo's normal sandbox (bwrap)
-//! can't nest in the container, and the container is already the isolation
-//! boundary. The grader runs separately, in its own hermetic containers — see
+//! `permission = free` (no OS sandbox) is mandatory here: baybo's normal
+//! sandbox (bwrap) can't nest in the container, and the container is already the
+//! isolation boundary. The grader runs separately, in its own hermetic containers — see
 //! [`crate::grader`].
 
 use std::collections::BTreeSet;
@@ -58,7 +58,7 @@ pub struct AgentModel {
     pub base_url: Option<String>,
 }
 
-/// Render the in-container `baybo.json`: `none` sandbox, the agent model,
+/// Render the in-container `baybo.json`: free Bash permission, the agent model,
 /// an isolated workspace, and a lifted rate limit. Returned as text to pipe into
 /// the container (no host temp file).
 pub fn render_agent_config(model: &AgentModel) -> String {
@@ -79,7 +79,7 @@ pub fn render_agent_config(model: &AgentModel) -> String {
         "workspace": { "path": CONTAINER_WORKSPACE },
         // The whole point of this run: Bash executes directly in the container
         // (the container IS the isolation boundary; bwrap can't nest here).
-        "sandbox": { "mode": "none" },
+        "permission": "free",
         "cost": { "rate_limit": { "max_requests": BENCH_RATE_LIMIT_MAX_REQUESTS } },
     });
     serde_json::to_string_pretty(&cfg).unwrap_or_else(|_| "{}".to_string())
@@ -717,9 +717,9 @@ mod tests {
     }
 
     #[test]
-    fn config_has_none_sandbox_and_isolated_workspace() {
+    fn config_has_free_permission_and_isolated_workspace() {
         let cfg: serde_json::Value = serde_json::from_str(&render_agent_config(&model())).unwrap();
-        assert_eq!(cfg["sandbox"]["mode"], "none");
+        assert_eq!(cfg["permission"], "free");
         // Workspace must be outside /testbed so baybo state never pollutes the diff.
         assert_eq!(cfg["workspace"]["path"], CONTAINER_WORKSPACE);
         assert!(

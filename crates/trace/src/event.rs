@@ -87,6 +87,11 @@ pub enum ToolEventPayload {
         input: String,
         output: String,
     },
+    /// A shell command the destructive-command detector could not parse
+    /// with the shell grammar; it fell back to the fail-closed keyword
+    /// pre-filter. Recorded so parser gaps are visible. `command` is
+    /// producer-truncated; the executor sanitizes it before persistence.
+    ParseFailure { command: String },
 }
 
 impl SpanEventKind {
@@ -199,6 +204,27 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["kind"]["payload"]["type"], "llm_call");
         assert_eq!(v["kind"]["payload"]["model"], "gpt-4o-mini");
+    }
+
+    #[test]
+    fn tool_event_parse_failure_round_trips() {
+        let span = SpanId::new();
+        let e = SpanEvent::new(
+            span,
+            5,
+            SpanEventKind::ToolEvent {
+                action: "delete_scan".into(),
+                payload: ToolEventPayload::ParseFailure {
+                    command: "echo we can't".into(),
+                },
+            },
+        );
+        let s = serde_json::to_string(&e).unwrap();
+        let back: SpanEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, e);
+        // Lock the wire tag so the trace UI can `case 'parse_failure':`.
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["kind"]["payload"]["type"], "parse_failure");
     }
 
     #[test]

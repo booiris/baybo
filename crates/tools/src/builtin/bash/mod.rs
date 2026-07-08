@@ -1,16 +1,21 @@
-//! `Bash` — execute a shell command via `sh -c` inside the OS sandbox.
+//! `Bash` — execute a shell command via `sh -c` under the configured safety
+//! policy.
 //!
-//! Every shell-needing command runs through bwrap (Linux) /
-//! sandbox-exec (macOS) / docker, EXCEPT invocations of the local
-//! `baybo` CLI (any sub-command whose argv0 is
-//! [`baybo_workspace::paths::BIN_NAME`]). The sandbox masks the Baybo
-//! state dir (`~/.baybo`/`$BAYBO_HOME`), so a sandboxed `baybo …` call
-//! can't see the parent gateway's config or session store — running
-//! it sandboxed is broken by construction, so the agent's own CLI
-//! gets the unsandboxed `sh -c` path directly.
+//! In `permission = auto` or `manual`, shell commands run through bwrap
+//! (Linux) / sandbox-exec (macOS) / docker first when the runtime has a usable
+//! inner sandbox. If the gateway detects an outer sandbox/container, Bash
+//! silently skips the inner OS sandbox; if no sandbox backend is available on a
+//! non-container host, Bash sends a notice and runs without the inner OS
+//! sandbox under the same approval policy. `free` runs directly without the
+//! OS sandbox. Invocations of the local `baybo` CLI (any sub-command whose
+//! argv0 is [`baybo_workspace::paths::BIN_NAME`]) are the exception: the
+//! sandbox masks the Baybo state dir (`~/.baybo`/`$BAYBO_HOME`), so a sandboxed
+//! `baybo …` call can't see the parent gateway's config or session store.
+//! Running it sandboxed is broken by construction, so the agent's own CLI gets
+//! the unsandboxed `sh -c` path directly.
 //!
-//! The sandbox runs in **permissive
-//! filesystem** mode capped at `workspace_root + $HOME`: FHS roots
+//! The OS sandbox runs in **permissive filesystem** mode capped at
+//! `workspace_root + $HOME`: FHS roots
 //! (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`,
 //! `/run/systemd/resolve`) stay RO so installed binaries and
 //! resolv.conf still work; credential vaults (`~/.ssh`, `~/.aws`,
@@ -24,16 +29,11 @@
 //! File-content viewers (`cat`, `head`, `tail`, `sed`, `awk`, …) are
 //! rejected at the tool layer to force the Read/Edit tools.
 //!
-//! Approval prompts only fire when the command tokens contain a
-//! file-delete (`rm`, `rmdir`, `unlink`, `shred`, `srm`, `wipe`,
-//! `find … -delete`) or a destructive `git` invocation (`clean -f`,
-//! `reset --hard`, `branch -d`/`-D`/`--delete`, `tag -d`, `push -f`/
-//! `--force`/`--force-with-lease`/`--delete`/`-d`, `stash drop`/
-//! `clear`, `worktree remove`, `update-ref -d`, `filter-branch`,
-//! `filter-repo`, `git rm`). If the sandbox itself refuses the
-//! command (cwd outside the bound union, bwrap setup failure, …), a
-//! separate prompt offers an unsandboxed retry. Environment
-//! variables and `cd` changes do NOT persist across invocations.
+//! `permission` controls approvals and isolation: `auto` risk-judges
+//! destructive commands and sandbox-failure escapes, `manual` declares every
+//! Bash command to the executor's approval gate and asks before sandbox escape,
+//! and `free` runs directly with no Bash approval. Environment variables and
+//! `cd` changes do NOT persist across invocations.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use baybo_trace::ToolEventPayload;
 use baybo_workspace::{WorkspacePaths, absolutise};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -55,19 +56,26 @@ use crate::{
     RunningChild, SpawnOpts, Tool, ToolContext, ToolError, ToolOutput,
 };
 
-use super::bash_judge::{PostFail, PreExec, judge_post_fail, judge_pre_exec};
+mod judge;
+mod parse;
+
+use judge::{PostFail, PreExec, judge_post_fail, judge_pre_exec};
+use parse::{
+    DELETE_SCAN_EVENT_ACTION, contains_delete_command, first_token, is_env_assignment,
+    parse_program, split_into_subcommands, truncate_for_event,
+};
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
 
-/// Shared Bash tool description. Four sections vary by sandbox mode —
+/// Shared Bash tool description. Four sections vary by permission —
 /// `{{isolation}}` (the FS/network surface), `{{approval}}` (the gate),
 /// `{{work_dir_scope}}` (writability), and `{{python_runtime}}` (uv-shimmed vs
-/// native) — substituted by [`render_description`] along with `{{max_output_kib}}`,
-/// `{{work_dir}}`, and `{{platform}}`. Each varying section describes ONLY its own
-/// concern so a mode swap re-skins exactly what changed and nothing is said
-/// twice. Work-dir/platform live here, not the system prompt, so they sit next
-/// to the tool that consumes them.
+/// native) — substituted by [`render_description`] along with
+/// `{{max_output_kib}}`, `{{work_dir}}`, and `{{platform}}`. Each varying section
+/// describes ONLY its own concern so a permission swap re-skins exactly what changed
+/// and nothing is said twice. Work-dir/platform live here, not the system
+/// prompt, so they sit next to the tool that consumes them.
 const DESCRIPTION_TEMPLATE: &str = r#"Execute a shell command in a fresh `sh -c` process. Environment changes and `cd` do not persist across invocations. Each of stdout and stderr is truncated at {{max_output_kib}} KiB.
 
 Reserve Bash for system commands, git operations, build/test, and terminal tasks that require shell execution. Do NOT use it for tasks with a dedicated tool:
@@ -104,19 +112,24 @@ const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only insid
 #[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are shimmed to `uv run python` / `uv pip` inside this shell. For one-file scripts with third-party deps, declare them via PEP 723 inline metadata (`# /// script` block) so `uv run --script my.py` resolves them per-call. The shims are shell functions scoped to the outer `sh -c` — `bash -c '…'` subshells, `/usr/bin/python`, and Python's own `subprocess` calls bypass them."#;
 
-/// `{{isolation}}` for `sandbox.mode = none`: only the OS sandbox is dropped (the
-/// work-dir jail and uv shim still apply — described by their own sections).
+/// `{{isolation}}` for `permission = free`: only the OS sandbox is
+/// dropped (the work-dir jail and uv shim still apply — described by their own
+/// sections).
 #[cfg(not(feature = "bench-bash"))]
-const NONE_ISOLATION: &str = r#"SANDBOX: The OS sandbox is OFF — commands run directly via `sh -c` on the host: no bwrap, no credential-vault masking, no resource caps, and the host filesystem is reachable. Network is enabled."#;
+const FREE_ISOLATION: &str = r#"SANDBOX: The OS sandbox is OFF — commands run directly via `sh -c` on the host: no bwrap, no credential-vault masking, no resource caps, and the host filesystem is reachable. Network is enabled."#;
 
-/// `{{approval}}` for `none`/`sandboxed`: the static destructive-token gate.
+/// `{{approval}}` for `permission = manual`: human approval for every
+/// Bash command.
 #[cfg(not(feature = "bench-bash"))]
-const SANDBOXED_APPROVAL: &str = r#"APPROVAL: Commands run without prompting by default. The pre-execution approval gate only fires when the command tokens contain a file-delete (`rm`, `rmdir`, `unlink`, `shred`, `srm`, `wipe`, or `find … -delete`) or a destructive `git` operation (`clean -f`, `reset --hard`, `branch -d`/`-D`/`--delete`, `tag -d`, `push -f`/`--force`/`--force-with-lease`/`--delete`/`-d`, `stash drop`/`clear`, `worktree remove`, `update-ref -d`, `filter-branch`, `filter-repo`)."#;
+const MANUAL_APPROVAL: &str = r#"APPROVAL: Every Bash command requires human approval before it runs. When an OS sandbox runner is available, approved commands run in the sandbox. If Baybo detected an outer container/sandbox, the inner sandbox is skipped silently; if no backend is available on a non-container host, Baybo sends a notice and runs without it. If a sandboxed run fails, Baybo asks again before retrying the same command without the sandbox. File-content viewer commands that Bash rejects up front (`cat foo`, `sed -i …`, etc.) are refused before any approval prompt."#;
 
-/// `{{approval}}` for `auto`: the LLM risk judge governs destructive commands +
-/// failure escalation.
+/// `{{approval}}` for `permission = auto`.
 #[cfg(not(feature = "bench-bash"))]
-const AUTO_APPROVAL: &str = r#"APPROVAL: Commands run without prompting by default. A destructive command (file-delete or a history-rewriting `git` op) is risk-judged before it runs — judged safe, it runs sandboxed unprompted; judged risky, you are asked. If a command fails inside the sandbox, the failure may be re-judged: when it looks caused by the sandbox AND safe, it is re-run outside the sandbox automatically; when risky, you are asked. Output from an unsandboxed re-run carries a `sandbox_escalation` field."#;
+const AUTO_APPROVAL: &str = r#"APPROVAL: Commands run in the OS sandbox without prompting by default when an OS sandbox runner is available. If Baybo detected an outer container/sandbox, the inner sandbox is skipped silently; if no backend is available on a non-container host, Baybo sends a notice and runs without it. A destructive command (file-delete or a history-rewriting `git` op) is risk-judged before it runs — judged safe, it runs under the active execution route unprompted; judged risky, you are asked. If a command fails inside the sandbox, the failure is re-judged: when automatic sandbox escape is safe, it is re-run outside the sandbox automatically; otherwise you are asked before the unsandboxed retry. Output from an unsandboxed re-run carries a `sandbox_escalation` field."#;
+
+/// `{{approval}}` for `permission = free`.
+#[cfg(not(feature = "bench-bash"))]
+const FREE_APPROVAL: &str = r#"APPROVAL: Bash is free: commands run directly without Bash pre-execution approval, destructive-command judging, or sandbox-failure escalation."#;
 
 // ── Prompt sections for the `bench-bash` profile: raw container exec ──────────
 // No OS sandbox, no work-dir jail, no uv shim, inherited cwd, no gate. Compiled
@@ -135,79 +148,71 @@ const BENCH_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are the hos
 const BENCH_APPROVAL: &str = r#"APPROVAL: Commands run directly with no approval gate."#;
 
 /// Compile-time switch for the bench profile (the `bench-bash` feature). When
-/// true, the Bash tool ignores `sandbox.mode` for execution shape and always
+/// true, the Bash tool ignores the configured permission for execution shape and always
 /// runs raw — no OS sandbox, no uv shim, no work-dir jail, inherited cwd, the
-/// bench prompt, and no risk judge. False (every prod build) → `sandbox.mode`
-/// (none/sandboxed/auto) drives behavior.
+/// bench prompt, and no approval gate.
 const BENCH: bool = cfg!(feature = "bench-bash");
 
-/// Whether `mode` runs the command with no OS sandbox (`sh -c` directly): the
-/// bench profile, or `sandbox.mode = none`. A free fn (not a method) so
-/// `execute` can derive it from a single mode snapshot.
-fn mode_skips_os_sandbox(mode: BashSandboxMode) -> bool {
-    BENCH || mode == BashSandboxMode::None
+fn permission_skips_os_sandbox(permission: BashPermissionMode) -> bool {
+    BENCH || permission == BashPermissionMode::Free
 }
 
-/// Whether `mode` runs the on-failure LLM risk judge — auto only, never bench.
-fn mode_runs_judge(mode: BashSandboxMode) -> bool {
-    !BENCH && mode == BashSandboxMode::Auto
-}
-
-/// How the Bash tool isolates a command, mirroring `baybo_config::SandboxMode`
-/// without taking a dep on `baybo-config`. The wiring layer maps between them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How Bash handles approval and sandbox escape.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum BashSandboxMode {
-    /// No OS sandbox: run directly, inherited cwd, no work-dir jail.
-    None = 0,
-    /// OS sandbox, no risk judge.
-    Sandboxed = 1,
-    /// OS sandbox plus the on-failure LLM risk judge.
-    Auto = 2,
+pub enum BashPermissionMode {
+    #[default]
+    Auto = 0,
+    Manual = 1,
+    Free = 2,
 }
 
-impl BashSandboxMode {
+impl BashPermissionMode {
     fn from_u8(v: u8) -> Self {
         match v {
-            0 => BashSandboxMode::None,
-            1 => BashSandboxMode::Sandboxed,
-            _ => BashSandboxMode::Auto,
+            1 => BashPermissionMode::Manual,
+            2 => BashPermissionMode::Free,
+            _ => BashPermissionMode::Auto,
         }
+    }
+
+    fn encode(self) -> u8 {
+        self as u8
     }
 }
 
-/// Shared, hot-swappable sandbox mode. A config reload calls [`Self::set`] and
+/// Shared, hot-swappable Bash permission mode. A config reload calls [`Self::set`] and
 /// every `BashTool` holding the `Arc` sees it on its next call — both the
 /// execution path and the live-rendered tool description. Lock-free: the mode
 /// is a single byte read on the per-command hot path.
-pub struct LiveSandboxMode(std::sync::atomic::AtomicU8);
+pub struct LivePermissionMode(std::sync::atomic::AtomicU8);
 
-impl LiveSandboxMode {
-    pub fn new(mode: BashSandboxMode) -> Self {
-        Self(std::sync::atomic::AtomicU8::new(mode as u8))
+impl LivePermissionMode {
+    pub fn new(permission: BashPermissionMode) -> Self {
+        Self(std::sync::atomic::AtomicU8::new(permission.encode()))
     }
 
-    pub fn get(&self) -> BashSandboxMode {
-        BashSandboxMode::from_u8(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    pub fn get(&self) -> BashPermissionMode {
+        BashPermissionMode::from_u8(self.0.load(std::sync::atomic::Ordering::Relaxed))
     }
 
-    pub fn set(&self, mode: BashSandboxMode) {
+    pub fn set(&self, permission: BashPermissionMode) {
         self.0
-            .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+            .store(permission.encode(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 pub struct BashTool {
-    /// Tool descriptions pre-rendered per [`BashSandboxMode`], indexed by the
-    /// mode's `u8` discriminant. [`Tool::description`] returns the one for the
-    /// current (hot-swappable) mode, so a `sandbox.mode` reload re-skins the
-    /// prompt the LLM sees without rebuilding the tool. The `bench-bash` build
-    /// has a single fixed prompt instead (the `bench_description` field).
+    /// Tool descriptions pre-rendered per [`BashPermissionMode`], indexed by
+    /// the permission's encoded byte. [`Tool::description`] returns the one for the
+    /// current hot-swappable permission, so a `permission` reload re-skins the prompt
+    /// the LLM sees without rebuilding the tool. The `bench-bash` build has a
+    /// single fixed prompt instead (the `bench_description` field).
     #[cfg(not(feature = "bench-bash"))]
     descriptions: [String; 3],
     /// The one fixed bench-profile description (inherited cwd, no jail, native
     /// python). Only exists — and is only rendered — under the `bench-bash`
-    /// feature, which overrides the per-mode descriptions.
+    /// feature, which overrides the per-permission descriptions.
     #[cfg(feature = "bench-bash")]
     bench_description: String,
     /// Absolute workspace root (`<workspace>`). Used together with
@@ -229,9 +234,9 @@ pub struct BashTool {
     /// ignore the variables — same loose-coupling rationale as
     /// [`inject_baybo_env`].
     uv_env_prefix: String,
-    /// Shared, hot-swappable sandbox mode. Read on every call (and by
-    /// [`Tool::description`]); a config reload swaps it via [`LiveSandboxMode::set`].
-    mode: Arc<LiveSandboxMode>,
+    /// Shared, hot-swappable permission mode. Read on every call (and by
+    /// [`Tool::description`]); a config reload swaps it via [`LivePermissionMode::set`].
+    permission: Arc<LivePermissionMode>,
 }
 
 impl BashTool {
@@ -254,37 +259,36 @@ impl BashTool {
             work_dir,
             skills_dir,
             uv_env_prefix: build_uv_env_exports(&paths, resolve_uv_bin_dir().as_deref()),
-            mode: Arc::new(LiveSandboxMode::new(BashSandboxMode::Sandboxed)),
+            permission: Arc::new(LivePermissionMode::new(BashPermissionMode::default())),
         }
     }
 
-    /// Pin a fixed sandbox mode via a fresh (non-shared) handle. For callers
+    /// Pin a fixed permission mode via a fresh (non-shared) handle. For callers
     /// that don't participate in hot-reload — mainly tests.
     #[cfg(test)]
-    pub fn with_mode(mut self, mode: BashSandboxMode) -> Self {
-        self.mode = Arc::new(LiveSandboxMode::new(mode));
+    pub fn with_permission(mut self, permission: BashPermissionMode) -> Self {
+        self.permission = Arc::new(LivePermissionMode::new(permission));
         self
     }
 
-    /// Share a hot-swappable mode handle (the production path): a config reload
-    /// calls [`LiveSandboxMode::set`] on it and this tool's next call — and its
+    /// Share a hot-swappable permission handle (the production path): a config reload
+    /// calls [`LivePermissionMode::set`] on it and this tool's next call — and its
     /// next [`Tool::description`] — observe the new mode.
-    pub fn with_mode_handle(mut self, mode: Arc<LiveSandboxMode>) -> Self {
-        self.mode = mode;
+    pub fn with_permission_handle(mut self, permission: Arc<LivePermissionMode>) -> Self {
+        self.permission = permission;
         self
     }
 
-    fn mode(&self) -> BashSandboxMode {
-        self.mode.get()
+    fn permission(&self) -> BashPermissionMode {
+        self.permission.get()
     }
 
     /// Live read of whether the OS sandbox is skipped. `execute` does NOT call
-    /// this — it snapshots the mode once and derives both flags via
-    /// [`mode_skips_os_sandbox`] / [`mode_runs_judge`] so they stay consistent
-    /// across one command. Kept as a point-in-time accessor for tests.
+    /// this — it snapshots permission once so one command keeps a consistent
+    /// execution shape. Kept as a point-in-time accessor for tests.
     #[cfg(test)]
     fn skip_os_sandbox(&self) -> bool {
-        mode_skips_os_sandbox(self.mode())
+        permission_skips_os_sandbox(self.permission())
     }
 
     /// Prefix `command` with the workspace-scoped UV exports and the
@@ -297,7 +301,7 @@ impl BashTool {
         // Only the bench profile skips the uv shims/exports: that container ships
         // its own python/pip and has no `uv`, so the `python() { uv run python …; }`
         // shim would turn every `python`/`pip` into `uv run …` → `uv: not found`.
-        // `sandbox.mode = none` keeps uv (it only drops the OS sandbox).
+        // `permission = free` keeps uv (it only drops the OS sandbox).
         if BENCH {
             return injected;
         }
@@ -308,39 +312,31 @@ impl BashTool {
     }
 }
 
-/// Render the three [`BashSandboxMode`] descriptions, indexed by the mode's `u8`
-/// discriminant. All three share the work-dir / python sections (none keeps the
-/// jail + uv); only `none`'s isolation and `auto`'s approval differ. Compiled
-/// out under `bench-bash` (which renders one fixed prompt — see `render_bench_description`).
+/// Render the three [`BashPermissionMode`] descriptions, indexed by the
+/// encoded permission byte. `free` drops only the OS sandbox; the work-dir jail
+/// and uv shim stay. Compiled out under `bench-bash` (which renders one fixed
+/// prompt — see `render_bench_description`).
 #[cfg(not(feature = "bench-bash"))]
 fn build_descriptions(work_dir: &Path, platform: &str) -> [String; 3] {
     let mut out: [String; 3] = Default::default();
-    // `none` drops only the OS sandbox; the work-dir jail + uv shim stay, so it
-    // shares Sandboxed's work-dir-scope / python / approval sections.
-    out[BashSandboxMode::None as usize] = render_description(
-        NONE_ISOLATION,
-        SANDBOXED_WORK_DIR_SCOPE,
-        SANDBOXED_PYTHON,
-        SANDBOXED_APPROVAL,
-        work_dir,
-        platform,
-    );
-    out[BashSandboxMode::Sandboxed as usize] = render_description(
-        SANDBOXED_ISOLATION,
-        SANDBOXED_WORK_DIR_SCOPE,
-        SANDBOXED_PYTHON,
-        SANDBOXED_APPROVAL,
-        work_dir,
-        platform,
-    );
-    out[BashSandboxMode::Auto as usize] = render_description(
-        SANDBOXED_ISOLATION,
-        SANDBOXED_WORK_DIR_SCOPE,
-        SANDBOXED_PYTHON,
-        AUTO_APPROVAL,
-        work_dir,
-        platform,
-    );
+    for (permission, isolation, approval) in [
+        (BashPermissionMode::Auto, SANDBOXED_ISOLATION, AUTO_APPROVAL),
+        (
+            BashPermissionMode::Manual,
+            SANDBOXED_ISOLATION,
+            MANUAL_APPROVAL,
+        ),
+        (BashPermissionMode::Free, FREE_ISOLATION, FREE_APPROVAL),
+    ] {
+        out[permission.encode() as usize] = render_description(
+            isolation,
+            SANDBOXED_WORK_DIR_SCOPE,
+            SANDBOXED_PYTHON,
+            approval,
+            work_dir,
+            platform,
+        );
+    }
     out
 }
 
@@ -361,7 +357,7 @@ fn render_bench_description(platform: &str) -> String {
     )
 }
 
-/// Fill the shared [`DESCRIPTION_TEMPLATE`]: the mode-specific sections first,
+/// Fill the shared [`DESCRIPTION_TEMPLATE`]: the permission-specific sections first,
 /// then the value placeholders (so a `{{work_dir}}` inside an inserted section
 /// is resolved too).
 fn render_description(
@@ -519,7 +515,9 @@ impl BashTool {
     /// Test-only constructor anchored at `/tmp` — production paths go
     /// through [`Self::new`] with the real workspace.
     pub fn for_test() -> Self {
-        Self::new(WorkspacePaths::new("/tmp"))
+        let mut tool = Self::new(WorkspacePaths::new("/tmp"));
+        tool.permission = Arc::new(LivePermissionMode::new(BashPermissionMode::Manual));
+        tool
     }
 }
 
@@ -551,7 +549,7 @@ impl Tool for BashTool {
         #[cfg(feature = "bench-bash")]
         let out = self.bench_description.clone();
         #[cfg(not(feature = "bench-bash"))]
-        let out = self.descriptions[self.mode() as usize].clone();
+        let out = self.descriptions[self.permission().encode() as usize].clone();
         out
     }
 
@@ -605,28 +603,18 @@ impl Tool for BashTool {
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
-        // Sandboxed commands skip the pre-execution approval gate by
-        // default. The OS sandbox constrains filesystem reach, and the
-        // mid-execution prompt covers the unsandboxed retry path when
-        // bwrap setup itself fails. The exception: file-delete tokens
-        // (`rm`/`rmdir`/`find -delete`) and destructive `git` ops still
-        // pop the prompt because a sandboxed delete inside the bound
-        // surface is both legitimate AND irreversible.
-        //
-        // FileToolRedirect commands (`cat foo`, `sed -i …`) are rejected
-        // before the sandbox spawn — pointless to ask either.
-        //
-        // Auto mode owns the destructive-command gate itself: the LLM judge in
-        // `execute` (pre_exec_gate) replaces the blunt token→always-prompt rule,
-        // so declaring the resource here too would double-gate. The bench profile
-        // has no gate at all. Either way, defer entirely.
-        if BENCH || self.mode() == BashSandboxMode::Auto {
+        // Manual permission declares every executable Bash command to the
+        // executor's human approval gate. Auto owns the destructive-command
+        // gate inside `execute` via the LLM judge, and free disables Baybo's
+        // pre-execution approval entirely. FileToolRedirect commands are
+        // rejected before any spawn, so asking would be noise.
+        if BENCH || self.permission() != BashPermissionMode::Manual {
             return Vec::new();
         }
         params
             .get("command")
             .and_then(|v| v.as_str())
-            .filter(|s| !is_file_tool_redirect(s) && contains_delete_command(s))
+            .filter(|s| !is_file_tool_redirect(s))
             .map(|s| {
                 vec![ResourceAccess::ExecCommand {
                     command: s.to_string(),
@@ -641,7 +629,7 @@ impl Tool for BashTool {
 
         if let Some(dir) = &p.cwd {
             require_absolute(dir, "Bash", "cwd")?;
-            // `none` keeps the work-dir jail (only the OS sandbox is dropped);
+            // `free` keeps the work-dir jail (only the OS sandbox is dropped);
             // only the bench profile lifts it.
             if !BENCH {
                 require_within_work_dir(dir, &self.workspace_root, &self.work_dir, "cwd")?;
@@ -696,8 +684,25 @@ impl Tool for BashTool {
             )));
         }
 
-        let baybo_resolution = classify_baybo_command(&command);
-        if matches!(baybo_resolution, BayboResolution::RequireAbsolutePath) {
+        // Record when the destructive-command detector's shell parser can't
+        // parse this command — it then falls back to the fail-closed keyword
+        // pre-filter, so surfacing the parse gap in the trace explains an
+        // otherwise-mysterious approval prompt and flags parser gaps to fix.
+        if parse_program(&command).is_none() {
+            ctx.events.emit(
+                DELETE_SCAN_EVENT_ACTION,
+                ToolEventPayload::ParseFailure {
+                    command: truncate_for_event(&command),
+                },
+            );
+        }
+
+        let permission = self.permission();
+        let execution_route = bash_execution_route(&command, permission);
+        if matches!(
+            execution_route,
+            BashExecutionRoute::RejectNonCanonicalBayboCliPath
+        ) {
             // The agent is clearly trying to invoke baybo (basename
             // match) but used a bare/relative/wrong-absolute argv0.
             // Sandboxing would just fail opaquely on the masked
@@ -715,6 +720,13 @@ impl Tool for BashTool {
                  unsandboxed shell never resolves `baybo` through `$PATH`."
             )));
         }
+        let sandbox_bypassed = execution_route.is_sandboxed() && ctx.sandbox.is_none();
+        let effective_sandboxed = execution_route.is_sandboxed() && !sandbox_bypassed;
+        let effective_escape_policy = if sandbox_bypassed {
+            SandboxEscapePolicy::None
+        } else {
+            execution_route.escape_policy()
+        };
 
         // Resolve any requested user secrets to plaintext for env injection.
         // Fail closed if requested but the secret store isn't wired. The names
@@ -737,50 +749,24 @@ impl Tool for BashTool {
             handle.resolve_env(&p.secret_env).await?
         };
 
-        // An absolute-path `baybo …` self-invocation runs unsandboxed by
-        // construction: the OS sandbox masks `~/.baybo`/`$BAYBO_HOME`, so a
-        // sandboxed call can't reach the gateway's config / session store, and
-        // argv0 is already the canonical gateway path so `sh -c` execve's it with
-        // no `$PATH` consultation. It is never a sandboxed run — no judge, no
-        // escalation, no timeout-to-background — so run it directly and return
-        // here, keeping the rest of `execute` free of the `bypass` concept.
-        if matches!(baybo_resolution, BayboResolution::Bypass) {
-            let out = self
-                .run_unsandboxed_wrapped(&command, cwd_ref, &extra_env, timeout, ctx)
-                .await?;
-            if out.timed_out {
-                return Err(ToolError::Timeout(format!("Bash exceeded {timeout:?}")));
-            }
-            return format_command_result(
-                &command,
-                out.exit_code,
-                &out.stdout,
-                &out.stderr,
-                &extra_env,
-                ctx,
-                None,
-            )
-            .await;
-        }
-
-        // Snapshot the (hot-swappable) sandbox mode ONCE for this command, so a
-        // concurrent `sandbox` config reload can't flip the gate / dispatch /
-        // escalation decisions against each other mid-command — the in-flight
-        // command commits to the mode it started with; the reload takes effect on
-        // the next one. (The command is also spawned exactly once, so the running
-        // process never switches sandbox backends underneath itself.)
-        let mode = self.mode();
-        let skip_sandbox = mode_skips_os_sandbox(mode);
-        let judge = mode_runs_judge(mode);
-
-        // Auto mode, destructive-token command: the LLM judge decides before
+        // Auto permission, destructive-token command: the LLM judge decides before
         // running whether this needs human approval (replacing the blunt
-        // token→always-prompt gate that `accessed_resources` defers in auto mode).
-        if judge && contains_delete_command(&command) {
-            self.pre_exec_gate(&command, cwd_ref, ctx).await?;
+        // token→always-prompt gate that `accessed_resources` defers in auto).
+        let pre_exec_judge = execution_route.pre_exec_judge();
+        if pre_exec_judge && contains_delete_command(&command) {
+            self.pre_exec_gate(&command, cwd_ref, ctx, effective_sandboxed)
+                .await?;
+        }
+        if sandbox_bypassed {
+            self.notify_sandbox_bypass(ctx, &command);
         }
 
         let args = vec!["-c".into(), self.wrap_command(&command)];
+        let detached_route = if sandbox_bypassed {
+            Some(DetachedExecutionRoute::Unsandboxed)
+        } else {
+            execution_route.detached_route()
+        };
 
         // Convertible path: in a user session (sink present) the default
         // `on_timeout` detaches a command that overruns its budget instead
@@ -788,93 +774,104 @@ impl Tool for BashTool {
         // in-window, or backgrounded) and `None` if it couldn't detach
         // (sandbox backend without detached support), in which case we fall
         // through to the blocking kill-on-timeout path below.
-        // Never background a command that injected `secret_env`: the detached
-        // path streams RAW output to files + the notification, and the escort
-        // has no secret handle to exact-redact with (the blocking path below
-        // does). Falling through keeps such a command on kill-on-timeout with
-        // redaction rather than leaking an echoed secret to disk / the turn.
+        // `secret_env` does not block detach. Background output files and
+        // completion tails are raw; if secrets were injected, the background
+        // arm below records that risk before handing the child to the sink.
         let convert_on_timeout = !p
             .on_timeout
             .as_deref()
             .map(str::trim)
             .is_some_and(|s| s.eq_ignore_ascii_case("kill"));
         if convert_on_timeout
-            // An unsandboxed run (bench profile, or `mode = none`) has no sandbox
-            // to detach into, so a timeout-to-background overrun would fail; keep
-            // it on the blocking path.
-            && !skip_sandbox
-            && extra_env.is_empty()
+            && let Some(detached_route) = detached_route
             && let Some(sink) = ctx.background_jobs.clone()
-            && let Some(output) =
-                run_detached(self, &command, &args, cwd_ref, &extra_env, timeout, ctx, &sink, judge)
-                    .await?
+            && let Some(output) = run_detached(
+                self,
+                detached_route,
+                &command,
+                &args,
+                cwd_ref,
+                &extra_env,
+                timeout,
+                ctx,
+                &sink,
+                effective_escape_policy,
+            )
+            .await?
         {
             return Ok(output);
         }
 
-        let out = if skip_sandbox {
-            // The bench profile / `mode = none` run directly via `sh -c` — there
-            // is no OS sandbox to wrap with (the bench container is already
-            // disposable; `none` opts out on the host). (An `baybo …`
-            // self-invocation also runs unsandboxed, but it returned early above.)
+        let out = if execution_route.is_unsandboxed() || sandbox_bypassed {
+            // The self-CLI, bench profile, and `permission = free` run
+            // directly via `sh -c` — there is no OS sandbox to wrap with (the
+            // bench container is already disposable; `free` opts out on the
+            // host; sandbox bypass handles outer-container or missing-backend
+            // downgrades after surfacing a notice).
             tokio::select! {
                 _ = ctx.cancellation_token.cancelled() => {
                     return Err(ToolError::Execution("cancelled".into()));
                 }
                 res = run_unsandboxed("sh", &args, cwd_ref, &extra_env, timeout) => res?,
             }
-        } else {
-            let Some(sandbox) = ctx.sandbox.as_ref() else {
+        } else if execution_route.is_sandboxed() {
+            if let Some(sandbox) = ctx.sandbox.as_ref() {
+                let attempt = tokio::select! {
+                    _ = ctx.cancellation_token.cancelled() => {
+                        return Err(ToolError::Execution("cancelled".into()));
+                    }
+                    res = sandbox.spawn_command(
+                        Path::new("sh"),
+                        &args,
+                        SpawnOpts {
+                            cwd: cwd_ref.map(Path::to_path_buf),
+                            stdin: None,
+                            extra_env: extra_env.clone(),
+                            timeout,
+                        },
+                    ) => res,
+                };
+                match attempt {
+                    Ok(out) => out,
+                    Err(sandbox_err) => {
+                        self.handle_sandbox_start_failure(
+                            &command,
+                            cwd_ref,
+                            &extra_env,
+                            timeout,
+                            ctx,
+                            sandbox_err,
+                            effective_escape_policy,
+                        )
+                        .await?
+                    }
+                }
+            } else {
                 return Err(ToolError::Execution(
-                    "OS sandbox unavailable: install bwrap (Linux: `apt install bubblewrap`) \
-                     or sandbox-exec (macOS, ships with the system) and restart baybo"
-                        .into(),
+                    "internal error: sandbox route selected without a sandbox runner".into(),
                 ));
-            };
-            let attempt = tokio::select! {
-                _ = ctx.cancellation_token.cancelled() => {
-                    return Err(ToolError::Execution("cancelled".into()));
-                }
-                res = sandbox.spawn_command(
-                    Path::new("sh"),
-                    &args,
-                    SpawnOpts {
-                        cwd: cwd_ref.map(Path::to_path_buf),
-                        stdin: None,
-                        extra_env: extra_env.clone(),
-                        timeout,
-                    },
-                ) => res,
-            };
-            match attempt {
-                Ok(out) => out,
-                Err(sandbox_err) => {
-                    // Sandbox infrastructure refused the command (cwd
-                    // outside the bound union, bwrap setup failure,
-                    // runner error, …). Offer the user a one-shot
-                    // unsandboxed retry that surfaces the failure
-                    // reason in the approval prompt.
-                    self.prompt_and_run_unsandboxed_retry(
-                        &command,
-                        cwd_ref,
-                        &extra_env,
-                        timeout,
-                        ctx,
-                        sandbox_err,
-                    )
-                    .await?
-                }
             }
+        } else {
+            unreachable!("baybo CLI routes are handled before command dispatch")
         };
 
         if out.timed_out {
             return Err(ToolError::Timeout(format!("Bash exceeded {timeout:?}")));
         }
 
-        // Auto mode: a failed sandboxed command may be re-run unsandboxed (when
-        // the judge deems it safe + sandbox-related) or escalated to the user.
+        // Auto permission: a failed sandboxed command may be re-run unsandboxed
+        // (when the judge deems it safe + sandbox-related) or escalated to the
+        // user.
         let (out, escalation) = self
-            .escalate_if_failed(&command, cwd_ref, out, &extra_env, timeout, ctx, judge)
+            .escalate_if_failed(
+                &command,
+                cwd_ref,
+                out,
+                &extra_env,
+                timeout,
+                ctx,
+                effective_escape_policy,
+            )
             .await?;
 
         format_command_result(
@@ -923,8 +920,9 @@ async fn format_command_result(
     if let Some(hint) = interpret_exit(command, exit_code) {
         result["return_code_interpretation"] = Value::String(hint.into());
     }
-    // Auto mode: tell the LLM this result came from an unsandboxed re-run so it
-    // reasons about the elevated privilege rather than assuming the sandbox.
+    // Auto permission: tell the LLM this result came from an unsandboxed re-run
+    // so it reasons about the elevated privilege rather than assuming the
+    // sandbox.
     if let Some(note) = escalation_note {
         result["sandbox_escalation"] = Value::String(note.to_string());
     }
@@ -985,11 +983,12 @@ enum DetachedOutcome {
 /// in time, return the normal result; if it overruns, hand the still-running
 /// child to the [`BackgroundJobSink`] and return a "moved to background"
 /// notice. Returns `Ok(None)` when the command couldn't be detached (sandbox
-/// backend without detached support / spawn failure) so the caller falls
-/// back to the blocking kill-on-timeout path.
+/// backend without detached support / spawn failure) so the caller falls back
+/// to the blocking kill-on-timeout path.
 #[allow(clippy::too_many_arguments)]
 async fn run_detached(
     tool: &BashTool,
+    route: DetachedExecutionRoute,
     command: &str,
     args: &[String],
     cwd: Option<&Path>,
@@ -997,33 +996,11 @@ async fn run_detached(
     timeout: Duration,
     ctx: &ToolContext,
     sink: &Arc<dyn BackgroundJobSink>,
-    judge: bool,
+    escape_policy: SandboxEscapePolicy,
 ) -> crate::Result<Option<ToolOutput>> {
-    // Only sandboxed runs reach here — the unsandboxed cases (`mode = none` /
-    // bench keep to the blocking path via the caller's `!skip_sandbox` guard;
-    // an `baybo …` bypass returned even earlier). So detach via the OS sandbox.
-    let mut child: Box<dyn RunningChild> = {
-        let Some(sandbox) = ctx.sandbox.as_ref() else {
-            return Ok(None);
-        };
-        match sandbox
-            .spawn_command_detached(
-                Path::new("sh"),
-                args,
-                SpawnOpts {
-                    cwd: cwd.map(Path::to_path_buf),
-                    stdin: None,
-                    extra_env: extra_env.to_vec(),
-                    timeout,
-                },
-            )
-            .await
-        {
-            Ok(c) => c,
-            // Backend can't detach (or setup failed) — fall back to the
-            // blocking path (which carries its own sandbox-failure retry).
-            Err(_) => return Ok(None),
-        }
+    let Some(mut child) = spawn_detached_child(route, args, cwd, extra_env, timeout, ctx).await?
+    else {
+        return Ok(None);
     };
 
     // One id shared by the output files, the handle returned to the LLM, and
@@ -1076,8 +1053,9 @@ async fn run_detached(
             let _ = tokio::fs::remove_file(&stdout_path).await;
             let _ = tokio::fs::remove_file(&stderr_path).await;
             // A command that completed in-window (the common fast-failing case)
-            // still gets the auto-mode on-failure judge — same as the blocking
-            // path. A command that overran and backgrounded does not (below).
+            // still gets the auto-permission on-failure judge — same as the
+            // blocking path. A command that overran and backgrounded does not
+            // (below).
             let out = crate::SandboxedOutput {
                 exit_code,
                 stdout,
@@ -1085,7 +1063,7 @@ async fn run_detached(
                 timed_out: false,
             };
             let (out, escalation) = tool
-                .escalate_if_failed(command, cwd, out, extra_env, timeout, ctx, judge)
+                .escalate_if_failed(command, cwd, out, extra_env, timeout, ctx, escape_policy)
                 .await?;
             Ok(Some(
                 format_command_result(
@@ -1102,6 +1080,20 @@ async fn run_detached(
         }
         DetachedOutcome::Backgrounded => {
             let display_path = stdout_path.display().to_string();
+            let stderr_display_path = stderr_path.display().to_string();
+            let secret_risk_note = if extra_env.is_empty() {
+                ""
+            } else {
+                tracing::warn!(
+                    target: "baybo::tools::bash",
+                    command = %command,
+                    secret_env_count = extra_env.len(),
+                    stdout_path = %display_path,
+                    stderr_path = %stderr_display_path,
+                    "background Bash command injected secret_env; output files are not redacted"
+                );
+                " Secret environment variables were injected; background output files and completion tails are stored raw and are not secret-redacted."
+            };
             let job = DetachedCommand {
                 handle_id: handle_id.clone(),
                 session_id: ctx.session_id.clone(),
@@ -1115,8 +1107,47 @@ async fn run_detached(
             Ok(Some(ToolOutput::Text(format!(
                 "Command still running after {timeout:?}; moved to the background as `{returned}`. \
                  Output is streaming to `{display_path}` (Read it for progress). You'll get a \
-                 notification when it finishes — keep working in the meantime."
+                 notification when it finishes — keep working in the meantime.{secret_risk_note}"
             ))))
+        }
+    }
+}
+
+async fn spawn_detached_child(
+    route: DetachedExecutionRoute,
+    args: &[String],
+    cwd: Option<&Path>,
+    extra_env: &[(String, String)],
+    timeout: Duration,
+    ctx: &ToolContext,
+) -> crate::Result<Option<Box<dyn RunningChild>>> {
+    match route {
+        DetachedExecutionRoute::Sandboxed => {
+            let Some(sandbox) = ctx.sandbox.as_ref() else {
+                return Ok(None);
+            };
+            match sandbox
+                .spawn_command_detached(
+                    Path::new("sh"),
+                    args,
+                    SpawnOpts {
+                        cwd: cwd.map(Path::to_path_buf),
+                        stdin: None,
+                        extra_env: extra_env.to_vec(),
+                        timeout,
+                    },
+                )
+                .await
+            {
+                Ok(child) => Ok(Some(child)),
+                Err(_) => Ok(None),
+            }
+        }
+        DetachedExecutionRoute::Unsandboxed => {
+            match spawn_unsandboxed_detached("sh", args, cwd, extra_env) {
+                Ok(child) => Ok(Some(child)),
+                Err(_) => Ok(None),
+            }
         }
     }
 }
@@ -1228,10 +1259,6 @@ fn interpret_exit(command: &str, exit_code: i32) -> Option<&'static str> {
     }
 }
 
-fn strip_path(s: &str) -> &str {
-    s.rsplit('/').next().unwrap_or(s)
-}
-
 const FILE_TOOL_REDIRECT_COMMANDS: &[&str] = &[
     "cat", "head", "tail", "less", "more", "tac", "sed", "awk", "gawk", "mawk",
 ];
@@ -1309,48 +1336,12 @@ fn sh_quote(s: &str) -> String {
     out
 }
 
-/// argv0 of the command string — the first whitespace-separated token,
-/// path-stripped (`/usr/bin/ls` → `ls`). Does NOT skip wrappers (`xargs`,
-/// `timeout`, `nohup`, …) and does NOT skip `KEY=VAL` env-var prefixes,
-/// because callers (delete detection, FileToolRedirect classification,
-/// exit-code interpretation) only care about the literal leading token.
-fn first_token(command: &str) -> Option<&str> {
-    let raw = command.split_whitespace().next()?;
-    let bare = raw.trim_start_matches('\\');
-    if bare.contains('=') && !bare.starts_with('=') {
-        return None;
-    }
-    Some(strip_path(bare))
-}
-
-/// argv0s that delete files. Compared against the argv0 of each
-/// sub-command (after env-prefix unwrapping) and against tokens that
-/// follow a known wrapper or `find`'s `-exec`/`-execdir`/`-ok`/`-okdir`
-/// primary. `mv` is intentionally absent — it relocates rather than
-/// destroys; `dd`, `truncate`, and `>` redirection can also wipe data
-/// but are too noisy to gate on. Path-prefixed forms (`/usr/bin/rm`)
-/// are normalized through `strip_path` before matching. `-delete` is
-/// the `find` primary, not an argv0, so it lives outside this list and
-/// is checked as "appears anywhere in the argv".
-const STANDALONE_DELETE_TOKENS: &[&str] = &["rm", "rmdir", "unlink", "shred", "srm", "wipe"];
-
-/// Wrappers whose argv0 is itself benign but whose first non-flag
-/// argument is the actual command being executed. We descend into the
-/// wrapped command position rather than parsing each wrapper's flag
-/// grammar perfectly — false positives (one extra approval prompt for
-/// `xargs grep rm file` etc.) are tolerable; missing a real
-/// `xargs rm` / `nohup rm` / `sudo rm` is not.
-const WRAPPER_COMMANDS: &[&str] = &[
-    "xargs", "nohup", "nice", "ionice", "timeout", "sudo", "doas", "env", "command", "exec",
-];
-
 /// Canonical absolute path of the running gateway binary, cached on
-/// first read. Drives the baybo sandbox-bypass match in
-/// [`classify_baybo_command`]: path-like argv0s (`/usr/local/bin/baybo`,
+/// first read. Drives the baybo self-CLI match in
+/// [`classify_baybo_cli_command`]: path-like argv0s (`/usr/local/bin/baybo`,
 /// `./target/debug/baybo`) are compared against THIS path, not against
 /// the literal string `"baybo"`, so an unrelated binary that happens
-/// to be named `baybo` somewhere else on disk does NOT trigger the
-/// bypass.
+/// to be named `baybo` somewhere else on disk does NOT run unsandboxed.
 ///
 /// Falls back to the raw `current_exe()` path if `canonicalize` fails
 /// (binary deleted post-exec, etc.); returns `None` only if
@@ -1361,41 +1352,150 @@ static BAYBO_BIN: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
     Some(std::fs::canonicalize(&exe).unwrap_or(exe))
 });
 
-/// How [`BashTool::execute`] should treat a shell command relative to
-/// the gateway's own `baybo` CLI.
+/// What the command line appears to be relative to the gateway's own `baybo`
+/// CLI. This enum deliberately does not mention sandboxing; the final execution
+/// route also depends on [`BashPermissionMode`].
 ///
 /// The sandbox masks the Baybo state dir (`~/.baybo`/`$BAYBO_HOME`), so a
 /// sandboxed `baybo …` can't reach the gateway's config or session
-/// store. That makes the bypass logic worth getting right in three
+/// store. That makes the self-CLI classification worth getting right in three
 /// directions:
 ///
-/// - [`Bypass`](BayboResolution::Bypass): the command is a single,
-///   safe baybo invocation written with the **absolute path** of the
-///   gateway binary. Run unsandboxed.
-/// - [`RequireAbsolutePath`](BayboResolution::RequireAbsolutePath):
-///   the command is clearly trying to invoke baybo (its argv0's
-///   `file_name` matches the gateway binary), but the caller used a
-///   bare/relative/wrong-absolute path. Refuse with an error that
-///   tells the caller the correct path — this is more useful than
-///   sandboxing it (which would just fail opaquely on the masked
-///   state dir).
-/// - [`Sandbox`](BayboResolution::Sandbox): baybo isn't the leading
-///   sub-command (or doesn't appear at all), OR an unsafe-env shape
-///   we don't want to bypass even with an absolute-path baybo argv0.
-enum BayboResolution {
-    Bypass,
-    RequireAbsolutePath,
-    Sandbox,
+/// - [`CanonicalSelfInvocation`](BayboCliCommandKind::CanonicalSelfInvocation):
+///   the command starts with the canonical absolute path of the gateway binary.
+/// - [`NonCanonicalSelfInvocation`](BayboCliCommandKind::NonCanonicalSelfInvocation):
+///   the command is clearly trying to invoke baybo (its argv0's `file_name`
+///   matches the gateway binary), but the caller used a bare/relative/wrong
+///   absolute path.
+/// - [`OtherCommand`](BayboCliCommandKind::OtherCommand): baybo isn't the
+///   leading sub-command, OR an unsafe-env shape prevents treating it as a
+///   trusted self-invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BayboCliCommandKind {
+    CanonicalSelfInvocation,
+    NonCanonicalSelfInvocation,
+    OtherCommand,
 }
 
-fn classify_baybo_command(command: &str) -> BayboResolution {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BashExecutionRoute {
+    RejectNonCanonicalBayboCliPath,
+    RunBayboCliUnsandboxed,
+    RunUnsandboxed,
+    RunSandboxed {
+        pre_exec_judge: bool,
+        escape_policy: SandboxEscapePolicy,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetachedExecutionRoute {
+    Sandboxed,
+    Unsandboxed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxEscapePolicy {
+    None,
+    AutoJudge,
+    ManualApproval,
+}
+
+enum SandboxEscapeDecision {
+    Run(String),
+    Prompt(String),
+}
+
+impl BashExecutionRoute {
+    fn is_sandboxed(self) -> bool {
+        matches!(self, BashExecutionRoute::RunSandboxed { .. })
+    }
+
+    fn is_unsandboxed(self) -> bool {
+        matches!(
+            self,
+            BashExecutionRoute::RunBayboCliUnsandboxed | BashExecutionRoute::RunUnsandboxed
+        )
+    }
+
+    fn detached_route(self) -> Option<DetachedExecutionRoute> {
+        match self {
+            BashExecutionRoute::RunSandboxed { .. } => Some(DetachedExecutionRoute::Sandboxed),
+            BashExecutionRoute::RunBayboCliUnsandboxed | BashExecutionRoute::RunUnsandboxed => {
+                Some(DetachedExecutionRoute::Unsandboxed)
+            }
+            BashExecutionRoute::RejectNonCanonicalBayboCliPath => None,
+        }
+    }
+
+    fn pre_exec_judge(self) -> bool {
+        matches!(
+            self,
+            BashExecutionRoute::RunSandboxed {
+                pre_exec_judge: true,
+                ..
+            }
+        )
+    }
+
+    fn escape_policy(self) -> SandboxEscapePolicy {
+        match self {
+            BashExecutionRoute::RunSandboxed { escape_policy, .. } => escape_policy,
+            _ => SandboxEscapePolicy::None,
+        }
+    }
+}
+
+fn bash_execution_route(command: &str, permission: BashPermissionMode) -> BashExecutionRoute {
+    bash_execution_route_for_kind(classify_baybo_cli_command(command), permission)
+}
+
+#[cfg(test)]
+fn bash_execution_route_with_bin(
+    command: &str,
+    bin: &Path,
+    permission: BashPermissionMode,
+) -> BashExecutionRoute {
+    bash_execution_route_for_kind(
+        classify_baybo_cli_command_with_bin(command, bin),
+        permission,
+    )
+}
+
+fn bash_execution_route_for_kind(
+    kind: BayboCliCommandKind,
+    permission: BashPermissionMode,
+) -> BashExecutionRoute {
+    match kind {
+        BayboCliCommandKind::CanonicalSelfInvocation => BashExecutionRoute::RunBayboCliUnsandboxed,
+        BayboCliCommandKind::NonCanonicalSelfInvocation => {
+            BashExecutionRoute::RejectNonCanonicalBayboCliPath
+        }
+        BayboCliCommandKind::OtherCommand if permission_skips_os_sandbox(permission) => {
+            BashExecutionRoute::RunUnsandboxed
+        }
+        BayboCliCommandKind::OtherCommand => match permission {
+            BashPermissionMode::Auto => BashExecutionRoute::RunSandboxed {
+                pre_exec_judge: true,
+                escape_policy: SandboxEscapePolicy::AutoJudge,
+            },
+            BashPermissionMode::Manual => BashExecutionRoute::RunSandboxed {
+                pre_exec_judge: false,
+                escape_policy: SandboxEscapePolicy::ManualApproval,
+            },
+            BashPermissionMode::Free => BashExecutionRoute::RunUnsandboxed,
+        },
+    }
+}
+
+fn classify_baybo_cli_command(command: &str) -> BayboCliCommandKind {
     let Some(bin) = BAYBO_BIN.as_deref() else {
-        return BayboResolution::Sandbox;
+        return BayboCliCommandKind::OtherCommand;
     };
-    classify_baybo_command_with_bin(command, bin)
+    classify_baybo_cli_command_with_bin(command, bin)
 }
 
-fn classify_baybo_command_with_bin(command: &str, bin: &Path) -> BayboResolution {
+fn classify_baybo_cli_command_with_bin(command: &str, bin: &Path) -> BayboCliCommandKind {
     // Only the FIRST sub-command's argv0 matters: if the user opens
     // the command line with an absolute-path baybo invocation, the
     // whole `sh -c` string runs unsandboxed (compound forms like
@@ -1403,7 +1503,7 @@ fn classify_baybo_command_with_bin(command: &str, bin: &Path) -> BayboResolution
     // included). A non-baybo leader keeps the sandbox.
     let subs = split_into_subcommands(command);
     let Some(tokens) = subs.first() else {
-        return BayboResolution::Sandbox;
+        return BayboCliCommandKind::OtherCommand;
     };
 
     let mut unquoted: Vec<String> = Vec::with_capacity(tokens.len());
@@ -1412,7 +1512,7 @@ fn classify_baybo_command_with_bin(command: &str, bin: &Path) -> BayboResolution
             Ok(mut words) if words.len() <= 1 => {
                 unquoted.push(words.pop().unwrap_or_default());
             }
-            _ => return BayboResolution::Sandbox,
+            _ => return BayboCliCommandKind::OtherCommand,
         }
     }
     let mut i = 0;
@@ -1421,12 +1521,12 @@ fn classify_baybo_command_with_bin(command: &str, bin: &Path) -> BayboResolution
             break;
         }
         if !is_safe_baybo_env_assignment(tok) {
-            return BayboResolution::Sandbox;
+            return BayboCliCommandKind::OtherCommand;
         }
         i += 1;
     }
     let Some(argv0) = unquoted.get(i) else {
-        return BayboResolution::Sandbox;
+        return BayboCliCommandKind::OtherCommand;
     };
 
     // "Looks like baybo" — basename of argv0 matches the gateway
@@ -1440,23 +1540,23 @@ fn classify_baybo_command_with_bin(command: &str, bin: &Path) -> BayboResolution
         _ => false,
     };
     if !looks_like_baybo {
-        return BayboResolution::Sandbox;
+        return BayboCliCommandKind::OtherCommand;
     }
 
-    if argv0_is_absolute_baybo_path(argv0, bin) {
-        BayboResolution::Bypass
+    if argv0_matches_gateway_binary(argv0, bin) {
+        BayboCliCommandKind::CanonicalSelfInvocation
     } else {
-        BayboResolution::RequireAbsolutePath
+        BayboCliCommandKind::NonCanonicalSelfInvocation
     }
 }
 
-/// Env assignments allowed as a prefix on an baybo invocation without
-/// forfeiting the sandbox bypass. The whitelist is intentionally narrow:
+/// Env assignments allowed as a prefix on a baybo invocation without forfeiting
+/// the unsandboxed route. The whitelist is intentionally narrow:
 /// the `BAYBO_` family (gateway-owned config the CLI reads) and the two
 /// `RUST_*` knobs the agent commonly uses to surface tracing. Anything
 /// else — `PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_*`,
 /// `HOME`/`XDG_*`, locale vars, … — could redirect command resolution
-/// or library loading and so must force the sandbox path.
+/// or library loading and so prevents the trusted self-invocation match.
 fn is_safe_baybo_env_assignment(tok: &str) -> bool {
     let Some(eq) = tok.find('=') else {
         return false;
@@ -1467,10 +1567,10 @@ fn is_safe_baybo_env_assignment(tok: &str) -> bool {
 
 /// True when `argv0` is a literal absolute path that resolves to the
 /// same FS object as `bin`. Bare names and relative paths are
-/// rejected outright — the bypass requires the caller to have spelled
-/// out the absolute path, so the unsandboxed shell's `execve` never
+/// rejected outright — the unsandboxed route requires the caller to have
+/// spelled out the absolute path, so the unsandboxed shell's `execve` never
 /// consults `$PATH` or the current working directory.
-fn argv0_is_absolute_baybo_path(argv0: &str, bin: &Path) -> bool {
+fn argv0_matches_gateway_binary(argv0: &str, bin: &Path) -> bool {
     let argv0_path = Path::new(argv0);
     if !argv0_path.is_absolute() {
         return false;
@@ -1483,278 +1583,9 @@ fn argv0_is_absolute_baybo_path(argv0: &str, bin: &Path) -> bool {
     canon(argv0_path) == canon(bin)
 }
 
-/// True when ANY sub-command of `command` performs a destructive
-/// operation: a standalone delete argv0 (`rm`/`rmdir`/…), `find -delete`
-/// (or `-exec rm`), or a known destructive `git` invocation (see
-/// [`git_args_are_destructive`]). Used by `accessed_resources` to
-/// decide whether the pre-execution approval gate should fire.
-fn contains_delete_command(command: &str) -> bool {
-    split_into_subcommands(command)
-        .iter()
-        .any(|sub| subcommand_is_destructive(sub))
-}
-
-fn subcommand_is_destructive(tokens: &[&str]) -> bool {
-    // Run each raw token through shell_words so that the argv we
-    // actually compare matches what `sh -c` would exec — quotes and
-    // backslash escapes are removed (`'rm'`, `"rm"`, `r'm'`,
-    // `/bin/'rm'`, `\rm`, `"git" reset --hard`, …). Without this step,
-    // surrounding the argv0 with quotes silently bypasses the approval
-    // gate. We fail closed (return true) on parse errors or any token
-    // that yields more than one word: shell ambiguity should escalate
-    // to a prompt, not slip through.
-    let mut unquoted: Vec<String> = Vec::with_capacity(tokens.len());
-    for tok in tokens {
-        match shell_words::split(tok) {
-            Ok(mut words) if words.len() <= 1 => {
-                unquoted.push(words.pop().unwrap_or_default());
-            }
-            _ => return true,
-        }
-    }
-
-    // `-delete` is a find primary — it can appear anywhere in the argv
-    // and there's no need to identify a "command position" first.
-    if unquoted.iter().any(|t| t == "-delete") {
-        return true;
-    }
-
-    // `-exec`/`-execdir`/`-ok`/`-okdir` followed by a destructive
-    // wrapped command. `find` semantics: the next token IS the wrapped
-    // argv0; the rest of the argv until `;`/`+` is its argv. We don't
-    // bother parsing the terminator — the argv0 check is enough.
-    for idx in 0..unquoted.len() {
-        if matches!(
-            unquoted[idx].as_str(),
-            "-exec" | "-execdir" | "-ok" | "-okdir"
-        ) && let Some(wrapped) = unquoted.get(idx + 1)
-            && argv0_is_destructive(wrapped, &unquoted[idx + 2..])
-        {
-            return true;
-        }
-    }
-
-    // Identify the sub-command's argv0 — skip env-var assignments
-    // (`KEY=val` prefix) so `LANG=C rm /foo` is recognised correctly.
-    let mut i = 0;
-    while i < unquoted.len() && is_env_assignment(&unquoted[i]) {
-        i += 1;
-    }
-    let Some(argv0) = unquoted.get(i) else {
-        return false;
-    };
-    let rest = &unquoted[i + 1..];
-
-    if argv0_is_destructive(argv0, rest) {
-        return true;
-    }
-
-    // Wrapper case (`xargs rm`, `nohup rm`, `sudo rm`, `LANG=C nice rm`,
-    // …). We don't model each wrapper's flag grammar — any non-flag
-    // token in `rest` is treated as a potential wrapped argv0. This
-    // accepts a few false positives (`xargs grep rm file` would prompt
-    // because `rm` could be the wrapped argv0) in exchange for catching
-    // the common destructive patterns the previous flat-token detector
-    // covered.
-    if WRAPPER_COMMANDS.contains(&strip_path(argv0)) {
-        for (rel_idx, tok) in rest.iter().enumerate() {
-            if tok.starts_with('-') {
-                continue;
-            }
-            if argv0_is_destructive(tok, &rest[rel_idx + 1..]) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn argv0_is_destructive(argv0: &str, rest: &[String]) -> bool {
-    let bare = strip_path(argv0);
-    if STANDALONE_DELETE_TOKENS.contains(&bare) {
-        return true;
-    }
-    if bare == "git" {
-        let args: Vec<&str> = rest.iter().map(String::as_str).collect();
-        return git_args_are_destructive(&args);
-    }
-    false
-}
-
-/// True if `tok` looks like a leading `KEY=value` env assignment.
-/// Bash treats one or more such tokens at the start of a sub-command as
-/// per-invocation env overrides, with the actual argv0 starting after
-/// them. We use the conservative shape `[A-Za-z_][A-Za-z0-9_]*=…`.
-fn is_env_assignment(tok: &str) -> bool {
-    let Some(eq) = tok.find('=') else {
-        return false;
-    };
-    let key = &tok[..eq];
-    if key.is_empty() {
-        return false;
-    }
-    let mut chars = key.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// `args` is the slice after the literal `git` token. Skip leading
-/// global options (which can take a separate value or embed one with
-/// `=`), then match known destructive subcommand+flag combinations.
-/// The match arms intentionally stay narrow — `git checkout .`, `git
-/// restore`, `git stash pop`, and `git reset --soft` rewrite working
-/// state but don't strictly delete, and gating them under approval is
-/// noisy enough to outweigh the safety win.
-fn git_args_are_destructive(args: &[&str]) -> bool {
-    let mut i = 0;
-    while let Some(&a) = args.get(i) {
-        if matches!(
-            a,
-            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix"
-        ) {
-            i += 2;
-            continue;
-        }
-        if a.starts_with("--") {
-            i += 1;
-            continue;
-        }
-        if matches!(a, "-p" | "-P") {
-            i += 1;
-            continue;
-        }
-        break;
-    }
-    let Some(&sub) = args.get(i) else {
-        return false;
-    };
-    let rest = &args[i + 1..];
-    match sub {
-        "clean" => rest.iter().any(|a| is_git_clean_destructive_flag(a)),
-        "reset" => rest.contains(&"--hard"),
-        "branch" => rest
-            .iter()
-            .any(|a| matches!(*a, "-d" | "-D" | "--delete" | "--delete-merged")),
-        "tag" => rest.iter().any(|a| matches!(*a, "-d" | "--delete")),
-        "push" => rest.iter().any(|a| {
-            matches!(
-                *a,
-                "-f" | "-d" | "--force" | "--force-with-lease" | "--delete"
-            ) || a.starts_with("--force-with-lease=")
-                || a.starts_with("--force-if-includes")
-        }),
-        "stash" => matches!(rest.first().copied(), Some("drop") | Some("clear")),
-        "worktree" => matches!(rest.first().copied(), Some("remove")),
-        "update-ref" => rest.iter().any(|a| matches!(*a, "-d" | "--delete")),
-        "filter-branch" | "filter-repo" => true,
-        // `git rm <pathspec>` removes files from the index (and the
-        // working tree unless `--cached`). Always destructive.
-        "rm" => true,
-        _ => false,
-    }
-}
-
-/// `git clean` only deletes when invoked with `-f`/`--force` (or a
-/// combined short flag containing `f`, e.g. `-fd`, `-fdx`). `-n` /
-/// `--dry-run` and `-i` / `--interactive` alone don't delete; we don't
-/// model `-n` cancelling `-f` — a false-positive prompt for a dry-run
-/// that also passes `-f` is acceptable.
-fn is_git_clean_destructive_flag(arg: &str) -> bool {
-    if arg == "-f" || arg == "--force" {
-        return true;
-    }
-    if arg.starts_with("--") {
-        return false;
-    }
-    if let Some(rest) = arg.strip_prefix('-') {
-        return !rest.is_empty()
-            && rest.chars().all(|c| c.is_ascii_alphabetic())
-            && rest.contains('f');
-    }
-    false
-}
-
-/// Lightweight tokenizer that respects single- and double-quoted regions
-/// and splits the command into one token-list per sub-command. A
-/// sub-command boundary is `;`, `|`, `&`, `(`, `)`, or backtick (the
-/// last splits even inside double quotes, since command substitution
-/// fires there). Whitespace is a token boundary that stays inside the
-/// current sub-command. Not a full shell parser — variable expansion,
-/// `$(…)` content, and escapes inside single quotes are not
-/// interpreted; the goal is "find argv0s per sub-command, well enough
-/// to drive a security heuristic". The `$` of `$(…)` is left as a
-/// stray token in the outer sub-command and the inner contents form
-/// their own sub-command, which is enough for delete-detection.
-fn split_into_subcommands(command: &str) -> Vec<Vec<&str>> {
-    let bytes = command.as_bytes();
-    let mut subs: Vec<Vec<&str>> = Vec::new();
-    let mut current: Vec<&str> = Vec::new();
-    let mut start: Option<usize> = None;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if !in_single && b == b'\\' && i + 1 < bytes.len() {
-            if start.is_none() {
-                start = Some(i);
-            }
-            i += 2;
-            continue;
-        }
-        if !in_double && b == b'\'' {
-            if start.is_none() {
-                start = Some(i);
-            }
-            in_single = !in_single;
-            i += 1;
-            continue;
-        }
-        if !in_single && b == b'"' {
-            if start.is_none() {
-                start = Some(i);
-            }
-            in_double = !in_double;
-            i += 1;
-            continue;
-        }
-        let outside_quotes = !in_single && !in_double;
-        let is_subcmd_separator = (outside_quotes && matches!(b, b';' | b'|' | b'&' | b'(' | b')'))
-            || (!in_single && b == b'`');
-        let is_token_separator = outside_quotes && b.is_ascii_whitespace();
-        if is_subcmd_separator {
-            if let Some(s) = start.take() {
-                current.push(&command[s..i]);
-            }
-            if !current.is_empty() {
-                subs.push(std::mem::take(&mut current));
-            }
-        } else if is_token_separator {
-            if let Some(s) = start.take() {
-                current.push(&command[s..i]);
-            }
-        } else if start.is_none() {
-            start = Some(i);
-        }
-        i += 1;
-    }
-    if let Some(s) = start {
-        current.push(&command[s..]);
-    }
-    if !current.is_empty() {
-        subs.push(current);
-    }
-    subs
-}
-
 impl BashTool {
-    async fn prompt_and_run_unsandboxed_retry(
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_sandbox_start_failure(
         &self,
         command: &str,
         cwd: Option<&Path>,
@@ -1762,48 +1593,50 @@ impl BashTool {
         timeout: Duration,
         ctx: &ToolContext,
         sandbox_err: ToolError,
+        policy: SandboxEscapePolicy,
     ) -> crate::Result<crate::SandboxedOutput> {
-        let Some(approval) = ctx.approval.as_ref() else {
-            return Err(ToolError::Execution(format!(
-                "sandboxed run failed and no mid-execution approval handle is wired, \
-                 cannot offer unsandboxed retry: {sandbox_err}"
-            )));
+        let reason = sandbox_err.to_string();
+        let decision = match policy {
+            SandboxEscapePolicy::AutoJudge => {
+                self.auto_sandbox_escape_decision(command, cwd, -1, "", &reason, extra_env, ctx)
+                    .await?
+            }
+            SandboxEscapePolicy::ManualApproval => SandboxEscapeDecision::Prompt(reason.clone()),
+            SandboxEscapePolicy::None => {
+                return Err(ToolError::Execution(format!(
+                    "sandboxed run failed and sandbox escape is disabled: {sandbox_err}"
+                )));
+            }
         };
-        let preview = format!(
-            "Sandboxed `Bash` invocation failed.\n\
-             Command : {command}\n\
-             Reason  : {sandbox_err}\n\
-             Approve to retry the SAME command WITHOUT the OS sandbox \
-             (full shell, no workspace cwd guard, no resource limits)."
-        );
-        // Cache must be bypassed: a prior sandboxed approval for this
-        // command does NOT cover an unsandboxed run, and we never persist
-        // an "approve always" on this elevated path either.
-        let decision = approval
-            .request_uncached(
-                "Bash",
-                &ctx.session_id,
-                &ctx.user,
-                vec![ResourceAccess::ExecCommand {
-                    command: command.to_string(),
-                }],
-                preview,
-            )
-            .await;
+
         match decision {
-            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => {
+            SandboxEscapeDecision::Run(rationale) => {
+                self.notify_escape(ctx, command, &rationale);
                 self.run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
                     .await
             }
-            ApprovalDecision::Deny => Err(ToolError::Execution(format!(
-                "sandboxed run failed and the unsandboxed retry was denied: {sandbox_err}"
-            ))),
+            SandboxEscapeDecision::Prompt(rationale) => {
+                if self
+                    .request_unsandboxed_retry_approval(command, ctx, &rationale, Some(&reason))
+                    .await?
+                {
+                    self.notify_escape(ctx, command, &rationale);
+                    self.run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                        .await
+                } else {
+                    Err(ToolError::Execution(format!(
+                        "sandboxed run failed and the unsandboxed retry was not approved: \
+                         {sandbox_err}"
+                    )))
+                }
+            }
         }
     }
 
     /// Run `command` unsandboxed via `sh -c` (with the workspace uv/env wrap),
     /// honoring the cancellation token. Shared by the sandbox-failure retry and
-    /// the auto-mode escalation so both compose the `sh -c` body identically.
+    /// the auto-permission escalation so both compose the `sh -c` body
+    /// identically.
     async fn run_unsandboxed_wrapped(
         &self,
         command: &str,
@@ -1821,7 +1654,7 @@ impl BashTool {
         }
     }
 
-    /// Auto-mode pre-execution gate for a destructive-token command: the LLM
+    /// Auto-permission pre-execution gate for a destructive-token command: the LLM
     /// judge decides whether it needs human approval before running (sandboxed).
     /// `Ok(())` proceeds; `Err` aborts (denied / no approval channel). Uses the
     /// cached approval path so an "approve always" sticks like the legacy gate.
@@ -1830,9 +1663,10 @@ impl BashTool {
         command: &str,
         cwd: Option<&Path>,
         ctx: &ToolContext,
+        sandboxed: bool,
     ) -> crate::Result<()> {
         let decision = match ctx.llm.as_deref() {
-            Some(llm) => judge_pre_exec(llm, command, cwd).await,
+            Some(llm) => judge_pre_exec(llm, &ctx.events, command, cwd, sandboxed).await,
             // No judge wired (argv mode / tests): fall back to requiring
             // approval, matching the non-auto destructive gate.
             None => PreExec::Prompt("risk judge unavailable — approval required".to_string()),
@@ -1847,11 +1681,16 @@ impl BashTool {
                  ({rationale})"
             )));
         };
+        let run_location = if sandboxed {
+            "inside the OS sandbox"
+        } else {
+            "without the OS sandbox"
+        };
         let preview = format!(
             "Destructive `Bash` command flagged by the risk judge.\n\
              Command : {command}\n\
              Reason  : {rationale}\n\
-             Approve to run it (inside the OS sandbox)."
+             Approve to run it ({run_location})."
         );
         let decision = approval
             .request(
@@ -1872,13 +1711,93 @@ impl BashTool {
         }
     }
 
-    /// Auto-mode on-failure escalation. For a sandboxed command that exited
-    /// non-zero, the judge decides: keep the original failure (not the
-    /// sandbox's fault), re-run unsandboxed (sandbox-related + safe), or ask the
-    /// user (risky). Returns the (possibly re-run) output plus an optional note
-    /// for the tool result when an unsandboxed re-run happened. Inert (returns
-    /// the input unchanged) when not auto's judge run, on success, on timeout, or
-    /// when no judge LLM is wired.
+    #[allow(clippy::too_many_arguments)]
+    async fn auto_sandbox_escape_decision(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        exit_code: i32,
+        stdout: &str,
+        stderr: &str,
+        extra_env: &[(String, String)],
+        ctx: &ToolContext,
+    ) -> crate::Result<SandboxEscapeDecision> {
+        let Some(llm) = ctx.llm.as_deref() else {
+            return Ok(SandboxEscapeDecision::Prompt(
+                "risk judge unavailable — approval required for sandbox escape".to_string(),
+            ));
+        };
+
+        let mut stdout_s = stdout.to_string();
+        let mut stderr_s = stderr.to_string();
+        if !extra_env.is_empty()
+            && let Some(handle) = ctx.secrets.as_deref()
+        {
+            let values: Vec<String> = extra_env.iter().map(|(_, v)| v.clone()).collect();
+            stdout_s = handle.redact(&stdout_s, &values).await?;
+            stderr_s = handle.redact(&stderr_s, &values).await?;
+        }
+
+        match judge_post_fail(
+            llm,
+            &ctx.events,
+            command,
+            cwd,
+            exit_code,
+            &stdout_s,
+            &stderr_s,
+        )
+        .await
+        {
+            PostFail::Unsandbox(rationale) => Ok(SandboxEscapeDecision::Run(rationale)),
+            PostFail::Prompt(rationale) => Ok(SandboxEscapeDecision::Prompt(rationale)),
+            PostFail::Keep => Ok(SandboxEscapeDecision::Prompt(
+                "risk judge did not approve automatic sandbox escape".to_string(),
+            )),
+        }
+    }
+
+    async fn request_unsandboxed_retry_approval(
+        &self,
+        command: &str,
+        ctx: &ToolContext,
+        rationale: &str,
+        failure: Option<&str>,
+    ) -> crate::Result<bool> {
+        let Some(approval) = ctx.approval.as_ref() else {
+            return Ok(false);
+        };
+        let failure_line = failure
+            .map(|f| format!("Failure : {f}\n"))
+            .unwrap_or_default();
+        let preview = format!(
+            "Sandboxed `Bash` command failed.\n\
+             Command : {command}\n\
+             {failure_line}\
+             Reason  : {rationale}\n\
+             Approve to retry WITHOUT the OS sandbox (full shell, no workspace guard)."
+        );
+        let decision = approval
+            .request_uncached(
+                "Bash",
+                &ctx.session_id,
+                &ctx.user,
+                vec![ResourceAccess::ExecCommand {
+                    command: command.to_string(),
+                }],
+                preview,
+            )
+            .await;
+        Ok(matches!(
+            decision,
+            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways
+        ))
+    }
+
+    /// On sandbox failure, decide whether to retry unsandboxed. Auto asks the
+    /// risk judge first and falls through to human approval when automatic
+    /// escape is not approved; manual goes straight to approval. Returns the
+    /// (possibly re-run) output plus an optional note for the tool result.
     #[allow(clippy::too_many_arguments)]
     async fn escalate_if_failed(
         &self,
@@ -1888,36 +1807,36 @@ impl BashTool {
         extra_env: &[(String, String)],
         timeout: Duration,
         ctx: &ToolContext,
-        // The caller's per-command mode snapshot (whether auto's judge governs),
-        // passed in rather than re-read so a mid-command reload can't flip it
-        // out of step with the dispatch decision.
-        judge: bool,
+        policy: SandboxEscapePolicy,
     ) -> crate::Result<(crate::SandboxedOutput, Option<String>)> {
-        if !judge || out.exit_code == 0 || out.timed_out {
+        if policy == SandboxEscapePolicy::None || out.exit_code == 0 || out.timed_out {
             return Ok((out, None));
         }
-        let Some(llm) = ctx.llm.as_deref() else {
-            // Auto mode but no judge available → behave as plain sandboxed:
-            // return the original failure, no escalation.
-            return Ok((out, None));
+
+        let decision = match policy {
+            SandboxEscapePolicy::AutoJudge => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                self.auto_sandbox_escape_decision(
+                    command,
+                    cwd,
+                    out.exit_code,
+                    &stdout,
+                    &stderr,
+                    extra_env,
+                    ctx,
+                )
+                .await?
+            }
+            SandboxEscapePolicy::ManualApproval => SandboxEscapeDecision::Prompt(format!(
+                "sandboxed command failed with exit code {}",
+                out.exit_code
+            )),
+            SandboxEscapePolicy::None => return Ok((out, None)),
         };
 
-        // Redact injected secret values out of the tails before they reach the
-        // judge LLM (a possibly different provider). The detached path never
-        // carries secrets, but the blocking path can.
-        let mut stdout_s = String::from_utf8_lossy(&out.stdout).into_owned();
-        let mut stderr_s = String::from_utf8_lossy(&out.stderr).into_owned();
-        if !extra_env.is_empty()
-            && let Some(handle) = ctx.secrets.as_deref()
-        {
-            let values: Vec<String> = extra_env.iter().map(|(_, v)| v.clone()).collect();
-            stdout_s = handle.redact(&stdout_s, &values).await?;
-            stderr_s = handle.redact(&stderr_s, &values).await?;
-        }
-
-        match judge_post_fail(llm, command, cwd, out.exit_code, &stdout_s, &stderr_s).await {
-            PostFail::Keep => Ok((out, None)),
-            PostFail::Unsandbox(rationale) => {
+        match decision {
+            SandboxEscapeDecision::Run(rationale) => {
                 self.notify_escape(ctx, command, &rationale);
                 let new = self
                     .run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
@@ -1929,59 +1848,61 @@ impl BashTool {
                     )),
                 ))
             }
-            PostFail::Prompt(rationale) => {
-                let Some(approval) = ctx.approval.as_ref() else {
-                    // Unattended (cron / subagent): no human to ask → return the
-                    // original sandboxed failure rather than escaping.
-                    return Ok((out, None));
-                };
-                let preview = format!(
-                    "Sandboxed `Bash` command failed; the risk judge flagged an unsandboxed \
-                     re-run as risky.\n\
-                     Command : {command}\n\
-                     Reason  : {rationale}\n\
-                     Approve to retry WITHOUT the OS sandbox (full shell, no workspace guard)."
-                );
-                // Uncached: an unsandboxed run is a different, elevated privilege
-                // than any prior sandboxed approval, and never persisted.
-                let decision = approval
-                    .request_uncached(
-                        "Bash",
-                        &ctx.session_id,
-                        &ctx.user,
-                        vec![ResourceAccess::ExecCommand {
-                            command: command.to_string(),
-                        }],
-                        preview,
-                    )
-                    .await;
-                match decision {
-                    ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => {
-                        self.notify_escape(ctx, command, &rationale);
-                        let new = self
-                            .run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
-                            .await?;
-                        Ok((
-                            new,
-                            Some(format!(
-                                "ran outside the OS sandbox after user approval: {rationale}"
-                            )),
-                        ))
-                    }
-                    ApprovalDecision::Deny => Ok((out, None)),
+            SandboxEscapeDecision::Prompt(rationale) => {
+                let failure = format!("exit code {}", out.exit_code);
+                if self
+                    .request_unsandboxed_retry_approval(command, ctx, &rationale, Some(&failure))
+                    .await?
+                {
+                    self.notify_escape(ctx, command, &rationale);
+                    let new = self
+                        .run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                        .await?;
+                    Ok((
+                        new,
+                        Some(format!(
+                            "ran outside the OS sandbox after user approval: {rationale}"
+                        )),
+                    ))
+                } else {
+                    Ok((out, None))
                 }
             }
         }
     }
 
-    /// Surface an unsandboxed auto-run to the user channel (no-op in cron /
-    /// tests) and the structured log, so a sandbox escape is never silent.
+    fn notify_sandbox_bypass(&self, ctx: &ToolContext, command: &str) {
+        let Some(reason) = ctx.sandbox_bypass_reason.as_deref() else {
+            tracing::debug!(
+                target: "baybo::tools::bash",
+                command = %command,
+                "running Bash without the inner OS sandbox; user notice suppressed"
+            );
+            return;
+        };
+        tracing::warn!(
+            target: "baybo::tools::bash",
+            command = %command,
+            reason = %reason,
+            "running Bash without the inner OS sandbox"
+        );
+        if let Some(notifier) = ctx.notifier.as_ref() {
+            notifier.emit(
+                NoticeLevel::Warn,
+                "Bash is running without the OS sandbox",
+                &format!("{reason}\nCommand: {command}"),
+            );
+        }
+    }
+
+    /// Surface an unsandboxed retry to the user channel (no-op in cron / tests)
+    /// and the structured log, so a sandbox escape is never silent.
     fn notify_escape(&self, ctx: &ToolContext, command: &str, rationale: &str) {
         tracing::warn!(
             target: "baybo::tools::bash",
             command = %command,
             rationale = %rationale,
-            "auto mode: running a failed command outside the OS sandbox"
+            "running a failed command outside the OS sandbox"
         );
         if let Some(notifier) = ctx.notifier.as_ref() {
             notifier.emit(
@@ -2028,15 +1949,52 @@ impl Drop for ProcessGroupKiller {
     }
 }
 
-async fn run_unsandboxed(
+struct ProcessGroupRunningChild {
+    child: tokio::process::Child,
+    group: ProcessGroupKiller,
+}
+
+#[async_trait]
+impl RunningChild for ProcessGroupRunningChild {
+    fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+    }
+
+    async fn wait(&mut self) -> i32 {
+        let code = self
+            .child
+            .wait()
+            .await
+            .ok()
+            .and_then(|s| s.code())
+            .unwrap_or(-1);
+        self.group.disarm();
+        code
+    }
+
+    fn start_kill(&mut self) {
+        self.group.kill_group();
+        let _ = self.child.start_kill();
+    }
+}
+
+fn build_unsandboxed_command(
     program: &str,
     args: &[String],
     cwd: Option<&Path>,
     extra_env: &[(String, String)],
-    timeout: Duration,
-) -> crate::Result<crate::SandboxedOutput> {
+) -> tokio::process::Command {
     use std::process::Stdio;
-    use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
     let mut cmd = Command::new(program);
@@ -2057,8 +2015,36 @@ async fn run_unsandboxed(
     // direct child, orphaning grandchildren; `process_group(0)` makes the child
     // the group leader so `ProcessGroupKiller` can SIGKILL `-pgid`.
     cmd.process_group(0);
+    cmd
+}
 
-    let mut child = cmd
+fn spawn_unsandboxed_detached(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    extra_env: &[(String, String)],
+) -> crate::Result<Box<dyn RunningChild>> {
+    let child = build_unsandboxed_command(program, args, cwd, extra_env)
+        .spawn()
+        .map_err(|e| ToolError::Execution(format!("spawn `{program}`: {e}")))?;
+    let group = ProcessGroupKiller::arm(child.id());
+    if child.stdout.is_none() || child.stderr.is_none() {
+        group.kill_group();
+        return Err(ToolError::Execution("child output pipe missing".into()));
+    }
+    Ok(Box::new(ProcessGroupRunningChild { child, group }))
+}
+
+async fn run_unsandboxed(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    extra_env: &[(String, String)],
+    timeout: Duration,
+) -> crate::Result<crate::SandboxedOutput> {
+    use tokio::io::AsyncReadExt;
+
+    let mut child = build_unsandboxed_command(program, args, cwd, extra_env)
         .spawn()
         .map_err(|e| ToolError::Execution(format!("spawn `{program}`: {e}")))?;
     // Reaps the group on every early-exit path: the timeout arm below, or the
@@ -2194,15 +2180,7 @@ mod tests {
 
         // `kill(pid, 0)` returns -1/ESRCH once the grandchild is gone. Poll
         // briefly for the SIGKILL to land.
-        let alive = |pid: i32| unsafe { libc::kill(pid, 0) == 0 };
-        let mut reaped = false;
-        for _ in 0..40 {
-            if !alive(pid) {
-                reaped = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        let reaped = wait_until_pid_gone(pid).await;
         if !reaped {
             // Don't leak the survivor if the fix regressed.
             unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -2211,6 +2189,16 @@ mod tests {
             reaped,
             "grandchild pid {pid} survived the timeout — process group not reaped"
         );
+    }
+
+    async fn wait_until_pid_gone(pid: i32) -> bool {
+        for _ in 0..40 {
+            if unsafe { libc::kill(pid, 0) != 0 } {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
     }
 
     #[test]
@@ -2444,48 +2432,105 @@ mod tests {
         assert_eq!(uv_bin_dir_in(&path), None);
     }
 
-    fn classify(command: &str, bin: &Path) -> BayboResolution {
-        classify_baybo_command_with_bin(command, bin)
+    fn classify(command: &str, bin: &Path) -> BayboCliCommandKind {
+        classify_baybo_cli_command_with_bin(command, bin)
+    }
+
+    fn auto_permission() -> BashPermissionMode {
+        BashPermissionMode::Auto
+    }
+
+    fn route(command: &str, bin: &Path, permission: BashPermissionMode) -> BashExecutionRoute {
+        bash_execution_route_with_bin(command, bin, permission)
     }
 
     #[test]
-    fn classify_baybo_bypasses_only_absolute_canonical_path() {
+    fn execution_route_combines_baybo_cli_match_with_permission() {
+        let bin = Path::new("/usr/local/bin/baybo");
+        assert_eq!(
+            route("/usr/local/bin/baybo cost", bin, BashPermissionMode::Auto,),
+            BashExecutionRoute::RunBayboCliUnsandboxed,
+        );
+        assert_eq!(
+            route("baybo cost", bin, BashPermissionMode::Auto,),
+            BashExecutionRoute::RejectNonCanonicalBayboCliPath,
+        );
+        assert_eq!(
+            route("ls -la", bin, BashPermissionMode::Free,),
+            BashExecutionRoute::RunUnsandboxed,
+        );
+        assert_eq!(
+            route("ls -la", bin, BashPermissionMode::Manual,),
+            BashExecutionRoute::RunSandboxed {
+                pre_exec_judge: false,
+                escape_policy: SandboxEscapePolicy::ManualApproval,
+            },
+        );
+        if BENCH {
+            assert_eq!(
+                route("ls -la", bin, auto_permission()),
+                BashExecutionRoute::RunUnsandboxed,
+            );
+        } else {
+            assert_eq!(
+                route("ls -la", bin, BashPermissionMode::Manual,),
+                BashExecutionRoute::RunSandboxed {
+                    pre_exec_judge: false,
+                    escape_policy: SandboxEscapePolicy::ManualApproval,
+                },
+            );
+            assert_eq!(
+                route("ls -la", bin, auto_permission()),
+                BashExecutionRoute::RunSandboxed {
+                    pre_exec_judge: true,
+                    escape_policy: SandboxEscapePolicy::AutoJudge,
+                },
+            );
+            assert_eq!(
+                route("ls -la", bin, BashPermissionMode::Free,),
+                BashExecutionRoute::RunUnsandboxed,
+            );
+        }
+    }
+
+    #[test]
+    fn classify_baybo_marks_only_absolute_canonical_path_as_self_invocation() {
         // Core invariant: ONLY a literal absolute-path argv0 that
-        // canonicalises to the gateway binary bypasses the sandbox.
+        // canonicalises to the gateway binary is a trusted self-invocation.
         let bin = Path::new("/usr/local/bin/baybo");
         assert!(matches!(
             classify("/usr/local/bin/baybo cost", bin),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
         assert!(matches!(
             classify("/usr/local/bin/baybo", bin),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
         assert!(matches!(
             classify("/usr/local/bin/baybo status --live", bin),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
-        // Quoted forms still bypass — shell_words::split strips the
+        // Quoted forms still match — shell_words::split strips the
         // wrapping single quotes before the canonical compare.
         assert!(matches!(
             classify("'/usr/local/bin/baybo' cost", bin),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
-        // Whitelisted env prefixes preserve the bypass.
+        // Whitelisted env prefixes preserve the self-invocation match.
         assert!(matches!(
             classify("BAYBO_LOG=trace /usr/local/bin/baybo log", bin),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
         assert!(matches!(
             classify(
                 "BAYBO_LOG=trace BAYBO_HOME=/x /usr/local/bin/baybo status",
                 bin
             ),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
         assert!(matches!(
             classify("RUST_LOG=debug /usr/local/bin/baybo status", bin),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
     }
 
@@ -2499,32 +2544,32 @@ mod tests {
         let bin = Path::new("/usr/local/bin/baybo");
         assert!(matches!(
             classify("baybo", bin),
-            BayboResolution::RequireAbsolutePath
+            BayboCliCommandKind::NonCanonicalSelfInvocation
         ));
         assert!(matches!(
             classify("baybo cost", bin),
-            BayboResolution::RequireAbsolutePath
+            BayboCliCommandKind::NonCanonicalSelfInvocation
         ));
         assert!(matches!(
             classify("baybo status --live", bin),
-            BayboResolution::RequireAbsolutePath
+            BayboCliCommandKind::NonCanonicalSelfInvocation
         ));
         // Relative path forms still look like baybo but aren't
         // absolute → require absolute path.
         assert!(matches!(
             classify("./baybo cost", bin),
-            BayboResolution::RequireAbsolutePath
+            BayboCliCommandKind::NonCanonicalSelfInvocation
         ));
         // Quoted bare name normalises to bare `baybo`.
         assert!(matches!(
             classify("'baybo' cost", bin),
-            BayboResolution::RequireAbsolutePath
+            BayboCliCommandKind::NonCanonicalSelfInvocation
         ));
         // Whitelisted env + bare argv0 — still require absolute
         // path; safe env doesn't excuse the missing path.
         assert!(matches!(
             classify("BAYBO_LOG=trace baybo log", bin),
-            BayboResolution::RequireAbsolutePath
+            BayboCliCommandKind::NonCanonicalSelfInvocation
         ));
     }
 
@@ -2538,26 +2583,29 @@ mod tests {
         let bin = Path::new("/usr/local/bin/baybo");
         assert!(matches!(
             classify("/opt/imposter/baybo --steal", bin),
-            BayboResolution::RequireAbsolutePath
+            BayboCliCommandKind::NonCanonicalSelfInvocation
         ));
     }
 
     #[test]
-    fn classify_baybo_sandbox_for_non_baybo_commands() {
+    fn classify_baybo_marks_non_baybo_commands_as_other() {
         let bin = Path::new("/usr/local/bin/baybo");
-        assert!(matches!(classify("ls -la", bin), BayboResolution::Sandbox));
+        assert!(matches!(
+            classify("ls -la", bin),
+            BayboCliCommandKind::OtherCommand
+        ));
         assert!(matches!(
             classify("git status", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
         // Different basename → not an baybo attempt at all.
         assert!(matches!(
             classify("baybolity cost", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
         assert!(matches!(
             classify("echo baybo", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
         // Wrappers — argv0 is the wrapper, not `baybo`, so we don't
         // treat this as an baybo attempt. (The wrapped sandbox call
@@ -2565,135 +2613,135 @@ mod tests {
         // learns to drop the wrapper.)
         assert!(matches!(
             classify("nohup baybo cost", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
         assert!(matches!(
             classify("xargs baybo", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
     }
 
     #[test]
-    fn classify_baybo_bypasses_compound_commands_led_by_baybo() {
+    fn classify_baybo_marks_compound_commands_led_by_baybo_as_self_invocation() {
         // Only the FIRST sub-command's argv0 is inspected — when it
         // is the absolute-path baybo binary, the entire `sh -c`
         // string runs unsandboxed, trailing segments included.
         let bin = Path::new("/usr/local/bin/baybo");
         assert!(matches!(
             classify("/usr/local/bin/baybo status; cat /home/u/.ssh/id_rsa", bin),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
         assert!(matches!(
             classify("/usr/local/bin/baybo status && curl evil", bin),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
         assert!(matches!(
             classify("/usr/local/bin/baybo status || true", bin),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
         assert!(matches!(
             classify("/usr/local/bin/baybo cost | head", bin),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
         assert!(matches!(
             classify("/usr/local/bin/baybo & disown", bin),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
     }
 
     #[test]
-    fn classify_baybo_sandbox_when_baybo_not_leading() {
-        // Non-baybo leaders keep the sandbox even when baybo appears
-        // later in the pipeline — the leader's argv0 is what drives
-        // the classification.
+    fn classify_baybo_marks_command_as_other_when_baybo_not_leading() {
+        // Non-baybo leaders are not trusted self-invocations even when baybo
+        // appears later in the pipeline — the leader's argv0 is what drives the
+        // classification.
         let bin = Path::new("/usr/local/bin/baybo");
         assert!(matches!(
             classify("echo $(/usr/local/bin/baybo status)", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
         assert!(matches!(
             classify("echo `/usr/local/bin/baybo status`", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
         assert!(matches!(
             classify("cd /tmp && /usr/local/bin/baybo status", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
     }
 
     #[test]
-    fn classify_baybo_sandbox_for_unsafe_env_prefixes() {
+    fn classify_baybo_marks_unsafe_env_prefixes_as_other() {
         // Codex P1 fix: env vars outside the whitelist could subvert
         // the baybo process even with an absolute-path argv0
-        // (`LD_PRELOAD` injection, `HOME` redirection, etc.). Force
-        // the sandbox path rather than raising the absolute-path
-        // error — fixing the path alone wouldn't make the command
-        // safe.
+        // (`LD_PRELOAD` injection, `HOME` redirection, etc.). Treat these as
+        // ordinary commands instead of trusted self-invocations; the configured
+        // Bash permission then decides the final route.
         let bin = Path::new("/usr/local/bin/baybo");
         assert!(matches!(
             classify(
                 "PATH=/tmp/malicious:/usr/bin /usr/local/bin/baybo status",
                 bin
             ),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
         assert!(matches!(
             classify("LD_PRELOAD=/tmp/evil.so /usr/local/bin/baybo status", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
         assert!(matches!(
             classify("LD_LIBRARY_PATH=/tmp/evil /usr/local/bin/baybo status", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
         assert!(matches!(
             classify(
                 "DYLD_INSERT_LIBRARIES=/tmp/evil.dylib /usr/local/bin/baybo status",
                 bin
             ),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
         assert!(matches!(
             classify("HOME=/tmp /usr/local/bin/baybo status", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
         // Quote-stripped form must reach the same conclusion.
         assert!(matches!(
             classify("'PATH=/tmp' /usr/local/bin/baybo status", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
-        // Mixed prefix: an unsafe key anywhere in the chain kills
-        // the bypass.
+        // Mixed prefix: an unsafe key anywhere in the chain prevents the
+        // self-invocation match.
         assert!(matches!(
             classify("BAYBO_LOG=trace PATH=/tmp /usr/local/bin/baybo status", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
     }
 
     #[test]
     fn classify_baybo_uses_bin_file_name() {
         // If the gateway was installed under a different file_name
-        // (`baybo2`), `baybo` is no longer an baybo attempt — it's just
-        // an unrelated command → sandbox. The new basename drives
-        // both the `looks like baybo` check and the canonical-path
-        // bypass.
+        // (`baybo2`), `baybo` is no longer a baybo self-invocation attempt —
+        // it's just an unrelated command. The new basename drives both the
+        // `looks like baybo` check and the canonical-path self-invocation match.
         let bin = Path::new("/usr/local/bin/baybo2");
         assert!(matches!(
             classify("baybo cost", bin),
-            BayboResolution::Sandbox
+            BayboCliCommandKind::OtherCommand
         ));
         assert!(matches!(
             classify("baybo2 cost", bin),
-            BayboResolution::RequireAbsolutePath
+            BayboCliCommandKind::NonCanonicalSelfInvocation
         ));
         assert!(matches!(
             classify("/usr/local/bin/baybo2 cost", bin),
-            BayboResolution::Bypass
+            BayboCliCommandKind::CanonicalSelfInvocation
         ));
     }
 
     #[test]
     fn sandboxed_description_renders_without_leftover_placeholders() {
-        let d = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws")).description();
+        let d = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
+            .with_permission(BashPermissionMode::Manual)
+            .description();
         assert!(
             !d.contains("{{"),
             "unfilled placeholder in description:\n{d}"
@@ -2703,17 +2751,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn none_runs_without_a_backend_but_keeps_the_jail() {
+    async fn free_runs_without_a_backend_but_keeps_the_jail() {
         let work = std::path::Path::new("/tmp/work");
         let _ = std::fs::create_dir_all(work);
-        // `none` Bash + a context with NO sandbox backend: it runs directly (no
+        // `free` Bash + a context with NO sandbox backend: it runs directly (no
         // OS sandbox), but the work-dir jail is still enforced at the tool layer.
         let tool = BashTool::new(baybo_workspace::WorkspacePaths::new("/tmp"))
-            .with_mode(BashSandboxMode::None);
+            .with_permission(BashPermissionMode::Free);
         let ctx = ctx_with(None);
 
         // In-work command runs directly, no sandbox backend required.
-        let marker = work.join(format!("none-marker-{}.txt", std::process::id()));
+        let marker = work.join(format!("free-marker-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let ok = serde_json::json!({
             "command": format!("touch {}", marker.display()),
@@ -2721,52 +2769,52 @@ mod tests {
         });
         tool.execute(ok, &ctx)
             .await
-            .expect("none runs an in-work command without a sandbox backend");
-        assert!(marker.exists(), "none ran the command directly");
+            .expect("free runs an in-work command without a sandbox backend");
+        assert!(marker.exists(), "free ran the command directly");
         let _ = std::fs::remove_file(&marker);
 
         // But a cwd OUTSIDE work/ is still rejected — unlike the bench profile,
-        // `none` keeps the jail.
+        // `free` keeps the jail.
         let outside = serde_json::json!({ "command": "true", "cwd": "/tmp" });
         assert!(
             tool.execute(outside, &ctx).await.is_err(),
-            "none keeps the work-dir jail (cwd outside work/ rejected)"
+            "free keeps the work-dir jail (cwd outside work/ rejected)"
         );
     }
 
     #[test]
-    fn none_description_drops_only_the_os_sandbox() {
-        let none = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
-            .with_mode(BashSandboxMode::None);
-        let d = none.description();
+    fn free_description_drops_only_the_os_sandbox() {
+        let free = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
+            .with_permission(BashPermissionMode::Free);
+        let d = free.description();
         assert!(
             !d.contains("{{"),
-            "unfilled placeholder in none description"
+            "unfilled placeholder in free description"
         );
         // OS-sandbox claims dropped...
         assert!(
             !d.contains("masked with empty tmpfs"),
-            "none drops the OS-sandbox masking claim"
+            "free drops the OS-sandbox masking claim"
         );
         assert!(
             d.contains("OS sandbox is OFF"),
-            "none says the sandbox is off"
+            "free says the sandbox is off"
         );
         // ...but the work-dir jail + uv shim are kept.
         assert!(
             d.contains("/some/ws/work"),
-            "none keeps the work-dir scope section"
+            "free keeps the work-dir scope section"
         );
         assert!(
             d.contains("uv run python"),
-            "none keeps the uv-shimmed python"
+            "free keeps the uv-shimmed python"
         );
     }
 
     #[test]
     fn auto_description_advertises_the_risk_judge() {
         let auto = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
-            .with_mode(BashSandboxMode::Auto);
+            .with_permission(auto_permission());
         let d = auto.description();
         assert!(
             !d.contains("{{"),
@@ -2785,48 +2833,48 @@ mod tests {
     }
 
     #[test]
-    fn mode_hot_swap_reskins_description_and_behavior() {
-        let handle = Arc::new(LiveSandboxMode::new(BashSandboxMode::Sandboxed));
+    fn permission_hot_swap_reskins_description_and_behavior() {
+        let handle = Arc::new(LivePermissionMode::new(BashPermissionMode::Manual));
         let tool = BashTool::new(baybo_workspace::WorkspacePaths::new("/some/ws"))
-            .with_mode_handle(Arc::clone(&handle));
+            .with_permission_handle(Arc::clone(&handle));
         // Sandboxed: masked surface, OS sandbox on.
         assert!(tool.description().contains("masked with empty tmpfs"));
         assert!(!tool.skip_os_sandbox());
 
-        // Hot-swap to none via the shared handle: the SAME tool now skips the OS
+        // Hot-swap to free via the shared handle: the SAME tool now skips the OS
         // sandbox but keeps uv + the work-dir scope — no rebuild.
-        handle.set(BashSandboxMode::None);
+        handle.set(BashPermissionMode::Free);
         assert!(tool.skip_os_sandbox());
         assert!(!tool.description().contains("masked with empty tmpfs"));
         assert!(tool.description().contains("OS sandbox is OFF"));
         assert!(tool.description().contains("uv run python"));
 
         // And to auto: sandboxed surface + the judge note in APPROVAL.
-        handle.set(BashSandboxMode::Auto);
+        handle.set(auto_permission());
         assert!(!tool.skip_os_sandbox());
         assert!(tool.description().contains("risk-judged"));
     }
 
     #[test]
-    fn none_keeps_uv_shims_in_wrap_command() {
-        // `none` drops only the OS sandbox; python is still uv-shimmed (unlike
+    fn free_keeps_uv_shims_in_wrap_command() {
+        // `free` drops only the OS sandbox; python is still uv-shimmed (unlike
         // the bench profile). The uv exports + shim must survive.
-        let none = BashTool::new(baybo_workspace::WorkspacePaths::new("/tmp"))
-            .with_mode(BashSandboxMode::None);
-        let wrapped = none.wrap_command("python -c 'x'");
+        let free = BashTool::new(baybo_workspace::WorkspacePaths::new("/tmp"))
+            .with_permission(BashPermissionMode::Free);
+        let wrapped = free.wrap_command("python -c 'x'");
         assert!(
             wrapped.contains("uv run python"),
-            "none must keep the uv shim: {wrapped}"
+            "free must keep the uv shim: {wrapped}"
         );
         assert!(
             wrapped.contains("UV_CACHE_DIR"),
-            "none must keep the uv exports: {wrapped}"
+            "free must keep the uv exports: {wrapped}"
         );
     }
 
     /// The `bench-bash` profile (compile-time): run `cargo test -p baybo-tools
     /// --features bench-bash bench_profile` to exercise these. They assert the
-    /// raw container behavior the feature switches on; the mode-specific tests
+    /// raw container behavior the feature switches on; the permission-specific tests
     /// above assume the feature is OFF (the default `cargo test`).
     #[cfg(feature = "bench-bash")]
     mod bench_profile {
@@ -2904,7 +2952,7 @@ mod tests {
         }
     }
 
-    // ── auto mode (SandboxMode::Auto) ──────────────────────────────────
+    // ── auto permission ────────────────────────────────────────────────
 
     /// A `BilledChat` that replies with one canned verdict, for driving the
     /// risk judge deterministically.
@@ -2939,7 +2987,7 @@ mod tests {
 
     #[tokio::test]
     async fn escalate_noop_on_success() {
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let tool = BashTool::for_test().with_permission(auto_permission());
         let mut ctx = ctx_with(None);
         ctx.llm = Some(judge_llm(V_SAFE)); // present but must not be consulted
         let ok = crate::SandboxedOutput {
@@ -2949,7 +2997,15 @@ mod tests {
             timed_out: false,
         };
         let (out, note) = tool
-            .escalate_if_failed("true", None, ok, &[], Duration::from_secs(5), &ctx, true)
+            .escalate_if_failed(
+                "true",
+                None,
+                ok,
+                &[],
+                Duration::from_secs(5),
+                &ctx,
+                SandboxEscapePolicy::AutoJudge,
+            )
             .await
             .unwrap();
         assert_eq!(out.exit_code, 0);
@@ -2957,8 +3013,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn escalate_noop_when_not_auto() {
-        let tool = BashTool::for_test(); // auto = false
+    async fn escalate_noop_when_policy_disallows_auto_escape() {
+        let tool = BashTool::for_test();
         let ctx = ctx_with(None);
         let (out, note) = tool
             .escalate_if_failed(
@@ -2968,7 +3024,7 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                false, // judge off → escalate is a no-op
+                SandboxEscapePolicy::None,
             )
             .await
             .unwrap();
@@ -2977,49 +3033,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn escalate_noop_without_judge_llm() {
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
-        let ctx = ctx_with(None); // ctx.llm = None
+    async fn escalate_without_judge_llm_prompts_when_possible() {
+        let tool = BashTool::for_test().with_permission(auto_permission());
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
+        let ctx = ctx_with_approval(None, gate);
         let (out, note) = tool
             .escalate_if_failed(
-                "x",
+                "true",
                 None,
                 failed_out(),
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                true,
+                SandboxEscapePolicy::AutoJudge,
             )
             .await
             .unwrap();
-        assert_eq!(out.exit_code, 1);
-        assert!(note.is_none());
+        assert_eq!(out.exit_code, 0);
+        assert!(note.unwrap().contains("user approval"));
     }
 
     #[tokio::test]
-    async fn escalate_keeps_when_unrelated() {
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
-        let mut ctx = ctx_with(None);
+    async fn escalate_prompts_when_judge_does_not_auto_escape() {
+        let tool = BashTool::for_test().with_permission(auto_permission());
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
+        let mut ctx = ctx_with_approval(None, gate);
         ctx.llm = Some(judge_llm(V_UNRELATED));
         let (out, note) = tool
             .escalate_if_failed(
-                "cc bad.c",
+                "true",
                 None,
                 failed_out(),
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                true,
+                SandboxEscapePolicy::AutoJudge,
             )
             .await
             .unwrap();
-        assert_eq!(out.exit_code, 1, "unrelated failure returned unchanged");
-        assert!(note.is_none());
+        assert_eq!(out.exit_code, 0, "approval allows unsandboxed retry");
+        assert!(note.unwrap().contains("user approval"));
     }
 
     #[tokio::test]
     async fn escalate_runs_unsandboxed_when_safe() {
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let tool = BashTool::for_test().with_permission(auto_permission());
         let mut ctx = ctx_with(None);
         ctx.llm = Some(judge_llm(V_SAFE));
         // `true` exits 0 unsandboxed, so a flip from the seeded exit 1 proves
@@ -3032,7 +3090,7 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                true,
+                SandboxEscapePolicy::AutoJudge,
             )
             .await
             .unwrap();
@@ -3042,7 +3100,7 @@ mod tests {
 
     #[tokio::test]
     async fn escalate_risky_runs_after_approval() {
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let tool = BashTool::for_test().with_permission(auto_permission());
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
         let mut ctx = ctx_with_approval(None, gate);
         ctx.llm = Some(judge_llm(V_RISKY));
@@ -3054,7 +3112,7 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                true,
+                SandboxEscapePolicy::AutoJudge,
             )
             .await
             .unwrap();
@@ -3064,7 +3122,7 @@ mod tests {
 
     #[tokio::test]
     async fn escalate_risky_kept_when_denied() {
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let tool = BashTool::for_test().with_permission(auto_permission());
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
         let mut ctx = ctx_with_approval(None, gate);
         ctx.llm = Some(judge_llm(V_RISKY));
@@ -3076,7 +3134,7 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                true,
+                SandboxEscapePolicy::AutoJudge,
             )
             .await
             .unwrap();
@@ -3086,7 +3144,7 @@ mod tests {
 
     #[tokio::test]
     async fn escalate_risky_kept_when_unattended() {
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let tool = BashTool::for_test().with_permission(auto_permission());
         let mut ctx = ctx_with(None); // no approval handle (cron / subagent)
         ctx.llm = Some(judge_llm(V_RISKY));
         let (out, note) = tool
@@ -3097,7 +3155,7 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                true,
+                SandboxEscapePolicy::AutoJudge,
             )
             .await
             .unwrap();
@@ -3109,13 +3167,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn escalate_honors_the_judge_snapshot_not_live_mode() {
-        // Regression for the mid-command reload race: the tool's LIVE mode is
-        // `none` (would never judge), but the per-command snapshot captured
-        // judge=true (the mode was `auto` at execute() entry). escalate must act
-        // on the snapshot it was handed, not re-read the now-swapped mode — so a
-        // reload landing mid-command can't flip the decision against the dispatch.
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::None);
+    async fn escalate_honors_the_judge_snapshot_not_live_permission() {
+        // Regression for the mid-command reload race: the tool's LIVE permission is
+        // `free` (would never judge), but the per-command snapshot captured
+        // AutoJudge (permission was `auto` at execute() entry). escalate must act
+        // on the snapshot it was handed, not re-read the now-swapped permission.
+        let tool = BashTool::for_test().with_permission(BashPermissionMode::Free);
         let mut ctx = ctx_with(None);
         ctx.llm = Some(judge_llm(V_SAFE));
         let (out, note) = tool
@@ -3126,35 +3183,106 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                true, // snapshot judge=true, despite the live mode being none
+                SandboxEscapePolicy::AutoJudge,
             )
             .await
             .unwrap();
         assert_eq!(
             out.exit_code, 0,
-            "escalated per the snapshot, not live mode"
+            "escalated per the snapshot, not live permission"
         );
         assert!(note.is_some());
     }
 
     #[tokio::test]
     async fn pre_exec_gate_proceeds_when_safe() {
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let tool = BashTool::for_test().with_permission(auto_permission());
         let mut ctx = ctx_with(None);
         ctx.llm = Some(judge_llm(r#"{"risk":"safe","rationale":"scratch dir"}"#));
-        tool.pre_exec_gate("rm -rf /tmp/scratch", None, &ctx)
+        tool.pre_exec_gate("rm -rf /tmp/scratch", None, &ctx, true)
             .await
             .expect("safe destructive command proceeds without approval");
     }
 
+    /// A `ToolEventSink` that records every emitted `(action, payload)`.
+    #[derive(Default)]
+    struct RecordingEventSink {
+        entries: Mutex<Vec<(String, ToolEventPayload)>>,
+    }
+
+    impl crate::ToolEventSink for RecordingEventSink {
+        fn emit(&self, action: &str, payload: ToolEventPayload) {
+            self.entries.lock().push((action.to_string(), payload));
+        }
+    }
+
+    #[tokio::test]
+    async fn risk_judge_records_llm_call_input_output_and_duration() {
+        let tool = BashTool::for_test().with_permission(auto_permission());
+        let mut ctx = ctx_with(None);
+        ctx.llm = Some(judge_llm(r#"{"risk":"safe","rationale":"scratch dir"}"#));
+        let events = Arc::new(RecordingEventSink::default());
+        ctx.events = Arc::clone(&events) as Arc<dyn crate::ToolEventSink>;
+
+        tool.pre_exec_gate("rm -rf /tmp/scratch", None, &ctx, true)
+            .await
+            .expect("safe verdict proceeds");
+
+        let recorded = events.entries.lock();
+        assert!(
+            recorded.iter().any(|(a, p)| a == "risk_judge"
+                && matches!(
+                    p,
+                    ToolEventPayload::LlmCall { input, output, .. }
+                        if input.contains("rm -rf /tmp/scratch") && output.contains("safe")
+                )),
+            "expected an llm_call event carrying judge input+output, got {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|(a, p)| a == "risk_judge" && matches!(p, ToolEventPayload::Phase { .. })),
+            "expected a phase (duration) event for the judge call, got {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unparsable_command_records_parse_failure_event() {
+        let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: b"ok\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let events = Arc::new(RecordingEventSink::default());
+        let mut ctx = ctx_with(Some(sandbox));
+        ctx.events = Arc::clone(&events) as Arc<dyn crate::ToolEventSink>;
+
+        // Unterminated quote → brush can't parse it → the detector falls back
+        // to the keyword pre-filter, and the parse gap is recorded.
+        let _ = BashTool::for_test()
+            .execute(json!({ "command": "echo it's fine" }), &ctx)
+            .await;
+
+        let recorded = events.entries.lock();
+        assert!(
+            recorded.iter().any(|(a, p)| a == "delete_scan"
+                && matches!(
+                    p,
+                    ToolEventPayload::ParseFailure { command } if command.contains("echo it's")
+                )),
+            "expected a parse_failure event, got {recorded:?}"
+        );
+    }
+
     #[tokio::test]
     async fn pre_exec_gate_denied_errors() {
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let tool = BashTool::for_test().with_permission(auto_permission());
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
         let mut ctx = ctx_with_approval(None, gate);
         ctx.llm = Some(judge_llm(r#"{"risk":"risky","rationale":"rm of source"}"#));
         let err = tool
-            .pre_exec_gate("rm -rf src", None, &ctx)
+            .pre_exec_gate("rm -rf src", None, &ctx, true)
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
@@ -3162,11 +3290,11 @@ mod tests {
 
     #[tokio::test]
     async fn pre_exec_gate_errors_when_unattended_and_risky() {
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let tool = BashTool::for_test().with_permission(auto_permission());
         let mut ctx = ctx_with(None); // no approval handle
         ctx.llm = Some(judge_llm(r#"{"risk":"risky","rationale":"rm of source"}"#));
         let err = tool
-            .pre_exec_gate("rm -rf src", None, &ctx)
+            .pre_exec_gate("rm -rf src", None, &ctx, true)
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
@@ -3174,12 +3302,44 @@ mod tests {
 
     #[tokio::test]
     async fn pre_exec_gate_without_llm_requires_approval() {
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let tool = BashTool::for_test().with_permission(auto_permission());
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
         let ctx = ctx_with_approval(None, gate); // ctx.llm = None → fail-closed prompt
-        tool.pre_exec_gate("rm -rf x", None, &ctx)
+        tool.pre_exec_gate("rm -rf x", None, &ctx, true)
             .await
             .expect("no judge → prompt, approval granted → proceed");
+    }
+
+    #[tokio::test]
+    async fn default_auto_judges_destructive_commands_inside_sandbox() {
+        let _ = std::fs::create_dir_all("/tmp/work");
+        let tool = BashTool::new(baybo_workspace::WorkspacePaths::new("/tmp"));
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
+        let sandbox: Arc<dyn crate::ExecSandbox> = Arc::new(FakeExecSandbox::new());
+        let mut ctx = ctx_with_approval(Some(sandbox), Arc::clone(&gate));
+        ctx.llm = Some(judge_llm(
+            r#"{"risk":"risky","rationale":"would delete source"}"#,
+        ));
+
+        let err = tool
+            .execute(
+                json!({
+                    "command": "rm -rf /tmp/work/default-auto-risky",
+                    "cwd": "/tmp/work",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ToolError::Execution(_)));
+        let requests = gate.requests();
+        assert_eq!(requests.len(), 1, "expected the auto permission prompt");
+        assert!(
+            requests[0].params_preview.contains("inside the OS sandbox"),
+            "default auto prompt must describe the sandboxed route: {}",
+            requests[0].params_preview,
+        );
     }
 
     /// A ctx whose `workspace_paths` point at a unique temp dir (so
@@ -3206,6 +3366,7 @@ mod tests {
         let tool = BashTool::for_test();
         let out = run_detached(
             &tool,
+            DetachedExecutionRoute::Sandboxed,
             "echo hi",
             &args,
             None,
@@ -3213,7 +3374,7 @@ mod tests {
             Duration::from_secs(5),
             &ctx,
             &sink,
-            false, // judge off
+            SandboxEscapePolicy::None,
         )
         .await
         .expect("run_detached ok");
@@ -3236,6 +3397,7 @@ mod tests {
         let tool = BashTool::for_test();
         let out = run_detached(
             &tool,
+            DetachedExecutionRoute::Sandboxed,
             "sleep 30",
             &args,
             None,
@@ -3243,7 +3405,7 @@ mod tests {
             Duration::from_millis(150),
             &ctx,
             &sink,
-            false, // judge off
+            SandboxEscapePolicy::None,
         )
         .await
         .expect("run_detached ok");
@@ -3256,6 +3418,125 @@ mod tests {
             recorded.map(|(_, cmd)| cmd),
             Some("sleep 30".to_string()),
             "an overrunning command must be handed to the sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_with_free_permission_can_background_unsandboxed_command() {
+        let (mut ctx, seen) = ctx_for_detached();
+        ctx.sandbox = None;
+        let tool = BashTool::for_test().with_permission(BashPermissionMode::Free);
+
+        let out = tool
+            .execute(
+                json!({
+                    "command": "sleep 30",
+                    "timeout_ms": 150,
+                }),
+                &ctx,
+            )
+            .await
+            .expect("unsandboxed command backgrounds");
+
+        let ToolOutput::Text(text) = out else {
+            panic!("expected a background notice, got {out:?}");
+        };
+        assert!(text.contains("background"), "notice: {text}");
+        let recorded = seen.lock().clone();
+        assert_eq!(
+            recorded.map(|(_, cmd)| cmd),
+            Some("sleep 30".to_string()),
+            "permission=free must use the detached background path"
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_env_can_background_and_warns_about_raw_output() {
+        let (mut ctx, seen) = ctx_for_detached();
+        ctx.sandbox = None;
+        ctx.secrets = Some(Arc::new(StubSecrets));
+        let tool = BashTool::for_test().with_permission(BashPermissionMode::Free);
+
+        let out = tool
+            .execute(
+                json!({
+                    "command": "sleep 30",
+                    "timeout_ms": 150,
+                    "secret_env": ["TESTTOKEN"],
+                }),
+                &ctx,
+            )
+            .await
+            .expect("secret_env command backgrounds");
+
+        let ToolOutput::Text(text) = out else {
+            panic!("expected a background notice, got {out:?}");
+        };
+        assert!(text.contains("background"), "notice: {text}");
+        assert!(
+            text.contains("not secret-redacted"),
+            "secret_env background notice must record raw-output risk: {text}"
+        );
+        let recorded = seen.lock().clone();
+        assert_eq!(
+            recorded.map(|(_, cmd)| cmd),
+            Some("sleep 30".to_string()),
+            "secret_env must not prevent background handoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_unsandboxed_cancel_reaps_process_group() {
+        let (ctx, _seen) = ctx_for_detached();
+        let sink = ctx.background_jobs.clone().unwrap();
+        let pidfile = std::env::temp_dir().join(format!(
+            "baybo-bg-pgkill-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&pidfile);
+
+        let script = format!(
+            "sleep 30 & echo $! > {}; wait",
+            sh_quote(&pidfile.to_string_lossy())
+        );
+        let args = vec!["-c".into(), script.clone()];
+        let tool = BashTool::for_test();
+        let out = run_detached(
+            &tool,
+            DetachedExecutionRoute::Unsandboxed,
+            &script,
+            &args,
+            None,
+            &[],
+            Duration::from_millis(150),
+            &ctx,
+            &sink,
+            SandboxEscapePolicy::None,
+        )
+        .await
+        .expect("run_detached ok");
+        let Some(ToolOutput::Text(text)) = out else {
+            panic!("expected a background notice, got {out:?}");
+        };
+        assert!(text.contains("background"), "notice: {text}");
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("pidfile written")
+            .trim()
+            .parse()
+            .expect("pid parses");
+        let _ = std::fs::remove_file(&pidfile);
+        let reaped = wait_until_pid_gone(pid).await;
+        if !reaped {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            reaped,
+            "grandchild pid {pid} survived detached cancellation"
         );
     }
 
@@ -3389,15 +3670,61 @@ mod tests {
         }
     }
 
+    struct RecordingNotifier {
+        notices: Arc<Mutex<Vec<(crate::NoticeLevel, String, String)>>>,
+    }
+
+    impl crate::SessionNotifier for RecordingNotifier {
+        fn emit(&self, level: crate::NoticeLevel, summary: &str, detail: &str) {
+            self.notices
+                .lock()
+                .push((level, summary.to_string(), detail.to_string()));
+        }
+    }
+
     #[tokio::test]
-    async fn refuses_when_sandbox_missing() {
-        let err = BashTool::for_test()
-            .execute(json!({ "command": "echo hi" }), &ctx_with(None))
+    async fn missing_sandbox_backend_notices_and_runs_unsandboxed() {
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = ctx_with(None);
+        ctx.sandbox_bypass_reason = Some("sandbox backend unavailable in test".to_string());
+        ctx.notifier = Some(Arc::new(RecordingNotifier {
+            notices: Arc::clone(&notices),
+        }));
+
+        let out = BashTool::for_test()
+            .execute(json!({ "command": "echo hi" }), &ctx)
             .await
-            .unwrap_err();
+            .expect("missing sandbox backend should downgrade to unsandboxed");
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], 0);
+        assert!(v["stdout"].as_str().unwrap_or("").contains("hi"));
+
+        let notices = notices.lock().clone();
+        assert_eq!(notices.len(), 1, "expected one sandbox bypass notice");
+        assert_eq!(notices[0].0, crate::NoticeLevel::Warn);
+        assert!(notices[0].1.contains("without the OS sandbox"));
+        assert!(notices[0].2.contains("sandbox backend unavailable in test"));
+        assert!(notices[0].2.contains("echo hi"));
+    }
+
+    #[tokio::test]
+    async fn outer_container_sandbox_bypass_runs_without_notice() {
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = ctx_with(None);
+        ctx.notifier = Some(Arc::new(RecordingNotifier {
+            notices: Arc::clone(&notices),
+        }));
+
+        let out = BashTool::for_test()
+            .execute(json!({ "command": "echo hi" }), &ctx)
+            .await
+            .expect("container sandbox bypass should still run unsandboxed");
+        let ToolOutput::Json(v) = out else { panic!() };
+        assert_eq!(v["exit_code"], 0);
+        assert!(v["stdout"].as_str().unwrap_or("").contains("hi"));
         assert!(
-            matches!(err, ToolError::Execution(ref m) if m.contains("OS sandbox unavailable")),
-            "got: {err:?}"
+            notices.lock().is_empty(),
+            "outer-container sandbox bypass should not notify the user"
         );
     }
 
@@ -3470,7 +3797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn baybo_invocations_bypass_the_sandbox() {
+    async fn canonical_baybo_invocations_run_unsandboxed() {
         // `baybo …` commands must NOT consult the sandbox: the sandbox
         // masks `~/.baybo`/`$BAYBO_HOME`, so a sandboxed baybo process
         // can't see the gateway's config or session store. Two
@@ -3481,8 +3808,8 @@ mod tests {
         //
         // The match is keyed off the running binary's `current_exe()`
         // — under `cargo test` that's the test harness binary (e.g.
-        // `baybo_tools-XXXX`), NOT `baybo`. So we drive the bypass with
-        // the absolute test-binary path; the underlying `sh -c` will
+        // `baybo_tools-XXXX`), NOT `baybo`. So we drive the self-invocation
+        // route with the absolute test-binary path; the underlying `sh -c` will
         // try to run the test binary with a non-existent arg, which
         // exits quickly without re-entering test discovery.
         let exe = std::env::current_exe().expect("current_exe in test");
@@ -3494,7 +3821,7 @@ mod tests {
             stderr: Vec::new(),
             timed_out: false,
         });
-        let cmd = format!("{exe_path} --baybo-bypass-probe-nonexistent-arg");
+        let cmd = format!("{exe_path} --baybo-self-probe-nonexistent-arg");
         let out = BashTool::for_test()
             .execute(
                 json!({ "command": cmd, "timeout_ms": 5000 }),
@@ -3509,8 +3836,8 @@ mod tests {
             fake.calls()
         );
 
-        // And the bypass works even when no sandbox is installed.
-        let cmd = format!("{exe_path} --baybo-bypass-probe-nonexistent-arg");
+        // And the self-invocation route works even when no sandbox is installed.
+        let cmd = format!("{exe_path} --baybo-self-probe-nonexistent-arg");
         BashTool::for_test()
             .execute(
                 json!({ "command": cmd, "timeout_ms": 5000 }),
@@ -3880,8 +4207,8 @@ mod tests {
             panic!("expected Execution error, got: {err:?}");
         };
         assert!(
-            msg.contains("bwrap setup failure") && msg.contains("denied"),
-            "deny should annotate the original sandbox error: {msg}"
+            msg.contains("bwrap setup failure") && msg.contains("not approved"),
+            "deny should annotate that the unsandboxed retry was not approved: {msg}"
         );
         assert_eq!(gate.requests().len(), 1, "deny path still prompts once");
     }
@@ -3901,13 +4228,13 @@ mod tests {
             panic!("expected Execution error, got: {err:?}");
         };
         assert!(
-            msg.contains("no mid-execution approval handle") && msg.contains("bwrap setup failure"),
-            "error must explain why retry wasn't offered AND keep original reason: {msg}"
+            msg.contains("not approved") && msg.contains("bwrap setup failure"),
+            "error must explain that retry was not approved AND keep original reason: {msg}"
         );
     }
 
     #[tokio::test]
-    async fn sandbox_ok_does_not_prompt_for_unsandboxed_retry() {
+    async fn manual_nonzero_exit_prompts_for_unsandboxed_retry() {
         let (_fake, sandbox) = fake_with_response(SandboxedOutput {
             exit_code: 1,
             stdout: Vec::new(),
@@ -3917,43 +4244,38 @@ mod tests {
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
         let ctx = ctx_with_approval(Some(sandbox), gate.clone());
 
-        // Non-zero exit is the command's own failure, not a sandbox
-        // infrastructure failure. We must NOT auto-prompt for an
-        // unsandboxed retry — that would be noise on every failed test.
+        // Manual permission asks again before a sandbox-failure escape. A
+        // non-zero command result is treated as failed sandboxed execution.
         let out = BashTool::for_test()
             .execute(json!({ "command": "false" }), &ctx)
             .await
             .expect("non-zero exit returns Ok");
         let ToolOutput::Json(v) = out else { panic!() };
         assert_eq!(v["exit_code"], 1);
-        assert!(
-            gate.requests().is_empty(),
-            "no approval prompt for non-zero exit: {:?}",
-            gate.requests()
+        assert_eq!(
+            gate.requests().len(),
+            1,
+            "manual failure should prompt once for unsandboxed retry"
         );
     }
 
     #[tokio::test]
-    async fn network_failure_in_sandbox_does_not_auto_escalate() {
-        // Pre-refactor we tried to detect "sandbox blocked the network"
-        // by stderr-pattern matching and prompted for an unsandboxed
-        // retry. Now that the Bash sandbox runs with NetworkPolicy::All,
-        // a "could not resolve host" stderr is a real network failure
-        // (DNS broken, host unreachable, …), and an unsandboxed retry
-        // wouldn't help. Surface the failure as-is.
+    async fn auto_network_failure_prompts_when_judge_does_not_auto_escape() {
         let (_fake, sandbox) = fake_with_response(SandboxedOutput {
             exit_code: 6,
             stdout: Vec::new(),
             stderr: b"curl: (6) Could not resolve host: example.com\n".to_vec(),
             timed_out: false,
         });
-        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
-        let ctx = ctx_with_approval(Some(sandbox), gate.clone());
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
+        let mut ctx = ctx_with_approval(Some(sandbox), gate.clone());
+        ctx.llm = Some(judge_llm(V_UNRELATED));
 
         let out = BashTool::for_test()
+            .with_permission(auto_permission())
             .execute(json!({ "command": "curl https://example.com" }), &ctx)
             .await
-            .expect("network failure surfaces as ordinary non-zero exit");
+            .expect("denied unsandboxed retry preserves original failure");
         let ToolOutput::Json(v) = out else { panic!() };
         assert_eq!(v["exit_code"], 6);
         assert!(
@@ -3963,11 +4285,7 @@ mod tests {
                 .contains("Could not resolve host"),
             "original stderr must be preserved verbatim: {v:?}"
         );
-        assert!(
-            gate.requests().is_empty(),
-            "network-pattern stderr must NOT trigger an unsandboxed-retry prompt: {:?}",
-            gate.requests()
-        );
+        assert_eq!(gate.requests().len(), 1, "auto non-escape asks approval");
     }
 
     #[tokio::test]
@@ -4047,7 +4365,7 @@ mod tests {
     }
 
     #[test]
-    fn accessed_resources_only_prompts_for_delete_tokens() {
+    fn manual_accessed_resources_prompts_for_every_executable_command() {
         // FileToolRedirect rejection bypasses approval — the sandbox
         // never gets reached.
         let resources = BashTool::for_test().accessed_resources(&json!({ "command": "cat foo" }));
@@ -4056,9 +4374,8 @@ mod tests {
             "content-read is rejected before sandbox; no approval needed"
         );
 
-        // Sandboxed-but-non-destructive: the sandbox is the gate, no
-        // approval prompt fires up front. This includes the commands
-        // that USED to qualify for the metadata fast lane.
+        // Manual permission: every executable Bash command declares
+        // ExecCommand for the executor's human approval gate.
         for cmd in [
             "echo hi",
             "git status",
@@ -4069,13 +4386,15 @@ mod tests {
             "stat /tmp/x",
         ] {
             let resources = BashTool::for_test().accessed_resources(&json!({ "command": cmd }));
-            assert!(
-                resources.is_empty(),
-                "{cmd:?} must skip pre-execution approval, got {resources:?}"
+            assert_eq!(
+                resources.len(),
+                1,
+                "{cmd:?} should declare ExecCommand for approval, got {resources:?}"
             );
         }
 
-        // Sandboxed AND destructive: pre-execution approval fires.
+        // Destructive commands still declare the same single ExecCommand
+        // resource; the destructive label is separate UI metadata.
         for cmd in [
             "rm /tmp/foo",
             "rm -rf /workspace/scratch",
@@ -4104,6 +4423,24 @@ mod tests {
                 "{cmd:?} should declare ExecCommand for approval, got {resources:?}"
             );
         }
+    }
+
+    #[test]
+    fn accessed_resources_only_manual_permission_prompts() {
+        let destructive = json!({ "command": "rm -rf /tmp/work/build" });
+        let benign = json!({ "command": "git status" });
+
+        let manual = BashTool::for_test().with_permission(BashPermissionMode::Manual);
+        assert_eq!(manual.accessed_resources(&destructive).len(), 1);
+        assert_eq!(manual.accessed_resources(&benign).len(), 1);
+
+        let auto = BashTool::for_test().with_permission(auto_permission());
+        assert!(auto.accessed_resources(&destructive).is_empty());
+        assert!(auto.accessed_resources(&benign).is_empty());
+
+        let free = BashTool::for_test().with_permission(BashPermissionMode::Free);
+        assert!(free.accessed_resources(&destructive).is_empty());
+        assert!(free.accessed_resources(&benign).is_empty());
     }
 
     #[test]
@@ -4268,9 +4605,9 @@ mod tests {
             );
         }
 
-        // Wrapper chains where the wrapped command is benign — must not
-        // trigger even though our wrapper-descent is intentionally
-        // aggressive about scanning every non-flag token.
+        // Wrapper chains where the wrapped command is benign — the
+        // descent resolves the real command position and checks only that
+        // argv0, so the wrapper's own arguments never trip detection.
         for cmd in [
             "nohup grep foo /tmp/file",
             "sudo cat /etc/passwd",
@@ -4446,8 +4783,161 @@ mod tests {
         }
     }
 
+    #[test]
+    fn contains_delete_command_catches_side_channels_and_wrapper_options() {
+        // Deletes that run through a side channel — process substitution,
+        // an expandable redirection / heredoc / here-string, or a command
+        // substitution inside `[[ … ]]` — never appear in the argv but
+        // still execute, so they must fire.
+        for cmd in [
+            "cat <(rm -rf build)",
+            "diff <(cat a) <(rm -rf b)",
+            "cat > >(rm -rf build)",
+            "cat <<EOF\n$(rm -rf build)\nEOF",
+            "grep x <<< $(rm -rf build)",
+            "[[ -n $(rm -rf build) ]]",
+            "[[ $(rm x) == y ]]",
+            // sudo option that takes a separate value must not hide the
+            // wrapped command behind it.
+            "sudo --user root rm -rf build",
+            "sudo --user=root rm -rf build",
+            // process substitution / heredoc feeding a compound command's
+            // own redirection, not a simple command's
+            "while read x; do :; done < <(rm -rf build)",
+            "{ ls; } > >(rm -rf build)",
+            // a coprocess runs its body command
+            "coproc rm -rf build",
+            "coproc grp { rm -rf build; }",
+            // compound headers are expanded before the body runs
+            "for f in $(rm -rf build); do :; done",
+            "case $(rm -rf build) in x) :; esac",
+            "case x in $(rm -rf build)) :; esac",
+            // command substitution nested inside a parameter / arithmetic
+            // expansion (not a top-level `$(…)`)
+            "echo ${UNSET:-$(rm -rf build)}",
+            "echo \"${UNSET:-$(rm -rf build)}\"",
+            ": $(( $(rm -rf build) ))",
+            // xargs deprecated optional-operand flags: rm is the command
+            "xargs -i rm",
+            "xargs -l rm",
+            // exec with a custom argv0 still runs the wrapped command
+            "exec -a custom rm -rf build",
+            // env's value-taking argv0 override hides the command otherwise
+            "env -a custom rm -rf build",
+            // arithmetic expressions expand command substitutions first
+            "(( $(rm -rf build) ))",
+            "for (( i=$(rm -rf build); i<1; i++ )); do :; done",
+            // the command supplied as a string argument (env -S / shell -c /
+            // eval) is parsed, not skipped as an opaque value
+            "env -S rm -rf build",
+            "env -S 'rm' -rf build",
+            "env -S \"rm -rf build\"",
+            "env --split-string='rm -rf build'",
+            "sh -c \"rm -rf build\"",
+            "bash -c 'ls; rm -rf build'",
+            "/bin/sh -c 'rm -rf build'",
+            "eval rm -rf build",
+            "eval \"rm -rf build\"",
+        ] {
+            assert!(
+                contains_delete_command(cmd),
+                "side-channel delete must trigger detection in {cmd:?}"
+            );
+        }
+
+        // Command substitution nested deeper than the recursion budget must
+        // fail closed (prompt) rather than be silently ignored.
+        let deep = format!("{}rm -rf x{}", "$(".repeat(40), ")".repeat(40));
+        assert!(
+            contains_delete_command(&deep),
+            "deeply nested substitution must fail closed"
+        );
+
+        // Benign counterparts must NOT trigger: a harmless process subst, a
+        // quoted heredoc (literal, never executed), a plain test, and a
+        // wrapper whose value-taking option is followed by a benign command.
+        for cmd in [
+            "cat <(ls build)",
+            "cat <<'EOF'\n$(rm -rf build)\nEOF",
+            "[[ -f build ]]",
+            "sudo --preserve-env ls",
+            "sudo --user root ls",
+            "for f in a b c; do :; done",
+            "case x in y) :; esac",
+            "echo ${HOME:-/tmp}",
+            ": $(( 1 + 2 ))",
+            "(( 1 + 2 ))",
+            "xargs -i ls",
+            "exec -a custom ls",
+            "env -a custom ls",
+            // command-string interpreters wrapping a benign command
+            "env -S 'ls -la'",
+            "sh -c \"grep rm file\"",
+            "bash -c 'echo rm'",
+            "eval echo rm",
+        ] {
+            assert!(
+                !contains_delete_command(cmd),
+                "benign side-channel command must NOT trigger in {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_delete_command_ast_regressions() {
+        // Real deletes hidden by constructs the old flat tokenizer
+        // mangled (multi-line scripts, control flow, subshells, command
+        // substitution, `find -exec` through a wrapper) MUST still fire.
+        for cmd in [
+            "cd build\nrm -rf *",
+            "if [ -d x ]; then rm -rf x; fi",
+            "if [[ -d x ]]; then rm -rf x; fi",
+            "for f in a b; do rm \"$f\"; done",
+            "while read f; do rm \"$f\"; done",
+            "(cd x && rm -rf y)",
+            "echo \"$(rm -rf build)\"",
+            "x=$(rm -rf build)",
+            "`rm -rf build`",
+            "find . -type f -exec sudo rm {} \\;",
+        ] {
+            assert!(
+                contains_delete_command(cmd),
+                "expected delete detection for {cmd:?}"
+            );
+        }
+
+        // False positives the substring / flat-token detector produced: a
+        // delete token that is only an argument, a lookup query, or a
+        // flagged no-op. None of these delete anything, so none may prompt.
+        for cmd in [
+            // delete token is an argument to a builtin/wrapper, not the argv0
+            "command -v rm",
+            "command -v shred",
+            "type rm",
+            "sudo pacman -S wipe",
+            "sudo apt-get install srm",
+            "sudo mv rm rm.old",
+            "find . | xargs grep rm",
+            "timeout 5 grep rm log",
+            // `-delete` as a literal argument, not a `find` primary
+            "echo -delete",
+            "grep -- -delete file",
+            // git rm variants that never touch the working tree
+            "git rm --cached path",
+            "git rm --dry-run file",
+            "git rm -n file",
+            // a quoted-heredoc body is opaque data, never parsed as commands
+            "python - <<'PY'\nimport re\nx = re.compile(r'rm -rf /')\nprint('done')\nPY",
+        ] {
+            assert!(
+                !contains_delete_command(cmd),
+                "benign command must NOT trigger detection in {cmd:?}"
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn benign_sandboxed_command_runs_without_pre_approval_prompt() {
+    async fn direct_execute_does_not_consult_pre_execution_approval_gate() {
         let (_fake, sandbox) = fake_with_response(SandboxedOutput {
             exit_code: 0,
             stdout: b"clean\n".to_vec(),
@@ -4458,12 +4948,11 @@ mod tests {
         let ctx = ctx_with_approval(Some(sandbox), gate.clone());
 
         // The pre-execution gate is wired through the registry, not
-        // BashTool::execute itself, so no prompt fires here regardless.
-        // What this test pins is the *resource declaration*: empty for
-        // benign commands so the registry has nothing to gate.
+        // BashTool::execute itself, so no prompt fires here directly even
+        // though manual permission declares an ExecCommand resource.
         let resources =
             BashTool::for_test().accessed_resources(&json!({ "command": "git status" }));
-        assert!(resources.is_empty());
+        assert_eq!(resources.len(), 1);
 
         let out = BashTool::for_test()
             .execute(json!({ "command": "git status" }), &ctx)
@@ -4473,7 +4962,7 @@ mod tests {
         assert_eq!(v["exit_code"], 0);
         assert!(
             gate.requests().is_empty(),
-            "benign command must not pop any in-flight approval prompt: {:?}",
+            "direct execute must not pop any in-flight approval prompt: {:?}",
             gate.requests()
         );
     }

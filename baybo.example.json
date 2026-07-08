@@ -63,11 +63,9 @@
     },
     "default_external_agent": null
   },
+  "permission": "auto",
   "proxy": {
     "url": "http://YOUR_PROXY_HOST:PORT",
     "no_proxy": ["example.com", ".internal"]
-  },
-  "sandbox": {
-    "mode": "auto"
   }
 }

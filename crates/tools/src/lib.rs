@@ -165,6 +165,12 @@ pub struct ToolContext {
     /// clone (one `PathBuf` inside).
     pub workspace_paths: WorkspacePaths,
     pub sandbox: Option<Arc<dyn ExecSandbox>>,
+    /// Optional user-facing reason the runtime intentionally did not wire
+    /// [`Self::sandbox`] for an ExecCommand-capable tool. `Some` means Bash
+    /// should surface a downgrade notice before running without the inner OS
+    /// sandbox; `None` keeps the downgrade silent (for bench / outer-container
+    /// environments where nested sandboxing is expected to be absent).
+    pub sandbox_bypass_reason: Option<String>,
     /// Mid-execution approval handle. Tools that decide which resources
     /// they will touch only after some internal work (e.g. one that
     /// runs an LLM to draft a program before knowing what files it will
@@ -175,8 +181,8 @@ pub struct ToolContext {
     /// Side-channel to surface non-fatal verdicts (warnings, blocks)
     /// to the user channel without going through the LLM-visible tool
     /// result. Today only the `Skill` tool emits notices (when the
-    /// risk assessor returns `Suspicious` or `Dangerous`); other tools
-    /// leave this `None`.
+    /// risk assessor returns `Suspicious` or `Dangerous`) and Bash emits
+    /// sandbox-downgrade / escape notices; other tools leave this `None`.
     pub notifier: Option<Arc<dyn SessionNotifier>>,
     /// Per-tool-call event sink. Tools emit arbitrary observations —
     /// phase timers (`http_request`, `html_to_markdown`, …), HTTP
@@ -256,6 +262,7 @@ impl ToolContext {
             workspace_root: PathBuf::from("/tmp"),
             workspace_paths: WorkspacePaths::new("/tmp"),
             sandbox: None,
+            sandbox_bypass_reason: None,
             approval: None,
             notifier: None,
             events: noop_event_sink(),

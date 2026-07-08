@@ -99,6 +99,7 @@ fn payload_text_bytes(payload: &ToolEventPayload) -> usize {
             input,
             output,
         } => model.len() + input.len() + output.len(),
+        ToolEventPayload::ParseFailure { command } => command.len(),
     }
 }
 
@@ -190,6 +191,7 @@ pub struct ToolExecutor {
     /// Forwarded to [`ToolContext::workspace_paths`].
     workspace_paths: baybo_workspace::WorkspacePaths,
     sandbox_runner: Option<Arc<dyn SandboxRunner>>,
+    sandbox_bypass_reason: Option<String>,
     /// Resolver for virtual reads (e.g. the session transcript), forwarded into
     /// every [`ToolContext`] this executor builds; `ReadTool` consults it before
     /// the filesystem. `None` ⇒ no virtual reads wired.
@@ -213,6 +215,7 @@ impl ToolExecutor {
         workspace_root: PathBuf,
         workspace_paths: baybo_workspace::WorkspacePaths,
         sandbox_runner: Option<Arc<dyn SandboxRunner>>,
+        sandbox_bypass_reason: Option<String>,
         virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
         background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>>,
         background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
@@ -224,6 +227,7 @@ impl ToolExecutor {
             workspace_root,
             workspace_paths,
             sandbox_runner,
+            sandbox_bypass_reason,
             virtual_reads,
             background_jobs,
             background_control,
@@ -247,6 +251,9 @@ impl ToolExecutor {
             ToolEventPayload::LlmCall { input, output, .. } => {
                 self.sanitize_in_place(input).await;
                 self.sanitize_in_place(output).await;
+            }
+            ToolEventPayload::ParseFailure { command } => {
+                self.sanitize_in_place(command).await;
             }
         }
     }
@@ -454,10 +461,13 @@ impl ToolExecutor {
 
                 // Build per-call sandbox adapter for tools declaring
                 // ExecCommand.
-                let sandbox: Option<Arc<dyn ExecSandbox>> = if let Some(manifest) =
-                    self.tool_registry.get_manifest(&tool_name_owned)
-                    && manifest.capabilities.contains(&ToolCapability::ExecCommand)
-                {
+                let uses_exec_command = self
+                    .tool_registry
+                    .get_manifest(&tool_name_owned)
+                    .is_some_and(|manifest| {
+                        manifest.capabilities.contains(&ToolCapability::ExecCommand)
+                    });
+                let sandbox: Option<Arc<dyn ExecSandbox>> = if uses_exec_command {
                     self.sandbox_runner.as_ref().map(|runner| {
                         let home = std::env::var_os("HOME").map(PathBuf::from);
                         let baybo_state = std::env::var_os("BAYBO_HOME")
@@ -477,6 +487,11 @@ impl ToolExecutor {
                             .with_readable_paths(vec![self.workspace_paths.skills_dir()]),
                         ) as Arc<dyn ExecSandbox>
                     })
+                } else {
+                    None
+                };
+                let sandbox_bypass_reason = if uses_exec_command && sandbox.is_none() {
+                    self.sandbox_bypass_reason.clone()
                 } else {
                     None
                 };
@@ -522,6 +537,7 @@ impl ToolExecutor {
                     workspace_root: self.workspace_root.clone(),
                     workspace_paths: self.workspace_paths.clone(),
                     sandbox,
+                    sandbox_bypass_reason,
                     approval: Some(approval),
                     notifier: notifier.clone(),
                     events: Arc::clone(&event_sink) as Arc<dyn baybo_tools::ToolEventSink>,
