@@ -21,6 +21,15 @@ final class ArchiveFlowUITests: XCTestCase {
         app.staticTexts["Demo conversation number \(n)"]
     }
 
+    /// The whole row button that wraps a preview line. Its frame spans both
+    /// lines of a titled row, so a coordinate drag anchored at its centre lands
+    /// between the two text lines — unlike the preview `StaticText`, which on a
+    /// titled row sits on the low second line where a full-swipe commit doesn't
+    /// register.
+    private func rowButton(_ app: XCUIApplication, _ n: Int) -> XCUIElement {
+        app.buttons.containing(.staticText, identifier: "Demo conversation number \(n)").firstMatch
+    }
+
     /// A stock swipe reveals the native trailing actions and parks them open
     /// (it doesn't cross the full-swipe threshold).
     private func reveal(_ element: XCUIElement) {
@@ -29,9 +38,13 @@ final class ArchiveFlowUITests: XCTestCase {
 
     /// Drag well past the row's leading edge — the full-swipe that commits the
     /// edge-most action (archive on the main list, unarchive when archived).
+    /// The leftward travel is ABSOLUTE, not normalized to the target's width: a
+    /// titled row's swipe target is its preview line, only as wide as its
+    /// glyphs, so a width-normalized drag under-travels and merely reveals the
+    /// actions. A fixed 600pt drag clears the commit threshold on any row shape.
     private func fullSwipe(_ element: XCUIElement) {
-        let start = element.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5))
-        let end = element.coordinate(withNormalizedOffset: CGVector(dx: -1.2, dy: 0.5))
+        let start = element.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
+        let end = start.withOffset(CGVector(dx: -600, dy: 0))
         start.press(forDuration: 0.05, thenDragTo: end)
     }
 
@@ -85,7 +98,7 @@ final class ArchiveFlowUITests: XCTestCase {
         let target = row(app, 4)
         XCTAssertTrue(target.waitForExistence(timeout: 5))
 
-        fullSwipe(target)
+        fullSwipe(rowButton(app, 4))
         XCTAssertTrue(
             app.buttons["Undo"].waitForExistence(timeout: 3),
             "no undo toast after a full-swipe archive")

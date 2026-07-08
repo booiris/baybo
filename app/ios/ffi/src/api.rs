@@ -129,6 +129,17 @@ pub struct ChatSessionSummary {
     /// Preview drawn from the most-recent user-authored message; `None` for a
     /// session without a user turn yet.
     pub last_user_text: Option<String>,
+    /// Preview drawn from the most-recent message regardless of author — the
+    /// newest user prompt or final assistant answer with text. Drives the
+    /// Telegram-style list's second line so the preview follows the
+    /// conversation (an agent reply shows once it lands). `None` on an older
+    /// gateway that predates the field, or a session with no displayable turn;
+    /// the row falls back to `last_user_text` / its title.
+    pub last_message_text: Option<String>,
+    /// Auto-generated conversation title (from the first user question), or
+    /// `None` before the title pass has run. The list renders it as the row's
+    /// bold first line; live updates arrive via [`SessionListSink::on_title`].
+    pub title: Option<String>,
     pub pinned: bool,
     pub archived: bool,
     /// Server-computed unread reply count (final assistant replies above this
@@ -215,6 +226,13 @@ pub trait SessionListSink: Send + Sync {
     /// `source` is the lowercase `ActivityKind` (`"user"` / `"assistant"`);
     /// `at_millis` is the activity's unix-epoch milliseconds.
     fn on_activity(&self, session_id: String, source: String, at_millis: i64);
+    /// A `SessionUpdated` patch carried a freshly-generated conversation
+    /// `title` for `session_id`. Connection-global like `on_activity` — it
+    /// fires for ANY session on the leg (subscribed or not), so the list can
+    /// swap a row's bold first line the moment the title pass lands without a
+    /// REST refetch. Only the title patch is forwarded; pin / archive / hide
+    /// stay on the optimistic + REST-merge path the list already owns.
+    fn on_title(&self, session_id: String, title: String);
 }
 
 /// Gateway-side cancellation of an in-flight pairing (the operator declined or

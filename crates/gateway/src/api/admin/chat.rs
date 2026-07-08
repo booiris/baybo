@@ -132,6 +132,18 @@ const PREVIEW_MAX_CHARS: usize = 120;
 /// the per-session count scan (see `SessionManager::unread_reply_count`).
 const UNREAD_COUNT_CAP: usize = 99;
 
+/// How far back the second-line preview (`last_message_preview`) walks the
+/// transcript tail for the newest bubble. A completed turn's final answer is
+/// its LAST row (the loop ends on the first tool-free reply, and control events
+/// live outside `session_messages`), so a shallow scan finds it; the extra rows
+/// only tolerate an occasional non-bubble row (a compaction summary or an
+/// attachment-only message) sitting above it. A turn still mid-tool-loop has no
+/// final answer yet, so the scan finds no bubble and the row falls back to
+/// `last_user_text` client-side — which is that turn's own prompt, exactly the
+/// bubble a deeper walk would reach — so scanning deeper buys almost nothing
+/// while multiplying the per-session tail fetch + deserialize.
+const LAST_MESSAGE_PREVIEW_SCAN: usize = 4;
+
 /// Default page size for the cron-messages list. Tuned to roughly
 /// match what the right-side panel renders before the user scrolls.
 const DEFAULT_CRON_MESSAGE_LIMIT: usize = 50;
@@ -553,6 +565,16 @@ pub struct ChatSessionSummary {
     /// transcript holds only system/tool rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_text: Option<String>,
+    /// Preview text drawn from the session's most-recent **displayable**
+    /// message regardless of author — the newest user prompt or final
+    /// assistant answer carrying text, truncated to [`PREVIEW_MAX_CHARS`].
+    /// Telegram-style list clients render this as the row's second line so
+    /// the preview follows the conversation (an agent reply shows once it
+    /// lands), while [`Self::last_user_text`] stays the user-only label the
+    /// web sidebar uses. `None` when the scanned tail holds only tool /
+    /// media rows or the session has no turn yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_text: Option<String>,
     /// The user-created folder this session is filed under, or absent for
     /// uncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web
     /// sidebar groups rows by this id.
@@ -763,22 +785,36 @@ async fn list_sessions(
         }
     }))
     .await;
+    // The Telegram-style second-line preview: the newest displayable message
+    // regardless of author. Fanned out concurrently like the user-only preview
+    // above, each degrading to `None` on error so one bad row can't fail the
+    // whole list.
+    let last_messages = futures::future::join_all(visible.iter().map(|s| {
+        let manager = state.session_manager.clone();
+        let sid = s.id.clone();
+        async move { last_message_preview(&manager, &sid).await }
+    }))
+    .await;
     let items: Vec<ChatSessionSummary> = visible
         .into_iter()
         .zip(previews)
         .zip(unread_counts)
-        .map(|((s, last_user_text), unread)| ChatSessionSummary {
-            session_id: s.id.to_string(),
-            created_at: s.created_at,
-            last_active: s.last_active,
-            hidden: s.hidden,
-            pinned: s.pinned,
-            archived: s.archived,
-            last_user_text,
-            folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
-            unread_count: unread as i64,
-            title: s.title.clone(),
-        })
+        .zip(last_messages)
+        .map(
+            |(((s, last_user_text), unread), last_message_text)| ChatSessionSummary {
+                session_id: s.id.to_string(),
+                created_at: s.created_at,
+                last_active: s.last_active,
+                hidden: s.hidden,
+                pinned: s.pinned,
+                archived: s.archived,
+                last_user_text,
+                last_message_text,
+                folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
+                unread_count: unread as i64,
+                title: s.title.clone(),
+            },
+        )
         .collect();
     Ok(Json(ChatSessionsList { items }))
 }
@@ -2111,6 +2147,53 @@ async fn last_user_preview(
     let (created_at, msg) = manager.last_user_message(session_id).await.ok().flatten()?;
     let item = message_item(0, created_at, "user", &msg, Vec::new())?;
     (!item.text.is_empty()).then(|| truncate_preview(&item.text))
+}
+
+/// Newest **displayable** message regardless of author — the freshest user
+/// prompt or final assistant answer carrying text — collapsed into the chat
+/// list's second-line preview. Walks the transcript tail newest-first and
+/// returns the first row that renders as a message BUBBLE, applying the same
+/// visibility rules as [`reconstruct_transcript`] so the preview never surfaces
+/// something the transcript itself hides: only a real user turn
+/// ([`ChatMessage::from_user`]) or a tool-free final assistant answer counts —
+/// agent-injected user rows (cron / recalled-memory framing), work-block
+/// narration (an assistant row with tool calls), and tool rows are skipped, and
+/// the model-facing cancelled-turn marker is stripped. `None` when the scanned
+/// tail holds no such bubble (media-only, a mid-tool-loop turn, or a fresh
+/// session) or the lookup fails — the row then falls back to its title / user
+/// preview client-side. Bounded to [`LAST_MESSAGE_PREVIEW_SCAN`] rows so a long
+/// tool loop can't turn one preview into an unbounded tail read.
+async fn last_message_preview(
+    manager: &baybo_session::SessionManager,
+    session_id: &SessionId,
+) -> Option<String> {
+    let tail = manager
+        .history_tail(session_id, None, LAST_MESSAGE_PREVIEW_SCAN)
+        .await
+        .ok()?;
+    tail.into_iter()
+        .rev()
+        .find_map(|(_ordinal, created_at, msg)| {
+            // Match reconstruct_transcript's bubble rules: a real user turn, or a
+            // tool-free final assistant answer. Everything else (agent-injected
+            // user rows, assistant work-block narration, tool results) renders no
+            // bubble there, so it must not become a preview here.
+            let role = if msg.from_user() {
+                "user"
+            } else if matches!(msg.role, Role::Assistant) && !msg.has_tool_use() {
+                "assistant"
+            } else {
+                return None;
+            };
+            let item = message_item(0, created_at, role, &msg, Vec::new())?;
+            // Strip the model-facing cancelled-turn marker (a no-op when absent):
+            // a /stop-salvaged reply keeps only its partial text, and a
+            // thinking-only marker-only row strips to empty and is skipped — the
+            // same "frame for the model, strip for the user" contract the
+            // transcript honours.
+            let text = baybo_context::prompts::cancelled_turn::strip_marker(&item.text);
+            (!text.is_empty()).then(|| truncate_preview(text))
+        })
 }
 
 /// Collapse whitespace and clip to [`PREVIEW_MAX_CHARS`] for the

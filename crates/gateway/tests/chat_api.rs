@@ -298,6 +298,142 @@ async fn seed_tool_turn_session(
     session_id
 }
 
+/// The chat-list summary carries a Telegram-style second-line preview
+/// (`last_message_text`) that follows the WHOLE conversation: it settles on the
+/// newest displayable message regardless of author, skipping the turn's
+/// text-less tool rows, while `last_user_text` stays the user-only label the
+/// web sidebar uses.
+#[tokio::test]
+async fn chat_list_last_message_text_follows_latest_reply() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    // user("run it") → tool_use → tool_result → reply("done")
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("seeded session listed")
+        .clone();
+
+    // Newest displayable message is the assistant's final answer — the
+    // intervening tool_use / tool_result rows carry no text and are skipped.
+    assert_eq!(
+        row["last_message_text"].as_str(),
+        Some("done"),
+        "preview must follow the conversation to the latest reply: {row:?}",
+    );
+    // The user-only label is unchanged: still the last human turn.
+    assert_eq!(row["last_user_text"].as_str(), Some("run it"));
+}
+
+/// The second-line preview mirrors the transcript's bubble rules: a turn that
+/// ends on tool activity (narration + tool_use + tool_result, no tool-free
+/// final answer) shows NO assistant bubble, so the preview must fall back to
+/// the user prompt rather than surface the mid-turn narration text.
+#[tokio::test]
+async fn chat_list_last_message_text_skips_mid_turn_narration() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+    let sid = SessionId::from(session_id.as_str());
+    // Newest tail rows are an assistant narration+tool row then a tool result —
+    // neither renders a bubble, so the preview must be the user prompt.
+    let rows = [
+        ChatMessage::user(vec![ContentBlock::Text("run it".into())]),
+        ChatMessage::assistant(vec![
+            ContentBlock::Text("let me check the logs".into()),
+            ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "Bash".into(),
+                input: json!({"command": "cat log"}),
+                signature: None,
+            },
+        ]),
+        ChatMessage::tool_result("c1".to_owned(), "…".to_owned()),
+    ];
+    for msg in rows {
+        tg.deps
+            .session_manager
+            .append_session_message(&sid, &msg)
+            .await
+            .expect("append");
+    }
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("seeded session listed")
+        .clone();
+    assert_eq!(
+        row["last_message_text"].as_str(),
+        Some("run it"),
+        "narration/tool rows must not surface as the preview: {row:?}",
+    );
+}
+
+/// A `/stop`-salvaged assistant reply carries the model-facing cancelled-turn
+/// marker folded into its text; the preview must strip it (the same contract
+/// the transcript renderer honours) so the list never shows internal framing.
+#[tokio::test]
+async fn chat_list_last_message_text_strips_cancelled_marker() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+    let sid = SessionId::from(session_id.as_str());
+    let salvaged = format!(
+        "here is the partial{}",
+        baybo_context::prompts::cancelled_turn::SUFFIX
+    );
+    let rows = [
+        ChatMessage::user(vec![ContentBlock::Text("do the thing".into())]),
+        ChatMessage::assistant(vec![ContentBlock::Text(salvaged)]),
+    ];
+    for msg in rows {
+        tg.deps
+            .session_manager
+            .append_session_message(&sid, &msg)
+            .await
+            .expect("append");
+    }
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("seeded session listed")
+        .clone();
+    assert_eq!(
+        row["last_message_text"].as_str(),
+        Some("here is the partial"),
+        "cancelled-turn marker must be stripped from the preview: {row:?}",
+    );
+}
+
 #[tokio::test]
 async fn chat_sync_difference_is_full_fidelity_with_coverage_watermark() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;

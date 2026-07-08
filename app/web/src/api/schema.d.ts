@@ -1024,6 +1024,17 @@ export interface components {
             /** Format: date-time */
             last_active: string;
             /**
+             * @description Preview text drawn from the session's most-recent **displayable**
+             *     message regardless of author — the newest user prompt or final
+             *     assistant answer carrying text, truncated to [`PREVIEW_MAX_CHARS`].
+             *     Telegram-style list clients render this as the row's second line so
+             *     the preview follows the conversation (an agent reply shows once it
+             *     lands), while [`Self::last_user_text`] stays the user-only label the
+             *     web sidebar uses. `None` when the scanned tail holds only tool /
+             *     media rows or the session has no turn yet.
+             */
+            last_message_text?: string | null;
+            /**
              * @description Preview text drawn from the session's most-recent user-authored
              *     message, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar
              *     renders this as the row label so users can scan past

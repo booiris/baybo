@@ -766,6 +766,20 @@ async fn dispatch_inbound_frame(
         }
         return;
     }
+    // A `SessionUpdated` patch carrying a freshly-generated title: forward it
+    // to the connection-global list sink so a row (subscribed or not) can swap
+    // its bold first line live. NOT a `return` — the frame still falls through
+    // to per-session routing exactly as before (the transcript webview simply
+    // ignores it), so only the added title hop is new behavior. Pin / archive /
+    // hide patches carry no title and stay entirely on the existing path.
+    if let Frame::SessionUpdated { session_id, patch } = &frame
+        && let Some(title) = &patch.title
+    {
+        let sink = list_sink.lock().clone();
+        if let Some(sink) = sink {
+            sink.on_title(session_id.as_str().to_owned(), title.clone());
+        }
+    }
     let target = frame
         .routing_session_id()
         .map(|session_id| session_id.as_str().to_owned());

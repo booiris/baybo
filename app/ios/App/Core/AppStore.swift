@@ -148,6 +148,30 @@ final class AppStore: ObservableObject {
                 SessionIndex.shared.setArchivedFlag("demo-\(i)", archived: i == 2)
                 SessionIndex.shared.setPinnedFlag("demo-\(i)", pinned: !demoPin && i == 3)
             }
+            // Titles + a couple of unread badges so the Telegram-style row (bold
+            // title over grey preview, time + count) is screenshotable; demo-6
+            // stays untitled to exercise the single-line fallback. Past-dated
+            // activity bumps unread WITHOUT reordering (`at` isn't newer than the
+            // row's `lastActive`), so the pin-reorder demo's ordering is intact.
+            let demoTitles = [
+                "demo-1": "Ship the iOS chat list",
+                "demo-2": "Weekend trip planning",
+                "demo-3": "Refactor the sync loop",
+                "demo-4": "Groceries and errands",
+                "demo-5": "Design review notes",
+            ]
+            for (id, title) in demoTitles {
+                SessionIndex.shared.applyTitle(sessionId: id, title: title)
+            }
+            // Reset unread first so repeated headless launches show a stable
+            // count (it persists in sessions.json, so an unbalanced bump would
+            // accumulate across runs), then seed exactly one on two rows.
+            for i in 1...6 {
+                SessionIndex.shared.clearUnread("demo-\(i)")
+            }
+            for id in ["demo-1", "demo-3"] {
+                SessionIndex.shared.noteActivity(sessionId: id, source: "assistant", atMillis: 0)
+            }
             if demoPin {
                 Task { @MainActor in
                     try? await Task.sleep(for: .seconds(2))

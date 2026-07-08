@@ -7,9 +7,15 @@ struct SessionRow: Codable, Identifiable, Equatable {
     let id: String
     var createdAt: Date
     var lastActive: Date
-    /// Preview drawn from the most-recent user-authored message; nil for a
-    /// session without a user turn yet.
-    var lastUserText: String?
+    /// Auto-generated conversation title (server-side, from the first user
+    /// question); nil until the title pass has run. The list's bold first line;
+    /// live-updated by a `SessionUpdated` patch (`SessionIndex.applyTitle`).
+    var title: String?
+    /// Second-line preview: the most-recent message regardless of author (user
+    /// prompt or agent reply). Captured locally on send, reconciled to server
+    /// truth (`last_message_text`) on merge; nil for a session with no
+    /// displayable turn yet.
+    var preview: String?
     var pinned: Bool
     /// Server-side flag (like `pinned`): archived rows live under the Archived
     /// screen instead of the main list, but keep accruing unread/recency.
@@ -19,27 +25,43 @@ struct SessionRow: Codable, Identifiable, Equatable {
     var unread: Int
 
     init(
-        id: String, createdAt: Date, lastActive: Date, lastUserText: String?,
-        pinned: Bool, archived: Bool = false, unread: Int = 0
+        id: String, createdAt: Date, lastActive: Date, title: String? = nil,
+        preview: String?, pinned: Bool, archived: Bool = false, unread: Int = 0
     ) {
         self.id = id
         self.createdAt = createdAt
         self.lastActive = lastActive
-        self.lastUserText = lastUserText
+        self.title = title
+        self.preview = preview
         self.pinned = pinned
         self.archived = archived
         self.unread = unread
     }
 
-    /// `unread` and `archived` post-date the first shipped schema, so an older
-    /// `sessions.json` won't carry the keys — default them instead of failing
-    /// the whole decode.
+    /// The pre-Telegram schema stored the preview under `lastUserText`; decode
+    /// it as a fallback so an existing `sessions.json` keeps its captured
+    /// previews across the upgrade instead of flashing blank until the first
+    /// REST merge.
+    private enum LegacyKeys: String, CodingKey { case lastUserText }
+
+    /// `unread` / `archived` / `title` post-date earlier schemas and `preview`
+    /// renamed `lastUserText` — decode each defensively so an older
+    /// `sessions.json` upgrades in place instead of failing the whole decode.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         lastActive = try c.decode(Date.self, forKey: .lastActive)
-        lastUserText = try c.decodeIfPresent(String.self, forKey: .lastUserText)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        if let current = try c.decodeIfPresent(String.self, forKey: .preview) {
+            preview = current
+        } else if let legacy = try? decoder.container(keyedBy: LegacyKeys.self),
+            let legacyText = try? legacy.decodeIfPresent(String.self, forKey: .lastUserText)
+        {
+            preview = legacyText
+        } else {
+            preview = nil
+        }
         pinned = try c.decode(Bool.self, forKey: .pinned)
         archived = try c.decodeIfPresent(Bool.self, forKey: .archived) ?? false
         unread = try c.decodeIfPresent(Int.self, forKey: .unread) ?? 0
@@ -124,7 +146,7 @@ final class SessionIndex: ObservableObject {
         rows.append(
             SessionRow(
                 id: sessionId, createdAt: now, lastActive: now,
-                lastUserText: nil, pinned: false))
+                preview: nil, pinned: false))
         save()
     }
 
@@ -137,14 +159,14 @@ final class SessionIndex: ObservableObject {
         let now = Date()
         if let idx = rows.firstIndex(where: { $0.id == sessionId }) {
             if !preview.isEmpty {
-                rows[idx].lastUserText = preview
+                rows[idx].preview = preview
             }
             rows[idx].lastActive = now
         } else {
             rows.append(
                 SessionRow(
                     id: sessionId, createdAt: now, lastActive: now,
-                    lastUserText: preview.isEmpty ? nil : preview, pinned: false))
+                    preview: preview.isEmpty ? nil : preview, pinned: false))
         }
         save()
     }
@@ -189,6 +211,18 @@ final class SessionIndex: ObservableObject {
         guard let idx = rows.firstIndex(where: { $0.id == sessionId }), rows[idx].unread != 0
         else { return }
         rows[idx].unread = 0
+        save()
+    }
+
+    /// A live `SessionUpdated` title patch reached the connection-global list
+    /// sink (`SessionActivityHandler.onTitle`): swap the row's bold first line
+    /// in place. Title is server-authoritative and never mutated locally, so it
+    /// applies unconditionally for a known row; an unknown id waits for a REST
+    /// merge to surface it (the title is also carried on the summary).
+    func applyTitle(sessionId: String, title: String) {
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }), rows[idx].title != title
+        else { return }
+        rows[idx].title = title
         save()
     }
 
@@ -325,8 +359,15 @@ final class SessionIndex: ObservableObject {
             let pending = pendingMutations[summary.sessionId]
             if pending == .hidden { continue }
             let mine = local[summary.sessionId]
-            let hasRemotePreview = !(summary.lastUserText ?? "").isEmpty
+            // Newest-message preview wins; fall back to the user-only label so
+            // an older gateway (no `last_message_text`) still renders a preview.
+            let remotePreview = summary.lastMessageText ?? summary.lastUserText
+            let hasRemotePreview = !(remotePreview ?? "").isEmpty
             guard mine != nil || hasRemotePreview || summary.pinned else { continue }
+            // Remote title is authoritative, but a live patch may have set it
+            // before this (older) snapshot caught up — keep the local one when
+            // the snapshot has none rather than blanking a title just shown.
+            let title = summary.title ?? mine?.title
 
             let archived: Bool
             if case .archived(let flag)? = pending {
@@ -349,17 +390,19 @@ final class SessionIndex: ObservableObject {
             // cheap accelerator.
             let unread = Int(summary.unreadCount)
             if let mine, mine.lastActive > lastActive {
+                // Local row saw activity after this snapshot (a just-sent
+                // message racing the refetch) — keep its fresher preview.
                 merged.append(
                     SessionRow(
                         id: summary.sessionId, createdAt: createdAt,
-                        lastActive: mine.lastActive,
-                        lastUserText: mine.lastUserText ?? summary.lastUserText,
+                        lastActive: mine.lastActive, title: title,
+                        preview: mine.preview ?? remotePreview,
                         pinned: pinned, archived: archived, unread: unread))
             } else {
                 merged.append(
                     SessionRow(
                         id: summary.sessionId, createdAt: createdAt, lastActive: lastActive,
-                        lastUserText: summary.lastUserText, pinned: pinned,
+                        title: title, preview: remotePreview, pinned: pinned,
                         archived: archived, unread: unread))
             }
         }
@@ -419,7 +462,7 @@ final class SessionIndex: ObservableObject {
             rows.append(
                 SessionRow(
                     id: sessionId, createdAt: now, lastActive: now,
-                    lastUserText: nil, pinned: false))
+                    preview: nil, pinned: false))
         }
         if let blob = defaults.string(forKey: ChatDefaults.transcriptState) {
             TranscriptStore.write(sessionId: sessionId, stateJson: blob)
@@ -465,6 +508,14 @@ final class SessionActivityHandler: SessionListSink, @unchecked Sendable {
             MainActor.assumeIsolated {
                 SessionIndex.shared.noteActivity(
                     sessionId: sessionId, source: source, atMillis: atMillis)
+            }
+        }
+    }
+
+    func onTitle(sessionId: String, title: String) {
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                SessionIndex.shared.applyTitle(sessionId: sessionId, title: title)
             }
         }
     }

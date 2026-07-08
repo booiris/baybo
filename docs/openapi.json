@@ -3887,6 +3887,13 @@
             "type": "string",
             "format": "date-time"
           },
+          "last_message_text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Preview text drawn from the session's most-recent **displayable**\nmessage regardless of author — the newest user prompt or final\nassistant answer carrying text, truncated to [`PREVIEW_MAX_CHARS`].\nTelegram-style list clients render this as the row's second line so\nthe preview follows the conversation (an agent reply shows once it\nlands), while [`Self::last_user_text`] stays the user-only label the\nweb sidebar uses. `None` when the scanned tail holds only tool /\nmedia rows or the session has no turn yet."
+          },
           "last_user_text": {
             "type": [
               "string",

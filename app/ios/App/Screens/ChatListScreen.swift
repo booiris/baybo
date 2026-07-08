@@ -84,6 +84,15 @@ struct ChatListScreen: View {
                 Task { await refresh() }
             }
         }
+        // Popping back from a conversation to the list root: `.task` doesn't
+        // re-run (the list stayed mounted under the pushed ChatScreen), so
+        // refresh here to reconcile the row a just-visited chat may have
+        // retitled / re-previewed while it was open.
+        .onChange(of: appStore.chatPath) { old, new in
+            if new.isEmpty && !old.isEmpty {
+                Task { await refresh() }
+            }
+        }
         #if DEBUG
             .task {
                 if ProcessInfo.processInfo.arguments.contains("-baybo-demo-refresh") {
@@ -101,8 +110,7 @@ struct ChatListScreen: View {
                 } label: {
                     SessionRowView(
                         row: row,
-                        langCode: lang.current.lproj,
-                        justNow: lang.t("list.justNow")
+                        langCode: lang.current.lproj
                     )
                 }
                 // CONSTANT background — the pinned tint lives in the row content
@@ -286,47 +294,32 @@ struct ChatListScreen: View {
     }
 }
 
-/// One list row: the last-user-text preview over a pin + relative-age line.
+/// One list row, Telegram-shaped: a bold conversation title over a grey
+/// last-message preview on the left; the last-active time over an unread badge
+/// (or pin marker) on the right. Untitled sessions collapse to a single
+/// message line until the server's title pass lands.
 struct SessionRowView: View {
     let row: SessionRow
-    /// The app language's locale identifier (drives the age formatter, so it
+    /// The app language's locale identifier (drives the time formatter, so it
     /// can't diverge from the chrome language).
     let langCode: String
-    let justNow: String
 
-    private static let justNowThreshold: TimeInterval = 5
-    private static let absoluteTimeThreshold: TimeInterval = 24 * 60 * 60
+    /// The window (in days from today) over which the time column shows a
+    /// weekday name rather than a clock time (today) or a calendar date (older).
+    private static let weekdayWindow: Range<Int> = 1..<7
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(verbatim: row.lastUserText ?? Lang.shared.t("list.previewPlaceholder"))
-                    .font(Theme.mono(15))
-                    .foregroundStyle(row.lastUserText == nil ? Theme.inkSoft : Theme.ink)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                HStack(spacing: 6) {
-                    if row.pinned {
-                        Image(systemName: "pin.fill")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(Theme.inkSoft)
-                            .transition(.scale.combined(with: .opacity))
-                    }
-                    Text(
-                        verbatim: Self.age(
-                            of: row.lastActive, locale: langCode, justNow: justNow)
-                    )
-                    .font(Theme.mono(12))
-                    .foregroundStyle(Theme.inkSoft)
-                }
-                .animation(ChatListScreen.pinTintFade, value: row.pinned)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            if row.unread > 0 {
-                unreadBadge
-            }
+        HStack(alignment: .top, spacing: 12) {
+            textColumn
+                .frame(maxWidth: .infinity, alignment: .leading)
+            metaColumn
         }
-        .padding(.vertical, 14)
+        // Uniform row height regardless of one vs two text lines or the badge's
+        // taller meta column — a single-line untitled row (with or without an
+        // unread badge) reserves the same block and centers within it, so the
+        // list never looks ragged.
+        .frame(minHeight: 38)
+        .padding(.vertical, 12)
         // The pinned ground, drawn in-content so it cross-fades instead of a
         // hard cell-background swap; negative gutter bleeds it edge-to-edge.
         .background {
@@ -337,6 +330,63 @@ struct SessionRowView: View {
                 .animation(ChatListScreen.pinTintFade, value: row.pinned)
         }
         .contentShape(Rectangle())
+    }
+
+    /// Left column. Titled → bold title + grey preview (two lines); untitled →
+    /// the message text alone on one line (bold when present, quiet-grey for the
+    /// empty placeholder), so a fresh row never doubles the same text.
+    @ViewBuilder private var textColumn: some View {
+        if let title = row.title, !title.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(verbatim: title)
+                    .font(Theme.mono(15, weight: .bold))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Text(verbatim: previewText)
+                    .font(Theme.mono(13))
+                    .foregroundStyle(Theme.inkSoft)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        } else {
+            Text(verbatim: previewText)
+                .font(Theme.mono(15, weight: row.preview == nil ? .regular : .bold))
+                .foregroundStyle(row.preview == nil ? Theme.inkSoft : Theme.ink)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+    }
+
+    private var previewText: String {
+        row.preview ?? Lang.shared.t("list.previewPlaceholder")
+    }
+
+    /// Right column: time pinned to the top (beside the title), the unread
+    /// badge or pin marker pinned to the bottom (beside the preview).
+    private var metaColumn: some View {
+        VStack(alignment: .trailing, spacing: 6) {
+            Text(verbatim: Self.timeLabel(row.lastActive, locale: langCode))
+                .font(Theme.mono(11))
+                .foregroundStyle(Theme.inkSoft)
+            Spacer(minLength: 0)
+            trailingMarker
+                .animation(ChatListScreen.pinTintFade, value: row.pinned)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    /// Bottom-right marker: the unread badge takes priority (Telegram-style),
+    /// falling back to a quiet pin glyph on a pinned-but-read row, else nothing.
+    @ViewBuilder private var trailingMarker: some View {
+        if row.unread > 0 {
+            unreadBadge
+        } else if row.pinned {
+            Image(systemName: "pin.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Theme.inkSoft)
+                .transition(.scale.combined(with: .opacity))
+        }
     }
 
     /// The unread count for a backgrounded session: an ink capsule with paper
@@ -352,26 +402,32 @@ struct SessionRowView: View {
             .accessibilityLabel(Text(verbatim: "\(row.unread)"))
     }
 
-    private static func age(
-        of date: Date,
-        locale: String,
-        justNow: String,
-        relativeTo now: Date = Date()
+    /// Telegram-style time column: a clock time for today, the weekday name
+    /// within the last week, then a calendar date (with year once it rolls
+    /// over). Locale drives digit shape and weekday/date ordering.
+    private static func timeLabel(
+        _ date: Date, locale: String, relativeTo now: Date = Date()
     ) -> String {
-        let elapsed = now.timeIntervalSince(date)
-        if elapsed < Self.justNowThreshold {
-            return justNow
-        }
-        if elapsed >= Self.absoluteTimeThreshold {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: locale)
-            let sameYear = Calendar.current.isDate(date, equalTo: now, toGranularity: .year)
-            formatter.setLocalizedDateFormatFromTemplate(sameYear ? "Mdjm" : "yMdjm")
+        // A server-stamped `lastActive` can land slightly ahead of the device
+        // clock (skew, or a just-sent row); clamp to now so a "tomorrow" value
+        // reads as the current time, not a future calendar date.
+        let date = min(date, now)
+        let calendar = Calendar.current
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: locale)
+        if calendar.isDateInToday(date) {
+            formatter.setLocalizedDateFormatFromTemplate("jm")
             return formatter.string(from: date)
         }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.locale = Locale(identifier: locale)
-        formatter.unitsStyle = .short
-        return formatter.localizedString(for: date, relativeTo: now)
+        let days = calendar.dateComponents(
+            [.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)
+        ).day
+        if let days, Self.weekdayWindow.contains(days) {
+            formatter.setLocalizedDateFormatFromTemplate("EEE")
+            return formatter.string(from: date)
+        }
+        let sameYear = calendar.isDate(date, equalTo: now, toGranularity: .year)
+        formatter.setLocalizedDateFormatFromTemplate(sameYear ? "Md" : "yMd")
+        return formatter.string(from: date)
     }
 }

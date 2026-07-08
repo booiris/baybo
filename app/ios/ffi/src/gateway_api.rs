@@ -82,6 +82,12 @@ struct SessionSummary {
     last_active: String,
     #[serde(default)]
     last_user_text: Option<String>,
+    /// Newest-message preview (any author) — absent on an older gateway.
+    #[serde(default)]
+    last_message_text: Option<String>,
+    /// Auto-generated title — absent until the title pass has run.
+    #[serde(default)]
+    title: Option<String>,
     pinned: bool,
     #[serde(default)]
     archived: bool,
@@ -196,6 +202,8 @@ pub(crate) async fn list_sessions<C: GatewayJsonClient + Sync>(
             created_at: s.created_at,
             last_active: s.last_active,
             last_user_text: s.last_user_text,
+            last_message_text: s.last_message_text,
+            title: s.title,
             pinned: s.pinned,
             archived: s.archived,
             unread_count: s.unread_count,

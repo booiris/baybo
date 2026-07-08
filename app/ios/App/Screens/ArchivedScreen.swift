@@ -90,8 +90,7 @@ struct ArchivedScreen: View {
                 } label: {
                     SessionRowView(
                         row: row,
-                        langCode: lang.current.lproj,
-                        justNow: lang.t("list.justNow")
+                        langCode: lang.current.lproj
                     )
                 }
                 .listRowBackground(Theme.paper)
