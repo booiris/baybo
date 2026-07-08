@@ -294,10 +294,10 @@ struct ChatListScreen: View {
     }
 }
 
-/// One list row, Telegram-shaped: a bold conversation title over a grey
-/// last-message preview on the left; the last-active time over an unread badge
-/// (or pin marker) on the right. Untitled sessions collapse to a single
-/// message line until the server's title pass lands.
+/// One list row, Telegram-shaped: a bold headline (the conversation title, or a
+/// short snippet of the user's last message until the title pass runs) over a
+/// grey last-message preview on the left; the last-active time over an unread
+/// badge on the right. Pinned rows are marked by a tinted background, not a glyph.
 struct SessionRowView: View {
     let row: SessionRow
     /// The app language's locale identifier (drives the time formatter, so it
@@ -314,10 +314,10 @@ struct SessionRowView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             metaColumn
         }
-        // Uniform row height regardless of one vs two text lines or the badge's
-        // taller meta column — a single-line untitled row (with or without an
-        // unread badge) reserves the same block and centers within it, so the
-        // list never looks ragged.
+        // Uniform row height regardless of a missing preview line or the badge's
+        // taller meta column — a headline-only row (a session with no message
+        // yet) reserves the same block and centers within it, so the list never
+        // looks ragged.
         .frame(minHeight: 38)
         .padding(.vertical, 12)
         // The pinned ground, drawn in-content so it cross-fades instead of a
@@ -332,38 +332,54 @@ struct SessionRowView: View {
         .contentShape(Rectangle())
     }
 
-    /// Left column. Titled → bold title + grey preview (two lines); untitled →
-    /// the message text alone on one line (bold when present, quiet-grey for the
-    /// empty placeholder), so a fresh row never doubles the same text.
-    @ViewBuilder private var textColumn: some View {
-        if let title = row.title, !title.isEmpty {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(verbatim: title)
-                    .font(Theme.mono(15, weight: .bold))
-                    .foregroundStyle(Theme.ink)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Text(verbatim: previewText)
+    /// Longest user-message snippet the bold headline shows before the title
+    /// pass has run — a compact title stand-in, not the full message.
+    private static let headlineMaxChars = 8
+
+    /// Left column: a bold headline over the grey last-message preview. The
+    /// headline is the conversation title, or — before the title pass runs — a
+    /// short snippet of the user's most recent message; the preview line below
+    /// is the latest message from either side.
+    private var textColumn: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(verbatim: headline)
+                .font(Theme.mono(15, weight: .bold))
+                .foregroundStyle(hasHeadline ? Theme.ink : Theme.inkSoft)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if let preview = row.preview, !preview.isEmpty {
+                Text(verbatim: preview)
                     .font(Theme.mono(13))
                     .foregroundStyle(Theme.inkSoft)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-        } else {
-            Text(verbatim: previewText)
-                .font(Theme.mono(15, weight: row.preview == nil ? .regular : .bold))
-                .foregroundStyle(row.preview == nil ? Theme.inkSoft : Theme.ink)
-                .lineLimit(1)
-                .truncationMode(.tail)
         }
     }
 
-    private var previewText: String {
-        row.preview ?? Lang.shared.t("list.previewPlaceholder")
+    /// Bold first line: the title, else a short snippet of the user's last
+    /// message, else a quiet placeholder for a session with no user turn yet.
+    private var headline: String {
+        if let title = row.title, !title.isEmpty { return title }
+        if let userText = row.userText, !userText.isEmpty { return Self.snippet(userText) }
+        return Lang.shared.t("list.previewPlaceholder")
     }
 
-    /// Right column: time pinned to the top (beside the title), the unread
-    /// badge or pin marker pinned to the bottom (beside the preview).
+    private var hasHeadline: Bool {
+        !(row.title ?? "").isEmpty || !(row.userText ?? "").isEmpty
+    }
+
+    /// The user-message fallback headline: whitespace collapsed and clipped to
+    /// `headlineMaxChars` with a trailing ellipsis when it overflows.
+    private static func snippet(_ text: String) -> String {
+        let collapsed = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return collapsed.count > headlineMaxChars
+            ? String(collapsed.prefix(headlineMaxChars)) + "…"
+            : collapsed
+    }
+
+    /// Right column: time pinned to the top (beside the headline), the unread
+    /// badge pinned to the bottom (beside the preview).
     private var metaColumn: some View {
         VStack(alignment: .trailing, spacing: 6) {
             Text(verbatim: Self.timeLabel(row.lastActive, locale: langCode))
@@ -371,21 +387,16 @@ struct SessionRowView: View {
                 .foregroundStyle(Theme.inkSoft)
             Spacer(minLength: 0)
             trailingMarker
-                .animation(ChatListScreen.pinTintFade, value: row.pinned)
         }
         .fixedSize(horizontal: true, vertical: false)
     }
 
-    /// Bottom-right marker: the unread badge takes priority (Telegram-style),
-    /// falling back to a quiet pin glyph on a pinned-but-read row, else nothing.
+    /// Bottom-right marker: the unread badge when there are unread replies, else
+    /// nothing. A pinned row is signalled by its tinted background alone — no
+    /// pin glyph.
     @ViewBuilder private var trailingMarker: some View {
         if row.unread > 0 {
             unreadBadge
-        } else if row.pinned {
-            Image(systemName: "pin.fill")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(Theme.inkSoft)
-                .transition(.scale.combined(with: .opacity))
         }
     }
 

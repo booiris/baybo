@@ -169,7 +169,9 @@ final class AppStore: ObservableObject {
             for i in 1...6 {
                 SessionIndex.shared.clearUnread("demo-\(i)")
             }
-            for id in ["demo-1", "demo-3"] {
+            // Badge demo-1 / demo-5 (not the pinned demo-3) so the screenshot
+            // shows a pinned-but-read row carrying only its tint, no glyph.
+            for id in ["demo-1", "demo-5"] {
                 SessionIndex.shared.noteActivity(sessionId: id, source: "assistant", atMillis: 0)
             }
             if demoPin {

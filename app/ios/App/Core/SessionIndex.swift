@@ -16,6 +16,10 @@ struct SessionRow: Codable, Identifiable, Equatable {
     /// truth (`last_message_text`) on merge; nil for a session with no
     /// displayable turn yet.
     var preview: String?
+    /// The most-recent USER message (server `last_user_text`). Drives the bold
+    /// first line's fallback (a short snippet) when there's no title yet — kept
+    /// separate from `preview`, which follows the agent's reply too.
+    var userText: String?
     var pinned: Bool
     /// Server-side flag (like `pinned`): archived rows live under the Archived
     /// screen instead of the main list, but keep accruing unread/recency.
@@ -26,13 +30,15 @@ struct SessionRow: Codable, Identifiable, Equatable {
 
     init(
         id: String, createdAt: Date, lastActive: Date, title: String? = nil,
-        preview: String?, pinned: Bool, archived: Bool = false, unread: Int = 0
+        preview: String?, userText: String? = nil, pinned: Bool, archived: Bool = false,
+        unread: Int = 0
     ) {
         self.id = id
         self.createdAt = createdAt
         self.lastActive = lastActive
         self.title = title
         self.preview = preview
+        self.userText = userText
         self.pinned = pinned
         self.archived = archived
         self.unread = unread
@@ -53,15 +59,15 @@ struct SessionRow: Codable, Identifiable, Equatable {
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         lastActive = try c.decode(Date.self, forKey: .lastActive)
         title = try c.decodeIfPresent(String.self, forKey: .title)
-        if let current = try c.decodeIfPresent(String.self, forKey: .preview) {
-            preview = current
-        } else if let legacy = try? decoder.container(keyedBy: LegacyKeys.self),
-            let legacyText = try? legacy.decodeIfPresent(String.self, forKey: .lastUserText)
-        {
-            preview = legacyText
-        } else {
-            preview = nil
+        // The pre-Telegram schema stored the user's last message under
+        // `lastUserText`; fall back to it for BOTH the preview and the user-text
+        // label so an existing sessions.json upgrades in place.
+        var legacy: String?
+        if let legacyContainer = try? decoder.container(keyedBy: LegacyKeys.self) {
+            legacy = (try? legacyContainer.decodeIfPresent(String.self, forKey: .lastUserText)) ?? nil
         }
+        preview = try c.decodeIfPresent(String.self, forKey: .preview) ?? legacy
+        userText = try c.decodeIfPresent(String.self, forKey: .userText) ?? legacy
         pinned = try c.decode(Bool.self, forKey: .pinned)
         archived = try c.decodeIfPresent(Bool.self, forKey: .archived) ?? false
         unread = try c.decodeIfPresent(Int.self, forKey: .unread) ?? 0
@@ -159,14 +165,19 @@ final class SessionIndex: ObservableObject {
         let now = Date()
         if let idx = rows.firstIndex(where: { $0.id == sessionId }) {
             if !preview.isEmpty {
+                // The just-sent message is both the newest message overall and
+                // the newest USER message, so it drives the preview AND the
+                // bold-line fallback until REST reconciles.
                 rows[idx].preview = preview
+                rows[idx].userText = preview
             }
             rows[idx].lastActive = now
         } else {
             rows.append(
                 SessionRow(
                     id: sessionId, createdAt: now, lastActive: now,
-                    preview: preview.isEmpty ? nil : preview, pinned: false))
+                    preview: preview.isEmpty ? nil : preview,
+                    userText: preview.isEmpty ? nil : preview, pinned: false))
         }
         save()
     }
@@ -391,19 +402,20 @@ final class SessionIndex: ObservableObject {
             let unread = Int(summary.unreadCount)
             if let mine, mine.lastActive > lastActive {
                 // Local row saw activity after this snapshot (a just-sent
-                // message racing the refetch) — keep its fresher preview.
+                // message racing the refetch) — keep its fresher preview/label.
                 merged.append(
                     SessionRow(
                         id: summary.sessionId, createdAt: createdAt,
                         lastActive: mine.lastActive, title: title,
                         preview: mine.preview ?? remotePreview,
+                        userText: mine.userText ?? summary.lastUserText,
                         pinned: pinned, archived: archived, unread: unread))
             } else {
                 merged.append(
                     SessionRow(
                         id: summary.sessionId, createdAt: createdAt, lastActive: lastActive,
-                        title: title, preview: remotePreview, pinned: pinned,
-                        archived: archived, unread: unread))
+                        title: title, preview: remotePreview, userText: summary.lastUserText,
+                        pinned: pinned, archived: archived, unread: unread))
             }
         }
         rows = merged
