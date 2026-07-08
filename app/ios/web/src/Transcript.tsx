@@ -668,7 +668,19 @@ export function Transcript({
     if (!box) return;
     const ro = new ResizeObserver(() => {
       const el = scrollEl();
-      if (el && followRef.current && !userTouchingRef.current) el.scrollTop = el.scrollHeight;
+      if (!el) return;
+      // A resize that leaves nothing below the fold — an empty/short draft, or
+      // the prewarm 0→full-size grow when a reused draft first paints — clears a
+      // jump button latched by a transient off-edge scroll during that resize:
+      // onScroll is the only recompute of follow/showJump, and a non-scrollable
+      // thread emits no further scroll event to correct it. Nothing to scroll ⇒
+      // always following, button hidden.
+      if (el.scrollHeight - el.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX) {
+        followRef.current = true;
+        setShowJump(false);
+        return;
+      }
+      if (followRef.current && !userTouchingRef.current) el.scrollTop = el.scrollHeight;
     });
     ro.observe(box);
     return () => ro.disconnect();
