@@ -2082,7 +2082,6 @@
                           "session_id",
                           "input_kind",
                           "origin",
-                          "shape",
                           "status",
                           "emitted_span_ids",
                           "created_at"
@@ -2130,10 +2129,6 @@
                           },
                           "session_id": {
                             "type": "string"
-                          },
-                          "shape": {
-                            "$ref": "#/components/schemas/JobShape",
-                            "description": "Turn vs maintenance."
                           },
                           "started_at": {
                             "type": [
@@ -4340,7 +4335,6 @@
           "session_id",
           "input_kind",
           "origin",
-          "shape",
           "status",
           "emitted_span_ids",
           "created_at"
@@ -4389,10 +4383,6 @@
           "session_id": {
             "type": "string"
           },
-          "shape": {
-            "$ref": "#/components/schemas/JobShape",
-            "description": "Turn vs maintenance."
-          },
           "started_at": {
             "type": [
               "string",
@@ -4411,7 +4401,7 @@
         "enum": [
           "user_chat",
           "cron",
-          "system",
+          "compact",
           "spawned",
           "subagent_notification"
         ]
@@ -4422,16 +4412,7 @@
         "enum": [
           "user",
           "cron",
-          "system",
           "spawned"
-        ]
-      },
-      "JobShape": {
-        "type": "string",
-        "description": "Wire mirror of [`baybo_job::JobShape`] — turn vs maintenance.",
-        "enum": [
-          "turn",
-          "maintenance"
         ]
       },
       "JobStatus": {

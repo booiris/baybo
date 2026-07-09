@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
-use baybo_channels::{
-    AgentEvent, AgentOutput, COMPACT_COMMAND, OutgoingMessage, ToolStatus, TurnStatus,
-};
+use baybo_channels::{AgentEvent, AgentOutput, OutgoingMessage, ToolStatus, TurnStatus};
 use baybo_context::ContextManager;
-use baybo_job::{JobInput, JobLifecycle, JobOutput, JobShape};
+use baybo_job::{JobInput, JobLifecycle, JobOutput};
 use baybo_llm::{
     Attribution, BillableLlm, BoundBilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
     ToolDefinitionForLlm,
@@ -338,7 +336,7 @@ pub trait InterjectionSource: Send {
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 /// The recall query for a job, or `None` for job kinds that don't recall.
-/// Memory recall/write run only for `UserChat` and `Cron` jobs — `System`,
+/// Memory recall/write run only for `UserChat` and `Cron` jobs — `Compact`,
 /// `Spawned` (subagent), and `SubagentNotification` have no direct user input
 /// and would pollute or double-write. The exhaustive match forces a
 /// classification when a new `JobInput` variant is added.
@@ -346,9 +344,9 @@ fn memory_recall_query(input: &JobInput) -> Option<Vec<ContentBlock>> {
     match input {
         JobInput::UserChat { content } => Some(content.clone()),
         JobInput::Cron { action_payload } => Some(cron_prompt_blocks(action_payload)),
-        JobInput::System { .. }
-        | JobInput::Spawned { .. }
-        | JobInput::SubagentNotification { .. } => None,
+        JobInput::Compact | JobInput::Spawned { .. } | JobInput::SubagentNotification { .. } => {
+            None
+        }
     }
 }
 
@@ -639,7 +637,7 @@ impl AgentLoop {
     /// caller as `AgentEvent::Message` so non-streaming adapters receive
     /// the canonical response.
     // `job_input` records why this job exists (provenance: which trigger
-    // kicked it off — User / Cron / System / Spawned), used for the JobSpec.
+    // kicked it off — User / Cron / Spawned), used for the JobSpec.
     // The turn's triggering message is appended to the transcript by the
     // actor *before* this runs (via `append_user_message` / `append_cron_fire`
     // / `append_subagent_notification`), so the loop iterates the current
@@ -699,13 +697,12 @@ impl AgentLoop {
     ) -> anyhow::Result<OutgoingMessage> {
         self.refresh_active_llm();
         // Memory recall query (and write eligibility) for this job — `None`
-        // for kinds that don't participate (System / Spawned / notification).
+        // for kinds that don't participate (Spawned / notification).
         let memory_query = memory_recall_query(&job_input);
         let is_user_turn = matches!(job_input.input_kind(), baybo_job::JobInputKind::UserChat);
         let spec = JobSpec {
             session_id: session.id.clone(),
             origin: session.trigger.kind(),
-            shape: JobShape::Turn,
             input: job_input,
             parent_job_id,
         };
@@ -731,7 +728,6 @@ impl AgentLoop {
                 let (outgoing, pending) = self
                     .run_inner(
                         session,
-                        job_lifecycle,
                         span_recorder,
                         job_id,
                         delta_tx,
@@ -773,7 +769,6 @@ impl AgentLoop {
     async fn run_inner(
         &mut self,
         session: &mut Session,
-        job_lifecycle: &Arc<JobLifecycle>,
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
@@ -888,15 +883,6 @@ impl AgentLoop {
                         job_user_input.extend(content.iter().cloned());
                     }
                 }
-                // Iteration-boundary summary-refresh check.
-                self.maybe_run_background_compression(
-                    session,
-                    job_lifecycle,
-                    span_recorder,
-                    job_id,
-                    /* job_done */ false,
-                )
-                .await;
             }
 
             // Refresh the checklist reminder (in `ContextManager`) BEFORE the
@@ -957,7 +943,6 @@ impl AgentLoop {
                     // the tokens / diff conjuncts still apply.
                     self.maybe_run_background_compression(
                         session,
-                        job_lifecycle,
                         span_recorder,
                         job_id,
                         /* job_done */ true,
@@ -986,6 +971,17 @@ impl AgentLoop {
                         // anchor: the model just touched the list, so don't nag.
                         self.last_task_management_turn = self.turn_counter;
                     }
+
+                    // Tool results are now appended and durable, so this
+                    // tool-round boundary can spawn a detached background
+                    // summary as a Compression step under the current job.
+                    self.maybe_run_background_compression(
+                        session,
+                        span_recorder,
+                        job_id,
+                        /* job_done */ false,
+                    )
+                    .await;
 
                     // Observe only after a resolved tool round: the snapshot is
                     // coherent (no dangling tool_use) and never spawned for a
@@ -2522,19 +2518,13 @@ impl AgentLoop {
         parent_job_id: Option<JobId>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<String> {
-        // `/compact` is a user-typed command, so the input is a UserChat
-        // payload regardless of the session's root trigger; the trigger
-        // is recorded separately as the job's origin. It runs
-        // `force_compress`, not the agent loop, so its shape is
-        // `Maintenance` (like background compression) despite the
-        // turn-shaped input.
-        let job_input = JobInput::UserChat {
-            content: vec![ContentBlock::Text(COMPACT_COMMAND.to_string())],
-        };
+        // `/compact` is a user-typed command, but it is not a chat turn: it
+        // runs `force_compress` directly and emits a notice, not an assistant
+        // reply.
+        let job_input = JobInput::Compact;
         let spec = JobSpec {
             session_id: session.id.clone(),
             origin: session.trigger.kind(),
-            shape: JobShape::Maintenance,
             input: job_input,
             parent_job_id,
         };
@@ -2569,7 +2559,7 @@ impl AgentLoop {
                 };
                 let output = JobOutput::Message {
                     content: vec![ContentBlock::Text(text.clone())],
-                    // `/compact` is a Maintenance job — never pushed.
+                    // `/compact` is not a user-chat turn — never pushed.
                     ordinal: None,
                 };
                 Ok((output, text))
@@ -2583,7 +2573,8 @@ impl AgentLoop {
     /// commit. When tokens and activity have crossed their thresholds
     /// (see [`ContextManager::maybe_request_background_summary`]) it
     /// `tokio::spawn`s a DETACHED background-summary pass attributed to
-    /// **this** (parent) session. Fire-and-forget: the user's turn never
+    /// **this** (parent) session and recorded as `StepKind::Compression`
+    /// under the current turn job. Fire-and-forget: the user's turn never
     /// blocks on it.
     ///
     /// `job_done = true` is passed at end-of-job (where the activity
@@ -2610,7 +2601,6 @@ impl AgentLoop {
     async fn maybe_run_background_compression(
         &mut self,
         session: &Session,
-        job_lifecycle: &Arc<JobLifecycle>,
         span_recorder: &Arc<SpanRecorder>,
         current_job_id: JobId,
         job_done: bool,
@@ -2641,16 +2631,14 @@ impl AgentLoop {
 
         // Pre-extract everything the 'static task needs — the spawned
         // future cannot borrow `&self` / `&session`. The pass bills +
-        // traces against this session.
+        // traces against this session and the current turn job.
         let session_id = session.id.clone();
-        let origin = session.trigger.kind();
         let user_id = session.user.id.clone();
         let llm_client = self.llm_client.clone();
         let security_gateway = self.security_gateway.clone();
         let tokenizer = Arc::clone(self.context_manager.tokenizer());
         let model_info = self.llm_client.model_info().clone();
         let recorder = Arc::clone(span_recorder);
-        let job_lifecycle = Arc::clone(job_lifecycle);
 
         // Fresh, never-cancelled token — NOT a child of the actor's
         // token. The idle reaper cancels the actor token; deriving from
@@ -2659,48 +2647,20 @@ impl AgentLoop {
         let cancel_token = CancellationToken::new();
 
         let handle = tokio::spawn(async move {
-            // Clone the session id for the runner before the spec moves
-            // it into `session_id`.
-            let runner_session_id = session_id.clone();
-            let spec = JobSpec {
+            let runner = crate::runtime::compression::BackgroundCompressionRunner {
+                llm_client,
+                security_gateway,
+                sessions,
+                workspace_paths,
+                tokenizer,
+                recorder,
+                model_info,
                 session_id,
-                // Runs inside the triggering (User / Cron) session, so it
-                // records that session's trigger as its origin.
-                origin,
-                // A compression pass, not an agent-loop turn.
-                shape: JobShape::Maintenance,
-                input: baybo_job::JobInput::System {
-                    payload: baybo_job::SystemJobPayload::Compression(payload.clone()),
-                },
-                // Parent the maintenance job under the triggering turn's job.
-                parent_job_id: Some(current_job_id),
+                user_id,
+                job_id: current_job_id,
+                cancel_token,
             };
-            let result = crate::runtime::scope::with_job(
-                &job_lifecycle,
-                cancel_token.clone(),
-                spec,
-                move |job_id| async move {
-                    let runner = crate::runtime::compression::BackgroundCompressionRunner {
-                        llm_client,
-                        security_gateway,
-                        sessions,
-                        workspace_paths,
-                        tokenizer,
-                        recorder,
-                        model_info,
-                        session_id: runner_session_id,
-                        user_id,
-                        job_id,
-                        cancel_token,
-                    };
-                    let outcome = runner.run(payload).await?;
-                    let value = serde_json::to_value(&outcome)?;
-                    let output = baybo_job::JobOutput::Structured { value };
-                    Ok((output, outcome))
-                },
-            )
-            .await;
-            if let Err(e) = result {
+            if let Err(e) = runner.run(payload).await {
                 warn!(error = %e, "background summary pass failed");
             }
         });
@@ -3245,10 +3205,9 @@ mod trim_response_text_edges_tests {
 #[cfg(test)]
 mod session_end_gate_tests {
     //! `should_fire_session_end` decides whether `Memory::on_session_end`
-    //! runs when an actor processes `ActorStop`. Subagent actors and
-    //! `System`-triggered (background compression) sessions also stop,
-    //! but their teardown is not a user-session ending — firing the hook
-    //! for them would write garbage memory.
+    //! runs when an actor processes `ActorStop`. Subagent actors also stop,
+    //! but their teardown is not a user-session ending — firing the hook for
+    //! them would write garbage memory.
     use super::should_fire_session_end;
     use baybo_model::{
         ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, TriggerSource,

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use baybo_channels::{AgentOutput, IncomingMessage, Message};
 use baybo_cost::CostManager;
-use baybo_job::{CancelReason, JobInput, JobLifecycle, JobOutput, JobShape};
+use baybo_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
 use baybo_llm::TokenUsage;
 use baybo_model::{
     BACKGROUND_DISPATCH_ACK_PREFIX, ChannelType, ChatMessage, ContentBlock, ExternalAgentKind,
@@ -1072,7 +1072,6 @@ async fn run_external_agent_job(
         .start_job(
             child_session_id.clone(),
             job_ctx.trigger_kind,
-            JobShape::Turn,
             JobInput::Spawned { initial_prompt },
             Some(job_ctx.parent_job_id),
         )

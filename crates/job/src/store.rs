@@ -15,7 +15,7 @@ fn job_input_kind_str(kind: JobInputKind) -> &'static str {
     match kind {
         JobInputKind::UserChat => "user_chat",
         JobInputKind::Cron => "cron",
-        JobInputKind::System => "system",
+        JobInputKind::Compact => "compact",
         JobInputKind::Spawned => "spawned",
         JobInputKind::SubagentNotification => "subagent_notification",
     }

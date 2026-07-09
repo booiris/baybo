@@ -219,14 +219,13 @@ impl LibsqlJobStore {
 #[allow(unused_must_use)] // tests build state machines via direct calls; the JobTransition audit record isn't the assertion target
 mod tests {
     use super::*;
-    use baybo_job::{Job, JobInput, JobShape, JobStatus};
+    use baybo_job::{Job, JobInput, JobStatus};
     use baybo_model::{ContentBlock, TriggerKind};
 
     fn test_job() -> Job {
         Job::new(
             SessionId::from("sess-1"),
             TriggerKind::User,
-            JobShape::Turn,
             JobInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
@@ -332,7 +331,6 @@ mod tests {
             Job::new(
                 s.clone(),
                 TriggerKind::User,
-                JobShape::Turn,
                 JobInput::UserChat {
                     content: vec![ContentBlock::Text("hi".into())],
                 },

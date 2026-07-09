@@ -6,9 +6,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::JobStatus;
 use crate::cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
-use crate::{
-    CancelReason, Job, JobError, JobInput, JobInputKind, JobShape, JobStatusKind, JobTransition,
-};
+use crate::{CancelReason, Job, JobError, JobInput, JobInputKind, JobStatusKind, JobTransition};
 use baybo_model::{JobId, SessionId, SpanId, TriggerKind};
 use baybo_store::JobStore;
 use tokio::sync::broadcast;
@@ -77,14 +75,9 @@ pub struct JobLifecycleEvent {
     pub session_id: SessionId,
     pub parent_job_id: Option<JobId>,
     pub phase: JobPhase,
-    /// Input class of the job (additive; the turn-state projector ignores it).
-    /// Lets the push dispatcher filter to real user turns
-    /// (`shape == Turn && kind == UserChat`) without re-fetching the Job.
+    /// Input class of the job. Lets the push dispatcher filter to real user
+    /// turns (`kind == UserChat`) without re-fetching the Job.
     pub kind: JobInputKind,
-    /// Execution shape of the job (additive). Pairs with `kind` so a
-    /// `/compact` — a `UserChat`-input but `Maintenance`-shape job — is
-    /// correctly excluded from push.
-    pub shape: JobShape,
 }
 
 /// Owns the job state machine + persistence orchestration. Pure
@@ -142,8 +135,6 @@ impl JobLifecycle {
     ///
     /// `origin` is the root trigger kind of the owning session — stored
     /// on the job as-is (see `baybo_job::kind`), independent of `input`.
-    /// `shape` is declared by the caller (the running code path), not
-    /// inferred from `input`.
     ///
     /// **Production code does not call this directly** — it goes
     /// through `agent::scope::with_job` (which builds a `JobSpec`
@@ -155,11 +146,10 @@ impl JobLifecycle {
         &self,
         session_id: SessionId,
         origin: TriggerKind,
-        shape: JobShape,
         input: JobInput,
         parent_job_id: Option<JobId>,
     ) -> Result<Job> {
-        let job = Job::new(session_id, origin, shape, input, parent_job_id);
+        let job = Job::new(session_id, origin, input, parent_job_id);
         self.store.create(&job.to_row()?).await?;
         Ok(job)
     }
@@ -342,8 +332,7 @@ impl JobLifecycle {
     /// turn activity. This centralizes the `Job::is_turn` filter so
     /// callers such as `/stop`, crash recovery, and TurnState projection
     /// do not each re-define "active reply" for themselves. A `/compact`
-    /// runs `Maintenance`-shaped, so it is correctly excluded here even
-    /// though its input is a `UserChat` payload.
+    /// has its own input kind, so it is correctly excluded here.
     pub async fn list_active_turns_by_session(
         &self,
         session_id: &baybo_model::SessionId,
@@ -356,8 +345,8 @@ impl JobLifecycle {
             .collect())
     }
 
-    /// When the session has a turn in flight (a non-terminal turn-shaped
-    /// job — see [`Job::is_turn`]), the instant it started. Chat
+    /// When the session has a turn in flight (a non-terminal turn job — see
+    /// [`Job::is_turn`]), the instant it started. Chat
     /// surfaces use this to tell a late-joining client "a reply is being
     /// produced since T"; `None` means the session is idle. A still-
     /// `Pending` turn reports its `created_at` (queued counts as in
@@ -433,7 +422,6 @@ impl JobLifecycle {
             parent_job_id: job.parent_job_id,
             phase,
             kind: job.input_kind(),
-            shape: job.shape,
         };
         self.persist(job, transition).await?;
         let _ = self.lifecycle_events.send(event);
@@ -454,7 +442,7 @@ impl JobLifecycle {
 mod tests {
     use super::*;
     use crate::test_support::MemoryJobStore;
-    use baybo_model::{BackgroundCompressionPayload, ContentBlock};
+    use baybo_model::ContentBlock;
 
     fn user_chat_input() -> JobInput {
         JobInput::UserChat {
@@ -480,7 +468,6 @@ mod tests {
             .start_job(
                 SessionId::from("s1"),
                 TriggerKind::User,
-                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
@@ -503,7 +490,6 @@ mod tests {
             .start_job(
                 SessionId::from("s1"),
                 TriggerKind::User,
-                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
@@ -532,7 +518,6 @@ mod tests {
             .start_job(
                 SessionId::from("s2"),
                 TriggerKind::User,
-                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
@@ -555,12 +540,11 @@ mod tests {
         // relies on a Spawned input working under any inherited root
         // trigger; more broadly, no input/trigger pairing is rejected.
         let lc = make_lifecycle();
-        for trigger in [TriggerKind::User, TriggerKind::Cron, TriggerKind::System] {
+        for trigger in [TriggerKind::User, TriggerKind::Cron] {
             let job = lc
                 .start_job(
                     SessionId::from(format!("child-of-{trigger:?}")),
                     trigger,
-                    JobShape::Turn,
                     JobInput::Spawned {
                         initial_prompt: vec![ContentBlock::Text("task".into())],
                     },
@@ -583,7 +567,6 @@ mod tests {
             .start_job(
                 SessionId::from("cron-session"),
                 TriggerKind::Cron,
-                JobShape::Turn,
                 JobInput::UserChat {
                     content: vec![ContentBlock::Text("hi".into())],
                 },
@@ -596,35 +579,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_turns_exclude_system_jobs() {
+    async fn active_turns_exclude_compact_jobs() {
         let lc = make_lifecycle();
         let session_id = SessionId::from("s1");
         let turn = lc
             .start_job(
                 session_id.clone(),
                 TriggerKind::User,
-                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
             .await
             .unwrap();
         lc.start(&turn.id).await.unwrap();
-        let system = lc
+        let compact = lc
             .start_job(
                 session_id.clone(),
-                TriggerKind::System,
-                JobShape::Maintenance,
-                JobInput::System {
-                    payload: crate::SystemJobPayload::Compression(BackgroundCompressionPayload {
-                        up_to_ordinal: 7,
-                    }),
-                },
+                TriggerKind::User,
+                JobInput::Compact,
                 None,
             )
             .await
             .unwrap();
-        lc.start(&system.id).await.unwrap();
+        lc.start(&compact.id).await.unwrap();
 
         let all_active = lc.list_active_by_session(&session_id).await.unwrap();
         assert_eq!(all_active.len(), 2);
@@ -645,7 +622,6 @@ mod tests {
             .start_job(
                 SessionId::from("s1"),
                 TriggerKind::User,
-                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
@@ -669,7 +645,6 @@ mod tests {
             .start_job(
                 SessionId::from("s1"),
                 TriggerKind::User,
-                JobShape::Turn,
                 user_chat_input(),
                 None,
             )

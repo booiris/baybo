@@ -110,7 +110,7 @@ Current drift tests:
 
 | Test                                            | Snapshot                | Regenerate with                                                            |
 | ----------------------------------------------- | ----------------------- | -------------------------------------------------------------------------- |
-| `crates/gateway/tests/openapi_spec_sync.rs`     | `docs/openapi.json`     | `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test openapi_spec_sync`     |
+| `crates/gateway/tests/openapi_spec_sync.rs`     | `docs/openapi.json`     | `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync` |
 
 The OpenAPI snapshot is the contract that `web/`'s
 `openapi-typescript` codegen reads to produce `app/web/src/api/schema.d.ts`;

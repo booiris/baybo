@@ -89,8 +89,8 @@ impl std::fmt::Display for ChannelType {
 
 /// What externally observable signal started this session.
 ///
-/// `Cron` and `System` carry their own contextual reference; `User` is
-/// purely "a person typed a message". A session spawned via subagent
+/// `Cron` carries its own contextual reference; `User` is purely "a person
+/// typed a message". A session spawned via subagent
 /// **inherits its trigger from its root session** — the `TriggerSource`
 /// answers "who paid for this work" / "what was the business reason",
 /// not "who literally constructed this session row".
@@ -123,7 +123,6 @@ impl TriggerSource {
 pub enum TriggerKind {
     User,
     Cron,
-    System,
     Spawned,
 }
 

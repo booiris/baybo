@@ -534,9 +534,9 @@ Dispatch trigger:
 
 1. A's `PushDispatcher` subscribes to the `JobLifecycle` broadcast bus.
 2. A dispatches only successfully completed real user chat turns:
-   `phase == Completed`, `shape == Turn`, and `kind == UserChat`.
-3. Cron, System, Spawned, SubagentNotification, failed turns, cancelled turns,
-   and Maintenance-shaped `/compact` jobs do not trigger push.
+   `phase == Completed` and `kind == UserChat`.
+3. Cron, Compact (`/compact`), Spawned, SubagentNotification, failed turns, and
+   cancelled turns do not trigger push.
 4. The `Completed { reply_ordinal }` event identifies the persisted assistant
    reply row. If there is no ordinal, A does not push.
 
