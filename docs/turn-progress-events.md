@@ -107,12 +107,13 @@ timer, mislabelling live turns as **Cancelled** and restarting the elapsed
 timer at `0s`. `TurnState` replaces the guess with server truth.
 
 The single source of truth is the **job store**: a turn is in flight exactly
-when the session has a non-terminal turn-shaped job (`Job::is_turn` — `shape ==
-Turn`). Background compression and `/compact` run `Maintenance`-shaped and are
-excluded, so a compaction never lights up the chat as a live reply — even
-`/compact`, whose input is a `UserChat` payload. `Frame::TurnState { active, started_at }` is that truth
-projected to chat clients. The actor emits **nothing**; there is one producer
-of the live signal and one of the join snapshot, both reading the same store:
+when the session has a non-terminal turn job (`Job::is_turn`). `/compact` has
+its own `Compact` input kind and is excluded, so it never lights up the chat as
+a live reply. Background compression is not a job of its own; it records a
+compression step under the triggering job. `Frame::TurnState { active,
+started_at }` is that truth projected to chat clients. The actor emits
+**nothing**; there is one producer of the live signal and one of the join
+snapshot, both reading the same store:
 
 - **Live edges** — the **turn-state projector** (`spawn_turn_state_projector`)
   subscribes to `JobLifecycle::subscribe_lifecycle_events`, which now carries
@@ -123,9 +124,9 @@ of the live signal and one of the join snapshot, both reading the same store:
   reads — they can't drift from a parallel actor emission (there is none), the
   close can't be skipped by an error or a crash, and the start carries the
   job's real `started_at`. "Recompute-is-truth" makes it robust to *which*
-  job's transition fired it (the turn, a child subagent, a
-  background-compression `System` job): each just means "recompute this session
-  now", and the broadcast is whatever is currently true.
+  job's transition fired it (the turn, a child subagent, or a `/compact` job):
+  each just means "recompute this session now", and the broadcast is whatever
+  is currently true.
 - **Join snapshot** — the gateway sends one `SubscribeState` bundle per
   `Subscribe`, whose `turn` half reads the same `active_turn_started_at`,
   so a late joiner (new tab, reconnect) renders the in-flight turn it

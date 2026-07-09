@@ -40,6 +40,10 @@ pub trait TraceStore: Send + Sync {
     async fn save_step(&self, step: &StepRow) -> Result<()>;
     async fn load_step(&self, step_id: &StepId) -> Result<Option<StepRow>>;
     async fn list_steps_by_job(&self, job_id: &JobId) -> Result<Vec<StepRow>>;
+    /// List steps that still need trace recovery: either the step row itself is
+    /// open, or at least one child span is open. Recovery uses this to find
+    /// detached trace work under jobs that are already terminal.
+    async fn list_unfinished_steps(&self) -> Result<Vec<StepRow>>;
 
     async fn save_span(&self, span: &SpanRow) -> Result<()>;
     async fn load_span(&self, span_id: &SpanId) -> Result<Option<SpanRow>>;

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `job` crate is the home for the Job concept: domain types (`Job`, `JobStatus`, `JobInputKind`, `JobShape`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `JobError`), the row conversions that persist them, and the `JobLifecycle` persistence orchestrator. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself; `JobLifecycle` wraps the `JobStore` with the cancel state machine, lifecycle-event bus, and `JobId → CancellationToken` registry the in-flight execution path subscribes to.
+The `job` crate is the home for the Job concept: domain types (`Job`, `JobStatus`, `JobInputKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `JobError`), the row conversions that persist them, and the `JobLifecycle` persistence orchestrator. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself; `JobLifecycle` wraps the `JobStore` with the cancel state machine, lifecycle-event bus, and `JobId → CancellationToken` registry the in-flight execution path subscribes to.
 
 The `JobStore` trait itself lives in the `baybo-store` ports crate and trades in row DTOs — `JobRow` (the queryable columns plus the serialized `Job` in `data`) and `JobTransitionRow`. This crate owns the `Job::to_row` / `Job::from_row` conversions, so the state machine stays here while the trait sits in a leaf crate every store consumer can reach. `baybo-storage` provides the libsql implementation, shuttling rows without depending on `baybo-job` (it converts in its tests only). `impl From<baybo_store::StorageError> for JobError` bridges errors at the call sites.
 
@@ -39,23 +39,18 @@ the boot recovery sweep rolls jobs left non-terminal by a prior process death to
 `Cancelled { SystemCrash }`, and the in-process actor panic runner does the same
 for the panicked session's active turn jobs.
 
-### Three orthogonal descriptors: input kind, origin, shape
+### Two orthogonal descriptors: input kind and origin
 
-A job is described along three independent axes, each with one source of truth — replacing a single overloaded `kind` that conflated "what payload" with "which trigger":
+A job is described along two independent axes, each with one source of truth — replacing a single overloaded `kind` that conflated "what payload" with "which trigger":
 
 ```rust
 // input kind — what payload fed the job; a projection of JobInput.
 // Display / the denormalised `jobs.kind` column only.
-pub enum JobInputKind { UserChat, Cron, System, Spawned, SubagentNotification }
-
-// shape — does it run a full agent-loop turn, or a one-shot
-// maintenance pass? Declared by the spawning code path.
-pub enum JobShape { Turn, Maintenance }
+pub enum JobInputKind { UserChat, Cron, Compact, Spawned, SubagentNotification }
 ```
 
-- **input kind** (`JobInputKind`) — `Job::input_kind()`, projected from `JobInput`. `JobInput` is a strongly typed payload enum whose variants line up 1:1 with `JobInputKind`.
-- **origin** (`baybo_model::TriggerKind`, stored on `Job.origin`) — the owning session's root trigger, recorded **as-is** at creation. It is *not* asserted against the payload: background compression runs inside a `User`-trigger session and records `origin = User` while carrying a `System` input. Subagent jobs record `origin = Spawned` (their session's inherited root).
-- **shape** (`JobShape`, stored on `Job.shape`) — **declared by the code path that runs the job**, not inferred from the payload: `run()` mints `Turn`; both background compression and the foreground `/compact` mint `Maintenance` (the latter despite its `UserChat` input — inferring shape from the input would mislabel it a turn). `Job::is_turn()` reads it. A session serialises its turns (≤1 active turn-job) but may run a concurrent `Maintenance` job, which is why `list_active_by_session` returns a `Vec`.
+- **input kind** (`JobInputKind`) — `Job::input_kind()`, projected from `JobInput`. `JobInput` is a strongly typed payload enum whose variants line up 1:1 with `JobInputKind`. `UserChat`, `Cron`, `Spawned`, and `SubagentNotification` are turn jobs; `Compact` is a foreground maintenance command and `Job::is_turn()` excludes it.
+- **origin** (`baybo_model::TriggerKind`, stored on `Job.origin`) — the owning session's root trigger, recorded **as-is** at creation. It is *not* asserted against the payload: `/compact` can run inside a `User`-trigger session while carrying a `Compact` input. Subagent jobs record `origin = Spawned` (their session's inherited root).
 
 `JobOutput` does not split this way — it has only `Message` and `Structured`, the two shapes any job can produce.
 
@@ -110,7 +105,6 @@ The job state machine itself is trigger-agnostic, but the actor that drives it f
 | --------------- | --------------------------------------------------------------- |
 | `User`          | Preempt: current job → `Cancelled { UserPreempt, ... }`          |
 | `Cron`          | Queue: actor mailbox holds it until current job is terminal     |
-| `System`        | Queue                                                            |
 | Subagent (any)  | Preempt: parent's cancellation token tree propagates downward   |
 
 Distinct from a new trigger arriving, the out-of-band `/stop` control command cancels the in-flight turn (and every in-flight descendant subagent) with `Cancelled { UserStopped, ... }` — that reason lets the subagent wait task suppress the terminal `BackgroundJobFinished` delivery so a stopped result never repopulates `pending_background_results`.
@@ -129,7 +123,7 @@ Distinct from a new trigger arriving, the out-of-band `/stop` control command ca
 
 - `input` / `final_result` / `JobStatus::Cancelled.partial_artifacts` store sanitized JSON / span-id lists only — sensitive values must already be placeholders
 - `save()` and `record_transition()` should run in the same transaction (enforced by `JobLifecycle`)
-- `Job.origin` and `Job.shape` are both supplied by the caller at `JobLifecycle::start_job` (via `JobSpec.origin` / `JobSpec.shape`) and passed straight into `Job::new`; neither is validated against the payload — input kind, origin, and shape are independent. Only `input_kind` is projected from `input`
+- `Job.origin` is supplied by the caller at `JobLifecycle::start_job` (via `JobSpec.origin`) and passed straight into `Job::new`; it is not validated against the payload. Only `input_kind` is projected from `input`
 - Does not depend on `trace`, `llm`, `tools`, or `agent`. Depends only on `baybo-model` for IDs.
 - `test_support::MemoryJobStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `baybo-job = { workspace = true, features = ["test-support"] }`.
 

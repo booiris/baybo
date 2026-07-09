@@ -24,9 +24,8 @@ Session (TriggerKind::User|Cron)
     ├─ end-of-job check        ──→ maybe_run_background_compression(job_done=true)
     │     └─ if gate passes AND no pass already in flight (in-memory JoinHandle):
     │          tokio::spawn(detached, fresh CancellationToken::new()):
-    │            mint JobInput::System job (attributed to PARENT session,
-    │            parent_job_id = triggering turn's job)
-    │              → BackgroundCompressionRunner::run → baybo_context::run_background_summary:
+    │            BackgroundCompressionRunner::run(current_job_id)
+    │              → baybo_context::run_background_summary:
     │                  1. load the session's session_messages (active, ordinal ≤ up_to_ordinal)
     │                  2. read summary.md (if exists)
     │                  3. one tool-free LLM call (same model as the session)
@@ -136,19 +135,10 @@ After a successful spawn the new `JoinHandle` is stored back on `self.bg_compres
 let cancel_token = CancellationToken::new();
 
 let handle = tokio::spawn(async move {
-    let spec = JobSpec {
-        session_id,                          // this session
-        origin: session.trigger.kind(),      // the triggering (User / Cron) session's trigger, recorded as-is
-        shape: JobShape::Maintenance,        // a compression pass, not an agent-loop turn
-        input: JobInput::System { payload },
-        parent_job_id: Some(current_job_id), // parent the maintenance job under the triggering turn
+    let runner = BackgroundCompressionRunner {
+        /* session_id, user_id, job_id: current_job_id, cancel_token, … */
     };
-    let result = scope::with_job(&job_lifecycle, cancel_token.clone(), spec, move |job_id| async move {
-        let runner = BackgroundCompressionRunner { /* session_id, user_id, job_id, cancel_token, … */ };
-        let outcome = runner.run(payload).await?;
-        Ok((JobOutput::Structured { value: serde_json::to_value(&outcome)? }, outcome))
-    }).await;
-    if let Err(e) = result {
+    if let Err(e) = runner.run(payload).await {
         warn!(error = %e, "background summary pass failed");
     }
 });
@@ -157,9 +147,8 @@ self.bg_compression = Some(handle);
 
 Key properties:
 
-- **Attribution is the session's.** `JobSpec.session_id`, and the `BackgroundCompressionRunner`'s `session_id` / `user_id`, are all the session's. The pass's cost row, `StepKind::Compression` step, and `LlmCall` span therefore attribute to the session/user.
-- **`origin` is the triggering session's trigger, recorded as-is** (`User` / `Cron`) — there is no payload/trigger constraint to satisfy. **`shape: JobShape::Maintenance`** is declared explicitly by this spawn path (not inferred from the `System` input) — that is what marks it as a non-turn job; the foreground `/compact` declares the same `Maintenance` shape despite a `UserChat` input. The job row's real attribution keys off `session_id` above, which is the session's.
-- **`parent_job_id = Some(current_job_id)`** parents the minted maintenance job under the triggering turn's job, so the trace nests correctly.
+- **Attribution is the session's.** The `BackgroundCompressionRunner`'s `session_id` / `user_id` are the session's. The pass's cost row, `StepKind::Compression` step, and `LlmCall` span therefore attribute to the session/user.
+- **No separate maintenance job is created.** The detached task reuses `current_job_id`, exactly like the progress observer/title generation pattern, so the background compaction appears as a `Compression` step inside the triggering job rather than as a sibling job.
 - **Cancel token** is a fresh `CancellationToken::new()` that is never cancelled. It is **not** derived from the actor's token — see *Cancellation* below.
 
 ### `BackgroundCompressionRunner::run` → `baybo_context::run_background_summary`
@@ -179,7 +168,7 @@ Key properties:
    VALUES
        (?, ?, prev.pass_count + 1, ?, prev.cost_micros + ?, ?, ?, 0);
    ```
-8. Return a `BackgroundSummaryOutcome`, which the spawned task serializes into `JobOutput::Structured`.
+8. Return a `BackgroundSummaryOutcome`, which the spawned task logs on failure/success boundaries; the durable summary metadata remains the source of truth.
 
 ### Cancellation
 
@@ -264,7 +253,7 @@ The first compression on every session pays a one-time synchronous-LLM-summary l
 | Refresh writes summary.md while compression reads | Atomic tempfile+rename — never partial |
 | Two refreshes interleave on same session | In-memory `AgentLoop.bg_compression` `JoinHandle` rejects the second: a present, not-finished handle short-circuits the spawn. |
 | Stale cursor (covers very old prefix) | Recent slice must cover everything after cursor; if `summary + recent + skill_trailer > 0.6 × max_tokens`, fall through |
-| Process restart mid-pass | The detached task is abandoned (its `JoinHandle` lived only in the dead actor); the previous summary stays on disk and the next trigger fires fresh. A summary dir whose metadata row never committed is swept by the startup FS reaper. |
+| Process restart mid-pass | The detached task is abandoned (its `JoinHandle` lived only in the dead actor); the previous summary stays on disk and the next trigger fires fresh. A summary dir whose metadata row never committed is swept by the startup FS reaper. Any half-open `Compression` step/span under the already-completed parent job is closed by boot trace recovery's unfinished-step sweep without changing the parent job status. |
 
 ## Cold-Start Recovery (session side)
 
@@ -276,9 +265,10 @@ In `ContextManager::restore_from_store`:
 
 ### Orphan reaping (startup)
 
-The only startup cleanup the background path needs is the **FS sweep** in `reap_orphan_summaries` (`crates/agent/src/runtime/compression.rs`), run once per boot before the supervisor spawns any actors:
+The background path has two startup cleanups:
 
 - **FS orphans**: scan `<workspace>/state/sessions/*/`; for each directory name (a `session_id`), check `SELECT 1 FROM session_summaries WHERE session_id = ?`. If no row, delete the directory. This removes a summary dir left behind when a pass wrote `summary.md` (disk first) and then crashed before its metadata row committed.
+- **Trace orphans**: `recover_orphaned_traces_and_jobs` asks `TraceStore::list_unfinished_steps` for half-open steps/spans. If the unfinished step belongs to a terminal parent job (the normal shape for a detached background-summary pass that outlived the turn), recovery closes the trace subtree as `SystemCrash` and leaves the completed parent job untouched.
 
 A leftover orphan dir is otherwise harmless (the fast-path sees `summary_metadata == None` and falls through); the sweep just keeps the workspace tidy. Best-effort: errors are logged at `warn` and never block boot.
 
@@ -293,7 +283,7 @@ A leftover orphan dir is otherwise harmless (the fast-path sees `summary_metadat
 Each background-summary pass:
 
 - Wrapped in real `StepKind::Compression` + `SpanKind::LlmCall` span (same machinery as the inline `CompressionRunner`).
-- The LLM call is bound to an `Attribution` whose `session_id` / `user_id` are the **session's** (the pass runs as a `JobInput::System` job under the session), so the cost row is charged against the **session**.
+- The LLM call is bound to an `Attribution` whose `session_id` / `user_id` are the **session's** and whose `job_id` is the triggering job, so the cost row is charged against the **session** and joins to a `Compression` step inside that job.
 - `session_summaries.cost_micros` accumulates the per-session summary-spend total (informational rollup).
 - Per-pass detail is queryable via `cost_records` joined on `span_id`.
 

@@ -523,12 +523,11 @@ pub fn spawn_idle_reaper(
 /// construction, and the actor never touches `TurnState` at all.
 ///
 /// Recompute-is-truth keeps this robust to *which* job's transition fired
-/// it: the turn itself, a child-session subagent, or a
-/// background-compression `System` job all just mean "recompute this
+/// it: the turn itself or a child-session subagent just means "recompute this
 /// session now", and the broadcast is whatever is currently true — never a
 /// stale "X started/ended". A `Lagged` drop is harmless: the next event
-/// recomputes, and the Subscribe snapshot covers a client that joined
-/// during the gap.
+/// recomputes, and the Subscribe snapshot covers a client that joined during
+/// the gap.
 pub fn spawn_turn_state_projector(
     job_lifecycle: Arc<baybo_job::JobLifecycle>,
     sessions: Arc<SessionManager>,

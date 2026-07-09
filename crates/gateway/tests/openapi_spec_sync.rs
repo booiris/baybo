@@ -7,7 +7,7 @@
 //! When the shape of the admin API changes on purpose, regenerate:
 //!
 //! ```bash
-//! UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test openapi_spec_sync
+//! UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync
 //! ```
 //!
 //! Commit the resulting `docs/openapi.json` in the same change that
@@ -48,7 +48,7 @@ fn openapi_json_is_in_sync() {
 
     let on_disk = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
-            "failed to read {}: {e}. run `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test openapi_spec_sync` to create it",
+            "failed to read {}: {e}. run `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync` to create it",
             path.display()
         )
     });
@@ -56,7 +56,7 @@ fn openapi_json_is_in_sync() {
     if on_disk != rendered {
         panic!(
             "docs/openapi.json is out of sync with the gateway's OpenAPI spec.\n\
-             run `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test openapi_spec_sync` to regenerate, \
+             run `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync` to regenerate, \
              then commit the updated file."
         );
     }

@@ -22,6 +22,11 @@
 //! 2. Cancel the job with
 //!    `ended_at = max(child_steps.ended_at, job.started_at_or_created_at)`
 //!    and `reason = SystemCrash`.
+//! 3. Sweep unfinished trace rows under terminal jobs. Detached work
+//!    (background compression, title generation, progress observers) can
+//!    outlive the turn job that owns its step; if the process exits mid-pass,
+//!    the job is already terminal, so recovery closes only the trace subtree
+//!    and leaves the job status untouched.
 //!
 //! All timestamps come from observed activity — never `Utc::now()`.
 //! The process may have crashed hours before the next boot; stamping
@@ -37,6 +42,7 @@
 //! the loop continues. A `RecoverySummary` is returned so the caller
 //! can log totals.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use baybo_job::{CancelReason, JobLifecycle};
@@ -79,9 +85,10 @@ pub struct RecoverySummary {
 /// unclean shutdown. Best-effort: per-job errors are warn-logged; the
 /// sweep continues with the next job.
 ///
-/// Idempotent: a second call is a no-op once the first has reached
-/// every non-terminal job (steps and spans are already terminal, the
-/// job listing comes back empty).
+/// Idempotent: a second call is a no-op once the first has reached every
+/// non-terminal job and every unfinished detached trace row (steps and spans
+/// are already terminal; the recoverable-job and unfinished-step listings come
+/// back empty).
 pub async fn recover_orphaned_traces_and_jobs(
     trace_store: Arc<dyn TraceStore>,
     job_lifecycle: Arc<JobLifecycle>,
@@ -96,12 +103,9 @@ pub async fn recover_orphaned_traces_and_jobs(
         }
     };
 
-    if jobs.is_empty() {
-        debug!("recovery sweep: no non-terminal jobs found");
-        return summary;
-    }
-
+    let mut recoverable_job_ids = HashSet::new();
     for job in jobs {
+        recoverable_job_ids.insert(job.id);
         summary.jobs_inspected += 1;
         let job_started = job.started_at.unwrap_or(job.created_at);
         match close_job_subtree(
@@ -140,6 +144,12 @@ pub async fn recover_orphaned_traces_and_jobs(
         }
     }
 
+    let detached_summary =
+        recover_detached_trace_rows(&trace_store, &job_lifecycle, &recoverable_job_ids).await;
+    summary.jobs_inspected += detached_summary.jobs_inspected;
+    summary.steps_closed += detached_summary.steps_closed;
+    summary.spans_closed += detached_summary.spans_closed;
+
     if summary.jobs_inspected > 0 {
         info!(
             jobs_inspected = summary.jobs_inspected,
@@ -148,6 +158,8 @@ pub async fn recover_orphaned_traces_and_jobs(
             spans_closed = summary.spans_closed,
             "recovery sweep: closed orphan trace rows from prior process"
         );
+    } else {
+        debug!("recovery sweep: no orphan jobs or detached trace rows found");
     }
 
     summary
@@ -231,6 +243,80 @@ pub async fn recover_panicked_actor_session(
             spans_closed = summary.spans_closed,
             "actor crash recovery: closed orphan trace rows"
         );
+    }
+
+    summary
+}
+
+async fn recover_detached_trace_rows(
+    trace_store: &Arc<dyn TraceStore>,
+    job_lifecycle: &Arc<JobLifecycle>,
+    recoverable_job_ids: &HashSet<JobId>,
+) -> RecoverySummary {
+    let mut summary = RecoverySummary::default();
+    let rows = match trace_store.list_unfinished_steps().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(error = %e, "recovery sweep: failed to list unfinished trace steps");
+            return summary;
+        }
+    };
+
+    let mut job_ids = HashSet::new();
+    for row in rows {
+        match Step::from_row(row) {
+            Ok(step) if !recoverable_job_ids.contains(&step.job_id) => {
+                job_ids.insert(step.job_id);
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "recovery sweep: failed to decode unfinished step row"),
+        }
+    }
+
+    for job_id in job_ids {
+        let job = match job_lifecycle.get(&job_id).await {
+            Ok(Some(job)) => job,
+            Ok(None) => {
+                warn!(%job_id, "recovery sweep: unfinished trace row references missing job");
+                continue;
+            }
+            Err(e) => {
+                warn!(%job_id, error = %e, "recovery sweep: failed to load job for unfinished trace row");
+                continue;
+            }
+        };
+
+        if !job.is_terminal() {
+            warn!(
+                %job_id,
+                status = %job.status.kind(),
+                "recovery sweep: unfinished trace row belongs to non-terminal job missed by recoverable listing"
+            );
+            continue;
+        }
+
+        let job_started = job.started_at.unwrap_or(job.created_at);
+        match close_job_subtree(
+            trace_store,
+            &job.id,
+            job_started,
+            RecoveryClock::ObservedActivity,
+        )
+        .await
+        {
+            Ok((closed_steps, closed_spans, _)) => {
+                if closed_steps > 0 || closed_spans > 0 {
+                    summary.jobs_inspected += 1;
+                    summary.steps_closed += closed_steps;
+                    summary.spans_closed += closed_spans;
+                }
+            }
+            Err(e) => warn!(
+                job_id = %job.id,
+                error = %e,
+                "recovery sweep: failed to close detached trace rows under terminal job"
+            ),
+        }
     }
 
     summary
@@ -374,7 +460,7 @@ async fn pick_span_close_time(
 mod tests {
     use super::*;
     use baybo_job::test_support::MemoryJobStore;
-    use baybo_job::{Job, JobInput, JobShape, JobStatus, JobStore};
+    use baybo_job::{Job, JobInput, JobStatus, JobStore};
     use baybo_model::{
         ApprovalDecision, ContentBlock, ParallelGroup, ResourceAccess, SessionId, SpanId, StepId,
         TriggerKind,
@@ -447,7 +533,6 @@ mod tests {
         let mut job = Job::new(
             SessionId::from("s1"),
             TriggerKind::User,
-            JobShape::Turn,
             JobInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
@@ -696,7 +781,6 @@ mod tests {
         let mut job = Job::new(
             SessionId::from("s1"),
             TriggerKind::User,
-            JobShape::Turn,
             JobInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
@@ -722,7 +806,6 @@ mod tests {
         let mut job = Job::new(
             SessionId::from("s1"),
             TriggerKind::User,
-            JobShape::Turn,
             JobInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
@@ -742,5 +825,65 @@ mod tests {
         let job_after = lifecycle.get(&job.id).await.unwrap().unwrap();
         assert!(matches!(job_after.status, JobStatus::Completed));
         assert_eq!(job_after.ended_at, Some(t0 + Duration::seconds(10)));
+    }
+
+    #[tokio::test]
+    async fn closes_detached_trace_rows_under_terminal_job_without_reopening_job() {
+        let t0 = Utc::now() - Duration::seconds(90);
+        let store = Arc::new(MemoryJobStore::new());
+        let mut job = Job::new(
+            SessionId::from("s1"),
+            TriggerKind::User,
+            JobInput::UserChat {
+                content: vec![ContentBlock::Text("hi".into())],
+            },
+            None,
+        );
+        job.status = JobStatus::Completed;
+        job.started_at = Some(t0);
+        let job_ended = t0 + Duration::seconds(10);
+        job.ended_at = Some(job_ended);
+        store.create(&job.to_row().unwrap()).await.unwrap();
+        let lifecycle = Arc::new(JobLifecycle::new(store));
+        let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
+
+        let step = Step {
+            id: StepId::new(),
+            job_id: job.id,
+            kind: StepKind::Compression,
+            started_at: t0 + Duration::seconds(20),
+            ended_at: None,
+            outcome: LifecycleState::Pending,
+        };
+        trace.save_step(&step.to_row().unwrap()).await.unwrap();
+        let span = make_span(
+            step.id,
+            llm_span_kind(),
+            t0 + Duration::seconds(21),
+            LifecycleState::Pending,
+            None,
+        );
+        trace.save_span(&span.to_row().unwrap()).await.unwrap();
+
+        let summary = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
+        assert_eq!(summary.jobs_inspected, 1);
+        assert_eq!(summary.jobs_cancelled, 0);
+        assert_eq!(summary.steps_closed, 1);
+        assert_eq!(summary.spans_closed, 1);
+
+        let step_after = Step::from_row(trace.load_step(&step.id).await.unwrap().unwrap()).unwrap();
+        assert_eq!(step_after.ended_at, Some(span.started_at));
+        assert!(matches!(
+            step_after.outcome,
+            LifecycleState::Done(LifecycleOutcome::Cancelled {
+                reason: CancelReason::SystemCrash
+            })
+        ));
+        let span_after = Span::from_row(trace.load_span(&span.id).await.unwrap().unwrap()).unwrap();
+        assert_eq!(span_after.ended_at, Some(span.started_at));
+
+        let job_after = lifecycle.get(&job.id).await.unwrap().unwrap();
+        assert!(matches!(job_after.status, JobStatus::Completed));
+        assert_eq!(job_after.ended_at, Some(job_ended));
     }
 }
