@@ -314,12 +314,12 @@ struct SessionRowView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             metaColumn
         }
-        // Uniform row height regardless of a missing preview line or the badge's
-        // taller meta column — a headline-only row (a session with no message
-        // yet) reserves the same block and centers within it, so the list never
-        // looks ragged.
-        .frame(minHeight: 38)
-        .padding(.vertical, 12)
+        // Taller blocks with room for the preview to wrap to two lines. minHeight
+        // keeps short rows (a one-line preview, or a headline-only session with no
+        // message yet) from collapsing shorter than the two-line rows, so the list
+        // reads as one even block height.
+        .frame(minHeight: 52)
+        .padding(.vertical, 15)
         // The pinned ground, drawn in-content so it cross-fades instead of a
         // hard cell-background swap; negative gutter bleeds it edge-to-edge.
         .background {
@@ -351,7 +351,8 @@ struct SessionRowView: View {
                 Text(verbatim: preview)
                     .font(Theme.mono(13))
                     .foregroundStyle(Theme.inkSoft)
-                    .lineLimit(1)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
                     .truncationMode(.tail)
             }
         }
