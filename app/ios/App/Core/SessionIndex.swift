@@ -400,23 +400,22 @@ final class SessionIndex: ObservableObject {
             // The live ping (`noteActivity`) still bumps it between pulls as a
             // cheap accelerator.
             let unread = Int(summary.unreadCount)
-            if let mine, mine.lastActive > lastActive {
-                // Local row saw activity after this snapshot (a just-sent
-                // message racing the refetch) — keep its fresher preview/label.
-                merged.append(
-                    SessionRow(
-                        id: summary.sessionId, createdAt: createdAt,
-                        lastActive: mine.lastActive, title: title,
-                        preview: mine.preview ?? remotePreview,
-                        userText: mine.userText ?? summary.lastUserText,
-                        pinned: pinned, archived: archived, unread: unread))
-            } else {
-                merged.append(
-                    SessionRow(
-                        id: summary.sessionId, createdAt: createdAt, lastActive: lastActive,
-                        title: title, preview: remotePreview, userText: summary.lastUserText,
-                        pinned: pinned, archived: archived, unread: unread))
-            }
+            // Server data is authoritative — adopt the snapshot's preview / user
+            // text / recency wholesale. A local row NEVER overrides a server
+            // value; it only fills a field the server left nil. (The old
+            // "keep local when mine.lastActive > lastActive" guard compared the
+            // DEVICE clock `recordUserSend` stamps against the SERVER clock, so a
+            // device running ahead pinned a stale just-sent preview forever — the
+            // list showed the question while the transcript already held the
+            // reply.) The optimistic just-sent preview still shows instantly
+            // between refreshes; a merge simply reconciles it to server truth.
+            merged.append(
+                SessionRow(
+                    id: summary.sessionId, createdAt: createdAt, lastActive: lastActive,
+                    title: title,
+                    preview: remotePreview ?? mine?.preview,
+                    userText: summary.lastUserText ?? mine?.userText,
+                    pinned: pinned, archived: archived, unread: unread))
         }
         rows = merged
         save()
