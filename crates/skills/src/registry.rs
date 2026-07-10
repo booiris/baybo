@@ -163,11 +163,15 @@ impl SkillRegistry {
     }
 
     /// Scan `<root>/<agent_id>/<skill>/SKILL.md` into the per-agent overlay.
-    /// Remembers `root` so `reload` replays the scan. Returns the number of
-    /// agent skills loaded. A missing root is not an error (no agents have
-    /// private skills yet).
+    /// Remembers `root` so `reload` replays the scan. Clears the overlay
+    /// first (mirrors `reload`'s "authoritative disk state wins"), so a
+    /// second call doesn't accumulate stale `(agent, skill)` entries from a
+    /// prior root or a since-deleted skill. Returns the number of agent
+    /// skills loaded. A missing root is not an error (no agents have private
+    /// skills yet).
     pub fn load_agent_skills_root(&self, root: &Path) -> usize {
         *self.agent_skills_root.write() = Some(root.to_path_buf());
+        self.agent_skills.clear();
         self.scan_agent_root(root)
     }
 
@@ -872,5 +876,28 @@ mod tests {
             reg.get_scoped(Some("A1"), "greet").unwrap().description,
             "agent greet"
         );
+    }
+
+    #[test]
+    fn load_agent_skills_root_second_call_does_not_accumulate_stale_entries() {
+        let reg = SkillRegistry::new();
+        let agents = tempfile::tempdir().unwrap();
+
+        let review_dir = agents.path().join("A1").join("review");
+        std::fs::create_dir_all(&review_dir).unwrap();
+        std::fs::write(
+            review_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: agent review\n---\nagent body review\n",
+        )
+        .unwrap();
+        assert_eq!(reg.load_agent_skills_root(agents.path()), 1);
+        assert!(reg.get_scoped(Some("A1"), "review").is_some());
+
+        // On-disk skill removed, then the root is loaded again (not via
+        // `reload`). Without clearing first, the deleted skill's stale entry
+        // would survive the second scan.
+        std::fs::remove_dir_all(&review_dir).unwrap();
+        assert_eq!(reg.load_agent_skills_root(agents.path()), 0);
+        assert!(reg.get_scoped(Some("A1"), "review").is_none());
     }
 }

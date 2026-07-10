@@ -26,9 +26,9 @@
 //!
 //! Every request carries `X-OpenViking-User` (the session user) and
 //! `X-OpenViking-Agent`, partitioning memories per agent profile. The agent
-//! header defaults to the session's bound agent (or [`DEFAULT_AGENT`] for an
-//! unbound session / agent-unaware caller) and is not overridable by any tool
-//! param — unlike mem0, no viking tool exposes an `agentId` override.
+//! header always tracks the calling session's bound agent (or
+//! [`DEFAULT_AGENT`] for an unbound session / agent-unaware caller) — no tool
+//! exposes an `agentId`-style override, matching the mem0 tools' posture.
 //!
 //! # References
 //!
@@ -63,8 +63,8 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:1933";
 const DEFAULT_ACCOUNT: &str = "default";
 /// Fallback agent namespace for unbound sessions and agent-unaware callers
 /// (e.g. the memory bench harness, the health probe). Matches
-/// [`baybo_model::BUILTIN_AGENT_PROFILE_ID`] / `SessionState::agent_id_or_builtin()`.
-pub const DEFAULT_AGENT: &str = "baybo";
+/// `SessionState::agent_id_or_builtin()`.
+pub const DEFAULT_AGENT: &str = baybo_model::BUILTIN_AGENT_PROFILE_ID;
 const DEFAULT_TOP_K: usize = 5;
 /// Per-request timeout budgets. Production uses [`OpenVikingTimeouts::default`];
 /// tests inject ms-scale values via [`OpenVikingMemory::with_timeouts`] to
@@ -233,8 +233,16 @@ impl OpenVikingInner {
         if let Ok(v) = HeaderValue::from_str(user_id) {
             h.insert(HeaderName::from_static("x-openviking-user"), v);
         }
-        if let Ok(v) = HeaderValue::from_str(agent_id) {
-            h.insert(HeaderName::from_static("x-openviking-agent"), v);
+        match HeaderValue::from_str(agent_id) {
+            Ok(v) => {
+                h.insert(HeaderName::from_static("x-openviking-agent"), v);
+            }
+            Err(e) => warn!(
+                agent_id,
+                error = %e,
+                "agent id is not header-safe; omitting x-openviking-agent \
+                 (request falls back to the server's default namespace)"
+            ),
         }
         if !self.api_key.is_empty() {
             if let Ok(v) = HeaderValue::from_str(&self.api_key) {
@@ -971,7 +979,7 @@ fn format_hit(item: &Value) -> Value {
 
 /// The tool call's agent namespace: the session's bound agent
 /// (`ToolContext::agent_id`), or [`DEFAULT_AGENT`] for an unbound session.
-/// Unlike the mem0 tools, no viking tool exposes an override param — the
+/// No viking tool exposes an override param (matching the mem0 tools) — the
 /// namespace always tracks the calling session.
 fn ctx_agent_id(ctx: &ToolContext) -> &str {
     ctx.agent_id

@@ -31,6 +31,20 @@ fn lineage_kind_str(s: &Session) -> Option<&'static str> {
     })
 }
 
+/// Parse the `agent_framework` column into a typed value. `None` (column
+/// unset — an unbound session) passes through as `None`; a stored tag this
+/// build doesn't recognise (e.g. written by a newer build) is a hard error —
+/// callers decide whether that fails the whole read (`get`) or skips just
+/// this row (`list_all` / `list_by_channel`).
+fn parse_agent_framework_col(col: Option<String>) -> Result<Option<AgentFramework>> {
+    match col {
+        None => Ok(None),
+        Some(s) => AgentFramework::parse(&s)
+            .map(Some)
+            .ok_or_else(|| StorageError::Storage(format!("unknown agent_framework {s:?}"))),
+    }
+}
+
 /// Rebuild a typed [`ChatMessage`] from a persisted `session_messages` row,
 /// honoring the stored `source` provenance. The sole rehydration seam for the
 /// sealed `source` field: every read path funnels its `(role, content, source)`
@@ -118,12 +132,7 @@ impl SessionStore for LibsqlSessionStore {
                 session.folder_id = folder_id_col.map(FolderId::from);
                 session.title = title_col;
                 session.state.agent_id = agent_id_col.map(AgentProfileId::from);
-                session.state.agent_framework = match agent_framework_col {
-                    None => None,
-                    Some(s) => Some(AgentFramework::parse(&s).ok_or_else(|| {
-                        StorageError::Storage(format!("unknown agent_framework {s:?}"))
-                    })?),
-                };
+                session.state.agent_framework = parse_agent_framework_col(agent_framework_col)?;
                 Ok(Some(session))
             }
             None => Ok(None),
@@ -486,11 +495,15 @@ impl SessionStore for LibsqlSessionStore {
             session.folder_id = folder_id_col.map(FolderId::from);
             session.title = title_col;
             session.state.agent_id = agent_id_col.map(AgentProfileId::from);
-            session.state.agent_framework = match agent_framework_col {
-                None => None,
-                Some(s) => Some(AgentFramework::parse(&s).ok_or_else(|| {
-                    StorageError::Storage(format!("unknown agent_framework {s:?}"))
-                })?),
+            session.state.agent_framework = match parse_agent_framework_col(agent_framework_col) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %id_col,
+                        "skipping session row with unrecognised agent_framework: {e}"
+                    );
+                    continue;
+                }
             };
             sessions.push(session);
         }
@@ -570,11 +583,15 @@ impl SessionStore for LibsqlSessionStore {
             session.folder_id = folder_id_col.map(FolderId::from);
             session.title = title_col;
             session.state.agent_id = agent_id_col.map(AgentProfileId::from);
-            session.state.agent_framework = match agent_framework_col {
-                None => None,
-                Some(s) => Some(AgentFramework::parse(&s).ok_or_else(|| {
-                    StorageError::Storage(format!("unknown agent_framework {s:?}"))
-                })?),
+            session.state.agent_framework = match parse_agent_framework_col(agent_framework_col) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %id_col,
+                        "skipping session row with unrecognised agent_framework: {e}"
+                    );
+                    continue;
+                }
             };
             sessions.push(session);
         }
@@ -1986,6 +2003,52 @@ mod tests {
 
         let store = LibsqlSessionStore::new(pool);
         let err = store.get(&s.id).await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::Storage(ref msg) if msg.contains("unknown agent_framework")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_all_skips_unknown_agent_framework_row_but_get_still_hard_errors() {
+        // Lists must skip-and-warn a corrupt `agent_framework` row exactly
+        // like they already skip an undeserializable JSON blob — one broken
+        // row must not 500 the whole chat-list query. `get()` on that same
+        // row keeps the hard error: a caller asking for one specific session
+        // needs to know it's broken, not have it silently vanish.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let good = make_root_session("good-framework");
+        store.save(&good).await.unwrap();
+        let bad = make_root_session("bad-framework");
+        store.save(&bad).await.unwrap();
+        store
+            .pool
+            .conn()
+            .execute(
+                "UPDATE sessions SET agent_id = ?2, agent_framework = ?3 WHERE id = ?1",
+                libsql::params![
+                    bad.id.as_str().to_string(),
+                    "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                    "not_a_real_framework".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let listed = store.list_all().await.unwrap();
+        let ids: Vec<&str> = listed.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            ids.contains(&"good-framework"),
+            "unaffected row must survive the listing: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"bad-framework"),
+            "corrupt-framework row must be skipped, not fail the listing: {ids:?}"
+        );
+
+        let err = store.get(&bad.id).await.unwrap_err();
         assert!(
             matches!(err, StorageError::Storage(ref msg) if msg.contains("unknown agent_framework")),
             "unexpected error: {err:?}"

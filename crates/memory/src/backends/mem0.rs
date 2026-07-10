@@ -30,9 +30,12 @@
 //! read, write, or delete another user's memories. An optional `scope:
 //! "session"` narrows reads to the current session via Mem0's `run_id` (sourced
 //! from `ToolContext::session_id`). `agent_id` partitions memories per agent
-//! profile: it defaults to the session's bound agent (`ToolContext::agent_id`,
-//! or [`DEFAULT_AGENT_ID`] for an unbound session) on both reads and writes,
-//! and is the one identity a tool call may still override.
+//! profile: it always tracks the calling session's bound agent
+//! (`ToolContext::agent_id`, or [`DEFAULT_AGENT_ID`] for an unbound session)
+//! on both reads and writes — never overridable by a tool param, matching the
+//! OpenViking tools' posture. Partition isolation is the invariant; a
+//! cross-agent operation is an operator action (the Mem0 dashboard), not a
+//! tool call.
 //!
 //! Failures are routed through a 5-failure / 120 s circuit breaker that pauses
 //! API calls after sustained outages.
@@ -79,8 +82,8 @@ use crate::{Memory, MemoryContext, MemoryError, RecalledMemory, Result};
 const DEFAULT_BASE_URL: &str = "https://api.mem0.ai";
 /// Fallback agent namespace for unbound sessions and agent-unaware callers
 /// (e.g. the memory bench harness). Matches
-/// [`baybo_model::BUILTIN_AGENT_PROFILE_ID`] / `SessionState::agent_id_or_builtin()`.
-pub const DEFAULT_AGENT_ID: &str = "baybo";
+/// `SessionState::agent_id_or_builtin()`.
+pub const DEFAULT_AGENT_ID: &str = baybo_model::BUILTIN_AGENT_PROFILE_ID;
 const DEFAULT_TOP_K: usize = 5;
 /// Default minimum similarity for `mem0_search` / search-and-delete. Mirrors
 /// the openclaw plugin's `searchThreshold` default.
@@ -639,19 +642,16 @@ fn read_filters(user_id: &str, agent_id: &str) -> Value {
     build_filters(user_id, Some(agent_id), None, None, None)
 }
 
-/// Resolve a tool call's effective agent namespace: the `agentId` param when
-/// the caller passed one, else the session's bound agent (`ctx.agent_id`), or
-/// [`DEFAULT_AGENT_ID`] for an unbound session. An explicit param always wins.
-fn resolve_agent_id<'a>(params: &'a Value, ctx: &'a ToolContext) -> &'a str {
-    let ctx_agent = ctx
-        .agent_id
+/// Resolve a tool call's effective agent namespace: the session's bound agent
+/// (`ctx.agent_id`), or [`DEFAULT_AGENT_ID`] for an unbound session. Always
+/// tracks the calling session — no tool param can widen or redirect the
+/// partition (cross-agent operations are an operator action via the Mem0
+/// dashboard, not a tool call).
+fn resolve_agent_id(ctx: &ToolContext) -> &str {
+    ctx.agent_id
         .as_ref()
         .map(|a| a.as_str())
-        .unwrap_or(DEFAULT_AGENT_ID);
-    params
-        .get("agentId")
-        .and_then(|v| v.as_str())
-        .unwrap_or(ctx_agent)
+        .unwrap_or(DEFAULT_AGENT_ID)
 }
 
 /// Resolve the optional `scope` param into a run-id filter. `"session"`
@@ -840,8 +840,7 @@ impl Tool for Mem0SearchTool {
                 "limit": {"type": "integer", "description": "Max results (default: configured top_k, max 50)."},
                 "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\" (current session only), or \"long-term\"."},
                 "categories": {"type": "array", "items": {"type": "string"}, "description": "Filter by category."},
-                "filters": {"type": "object", "description": "Advanced Mem0 filter object (AND/OR/operators)."},
-                "agentId": {"type": "string", "description": "Agent namespace to filter by (default: the session's agent)."}
+                "filters": {"type": "object", "description": "Advanced Mem0 filter object (AND/OR/operators)."}
             },
             "required": ["query"]
         })
@@ -861,7 +860,7 @@ impl Tool for Mem0SearchTool {
             .map(|n| n.min(50) as usize)
             .unwrap_or(self.inner.top_k);
         let user_id = ctx.user.id.as_str();
-        let agent_id = resolve_agent_id(&params, ctx);
+        let agent_id = resolve_agent_id(ctx);
         let run_id = scope_run_id(
             params.get("scope").and_then(|v| v.as_str()),
             ctx.session_id.as_str(),
@@ -956,8 +955,7 @@ impl Tool for Mem0AddTool {
                 "category": {"type": "string", "description": "e.g. identity, preference, decision, rule, project, configuration, technical, relationship."},
                 "importance": {"type": "number", "description": "Importance 0.0–1.0 (stored as metadata)."},
                 "metadata": {"type": "object", "description": "Additional metadata to attach."},
-                "longTerm": {"type": "boolean", "description": "Long-term (default true). false → session-scoped."},
-                "agentId": {"type": "string", "description": "Agent namespace (default: the session's agent)."}
+                "longTerm": {"type": "boolean", "description": "Long-term (default true). false → session-scoped."}
             },
             "required": []
         })
@@ -987,7 +985,7 @@ impl Tool for Mem0AddTool {
             ));
         }
         let user_id = ctx.user.id.as_str();
-        let agent_id = resolve_agent_id(&params, ctx);
+        let agent_id = resolve_agent_id(ctx);
         let long_term = params
             .get("longTerm")
             .and_then(|v| v.as_bool())
@@ -1126,8 +1124,7 @@ impl Tool for Mem0ListTool {
         json!({
             "type": "object",
             "properties": {
-                "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\", or \"long-term\"."},
-                "agentId": {"type": "string", "description": "Agent namespace to filter by (default: the session's agent)."}
+                "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\", or \"long-term\"."}
             },
             "required": []
         })
@@ -1138,7 +1135,7 @@ impl Tool for Mem0ListTool {
             return Ok(breaker_unavailable());
         }
         let user_id = ctx.user.id.as_str();
-        let agent_id = resolve_agent_id(&params, ctx);
+        let agent_id = resolve_agent_id(ctx);
         let run_id = scope_run_id(
             params.get("scope").and_then(|v| v.as_str()),
             ctx.session_id.as_str(),
@@ -1324,8 +1321,7 @@ impl Tool for Mem0DeleteTool {
                 "memoryId": {"type": "string", "description": "Specific memory ID to delete."},
                 "query": {"type": "string", "description": "Search query to find and delete a memory."},
                 "all": {"type": "boolean", "description": "Delete ALL of the user's memories. Requires confirm: true."},
-                "confirm": {"type": "boolean", "description": "Safety gate for bulk deletion."},
-                "agentId": {"type": "string", "description": "Agent namespace scope (default: the session's agent)."}
+                "confirm": {"type": "boolean", "description": "Safety gate for bulk deletion."}
             },
             "required": []
         })
@@ -1336,7 +1332,7 @@ impl Tool for Mem0DeleteTool {
             return Ok(breaker_unavailable());
         }
         let user_id = ctx.user.id.as_str();
-        let agent_id = resolve_agent_id(&params, ctx);
+        let agent_id = resolve_agent_id(ctx);
 
         if let Some(memory_id) = params.get("memoryId").and_then(|v| v.as_str()) {
             return Ok(self.delete_by_id(memory_id, ctx).await);

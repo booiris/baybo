@@ -103,7 +103,7 @@ Recalled memories enter the prompt as a **persisted, framed** block — never
 - **mem0**: `recall`'s `POST /v2/memories/search/` filters on `{AND: [{user_id}, {agent_id}]}`; `on_job_complete`'s `POST /v1/memories/` write carries `agent_id` alongside `user_id`.
 - **OpenViking**: every request carries `X-OpenViking-Agent: <agent_id>`; there is no per-call override.
 
-Memory tools (`mem0_*`, `viking_*`) get the same scoping through `ToolContext.agent_id` (`Option<AgentProfileId>`; `None` for an unbound session falls back to the backend's own default constant — `mem0::DEFAULT_AGENT_ID` / `openviking::DEFAULT_AGENT`, both `"baybo"`). mem0 tools accept an explicit `agentId` param that overrides the session default per call; OpenViking tools do not expose an override. `mem0_delete{all: true}` and `mem0_list` default to the calling session's own agent partition like every other tool — a deliberately narrow blast radius for the destructive path; an explicit `agentId` widens a call to another agent's partition where the tool supports the param.
+Memory tools (`mem0_*`, `viking_*`) get the same scoping through `ToolContext.agent_id` (`Option<AgentProfileId>`; `None` for an unbound session falls back to the backend's own default constant — `mem0::DEFAULT_AGENT_ID` / `openviking::DEFAULT_AGENT`, both `BUILTIN_AGENT_PROFILE_ID`). No tool of either backend exposes an `agentId`-style override — the agent namespace always tracks the calling session, including for `mem0_delete{all: true}` and `mem0_list`, a deliberately narrow blast radius for the destructive path. Partition isolation is the invariant; a cross-agent operation is an operator action (e.g. via the Mem0 dashboard), never a tool call.
 
 ## Flow & hook points
 
@@ -184,9 +184,8 @@ the typed config for future backends.
 
 Hosted SaaS via the Mem0 Platform REST API. Per-user scope comes from the
 caller's `user_id` at every call; `agent_id` (see [Partitioning by
-agent](#partitioning-by-agent)) scopes both hook calls to the session's bound
-agent — not overridable there. Tool calls default to the same session agent
-via `ToolContext.agent_id` but may override it with an explicit `agentId`
+agent](#partitioning-by-agent)) scopes both hook calls and tool calls to the
+session's bound agent (`ToolContext.agent_id`) — not overridable by any
 param. Tool reads separately accept an optional `scope: "session"` that
 narrows to the current session via Mem0's `run_id` (sourced from
 `ToolContext::session_id`).
@@ -207,9 +206,9 @@ verbatim (`infer: false`) — the model already decided what is worth keeping.
 | `mem0_search` | `POST /v2/memories/search/` | Semantic search; optional `scope` / `categories` / advanced `filters`. |
 | `mem0_add` | `POST /v1/memories/` (`infer: false`) | Store fact(s) verbatim; `category` / `importance` / `metadata`; `longTerm: false` → session-scoped. |
 | `mem0_get` | `GET /v1/memories/{id}/` | Fetch one memory by id. |
-| `mem0_list` | `POST /v2/memories/` | List the user's memories in the session's agent partition (paginated); `agentId` overrides. |
+| `mem0_list` | `POST /v2/memories/` | List the user's memories in the session's agent partition (paginated). |
 | `mem0_update` | `PUT /v1/memories/{id}/` | Replace a memory's text in place. |
-| `mem0_delete` | `DELETE /v1/memories/{id}/` or `?user_id=` | Delete by id, search-and-delete by `query`, or `all: true` + `confirm: true` — `query`/`all` variants scope to the session's agent partition by default; `agentId` overrides. |
+| `mem0_delete` | `DELETE /v1/memories/{id}/` or `?user_id=` | Delete by id, search-and-delete by `query`, or `all: true` + `confirm: true` — `query`/`all` variants scope to the session's agent partition. |
 | `mem0_event_list` | `GET /v1/events/` | List recent background processing events. |
 | `mem0_event_status` | `GET /v1/event/{id}/` | Status / latency / results of one event. |
 

@@ -787,6 +787,35 @@ async fn tool_delete_all_cannot_target_another_user() {
     );
 }
 
+#[tokio::test]
+async fn tool_search_ignores_agent_id_param() {
+    // The `agentId` override was removed: the agent partition always tracks
+    // the calling session (`ctx.agent_id`), matching the OpenViking tools.
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v2/memories/search/",
+            post(
+                |State(c): State<Captured>, Json(body): Json<Value>| async move {
+                    c.bodies.lock().push(body);
+                    Json(json!([]))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let mut ctx = tool_context("u-15");
+    ctx.agent_id = Some("A1".into());
+    let _ = tool_by_name(&m, TOOL_SEARCH)
+        .execute(json!({"query": "x", "agentId": "other-agent"}), &ctx)
+        .await
+        .unwrap();
+    let body = captured.bodies.lock().last().unwrap().clone();
+    assert_eq!(body["filters"]["AND"][1]["agent_id"], "A1");
+}
+
 // ---------------------------------------------------------------------------
 // tool manifest sanity
 // ---------------------------------------------------------------------------
