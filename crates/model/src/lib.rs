@@ -13,6 +13,7 @@ mod message;
 mod model_tier;
 mod money;
 mod pricing;
+mod reasoning_effort;
 mod security_types;
 mod session;
 pub mod spawn_protocol;
@@ -40,6 +41,7 @@ pub use message::{
 pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};
 pub use pricing::LlmPricingOverride;
+pub use reasoning_effort::ReasoningEffort;
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
     BackgroundCompressionPayload, ChannelType, GroupState, Lineage, LineageKind, Session,
