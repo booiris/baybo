@@ -146,6 +146,23 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
+    async fn set_agent_binding(
+        &self,
+        session_id: &SessionId,
+        agent_id: &baybo_model::AgentProfileId,
+        framework: baybo_model::AgentFramework,
+    ) -> Result<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) if s.state.agent_id.is_none() => {
+                s.state.agent_id = Some(agent_id.clone());
+                s.state.agent_framework = Some(framework);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     async fn set_title(&self, session_id: &SessionId, title: Option<&str>) -> Result<bool> {
         let mut data = self.data.lock();
         match data.get_mut(session_id) {

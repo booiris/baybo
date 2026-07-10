@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
 use baybo_model::{
-    ChatMessage, ControlEvent, ControlEventKind, FolderId, LineageKind, LlmEntryName, Session,
-    SessionId,
+    AgentFramework, AgentProfileId, ChatMessage, ControlEvent, ControlEventKind, FolderId,
+    LineageKind, LlmEntryName, Session, SessionId,
 };
 use baybo_store::StorageError;
 use baybo_store::session::{Result, SessionStore, StoredMessage};
@@ -70,7 +70,8 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm, pinned, folder_id, title FROM sessions WHERE id = ?1",
+                "SELECT data, hidden, last_llm, pinned, folder_id, title, agent_id, agent_framework \
+                 FROM sessions WHERE id = ?1",
                 libsql::params![session_id.as_str().to_string()],
             )
             .await
@@ -101,6 +102,12 @@ impl SessionStore for LibsqlSessionStore {
                 let title_col: Option<String> = row
                     .get(5)
                     .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                let agent_id_col: Option<String> = row
+                    .get(6)
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                let agent_framework_col: Option<String> = row
+                    .get(7)
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
                 let mut session: Session = serde_json::from_str(&data)
                     .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
                 // Flat columns are authoritative; targeted setters leave the
@@ -110,6 +117,13 @@ impl SessionStore for LibsqlSessionStore {
                 session.pinned = pinned_col != 0;
                 session.folder_id = folder_id_col.map(FolderId::from);
                 session.title = title_col;
+                session.state.agent_id = agent_id_col.map(AgentProfileId::from);
+                session.state.agent_framework = match agent_framework_col {
+                    None => None,
+                    Some(s) => Some(AgentFramework::parse(&s).ok_or_else(|| {
+                        StorageError::Storage(format!("unknown agent_framework {s:?}"))
+                    })?),
+                };
                 Ok(Some(session))
             }
             None => Ok(None),
@@ -219,6 +233,30 @@ impl SessionStore for LibsqlSessionStore {
             )
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_last_llm: {e}")))?;
+        Ok(affected > 0)
+    }
+
+    async fn set_agent_binding(
+        &self,
+        session_id: &SessionId,
+        agent_id: &AgentProfileId,
+        framework: AgentFramework,
+    ) -> Result<bool> {
+        let conn = self.pool.conn();
+        let affected = conn
+            .execute(
+                "UPDATE sessions SET agent_id = ?2, agent_framework = ?3 \
+                 WHERE id = ?1 AND agent_id IS NULL",
+                libsql::params![
+                    session_id.as_str().to_string(),
+                    agent_id.as_str().to_string(),
+                    framework.as_str(),
+                ],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql set_agent_binding: {e}"))
+            })?;
         Ok(affected > 0)
     }
 
@@ -387,7 +425,8 @@ impl SessionStore for LibsqlSessionStore {
         // know) can be named in the skip warning.
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm, pinned, id, folder_id, title FROM sessions \
+                "SELECT data, hidden, last_llm, pinned, id, folder_id, title, \
+                 agent_id, agent_framework FROM sessions \
                  ORDER BY last_active DESC",
                 (),
             )
@@ -421,6 +460,12 @@ impl SessionStore for LibsqlSessionStore {
             let title_col: Option<String> = row
                 .get(6)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let agent_id_col: Option<String> = row
+                .get(7)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let agent_framework_col: Option<String> = row
+                .get(8)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             // A single undeserializable row (e.g. one written by an older
             // build whose `lineage.kind` this build doesn't know) must
             // degrade to "silently absent from the listing", never fail
@@ -440,6 +485,13 @@ impl SessionStore for LibsqlSessionStore {
             session.pinned = pinned_col != 0;
             session.folder_id = folder_id_col.map(FolderId::from);
             session.title = title_col;
+            session.state.agent_id = agent_id_col.map(AgentProfileId::from);
+            session.state.agent_framework = match agent_framework_col {
+                None => None,
+                Some(s) => Some(AgentFramework::parse(&s).ok_or_else(|| {
+                    StorageError::Storage(format!("unknown agent_framework {s:?}"))
+                })?),
+            };
             sessions.push(session);
         }
         Ok(sessions)
@@ -457,7 +509,8 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm, pinned, id, folder_id, title FROM sessions \
+                "SELECT data, hidden, last_llm, pinned, id, folder_id, title, \
+                 agent_id, agent_framework FROM sessions \
                  WHERE json_extract(data, '$.channel') = ?1 \
                  ORDER BY last_active DESC",
                 libsql::params![channel.as_str().to_string()],
@@ -492,6 +545,12 @@ impl SessionStore for LibsqlSessionStore {
             let title_col: Option<String> = row
                 .get(6)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let agent_id_col: Option<String> = row
+                .get(7)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let agent_framework_col: Option<String> = row
+                .get(8)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             // Same skip-on-error discipline as `list_all`: a row whose
             // blob fails to deserialize drops out of the listing rather
             // than failing the whole chat-list query.
@@ -510,6 +569,13 @@ impl SessionStore for LibsqlSessionStore {
             session.pinned = pinned_col != 0;
             session.folder_id = folder_id_col.map(FolderId::from);
             session.title = title_col;
+            session.state.agent_id = agent_id_col.map(AgentProfileId::from);
+            session.state.agent_framework = match agent_framework_col {
+                None => None,
+                Some(s) => Some(AgentFramework::parse(&s).ok_or_else(|| {
+                    StorageError::Storage(format!("unknown agent_framework {s:?}"))
+                })?),
+            };
             sessions.push(session);
         }
         Ok(sessions)
@@ -1614,6 +1680,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_sessions_table_without_agent_binding_is_migrated() {
+        // The "DB created before `agent_id`/`agent_framework` existed" case
+        // the migration list (libsql/mod.rs) handles. Without the ALTER
+        // migrations the store's `SELECT … agent_id, agent_framework` would
+        // fail with "no such column"; with them the columns come back NULL
+        // and the old row reads as unbound.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        pool.conn()
+            .execute(
+                "ALTER TABLE sessions DROP COLUMN agent_id",
+                libsql::params![],
+            )
+            .await
+            .unwrap();
+        pool.conn()
+            .execute(
+                "ALTER TABLE sessions DROP COLUMN agent_framework",
+                libsql::params![],
+            )
+            .await
+            .unwrap();
+        let data = serde_json::to_string(&make_root_session("legacy-agent")).unwrap();
+        pool.conn()
+            .execute(
+                "INSERT INTO sessions \
+                 (id, root_session_id, trigger_kind, created_at, last_active, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                libsql::params![
+                    "legacy-agent".to_string(),
+                    "legacy-agent".to_string(),
+                    "user".to_string(),
+                    super::super::time::to_us(Utc::now()),
+                    super::super::time::to_us(Utc::now()),
+                    data,
+                ],
+            )
+            .await
+            .unwrap();
+        // Re-running init_db applies the idempotent ALTERs (re-adds both
+        // columns).
+        pool.init_db().await.unwrap();
+
+        let store = LibsqlSessionStore::new(pool);
+        let id = SessionId::from("legacy-agent");
+        let loaded = store.get(&id).await.unwrap().expect("legacy row present");
+        assert_eq!(loaded.state.agent_id, None);
+        assert_eq!(loaded.state.agent_framework, None);
+        // And the columns are now writable like any other.
+        let agent_id = baybo_model::AgentProfileId::from("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(
+            store
+                .set_agent_binding(&id, &agent_id, baybo_model::AgentFramework::Baybo)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.get(&id).await.unwrap().unwrap().state.agent_id,
+            Some(agent_id)
+        );
+    }
+
+    #[tokio::test]
     async fn message_platform_msg_id_round_trips_and_legacy_defaults_empty() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlSessionStore::new(pool.clone());
@@ -1742,6 +1870,125 @@ mod tests {
             listed[0].state.last_llm,
             Some(baybo_model::LlmEntryName::from("gpt-4o")),
             "last_llm must reflect the column in list projections"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_projections_reflect_agent_binding_columns() {
+        // `list_all` / `list_by_channel` must project the flat
+        // `agent_id` / `agent_framework` columns the same way `get`
+        // does, so a listed `Session` carries the authoritative
+        // binding rather than the (stale, always-`None`) blob value.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let mut s = make_root_session("agent-list");
+        s.channel = ChannelType::http();
+        store.save(&s).await.unwrap();
+        let id = baybo_model::AgentProfileId::from("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(
+            store
+                .set_agent_binding(&s.id, &id, baybo_model::AgentFramework::Codex)
+                .await
+                .unwrap()
+        );
+
+        let listed_all = store.list_all().await.unwrap();
+        let found = listed_all.iter().find(|x| x.id == s.id).unwrap();
+        assert_eq!(found.state.agent_id, Some(id.clone()));
+        assert_eq!(
+            found.state.agent_framework,
+            Some(baybo_model::AgentFramework::Codex)
+        );
+
+        let listed_by_channel = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        assert_eq!(listed_by_channel.len(), 1);
+        assert_eq!(listed_by_channel[0].state.agent_id, Some(id));
+        assert_eq!(
+            listed_by_channel[0].state.agent_framework,
+            Some(baybo_model::AgentFramework::Codex)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_agent_binding_is_write_once_and_survives_save() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+        let s = make_root_session("agent-bound");
+        store.save(&s).await.unwrap();
+
+        let id = baybo_model::AgentProfileId::from("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(
+            store
+                .set_agent_binding(&s.id, &id, baybo_model::AgentFramework::Baybo)
+                .await
+                .unwrap()
+        );
+        // Write-once: a second bind is refused.
+        assert!(
+            !store
+                .set_agent_binding(&s.id, &id, baybo_model::AgentFramework::Baybo)
+                .await
+                .unwrap()
+        );
+        // Missing row is refused.
+        let ghost = make_root_session("ghost");
+        assert!(
+            !store
+                .set_agent_binding(&ghost.id, &id, baybo_model::AgentFramework::Baybo)
+                .await
+                .unwrap()
+        );
+
+        // A full-blob save (touch path) must not clobber the columns.
+        store.save(&s).await.unwrap();
+        let loaded = store.get(&s.id).await.unwrap().expect("row present");
+        assert_eq!(loaded.state.agent_id, Some(id));
+        assert_eq!(
+            loaded.state.agent_framework,
+            Some(baybo_model::AgentFramework::Baybo)
+        );
+
+        // Unbound session reads back as None.
+        let plain = make_root_session("plain");
+        store.save(&plain).await.unwrap();
+        let loaded = store.get(&plain.id).await.unwrap().expect("row present");
+        assert_eq!(loaded.state.agent_id, None);
+        assert_eq!(loaded.state.agent_framework, None);
+    }
+
+    #[tokio::test]
+    async fn unknown_agent_framework_column_errors_rather_than_falling_back() {
+        // Matches the agent-profiles read rule: an unrecognised framework
+        // tag must surface as a hard `StorageError`, never silently
+        // degrade to a default framework.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let s = make_root_session("bad-framework");
+        pool.conn()
+            .execute(
+                "INSERT INTO sessions \
+                 (id, root_session_id, trigger_kind, created_at, last_active, data, \
+                  agent_id, agent_framework) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                libsql::params![
+                    s.id.as_str().to_string(),
+                    s.id.as_str().to_string(),
+                    "user".to_string(),
+                    super::super::time::to_us(Utc::now()),
+                    super::super::time::to_us(Utc::now()),
+                    serde_json::to_string(&s).unwrap(),
+                    "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                    "not_a_real_framework".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let store = LibsqlSessionStore::new(pool);
+        let err = store.get(&s.id).await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::Storage(ref msg) if msg.contains("unknown agent_framework")),
+            "unexpected error: {err:?}"
         );
     }
 

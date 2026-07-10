@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use baybo_model::{
-    ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId, FolderSummary,
-    LlmEntryName, MAX_FOLDER_NAME_LEN, Role, Session, SessionId, SessionState, TriggerSource, User,
+    AgentFramework, AgentProfileId, ChannelType, ChatMessage, ControlEvent, ControlEventKind,
+    FolderId, FolderSummary, LlmEntryName, MAX_FOLDER_NAME_LEN, Role, Session, SessionId,
+    SessionState, TriggerSource, User,
 };
 use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
@@ -574,6 +575,23 @@ impl SessionManager {
         }
         debug!(session_id = %session_id, llm = ?llm, "set session llm pin");
         Ok(())
+    }
+
+    /// Bind a session to an agent profile (write-once; see the store docs).
+    /// Returns `Ok(false)` when the row is missing or already bound —
+    /// callers decide whether that's an error.
+    pub async fn set_agent_binding(
+        &self,
+        session_id: &SessionId,
+        agent_id: &AgentProfileId,
+        framework: AgentFramework,
+    ) -> Result<bool> {
+        let updated = self
+            .store
+            .set_agent_binding(session_id, agent_id, framework)
+            .await?;
+        debug!(session_id = %session_id, agent_id = %agent_id, updated, "set session agent binding");
+        Ok(updated)
     }
 
     /// Flip the session's chat-list `pinned` flag — the sidebar "pin to

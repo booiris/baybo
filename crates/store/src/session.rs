@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use baybo_model::{
-    ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId, LineageKind, LlmEntryName,
-    Session, SessionId,
+    AgentFramework, AgentProfileId, ChannelType, ChatMessage, ControlEvent, ControlEventKind,
+    FolderId, LineageKind, LlmEntryName, Session, SessionId,
 };
 use chrono::{DateTime, Utc};
 
@@ -65,6 +65,17 @@ pub trait SessionStore: Send + Sync {
         &self,
         session_id: &SessionId,
         llm: Option<&LlmEntryName>,
+    ) -> Result<bool>;
+
+    /// Bind this session to an agent profile. Write-once: the SQL guard
+    /// (`WHERE agent_id IS NULL`) makes a re-bind affect zero rows, so the
+    /// binding is structurally immutable. `Ok(false)` = no row matched
+    /// (missing id, or already bound).
+    async fn set_agent_binding(
+        &self,
+        session_id: &SessionId,
+        agent_id: &AgentProfileId,
+        framework: AgentFramework,
     ) -> Result<bool>;
 
     /// Set (or clear, with `false`) the session's chat-list pin flag —

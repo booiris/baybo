@@ -185,6 +185,16 @@ impl LibsqlPool {
                     read_cursor           INTEGER,
                     -- Auto-generated conversation title; owned by set_title.
                     title                 TEXT,
+                    -- Agent-profile binding, set once by set_agent_binding
+                    -- (the SQL guard `WHERE agent_id IS NULL` makes a
+                    -- second call a no-op, so the pair is structurally
+                    -- write-once). NULL ⇒ the builtin baybo agent. Like
+                    -- the other chat flat columns, `save`'s DO UPDATE
+                    -- omits both so a concurrent `touch` can't clobber
+                    -- the binding; `get` patches `Session.state.agent_id`
+                    -- / `agent_framework` from these columns on read.
+                    agent_id              TEXT,
+                    agent_framework       TEXT,
                     data                  TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_root
@@ -595,6 +605,8 @@ impl LibsqlPool {
             "ALTER TABLE devices ADD COLUMN remote_api_key TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE session_messages ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sessions ADD COLUMN read_cursor INTEGER",
+            "ALTER TABLE sessions ADD COLUMN agent_id TEXT",
+            "ALTER TABLE sessions ADD COLUMN agent_framework TEXT",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {
