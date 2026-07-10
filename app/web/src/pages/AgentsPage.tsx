@@ -488,6 +488,8 @@ function AgentEditorPanel({
   const [framework, setFramework] = useState<AgentFramework>(agent?.framework ?? 'baybo');
   const [systemPrompt, setSystemPrompt] = useState(agent?.system_prompt ?? '');
   const [llm, setLlm] = useState(agent?.llm ?? '');
+  const [allowedModels, setAllowedModels] = useState<string[]>(agent?.allowed_models ?? []);
+  const [reasoningEffort, setReasoningEffort] = useState(agent?.reasoning_effort ?? '');
   const [avatarBlobId, setAvatarBlobId] = useState<string | null>(agent?.avatar_blob_id ?? null);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
@@ -554,6 +556,8 @@ function AgentEditorPanel({
         framework,
         system_prompt: systemPrompt.trim() === '' ? null : systemPrompt,
         llm: llm === '' ? null : llm,
+        allowed_models: allowedModels,
+        reasoning_effort: reasoningEffort === '' ? null : reasoningEffort,
       };
       if (agent === null) {
         const { data, error: apiError, response } = await client.POST('/v1/agents', {
@@ -599,6 +603,7 @@ function AgentEditorPanel({
     }
   }, [
     agent,
+    allowedModels,
     avatarBlobId,
     avatarChanged,
     client,
@@ -610,6 +615,7 @@ function AgentEditorPanel({
     logout,
     name,
     onSaved,
+    reasoningEffort,
     systemPrompt,
   ]);
 
@@ -738,7 +744,10 @@ function AgentEditorPanel({
                 onChange={(e) => setLlm(e.target.value)}
               >
                 <option value="">Default model</option>
-                {llmNames.map((n) => (
+                {(allowedModels.length > 0
+                  ? llmNames.filter((n) => allowedModels.includes(n))
+                  : llmNames
+                ).map((n) => (
                   <option key={n} value={n}>
                     {n}
                   </option>
@@ -750,6 +759,73 @@ function AgentEditorPanel({
                   <option value={llm}>{llm} (unavailable)</option>
                 )}
               </SelectBox>
+            </div>
+          </div>
+
+          {/* ── model constraints ── */}
+          <div className="flex gap-4">
+            <div className="flex-1" title={externalFramework ? BAYBO_ONLY_HINT : undefined}>
+              <label className={fieldLabel}>
+                Reasoning effort {externalFramework && <span className="normal-case">(baybo only)</span>}
+              </label>
+              <SelectBox
+                className={`w-full h-10 !border ${contentLocked || externalFramework ? 'opacity-60' : ''}`}
+                value={reasoningEffort}
+                disabled={contentLocked || externalFramework}
+                onChange={(e) => setReasoningEffort(e.target.value)}
+              >
+                <option value="">Default (entry setting)</option>
+                {['minimal', 'low', 'medium', 'high', 'xhigh'].map((e) => (
+                  <option key={e} value={e}>
+                    {e}
+                  </option>
+                ))}
+              </SelectBox>
+            </div>
+            <div className="flex-1" title={externalFramework ? BAYBO_ONLY_HINT : undefined}>
+              <label className={fieldLabel}>
+                Allowed models {externalFramework && <span className="normal-case">(baybo only)</span>}
+              </label>
+              <p className="text-[0.7rem] text-ink-soft mb-1">
+                None checked = every configured model. Checked entries are the
+                only models sessions bound to this agent may switch to.
+              </p>
+              <div
+                className={`border-2 border-black rounded-md p-2 flex flex-col gap-1 max-h-40 overflow-y-auto ${
+                  contentLocked || externalFramework ? 'opacity-60 pointer-events-none' : ''
+                }`}
+              >
+                {llmNames.map((n) => (
+                  <label key={n} className="flex items-center gap-2 text-sm cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={allowedModels.includes(n)}
+                      disabled={contentLocked || externalFramework}
+                      onChange={(e) =>
+                        setAllowedModels((prev) =>
+                          e.target.checked ? [...prev, n] : prev.filter((m) => m !== n),
+                        )
+                      }
+                    />
+                    <span className="truncate">{n}</span>
+                  </label>
+                ))}
+                {allowedModels
+                  .filter((m) => !llmNames.includes(m))
+                  .map((m) => (
+                    <label key={m} className="flex items-center gap-2 text-sm opacity-70">
+                      <input
+                        type="checkbox"
+                        checked
+                        disabled={contentLocked || externalFramework}
+                        onChange={() =>
+                          setAllowedModels((prev) => prev.filter((x) => x !== m))
+                        }
+                      />
+                      <span className="truncate">{m} (unavailable)</span>
+                    </label>
+                  ))}
+              </div>
             </div>
           </div>
 

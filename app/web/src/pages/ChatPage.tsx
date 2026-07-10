@@ -49,6 +49,7 @@ import { CronInbox } from '../components/CronInbox';
 import { TaskChecklist } from '../components/chat/TaskChecklist';
 import { AttachmentImage } from './chat/AttachmentImage';
 import { type AgentOption } from './chat/AgentPicker';
+import { filterAllowedModels } from './chat/modelFilter';
 import { QueuePanel } from './chat/QueuePanel';
 import { SessionSidebar } from './chat/SessionSidebar';
 import {
@@ -183,6 +184,7 @@ interface ModelOption {
  *  chip resolves via {@link useBlobUrl}. */
 interface AgentEntry extends AgentOption {
   avatarBlobId: string | null;
+  allowedModels: string[];
 }
 
 /**
@@ -390,6 +392,13 @@ export function ChatPage() {
   const currentView = (sessionId && views[sessionId]) || EMPTY_VIEW;
   const activeSession = sessionId ? sessions.find((s) => s.session_id === sessionId) : undefined;
   const activeTitle = activeSession?.title;
+  const activeAgent = activeSession?.agent_id
+    ? agentsById.get(activeSession.agent_id)
+    : undefined;
+  const visibleModels = useMemo(
+    () => filterAllowedModels(models, activeAgent?.allowedModels ?? []),
+    [models, activeAgent],
+  );
   // A turn is "in flight" either optimistically (between send and the first
   // response) or per the server's authoritative TurnState. While busy the
   // composer's send button becomes a stop button and new sends are blocked.
@@ -961,6 +970,7 @@ export function ChatPage() {
           builtin: a.builtin,
           framework: a.framework,
           avatarBlobId: a.avatar_blob_id ?? null,
+          allowedModels: a.allowed_models ?? [],
         })),
       );
       folderStore.replaceFolders(
@@ -2687,6 +2697,7 @@ export function ChatPage() {
                     builtin: false,
                     framework: 'baybo',
                     avatarBlobId: null,
+                    allowedModels: [],
                   }
                 }
                 baseUrl={baseUrl}
@@ -2956,7 +2967,7 @@ export function ChatPage() {
                 </div>
                 {sessionId && models.length > 1 ? (
                   <ModelPicker
-                    models={models}
+                    models={visibleModels}
                     defaultName={defaultModelName}
                     current={currentView.model}
                     onSelect={handleSelectModel}
@@ -5378,6 +5389,14 @@ function ModelPicker({
             onClick={() => void pick(null)}
           />
           <div className="my-1 border-t-2 border-black/10" />
+          {pinned !== null && !models.some((m) => m.name === pinned) ? (
+            <ModelPickerRow
+              label={pinned}
+              sublabel="(not in allowed set)"
+              selected
+              onClick={() => {}}
+            />
+          ) : null}
           {models.map((m) => (
             <ModelPickerRow
               key={m.name}
