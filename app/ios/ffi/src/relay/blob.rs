@@ -27,6 +27,7 @@ const HEADER_RANGE: &str = "range";
 async fn download_to_path(
     blob_id: &str,
     entry: &blob_helper::BlobCacheEntry,
+    progress: blob_helper::ProgressSink,
 ) -> Result<(), String> {
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
@@ -62,11 +63,17 @@ async fn download_to_path(
         return Err("download resume was not accepted".into());
     }
 
+    // A 206's `body_len` counts the REMAINING bytes, so the blob's full length
+    // is what a resume already holds plus what this response will carry.
+    let total = body_len.map(|len| resume_from + len);
+    let mut ticker = blob_helper::ProgressTicker::new(progress, total, resume_from);
+
     let mut file = blob_helper::open_part_append(entry).await?;
 
     let mut expected_body_offset = resume_from;
     if body_len == Some(0) {
         blob_helper::finalize_download(file, entry, hasher).await?;
+        ticker.finish();
         let _ = ws.close(None).await;
         return Ok(());
     }
@@ -89,8 +96,10 @@ async fn download_to_path(
                     .map_err(|e| format!("write part: {e}"))?;
                 hasher.update(&data);
                 expected_body_offset += data.len() as u64;
+                ticker.advance(data.len());
                 if last {
                     blob_helper::finalize_download(file, entry, hasher).await?;
+                    ticker.finish();
                     let _ = ws.close(None).await;
                     return Ok(());
                 }
@@ -186,9 +195,12 @@ async fn upload_bytes_over_tunnel(
     Ok(parsed.blob_id)
 }
 
-async fn download_blob_bytes(blob_id: String) -> Result<Vec<u8>, String> {
+async fn download_blob_bytes(
+    blob_id: String,
+    progress: blob_helper::ProgressSink,
+) -> Result<Vec<u8>, String> {
     blob_helper::read_or_download_blob_bytes(blob_id, |blob_id, entry| async move {
-        download_to_path(&blob_id, &entry).await
+        download_to_path(&blob_id, &entry, progress).await
     })
     .await
 }
@@ -206,7 +218,8 @@ impl GatewayBlobClient for super::GatewayApi {
     fn download_blob(
         &self,
         blob_id: String,
+        progress: blob_helper::ProgressSink,
     ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send + '_ {
-        async move { download_blob_bytes(blob_id).await }
+        async move { download_blob_bytes(blob_id, progress).await }
     }
 }

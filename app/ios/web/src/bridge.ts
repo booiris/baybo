@@ -25,6 +25,20 @@ type BlobResultPayload = {
   error: string | null;
 };
 
+/// A file attachment's lifecycle, owned by native (the blob cache is on-device
+/// and iOS may purge it, so `ready` is a fact about disk, never a memory).
+export type FileState = "idle" | "loading" | "ready" | "failed";
+
+export type FileStatePayload = {
+  blobId: string;
+  state: FileState;
+  /// Bytes on disk while `loading`. `total` is the blob's full length when the
+  /// server declared one — the card already knows it from the attachment.
+  loaded?: number;
+  total?: number;
+  error?: string;
+};
+
 type BayboGlobal = {
   init(payload: InitPayload): void;
   pushFrame(frameJson: string): void;
@@ -32,6 +46,7 @@ type BayboGlobal = {
   userSent(payload: UserSentPayload): void;
   sendFailed(msgId: string): void;
   blobResult(payload: BlobResultPayload): void;
+  fileState(payload: FileStatePayload): void;
   setLanguage(lang: string): void;
   setBottomInset(px: number): void;
   jumpToLatest(): void;
@@ -226,6 +241,45 @@ function settleBlob(payload: BlobResultPayload): void {
   }
 }
 
+// ---- file attachments (download / preview) ---------------------------------
+
+/// Keyed by blob id rather than fanned through the transcript's reducer: every
+/// card subscribes for itself, so a progress tick re-renders one card instead of
+/// the whole thread (and `MessageRow`'s memo survives).
+const fileStateListeners = new Map<string, Set<(payload: FileStatePayload) => void>>();
+
+export function onFileState(
+  blobId: string,
+  listener: (payload: FileStatePayload) => void,
+): () => void {
+  let listeners = fileStateListeners.get(blobId);
+  if (!listeners) {
+    listeners = new Set();
+    fileStateListeners.set(blobId, listeners);
+  }
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) fileStateListeners.delete(blobId);
+  };
+}
+
+/// Ask native whether the blob is already on disk. Answered with a `fileState`.
+export function queryFileState(blobId: string): void {
+  postSafe({ type: "queryFileState", blobId });
+}
+
+/// Start (or join) the download. Native streams `loading` ticks, then `ready`.
+export function downloadFile(blobId: string): void {
+  postSafe({ type: "downloadFile", blobId });
+}
+
+/// Open the downloaded file — QuickLook where iOS can render it, the share
+/// sheet otherwise. Native needs the name and mime to pick the previewer.
+export function previewFile(blobId: string, filename: string, mimeType: string): void {
+  postSafe({ type: "previewFile", blobId, filename, mimeType });
+}
+
 // ---- inbound dispatch ------------------------------------------------------
 
 export type TranscriptEvents = {
@@ -332,6 +386,11 @@ window.baybo = {
   },
   blobResult(payload) {
     settleBlob(payload);
+  },
+  fileState(payload) {
+    // A tick for a blob no card is showing (the session switched mid-download)
+    // simply has no listener.
+    for (const listener of fileStateListeners.get(payload.blobId) ?? []) listener(payload);
   },
   setLanguage(lang) {
     onLanguageCb?.(lang);

@@ -57,6 +57,7 @@ pub(crate) trait GatewayBlobClient {
     fn download_blob(
         &self,
         blob_id: String,
+        progress: crate::blob_helper::ProgressSink,
     ) -> impl Future<Output = Result<Vec<u8>, String>> + Send + '_;
 }
 
@@ -372,8 +373,9 @@ pub(crate) async fn upload_bytes<C: GatewayBlobClient + Sync>(
 pub(crate) async fn download_blob_bytes<C: GatewayBlobClient + Sync>(
     client: &C,
     blob_id: String,
+    progress: crate::blob_helper::ProgressSink,
 ) -> Result<Vec<u8>, String> {
-    client.download_blob(blob_id).await
+    client.download_blob(blob_id, progress).await
 }
 
 fn validate_path_segment(value: &str, name: &str) -> Result<(), String> {

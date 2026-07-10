@@ -552,11 +552,91 @@ button {
   color: var(--color-ink-soft);
 }
 .attachment-retry:active { opacity: 0.7; transform: none; }
+/* File cards share one width so a stack of them keeps a straight edge (the
+   bubble otherwise shrinks to each filename). Capped so a lone card doesn't
+   stretch across the whole reading column. */
+.attachment-bubble.file { width: min(100%, 19rem); }
+/* A button, not a div: an undownloaded file is fetched by tapping it, a
+   downloaded one opens. `text-align: left` undoes the UA button centering. */
 .attachment-file {
-  font-size: 0.85rem;
-  padding: 0.35rem 0.6rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  padding: 0.55rem 0.7rem;
   background: var(--color-surface);
-  border: 1px solid var(--color-line);
+  border: 1px solid var(--color-ink);
   border-radius: var(--radius);
-  overflow-wrap: anywhere;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+.attachment-file:active { opacity: 0.65; }
+/* Mid-download the card is inert; a press that does nothing must not pretend. */
+.attachment-file.loading:active { opacity: 1; }
+.attachment-file.failed { border-color: var(--color-err); }
+.attachment-file.failed .file-glyph { color: var(--color-err); }
+
+/* The ring orbits the glyph, so the icon itself never moves between states. */
+.file-glyph-slot {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.7rem;
+  height: 1.7rem;
+}
+.file-glyph {
+  width: 1.15rem;
+  height: 1.15rem;
+  color: var(--color-ink-soft);
+}
+/* Indeterminate on purpose: the byte counter beside it carries the real
+   progress, and an arc that stalls on a slow chunk reads as a hang. */
+.file-spinner {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-line);
+  border-top-color: var(--color-ink-soft);
+  animation: file-spin 720ms linear infinite;
+}
+@keyframes file-spin {
+  to { transform: rotate(360deg); }
+}
+/* `min-width: 0` is what lets the name actually ellipsize inside the flex row. */
+.file-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.05rem;
+  min-width: 0;
+}
+/* Middle ellipsis: the head absorbs the clipping, the tail never shrinks, so
+   `…-Q3-final.pdf` keeps the part that distinguishes the file. */
+.file-name {
+  display: flex;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.35;
+  color: var(--color-ink);
+}
+.file-name-head {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-name-tail {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.file-meta {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  line-height: 1.3;
+  letter-spacing: 0.03em;
+  color: var(--color-ink-soft);
 }

@@ -113,6 +113,19 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("blobResult", jsonObjectLiteral(payload))
     }
 
+    /// One file card's lifecycle step. `loaded`/`total` only ride a `loading`
+    /// tick; `error` only a `failed` one.
+    func fileState(
+        blobId: String, state: String, loaded: UInt64? = nil, total: UInt64? = nil,
+        error: String? = nil
+    ) {
+        var payload: [String: Any] = ["blobId": blobId, "state": state]
+        if let loaded { payload["loaded"] = loaded }
+        if let total { payload["total"] = total }
+        if let error { payload["error"] = error }
+        call("fileState", jsonObjectLiteral(payload))
+    }
+
     func setLanguage(_ lang: String) {
         call("setLanguage", jsonLiteral(lang))
     }
@@ -301,6 +314,21 @@ extension TranscriptBridge: WKScriptMessageHandler {
                 let blobId = body["blobId"] as? String
             {
                 store?.requestBlob(id: id, blobId: blobId)
+            }
+        case "queryFileState":
+            if let blobId = body["blobId"] as? String {
+                store?.queryFileState(blobId: blobId)
+            }
+        case "downloadFile":
+            if let blobId = body["blobId"] as? String {
+                store?.downloadFile(blobId: blobId)
+            }
+        case "previewFile":
+            if let blobId = body["blobId"] as? String,
+                let filename = body["filename"] as? String,
+                let mimeType = body["mimeType"] as? String
+            {
+                store?.previewFile(blobId: blobId, filename: filename, mimeType: mimeType)
             }
         case "retry":
             // The failed-bubble dot was tapped. The webview carries the payload

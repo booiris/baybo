@@ -1,4 +1,27 @@
 import SwiftUI
+import UniformTypeIdentifiers
+
+/// A file attachment sitting in the app's temp dir, ready for QuickLook or the
+/// share sheet. Identified by its URL so `.sheet(item:)` re-presents when the
+/// user taps a different file.
+struct FilePreview: Identifiable {
+    let url: URL
+    var id: URL { url }
+}
+
+/// Bridges the core's `BlobProgress` callback (a tokio worker) onto the main
+/// actor. The core already rate-limits the ticks.
+final class BlobProgressForwarder: BlobProgress, @unchecked Sendable {
+    private let onTick: @MainActor (UInt64, UInt64?) -> Void
+
+    init(onTick: @escaping @MainActor (UInt64, UInt64?) -> Void) {
+        self.onTick = onTick
+    }
+
+    func onProgress(downloaded: UInt64, total: UInt64?) {
+        Task { @MainActor in onTick(downloaded, total) }
+    }
+}
 
 /// The chat screen's connection state machine + send path — the native owner of
 /// everything the webview's reconnect effect used to do (App.tsx 903-984).
@@ -43,6 +66,8 @@ final class ChatStore: ObservableObject {
     @Published private(set) var connState: ConnState
     /// Transient composer notice (send failed / waiting for upload / too large).
     @Published var notice: String?
+    /// A tapped file attachment, materialised on disk and awaiting presentation.
+    @Published var filePreview: FilePreview?
 
     /// Increments on every successful dial; the webview uses it to retry
     /// attachments that raced ahead of the leg going live, and — the sync-loop
@@ -292,6 +317,12 @@ final class ChatStore: ObservableObject {
 
         func pushDemoFrame(_ frameJson: String) {
             pushFrame(frameJson)
+        }
+
+        func pushDemoFileState(
+            blobId: String, state: String, loaded: UInt64? = nil, total: UInt64? = nil
+        ) {
+            bridge?.fileState(blobId: blobId, state: state, loaded: loaded, total: total)
         }
     #endif
 
@@ -659,7 +690,10 @@ final class ChatStore: ObservableObject {
     func requestBlob(id: Int, blobId: String) {
         Task {
             do {
-                let bytes = try await Baybo.client.blobDownloadBytes(blobId: blobId)
+                // A thumbnail fetch: nobody is watching the byte count, and the
+                // core skips the tick machinery entirely for a nil observer.
+                let bytes = try await Baybo.client.blobDownloadBytes(
+                    blobId: blobId, progress: nil)
                 // Encode off the main actor: base64 of a large blob (up to
                 // 100 MiB) would stall every tap for seconds.
                 let (encoded, mime) = await Task.detached(priority: .userInitiated) {
@@ -671,6 +705,97 @@ final class ChatStore: ObservableObject {
                     id: id, dataBase64: nil, mimeType: "", error: bayboErrorText(error))
             }
         }
+    }
+
+    // MARK: - File attachments (download → preview)
+
+    /// Blobs with a download task in flight, so a second tap joins rather than
+    /// racing a duplicate stream through the core's per-blob cache lock.
+    private var fileDownloads: Set<String> = []
+
+    /// Answer the card's mount-time probe. The blob cache lives in the OS temp
+    /// dir, so this is asked every mount rather than remembered.
+    func queryFileState(blobId: String) {
+        if fileDownloads.contains(blobId) {
+            bridge?.fileState(blobId: blobId, state: "loading")
+            return
+        }
+        Task {
+            let cached = await Baybo.client.blobIsCached(blobId: blobId)
+            bridge?.fileState(blobId: blobId, state: cached ? "ready" : "idle")
+        }
+    }
+
+    func downloadFile(blobId: String) {
+        guard fileDownloads.insert(blobId).inserted else { return }
+        bridge?.fileState(blobId: blobId, state: "loading", loaded: 0)
+        Task {
+            defer { fileDownloads.remove(blobId) }
+            do {
+                _ = try await Baybo.client.blobDownloadBytes(
+                    blobId: blobId,
+                    progress: BlobProgressForwarder { [weak self] loaded, total in
+                        self?.bridge?.fileState(
+                            blobId: blobId, state: "loading", loaded: loaded, total: total)
+                    })
+                bridge?.fileState(blobId: blobId, state: "ready")
+            } catch {
+                bridge?.fileState(
+                    blobId: blobId, state: "failed", error: bayboErrorText(error))
+            }
+        }
+    }
+
+    /// Materialise the blob under its real name — QuickLook and the share sheet
+    /// both pick the handler from the extension, and the core's cache names its
+    /// files by digest — then hand it to the screen.
+    func previewFile(blobId: String, filename: String, mimeType: String) {
+        Task {
+            do {
+                let bytes = try await Baybo.client.blobDownloadBytes(
+                    blobId: blobId, progress: nil)
+                let url = try Self.writePreviewFile(
+                    bytes: bytes, blobId: blobId, filename: filename, mimeType: mimeType)
+                filePreview = FilePreview(url: url)
+            } catch {
+                bridge?.fileState(
+                    blobId: blobId, state: "failed", error: bayboErrorText(error))
+            }
+        }
+    }
+
+    /// `<tmp>/baybo-preview/<blob digest>/<filename>` — the digest directory
+    /// keeps two blobs that share a filename apart, and lets a re-open reuse the
+    /// file already written.
+    private static func writePreviewFile(
+        bytes: Data, blobId: String, filename: String, mimeType: String
+    ) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("baybo-preview", isDirectory: true)
+            .appendingPathComponent(previewDirComponent(for: blobId), isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent(previewFilename(filename, mimeType: mimeType))
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try bytes.write(to: url, options: .atomic)
+        }
+        return url
+    }
+
+    /// The digest half of `sha256:<hex>.<read-token>`; the token is a capability
+    /// and rotates per upload, so it must never key a directory.
+    private static func previewDirComponent(for blobId: String) -> String {
+        let hex = blobId.drop(while: { $0 != ":" }).dropFirst().prefix(while: { $0 != "." })
+        return hex.isEmpty ? "blob" : String(hex)
+    }
+
+    /// A nameless blob still needs an extension or QuickLook can't pick a
+    /// previewer; derive one from the mime.
+    private static func previewFilename(_ filename: String, mimeType: String) -> String {
+        let trimmed = filename.replacingOccurrences(of: "/", with: "_")
+        if !trimmed.isEmpty, trimmed.contains(".") { return trimmed }
+        let ext = UTType(mimeType: mimeType)?.preferredFilenameExtension
+        let base = trimmed.isEmpty ? "attachment" : trimmed
+        return ext.map { "\(base).\($0)" } ?? base
     }
 
     /// Cheap magic-byte sniff so the webview can build a typed Blob; the exact

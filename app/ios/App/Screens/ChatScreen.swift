@@ -75,12 +75,16 @@ struct ChatScreen: View {
             .animation(.easeOut(duration: 0.16), value: bridge.jumpVisible)
         }
         .background(Theme.paper)
+        .sheet(item: $store.filePreview) { preview in
+            FilePreviewSheet(url: preview.url)
+        }
         .onAppear {
             host.bridge.retarget(to: store)
             store.connectIfNeeded()
             SessionIndex.shared.enterSession(store.sessionId)
             #if DEBUG
                 store.startDemoFramesIfRequested()
+                store.startDemoAttachmentsIfRequested()
                 store.startDemoSwitchIfRequested()
                 bridge.startDemoJumpIfRequested()
                 startDemoBackIfRequested()

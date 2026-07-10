@@ -71,6 +71,11 @@ pub struct ClientConfig {
     /// Directory for the rotating `baybo.log` (2 MiB × 3 files — the exportable
     /// log bundle). `None` disables file logging (host tests).
     pub log_dir: Option<String>,
+    /// Durable home for downloaded blobs, content-addressed by digest. `None`
+    /// falls back to the OS temp dir, which iOS purges under storage pressure —
+    /// fine for host tests, wrong for a file the user asked to keep. Nothing
+    /// evicts from it; the embedder owns retention.
+    pub blob_cache_dir: Option<String>,
 }
 
 /// Scan-to-pair target parsed from a `baybo://pair` QR payload.
@@ -194,6 +199,18 @@ impl From<AttachmentRef> for crate::core::WireAttachment {
             filename: a.filename,
         }
     }
+}
+
+/// Byte progress for one `blob_download_bytes` call. Calls arrive on the core's
+/// tokio workers and are rate-limited by the core, not per network chunk — a
+/// 100 MiB download would otherwise cross the FFI thousands of times.
+#[uniffi::export(with_foreign)]
+pub trait BlobProgress: Send + Sync {
+    /// `downloaded` counts the bytes already on disk for this blob, so a
+    /// **resumed** download opens above zero rather than snapping back. `total`
+    /// is the blob's full length when the server declared one; the caller
+    /// usually knows it already from the attachment's `size`.
+    fn on_progress(&self, downloaded: u64, total: Option<u64>);
 }
 
 /// Where a subscribed chat session's frames land. The binding owns one global

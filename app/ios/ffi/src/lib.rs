@@ -29,9 +29,9 @@ use std::sync::Arc;
 use crate::core::WireAttachment;
 
 pub use api::{
-    ApnsEnvironment, AttachmentKind, AttachmentRef, BayboError, ChatSessionSummary, ClientConfig,
-    FrameSink, MessageLookup, PairAbortListener, PairChallenge, PairTarget, PairedSummary,
-    SessionListSink,
+    ApnsEnvironment, AttachmentKind, AttachmentRef, BayboError, BlobProgress, ChatSessionSummary,
+    ClientConfig, FrameSink, MessageLookup, PairAbortListener, PairChallenge, PairTarget,
+    PairedSummary, SessionListSink,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -71,6 +71,9 @@ impl BayboClient {
     pub fn new(config: ClientConfig) -> Arc<Self> {
         install_crypto_provider();
         logging::install(config.log_dir);
+        if let Some(dir) = config.blob_cache_dir {
+            blob_helper::set_blob_cache_dir(dir.into());
+        }
         #[cfg(all(debug_assertions, target_os = "ios"))]
         debug_seed_push_key();
         let apns = Arc::new(ApnsState::new(config.apns_env));
@@ -601,20 +604,39 @@ impl BayboClient {
     /// transport, returning the verified bytes. Relay sends `GET /v1/blobs/{id}`
     /// over a dedicated E2E API tunnel blob leg into a content-addressed
     /// on-device cache (reused on the next render); direct GETs plain
-    /// `/v1/blobs/{id}` (Bearer + device id).
+    /// `/v1/blobs/{id}` (Bearer + device id). Both legs resume a partial
+    /// download rather than restarting it.
+    ///
+    /// `progress` observes the byte count while it streams; pass `None` when
+    /// nobody is watching (a thumbnail fetch). It never fires for a cache hit —
+    /// ask [`Self::blob_is_cached`] first if that distinction matters.
     pub async fn blob_download_bytes(
         self: Arc<Self>,
         blob_id: String,
+        progress: Option<Arc<dyn BlobProgress>>,
     ) -> Result<Vec<u8>, BayboError> {
         runtime::run(async move {
             match active_leg()? {
-                ActiveLeg::Direct => direct::download_blob_bytes(&self.direct, blob_id).await,
+                ActiveLeg::Direct => {
+                    direct::download_blob_bytes(&self.direct, blob_id, progress).await
+                }
                 ActiveLeg::Relay => {
-                    gateway_api::download_blob_bytes(&relay::GatewayApi, blob_id).await
+                    gateway_api::download_blob_bytes(&relay::GatewayApi, blob_id, progress).await
                 }
             }
         })
         .await
+    }
+
+    /// Is this blob already in the on-device cache? Never downloads, never
+    /// touches the network. The cache lives under the OS temp dir, which iOS
+    /// purges under storage pressure — re-ask rather than remembering a `true`.
+    pub async fn blob_is_cached(self: Arc<Self>, blob_id: String) -> bool {
+        // A probe that cannot fail: if the core task somehow can't run, "not
+        // cached" is the safe answer — the caller just downloads it again.
+        runtime::run(async move { Ok::<_, String>(blob_helper::is_cached(&blob_id).await) })
+            .await
+            .unwrap_or(false)
     }
 }
 

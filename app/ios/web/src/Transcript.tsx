@@ -12,14 +12,19 @@ import { useTranslation } from "react-i18next";
 import {
   blobObjectUrl,
   copyText,
+  downloadFile,
   fetchHistory,
   log,
+  onFileState,
   persistState,
   postJumpVisible,
   postMarkRead,
   postSyncRequest,
+  previewFile,
+  queryFileState,
   retrySend,
   subscribeTranscript,
+  type FileState,
   type UserSentPayload,
 } from "./bridge";
 import { MarkdownBody } from "./Markdown";
@@ -471,15 +476,154 @@ function AttachmentBubble({
   className?: string;
   children?: ReactNode;
 }) {
+  const isImage = attachment.kind === "image";
+  const classes = ["attachment-bubble", isImage ? "" : "file", className ?? ""]
+    .filter(Boolean)
+    .join(" ");
   return (
-    <div className={`attachment-bubble${className ? ` ${className}` : ""}`}>
-      {attachment.kind === "image" ? (
+    <div className={classes}>
+      {isImage ? (
         <AttachmentImage attachment={attachment} connEpoch={connEpoch} />
       ) : (
-        <div className="attachment-file">📎 {attachment.filename ?? attachment.mime_type}</div>
+        <AttachmentFile attachment={attachment} />
       )}
       {children}
     </div>
+  );
+}
+
+/// Binary units, and only as much precision as disambiguates: `812 B`,
+/// `24 KB`, `2.3 MB`, `140 MB`.
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.round(kb)} KB`;
+  const mb = kb / 1024;
+  return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
+}
+
+/// A short, upper-case type badge. The filename's extension is the most
+/// honest source (`.docx` beats the mime's
+/// `vnd.openxmlformats-officedocument.wordprocessingml.document`); fall back to
+/// the mime subtype with its `+xml` suffix and `vnd.…` vendor path stripped.
+function typeLabel(attachment: WireAttachment): string {
+  const dot = attachment.filename?.lastIndexOf(".") ?? -1;
+  const ext = dot > 0 ? attachment.filename?.slice(dot + 1) : undefined;
+  if (ext && ext.length <= 4) return ext.toUpperCase();
+  const subtype = attachment.mime_type.split("/")[1] ?? attachment.mime_type;
+  const bare = subtype.split(";")[0].split("+")[0].split(".").pop() ?? "";
+  return (bare || attachment.mime_type).toUpperCase();
+}
+
+/// How much of a long filename's tail always survives. `…-Q3-final.pdf` is what
+/// tells a reader this is the final and not the draft; a plain end-ellipsis
+/// throws exactly that away.
+const FILENAME_TAIL_CHARS = 10;
+
+/// Split a name so CSS can ellipsize the head while the tail stays pinned.
+/// Short names take the whole width and get no tail.
+function splitForMiddleEllipsis(name: string): [string, string] {
+  if (name.length <= FILENAME_TAIL_CHARS * 2) return [name, ""];
+  return [name.slice(0, -FILENAME_TAIL_CHARS), name.slice(-FILENAME_TAIL_CHARS)];
+}
+
+/// A document with a folded corner — the file already on this device.
+const GLYPH_FILE = (
+  <>
+    <path
+      d="M11.6 2.6H5.8a1.7 1.7 0 0 0-1.7 1.7v11.4a1.7 1.7 0 0 0 1.7 1.7h8.4a1.7 1.7 0 0 0 1.7-1.7V6.9L11.6 2.6Z"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinejoin="round"
+    />
+    <path d="M11.5 2.7v4.3h4.3" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+  </>
+);
+
+/// An arrow into a tray — tap to fetch. Also what spins inside the ring while
+/// the bytes stream, so the icon never jumps between states.
+const GLYPH_DOWNLOAD = (
+  <>
+    <path
+      d="M10 3.4v9.2M6.4 9.2 10 12.8l3.6-3.6"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <path
+      d="M4.4 14.6v1.2a1.4 1.4 0 0 0 1.4 1.4h8.4a1.4 1.4 0 0 0 1.4-1.4v-1.2"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinecap="round"
+    />
+  </>
+);
+
+/// One file attachment's on-device lifecycle. Native owns the truth (the blob
+/// cache is a directory iOS may purge), so the card asks on every mount rather
+/// than trusting a `ready` it saw before.
+function useFileState(blobId: string): { state: FileState; loaded: number } {
+  const [state, setState] = useState<FileState>("idle");
+  const [loaded, setLoaded] = useState(0);
+
+  useEffect(() => {
+    const unsubscribe = onFileState(blobId, (payload) => {
+      setState(payload.state);
+      if (payload.state === "loading") setLoaded(payload.loaded ?? 0);
+    });
+    queryFileState(blobId);
+    return unsubscribe;
+  }, [blobId]);
+
+  return { state, loaded };
+}
+
+/// A non-image attachment: a stroked glyph (never the 📎 emoji — it arrives
+/// coloured and glossy, the one thing this monochrome system has no room for),
+/// the filename middle-clipped on one line, and the type + size beneath. The
+/// wire has carried `size` all along; nothing showed it.
+///
+/// Tapping an undownloaded file fetches it — the glyph becomes an indeterminate
+/// ring and the size turns into a `1.2 MB / 2.3 MB` counter, which is where the
+/// real progress lives. Tapping it once it's on disk opens the preview.
+function AttachmentFile({ attachment }: { attachment: WireAttachment }) {
+  const { state, loaded } = useFileState(attachment.blob_id);
+  const type = typeLabel(attachment);
+  // A nameless blob has nothing better to title itself with than its type, so
+  // the meta line would only repeat it.
+  const name = attachment.filename ?? type;
+  const [head, tail] = splitForMiddleEllipsis(name);
+
+  const meta =
+    state === "loading"
+      ? `${formatBytes(loaded)} / ${formatBytes(attachment.size)}`
+      : attachment.filename
+        ? `${type} · ${formatBytes(attachment.size)}`
+        : formatBytes(attachment.size);
+
+  const onTap = useCallback(() => {
+    if (state === "loading") return;
+    if (state === "ready") previewFile(attachment.blob_id, name, attachment.mime_type);
+    else downloadFile(attachment.blob_id);
+  }, [state, attachment.blob_id, attachment.mime_type, name]);
+
+  return (
+    <button type="button" className={`attachment-file ${state}`} onClick={onTap}>
+      <span className="file-glyph-slot">
+        <svg className="file-glyph" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+          {state === "ready" ? GLYPH_FILE : GLYPH_DOWNLOAD}
+        </svg>
+        {state === "loading" && <span className="file-spinner" aria-hidden="true" />}
+      </span>
+      <span className="file-text">
+        <span className="file-name">
+          <span className="file-name-head">{head}</span>
+          {tail && <span className="file-name-tail">{tail}</span>}
+        </span>
+        <span className="file-meta">{meta}</span>
+      </span>
+    </button>
   );
 }
 

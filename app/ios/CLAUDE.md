@@ -203,9 +203,9 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   400ms; the core coalesces concurrent dials.
 - **Bridge** (`App/Web/TranscriptBridge.swift` ⇄ `web/src/bridge.ts`):
   native→web
-  `init/pushFrame/setConnEpoch/userSent/blobResult/setLanguage/setBottomInset/jumpToLatest/requestSync`;
+  `init/pushFrame/setConnEpoch/userSent/blobResult/fileState/setLanguage/setBottomInset/jumpToLatest/requestSync`;
   web→native
-  `ready/sync/persist/fetchHistory/requestBlob/openUrl/copy/log/jumpVisible`.
+  `ready/sync/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/openUrl/copy/log/jumpVisible`.
   (`copy` is a user-bubble long-press: native writes `UIPasteboard` + fires a
   haptic, because a `file://` WKWebView rejects `navigator.clipboard` outside a
   live gesture.) The
@@ -214,6 +214,34 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   `sync_failed`). Transcript persistence is the per-session mirror file, a pure
   `{rows, cursor}` cache (NOT webview localStorage — file:// storage is
   unreliable and upgrade-fragile).
+- **File attachments** (`kind != "image"`) render as a tappable card whose glyph
+  is a download arrow until the blob is on disk, then a document. Tapping fetches
+  it; tapping a fetched one opens `FilePreviewSheet` — `QLPreviewController`
+  wrapped in `UIViewControllerRepresentable` (SwiftUI's `quickLookPreview` is
+  **macOS-only**; it does not exist in the iOS SDK), falling back to
+  `UIActivityViewController` when `QLPreviewController.canPreview` says no
+  (archives, unknown binaries). QuickLook picks its previewer from the file
+  extension, and the core's cache names files by digest, so `previewFile` writes
+  `<tmp>/baybo-preview/<digest>/<real name>` first.
+  The spinning ring is **indeterminate on purpose** — the byte counter beside it
+  (`884 KB / 2.3 MB`) is the progress. Bytes come from the core's `BlobProgress`
+  callback (`blob_download_bytes(blob_id, progress)`), rate-limited to one tick
+  per 100ms **in Rust**: a 100 MiB download hands the chunk loop thousands of
+  buffers, and every tick would otherwise cross the FFI and the webview bridge.
+  `downloaded` is bytes ON DISK, so a resumed download (both legs send
+  `Range: bytes=N-`) opens at its floor instead of snapping back to zero.
+  `blob_is_cached` is the mount-time probe. Downloaded blobs live in
+  `Application Support/baybo/blobs` (`ClientConfig.blobCacheDir`, set in
+  `Baybo.swift`) — **not** the OS temp dir, which iOS reclaims under storage
+  pressure: a file the user downloaded stays downloaded. The directory is
+  excluded from backup (a blob runs to 100 MiB and is always re-fetchable) and
+  **nothing evicts from it** — it only grows. That is deliberate; when it needs
+  bounding it wants a stated retention policy, not a surprise sweep. `ready` is
+  still re-asked on every mount rather than remembered, because the directory is
+  a fact about disk.
+  Cards subscribe to `fileState` **by blob id** (`onFileState`), so a progress
+  tick re-renders one card and `MessageRow`'s memo survives — and two cards on
+  the same blob (an agent's file the user quotes back) update together.
 - **Keyboard**: the transcript webview is FULL-BLEED and its frame never
   tracks the keyboard — a keyboard-resized WKWebView relayouts once, async,
   at the final size, so content sits still through the slide and snaps at the
@@ -252,7 +280,16 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   recordable (`simctl io recordVideo` + ffmpeg montage). Launch with
   `-baybo-open-chat -baybo-demo-frames` (DEBUG) to feed one canned turn
   (thinking → tool → streamed markdown → finalize) through the real bridge —
-  screenshot the sim at ~3s/~6s/~12s. `-baybo-demo-jump` scrolls the log off the newest edge at
+  screenshot the sim at ~3s/~6s/~12s. `-baybo-open-chat -baybo-demo-attachments`
+  pushes a short agent turn carrying three FILE attachments (long name / nameless
+  blob / sub-KB) plus a user send carrying one, so the file-card styling is
+  screenshot-verifiable at ~4s on BOTH sides with no gateway. Add
+  `-baybo-demo-download` to it and native pushes the `fileState` messages a real
+  download would, walking the first card idle → loading (ring + byte counter) →
+  ready over ~6s (shoot at ~4s / ~5.5s / ~9s); it drives the exact web reducer
+  the native path drives, only the bytes are fake. A file chip renders
+  straight from the frame, while the `image` kind would need a live blob leg.
+  `-baybo-demo-jump` scrolls the log off the newest edge at
   4s (native glass jump button pops) and runs the native jump path at 7s.
   `-baybo-demo-keyboard` raises the keyboard 2s in and drops
   it at 5s (record with `simctl io recordVideo`, extract frames with ffmpeg);

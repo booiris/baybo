@@ -9,6 +9,80 @@
     /// harmless.
     extension ChatStore {
         private static let demoFramesArg = "-baybo-demo-frames"
+        private static let demoAttachmentsArg = "-baybo-demo-attachments"
+        private static let demoDownloadArg = "-baybo-demo-download"
+
+        /// `-baybo-demo-download` (with `-baybo-demo-attachments`): push the
+        /// `fileState` messages a real download would, so the card's idle →
+        /// loading (spinner + byte counter) → ready transition is
+        /// screenshot-verifiable with no gateway and no blob leg. It drives the
+        /// exact web reducer the native path drives; only the bytes are fake.
+        private func driveDemoDownloadIfRequested() async {
+            guard ProcessInfo.processInfo.arguments.contains(Self.demoDownloadArg) else { return }
+            let blobId = Self.demoFileAttachments[0]["blob_id"] as? String ?? ""
+            let total = Self.demoFileAttachments[0]["size"] as? Int ?? 0
+            try? await Task.sleep(for: .milliseconds(1500))
+            for step in 1...6 {
+                let loaded = UInt64(total * step / 8)
+                pushDemoFileState(
+                    blobId: blobId, state: "loading", loaded: loaded, total: UInt64(total))
+                try? await Task.sleep(for: .milliseconds(700))
+            }
+            pushDemoFileState(blobId: blobId, state: "ready")
+        }
+
+        /// Spread the file chip has to survive: a long name that must clip, a
+        /// nameless blob that falls back to its mime, a sub-kilobyte file and a
+        /// multi-megabyte one. A file chip renders straight from the frame (no
+        /// blob fetch), so this is screenshot-verifiable with no gateway — the
+        /// `image` kind would need a live blob leg.
+        private static let demoFileAttachments: [[String: Any]] = [
+            [
+                "kind": "file", "blob_id": "sha256:demo1.tok",
+                "mime_type": "application/pdf", "size": 2_413_512,
+                "filename": "baybo-architecture-review-2026-Q3-final.pdf",
+            ],
+            [
+                "kind": "file", "blob_id": "sha256:demo2.tok",
+                "mime_type": "image/svg+xml", "size": 24_190,
+                "filename": "bg_character_card.svg",
+            ],
+            [
+                "kind": "file", "blob_id": "sha256:demo3.tok",
+                "mime_type": "application/zip", "size": 812,
+            ],
+        ]
+
+        /// `-baybo-demo-attachments` (DEBUG): one short agent turn carrying the
+        /// file chips above, so the attachment styling fits on a single
+        /// screenshot instead of scrolling off above a long markdown answer.
+        func startDemoAttachmentsIfRequested() {
+            guard ProcessInfo.processInfo.arguments.contains(Self.demoAttachmentsArg) else {
+                return
+            }
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(500))
+                pushDemoUserSent(msgId: "demo-att-user", text: "把角色卡和架构评审发我")
+                pushDemo(["kind": "turn_state", "active": true])
+                try? await Task.sleep(for: .milliseconds(600))
+                pushDemo([
+                    "kind": "message", "role": "assistant",
+                    "content": "已生成好了，附件里有角色卡和这一季的架构评审。",
+                    "platform_msg_id": "demo-att-1", "ordinal": 1,
+                    "attachments": Self.demoFileAttachments,
+                ])
+                pushDemo(["kind": "turn_state", "active": false])
+                // The same card renders right-aligned on a user send, under the
+                // outbox's sending chrome — verify both, not just the agent side.
+                try? await Task.sleep(for: .milliseconds(400))
+                pushDemo([
+                    "kind": "message", "role": "user", "content": "这份也帮我看下",
+                    "platform_msg_id": "demo-att-u2", "ordinal": 2,
+                    "attachments": [Self.demoFileAttachments[0]],
+                ])
+                await driveDemoDownloadIfRequested()
+            }
+        }
         @MainActor private static var demoSwitchSeeded = Set<String>()
 
         func startDemoFramesIfRequested() {
