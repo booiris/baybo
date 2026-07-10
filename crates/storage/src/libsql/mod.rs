@@ -542,6 +542,8 @@ impl LibsqlPool {
                     system_prompt   TEXT,
                     framework       TEXT NOT NULL,
                     llm             TEXT,
+                    allowed_models  TEXT,
+                    reasoning_effort TEXT,
                     builtin         INTEGER NOT NULL DEFAULT 0,
                     created_at      INTEGER NOT NULL,
                     updated_at      INTEGER NOT NULL
@@ -608,6 +610,8 @@ impl LibsqlPool {
             "ALTER TABLE sessions ADD COLUMN read_cursor INTEGER",
             "ALTER TABLE sessions ADD COLUMN agent_id TEXT",
             "ALTER TABLE sessions ADD COLUMN agent_framework TEXT",
+            "ALTER TABLE agent_profiles ADD COLUMN allowed_models TEXT",
+            "ALTER TABLE agent_profiles ADD COLUMN reasoning_effort TEXT",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {

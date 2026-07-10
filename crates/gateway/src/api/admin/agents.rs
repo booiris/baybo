@@ -268,6 +268,8 @@ async fn create_agent(
         system_prompt: req.system_prompt,
         framework: req.framework.into(),
         llm,
+        allowed_models: Vec::new(),
+        reasoning_effort: None,
         builtin: false,
         created_at: now,
         updated_at: now,
@@ -327,6 +329,8 @@ async fn update_agent(
         system_prompt: req.system_prompt,
         framework: req.framework.into(),
         llm: super::validate_llm_pin(&state, req.llm.as_deref())?,
+        allowed_models: Vec::new(),
+        reasoning_effort: None,
     };
     let matched = state
         .agent_profile_store

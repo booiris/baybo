@@ -8,7 +8,7 @@
 //! See `docs/modules/agent-profiles.md`.
 
 use async_trait::async_trait;
-use baybo_model::{AgentFramework, AgentProfileId, LlmEntryName};
+use baybo_model::{AgentFramework, AgentProfileId, LlmEntryName, ReasoningEffort};
 use chrono::{DateTime, Utc};
 
 use crate::StorageError;
@@ -32,6 +32,13 @@ pub struct AgentProfileRow {
     pub system_prompt: Option<String>,
     pub framework: AgentFramework,
     pub llm: Option<LlmEntryName>,
+    /// LLM entries a bound session may switch to. Empty = unrestricted.
+    /// When non-empty and `llm` is also set, the pin is a member
+    /// (gateway-enforced at write).
+    pub allowed_models: Vec<LlmEntryName>,
+    /// Per-request reasoning effort for providers that support it.
+    /// `None` = follow the LLM entry's own configured value.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Read-side state only — never bound on insert; the libsql seed is
     /// the sole writer of `builtin = 1`.
     pub builtin: bool,
@@ -49,6 +56,13 @@ pub struct AgentProfileUpdate {
     pub system_prompt: Option<String>,
     pub framework: AgentFramework,
     pub llm: Option<LlmEntryName>,
+    /// LLM entries a bound session may switch to. Empty = unrestricted.
+    /// When non-empty and `llm` is also set, the pin is a member
+    /// (gateway-enforced at write).
+    pub allowed_models: Vec<LlmEntryName>,
+    /// Per-request reasoning effort for providers that support it.
+    /// `None` = follow the LLM entry's own configured value.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Agent-profile lifecycle persistence. The store is a dumb writer — name

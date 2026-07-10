@@ -48,6 +48,8 @@ impl AgentProfileStore for MemoryAgentProfileStore {
         row.system_prompt = update.system_prompt.clone();
         row.framework = update.framework;
         row.llm = update.llm.clone();
+        row.allowed_models = update.allowed_models.clone();
+        row.reasoning_effort = update.reasoning_effort;
         Ok(true)
     }
     async fn set_avatar(&self, id: &AgentProfileId, blob_id: Option<&str>) -> Result<bool> {

@@ -720,6 +720,8 @@ mod tests {
             system_prompt: None,
             framework: baybo_model::AgentFramework::Baybo,
             llm,
+            allowed_models: Vec::new(),
+            reasoning_effort: None,
             builtin: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

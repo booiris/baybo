@@ -1,7 +1,9 @@
 //! libsql implementation of [`AgentProfileStore`].
 
 use async_trait::async_trait;
-use baybo_model::{AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, LlmEntryName};
+use baybo_model::{
+    AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, LlmEntryName, ReasoningEffort,
+};
 
 use super::LibsqlPool;
 use baybo_store::StorageError;
@@ -14,7 +16,8 @@ const BUILTIN_AGENT_PROFILE_DESCRIPTION: &str =
     "Baybo's default persona: workspace Soul prompt, default model, full skill and tool set.";
 
 const SELECT_COLS: &str = "id, name, description, avatar_blob_id, system_prompt, framework, \
-                           llm, builtin, created_at, updated_at";
+                           llm, builtin, created_at, updated_at, allowed_models, \
+                           reasoning_effort";
 
 pub struct LibsqlAgentProfileStore {
     pool: LibsqlPool,
@@ -108,6 +111,29 @@ fn row_from_libsql(row: &libsql::Row) -> Result<AgentProfileRow> {
             "agent_profiles.updated_at out of range: {updated_at_us}"
         ))
     })?;
+    let allowed_models_raw: Option<String> = row
+        .get(10)
+        .map_err(|e| col_err("agent_profiles.allowed_models", e))?;
+    let allowed_models: Vec<LlmEntryName> = match allowed_models_raw {
+        None => Vec::new(),
+        Some(json) => {
+            let names: Vec<String> = serde_json::from_str(&json).map_err(|e| {
+                StorageError::Storage(format!("agent_profiles.allowed_models: bad JSON: {e}"))
+            })?;
+            names.into_iter().map(LlmEntryName::from).collect()
+        }
+    };
+    let reasoning_effort_raw: Option<String> = row
+        .get(11)
+        .map_err(|e| col_err("agent_profiles.reasoning_effort", e))?;
+    let reasoning_effort = match reasoning_effort_raw {
+        None => None,
+        Some(s) => Some(ReasoningEffort::parse(&s).ok_or_else(|| {
+            StorageError::Storage(format!(
+                "agent_profiles.reasoning_effort: unknown value {s:?}"
+            ))
+        })?),
+    };
     Ok(AgentProfileRow {
         id: AgentProfileId::from(id),
         name,
@@ -116,10 +142,25 @@ fn row_from_libsql(row: &libsql::Row) -> Result<AgentProfileRow> {
         system_prompt,
         framework,
         llm: llm.map(LlmEntryName::from),
+        allowed_models,
+        reasoning_effort,
         builtin: builtin_col != 0,
         created_at,
         updated_at,
     })
+}
+
+/// JSON-encode a non-empty allowed-model set as a `TEXT` column; an empty
+/// set stores `NULL` (never `"[]"`) so "unrestricted" round-trips the same
+/// way it started.
+fn encode_allowed_models(models: &[LlmEntryName]) -> Result<Option<String>> {
+    if models.is_empty() {
+        return Ok(None);
+    }
+    let names: Vec<&str> = models.iter().map(LlmEntryName::as_str).collect();
+    serde_json::to_string(&names)
+        .map(Some)
+        .map_err(|e| StorageError::Storage(format!("encode allowed_models: {e}")))
 }
 
 #[async_trait]
@@ -170,11 +211,12 @@ impl AgentProfileStore for LibsqlAgentProfileStore {
         let conn = self.pool.conn();
         // `builtin` is deliberately not in the column list: the schema
         // DEFAULT 0 fills it, so the seed stays the only writer of 1.
+        let allowed_models = encode_allowed_models(&row.allowed_models)?;
         conn.execute(
             "INSERT INTO agent_profiles \
              (id, name, description, avatar_blob_id, system_prompt, framework, \
-              llm, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              llm, created_at, updated_at, allowed_models, reasoning_effort) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             libsql::params![
                 row.id.as_str().to_string(),
                 row.name.clone(),
@@ -185,6 +227,8 @@ impl AgentProfileStore for LibsqlAgentProfileStore {
                 row.llm.as_ref().map(|l| l.as_str().to_string()),
                 super::time::to_us(row.created_at),
                 super::time::to_us(row.updated_at),
+                allowed_models,
+                row.reasoning_effort.map(|e| e.as_str().to_owned()),
             ],
         )
         .await
@@ -194,11 +238,12 @@ impl AgentProfileStore for LibsqlAgentProfileStore {
 
     async fn update(&self, id: &AgentProfileId, update: &AgentProfileUpdate) -> Result<bool> {
         let conn = self.pool.conn();
+        let allowed_models = encode_allowed_models(&update.allowed_models)?;
         let affected = conn
             .execute(
                 "UPDATE agent_profiles SET \
                  name = ?2, description = ?3, system_prompt = ?4, framework = ?5, \
-                 llm = ?6, updated_at = ?7 \
+                 llm = ?6, allowed_models = ?7, reasoning_effort = ?8, updated_at = ?9 \
                  WHERE id = ?1 AND builtin = 0",
                 libsql::params![
                     id.as_str().to_string(),
@@ -207,6 +252,8 @@ impl AgentProfileStore for LibsqlAgentProfileStore {
                     update.system_prompt.clone(),
                     update.framework.as_str(),
                     update.llm.as_ref().map(|l| l.as_str().to_string()),
+                    allowed_models,
+                    update.reasoning_effort.map(|e| e.as_str().to_owned()),
                     super::time::now_us(),
                 ],
             )
@@ -268,6 +315,8 @@ mod tests {
             system_prompt: Some("You are terse.".to_owned()),
             framework: AgentFramework::Claude,
             llm: Some(LlmEntryName::from("primary")),
+            allowed_models: Vec::new(),
+            reasoning_effort: None,
             builtin: false,
             created_at: now,
             updated_at: now,
@@ -281,6 +330,8 @@ mod tests {
             system_prompt: None,
             framework: AgentFramework::Baybo,
             llm: None,
+            allowed_models: Vec::new(),
+            reasoning_effort: None,
         }
     }
 
@@ -459,5 +510,71 @@ mod tests {
             .map(|r| r.name)
             .collect();
         assert_eq!(names, vec!["baybo", "Alpha", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn allowed_models_and_effort_round_trip() {
+        let store = open_store().await;
+        let mut row = custom_row("Tuned");
+        row.allowed_models = vec![LlmEntryName::from("fast"), LlmEntryName::from("deep")];
+        row.reasoning_effort = Some(baybo_model::ReasoningEffort::High);
+        store.create(&row).await.unwrap();
+
+        let back = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(back.allowed_models, row.allowed_models, "order preserved");
+        assert_eq!(
+            back.reasoning_effort,
+            Some(baybo_model::ReasoningEffort::High)
+        );
+
+        // Full replace resets both to inherit/unrestricted.
+        assert!(
+            store
+                .update(&row.id, &content_update("Tuned 2"))
+                .await
+                .unwrap()
+        );
+        let reset = store.get(&row.id).await.unwrap().unwrap();
+        assert!(reset.allowed_models.is_empty());
+        assert!(reset.reasoning_effort.is_none());
+
+        // Empty set stores NULL (round-trips as empty, not "[]").
+        let plain = custom_row("Plain");
+        store.create(&plain).await.unwrap();
+        let plain_back = store.get(&plain.id).await.unwrap().unwrap();
+        assert!(plain_back.allowed_models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_effort_or_set_column_errors_on_read() {
+        let store = open_store().await;
+        let row = custom_row("Broken");
+        store.create(&row).await.unwrap();
+        store
+            .pool
+            .conn()
+            .execute(
+                "UPDATE agent_profiles SET reasoning_effort = 'ultra' WHERE id = ?1",
+                libsql::params![row.id.as_str().to_string()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.get(&row.id).await.is_err(),
+            "unknown effort must error"
+        );
+        store
+            .pool
+            .conn()
+            .execute(
+                "UPDATE agent_profiles SET reasoning_effort = NULL, allowed_models = 'not-json' WHERE id = ?1",
+                libsql::params![row.id.as_str().to_string()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.get(&row.id).await.is_err(),
+            "malformed set must error"
+        );
     }
 }

@@ -2424,6 +2424,8 @@ mod tests {
             system_prompt: prompt.map(str::to_owned),
             framework: baybo_model::AgentFramework::Baybo,
             llm: None,
+            allowed_models: Vec::new(),
+            reasoning_effort: None,
             builtin: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -2568,6 +2570,8 @@ mod tests {
                     system_prompt: Some("edited prompt".into()),
                     framework: baybo_model::AgentFramework::Baybo,
                     llm: None,
+                    allowed_models: Vec::new(),
+                    reasoning_effort: None,
                 },
             )
             .await
