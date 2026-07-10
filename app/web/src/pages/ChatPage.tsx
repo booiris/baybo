@@ -44,9 +44,11 @@ import {
   type WireWorkStep,
 } from '../api/chatWs';
 import type { components } from '../api/schema';
+import { useBlobUrl } from '../api/useBlobUrl';
 import { CronInbox } from '../components/CronInbox';
 import { TaskChecklist } from '../components/chat/TaskChecklist';
 import { AttachmentImage } from './chat/AttachmentImage';
+import { type AgentOption } from './chat/AgentPicker';
 import { QueuePanel } from './chat/QueuePanel';
 import { SessionSidebar } from './chat/SessionSidebar';
 import {
@@ -173,6 +175,14 @@ interface ModelOption {
   provider: string;
   model: string;
   isDefault: boolean;
+}
+
+/** An agent profile as projected for the new-chat picker + session chips,
+ *  from a `GET /v1/agents` entry. Extends {@link AgentOption} (the
+ *  picker's own presentational shape) with the avatar blob id the header
+ *  chip resolves via {@link useBlobUrl}. */
+interface AgentEntry extends AgentOption {
+  avatarBlobId: string | null;
 }
 
 /**
@@ -359,6 +369,14 @@ export function ChatPage() {
   // mount; the picker only renders when more than one model exists.
   const [models, setModels] = useState<ModelOption[]>([]);
   const [defaultModelName, setDefaultModelName] = useState('');
+  // Agent profiles for the new-chat picker + session chips, fetched once
+  // alongside models. `agentsById` resolves a session's/patch's `agent_id`
+  // to its name/avatar for the sidebar row + header chip.
+  const [agentOptions, setAgentOptions] = useState<AgentEntry[]>([]);
+  const agentsById = useMemo(
+    () => new Map(agentOptions.map((a) => [a.id, a] as const)),
+    [agentOptions],
+  );
 
   // Files picked in the composer, uploaded to the blob store on select and
   // attached to the next outgoing message once their upload lands.
@@ -370,9 +388,8 @@ export function ChatPage() {
   // the derived projection of the URL's sessionId.
   const [views, setViews] = useState<Record<string, SessionView>>({});
   const currentView = (sessionId && views[sessionId]) || EMPTY_VIEW;
-  const activeTitle = sessionId
-    ? sessions.find((s) => s.session_id === sessionId)?.title
-    : undefined;
+  const activeSession = sessionId ? sessions.find((s) => s.session_id === sessionId) : undefined;
+  const activeTitle = activeSession?.title;
   // A turn is "in flight" either optimistically (between send and the first
   // response) or per the server's authoritative TurnState. While busy the
   // composer's send button becomes a stop button and new sends are blocked.
@@ -912,11 +929,13 @@ export function ChatPage() {
         { data: manifest, error: manifestError },
         { data: modelList, error: modelError },
         { data: folderList, error: folderError },
+        { data: agentList, error: agentError },
       ] = await Promise.all([
         client.GET('/v1/chat/sessions'),
         client.GET('/v1/chat/slash-manifest'),
         client.GET('/v1/llm/models'),
         client.GET('/v1/chat/folders'),
+        client.GET('/v1/agents'),
       ]);
       if (cancelled) return;
       if (listError) {
@@ -931,6 +950,19 @@ export function ChatPage() {
       if (folderError) {
         console.warn('chat bootstrap: list folders failed', folderError);
       }
+      if (agentError) {
+        console.warn('chat bootstrap: list agents failed', agentError);
+      }
+      setAgentOptions(
+        (agentList?.items ?? []).map((a) => ({
+          id: a.id,
+          name: a.name,
+          description: a.description,
+          builtin: a.builtin,
+          framework: a.framework,
+          avatarBlobId: a.avatar_blob_id ?? null,
+        })),
+      );
       folderStore.replaceFolders(
         (folderList?.items ?? []).map((f) => ({
           id: f.id,
@@ -958,6 +990,7 @@ export function ChatPage() {
         last_user_text: s.last_user_text ?? undefined,
         folder_id: s.folder_id ?? undefined,
         title: s.title ?? undefined,
+        agent_id: s.agent_id ?? undefined,
       }));
       setSessions(existing);
       setSlashCommands(manifest?.items ?? []);
@@ -2546,37 +2579,43 @@ export function ChatPage() {
     [client, sessionId],
   );
 
-  const handleNewChat = useCallback(async () => {
-    setCreating(true);
-    try {
-      const { data } = await client.POST('/v1/chat/sessions', { body: {} });
-      if (data?.session_id) {
-        // The server's Created broadcast (Frame::SessionUpdated, full
-        // patch) reaches this tab too and `applySessionPatch` adds the
-        // row for an unknown session_id. If that frame lands before the
-        // POST response returns, an unconditional prepend here would
-        // double the row. Guard with the same check createAnchorSession
-        // uses — whichever path runs first wins; the second is a no-op.
-        setSessions((prev) =>
-          prev.some((s) => s.session_id === data.session_id)
-            ? prev
-            : [
-                {
-                  session_id: data.session_id,
-                  created_at: new Date().toISOString(),
-                  last_active: new Date().toISOString(),
-                  unread: 0,
-                  pinned: false,
-                },
-                ...prev,
-              ],
-        );
-        navigateRef.current(`/chat/${data.session_id}`);
+  const handleNewChat = useCallback(
+    async (agentId: string | null) => {
+      setCreating(true);
+      try {
+        const { data } = await client.POST('/v1/chat/sessions', {
+          body: agentId ? { agent_id: agentId } : {},
+        });
+        if (data?.session_id) {
+          // The server's Created broadcast (Frame::SessionUpdated, full
+          // patch) reaches this tab too and `applySessionPatch` adds the
+          // row for an unknown session_id. If that frame lands before the
+          // POST response returns, an unconditional prepend here would
+          // double the row. Guard with the same check createAnchorSession
+          // uses — whichever path runs first wins; the second is a no-op.
+          setSessions((prev) =>
+            prev.some((s) => s.session_id === data.session_id)
+              ? prev
+              : [
+                  {
+                    session_id: data.session_id,
+                    created_at: new Date().toISOString(),
+                    last_active: new Date().toISOString(),
+                    unread: 0,
+                    pinned: false,
+                    agent_id: agentId ?? undefined,
+                  },
+                  ...prev,
+                ],
+          );
+          navigateRef.current(`/chat/${data.session_id}`);
+        }
+      } finally {
+        setCreating(false);
       }
-    } finally {
-      setCreating(false);
-    }
-  }, [client]);
+    },
+    [client],
+  );
 
   const pendingApprovalIds = useMemo(
     () =>
@@ -2593,6 +2632,7 @@ export function ChatPage() {
       {/* Session list sidebar (zone 2; the global icon rail is zone 1) */}
       <SessionSidebar
         sessions={sessions}
+        agents={agentOptions}
         activeSessionId={sessionId}
         pendingIds={pendingApprovalIds}
         creating={creating}
@@ -2637,6 +2677,22 @@ export function ChatPage() {
             ) : (
               <span className="font-bold text-sm text-ink-soft">No session</span>
             )}
+            {activeSession?.agent_id ? (
+              <HeaderAgentChip
+                agent={
+                  agentsById.get(activeSession.agent_id) ?? {
+                    id: activeSession.agent_id,
+                    name: activeSession.agent_id,
+                    description: '',
+                    builtin: false,
+                    framework: 'baybo',
+                    avatarBlobId: null,
+                  }
+                }
+                baseUrl={baseUrl}
+                token={adminToken}
+              />
+            ) : null}
           </div>
           <div className="flex items-center gap-3 shrink-0">
             <ConnectionBadge status={status} />
@@ -4336,6 +4392,7 @@ function applySessionPatch(
         pinned: patch.pinned ?? false,
         folder_id: patchedFolder,
         title: patch.title,
+        agent_id: patch.agent_id,
       },
       ...prev,
     ];
@@ -4352,13 +4409,18 @@ function applySessionPatch(
     last_user_text: current.last_user_text,
     folder_id: nextFolderId,
     title: patch.title ?? current.title,
+    // Never changes once set (see `SessionPatch.agent_id`'s doc comment),
+    // so a later patch missing the field keeps whatever this row already
+    // has rather than clearing it.
+    agent_id: current.agent_id ?? patch.agent_id,
   };
   if (
     merged.created_at === current.created_at &&
     merged.last_active === current.last_active &&
     merged.pinned === current.pinned &&
     merged.folder_id === current.folder_id &&
-    merged.title === current.title
+    merged.title === current.title &&
+    merged.agent_id === current.agent_id
   ) {
     return prev;
   }
@@ -5354,6 +5416,41 @@ function ModelPickerRow({
         <span className="block font-mono text-[0.65rem] text-ink-soft truncate">{sublabel}</span>
       </span>
     </button>
+  );
+}
+
+/** Header badge for the active session's bound agent, shown only for
+ *  sessions with an `agent_id` (a builtin/unbound session shows nothing).
+ *  Reuses the picker row's monogram styling; swaps in the profile's
+ *  uploaded avatar (via {@link useBlobUrl}) once it resolves. */
+function HeaderAgentChip({
+  agent,
+  baseUrl,
+  token,
+}: {
+  agent: AgentEntry;
+  baseUrl: string;
+  token: string | null;
+}) {
+  const avatarUrl = useBlobUrl(agent.avatarBlobId, baseUrl, token);
+  return (
+    <span
+      className="flex items-center gap-1.5 px-2 py-1 bg-white border-2 border-black rounded-md shadow-brutal-xs shrink-0"
+      title={agent.description || agent.name}
+    >
+      {avatarUrl ? (
+        <img
+          src={avatarUrl}
+          alt={agent.name}
+          className="w-5 h-5 rounded-full border border-black object-cover shrink-0"
+        />
+      ) : (
+        <span className="w-5 h-5 shrink-0 rounded-full border border-black bg-brand/40 flex items-center justify-center text-[0.6rem] font-bold uppercase">
+          {agent.name.slice(0, 1)}
+        </span>
+      )}
+      <span className="font-mono text-xs font-bold truncate max-w-[140px]">{agent.name}</span>
+    </span>
   );
 }
 

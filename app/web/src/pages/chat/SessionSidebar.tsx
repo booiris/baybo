@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import {
   RiAddLine,
@@ -39,6 +39,7 @@ import type { Folder, SessionSummary } from './types';
 import { useQueueCounts } from './queueStore';
 import { useFolders, useFolderStore } from './folderStore';
 import { ChatContextMenu, FolderContextMenu } from './FolderContextMenu';
+import { AgentPicker, type AgentOption } from './AgentPicker';
 
 // Chat zone 2: the session list sidebar (the global icon rail is zone 1, the
 // thread + floating composer is zone 3). A newest-first conversation list of
@@ -89,6 +90,7 @@ function SessionRow({
   unreadCount,
   queueCount,
   depth,
+  agent,
   onHide,
   onTogglePin,
   onContextMenu,
@@ -100,6 +102,11 @@ function SessionRow({
   queueCount: number;
   /** Indent level (0 for top-level buckets, 1+ inside folders). */
   depth: number;
+  /** The bound agent profile for `session.agent_id`, resolved by the
+   *  caller; `undefined` for an unbound session OR an id the loaded
+   *  agent list doesn't (yet) recognize — either way the row falls back
+   *  to the plain conversation glyph. */
+  agent?: AgentOption;
 } & RowCallbacks) {
   // A chat is a plain draggable, NOT a sortable: chat order is server-driven
   // (newest-first), so dragging one must not reflow the list — it only lifts
@@ -137,12 +144,23 @@ function SessionRow({
       }`}
       title={session.session_id}
     >
-      {/* Leading conversation glyph — distinguishes a chat row from a
-          folder row (which carries a folder glyph) at a glance. */}
-      <RiChat1Line
-        className={`text-[0.8rem] shrink-0 ${active ? 'text-ink/70' : 'text-ink-soft'}`}
-        aria-hidden
-      />
+      {/* Leading glyph: the bound agent's monogram for an agent-scoped
+          chat, else the plain conversation glyph — either way it
+          distinguishes a chat row from a folder row (folder glyph) at a
+          glance. */}
+      {agent ? (
+        <span
+          className="w-4 h-4 shrink-0 rounded-full border border-black bg-brand/40 flex items-center justify-center text-[0.55rem] font-bold uppercase"
+          title={agent.name}
+        >
+          {agent.name.slice(0, 1)}
+        </span>
+      ) : (
+        <RiChat1Line
+          className={`text-[0.8rem] shrink-0 ${active ? 'text-ink/70' : 'text-ink-soft'}`}
+          aria-hidden
+        />
+      )}
       {/* Persistent pin glyph on pinned rows so the state reads at a
           glance even before hovering; hidden on hover where the
           interactive toggle takes its place. */}
@@ -438,8 +456,73 @@ interface ChatMenuState {
   y: number;
 }
 
+/** The sidebar's New-chat button. A single configured agent (just the
+ *  builtin) creates immediately — preserving the one-click flow; more
+ *  than one opens the {@link AgentPicker} popover instead. Dismisses on
+ *  Escape or an outside click, same convention as the composer's
+ *  `ModelPicker`. */
+function NewChatButton({
+  agents,
+  creating,
+  onNewChat,
+}: {
+  agents: AgentOption[];
+  creating: boolean;
+  onNewChat: (agentId: string | null) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        type="button"
+        onClick={() => {
+          if (agents.length > 1) {
+            setOpen((o) => !o);
+            return;
+          }
+          onNewChat(null);
+        }}
+        disabled={creating}
+        className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-brand text-ink border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.85rem] hover:bg-brand-hover active:translate-x-[2px] active:translate-y-[2px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+      >
+        <RiAddLine className="text-lg" />
+        New chat
+      </button>
+      {open ? (
+        <AgentPicker
+          agents={agents}
+          onPick={(agentId) => {
+            setOpen(false);
+            onNewChat(agentId);
+          }}
+          onClose={() => setOpen(false)}
+        />
+      ) : null}
+    </div>
+  );
+}
+
 export function SessionSidebar({
   sessions,
+  agents,
   activeSessionId,
   pendingIds,
   creating,
@@ -456,11 +539,14 @@ export function SessionSidebar({
   onNewChatInFolder,
 }: {
   sessions: SessionSummary[];
+  /** Agent profiles for the new-chat picker + row chips. */
+  agents: AgentOption[];
   activeSessionId: string | null | undefined;
   pendingIds: ReadonlySet<string>;
   creating: boolean;
   loading: boolean;
-  onNewChat: () => void;
+  /** `agentId` is `null` for the builtin (unbound). */
+  onNewChat: (agentId: string | null) => void;
   onHide: (id: string) => void;
   onTogglePin: (id: string, pinned: boolean) => void;
   onAssignFolder: (id: string, folderId: string | null) => void;
@@ -474,6 +560,7 @@ export function SessionSidebar({
   const queueCounts = useQueueCounts();
   const { folders, collapsed } = useFolders();
   const { toggleCollapse, ensureExpanded } = useFolderStore();
+  const agentsById = useMemo(() => new Map(agents.map((a) => [a.id, a] as const)), [agents]);
 
   // ── Buckets ────────────────────────────────────────────────────────────
   // Pinned chats are lifted out of the tree entirely. Non-pinned chats are
@@ -679,12 +766,13 @@ export function SessionSidebar({
         unreadCount={s.unread}
         queueCount={queueCounts.get(s.session_id) ?? 0}
         depth={depth}
+        agent={s.agent_id ? agentsById.get(s.agent_id) : undefined}
         onHide={onHide}
         onTogglePin={onTogglePin}
         onContextMenu={openChatMenu}
       />
     ),
-    [activeSessionId, pendingIds, queueCounts, onHide, onTogglePin, openChatMenu],
+    [activeSessionId, pendingIds, queueCounts, agentsById, onHide, onTogglePin, openChatMenu],
   );
 
   const renderFolderSubtree = useCallback(
@@ -761,15 +849,7 @@ export function SessionSidebar({
   return (
     <aside className="w-[260px] border-r-2 border-black flex flex-col bg-canvas shrink-0">
       <div className="px-3 py-3 border-b-2 border-black">
-        <button
-          type="button"
-          onClick={onNewChat}
-          disabled={creating}
-          className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-brand text-ink border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.85rem] hover:bg-brand-hover active:translate-x-[2px] active:translate-y-[2px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-        >
-          <RiAddLine className="text-lg" />
-          New chat
-        </button>
+        <NewChatButton agents={agents} creating={creating} onNewChat={onNewChat} />
       </div>
       <nav className="flex-1 overflow-auto px-2 py-2 flex flex-col gap-1">
         {loading ? (

@@ -31,6 +31,11 @@ export interface SessionSummary {
   folder_id?: string;
   /** Auto-generated title used before falling back to `last_user_text`. */
   title?: string;
+  /** Bound agent profile id; absent = builtin. Server-authoritative,
+   *  set at creation and never changes for the session's lifetime — carried
+   *  on the list endpoint, on `SessionPatch.agent_id` (Create/Unhide
+   *  broadcasts), and stamped locally on the optimistic new-chat prepend. */
+  agent_id?: string;
 }
 
 /** A user-created chat-list folder. Two-level tree via `parent_id`

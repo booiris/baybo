@@ -13,6 +13,7 @@ import { SelectBox } from '../components/SelectBox';
 import { useAdminClient, useAuth } from '../api/auth';
 import { useMockMode, MOCK_AGENT_PROFILES } from '../api/mock';
 import type { components } from '../api/schema';
+import { useBlobUrl } from '../api/useBlobUrl';
 // 256² webp squeezed from assets/baybo.png — the builtin profile's default
 // face when no avatar blob is set (avatar_blob_id stays NULL in the DB).
 import bayboAvatar from '../assets/baybo-avatar.webp';
@@ -143,6 +144,37 @@ export function AgentsPage() {
     if (selected !== null && selected === pendingSelectRef.current) return;
     setSelected(agents[0].id);
   }, [agents, selected]);
+
+  // Skills readout is scoped to the selected agent: the shared registry set
+  // for the builtin, that profile's skill folder overlaid on the shared set
+  // otherwise (mirrors `GET /v1/skills?agent_id`'s own semantics). Refetches
+  // whenever the selection resolves to a different real agent row; the
+  // create-form selection ('new') and no-selection leave the last-loaded
+  // list in place — the bootstrap fetch above already seeded it unscoped.
+  useEffect(() => {
+    if (isMock) return;
+    if (selected === null || selected === 'new') return;
+    const agent = agents.find((a) => a.id === selected);
+    if (!agent) return;
+    let cancelled = false;
+    void (async () => {
+      const { data, error, response } = await client.GET('/v1/skills', {
+        params: { query: agent.builtin ? {} : { agent_id: agent.id } },
+      });
+      if (cancelled) return;
+      if (response.status === 401) {
+        logout();
+        return;
+      }
+      if (error || !response.ok) return;
+      setRegisteredSkills(
+        (data?.items ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)),
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [client, selected, agents, isMock, logout]);
 
   const refresh = useCallback(() => setRefreshKey((k) => k + 1), []);
 
@@ -368,40 +400,6 @@ function AgentRow({
 }
 
 // ── avatar ──────────────────────────────────────────────────────────
-
-// `<img>` can't carry the Authorization header, so fetch the blob and hand
-// the bitmap over as an object URL (same pattern as the chat
-// AttachmentImage). Returns null while loading, on failure, or without a
-// blob id — callers fall back to their default portrait.
-function useBlobUrl(blobId: string | null, baseUrl: string, token: string | null): string | null {
-  const [url, setUrl] = useState<string | null>(null);
-  useEffect(() => {
-    setUrl(null);
-    if (!blobId) return;
-    let cancelled = false;
-    let objectUrl: string | null = null;
-    void (async () => {
-      try {
-        const base = (baseUrl || '').replace(/\/+$/, '');
-        const res = await fetch(`${base}/v1/blobs/${encodeURIComponent(blobId)}`, {
-          headers: { Authorization: `Bearer ${token ?? ''}` },
-        });
-        if (!res.ok) throw new Error(`blob ${res.status}`);
-        const blob = await res.blob();
-        if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        setUrl(objectUrl);
-      } catch {
-        // Callers render their fallback.
-      }
-    })();
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [blobId, baseUrl, token]);
-  return url;
-}
 
 // A character face on its tint tile: uploaded avatar > bundled brand image
 // (builtin) > big monogram.
