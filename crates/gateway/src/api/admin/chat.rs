@@ -1180,11 +1180,32 @@ async fn set_session_model(
     Json(req): Json<SetSessionModelRequest>,
 ) -> Result<Json<SetSessionModelResponse>> {
     let authed = authed.as_ref().map(|ext| &ext.0);
-    // We only need the existence/scope check, not the loaded blob:
-    // persistence goes through the targeted `set_last_llm` below.
-    let (sid, _) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
 
     let pin: Option<LlmEntryName> = super::validate_llm_pin(&state, req.llm.as_deref())?;
+
+    // A new pin must respect the bound agent's allowed set; clearing the
+    // pin (`llm: null`) always bypasses the check, and a deleted profile
+    // is tolerated (skip) rather than surfaced as an error here.
+    if let (Some(pin), Some(agent_id)) = (pin.as_ref(), session.state.agent_id.as_ref()) {
+        match state.agent_profile_store.get(agent_id).await {
+            Ok(Some(profile))
+                if !profile.allowed_models.is_empty() && !profile.allowed_models.contains(pin) =>
+            {
+                return Err(GatewayError::BadRequest(format!(
+                    "model {:?} is not in agent {:?}'s allowed set",
+                    pin.as_str(),
+                    profile.name
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(GatewayError::Internal(format!(
+                    "load agent profile for model-set check: {e}"
+                )));
+            }
+        }
+    }
 
     // Persist the pin durably FIRST, via a targeted flat-column write
     // (`set_last_llm`). Unlike a full-session `save`, this can't be

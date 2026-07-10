@@ -5,11 +5,15 @@
 //! delete, avatar allowed), creates validate name/llm/avatar-blob, `PUT`
 //! is a full content replace, and deletes are plain row removals.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
+use baybo_agent::{LlmClientPool, LlmPoolHandle};
 use baybo_gateway::test_support::build_test_deps;
+use baybo_llm::{CostHooks, LlmProviderConfig, LlmProviderRegistry};
+use baybo_model::LlmEntryName;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -285,7 +289,214 @@ async fn agents_api_round_trip() {
     assert_eq!(list["items"].as_array().expect("items").len(), 1);
 }
 
+// `allowed_models` set validation + `reasoning_effort` validation, plus
+// the pin-must-be-a-member rule (needs a second pool entry, hence the
+// dedicated two-entry admin state — see `build_admin_state_two_llms`).
+#[tokio::test]
+async fn agent_model_set_and_effort_validation() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let (state, entry_a, entry_b) = build_admin_state_two_llms(&tg);
+    let router = build_router(state);
+
+    // ── 1. allowed_models + reasoning_effort round-trip ────────────────
+    let created = post_expect(
+        &router,
+        "/v1/agents",
+        json!({
+            "name": "Restricted",
+            "llm": entry_a,
+            "allowed_models": [entry_a],
+            "reasoning_effort": "high",
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let agent_id = created["id"].as_str().expect("id").to_owned();
+    assert_eq!(
+        created["allowed_models"]
+            .as_array()
+            .expect("allowed_models"),
+        &vec![Value::String(entry_a.clone())],
+    );
+    assert_eq!(created["reasoning_effort"].as_str(), Some("high"));
+
+    let fetched = get(&router, &format!("/v1/agents/{agent_id}"), StatusCode::OK).await;
+    assert_eq!(
+        fetched["allowed_models"]
+            .as_array()
+            .expect("allowed_models"),
+        &vec![Value::String(entry_a.clone())],
+    );
+    assert_eq!(fetched["reasoning_effort"].as_str(), Some("high"));
+
+    // ── 1b. empty-string reasoning_effort clears to None ────────────────
+    let cleared_effort = post_expect(
+        &router,
+        "/v1/agents",
+        json!({ "name": "No Effort", "reasoning_effort": "" }),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        cleared_effort.get("reasoning_effort").is_none(),
+        "empty-string reasoning_effort must clear to absent, got {cleared_effort:?}",
+    );
+
+    // ── 2. unknown allowed_models member → 400 ──────────────────────────
+    let err = post_expect(
+        &router,
+        "/v1/agents",
+        json!({ "name": "Bad Set", "allowed_models": ["nope"] }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown LLM entry"),
+        "expected unknown-entry error, got {err:?}",
+    );
+
+    // ── 2b. empty-string member → 400 ("must not be empty") ─────────────
+    let err = post_expect(
+        &router,
+        "/v1/agents",
+        json!({ "name": "Empty Member", "allowed_models": [""] }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("must not be empty"),
+        "expected empty-member error, got {err:?}",
+    );
+
+    // ── 3. pin not a member of the set → 400 (needs two real entries) ───
+    let err = post_expect(
+        &router,
+        "/v1/agents",
+        json!({ "name": "Mismatched", "llm": entry_a, "allowed_models": [entry_b] }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("is not in allowed_models"),
+        "expected pin/set mismatch error, got {err:?}",
+    );
+
+    // ── 4. unknown reasoning_effort → 400 listing legal values ──────────
+    let err = post_expect(
+        &router,
+        "/v1/agents",
+        json!({ "name": "Bad Effort", "reasoning_effort": "ultra" }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        err["error"].as_str().unwrap_or("").contains("minimal"),
+        "expected legal-values listing, got {err:?}",
+    );
+
+    // ── 5. full-replace PUT without the two fields resets them ──────────
+    put_expect(
+        &router,
+        &format!("/v1/agents/{agent_id}"),
+        json!({ "name": "Restricted", "description": "", "framework": "baybo" }),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let after_put = get(&router, &format!("/v1/agents/{agent_id}"), StatusCode::OK).await;
+    assert!(
+        after_put.get("allowed_models").is_none(),
+        "allowed_models must reset to absent, got {after_put:?}",
+    );
+    assert!(
+        after_put.get("reasoning_effort").is_none(),
+        "reasoning_effort must reset to absent, got {after_put:?}",
+    );
+
+    // ── 6. duplicates collapse, order preserved ──────────────────────────
+    let created2 = post_expect(
+        &router,
+        "/v1/agents",
+        json!({ "name": "Deduped", "allowed_models": [entry_b, entry_a, entry_b] }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        created2["allowed_models"]
+            .as_array()
+            .expect("allowed_models"),
+        &vec![
+            Value::String(entry_b.clone()),
+            Value::String(entry_a.clone())
+        ],
+        "duplicate allowed_models entries collapse, first-seen order preserved",
+    );
+}
+
 // ── helpers ─────────────────────────────────────────────────────────
+
+/// Build an `AdminState` whose LLM pool has two live entries (the
+/// harness's original stub plus a freshly built second stub client), so
+/// tests can exercise membership rules end-to-end (`validate_llm_pin`
+/// keys off `state.llm_pool`, not `state.config`) — a bare unknown name
+/// only proves the "not configured" 400, not the "configured but not a
+/// set member" 400. `build_test_deps` itself stays single-entry (it's
+/// shared by every gateway test file); this helper only swaps `llm_pool`
+/// on a state built from the same `tg`, so it can't affect other tests.
+fn build_admin_state_two_llms(
+    tg: &baybo_gateway::test_support::TestGateway,
+) -> (baybo_gateway::server::AdminState, String, String) {
+    let original_name = tg
+        .deps
+        .llm_pool
+        .read()
+        .entry_names()
+        .first()
+        .expect("test pool has one entry")
+        .clone();
+    let original_client = tg.deps.llm_pool.read().default_client();
+
+    let registry = LlmProviderRegistry::with_default_providers();
+    let second_client = registry
+        .create_client(
+            &LlmProviderConfig {
+                provider: "openai".into(),
+                api_key: Some("sk-test-placeholder".into()),
+                base_url: None,
+                model: "gpt-4o-second-stub".into(),
+                supports_vision: None,
+                context_window: None,
+                pricing: None,
+                reasoning_effort: None,
+                vault: None,
+                proxy: None,
+            },
+            None,
+            CostHooks::passthrough(),
+        )
+        .expect("second stub LLM client");
+    let second_name = LlmEntryName::from(second_client.model_info().id.clone());
+
+    let mut clients = HashMap::new();
+    clients.insert(original_name.clone(), original_client);
+    clients.insert(second_name.clone(), second_client);
+    let llm_pool: LlmPoolHandle = Arc::new(parking_lot::RwLock::new(Arc::new(
+        LlmClientPool::new(clients, original_name.clone())
+            .expect("two-entry stub pool default present"),
+    )));
+
+    let mut state = build_admin_state(tg);
+    state.llm_pool = llm_pool;
+    (state, original_name.to_string(), second_name.to_string())
+}
 
 fn build_admin_state(
     tg: &baybo_gateway::test_support::TestGateway,

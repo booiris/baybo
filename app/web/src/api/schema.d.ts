@@ -744,6 +744,8 @@ export interface components {
          *     are read live from the skill registry (`GET /v1/skills`).
          */
         AgentProfileDto: {
+            /** @description LLM entries a bound session may switch to. Empty = unrestricted. */
+            allowed_models?: string[];
             avatar_blob_id?: string | null;
             /**
              * @description The seeded built-in profile: read-only except its avatar,
@@ -757,6 +759,11 @@ export interface components {
             id: string;
             llm?: string | null;
             name: string;
+            /**
+             * @description Per-request reasoning effort for providers that support it.
+             *     Absent = follow the LLM entry's own configured value.
+             */
+            reasoning_effort?: string | null;
             system_prompt?: string | null;
             /** Format: date-time */
             updated_at: string;
@@ -1223,6 +1230,12 @@ export interface components {
          */
         CreateAgentProfileRequest: {
             /**
+             * @description LLM entries a bound session may switch to; each must match a
+             *     configured entry. Empty = unrestricted. When `llm` is also set it
+             *     must be a member of this set.
+             */
+            allowed_models?: string[];
+            /**
              * @description Optional avatar (full blob id from `POST /v1/blobs`); validated
              *     exactly like `PUT /v1/agents/{agent_id}/avatar`.
              */
@@ -1235,6 +1248,12 @@ export interface components {
              */
             llm?: string | null;
             name: string;
+            /**
+             * @description Per-request reasoning effort for providers that support it; see
+             *     [`baybo_model::ReasoningEffort::ALL`] for legal values. Empty/absent
+             *     = follow the LLM entry's own configured value.
+             */
+            reasoning_effort?: string | null;
             system_prompt?: string | null;
         };
         /**
@@ -1767,10 +1786,22 @@ export interface components {
          *     absent nullable fields reset to the inherit-default state.
          */
         UpdateAgentProfileRequest: {
+            /**
+             * @description LLM entries a bound session may switch to; each must match a
+             *     configured entry. Empty = unrestricted. When `llm` is also set it
+             *     must be a member of this set.
+             */
+            allowed_models?: string[];
             description: string;
             framework: components["schemas"]["AgentFrameworkDto"];
             llm?: string | null;
             name: string;
+            /**
+             * @description Per-request reasoning effort for providers that support it; see
+             *     [`baybo_model::ReasoningEffort::ALL`] for legal values. Empty/absent
+             *     = follow the LLM entry's own configured value.
+             */
+            reasoning_effort?: string | null;
             system_prompt?: string | null;
         };
         /** @description Request body for `POST /v1/mobile/apns-token`. */
@@ -1846,6 +1877,8 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: {
+                            /** @description LLM entries a bound session may switch to. Empty = unrestricted. */
+                            allowed_models?: string[];
                             avatar_blob_id?: string | null;
                             /**
                              * @description The seeded built-in profile: read-only except its avatar,
@@ -1859,6 +1892,11 @@ export interface operations {
                             id: string;
                             llm?: string | null;
                             name: string;
+                            /**
+                             * @description Per-request reasoning effort for providers that support it.
+                             *     Absent = follow the LLM entry's own configured value.
+                             */
+                            reasoning_effort?: string | null;
                             system_prompt?: string | null;
                             /** Format: date-time */
                             updated_at: string;

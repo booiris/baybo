@@ -42,6 +42,13 @@
                           "updated_at"
                         ],
                         "properties": {
+                          "allowed_models": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "LLM entries a bound session may switch to. Empty = unrestricted."
+                          },
                           "avatar_blob_id": {
                             "type": [
                               "string",
@@ -73,6 +80,13 @@
                           },
                           "name": {
                             "type": "string"
+                          },
+                          "reasoning_effort": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "Per-request reasoning effort for providers that support it.\nAbsent = follow the LLM entry's own configured value."
                           },
                           "system_prompt": {
                             "type": [
@@ -3327,6 +3341,13 @@
           "updated_at"
         ],
         "properties": {
+          "allowed_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "LLM entries a bound session may switch to. Empty = unrestricted."
+          },
           "avatar_blob_id": {
             "type": [
               "string",
@@ -3358,6 +3379,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Per-request reasoning effort for providers that support it.\nAbsent = follow the LLM entry's own configured value."
           },
           "system_prompt": {
             "type": [
@@ -4091,6 +4119,13 @@
           "name"
         ],
         "properties": {
+          "allowed_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "LLM entries a bound session may switch to; each must match a\nconfigured entry. Empty = unrestricted. When `llm` is also set it\nmust be a member of this set."
+          },
           "avatar_blob_id": {
             "type": [
               "string",
@@ -4113,6 +4148,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Per-request reasoning effort for providers that support it; see\n[`baybo_model::ReasoningEffort::ALL`] for legal values. Empty/absent\n= follow the LLM entry's own configured value."
           },
           "system_prompt": {
             "type": [
@@ -5371,6 +5413,13 @@
           "framework"
         ],
         "properties": {
+          "allowed_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "LLM entries a bound session may switch to; each must match a\nconfigured entry. Empty = unrestricted. When `llm` is also set it\nmust be a member of this set."
+          },
           "description": {
             "type": "string"
           },
@@ -5385,6 +5434,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Per-request reasoning effort for providers that support it; see\n[`baybo_model::ReasoningEffort::ALL`] for legal values. Empty/absent\n= follow the LLM entry's own configured value."
           },
           "system_prompt": {
             "type": [

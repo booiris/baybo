@@ -5,17 +5,22 @@
 //! DELETE hides the row (the session itself stays on the server, only the
 //! chat list filters it) → unhide restores it to the default listing.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
+use baybo_agent::{LlmClientPool, LlmPoolHandle};
 use baybo_channels::ChannelKind;
 use baybo_config::ChannelsConfig;
 use baybo_gateway::auth::{AuthedClient, DEVICE_ID_HEADER};
 use baybo_gateway::channel::boot;
 use baybo_gateway::server::build_admin_router_for_tests;
 use baybo_gateway::test_support::build_test_deps;
-use baybo_model::{ChannelType, ChatMessage, ContentBlock, SessionId, User};
+use baybo_llm::{CostHooks, LlmProviderConfig, LlmProviderRegistry};
+use baybo_model::{
+    AgentProfileId, ChannelType, ChatMessage, ContentBlock, LlmEntryName, SessionId, User,
+};
 use baybo_store::{DeviceRow, DeviceStatus};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -987,6 +992,62 @@ fn build_router(state: baybo_gateway::server::AdminState) -> axum::Router {
     router.with_state(state)
 }
 
+/// Build an `AdminState` whose LLM pool has two live entries (the
+/// harness's original stub plus a freshly built second stub client), so
+/// the allowed-set enforcement test can exercise "switching to a
+/// configured-but-not-a-member name" end-to-end (`validate_llm_pin` keys
+/// off `state.llm_pool`, not `state.config`, so a single-entry pool can
+/// only ever produce the "unknown entry" 400, never this one).
+/// `build_test_deps` itself stays single-entry (shared by every gateway
+/// test file); this helper only swaps `llm_pool` on a state built from
+/// the same `tg`, so it can't affect other tests.
+fn build_admin_state_two_llms(
+    tg: &baybo_gateway::test_support::TestGateway,
+) -> (baybo_gateway::server::AdminState, String, String) {
+    let original_name = tg
+        .deps
+        .llm_pool
+        .read()
+        .entry_names()
+        .first()
+        .expect("test pool has one entry")
+        .clone();
+    let original_client = tg.deps.llm_pool.read().default_client();
+
+    let registry = LlmProviderRegistry::with_default_providers();
+    let second_client = registry
+        .create_client(
+            &LlmProviderConfig {
+                provider: "openai".into(),
+                api_key: Some("sk-test-placeholder".into()),
+                base_url: None,
+                model: "gpt-4o-second-stub".into(),
+                supports_vision: None,
+                context_window: None,
+                pricing: None,
+                reasoning_effort: None,
+                vault: None,
+                proxy: None,
+            },
+            None,
+            CostHooks::passthrough(),
+        )
+        .expect("second stub LLM client");
+    let second_name = LlmEntryName::from(second_client.model_info().id.clone());
+
+    let mut clients = HashMap::new();
+    clients.insert(original_name.clone(), original_client);
+    clients.insert(second_name.clone(), second_client);
+    let llm_pool: LlmPoolHandle = Arc::new(parking_lot::RwLock::new(Arc::new(
+        LlmClientPool::new(clients, original_name.clone())
+            .expect("two-entry stub pool default present"),
+    )));
+
+    let mut state = build_admin_state(tg);
+    state.llm_pool = llm_pool;
+    (state, original_name.to_string(), second_name.to_string())
+}
+
 fn approved_device(device_id: &str, auth_token: &str) -> DeviceRow {
     DeviceRow {
         device_id: device_id.into(),
@@ -1196,6 +1257,140 @@ async fn set_session_model_validates_persists_and_clears() {
         detail_after.get("last_llm").is_none_or(Value::is_null),
         "session detail must drop last_llm after clear: {detail_after:?}",
     );
+}
+
+// Per-session model switch respects the bound agent's `allowed_models`
+// set: a pin outside the set is a 400, clearing the pin always bypasses
+// the check, an unbound session has no restriction, and a profile
+// deleted after the session bound to it is tolerated (skip, not 500).
+#[tokio::test]
+async fn set_session_model_enforces_agent_allowed_set() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let (state, entry_a, entry_b) = build_admin_state_two_llms(&tg);
+    let router = build_router(state);
+
+    // ── 1. Session bound to a profile whose set contains the pin → 200,
+    // and switching to a name outside the set is a 400 ─────────────────
+    let profile_a = post(
+        &router,
+        "/v1/agents",
+        Body::from(json!({ "name": "Restricted A", "allowed_models": [entry_a] }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    let agent_a_id = profile_a["id"].as_str().expect("id").to_owned();
+    let session_a = post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "agent_id": agent_a_id }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    let session_a_id = session_a["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let model_uri_a = format!("/v1/chat/sessions/{session_a_id}/model");
+    let set = put(
+        &router,
+        &model_uri_a,
+        Body::from(format!(r#"{{"llm":"{entry_a}"}}"#)),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(set["last_llm"].as_str(), Some(entry_a.as_str()));
+
+    let err = put(
+        &router,
+        &model_uri_a,
+        Body::from(format!(r#"{{"llm":"{entry_b}"}}"#)),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        err["error"].as_str().unwrap_or("").contains("allowed set"),
+        "expected allowed-set error, got {err:?}",
+    );
+
+    // ── 2. Clearing the pin always bypasses the set check ───────────────
+    let profile_b = post(
+        &router,
+        "/v1/agents",
+        Body::from(json!({ "name": "Restricted B", "allowed_models": [entry_a] }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    let agent_b_id = profile_b["id"].as_str().expect("id").to_owned();
+    let session_b = post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "agent_id": agent_b_id }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    let session_b_id = session_b["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_b_id}/model"),
+        Body::from(r#"{"llm":null}"#),
+        StatusCode::OK,
+    )
+    .await;
+
+    // ── 3. An unbound session has no restriction ─────────────────────────
+    let session_c = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_c_id = session_c["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_c_id}/model"),
+        Body::from(format!(r#"{{"llm":"{entry_b}"}}"#)),
+        StatusCode::OK,
+    )
+    .await;
+
+    // ── 4. A profile deleted after the session bound to it is tolerated
+    // (skip the check rather than 500) ────────────────────────────────────
+    let profile_d = post(
+        &router,
+        "/v1/agents",
+        Body::from(json!({ "name": "Restricted D", "allowed_models": [entry_a] }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    let agent_d_id = profile_d["id"].as_str().expect("id").to_owned();
+    let session_d = post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "agent_id": agent_d_id }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    let session_d_id = session_d["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    tg.deps
+        .stores
+        .agent_profile
+        .delete(&AgentProfileId::from(agent_d_id.as_str()))
+        .await
+        .expect("delete agent profile");
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_d_id}/model"),
+        Body::from(format!(r#"{{"llm":"{entry_b}"}}"#)),
+        StatusCode::OK,
+    )
+    .await;
 }
 
 // Sidebar preview: `list_sessions` must surface each session's most

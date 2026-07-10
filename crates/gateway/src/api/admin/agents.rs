@@ -7,7 +7,9 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use baybo_model::{AgentFramework, AgentProfileId, MAX_AGENT_PROFILE_NAME_CHARS};
+use baybo_model::{
+    AgentFramework, AgentProfileId, LlmEntryName, MAX_AGENT_PROFILE_NAME_CHARS, ReasoningEffort,
+};
 use baybo_store::StorageError;
 use baybo_store::agent_profile::{AgentProfileRow, AgentProfileUpdate};
 use chrono::{DateTime, SubsecRound, Utc};
@@ -78,6 +80,13 @@ pub struct AgentProfileDto {
     pub framework: AgentFrameworkDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<String>,
+    /// LLM entries a bound session may switch to. Empty = unrestricted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_models: Vec<String>,
+    /// Per-request reasoning effort for providers that support it.
+    /// Absent = follow the LLM entry's own configured value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// The seeded built-in profile: read-only except its avatar,
     /// cannot be deleted.
     pub builtin: bool,
@@ -95,6 +104,8 @@ impl From<AgentProfileRow> for AgentProfileDto {
             system_prompt: r.system_prompt,
             framework: r.framework.into(),
             llm: r.llm.map(|l| l.to_string()),
+            allowed_models: r.allowed_models.iter().map(|n| n.to_string()).collect(),
+            reasoning_effort: r.reasoning_effort.map(|e| e.as_str().to_owned()),
             builtin: r.builtin,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -117,6 +128,16 @@ pub struct CreateAgentProfileRequest {
     /// `GET /v1/llm/models`.
     #[serde(default)]
     pub llm: Option<String>,
+    /// LLM entries a bound session may switch to; each must match a
+    /// configured entry. Empty = unrestricted. When `llm` is also set it
+    /// must be a member of this set.
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    /// Per-request reasoning effort for providers that support it; see
+    /// [`baybo_model::ReasoningEffort::ALL`] for legal values. Empty/absent
+    /// = follow the LLM entry's own configured value.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Optional avatar (full blob id from `POST /v1/blobs`); validated
     /// exactly like `PUT /v1/agents/{agent_id}/avatar`.
     #[serde(default)]
@@ -136,6 +157,16 @@ pub struct UpdateAgentProfileRequest {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub llm: Option<String>,
+    /// LLM entries a bound session may switch to; each must match a
+    /// configured entry. Empty = unrestricted. When `llm` is also set it
+    /// must be a member of this set.
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    /// Per-request reasoning effort for providers that support it; see
+    /// [`baybo_model::ReasoningEffort::ALL`] for legal values. Empty/absent
+    /// = follow the LLM entry's own configured value.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Request body for `PUT /v1/agents/{agent_id}/avatar`.
@@ -162,6 +193,51 @@ fn validate_name(raw: &str) -> Result<String> {
         )));
     }
     Ok(name.to_owned())
+}
+
+/// Validate + normalize the allowed-models set: every member must be a live
+/// pool entry; duplicates collapse (order preserved); when a pin is also
+/// set, it must be a member.
+fn validate_allowed_models(
+    state: &AdminState,
+    raw: &[String],
+    pin: Option<&LlmEntryName>,
+) -> Result<Vec<LlmEntryName>> {
+    let mut out: Vec<LlmEntryName> = Vec::with_capacity(raw.len());
+    for name in raw {
+        let entry = super::validate_llm_pin(state, Some(name))?.ok_or_else(|| {
+            GatewayError::BadRequest("allowed_models entries must not be empty".to_owned())
+        })?;
+        if !out.contains(&entry) {
+            out.push(entry);
+        }
+    }
+    if let (Some(pin), false) = (pin, out.is_empty())
+        && !out.contains(pin)
+    {
+        return Err(GatewayError::BadRequest(format!(
+            "llm pin {:?} is not in allowed_models",
+            pin.as_str()
+        )));
+    }
+    Ok(out)
+}
+
+fn validate_reasoning_effort(raw: Option<&str>) -> Result<Option<ReasoningEffort>> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) => match ReasoningEffort::parse(s) {
+            Some(e) => Ok(Some(e)),
+            None => Err(GatewayError::BadRequest(format!(
+                "unknown reasoning_effort {s:?}; expected one of {}",
+                ReasoningEffort::ALL
+                    .iter()
+                    .map(|e| e.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        },
+    }
 }
 
 /// Reject a dangling or non-image avatar reference at write time; after
@@ -253,6 +329,8 @@ async fn create_agent(
 ) -> Result<Json<AgentProfileDto>> {
     let name = validate_name(&req.name)?;
     let llm = super::validate_llm_pin(&state, req.llm.as_deref())?;
+    let allowed_models = validate_allowed_models(&state, &req.allowed_models, llm.as_ref())?;
+    let reasoning_effort = validate_reasoning_effort(req.reasoning_effort.as_deref())?;
     if let Some(blob_id) = req.avatar_blob_id.as_deref() {
         validate_avatar_blob(&state, blob_id).await?;
     }
@@ -268,8 +346,8 @@ async fn create_agent(
         system_prompt: req.system_prompt,
         framework: req.framework.into(),
         llm,
-        allowed_models: Vec::new(),
-        reasoning_effort: None,
+        allowed_models,
+        reasoning_effort,
         builtin: false,
         created_at: now,
         updated_at: now,
@@ -323,14 +401,18 @@ async fn update_agent(
     if row.builtin {
         return Err(GatewayError::BadRequest(BUILTIN_READ_ONLY.to_owned()));
     }
+    let name = validate_name(&req.name)?;
+    let llm = super::validate_llm_pin(&state, req.llm.as_deref())?;
+    let allowed_models = validate_allowed_models(&state, &req.allowed_models, llm.as_ref())?;
+    let reasoning_effort = validate_reasoning_effort(req.reasoning_effort.as_deref())?;
     let update = AgentProfileUpdate {
-        name: validate_name(&req.name)?,
+        name,
         description: req.description,
         system_prompt: req.system_prompt,
         framework: req.framework.into(),
-        llm: super::validate_llm_pin(&state, req.llm.as_deref())?,
-        allowed_models: Vec::new(),
-        reasoning_effort: None,
+        llm,
+        allowed_models,
+        reasoning_effort,
     };
     let matched = state
         .agent_profile_store
