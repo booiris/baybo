@@ -152,6 +152,10 @@ pub struct ToolContext {
     /// pins back to the exact span that spawned them.
     pub span_id: SpanId,
     pub user: User,
+    /// The session's bound agent profile, if any. `None` = the builtin
+    /// agent. Scopes per-agent skill lookups and defaults memory tools'
+    /// agent namespace.
+    pub agent_id: Option<baybo_model::AgentProfileId>,
     pub timeout: Duration,
     pub cancellation_token: tokio_util::sync::CancellationToken,
     /// Sandbox FS scope — points at `<workspace>/work/`. Tools whose
@@ -257,6 +261,7 @@ impl ToolContext {
                 name: None,
                 channel: ChannelType::tui(),
             },
+            agent_id: None,
             timeout: Duration::from_secs(5),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             workspace_root: PathBuf::from("/tmp"),

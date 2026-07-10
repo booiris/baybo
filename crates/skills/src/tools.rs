@@ -155,9 +155,10 @@ impl Tool for SkillTool {
             )));
         }
 
+        let scope = ctx.agent_id.as_ref().map(|a| a.as_str());
         let skill = self
             .registry
-            .get(&p.skill)
+            .get_scoped(scope, &p.skill)
             .ok_or_else(|| ToolError::NotFound(format!("skill '{}'", p.skill)))?;
 
         if !skill.agent_invocable {
@@ -907,6 +908,40 @@ mod tests {
         assert_eq!(lf["templates"], json!(["templates/cfg.yaml"]));
         assert_eq!(lf["scripts"], json!(["scripts/s.sh"]));
         assert_eq!(lf["other"], json!(["misc.txt"]));
+    }
+
+    #[tokio::test]
+    async fn skill_tool_resolves_agent_overlay_first() {
+        // Registry with a shared `greet` and an A1 overlay `greet`.
+        let registry = Arc::new(SkillRegistry::new());
+        let shared_dir = tempdir().unwrap();
+        fs::write(shared_dir.path().join("SKILL.md"), "# Body\n").unwrap();
+        registry.register(mk_skill(shared_dir.path(), "greet"));
+
+        let agents = tempdir().unwrap();
+        let d = agents.path().join("A1").join("greet");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(
+            d.join("SKILL.md"),
+            "---\nname: greet\ndescription: agent greet\n---\nagent body\n",
+        )
+        .unwrap();
+        registry.load_agent_skills_root(agents.path());
+
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysPass),
+        };
+        let mut ctx = mk_ctx();
+        ctx.agent_id = Some(baybo_model::AgentProfileId::from("A1"));
+
+        let out = tool.execute(json!({"skill": "greet"}), &ctx).await.unwrap();
+        let v = match out {
+            ToolOutput::Json(v) => v,
+            other => panic!("expected json, got {other:?}"),
+        };
+        let text = v.to_string();
+        assert!(text.contains("agent body"), "overlay must win: {text}");
     }
 
     /// The slash route must surface the same sub-file affordance the LLM

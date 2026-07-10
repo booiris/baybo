@@ -532,6 +532,7 @@ impl ToolExecutor {
                     job_id,
                     span_id: span_handle.span_id,
                     user: user.clone(),
+                    agent_id: None,
                     timeout: effective_timeout,
                     cancellation_token: cancel_token,
                     workspace_root: self.workspace_root.clone(),

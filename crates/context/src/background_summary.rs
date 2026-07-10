@@ -361,6 +361,7 @@ fn make_tool_context(workspace_paths: &WorkspacePaths, cancel: CancellationToken
             name: None,
             channel: ChannelType::tui(),
         },
+        agent_id: None,
         timeout: Duration::from_secs(30),
         cancellation_token: cancel,
         workspace_root: workspace_paths.root().to_path_buf(),
