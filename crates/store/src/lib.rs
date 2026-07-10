@@ -23,6 +23,8 @@ pub mod session_folder;
 pub mod session_summary;
 pub mod skill_risk;
 pub mod task;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod trace;
 
 pub use agent_profile::{AgentProfileRow, AgentProfileStore, AgentProfileUpdate};

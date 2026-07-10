@@ -14,6 +14,10 @@ baybo-session = { workspace = true }
 # Subagent profile registry: context resolves a subagent session's system
 # prompt from its profile name (see `ContextManager::subagent_profile`).
 baybo-subagent = { workspace = true }
+# Agent profile store: context resolves an agent-bound session's system
+# prompt from its profile row live (see `ContextManager::agent_profile`).
+# Leaf crate, no cycle risk.
+baybo-store = { workspace = true }
 baybo-tools = { workspace = true }
 baybo-trace = { workspace = true }
 # `io` exposes `identity::load_identity_files`, used by prompts::soul to
@@ -45,6 +49,7 @@ hex = { workspace = true }
 # fakes the context unit tests build their `SessionManager` from.
 baybo-session = { workspace = true, features = ["test-support"] }
 baybo-storage = { workspace = true, features = ["test-support"] }
+baybo-store = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }

@@ -475,6 +475,7 @@ impl AgentTestHarnessBuilder {
             session_id: session.id.clone(),
             sessions: Arc::clone(&session_manager),
             subagent_profile: Some((subagent_registry, "harness".to_string())),
+            agent_profile: None,
         });
 
         let guarded_llm =

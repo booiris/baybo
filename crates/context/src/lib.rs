@@ -71,7 +71,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use baybo_llm::{ChatRequest, LlmResponse};
-use baybo_model::{BackgroundCompressionPayload, ChatMessage, ContentBlock, Role, SessionId};
+use baybo_model::{
+    AgentProfileId, BackgroundCompressionPayload, ChatMessage, ContentBlock, Role, SessionId,
+};
 use baybo_session::SessionManager;
 use baybo_skills::render::{render_skill_block, render_skill_reminder};
 use baybo_skills::{
@@ -196,6 +198,16 @@ pub struct ContextManager {
     /// `reseed_system_row` after each compaction, so a source edit (workspace
     /// soul *or* subagent profile) lands on the next compaction.
     subagent_profile: Option<(Arc<baybo_subagent::SubagentRegistry>, String)>,
+    /// For an agent-bound session: `(profile store, profile id)` — context
+    /// resolves the session's system prompt from the profile row live (at
+    /// seed and on every post-compaction reseed, so a profile edit lands
+    /// like a Soul edit) and scopes skill listings to the agent's overlay
+    /// folder. `None` = builtin behavior (workspace Soul, shared skills
+    /// only).
+    agent_profile: Option<(
+        Arc<dyn baybo_store::agent_profile::AgentProfileStore>,
+        AgentProfileId,
+    )>,
     /// Boundary the trigger gate measures from. Set to `messages.len()`
     /// after every compression apply and reconstructed from
     /// `session_summaries.cursor` on cold start.
@@ -254,6 +266,16 @@ pub struct ContextManagerConfig {
     /// resolving it to a prompt is context's job, so an edited profile is
     /// picked up like an edited workspace soul.
     pub subagent_profile: Option<(Arc<baybo_subagent::SubagentRegistry>, String)>,
+    /// For an agent-bound session: `(profile store, profile id)` — context
+    /// resolves the session's system prompt from the profile row live (at
+    /// seed and on every post-compaction reseed, so a profile edit lands
+    /// like a Soul edit) and scopes skill listings to the agent's overlay
+    /// folder. `None` = builtin behavior (workspace Soul, shared skills
+    /// only).
+    pub agent_profile: Option<(
+        Arc<dyn baybo_store::agent_profile::AgentProfileStore>,
+        AgentProfileId,
+    )>,
 }
 
 impl ContextManager {
@@ -277,6 +299,7 @@ impl ContextManager {
             session_id: config.session_id,
             sessions: config.sessions,
             subagent_profile: config.subagent_profile,
+            agent_profile: config.agent_profile,
             last_summary_anchor: None,
             last_synced_cursor: None,
             task_reminder: None,
@@ -363,28 +386,56 @@ impl ContextManager {
             .unwrap_or_else(|| crate::prompts::soul::FALLBACK_SYSTEM_PROMPT.to_string())
     }
 
-    /// Resolve the session's system prompt from its source: a subagent profile
-    /// (looked up by name in the spawn registry) or the workspace soul. `None`
-    /// on a resolution failure (profile not found, or workspace I/O error) so
-    /// the caller decides whether to fall back (seed) or keep the prior row
-    /// (reseed).
+    /// Resolve the session's system prompt from its source, in priority
+    /// order: a subagent profile (looked up by name in the spawn registry),
+    /// then an agent profile's `system_prompt` (looked up live in the
+    /// profile store), then the workspace soul. A subagent profile not found
+    /// is a hard failure (`None`, no soul fallback — the subagent arm is
+    /// unchanged from before this priority list existed); an agent profile's
+    /// `NULL` `system_prompt`, a missing row, or a store error all fall
+    /// through to the workspace soul rather than failing resolution outright.
     async fn try_resolve_system_prompt(&self) -> Option<String> {
-        match &self.subagent_profile {
-            Some((registry, profile_name)) => {
-                let resolved = registry.get(profile_name).map(|p| p.system_prompt);
-                if resolved.is_none() {
-                    tracing::warn!(subagent_type = %profile_name, "subagent profile not found in registry");
-                }
-                resolved
+        if let Some((registry, profile_name)) = &self.subagent_profile {
+            let resolved = registry.get(profile_name).map(|p| p.system_prompt);
+            if resolved.is_none() {
+                tracing::warn!(subagent_type = %profile_name, "subagent profile not found in registry");
             }
-            None => match crate::prompts::soul::assemble_from_workspace(&self.workspace).await {
-                Ok(prompt) => Some(prompt),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to assemble workspace soul");
-                    None
-                }
-            },
+            return resolved;
         }
+        if let Some((store, profile_id)) = &self.agent_profile {
+            match store.get(profile_id).await {
+                Ok(Some(row)) => {
+                    if let Some(prompt) = row.system_prompt {
+                        return Some(prompt);
+                    }
+                    // NULL prompt ⇒ inherit the workspace Soul below.
+                }
+                Ok(None) => tracing::warn!(
+                    agent_id = %profile_id,
+                    "bound agent profile missing; falling back to workspace soul"
+                ),
+                Err(e) => tracing::warn!(
+                    agent_id = %profile_id, error = %e,
+                    "agent profile lookup failed; falling back to workspace soul"
+                ),
+            }
+        }
+        match crate::prompts::soul::assemble_from_workspace(&self.workspace).await {
+            Ok(prompt) => Some(prompt),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to assemble workspace soul");
+                None
+            }
+        }
+    }
+
+    /// Skill-registry scope key for the bound agent profile, or `None` for a
+    /// builtin/unbound session (shared skills only). Threaded through every
+    /// skill-listing consumer ([`Self::invocable_skill_summaries`],
+    /// [`insert_skill_trailer`], [`Self::slash_expansion_message`]) so an
+    /// agent's overlay skills never leak into another session's listing.
+    fn agent_scope(&self) -> Option<&str> {
+        self.agent_profile.as_ref().map(|(_, id)| id.as_str())
     }
 
     /// Refresh the leading system row after a *committed* compaction so a
@@ -456,7 +507,7 @@ impl ContextManager {
             return Vec::new();
         }
         self.skill_registry
-            .all_summaries_sorted()
+            .summaries_for_agent(self.agent_scope())
             .into_iter()
             .filter(|s| {
                 s.agent_invocable && !matches!(s.trust_level, baybo_model::TrustLevel::Untrusted)
@@ -505,7 +556,9 @@ impl ContextManager {
             .map(|m| baybo_llm::multimodal::extract_text(&m.content))?;
         let (skill_name, _args) =
             detect_slash_invocation(&user_text, &self.invocable_skill_summaries())?;
-        let skill = self.skill_registry.get(&skill_name)?;
+        let skill = self
+            .skill_registry
+            .get_scoped(self.agent_scope(), &skill_name)?;
         let body = render_skill_for_slash(&skill, self.session_id.as_str());
         Some((
             skill_name,
@@ -907,6 +960,7 @@ impl ContextManager {
             self.skill_registry.as_ref(),
             self.tokenizer.as_ref(),
             &self.called_skills,
+            self.agent_scope(),
         );
 
         let before_tokens = self.budget.current();
@@ -1888,11 +1942,12 @@ fn build_skill_detail_payload(
     registry: &SkillRegistry,
     tokenizer: &dyn Tokenizer,
     called_skills: &[String],
+    agent: Option<&str>,
 ) -> Option<String> {
     let mut total = 0usize;
     let mut blocks: Vec<String> = Vec::new();
     for name in called_skills {
-        let Some(skill) = registry.get(name) else {
+        let Some(skill) = registry.get_scoped(agent, name) else {
             continue;
         };
         let remaining = TOTAL_SKILL_TOKEN_CAP.saturating_sub(total);
@@ -1941,17 +1996,18 @@ pub(crate) fn insert_skill_trailer(
     registry: &SkillRegistry,
     tokenizer: &dyn Tokenizer,
     called_skills: &[String],
+    agent: Option<&str>,
 ) {
     let mut insert_at = 0;
     while insert_at < messages.len() && messages[insert_at].role == Role::System {
         insert_at += 1;
     }
-    let reminder = render_skill_reminder(&registry.all_summaries_sorted());
+    let reminder = render_skill_reminder(&registry.summaries_for_agent(agent));
     messages.insert(
         insert_at,
         ChatMessage::agent_context(vec![ContentBlock::Text(reminder)]),
     );
-    if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
+    if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills, agent) {
         messages.insert(
             insert_at + 1,
             ChatMessage::agent_context(vec![ContentBlock::Text(detail)]),
@@ -1970,12 +2026,13 @@ pub(crate) fn estimate_skill_trailer_tokens(
     registry: &SkillRegistry,
     tokenizer: &dyn Tokenizer,
     called_skills: &[String],
+    agent: Option<&str>,
 ) -> usize {
-    let reminder = render_skill_reminder(&registry.all_summaries_sorted());
+    let reminder = render_skill_reminder(&registry.summaries_for_agent(agent));
     let mut total = tokenizer.count_message(&ChatMessage::agent_context(vec![ContentBlock::Text(
         reminder,
     )]));
-    if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
+    if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills, agent) {
         total += tokenizer.count_message(&ChatMessage::agent_context(vec![ContentBlock::Text(
             detail,
         )]));
@@ -2084,6 +2141,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
+            agent_profile: None,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -2264,6 +2322,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
+            agent_profile: None,
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed")).await;
@@ -2326,6 +2385,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: Some((Arc::clone(&registry), "test-agent".to_string())),
+            agent_profile: None,
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "SUBAGENT_PROFILE"))
@@ -2353,6 +2413,249 @@ mod tests {
             }
             other => panic!("expected system text, got {other:?}"),
         }
+    }
+
+    fn profile_row(id: &str, prompt: Option<&str>) -> baybo_store::agent_profile::AgentProfileRow {
+        baybo_store::agent_profile::AgentProfileRow {
+            id: AgentProfileId::from(id),
+            name: id.to_string(),
+            description: String::new(),
+            avatar_blob_id: None,
+            system_prompt: prompt.map(str::to_owned),
+            framework: baybo_model::AgentFramework::Baybo,
+            llm: None,
+            builtin: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Helper: build a ContextManager bound (or not) to an agent profile,
+    /// with a chosen skill registry + workspace and the test-defaults for
+    /// everything else — mirrors [`make_ctx_with_registry`] plus the
+    /// `agent_profile` arm under test.
+    fn make_ctx_with_agent(
+        skill_registry: Arc<SkillRegistry>,
+        workspace: Arc<baybo_workspace::WorkspacePaths>,
+        agent_profile: Option<(Arc<dyn baybo_store::agent_profile::AgentProfileStore>, &str)>,
+        keep_recent: usize,
+        max_tokens: usize,
+        threshold: f64,
+    ) -> ContextManager {
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace,
+            keep_recent,
+            compression_threshold: threshold,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry,
+            session_id: test_session_id(),
+            sessions: test_sessions(),
+            subagent_profile: None,
+            agent_profile: agent_profile.map(|(store, id)| (store, AgentProfileId::from(id))),
+        });
+        ctx.set_active_model_context_window(max_tokens);
+        ctx
+    }
+
+    /// Read the leading `Role::System` row's text, panicking if the
+    /// transcript isn't seeded or doesn't lead with a text system row.
+    fn first_system_text(ctx: &ContextManager) -> String {
+        let first = ctx.messages().first().expect("seeded system row");
+        assert_eq!(first.role, Role::System);
+        match &first.content[0] {
+            ContentBlock::Text(t) => t.clone(),
+            other => panic!("unexpected block {other:?}"),
+        }
+    }
+
+    /// Priority: agent-profile `system_prompt` beats the workspace Soul when
+    /// set; a `NULL` prompt on the bound row, and a bound-but-missing row,
+    /// both fall through to the Soul rather than the minimal fallback (which
+    /// only fires on an actual resolution error, e.g. workspace I/O).
+    #[tokio::test]
+    async fn agent_profile_prompt_overrides_soul_and_null_falls_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Arc::new(baybo_workspace::WorkspacePaths::new(
+            dir.path().to_path_buf(),
+        ));
+        let store = baybo_store::test_support::MemoryAgentProfileStore::new();
+        store.insert(profile_row("A1", Some("I am agent A1.")));
+        store.insert(profile_row("A2", None));
+        let store_dyn = store as Arc<dyn baybo_store::agent_profile::AgentProfileStore>;
+
+        // Bound to A1 (prompt set) → profile prompt wins.
+        let mut mgr = make_ctx_with_agent(
+            Arc::new(SkillRegistry::new()),
+            Arc::clone(&workspace),
+            Some((Arc::clone(&store_dyn), "A1")),
+            2,
+            100_000,
+            0.75,
+        );
+        mgr.ensure_seeded().await;
+        assert_eq!(first_system_text(&mgr), "I am agent A1.");
+
+        // Bound to A2 (NULL prompt) → workspace Soul (contains the soul TOP hint,
+        // not the minimal fallback).
+        let mut mgr2 = make_ctx_with_agent(
+            Arc::new(SkillRegistry::new()),
+            Arc::clone(&workspace),
+            Some((Arc::clone(&store_dyn), "A2")),
+            2,
+            100_000,
+            0.75,
+        );
+        mgr2.ensure_seeded().await;
+        let text2 = first_system_text(&mgr2);
+        assert_ne!(text2, "I am agent A1.");
+        assert!(
+            text2.contains("<soul"),
+            "NULL prompt must inherit the Soul: {text2}"
+        );
+
+        // Bound to a deleted profile → Soul fallback too.
+        let mut mgr3 = make_ctx_with_agent(
+            Arc::new(SkillRegistry::new()),
+            Arc::clone(&workspace),
+            Some((Arc::clone(&store_dyn), "GONE")),
+            2,
+            100_000,
+            0.75,
+        );
+        mgr3.ensure_seeded().await;
+        let text3 = first_system_text(&mgr3);
+        assert!(
+            text3.contains("<soul"),
+            "missing profile must inherit the Soul"
+        );
+    }
+
+    /// Resolution is a live store read on every reseed, not a value
+    /// snapshotted at seed time: an edited profile lands on the next
+    /// post-compaction reseed exactly like an edited workspace soul does
+    /// (see `reseed_rereads_grown_workspace_soul_without_vetoing_compaction`).
+    #[tokio::test]
+    async fn agent_profile_edit_is_picked_up_on_reseed_after_compaction() {
+        let store = baybo_store::test_support::MemoryAgentProfileStore::new();
+        store.insert(profile_row("A1", Some("original prompt")));
+        let store_dyn =
+            Arc::clone(&store) as Arc<dyn baybo_store::agent_profile::AgentProfileStore>;
+
+        let mut ctx = make_ctx_with_agent(
+            Arc::new(SkillRegistry::new()),
+            test_workspace(),
+            Some((Arc::clone(&store_dyn), "A1")),
+            2,
+            100_000,
+            0.75,
+        );
+        // Seed manually with a placeholder distinct from both the original
+        // and the edited prompt (mirrors the soul-edit reseed test) so the
+        // assertion below can only pass if reseed re-read the store live.
+        ctx.append(&make_msg(Role::System, "placeholder")).await;
+        ctx.append(&make_msg(Role::User, &padded("first"))).await;
+        ctx.append(&make_msg(Role::Assistant, &padded("second")))
+            .await;
+        ctx.append(&make_msg(Role::User, &padded("third"))).await;
+
+        store_dyn
+            .update(
+                &AgentProfileId::from("A1"),
+                &baybo_store::agent_profile::AgentProfileUpdate {
+                    name: "A1".into(),
+                    description: String::new(),
+                    system_prompt: Some("edited prompt".into()),
+                    framework: baybo_model::AgentFramework::Baybo,
+                    llm: None,
+                },
+            )
+            .await
+            .expect("update");
+
+        // err_chat → truncate fallback, then reseed_system_row re-resolves.
+        let outcome = ctx.force_compress("test-model", err_chat).await.unwrap();
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            first_system_text(&ctx),
+            "edited prompt",
+            "reseed must re-read the profile store live, not a seed-time snapshot"
+        );
+    }
+
+    /// Skill listings scope to the bound agent's overlay folder: a manager
+    /// bound to A1 advertises A1's overlay skill in the seed reminder; an
+    /// unbound manager sees the shared set only.
+    #[tokio::test]
+    async fn ensure_seeded_scopes_skill_reminder_to_bound_agent() {
+        let registry = Arc::new(SkillRegistry::new());
+        let shared = tempfile::tempdir().expect("tempdir");
+        let agents = tempfile::tempdir().expect("tempdir");
+
+        let shared_dir = shared.path().join("shared-skill");
+        std::fs::create_dir_all(&shared_dir).expect("shared dir");
+        std::fs::write(
+            shared_dir.join("SKILL.md"),
+            "---\nname: shared-skill\ndescription: shared skill\n---\nshared body\n",
+        )
+        .expect("write shared skill");
+
+        let overlay_dir = agents.path().join("A1").join("overlay-skill");
+        std::fs::create_dir_all(&overlay_dir).expect("overlay dir");
+        std::fs::write(
+            overlay_dir.join("SKILL.md"),
+            "---\nname: overlay-skill\ndescription: overlay skill\n---\noverlay body\n",
+        )
+        .expect("write overlay skill");
+
+        registry.load_dir(shared.path());
+        registry.load_agent_skills_root(agents.path());
+
+        let store = baybo_store::test_support::MemoryAgentProfileStore::new();
+        let store_dyn = store as Arc<dyn baybo_store::agent_profile::AgentProfileStore>;
+
+        // Bound to A1: reminder must include the overlay skill.
+        let mut bound = make_ctx_with_agent(
+            Arc::clone(&registry),
+            test_workspace(),
+            Some((Arc::clone(&store_dyn), "A1")),
+            2,
+            100_000,
+            0.75,
+        );
+        bound.ensure_seeded().await;
+        let ContentBlock::Text(bound_reminder) = &bound.messages()[1].content[0] else {
+            panic!("reminder should be a text block");
+        };
+        assert!(
+            bound_reminder.contains("overlay-skill"),
+            "A1-bound reminder must advertise the overlay skill: {bound_reminder}"
+        );
+
+        // Unbound: shared set only, no overlay.
+        let mut unbound = make_ctx_with_agent(
+            Arc::clone(&registry),
+            test_workspace(),
+            None,
+            2,
+            100_000,
+            0.75,
+        );
+        unbound.ensure_seeded().await;
+        let ContentBlock::Text(unbound_reminder) = &unbound.messages()[1].content[0] else {
+            panic!("reminder should be a text block");
+        };
+        assert!(
+            unbound_reminder.contains("shared-skill"),
+            "unbound reminder must advertise the shared skill"
+        );
+        assert!(
+            !unbound_reminder.contains("overlay-skill"),
+            "unbound reminder must NOT advertise the agent overlay skill: {unbound_reminder}"
+        );
     }
 
     #[tokio::test]
@@ -2780,6 +3083,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
+            agent_profile: None,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -3045,6 +3349,7 @@ mod tests {
             &registry,
             &SimpleTokenizer,
             &["big".to_string(), "small".to_string()],
+            None,
         )
         .expect("payload");
 
@@ -3074,6 +3379,7 @@ mod tests {
             &registry,
             &SimpleTokenizer,
             &names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            None,
         )
         .expect("payload");
 
@@ -3105,6 +3411,7 @@ mod tests {
             &registry,
             &SimpleTokenizer,
             &names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            None,
         )
         .expect("payload");
 
@@ -3122,7 +3429,7 @@ mod tests {
         // so the trailer-emitting caller skips the message entirely.
         let registry = Arc::new(SkillRegistry::new());
         assert!(
-            build_skill_detail_payload(&registry, &SimpleTokenizer, &["ghost".to_string()])
+            build_skill_detail_payload(&registry, &SimpleTokenizer, &["ghost".to_string()], None)
                 .is_none()
         );
     }

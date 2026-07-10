@@ -845,6 +845,10 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                             .subagent_type
                             .clone()
                             .map(|name| (Arc::clone(&subagent_registry), name)),
+                        // Agent-bound runtime wiring lands in a later task; the
+                        // builtin path (workspace Soul, shared skills only) is
+                        // unconditional here for now.
+                        agent_profile: None,
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),
