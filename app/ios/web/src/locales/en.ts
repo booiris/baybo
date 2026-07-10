@@ -9,6 +9,7 @@ export const en = {
       imageAlt: "image",
       recoverFailed: "Couldn't reload history: {{error}}",
       retrySend: "Send failed — tap to retry",
+      copied: "Copied",
       working: "Working",
       worked: "Worked",
       workedFor: "Worked {{dur}}",

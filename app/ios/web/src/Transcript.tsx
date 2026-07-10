@@ -1,7 +1,17 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type TouchEvent as ReactTouchEvent,
+} from "react";
 import { useTranslation } from "react-i18next";
 import {
   blobObjectUrl,
+  copyText,
   fetchHistory,
   log,
   persistState,
@@ -473,6 +483,86 @@ function AttachmentBubble({
   );
 }
 
+/// Long-press-to-copy on a user bubble: hold ~450ms without dragging (a drag is
+/// a scroll, which cancels). Native owns the clipboard write + confirming haptic
+/// (`copyText`); the web side plays the squish + "copied" pill for
+/// `COPY_TOAST_MS` before it fades.
+const LONG_PRESS_MS = 450;
+const LONG_PRESS_MOVE_CANCEL_PX = 10;
+const COPY_TOAST_MS = 1300;
+/// Below this gap between the bubble's top and the header-covered strip, the
+/// pill would render under the native header overlay — flip it below instead.
+const TOAST_HEADER_CLEARANCE_PX = 30;
+
+/// Fire `onLongPress` after a still ~`LONG_PRESS_MS` press; any drag past
+/// `LONG_PRESS_MOVE_CANCEL_PX` (a scroll) or a lift first cancels it. Touch-only
+/// — the pointer here is always a finger on the transcript webview.
+function useLongPress(onLongPress: () => void): {
+  onTouchStart: (e: ReactTouchEvent) => void;
+  onTouchMove: (e: ReactTouchEvent) => void;
+  onTouchEnd: () => void;
+} {
+  const timer = useRef<number | undefined>(undefined);
+  const origin = useRef<{ x: number; y: number } | null>(null);
+  // The document-level second-finger watch, live only while a press is armed.
+  const docWatch = useRef<((e: TouchEvent) => void) | null>(null);
+
+  const cancel = useCallback(() => {
+    clearTimeout(timer.current);
+    timer.current = undefined;
+    origin.current = null;
+    if (docWatch.current) {
+      document.removeEventListener("touchstart", docWatch.current, true);
+      docWatch.current = null;
+    }
+  }, []);
+
+  // Clear an armed press (timer + document watch) on unmount.
+  useEffect(() => cancel, [cancel]);
+
+  const onTouchStart = useCallback(
+    (e: ReactTouchEvent) => {
+      cancel();
+      if (e.touches.length !== 1) return;
+      const t = e.touches[0];
+      origin.current = { x: t.clientX, y: t.clientY };
+      timer.current = window.setTimeout(() => {
+        cancel();
+        onLongPress();
+      }, LONG_PRESS_MS);
+      // A second finger landing anywhere — even off the bubble — is a pinch or
+      // scroll, not a copy. onTouchStart only re-fires for touches ON the bubble,
+      // so watch the whole document while armed; `cancel` removes the listener.
+      const watch = (ev: TouchEvent) => {
+        if (ev.touches.length > 1) cancel();
+      };
+      docWatch.current = watch;
+      document.addEventListener("touchstart", watch, { passive: true, capture: true });
+    },
+    [cancel, onLongPress],
+  );
+
+  const onTouchMove = useCallback(
+    (e: ReactTouchEvent) => {
+      if (origin.current === null || timer.current === undefined) return;
+      if (e.touches.length !== 1) {
+        cancel();
+        return;
+      }
+      const t = e.touches[0];
+      if (
+        Math.abs(t.clientX - origin.current.x) > LONG_PRESS_MOVE_CANCEL_PX ||
+        Math.abs(t.clientY - origin.current.y) > LONG_PRESS_MOVE_CANCEL_PX
+      ) {
+        cancel();
+      }
+    },
+    [cancel],
+  );
+
+  return { onTouchStart, onTouchMove, onTouchEnd: cancel };
+}
+
 /// One finalized transcript row, rendered as a GROUP of stacked bubbles: each
 /// image / file attachment is its OWN bubble, separate from the text bubble —
 /// never merged into one. User attachments + text stack right-aligned; assistant
@@ -489,6 +579,32 @@ const MessageRow = memo(function MessageRow({
   onRetry: (m: ChatMsg) => void;
 }) {
   const { t } = useTranslation();
+
+  // Long-press copy — armed for every row but only wired onto the user text
+  // bubble below (hooks must run unconditionally, ahead of the role returns).
+  // `copyId` is a nonce (0 = idle): bumping it every copy — and keying the pill
+  // on it — forces a fresh mount so the confirm animation REPLAYS even on a
+  // repeat copy inside the toast window (a plain boolean would Object.is-bail
+  // the re-render and the pill would sit frozen).
+  const [copyId, setCopyId] = useState(0);
+  const [toastBelow, setToastBelow] = useState(false);
+  const bubbleRef = useRef<HTMLDivElement | null>(null);
+  const copyTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => clearTimeout(copyTimer.current), []);
+  const copy = useCallback(() => {
+    if (m.role !== "user" || !m.content) return;
+    copyText(m.content);
+    // The pill floats above the bubble by default; a bubble near the top of the
+    // scroll would push it under the native header overlay, so flip it below.
+    const el = bubbleRef.current;
+    const log = el?.closest(".chat-log");
+    const inset = log ? parseFloat(getComputedStyle(log).paddingTop) || 0 : 0;
+    setToastBelow(el !== null && el.getBoundingClientRect().top - inset < TOAST_HEADER_CLEARANCE_PX);
+    setCopyId((n) => n + 1);
+    clearTimeout(copyTimer.current);
+    copyTimer.current = window.setTimeout(() => setCopyId(0), COPY_TOAST_MS);
+  }, [m.role, m.content]);
+  const longPress = useLongPress(copy);
 
   if (m.role === "notice") {
     return <div className="bubble notice">{m.content}</div>;
@@ -541,9 +657,26 @@ const MessageRow = memo(function MessageRow({
         );
       })}
       {hasText && (
-        <div className={`bubble user${sendClass}`}>
+        <div
+          ref={bubbleRef}
+          className={`bubble user${sendClass}${copyId !== 0 ? " copied" : ""}`}
+          onTouchStart={longPress.onTouchStart}
+          onTouchMove={longPress.onTouchMove}
+          onTouchEnd={longPress.onTouchEnd}
+          onTouchCancel={longPress.onTouchEnd}
+        >
           {m.content}
           {sendChrome}
+          {copyId !== 0 && (
+            <span
+              key={copyId}
+              className={`copy-toast${toastBelow ? " copy-toast-below" : ""}`}
+              aria-hidden="true"
+            >
+              <span className="copy-toast-check">✓</span>
+              {t("chat.copied")}
+            </span>
+          )}
         </div>
       )}
     </div>

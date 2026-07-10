@@ -124,7 +124,65 @@ button {
   white-space: pre-wrap;
   word-break: break-word;
 }
-.bubble.user { align-self: flex-end; background: var(--color-ink); color: var(--color-paper); border-color: var(--color-ink); }
+.bubble.user {
+  position: relative;
+  align-self: flex-end;
+  background: var(--color-ink);
+  color: var(--color-paper);
+  border-color: var(--color-ink);
+  /* This bubble is the long-press-to-copy affordance, so it OWNS the long-press:
+     the native iOS selection callout (turned on for every .bubble above) is
+     turned back OFF here — else it fires its own selection UI at the same ~500ms
+     and fights the custom copy. Assistant prose keeps native selection. */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+/* Copy confirm: a quick squish-and-pop on the bubble plus a floating "copied"
+   pill that rises above it and fades. Monochrome, on the app's soft spring. The
+   pill's fade matches COPY_TOAST_MS in Transcript.tsx (React unmounts it then). */
+.bubble.user.copied {
+  animation: copy-squish 320ms cubic-bezier(0.34, 1.4, 0.64, 1);
+}
+@keyframes copy-squish {
+  0% { transform: scale(1); }
+  35% { transform: scale(0.95); }
+  70% { transform: scale(1.03); }
+  100% { transform: scale(1); }
+}
+.copy-toast {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 0.4rem);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.22rem 0.6rem;
+  border-radius: 999px;
+  background: var(--color-ink);
+  color: var(--color-paper);
+  font-family: var(--font-sans);
+  font-size: 0.8rem;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+  transform-origin: bottom center;
+  animation: copy-toast 1300ms ease forwards;
+}
+.copy-toast-check { font-weight: 700; }
+/* Near the top of the scroll the above-anchored pill would hide under the
+   native header — flip it below the bubble there (set from Transcript.tsx). */
+.copy-toast-below {
+  top: calc(100% + 0.4rem);
+  bottom: auto;
+}
+@keyframes copy-toast {
+  0% { opacity: 0; transform: translateX(-50%) translateY(5px) scale(0.9); }
+  14% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+  78% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateX(-50%) translateY(-5px) scale(0.98); }
+}
 /* Optimistic-send status: both indicators sit to the LEFT of the (right-aligned)
    bubble, vertically centered. Centered via top + negative margin (NOT
    translateY) so the spinner's transform stays free for its rotation. */

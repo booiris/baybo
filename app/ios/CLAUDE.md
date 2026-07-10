@@ -205,7 +205,10 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   native→web
   `init/pushFrame/setConnEpoch/userSent/blobResult/setLanguage/setBottomInset/jumpToLatest/requestSync`;
   web→native
-  `ready/sync/persist/fetchHistory/requestBlob/openUrl/log/jumpVisible`. The
+  `ready/sync/persist/fetchHistory/requestBlob/openUrl/copy/log/jumpVisible`.
+  (`copy` is a user-bubble long-press: native writes `UIPasteboard` + fires a
+  haptic, because a `file://` WKWebView rejects `navigator.clipboard` outside a
+  live gesture.) The
   `sync` message carries the webview's cursor (`sinceOrdinal`, null = baseline)
   + elected page size; native answers with a synthesized `sync_page` frame (or
   `sync_failed`). Transcript persistence is the per-session mirror file, a pure

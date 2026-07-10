@@ -128,6 +128,15 @@ export function openUrl(url: string): void {
   else window.open(url, "_blank", "noopener");
 }
 
+/// Copy text to the system clipboard. Native owns the write (UIPasteboard) and
+/// fires the confirming haptic — a WKWebView rejects `navigator.clipboard`
+/// writes outside a live user gesture, and a long-press timer has none. Dev
+/// browser: best-effort clipboard write so the affordance still works there.
+export function copyText(text: string): void {
+  if (native) postSafe({ type: "copy", text });
+  else void navigator.clipboard?.writeText(text).catch(() => {});
+}
+
 // History fetches are fire-and-forget from Web's perspective: native calls the
 // chat API and pushes back a local `history_page` / `history_failed` frame.
 export function fetchHistory(beforeOrdinal: number | null, limit: number): void {

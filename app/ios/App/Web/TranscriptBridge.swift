@@ -324,6 +324,14 @@ extension TranscriptBridge: WKScriptMessageHandler {
             {
                 UIApplication.shared.open(url)
             }
+        case "copy":
+            // A user-bubble long-press. Native owns the write: a WKWebView
+            // rejects `navigator.clipboard` outside a live gesture (the web
+            // timer has none), and only native can fire the confirming haptic.
+            if let text = body["text"] as? String, !text.isEmpty {
+                UIPasteboard.general.string = text
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            }
         case "log":
             let level = body["level"] as? String ?? "info"
             let message = body["message"] as? String ?? ""
