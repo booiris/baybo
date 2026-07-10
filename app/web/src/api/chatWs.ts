@@ -115,7 +115,7 @@ export interface TaskView {
  *  within the buffered turn; `reasoning` / `prose` bodies live in
  *  `text`. */
 export interface WireWorkStep {
-  kind: 'reasoning' | 'prose' | 'tool';
+  kind: 'reasoning' | 'prose' | 'tool' | 'status';
   text?: string;
   call_id?: string;
   tool?: string;
