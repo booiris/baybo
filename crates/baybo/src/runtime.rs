@@ -39,6 +39,7 @@ use baybo_security::{LeakDetectionRule, LeakDetector};
 use baybo_skills::SkillRegistry;
 use baybo_skills_assessor::SkillAssessor;
 use baybo_storage::Store;
+use baybo_store::AgentProfileStore;
 use baybo_tools::ToolRegistry;
 use baybo_tools::mcp::{EmbeddedMcpServer, McpReconciler};
 use baybo_trace::{SpanRecorder, TraceEventStream};
@@ -790,6 +791,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
         let sessions = Arc::clone(&graph.session_manager);
         let subagent_registry = Arc::clone(&graph.subagent_registry);
+        let agent_profile_store: Arc<dyn AgentProfileStore> =
+            Arc::clone(&graph.stores.agent_profile);
         let workspace_paths_arc = Arc::new(baybo_workspace::WorkspacePaths::new(
             graph.workspace.root.clone(),
         ));
@@ -845,10 +848,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                             .subagent_type
                             .clone()
                             .map(|name| (Arc::clone(&subagent_registry), name)),
-                        // Agent-bound runtime wiring lands in a later task; the
-                        // builtin path (workspace Soul, shared skills only) is
-                        // unconditional here for now.
-                        agent_profile: None,
+                        agent_profile: session
+                            .state
+                            .agent_id
+                            .clone()
+                            .map(|id| (Arc::clone(&agent_profile_store), id)),
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),
@@ -973,6 +977,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         security_gateway: Arc::clone(&graph.security_gateway),
         cost_manager: Arc::clone(&cost_manager),
         actor_spawner: spawn_actor_for,
+        agent_profile_store: Arc::clone(&graph.stores.agent_profile),
         job_lifecycle: Arc::clone(&graph.job_lifecycle),
         cron_trigger_rx,
         actor_parent_token: graph.actor_parent_token.clone(),

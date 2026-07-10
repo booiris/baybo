@@ -1987,6 +1987,74 @@ async fn memory_on_session_end_fires_on_actor_stop_with_durable_transcript() {
     );
 }
 
+#[tokio::test]
+async fn memory_hooks_partition_by_bound_agent_id() {
+    // A session bound to an agent profile threads that profile's id into
+    // every memory hook's `MemoryContext` (`recall` + `on_job_complete`);
+    // an unbound session threads the builtin id instead. Exercises the
+    // identity wired at actor-spawn time (`session.state.agent_id` →
+    // `MemoryContext::agent_id`), not just the mint-site plumbing.
+    let bound_memory = Arc::new(RecordingMemory::new());
+    let mut bound_session = SessionBuilder::new().id("sess-bound-agent").build();
+    bound_session.state.agent_id = Some(baybo_model::AgentProfileId::from("A1"));
+    let mut bound_harness = AgentTestHarness::builder()
+        .session(bound_session)
+        .with_memory(bound_memory.clone() as Arc<dyn Memory>)
+        .build();
+    bound_harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("noted".into())]);
+
+    bound_harness.send_text("remember this").await.unwrap();
+    let _ = bound_harness.drain_outputs(DRAIN_TIMEOUT).await;
+    await_job_complete(&bound_memory, 1).await;
+
+    assert_eq!(
+        bound_memory.recall_agent_ids(),
+        vec!["A1".to_string()],
+        "recall on a bound session carries the bound agent id"
+    );
+    assert_eq!(
+        bound_memory.job_complete_agent_ids(),
+        vec!["A1".to_string()],
+        "on_job_complete on a bound session carries the bound agent id"
+    );
+    bound_harness.shutdown().await;
+
+    let unbound_memory = Arc::new(RecordingMemory::new());
+    let unbound_session = SessionBuilder::new().id("sess-unbound-agent").build();
+    assert_eq!(
+        unbound_session.state.agent_id, None,
+        "control: the default session builder leaves agent_id unbound"
+    );
+    let mut unbound_harness = AgentTestHarness::builder()
+        .session(unbound_session)
+        .with_memory(unbound_memory.clone() as Arc<dyn Memory>)
+        .build();
+    unbound_harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("noted".into())]);
+
+    unbound_harness
+        .send_text("remember this too")
+        .await
+        .unwrap();
+    let _ = unbound_harness.drain_outputs(DRAIN_TIMEOUT).await;
+    await_job_complete(&unbound_memory, 1).await;
+
+    assert_eq!(
+        unbound_memory.recall_agent_ids(),
+        vec![baybo_model::BUILTIN_AGENT_PROFILE_ID.to_string()],
+        "recall on an unbound session carries the builtin agent id"
+    );
+    assert_eq!(
+        unbound_memory.job_complete_agent_ids(),
+        vec![baybo_model::BUILTIN_AGENT_PROFILE_ID.to_string()],
+        "on_job_complete on an unbound session carries the builtin agent id"
+    );
+    unbound_harness.shutdown().await;
+}
+
 /// The `Task*` tools persist the checklist to the shared store AND the loop
 /// surfaces it to the channel as a `TaskList` snapshot — across three turns:
 /// `TaskCreate`, then `TaskUpdate` editing a task in place, then

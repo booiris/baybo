@@ -54,6 +54,7 @@ baybo-memory = { workspace = true, features = ["test-support"] }
 baybo-security = { workspace = true, features = ["test-support"] }
 baybo-session = { workspace = true, features = ["test-support"] }
 baybo-storage = { workspace = true, features = ["test-support"] }
+baybo-store = { workspace = true, features = ["test-support"] }
 baybo-trace = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 # `test-util` (not in the `full` feature set) for `start_paused` time control

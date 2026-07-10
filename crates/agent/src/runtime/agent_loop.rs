@@ -1180,6 +1180,7 @@ impl AgentLoop {
         let executor = Arc::clone(&self.tool_executor);
         let session_id_for_calls = session.id.clone();
         let user_for_calls = session.user.clone();
+        let agent_for_calls = session.state.agent_id.clone();
         // Gate (Copy, captured per closure): only a user-facing session may
         // background a slow command — keeps cron / nested-subagent bash on
         // kill-on-timeout. Mirrors the subagent-conversion gate.
@@ -1200,6 +1201,7 @@ impl AgentLoop {
             let executor = Arc::clone(&executor);
             let session_id = session_id_for_calls.clone();
             let user = user_for_calls.clone();
+            let agent_id = agent_for_calls.clone();
             let approved = Arc::clone(&approved);
             let recorder = Arc::clone(&recorder_for_calls);
             let step = step_for_calls.clone();
@@ -1238,6 +1240,7 @@ impl AgentLoop {
                         arguments,
                         &session_id,
                         &user,
+                        agent_id,
                         &approved,
                         &recorder,
                         &step,

@@ -25,6 +25,7 @@ use std::time::Instant;
 use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use baybo_cron::CronTriggerEvent;
 use baybo_model::{LlmEntryName, Session};
+use baybo_store::AgentProfileStore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -162,6 +163,10 @@ pub struct Router {
     cost_manager: Arc<CostManager>,
     rate_limiter: RateLimiter,
     actor_spawner: ActorSpawner,
+    /// Live agent-profile reads for [`user_input::resolve_initial_llm`] —
+    /// spawn-time LLM precedence needs the bound profile's current `llm`
+    /// pin, not a snapshot taken at router construction.
+    agent_profile_store: Arc<dyn AgentProfileStore>,
     /// Job lifecycle handle — subscribe to terminal-event broadcasts and
     /// reconcile via the store on broadcast lag.
     job_lifecycle: Arc<JobLifecycle>,
@@ -186,6 +191,8 @@ pub struct RouterConfig {
     pub security_gateway: Arc<SecurityGateway>,
     pub cost_manager: Arc<CostManager>,
     pub actor_spawner: ActorSpawner,
+    /// See [`Router::agent_profile_store`].
+    pub agent_profile_store: Arc<dyn AgentProfileStore>,
     pub job_lifecycle: Arc<JobLifecycle>,
     pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
     /// Cancellation parent passed to every top-level actor the router
@@ -207,6 +214,7 @@ impl Router {
             security_gateway,
             cost_manager,
             actor_spawner,
+            agent_profile_store,
             job_lifecycle,
             cron_trigger_rx,
             actor_parent_token,
@@ -220,6 +228,7 @@ impl Router {
             cost_manager,
             rate_limiter: RateLimiter::new(rate_limit),
             actor_spawner,
+            agent_profile_store,
             job_lifecycle,
             cron_trigger_rx: Some(cron_trigger_rx),
             actor_parent_token,

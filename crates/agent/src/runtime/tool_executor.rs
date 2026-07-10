@@ -5,7 +5,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use baybo_llm::{Attribution, BillableLlm, BilledChat};
-use baybo_model::{JobId, ParallelGroup, SessionId, SpanId, TrustLevel, User};
+use baybo_model::{AgentProfileId, JobId, ParallelGroup, SessionId, SpanId, TrustLevel, User};
 
 use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use baybo_tools::{
@@ -324,6 +324,7 @@ impl ToolExecutor {
         params: Value,
         session_id: &SessionId,
         user: &User,
+        agent_id: Option<AgentProfileId>,
         approved_resources: &Arc<Mutex<Vec<ApprovedResource>>>,
         recorder: &Arc<SpanRecorder>,
         step: &StepHandle,
@@ -532,7 +533,7 @@ impl ToolExecutor {
                     job_id,
                     span_id: span_handle.span_id,
                     user: user.clone(),
-                    agent_id: None,
+                    agent_id,
                     timeout: effective_timeout,
                     cancellation_token: cancel_token,
                     workspace_root: self.workspace_root.clone(),
