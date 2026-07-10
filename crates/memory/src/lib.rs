@@ -54,6 +54,7 @@ pub type Result<T> = std::result::Result<T, MemoryError>;
 /// per-session / per-job de-duplication off.
 pub struct MemoryContext {
     user_id: String,
+    agent_id: String,
     session_id: SessionId,
     job_id: JobId,
     recorder: Arc<SpanRecorder>,
@@ -66,6 +67,7 @@ impl MemoryContext {
     /// every [`Self::scoped_llm_call`] span nests under it.
     pub fn new(
         user_id: String,
+        agent_id: String,
         session_id: SessionId,
         job_id: JobId,
         recorder: Arc<SpanRecorder>,
@@ -73,6 +75,7 @@ impl MemoryContext {
     ) -> Self {
         Self {
             user_id,
+            agent_id,
             session_id,
             job_id,
             recorder,
@@ -82,6 +85,12 @@ impl MemoryContext {
 
     pub fn user_id(&self) -> &str {
         &self.user_id
+    }
+
+    /// The bound agent-profile id, or the builtin id (`"baybo"`) for
+    /// unbound sessions. Backends use it as their partition key.
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
     }
 
     pub fn session_id(&self) -> &SessionId {

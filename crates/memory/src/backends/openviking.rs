@@ -24,6 +24,12 @@
 //! | `viking_forget` | delete by URI (`DELETE /api/v1/fs`), or search-and-delete on a strong single match. |
 //! | `viking_archive_expand` | fetch original messages from a compressed session archive. |
 //!
+//! Every request carries `X-OpenViking-User` (the session user) and
+//! `X-OpenViking-Agent`, partitioning memories per agent profile. The agent
+//! header defaults to the session's bound agent (or [`DEFAULT_AGENT`] for an
+//! unbound session / agent-unaware caller) and is not overridable by any tool
+//! param — unlike mem0, no viking tool exposes an `agentId` override.
+//!
 //! # References
 //!
 //! - OpenViking project: <https://github.com/volcengine/OpenViking>
@@ -55,7 +61,10 @@ use crate::{Memory, MemoryContext, MemoryError, RecalledMemory, Result};
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:1933";
 const DEFAULT_ACCOUNT: &str = "default";
-const DEFAULT_AGENT: &str = "baybo";
+/// Fallback agent namespace for unbound sessions and agent-unaware callers
+/// (e.g. the memory bench harness, the health probe). Matches
+/// [`baybo_model::BUILTIN_AGENT_PROFILE_ID`] / `SessionState::agent_id_or_builtin()`.
+pub const DEFAULT_AGENT: &str = "baybo";
 const DEFAULT_TOP_K: usize = 5;
 /// Per-request timeout budgets. Production uses [`OpenVikingTimeouts::default`];
 /// tests inject ms-scale values via [`OpenVikingMemory::with_timeouts`] to
@@ -216,7 +225,7 @@ impl OpenVikingInner {
         format!("{base}{path}")
     }
 
-    fn base_headers(&self, user_id: &str) -> HeaderMap {
+    fn base_headers(&self, user_id: &str, agent_id: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         if let Ok(v) = HeaderValue::from_str(&self.account) {
             h.insert(HeaderName::from_static("x-openviking-account"), v);
@@ -224,7 +233,7 @@ impl OpenVikingInner {
         if let Ok(v) = HeaderValue::from_str(user_id) {
             h.insert(HeaderName::from_static("x-openviking-user"), v);
         }
-        if let Ok(v) = HeaderValue::from_str(DEFAULT_AGENT) {
+        if let Ok(v) = HeaderValue::from_str(agent_id) {
             h.insert(HeaderName::from_static("x-openviking-agent"), v);
         }
         if !self.api_key.is_empty() {
@@ -238,8 +247,8 @@ impl OpenVikingInner {
         h
     }
 
-    fn json_headers(&self, user_id: &str) -> HeaderMap {
-        let mut h = self.base_headers(user_id);
+    fn json_headers(&self, user_id: &str, agent_id: &str) -> HeaderMap {
+        let mut h = self.base_headers(user_id, agent_id);
         h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         h
     }
@@ -341,6 +350,7 @@ impl OpenVikingInner {
         &self,
         path: &str,
         user_id: &str,
+        agent_id: &str,
         query: &[(&str, &str)],
         timeout: Duration,
         events: Option<&Arc<dyn ToolEventSink>>,
@@ -350,7 +360,7 @@ impl OpenVikingInner {
         let builder = self
             .client
             .get(url)
-            .headers(self.base_headers(user_id))
+            .headers(self.base_headers(user_id, agent_id))
             .timeout(timeout);
         let preview = if query.is_empty() {
             None
@@ -365,6 +375,7 @@ impl OpenVikingInner {
         &self,
         path: &str,
         user_id: &str,
+        agent_id: &str,
         body: &Value,
         timeout: Duration,
         events: Option<&Arc<dyn ToolEventSink>>,
@@ -372,7 +383,7 @@ impl OpenVikingInner {
         let builder = self
             .client
             .post(self.url(path))
-            .headers(self.json_headers(user_id))
+            .headers(self.json_headers(user_id, agent_id))
             .json(body)
             .timeout(timeout);
         self.run_request("POST", path, builder, Some(preview_value(body)), events)
@@ -383,13 +394,14 @@ impl OpenVikingInner {
         &self,
         path: &str,
         user_id: &str,
+        agent_id: &str,
         timeout: Duration,
         events: Option<&Arc<dyn ToolEventSink>>,
     ) -> Result<Value> {
         let builder = self
             .client
             .post(self.url(path))
-            .headers(self.json_headers(user_id))
+            .headers(self.json_headers(user_id, agent_id))
             .body("{}")
             .timeout(timeout);
         self.run_request("POST", path, builder, Some("{}".into()), events)
@@ -400,6 +412,7 @@ impl OpenVikingInner {
         &self,
         path: &str,
         user_id: &str,
+        agent_id: &str,
         query: &[(&str, &str)],
         timeout: Duration,
         events: Option<&Arc<dyn ToolEventSink>>,
@@ -409,7 +422,7 @@ impl OpenVikingInner {
         let builder = self
             .client
             .delete(url)
-            .headers(self.base_headers(user_id))
+            .headers(self.base_headers(user_id, agent_id))
             .timeout(timeout);
         let preview = if query.is_empty() {
             None
@@ -424,12 +437,15 @@ impl OpenVikingInner {
     async fn commit(
         &self,
         user_id: &str,
+        agent_id: &str,
         session_id: &str,
         timeout: Duration,
         events: Option<&Arc<dyn ToolEventSink>>,
     ) -> Result<CommitAck> {
         let path = format!("/api/v1/sessions/{session_id}/commit");
-        let resp = self.post_empty(&path, user_id, timeout, events).await?;
+        let resp = self
+            .post_empty(&path, user_id, agent_id, timeout, events)
+            .await?;
         Ok(CommitAck {
             status: resp
                 .get("status")
@@ -447,9 +463,11 @@ impl OpenVikingInner {
     /// Poll `/tasks/{task_id}` until terminal, `timeout` elapses, or
     /// `cancelled()` returns true. A poll `get` error ends it early. Shared by
     /// `viking_store` and the public [`OpenVikingMemory::wait_commit_task`].
+    #[allow(clippy::too_many_arguments)]
     async fn poll_commit_task(
         &self,
         user_id: &str,
+        agent_id: &str,
         task_id: &str,
         interval: Duration,
         timeout: Duration,
@@ -473,7 +491,14 @@ impl OpenVikingInner {
             }
             tokio::time::sleep(interval).await;
             match self
-                .get(&task_path, user_id, &[], self.timeouts.http, events)
+                .get(
+                    &task_path,
+                    user_id,
+                    agent_id,
+                    &[],
+                    self.timeouts.http,
+                    events,
+                )
                 .await
             {
                 Ok(task) => match task.get("status").and_then(|v| v.as_str()) {
@@ -597,13 +622,14 @@ impl OpenVikingMemory {
     }
 
     /// Best-effort `GET /health` probe. Logs `warn` on failure; the runtime
-    /// keeps the backend registered.
+    /// keeps the backend registered. Not session-scoped, so it always probes
+    /// under the builtin [`DEFAULT_AGENT`] namespace.
     pub async fn probe(&self) {
         let result = self
             .inner
             .client
             .get(self.inner.url("/health"))
-            .headers(self.inner.base_headers("default"))
+            .headers(self.inner.base_headers("default", DEFAULT_AGENT))
             .timeout(self.inner.timeouts.health)
             .send()
             .await;
@@ -622,9 +648,20 @@ impl OpenVikingMemory {
     /// ([`Memory::on_session_end`]) commits fire-and-forget; callers that must
     /// know when server-side extraction actually *finished* — benchmarks,
     /// diagnostics — commit through this and then poll [`Self::wait_commit_task`].
-    pub async fn commit_session(&self, user_id: &str, session_id: &str) -> Result<CommitAck> {
+    pub async fn commit_session(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        session_id: &str,
+    ) -> Result<CommitAck> {
         self.inner
-            .commit(user_id, session_id, self.inner.timeouts.write, None)
+            .commit(
+                user_id,
+                agent_id,
+                session_id,
+                self.inner.timeouts.write,
+                None,
+            )
             .await
     }
 
@@ -633,12 +670,15 @@ impl OpenVikingMemory {
     pub async fn wait_commit_task(
         &self,
         user_id: &str,
+        agent_id: &str,
         task_id: &str,
         interval: Duration,
         timeout: Duration,
     ) -> CommitTaskOutcome {
         self.inner
-            .poll_commit_task(user_id, task_id, interval, timeout, None, || false)
+            .poll_commit_task(user_id, agent_id, task_id, interval, timeout, None, || {
+                false
+            })
             .await
     }
 
@@ -646,7 +686,12 @@ impl OpenVikingMemory {
     /// the configured `top_k`, returning the recalled memory contents. The
     /// trait [`Memory::recall`] is this plus `MemoryContext` plumbing and
     /// failure-swallowing.
-    pub async fn recall_for(&self, user_id: &str, query: &str) -> Result<Vec<RecalledMemory>> {
+    pub async fn recall_for(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        query: &str,
+    ) -> Result<Vec<RecalledMemory>> {
         if query.is_empty() {
             return Ok(Vec::new());
         }
@@ -656,6 +701,7 @@ impl OpenVikingMemory {
             .post_json(
                 "/api/v1/search/find",
                 user_id,
+                agent_id,
                 &body,
                 self.inner.timeouts.recall,
                 None,
@@ -670,6 +716,7 @@ impl OpenVikingMemory {
     pub async fn add_message(
         &self,
         user_id: &str,
+        agent_id: &str,
         session_id: &str,
         role: &str,
         content: &str,
@@ -677,7 +724,14 @@ impl OpenVikingMemory {
         let path = format!("/api/v1/sessions/{session_id}/messages");
         let body = json!({"role": role, "content": content});
         self.inner
-            .post_json(&path, user_id, &body, self.inner.timeouts.write, None)
+            .post_json(
+                &path,
+                user_id,
+                agent_id,
+                &body,
+                self.inner.timeouts.write,
+                None,
+            )
             .await?;
         Ok(())
     }
@@ -788,7 +842,10 @@ impl Memory for OpenVikingMemory {
         ctx: &MemoryContext,
         query: &[ContentBlock],
     ) -> Result<Vec<RecalledMemory>> {
-        match self.recall_for(ctx.user_id(), &concat_text(query)).await {
+        match self
+            .recall_for(ctx.user_id(), ctx.agent_id(), &concat_text(query))
+            .await
+        {
             Ok(memories) => Ok(memories),
             Err(e) => {
                 warn!(error = %e, "openviking recall failed (timeout or backend)");
@@ -809,15 +866,18 @@ impl Memory for OpenVikingMemory {
             return Ok(());
         }
         let user_id = ctx.user_id();
+        let agent_id = ctx.agent_id();
         let sid = ctx.session_id().as_str();
         if !user_text.is_empty()
-            && let Err(e) = self.add_message(user_id, sid, "user", &user_text).await
+            && let Err(e) = self
+                .add_message(user_id, agent_id, sid, "user", &user_text)
+                .await
         {
             debug!(error = %e, "openviking on_job_complete user msg failed");
         }
         if !assistant_text.is_empty()
             && let Err(e) = self
-                .add_message(user_id, sid, "assistant", &assistant_text)
+                .add_message(user_id, agent_id, sid, "assistant", &assistant_text)
                 .await
         {
             debug!(error = %e, "openviking on_job_complete assistant msg failed");
@@ -833,7 +893,7 @@ impl Memory for OpenVikingMemory {
         // discarded here (the user never waits on extraction). Callers needing
         // true completion go through `commit_session` + `wait_commit_task`.
         if let Err(e) = self
-            .commit_session(ctx.user_id(), ctx.session_id().as_str())
+            .commit_session(ctx.user_id(), ctx.agent_id(), ctx.session_id().as_str())
             .await
         {
             warn!(error = %e, "openviking session commit failed");
@@ -909,6 +969,17 @@ fn format_hit(item: &Value) -> Value {
     })
 }
 
+/// The tool call's agent namespace: the session's bound agent
+/// (`ToolContext::agent_id`), or [`DEFAULT_AGENT`] for an unbound session.
+/// Unlike the mem0 tools, no viking tool exposes an override param — the
+/// namespace always tracks the calling session.
+fn ctx_agent_id(ctx: &ToolContext) -> &str {
+    ctx.agent_id
+        .as_ref()
+        .map(|a| a.as_str())
+        .unwrap_or(DEFAULT_AGENT)
+}
+
 // ---------------------------------------------------------------------------
 // Tools — the four `viking_*` tools (recall / store / forget / archive_expand),
 // ported from the official OpenViking `openclaw-plugin`.
@@ -925,6 +996,7 @@ impl VikingRecallTool {
         target_uri: &str,
         request_limit: usize,
         user_id: &str,
+        agent_id: &str,
         events: &Arc<dyn ToolEventSink>,
     ) -> Vec<Value> {
         let body = json!({
@@ -938,6 +1010,7 @@ impl VikingRecallTool {
             .post_json(
                 "/api/v1/search/find",
                 user_id,
+                agent_id,
                 &body,
                 self.inner.timeouts.http,
                 Some(events),
@@ -995,10 +1068,18 @@ impl Tool for VikingRecallTool {
         // Over-fetch then post-filter to leaves, like the official plugin.
         let request_limit = (limit * 4).max(20);
         let user_id = ctx.user.id.as_str();
+        let agent_id = ctx_agent_id(ctx);
 
         let merged = if let Some(target_uri) = params.get("targetUri").and_then(|v| v.as_str()) {
-            self.find(query, target_uri, request_limit, user_id, &ctx.events)
-                .await
+            self.find(
+                query,
+                target_uri,
+                request_limit,
+                user_id,
+                agent_id,
+                &ctx.events,
+            )
+            .await
         } else {
             // Both roots concurrently; a failed leg contributes nothing.
             let (user_hits, agent_hits) = tokio::join!(
@@ -1007,6 +1088,7 @@ impl Tool for VikingRecallTool {
                     USER_MEMORIES_URI,
                     request_limit,
                     user_id,
+                    agent_id,
                     &ctx.events
                 ),
                 self.find(
@@ -1014,6 +1096,7 @@ impl Tool for VikingRecallTool {
                     AGENT_MEMORIES_URI,
                     request_limit,
                     user_id,
+                    agent_id,
                     &ctx.events
                 ),
             );
@@ -1079,6 +1162,7 @@ impl Tool for VikingStoreTool {
             .and_then(|v| v.as_str())
             .unwrap_or("user");
         let user_id = ctx.user.id.as_str();
+        let agent_id = ctx_agent_id(ctx);
         let session_id = params
             .get("sessionId")
             .and_then(|v| v.as_str())
@@ -1091,6 +1175,7 @@ impl Tool for VikingStoreTool {
             .post_json(
                 &msg_path,
                 user_id,
+                agent_id,
                 &body,
                 self.inner.timeouts.http,
                 Some(&ctx.events),
@@ -1102,6 +1187,7 @@ impl Tool for VikingStoreTool {
             .inner
             .commit(
                 user_id,
+                agent_id,
                 &session_id,
                 self.inner.timeouts.http,
                 Some(&ctx.events),
@@ -1122,6 +1208,7 @@ impl Tool for VikingStoreTool {
                 .inner
                 .poll_commit_task(
                     user_id,
+                    agent_id,
                     task_id,
                     STORE_POLL_INTERVAL,
                     self.inner.timeouts.store_poll,
@@ -1161,6 +1248,7 @@ impl VikingForgetTool {
             .delete(
                 "/api/v1/fs",
                 ctx.user.id.as_str(),
+                ctx_agent_id(ctx),
                 &[("uri", uri), ("recursive", "false")],
                 self.inner.timeouts.http,
                 Some(&ctx.events),
@@ -1239,6 +1327,7 @@ impl Tool for VikingForgetTool {
             .post_json(
                 "/api/v1/search/find",
                 ctx.user.id.as_str(),
+                ctx_agent_id(ctx),
                 &body,
                 self.inner.timeouts.http,
                 Some(&ctx.events),
@@ -1317,6 +1406,7 @@ impl Tool for VikingArchiveExpandTool {
             .get(
                 &path,
                 ctx.user.id.as_str(),
+                ctx_agent_id(ctx),
                 &[],
                 self.inner.timeouts.http,
                 Some(&ctx.events),

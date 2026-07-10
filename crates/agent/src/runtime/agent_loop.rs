@@ -712,6 +712,7 @@ impl AgentLoop {
         // directly out here.
         let memory_handle = self.memory.clone();
         let memory_user_id = session.user.id.clone();
+        let memory_agent_id = session.state.agent_id_or_builtin().to_owned();
         let memory_session_id = session.id.clone();
         // The `on_job_complete` spawn is intentionally OUTSIDE `with_job`'s
         // body: `with_job`'s post-body window can still mark the job
@@ -755,6 +756,7 @@ impl AgentLoop {
             Self::spawn_job_complete_write(
                 memory_handle,
                 memory_user_id,
+                memory_agent_id,
                 memory_session_id,
                 job_id,
                 span_recorder,
@@ -1689,6 +1691,7 @@ impl AgentLoop {
             return;
         };
         let user_id = session.user.id.clone();
+        let agent_id = session.state.agent_id_or_builtin().to_owned();
         let session_id = session.id.clone();
         let query = query.to_vec();
         let recorder = Arc::clone(span_recorder);
@@ -1698,7 +1701,7 @@ impl AgentLoop {
             StepKind::MemoryRecall,
             Some((cancel_token, baybo_job::CancelReason::ParentCancelled)),
             move |step| async move {
-                let ctx = MemoryContext::new(user_id, session_id, job_id, recorder, step);
+                let ctx = MemoryContext::new(user_id, agent_id, session_id, job_id, recorder, step);
                 match memory.recall(&ctx, &query).await {
                     Ok(mems) => Ok((LifecycleOutcome::Ok, mems)),
                     Err(e) => Err(anyhow::Error::new(e)),
@@ -1783,6 +1786,7 @@ impl AgentLoop {
             return;
         }
         let user_id = session.user.id.clone();
+        let agent_id = session.state.agent_id_or_builtin().to_owned();
         let session_id = session.id.clone();
         let recorder = Arc::clone(span_recorder);
         tokio::spawn(async move {
@@ -1817,7 +1821,14 @@ impl AgentLoop {
                 StepKind::MemoryWrite,
                 None,
                 move |step| async move {
-                    let ctx = MemoryContext::new(user_id, session_id, job_id, ctx_recorder, step);
+                    let ctx = MemoryContext::new(
+                        user_id,
+                        agent_id,
+                        session_id,
+                        job_id,
+                        ctx_recorder,
+                        step,
+                    );
                     match memory.on_session_end(&ctx, &transcript).await {
                         Ok(()) => Ok((LifecycleOutcome::Ok, ())),
                         Err(e) => Err(anyhow::Error::new(e)),
@@ -1837,15 +1848,18 @@ impl AgentLoop {
     /// [`Attribution`] under a `MemoryWrite` trace step. No-op when no memory
     /// is wired (`memory == None`).
     ///
-    /// Free-standing (no `&self`) and takes owned `user_id` / `session_id`
-    /// so `run()` can call it AFTER `with_job` returns — the closure that
-    /// drives the iteration loop moves `&mut self` + `&mut session` into
-    /// `with_job`'s body, so the borrow checker won't let us touch either
-    /// from `run()` afterwards. Pre-extract `self.memory.clone()` and the
-    /// two ids before the closure, then call this with the owned values.
+    /// Free-standing (no `&self`) and takes owned `user_id` / `agent_id` /
+    /// `session_id` so `run()` can call it AFTER `with_job` returns — the
+    /// closure that drives the iteration loop moves `&mut self` + `&mut
+    /// session` into `with_job`'s body, so the borrow checker won't let us
+    /// touch either from `run()` afterwards. Pre-extract `self.memory.clone()`
+    /// and the three ids before the closure, then call this with the owned
+    /// values.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_job_complete_write(
         memory: Option<Arc<dyn Memory>>,
         user_id: String,
+        agent_id: String,
         session_id: SessionId,
         job_id: JobId,
         span_recorder: &Arc<SpanRecorder>,
@@ -1864,7 +1878,14 @@ impl AgentLoop {
                 StepKind::MemoryWrite,
                 None,
                 move |step| async move {
-                    let ctx = MemoryContext::new(user_id, session_id, job_id, ctx_recorder, step);
+                    let ctx = MemoryContext::new(
+                        user_id,
+                        agent_id,
+                        session_id,
+                        job_id,
+                        ctx_recorder,
+                        step,
+                    );
                     match memory
                         .on_job_complete(&ctx, &user_input, &final_output)
                         .await

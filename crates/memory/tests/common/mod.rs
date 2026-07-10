@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::Router;
 use baybo_memory::MemoryContext;
-use baybo_model::{ChannelType, JobId, SessionId, User};
+use baybo_model::{BUILTIN_AGENT_PROFILE_ID, ChannelType, JobId, SessionId, User};
 use baybo_tools::ToolContext;
 use baybo_trace::test_support::MemoryTraceStore;
 use baybo_trace::{SpanRecorder, StepKind, TraceEventStream};
@@ -36,7 +36,21 @@ pub fn base_url(server: &TestServer) -> String {
     format!("http://{}", server.addr)
 }
 
+/// Unbound-agent fixture: builds a [`MemoryContext`] scoped to the builtin
+/// agent id (`"baybo"`), matching an unbound session's `agent_id_or_builtin()`.
 pub async fn memory_context(user_id: &str, session_id: &str, step_kind: StepKind) -> MemoryContext {
+    memory_context_for_agent(BUILTIN_AGENT_PROFILE_ID, user_id, session_id, step_kind).await
+}
+
+/// Bound-agent fixture: builds a [`MemoryContext`] scoped to `agent_id`, for
+/// tests asserting a backend partitions recall/writes by the session's bound
+/// agent rather than the builtin default.
+pub async fn memory_context_for_agent(
+    agent_id: &str,
+    user_id: &str,
+    session_id: &str,
+    step_kind: StepKind,
+) -> MemoryContext {
     let recorder = Arc::new(SpanRecorder::new(
         SessionId::from(session_id),
         user_id.to_string(),
@@ -47,6 +61,7 @@ pub async fn memory_context(user_id: &str, session_id: &str, step_kind: StepKind
     let step = recorder.begin_step(job_id, step_kind).await.unwrap();
     MemoryContext::new(
         user_id.to_string(),
+        agent_id.to_string(),
         SessionId::from(session_id),
         job_id,
         recorder,

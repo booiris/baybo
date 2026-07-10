@@ -21,8 +21,11 @@ use crate::{Memory, MemoryContext, RecalledMemory, Result};
 pub struct RecordingMemory {
     canned_recall: Mutex<Vec<RecalledMemory>>,
     recall_queries: Mutex<Vec<Vec<ContentBlock>>>,
+    recall_agent_ids: Mutex<Vec<String>>,
     job_completions: Mutex<Vec<(Vec<ContentBlock>, Vec<ContentBlock>)>>,
+    job_complete_agent_ids: Mutex<Vec<String>>,
     session_ends: Mutex<Vec<Vec<ChatMessage>>>,
+    session_end_agent_ids: Mutex<Vec<String>>,
 }
 
 impl RecordingMemory {
@@ -50,6 +53,11 @@ impl RecordingMemory {
         self.recall_queries.lock().clone()
     }
 
+    /// `ctx.agent_id()` for each `recall` call, in order.
+    pub fn recall_agent_ids(&self) -> Vec<String> {
+        self.recall_agent_ids.lock().clone()
+    }
+
     pub fn job_complete_count(&self) -> usize {
         self.job_completions.lock().len()
     }
@@ -57,6 +65,11 @@ impl RecordingMemory {
     /// The `(user_input, final_output)` pairs passed to each `on_job_complete`.
     pub fn job_completions(&self) -> Vec<(Vec<ContentBlock>, Vec<ContentBlock>)> {
         self.job_completions.lock().clone()
+    }
+
+    /// `ctx.agent_id()` for each `on_job_complete` call, in order.
+    pub fn job_complete_agent_ids(&self) -> Vec<String> {
+        self.job_complete_agent_ids.lock().clone()
     }
 
     pub fn session_end_count(&self) -> usize {
@@ -67,33 +80,45 @@ impl RecordingMemory {
     pub fn session_ends(&self) -> Vec<Vec<ChatMessage>> {
         self.session_ends.lock().clone()
     }
+
+    /// `ctx.agent_id()` for each `on_session_end` call, in order.
+    pub fn session_end_agent_ids(&self) -> Vec<String> {
+        self.session_end_agent_ids.lock().clone()
+    }
 }
 
 #[async_trait]
 impl Memory for RecordingMemory {
     async fn recall(
         &self,
-        _ctx: &MemoryContext,
+        ctx: &MemoryContext,
         query: &[ContentBlock],
     ) -> Result<Vec<RecalledMemory>> {
         self.recall_queries.lock().push(query.to_vec());
+        self.recall_agent_ids.lock().push(ctx.agent_id().to_owned());
         Ok(self.canned_recall.lock().clone())
     }
 
     async fn on_job_complete(
         &self,
-        _ctx: &MemoryContext,
+        ctx: &MemoryContext,
         user_input: &[ContentBlock],
         final_output: &[ContentBlock],
     ) -> Result<()> {
         self.job_completions
             .lock()
             .push((user_input.to_vec(), final_output.to_vec()));
+        self.job_complete_agent_ids
+            .lock()
+            .push(ctx.agent_id().to_owned());
         Ok(())
     }
 
-    async fn on_session_end(&self, _ctx: &MemoryContext, transcript: &[ChatMessage]) -> Result<()> {
+    async fn on_session_end(&self, ctx: &MemoryContext, transcript: &[ChatMessage]) -> Result<()> {
         self.session_ends.lock().push(transcript.to_vec());
+        self.session_end_agent_ids
+            .lock()
+            .push(ctx.agent_id().to_owned());
         Ok(())
     }
 }

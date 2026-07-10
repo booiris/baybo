@@ -20,7 +20,7 @@ use baybo_trace::StepKind;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use crate::common::{base_url, memory_context, spawn, tool_context};
+use crate::common::{base_url, memory_context, memory_context_for_agent, spawn, tool_context};
 
 #[derive(Default, Clone)]
 struct Captured {
@@ -96,6 +96,7 @@ async fn recall_sends_query_with_user_filter_and_returns_memory_text() {
     let body = captured.bodies.lock().last().unwrap().clone();
     assert_eq!(body["query"], "hello world");
     assert_eq!(body["filters"]["AND"][0]["user_id"], "u-1");
+    assert_eq!(body["filters"]["AND"][1]["agent_id"], "baybo");
     assert_eq!(body["rerank"], true);
     assert_eq!(body["top_k"], 5);
     let auth = captured.auth.lock().clone().unwrap_or_default();
@@ -211,6 +212,53 @@ async fn on_job_complete_skips_when_both_sides_empty() {
     assert!(captured.bodies.lock().is_empty(), "no call should fire");
 }
 
+#[tokio::test]
+async fn on_job_complete_and_recall_carry_agent_id() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v1/memories/",
+            post(
+                |State(c): State<Captured>, Json(body): Json<Value>| async move {
+                    c.bodies.lock().push(body.clone());
+                    Json(json!({"results": []}))
+                },
+            ),
+        )
+        .route(
+            "/v2/memories/search/",
+            post(
+                |State(c): State<Captured>, Json(body): Json<Value>| async move {
+                    c.bodies.lock().push(body.clone());
+                    Json(json!([]))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let write_ctx = memory_context_for_agent("A1", "u-x", "s-x", StepKind::MemoryWrite).await;
+    let user_in = vec![ContentBlock::Text("hi".into())];
+    let assistant_out = vec![ContentBlock::Text("hello".into())];
+    m.on_job_complete(&write_ctx, &user_in, &assistant_out)
+        .await
+        .unwrap();
+
+    let body = captured.bodies.lock().last().unwrap().clone();
+    assert_eq!(body["agent_id"], "A1");
+
+    let recall_ctx = memory_context_for_agent("A1", "u-x", "s-x", StepKind::MemoryRecall).await;
+    let _ = m
+        .recall(&recall_ctx, &[ContentBlock::Text("q".into())])
+        .await
+        .unwrap();
+
+    let body = captured.bodies.lock().last().unwrap().clone();
+    let filters = body["filters"]["AND"].as_array().unwrap();
+    assert!(filters.iter().any(|f| f["agent_id"] == "A1"), "{filters:?}");
+}
+
 // ---------------------------------------------------------------------------
 // on_session_end (mem0 → no-op)
 // ---------------------------------------------------------------------------
@@ -283,9 +331,10 @@ async fn tool_search_builds_scoped_filter_and_caps_limit() {
     assert_eq!(body["rerank"], true);
     assert_eq!(body["threshold"], 0.3);
     assert_eq!(body["filters"]["AND"][0]["user_id"], "u-5");
-    assert_eq!(body["filters"]["AND"][1]["run_id"], "test-session");
+    assert_eq!(body["filters"]["AND"][1]["agent_id"], "baybo");
+    assert_eq!(body["filters"]["AND"][2]["run_id"], "test-session");
     assert_eq!(
-        body["filters"]["AND"][2]["categories"]["in"][0],
+        body["filters"]["AND"][3]["categories"]["in"][0],
         "preference"
     );
 }

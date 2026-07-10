@@ -14,8 +14,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use baybo_memory::RecalledMemory;
-use baybo_memory::backends::mem0::{Mem0Config, Mem0Memory};
-use baybo_memory::backends::openviking::{OpenVikingConfig, OpenVikingMemory};
+use baybo_memory::backends::mem0::{
+    DEFAULT_AGENT_ID as MEM0_DEFAULT_AGENT_ID, Mem0Config, Mem0Memory,
+};
+use baybo_memory::backends::openviking::{
+    DEFAULT_AGENT as OPENVIKING_DEFAULT_AGENT, OpenVikingConfig, OpenVikingMemory,
+};
 
 use crate::testset::{BenchConversation, BenchSample};
 use crate::{ConvScope, MEM0_API_KEY_ENV, scope_session_id};
@@ -112,8 +116,11 @@ impl BackendHandle {
     /// question into the store.
     pub async fn recall_for(&self, user_id: &str, query: &str) -> Result<Vec<RecalledMemory>> {
         let memories = match self {
-            BackendHandle::Mem0(m) => m.recall_for(user_id, query).await?,
-            BackendHandle::OpenViking(o) => o.recall_for(user_id, query).await?,
+            BackendHandle::Mem0(m) => m.recall_for(user_id, MEM0_DEFAULT_AGENT_ID, query).await?,
+            BackendHandle::OpenViking(o) => {
+                o.recall_for(user_id, OPENVIKING_DEFAULT_AGENT, query)
+                    .await?
+            }
         };
         Ok(memories)
     }
@@ -135,31 +142,40 @@ impl BackendHandle {
                     let sid = scope_session_id(user_id, session.index);
                     for (user_text, assistant_text) in &pairs {
                         if !user_text.is_empty() {
-                            ov.add_message(user_id, &sid, "user", user_text)
-                                .await
-                                .with_context(|| {
-                                    format!(
-                                        "add user msg (conv {conv_idx}, session {})",
-                                        session.index
-                                    )
-                                })?;
+                            ov.add_message(
+                                user_id,
+                                OPENVIKING_DEFAULT_AGENT,
+                                &sid,
+                                "user",
+                                user_text,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("add user msg (conv {conv_idx}, session {})", session.index)
+                            })?;
                         }
                         if !assistant_text.is_empty() {
-                            ov.add_message(user_id, &sid, "assistant", assistant_text)
-                                .await
-                                .with_context(|| {
-                                    format!(
-                                        "add assistant msg (conv {conv_idx}, session {})",
-                                        session.index
-                                    )
-                                })?;
+                            ov.add_message(
+                                user_id,
+                                OPENVIKING_DEFAULT_AGENT,
+                                &sid,
+                                "assistant",
+                                assistant_text,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "add assistant msg (conv {conv_idx}, session {})",
+                                    session.index
+                                )
+                            })?;
                         }
                     }
                     session_ids.push(sid);
                 }
                 BackendHandle::Mem0(m) => {
                     for (user_text, assistant_text) in &pairs {
-                        m.add_turn(user_id, user_text, assistant_text)
+                        m.add_turn(user_id, MEM0_DEFAULT_AGENT_ID, user_text, assistant_text)
                             .await
                             .with_context(|| {
                                 format!("add turn (conv {conv_idx}, session {})", session.index)
@@ -236,7 +252,7 @@ async fn commit_and_wait(
     let mut pending = Vec::new();
     for sid in session_ids {
         let ack = ov
-            .commit_session(user_id, sid)
+            .commit_session(user_id, OPENVIKING_DEFAULT_AGENT, sid)
             .await
             .with_context(|| format!("openviking commit {sid}"))?;
         if ack.status != "completed"
@@ -248,7 +264,13 @@ async fn commit_and_wait(
     let mut all_completed = true;
     for (sid, task_id) in &pending {
         let outcome = ov
-            .wait_commit_task(user_id, task_id, opts.interval, opts.timeout)
+            .wait_commit_task(
+                user_id,
+                OPENVIKING_DEFAULT_AGENT,
+                task_id,
+                opts.interval,
+                opts.timeout,
+            )
             .await;
         if outcome.status != "completed" {
             all_completed = false;

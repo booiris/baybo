@@ -29,8 +29,10 @@
 //! every call — never overridable by a tool param, so one user's tools cannot
 //! read, write, or delete another user's memories. An optional `scope:
 //! "session"` narrows reads to the current session via Mem0's `run_id` (sourced
-//! from `ToolContext::session_id`). `agent_id` defaults to `"baybo"` (deployment
-//! identity) on writes and is the one identity a tool call may still set.
+//! from `ToolContext::session_id`). `agent_id` partitions memories per agent
+//! profile: it defaults to the session's bound agent (`ToolContext::agent_id`,
+//! or [`DEFAULT_AGENT_ID`] for an unbound session) on both reads and writes,
+//! and is the one identity a tool call may still override.
 //!
 //! Failures are routed through a 5-failure / 120 s circuit breaker that pauses
 //! API calls after sustained outages.
@@ -75,7 +77,10 @@ use tracing::{debug, info, warn};
 use crate::{Memory, MemoryContext, MemoryError, RecalledMemory, Result};
 
 const DEFAULT_BASE_URL: &str = "https://api.mem0.ai";
-const DEFAULT_AGENT_ID: &str = "baybo";
+/// Fallback agent namespace for unbound sessions and agent-unaware callers
+/// (e.g. the memory bench harness). Matches
+/// [`baybo_model::BUILTIN_AGENT_PROFILE_ID`] / `SessionState::agent_id_or_builtin()`.
+pub const DEFAULT_AGENT_ID: &str = "baybo";
 const DEFAULT_TOP_K: usize = 5;
 /// Default minimum similarity for `mem0_search` / search-and-delete. Mirrors
 /// the openclaw plugin's `searchThreshold` default.
@@ -493,9 +498,14 @@ impl Mem0Memory {
     }
 
     /// Context-free recall for harnesses/diagnostics: `POST /v2/memories/search/`
-    /// scoped to `user_id`. The trait [`Memory::recall`] is this plus the
-    /// circuit breaker and failure-swallowing.
-    pub async fn recall_for(&self, user_id: &str, query: &str) -> Result<Vec<RecalledMemory>> {
+    /// scoped to `user_id` + `agent_id`. The trait [`Memory::recall`] is this
+    /// plus the circuit breaker and failure-swallowing.
+    pub async fn recall_for(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        query: &str,
+    ) -> Result<Vec<RecalledMemory>> {
         if query.is_empty() {
             return Ok(Vec::new());
         }
@@ -504,7 +514,7 @@ impl Mem0Memory {
         } else {
             json!({
                 "query": query,
-                "filters": read_filters(user_id),
+                "filters": read_filters(user_id, agent_id),
                 "rerank": self.inner.rerank,
                 "top_k": self.inner.top_k,
             })
@@ -517,11 +527,12 @@ impl Mem0Memory {
     }
 
     /// Context-free turn write for harnesses: `POST /v1/memories/` with one
-    /// user+assistant pair under `user_id`. Extraction runs async server-side;
-    /// poll its completion with [`Self::wait_events_completed`].
+    /// user+assistant pair under `user_id` + `agent_id`. Extraction runs
+    /// async server-side; poll its completion with [`Self::wait_events_completed`].
     pub async fn add_turn(
         &self,
         user_id: &str,
+        agent_id: &str,
         user_text: &str,
         assistant_text: &str,
     ) -> Result<()> {
@@ -531,7 +542,7 @@ impl Mem0Memory {
                 {"role": "assistant", "content": assistant_text},
             ],
             "user_id": user_id,
-            "agent_id": DEFAULT_AGENT_ID,
+            "agent_id": agent_id,
         });
         self.inner
             .post_json("/v1/memories/", &body, WRITE_TIMEOUT, None)
@@ -622,9 +633,25 @@ fn build_filters(
     json!({ "AND": conds })
 }
 
-/// The user-only filter the recall hot path uses (`{AND: [{user_id}]}`).
-fn read_filters(user_id: &str) -> Value {
-    build_filters(user_id, None, None, None, None)
+/// The user+agent filter the recall hot path uses
+/// (`{AND: [{user_id}, {agent_id}]}`).
+fn read_filters(user_id: &str, agent_id: &str) -> Value {
+    build_filters(user_id, Some(agent_id), None, None, None)
+}
+
+/// Resolve a tool call's effective agent namespace: the `agentId` param when
+/// the caller passed one, else the session's bound agent (`ctx.agent_id`), or
+/// [`DEFAULT_AGENT_ID`] for an unbound session. An explicit param always wins.
+fn resolve_agent_id<'a>(params: &'a Value, ctx: &'a ToolContext) -> &'a str {
+    let ctx_agent = ctx
+        .agent_id
+        .as_ref()
+        .map(|a| a.as_str())
+        .unwrap_or(DEFAULT_AGENT_ID);
+    params
+        .get("agentId")
+        .and_then(|v| v.as_str())
+        .unwrap_or(ctx_agent)
 }
 
 /// Resolve the optional `scope` param into a run-id filter. `"session"`
@@ -671,7 +698,10 @@ impl Memory for Mem0Memory {
         if self.inner.breaker_open() {
             return Ok(Vec::new());
         }
-        match self.recall_for(ctx.user_id(), &concat_text(query)).await {
+        match self
+            .recall_for(ctx.user_id(), ctx.agent_id(), &concat_text(query))
+            .await
+        {
             Ok(memories) => {
                 self.inner.record_success();
                 Ok(memories)
@@ -699,7 +729,7 @@ impl Memory for Mem0Memory {
             return Ok(());
         }
         match self
-            .add_turn(ctx.user_id(), &user_text, &assistant_text)
+            .add_turn(ctx.user_id(), ctx.agent_id(), &user_text, &assistant_text)
             .await
         {
             Ok(()) => {
@@ -811,7 +841,7 @@ impl Tool for Mem0SearchTool {
                 "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\" (current session only), or \"long-term\"."},
                 "categories": {"type": "array", "items": {"type": "string"}, "description": "Filter by category."},
                 "filters": {"type": "object", "description": "Advanced Mem0 filter object (AND/OR/operators)."},
-                "agentId": {"type": "string", "description": "Filter to a specific agent namespace."}
+                "agentId": {"type": "string", "description": "Agent namespace to filter by (default: the session's agent)."}
             },
             "required": ["query"]
         })
@@ -831,7 +861,7 @@ impl Tool for Mem0SearchTool {
             .map(|n| n.min(50) as usize)
             .unwrap_or(self.inner.top_k);
         let user_id = ctx.user.id.as_str();
-        let agent_id = params.get("agentId").and_then(|v| v.as_str());
+        let agent_id = resolve_agent_id(&params, ctx);
         let run_id = scope_run_id(
             params.get("scope").and_then(|v| v.as_str()),
             ctx.session_id.as_str(),
@@ -854,7 +884,7 @@ impl Tool for Mem0SearchTool {
                 "top_k": limit,
                 "threshold": DEFAULT_SEARCH_THRESHOLD,
                 "rerank": self.inner.rerank,
-                "filters": build_filters(user_id, agent_id, run_id, categories.as_deref(), params.get("filters")),
+                "filters": build_filters(user_id, Some(agent_id), run_id, categories.as_deref(), params.get("filters")),
             })
         };
         match self
@@ -927,7 +957,7 @@ impl Tool for Mem0AddTool {
                 "importance": {"type": "number", "description": "Importance 0.0–1.0 (stored as metadata)."},
                 "metadata": {"type": "object", "description": "Additional metadata to attach."},
                 "longTerm": {"type": "boolean", "description": "Long-term (default true). false → session-scoped."},
-                "agentId": {"type": "string", "description": "Agent namespace (default: baybo)."}
+                "agentId": {"type": "string", "description": "Agent namespace (default: the session's agent)."}
             },
             "required": []
         })
@@ -957,10 +987,7 @@ impl Tool for Mem0AddTool {
             ));
         }
         let user_id = ctx.user.id.as_str();
-        let agent_id = params
-            .get("agentId")
-            .and_then(|v| v.as_str())
-            .unwrap_or(DEFAULT_AGENT_ID);
+        let agent_id = resolve_agent_id(&params, ctx);
         let long_term = params
             .get("longTerm")
             .and_then(|v| v.as_bool())
@@ -1100,7 +1127,7 @@ impl Tool for Mem0ListTool {
             "type": "object",
             "properties": {
                 "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\", or \"long-term\"."},
-                "agentId": {"type": "string", "description": "Filter to a specific agent namespace."}
+                "agentId": {"type": "string", "description": "Agent namespace to filter by (default: the session's agent)."}
             },
             "required": []
         })
@@ -1111,25 +1138,29 @@ impl Tool for Mem0ListTool {
             return Ok(breaker_unavailable());
         }
         let user_id = ctx.user.id.as_str();
-        let agent_id = params.get("agentId").and_then(|v| v.as_str());
+        let agent_id = resolve_agent_id(&params, ctx);
         let run_id = scope_run_id(
             params.get("scope").and_then(|v| v.as_str()),
             ctx.session_id.as_str(),
         );
         // OSS lists via GET /memories?user_id=; Platform POSTs a v2 filter + page.
-        let (method, body, qp): (Method, Option<Value>, Vec<(&str, String)>) =
-            if self.inner.self_hosted {
-                (Method::GET, None, vec![("user_id", user_id.to_string())])
-            } else {
-                (
-                    Method::POST,
-                    Some(json!({"filters": build_filters(user_id, agent_id, run_id, None, None)})),
-                    vec![
-                        ("page", "1".to_string()),
-                        ("page_size", MAX_LIST_ENTRIES.to_string()),
-                    ],
-                )
-            };
+        let (method, body, qp): (Method, Option<Value>, Vec<(&str, String)>) = if self
+            .inner
+            .self_hosted
+        {
+            (Method::GET, None, vec![("user_id", user_id.to_string())])
+        } else {
+            (
+                Method::POST,
+                Some(
+                    json!({"filters": build_filters(user_id, Some(agent_id), run_id, None, None)}),
+                ),
+                vec![
+                    ("page", "1".to_string()),
+                    ("page_size", MAX_LIST_ENTRIES.to_string()),
+                ],
+            )
+        };
         match self
             .inner
             .request(
@@ -1294,7 +1325,7 @@ impl Tool for Mem0DeleteTool {
                 "query": {"type": "string", "description": "Search query to find and delete a memory."},
                 "all": {"type": "boolean", "description": "Delete ALL of the user's memories. Requires confirm: true."},
                 "confirm": {"type": "boolean", "description": "Safety gate for bulk deletion."},
-                "agentId": {"type": "string", "description": "Agent namespace scope."}
+                "agentId": {"type": "string", "description": "Agent namespace scope (default: the session's agent)."}
             },
             "required": []
         })
@@ -1305,7 +1336,7 @@ impl Tool for Mem0DeleteTool {
             return Ok(breaker_unavailable());
         }
         let user_id = ctx.user.id.as_str();
-        let agent_id = params.get("agentId").and_then(|v| v.as_str());
+        let agent_id = resolve_agent_id(&params, ctx);
 
         if let Some(memory_id) = params.get("memoryId").and_then(|v| v.as_str()) {
             return Ok(self.delete_by_id(memory_id, ctx).await);
@@ -1319,7 +1350,7 @@ impl Tool for Mem0DeleteTool {
                     "query": query,
                     "top_k": DELETE_SEARCH_TOP_K,
                     "threshold": DEFAULT_SEARCH_THRESHOLD,
-                    "filters": build_filters(user_id, agent_id, None, None, None),
+                    "filters": build_filters(user_id, Some(agent_id), None, None, None),
                 })
             };
             let resp = match self
@@ -1384,10 +1415,10 @@ impl Tool for Mem0DeleteTool {
                     "Bulk deletion requires confirm: true.".into(),
                 ));
             }
-            let mut qp = vec![("user_id", user_id.to_string())];
-            if let Some(agent_id) = agent_id {
-                qp.push(("agent_id", agent_id.to_string()));
-            }
+            let qp = vec![
+                ("user_id", user_id.to_string()),
+                ("agent_id", agent_id.to_string()),
+            ];
             return match self
                 .inner
                 .request(
