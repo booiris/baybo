@@ -5,22 +5,17 @@
 //! DELETE hides the row (the session itself stays on the server, only the
 //! chat list filters it) → unhide restores it to the default listing.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
-use baybo_agent::{LlmClientPool, LlmPoolHandle};
 use baybo_channels::ChannelKind;
 use baybo_config::ChannelsConfig;
 use baybo_gateway::auth::{AuthedClient, DEVICE_ID_HEADER};
 use baybo_gateway::channel::boot;
 use baybo_gateway::server::build_admin_router_for_tests;
 use baybo_gateway::test_support::build_test_deps;
-use baybo_llm::{CostHooks, LlmProviderConfig, LlmProviderRegistry};
-use baybo_model::{
-    AgentProfileId, ChannelType, ChatMessage, ContentBlock, LlmEntryName, SessionId, User,
-};
+use baybo_model::{AgentProfileId, ChannelType, ChatMessage, ContentBlock, SessionId, User};
 use baybo_store::{DeviceRow, DeviceStatus};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -992,62 +987,6 @@ fn build_router(state: baybo_gateway::server::AdminState) -> axum::Router {
     router.with_state(state)
 }
 
-/// Build an `AdminState` whose LLM pool has two live entries (the
-/// harness's original stub plus a freshly built second stub client), so
-/// the allowed-set enforcement test can exercise "switching to a
-/// configured-but-not-a-member name" end-to-end (`validate_llm_pin` keys
-/// off `state.llm_pool`, not `state.config`, so a single-entry pool can
-/// only ever produce the "unknown entry" 400, never this one).
-/// `build_test_deps` itself stays single-entry (shared by every gateway
-/// test file); this helper only swaps `llm_pool` on a state built from
-/// the same `tg`, so it can't affect other tests.
-fn build_admin_state_two_llms(
-    tg: &baybo_gateway::test_support::TestGateway,
-) -> (baybo_gateway::server::AdminState, String, String) {
-    let original_name = tg
-        .deps
-        .llm_pool
-        .read()
-        .entry_names()
-        .first()
-        .expect("test pool has one entry")
-        .clone();
-    let original_client = tg.deps.llm_pool.read().default_client();
-
-    let registry = LlmProviderRegistry::with_default_providers();
-    let second_client = registry
-        .create_client(
-            &LlmProviderConfig {
-                provider: "openai".into(),
-                api_key: Some("sk-test-placeholder".into()),
-                base_url: None,
-                model: "gpt-4o-second-stub".into(),
-                supports_vision: None,
-                context_window: None,
-                pricing: None,
-                reasoning_effort: None,
-                vault: None,
-                proxy: None,
-            },
-            None,
-            CostHooks::passthrough(),
-        )
-        .expect("second stub LLM client");
-    let second_name = LlmEntryName::from(second_client.model_info().id.clone());
-
-    let mut clients = HashMap::new();
-    clients.insert(original_name.clone(), original_client);
-    clients.insert(second_name.clone(), second_client);
-    let llm_pool: LlmPoolHandle = Arc::new(parking_lot::RwLock::new(Arc::new(
-        LlmClientPool::new(clients, original_name.clone())
-            .expect("two-entry stub pool default present"),
-    )));
-
-    let mut state = build_admin_state(tg);
-    state.llm_pool = llm_pool;
-    (state, original_name.to_string(), second_name.to_string())
-}
-
 fn approved_device(device_id: &str, auth_token: &str) -> DeviceRow {
     DeviceRow {
         device_id: device_id.into(),
@@ -1269,7 +1208,9 @@ async fn set_session_model_enforces_agent_allowed_set() {
     let http_config = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
 
-    let (state, entry_a, entry_b) = build_admin_state_two_llms(&tg);
+    let mut state = build_admin_state(&tg);
+    let (llm_pool, entry_a, entry_b) = baybo_gateway::test_support::two_entry_llm_pool(&tg);
+    state.llm_pool = llm_pool;
     let router = build_router(state);
 
     // ── 1. Session bound to a profile whose set contains the pin → 200,

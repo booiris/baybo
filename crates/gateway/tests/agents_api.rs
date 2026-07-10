@@ -5,15 +5,11 @@
 //! delete, avatar allowed), creates validate name/llm/avatar-blob, `PUT`
 //! is a full content replace, and deletes are plain row removals.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
-use baybo_agent::{LlmClientPool, LlmPoolHandle};
 use baybo_gateway::test_support::build_test_deps;
-use baybo_llm::{CostHooks, LlmProviderConfig, LlmProviderRegistry};
-use baybo_model::LlmEntryName;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -291,11 +287,13 @@ async fn agents_api_round_trip() {
 
 // `allowed_models` set validation + `reasoning_effort` validation, plus
 // the pin-must-be-a-member rule (needs a second pool entry, hence the
-// dedicated two-entry admin state — see `build_admin_state_two_llms`).
+// dedicated two-entry pool — see `test_support::two_entry_llm_pool`).
 #[tokio::test]
 async fn agent_model_set_and_effort_validation() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let (state, entry_a, entry_b) = build_admin_state_two_llms(&tg);
+    let mut state = build_admin_state(&tg);
+    let (llm_pool, entry_a, entry_b) = baybo_gateway::test_support::two_entry_llm_pool(&tg);
+    state.llm_pool = llm_pool;
     let router = build_router(state);
 
     // ── 1. allowed_models + reasoning_effort round-trip ────────────────
@@ -442,61 +440,6 @@ async fn agent_model_set_and_effort_validation() {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
-
-/// Build an `AdminState` whose LLM pool has two live entries (the
-/// harness's original stub plus a freshly built second stub client), so
-/// tests can exercise membership rules end-to-end (`validate_llm_pin`
-/// keys off `state.llm_pool`, not `state.config`) — a bare unknown name
-/// only proves the "not configured" 400, not the "configured but not a
-/// set member" 400. `build_test_deps` itself stays single-entry (it's
-/// shared by every gateway test file); this helper only swaps `llm_pool`
-/// on a state built from the same `tg`, so it can't affect other tests.
-fn build_admin_state_two_llms(
-    tg: &baybo_gateway::test_support::TestGateway,
-) -> (baybo_gateway::server::AdminState, String, String) {
-    let original_name = tg
-        .deps
-        .llm_pool
-        .read()
-        .entry_names()
-        .first()
-        .expect("test pool has one entry")
-        .clone();
-    let original_client = tg.deps.llm_pool.read().default_client();
-
-    let registry = LlmProviderRegistry::with_default_providers();
-    let second_client = registry
-        .create_client(
-            &LlmProviderConfig {
-                provider: "openai".into(),
-                api_key: Some("sk-test-placeholder".into()),
-                base_url: None,
-                model: "gpt-4o-second-stub".into(),
-                supports_vision: None,
-                context_window: None,
-                pricing: None,
-                reasoning_effort: None,
-                vault: None,
-                proxy: None,
-            },
-            None,
-            CostHooks::passthrough(),
-        )
-        .expect("second stub LLM client");
-    let second_name = LlmEntryName::from(second_client.model_info().id.clone());
-
-    let mut clients = HashMap::new();
-    clients.insert(original_name.clone(), original_client);
-    clients.insert(second_name.clone(), second_client);
-    let llm_pool: LlmPoolHandle = Arc::new(parking_lot::RwLock::new(Arc::new(
-        LlmClientPool::new(clients, original_name.clone())
-            .expect("two-entry stub pool default present"),
-    )));
-
-    let mut state = build_admin_state(tg);
-    state.llm_pool = llm_pool;
-    (state, original_name.to_string(), second_name.to_string())
-}
 
 fn build_admin_state(
     tg: &baybo_gateway::test_support::TestGateway,

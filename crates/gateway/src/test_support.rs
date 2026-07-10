@@ -14,11 +14,12 @@ use std::time::Duration;
 
 use crate::auth::ChannelTokenTable;
 use baybo_agent::service::ShutdownSignal;
-use baybo_agent::{CronScheduler, SessionManager};
+use baybo_agent::{CronScheduler, LlmClientPool, LlmPoolHandle, SessionManager};
 use baybo_channels::{ChannelRegistry, RouterInbound};
 use baybo_config::BayboConfig;
 use baybo_job::JobLifecycle;
-use baybo_llm::{LlmProviderConfig, LlmProviderRegistry};
+use baybo_llm::{CostHooks, LlmProviderConfig, LlmProviderRegistry};
+use baybo_model::LlmEntryName;
 use baybo_security::{EncryptionKey, SecretVault};
 use baybo_skills::SkillRegistry;
 use baybo_storage::Store;
@@ -254,4 +255,57 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         channel_tokens,
         _tempdir: tempdir,
     }
+}
+
+/// A two-entry stub `LlmClientPool` — `tg`'s original client plus a
+/// freshly built second stub — for tests that exercise allowed-models /
+/// pin-membership rules end-to-end: `validate_llm_pin` keys off
+/// `AdminState::llm_pool`, not `state.config`, so the single-entry pool
+/// `build_test_deps` always builds (shared by every gateway test file,
+/// which stays untouched by this helper) can only ever produce the
+/// "unknown entry" 400, never the "configured but not a set member" one.
+/// Returns the pool handle plus the two live entry names (original,
+/// second) so a test can address a member vs. a non-member by name; the
+/// caller assigns the handle onto its own `AdminState.llm_pool`.
+pub fn two_entry_llm_pool(tg: &TestGateway) -> (LlmPoolHandle, String, String) {
+    let original_name = tg
+        .deps
+        .llm_pool
+        .read()
+        .entry_names()
+        .first()
+        .expect("test pool has one entry")
+        .clone();
+    let original_client = tg.deps.llm_pool.read().default_client();
+
+    let registry = LlmProviderRegistry::with_default_providers();
+    let second_client = registry
+        .create_client(
+            &LlmProviderConfig {
+                provider: "openai".into(),
+                api_key: Some("sk-test-placeholder".into()),
+                base_url: None,
+                model: "gpt-4o-second-stub".into(),
+                supports_vision: None,
+                context_window: None,
+                pricing: None,
+                reasoning_effort: None,
+                vault: None,
+                proxy: None,
+            },
+            None,
+            CostHooks::passthrough(),
+        )
+        .expect("second stub LLM client");
+    let second_name = LlmEntryName::from(second_client.model_info().id.clone());
+
+    let mut clients = std::collections::HashMap::new();
+    clients.insert(original_name.clone(), original_client);
+    clients.insert(second_name.clone(), second_client);
+    let llm_pool: LlmPoolHandle = Arc::new(parking_lot::RwLock::new(Arc::new(
+        LlmClientPool::new(clients, original_name.clone())
+            .expect("two-entry stub pool default present"),
+    )));
+
+    (llm_pool, original_name.to_string(), second_name.to_string())
 }

@@ -508,7 +508,9 @@ async fn main_loop_requests_carry_configured_reasoning_effort() {
         .push_stream(vec![StreamEvent::Text("ok".into())]);
     plain.send_text("hello").await.unwrap();
     plain.drain_outputs(DRAIN_TIMEOUT).await;
-    assert_eq!(plain.stub_llm.captured_requests()[0].reasoning_effort, None);
+    let plain_reqs = plain.stub_llm.captured_requests();
+    assert!(!plain_reqs.is_empty());
+    assert_eq!(plain_reqs[0].reasoning_effort, None);
     plain.shutdown().await;
 }
 

@@ -14,6 +14,7 @@ import { useAdminClient, useAuth } from '../api/auth';
 import { useMockMode, MOCK_AGENT_PROFILES } from '../api/mock';
 import type { components } from '../api/schema';
 import { useBlobUrl } from '../api/useBlobUrl';
+import { REASONING_EFFORT_LEVELS } from './chat/modelFilter';
 // 256² webp squeezed from assets/baybo.png — the builtin profile's default
 // face when no avatar blob is set (avatar_blob_id stays NULL in the DB).
 import bayboAvatar from '../assets/baybo-avatar.webp';
@@ -752,12 +753,23 @@ function AgentEditorPanel({
                     {n}
                   </option>
                 ))}
-                {/* A stale pin (entry removed from baybo.json) must stay
-                    visible and deliberately clearable — a hidden stale value
-                    would 400 on save while the form looks like "Default". */}
+                {/* The options above render only the checked `allowedModels`
+                    subset when it's non-empty, so a pin can go missing from
+                    this list two ways: removed from baybo.json entirely, or
+                    still a live pool entry but excluded by the checked set.
+                    Either must stay visible and deliberately clearable — a
+                    hidden stale value would render as "Default model" while
+                    state still holds it, and Save would 400 with no visible
+                    cause. */}
                 {llm !== '' && !llmNames.includes(llm) && (
                   <option value={llm}>{llm} (unavailable)</option>
                 )}
+                {llm !== '' &&
+                  llmNames.includes(llm) &&
+                  allowedModels.length > 0 &&
+                  !allowedModels.includes(llm) && (
+                    <option value={llm}>{llm} (not in allowed set)</option>
+                  )}
               </SelectBox>
             </div>
           </div>
@@ -775,7 +787,7 @@ function AgentEditorPanel({
                 onChange={(e) => setReasoningEffort(e.target.value)}
               >
                 <option value="">Default (entry setting)</option>
-                {['minimal', 'low', 'medium', 'high', 'xhigh'].map((e) => (
+                {REASONING_EFFORT_LEVELS.map((e) => (
                   <option key={e} value={e}>
                     {e}
                   </option>

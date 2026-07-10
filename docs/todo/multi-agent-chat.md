@@ -59,7 +59,7 @@ two fields live directly on `Session.state.{agent_id, agent_framework}`
 (`SessionState::agent_id_or_builtin()` is the "baybo for unbound" accessor),
 and the store handle is a plain `Arc<dyn AgentProfileStore>` threaded to the
 handful of consumers that need a live read (`ContextManager`, the router's
-`resolve_initial_llm`). Same data, no extra indirection; a named `AgentBinding`
+`resolve_spawn_llm`). Same data, no extra indirection; a named `AgentBinding`
 struct is worth introducing only when Phase 2's external-framework branch
 needs one value to carry through the turn-dispatch seam.
 

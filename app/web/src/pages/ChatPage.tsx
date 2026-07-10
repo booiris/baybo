@@ -397,7 +397,7 @@ export function ChatPage() {
     : undefined;
   const visibleModels = useMemo(
     () => filterAllowedModels(models, activeAgent?.allowedModels ?? []),
-    [models, activeAgent],
+    [models, activeAgent?.allowedModels],
   );
   // A turn is "in flight" either optimistically (between send and the first
   // response) or per the server's authoritative TurnState. While busy the
@@ -2968,6 +2968,7 @@ export function ChatPage() {
                 {sessionId && models.length > 1 ? (
                   <ModelPicker
                     models={visibleModels}
+                    allModels={models}
                     defaultName={defaultModelName}
                     current={currentView.model}
                     onSelect={handleSelectModel}
@@ -5317,11 +5318,16 @@ function connectionBadgeLabel(status: ConnectionStatus): string {
  *  the viewport. Rendered only when more than one model is configured. */
 function ModelPicker({
   models,
+  allModels,
   defaultName,
   current,
   onSelect,
 }: {
   models: ModelOption[];
+  /** Unfiltered model pool (before `allowed_models` filtering), so a flagged
+   *  pin can be told apart: gone from the pool entirely ("unavailable") vs.
+   *  a live pool entry the agent's set just excludes ("not in allowed set"). */
+  allModels: ModelOption[];
   defaultName: string;
   current: string | null | undefined;
   onSelect: (name: string | null) => void | Promise<void>;
@@ -5392,7 +5398,11 @@ function ModelPicker({
           {pinned !== null && !models.some((m) => m.name === pinned) ? (
             <ModelPickerRow
               label={pinned}
-              sublabel="(not in allowed set)"
+              sublabel={
+                allModels.some((m) => m.name === pinned)
+                  ? '(not in allowed set)'
+                  : '(unavailable)'
+              }
               selected
               onClick={() => {}}
             />

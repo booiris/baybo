@@ -814,7 +814,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         ));
         Arc::new(
             move |session: baybo_model::Session,
-                  llm_choice: baybo_agent::router::SpawnLlmChoice,
+                  llm_choice: baybo_agent::SpawnLlmChoice,
                   response_tx: mpsc::Sender<AgentOutput>,
                   actor_token: CancellationToken| {
                 // `llm_choice.initial_llm` is `Some` either when the

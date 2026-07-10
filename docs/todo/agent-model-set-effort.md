@@ -80,9 +80,9 @@ the session.
 1. `ChatRequest` gains `reasoning_effort: Option<String>`
    (`#[serde(default, skip_serializing_if = "Option::is_none")]`, beside
    `temperature`).
-2. The router's spawn-time profile fetch (the session-pin-vs-profile-pin
-   resolver, renamed `resolve_spawn_llm` now that it also carries effort)
-   expands to also carry the profile's `reasoning_effort`, returning a
+2. The router's spawn-time profile fetch (`resolve_spawn_llm`, the
+   session-pin-vs-profile-pin resolver) expands to also carry the profile's
+   `reasoning_effort`, returning a
    `SpawnLlmChoice { initial_llm, reasoning_effort }` to the actor spawner —
    the profile is fetched even when the session's own pin is already set,
    because `reasoning_effort` only ever comes from the profile. It lands on

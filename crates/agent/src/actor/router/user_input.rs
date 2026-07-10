@@ -59,6 +59,16 @@ pub(crate) async fn resolve_spawn_llm(
             };
         }
     };
+    if let Some(pin) = &session.state.last_llm
+        && !profile.allowed_models.is_empty()
+        && !profile.allowed_models.contains(pin)
+    {
+        warn!(
+            agent_id = %agent_id,
+            pin = %pin,
+            "session pin is outside the agent's allowed_models set; keeping it (set is enforced at switch time)"
+        );
+    }
     SpawnLlmChoice {
         initial_llm: session.state.last_llm.clone().or(profile.llm),
         reasoning_effort: profile.reasoning_effort,
@@ -783,5 +793,33 @@ mod tests {
         let choice = resolve_spawn_llm(&store, &session).await;
         assert_eq!(choice.initial_llm, Some(LlmEntryName::from("user-pick")));
         assert_eq!(choice.reasoning_effort, None);
+    }
+
+    // A historical pin outside a later-shrunk `allowed_models` set is
+    // tolerated at spawn (the spec's error table): the pin is kept as-is
+    // (enforcement lives at switch time, `PUT .../model`, not here) and the
+    // resolver only warns, never fails. No tracing-capture assertion here —
+    // `crates/agent` has no dependency on `baybo-integration-tests`'
+    // capture helper (and can't: that crate depends on this one), so this
+    // test only pins down the tolerance behavior.
+    #[tokio::test]
+    async fn spawn_llm_tolerates_pin_outside_shrunk_allowed_models() {
+        use baybo_store::test_support::MemoryAgentProfileStore;
+        let store = MemoryAgentProfileStore::new();
+        let mut profile = profile_row("A1", None);
+        profile.allowed_models = vec![LlmEntryName::from("member-only")];
+        store.insert(profile);
+        let store: Arc<dyn baybo_store::agent_profile::AgentProfileStore> = store;
+
+        let mut session = make_session();
+        session.state.agent_id = Some(baybo_model::AgentProfileId::from("A1"));
+        session.state.last_llm = Some(LlmEntryName::from("outside-the-set"));
+
+        let choice = resolve_spawn_llm(&store, &session).await;
+        assert_eq!(
+            choice.initial_llm,
+            Some(LlmEntryName::from("outside-the-set")),
+            "a pin outside allowed_models is tolerated at spawn, not rewritten",
+        );
     }
 }
