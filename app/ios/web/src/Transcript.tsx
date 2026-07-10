@@ -158,6 +158,17 @@ function ordinalFromMessageId(id: string): number | null {
   return Number.isSafeInteger(n) ? n : null;
 }
 
+/// Durable ordinal out of a server row id — a `m<ordinal>` message OR a
+/// `w<ordinal>` work block. `null` for a client-minted `uid()` (a live block)
+/// or an `n<seq>` notice, neither of which carries an ordinal. Used to place a
+/// re-delivered work block into its own turn during a sync-difference merge.
+function rowOrdinal(id: string): number | null {
+  const match = /^[mw](\d+)$/.exec(id);
+  if (!match) return null;
+  const n = Number(match[1]);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 /// Identity of a work step for dedup when folding two representations of the
 /// same turn's block: a tool step is keyed by its call id (stable across the
 /// live vs reconstructed shapes); text steps by kind + text.
@@ -213,6 +224,26 @@ function reconcileWork(base: WorkRow, recon: WorkRow): WorkRow {
   };
 }
 
+/// Index in `rows` of the work block belonging to the SAME turn as a work row
+/// of durable ordinal `ord` that has ended up ABOVE the turn's answer bubble.
+/// Scan back over the trailing answer/notice run; accept the preceding work
+/// block only when that run carries an answer ordinal-above `ord`, so a
+/// genuinely later turn's block (its answer not yet on screen) is never
+/// mis-folded. `-1` when there is no such block. Used to re-home a durable
+/// progress `status` block the reopen path can strand below the reply.
+function sameTurnWorkIndex(rows: Row[], ord: number): number {
+  let j = rows.length - 1;
+  let sawTurnAnswer = false;
+  while (j >= 0) {
+    const rj = rows[j];
+    if (rj.role !== "assistant" && rj.role !== "notice") break;
+    const oj = rowOrdinal(rj.id);
+    if (rj.role === "assistant" && oj !== null && oj > ord) sawTurnAnswer = true;
+    j--;
+  }
+  return sawTurnAnswer && j >= 0 && rows[j].role === "work" ? j : -1;
+}
+
 /// Restored rows re-enter with live-turn state INTACT: a work block that was
 /// live at persist stays live ("working"), because exiting and re-entering
 /// mid-turn — or before the agent's final reply — must NOT collapse it to
@@ -228,13 +259,17 @@ function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
   for (const r of rows ?? []) {
     if (r.role === "work") {
       if (!Array.isArray(r.steps) || r.steps.length === 0) continue;
-      // Heal a mirror split by the re-entry bug: two work blocks directly
-      // adjacent (NO message row between) are ONE turn torn apart — a healthy
-      // turn always has a message between its block and the next, so adjacency
-      // alone marks the tear, whether or not either half already closed. Fold
-      // the whole run into one card, staying "working" if any piece was still
-      // live (a turn with no final reply must not read as "worked"); the split's
-      // real duration was lost, so it stays untimed.
+      // Heal a mirror split by the (now-fixed) re-entry bug: two work blocks
+      // directly adjacent (NO message row between) are ONE turn torn apart — a
+      // healthy turn always has a message between its block and the next, so
+      // adjacency alone marks the tear, whether or not either half already
+      // closed. Fold the whole run into one card, staying "working" if any piece
+      // was still live (a turn with no final reply must not read as "worked");
+      // the split's real duration was lost, so it stays untimed. Since the
+      // `withOpenWork` fold-into-frozen-tail invariant now prevents minting a
+      // fresh adjacency split, this only ever folds a LEGACY on-disk mirror
+      // written by a pre-fix build (it re-persists as one row, so it fires once
+      // per such session) — kept as defense-in-depth.
       const prev = out[out.length - 1];
       if (prev && prev.role === "work") {
         out[out.length - 1] = {
@@ -245,7 +280,21 @@ function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
           elapsedMs: undefined,
         };
       } else {
-        out.push({ ...r, startedAt: undefined });
+        // Heal a DIFFERENT persisted split: a durable progress block that a
+        // prior build's reopen sync stranded AFTER its turn's answer bubble (so
+        // it isn't adjacent to its own block — the adjacency heal above can't
+        // reach it). Fold it back into the turn's pre-answer work block by
+        // ordinal, so a mirror already corrupted by that bug self-corrects on
+        // the next open instead of keeping the stray "Worked" card below the
+        // reply forever (the reopen sync is a no-op once the cursor passed it).
+        const ord = rowOrdinal(r.id);
+        const at = ord !== null ? sameTurnWorkIndex(out, ord) : -1;
+        const target = at >= 0 ? out[at] : undefined;
+        if (target && target.role === "work") {
+          out[at] = { ...target, steps: mergeWorkSteps(target.steps, r.steps), active: target.active || r.active };
+        } else {
+          out.push({ ...r, startedAt: undefined });
+        }
       }
     } else if (r.role === "user" || r.role === "assistant" || r.role === "notice") {
       // A send still "sending" when we persisted can't be in flight after a
@@ -819,15 +868,25 @@ export function Transcript({
   const withOpenWork = useCallback((mutate: (row: WorkRow) => WorkRow) => {
     setMessages((rows) => {
       const last = rows[rows.length - 1];
-      // A restored live block stays `active`, so a re-entry's buffered
-      // continuation extends THIS block (keeping its real startedAt) instead of
-      // opening a second one.
-      if (last && last.role === "work" && last.active) {
+      // A work frame belongs to the tail work block whenever the tail IS one —
+      // even if it was just FROZEN. A restored live block stays `active` and a
+      // re-entry's continuation extends it (keeping its real startedAt); but a
+      // block can also be frozen MID-STREAM by a `turn_state{inactive}` that
+      // raced ahead of a straggler frame — on cancel the gateway emits an
+      // unguarded `tool_completed` through the SAME ordered channel the turn-end
+      // projector rides, so `[tool_started] → turn_state{inactive} → tool_completed`
+      // reaches the client with the block already closed. Folding into the frozen
+      // tail rather than forking is the invariant that keeps ONE turn to ONE card:
+      // withOpenWork never appends a work row adjacent to another (the
+      // `[work][work]` re-entry split). The straggler even resolves its own
+      // still-"running" tool step in place. The block keeps its frozen
+      // `active:false`, so a cancelled turn reads "Worked", not a stuck "Working".
+      if (last && last.role === "work") {
         return [...rows.slice(0, -1), mutate(last)];
       }
-      // Opening a NEW block: freeze EVERY still-`active` block anywhere in the
-      // thread first, so a stale open block can't linger as a second live
-      // "Working" card beside this one.
+      // Tail is not a work row: this frame opens a NEW block. Freeze EVERY
+      // still-`active` block anywhere in the thread first, so a stale open block
+      // can't linger as a second live "Working" card beside this one.
       const fresh: WorkRow = { id: uid(), role: "work", steps: [], active: true, startedAt: Date.now() };
       return [...freezeActiveWork(rows), mutate(fresh)];
     });
@@ -1166,6 +1225,29 @@ export function Transcript({
             if (row.role === "work" && tail && tail.role === "work") {
               next[next.length - 1] = reconcileWork(tail, row);
               continue;
+            }
+            // A re-delivered `work` row whose turn ALREADY ended on screen: its
+            // block sits ABOVE the turn's answer bubble (+ any trailing
+            // notices), so the tail isn't work and id-dedup misses — a live
+            // block is keyed by a client `uid()` while the reconstruction keys
+            // it `w<ordinal>`, and even two reconstructions disagree
+            // (`w<first-tool>` for a full tail vs `w<progress-anchor>` for a
+            // difference window). Fold it back into that block instead of
+            // pushing a SECOND card below the answer — the observer's `status`
+            // narration, made durable, is re-delivered by the inclusive
+            // (`after_ordinal >= since`) control-event scan and would otherwise
+            // land as a stray "Worked" block under the reply. Bound the
+            // back-scan to the SAME turn: reconcile only when the trailing run
+            // holds an answer ordinal-above this block, so a genuinely later
+            // turn's block (its answer not yet on screen) still appends.
+            if (row.role === "work") {
+              const ord = rowOrdinal(row.id);
+              const at = ord !== null ? sameTurnWorkIndex(next, ord) : -1;
+              const target = at >= 0 ? next[at] : undefined;
+              if (target && target.role === "work") {
+                next[at] = reconcileWork(target, row);
+                continue;
+              }
             }
             if (row.role === "assistant") closeTrailingWork();
             next.push(row);
