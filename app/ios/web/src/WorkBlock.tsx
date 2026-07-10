@@ -62,6 +62,16 @@ function WorkStepView({ step }: { step: WorkStep }) {
       );
     case "status":
       return <div className="step status">{step.text}</div>;
+    case "notice":
+      // An out-of-band notice that landed mid-turn — a leveled line inside the
+      // block, so it doesn't sever the card. Severity reads via the color ramp
+      // (info dim → warn ink → error red); △ is text-presentation (no emoji).
+      return (
+        <div className={`step notice notice-${step.level}`}>
+          <span className="step-glyph">△</span>
+          <span className="step-text">{step.text}</span>
+        </div>
+      );
     case "tool": {
       const failed = step.status === "error" || step.status === "denied";
       const running = step.status === "running";

@@ -779,6 +779,23 @@ export function Transcript({
     prependAnchor.current = null;
   }, [messages]);
 
+  // A terminal notice that lands mid-turn folds INTO the open work block as a
+  // leveled step, so it doesn't sever the block into two cards (the tail must
+  // stay a work row for `withOpenWork` to keep extending it). Only an active
+  // block folds: those mid-turn notices are live-only (never persisted), so the
+  // folded step can't duplicate a durable row. A notice with no active block —
+  // between turns, or a persisted `/stop`/`/compact` outcome anchored after the
+  // turn — keeps its own centered `role:"notice"` row (its durable shape).
+  const foldTerminalNotice = useCallback((level: string, text: string) => {
+    setMessages((rows) => {
+      const last = rows[rows.length - 1];
+      if (last && last.role === "work" && last.active) {
+        return [...rows.slice(0, -1), { ...last, steps: [...last.steps, { kind: "notice", level, text }] }];
+      }
+      return [...rows, { id: uid(), role: "notice", content: text }];
+    });
+  }, []);
+
   const appendNotice = useCallback((text: string) => {
     setMessages((m) => [...m, { id: uid(), role: "notice", content: text }]);
   }, []);
@@ -1408,7 +1425,8 @@ export function Transcript({
           foldStreamingIntoProse();
           pushWorkStep({ kind: "status", text: frame.text });
         } else {
-          appendNotice(frame.text);
+          // A terminal notice folds into an open block rather than cutting it.
+          foldTerminalNotice(frame.level, frame.text);
         }
         break;
       case "sync_page":

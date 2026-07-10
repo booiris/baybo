@@ -171,6 +171,11 @@ export type WorkStep =
   // agent "went back to thinking", so the text so far was intermediate.
   | { kind: "prose"; text: string }
   | { kind: "status"; text: string }
+  // An out-of-band agent notice (skill warning, degraded-mode banner) that
+  // landed WHILE the turn's work block was open — folded in as a step (styled by
+  // `level`) instead of severing the block into two cards. A notice with no open
+  // block still renders as its own centered `role:"notice"` row.
+  | { kind: "notice"; level: string; text: string }
   | { kind: "tool"; callId: string; label: string; status: string; summary?: string };
 
 /// A turn's collapsible work block, kept as its own transcript row (the web

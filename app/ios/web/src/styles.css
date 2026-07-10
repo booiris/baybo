@@ -393,6 +393,13 @@ button {
 @keyframes glyph-pulse { 50% { opacity: 0.25; } }
 .step.prose { display: block; font-family: var(--font-sans); font-size: 0.85rem; color: var(--color-ink); }
 .step.status { white-space: pre-wrap; }
+/* Mid-turn notice folded into the block: a severity ramp on the monochrome
+   system (info dim grey → warn full ink → error the established red), no new
+   accent hue. */
+.step.notice { color: var(--color-ink-soft); }
+.step.notice .step-text { white-space: pre-wrap; }
+.step.notice.notice-warn { color: var(--color-ink); }
+.step.notice.notice-error { color: var(--color-err); }
 
 /* Pre-first-frame turn indicator (the web chat's "Working…" card, as a line).
    It renders only a fixed i18n label, but wrap it too so no future translation
