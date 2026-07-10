@@ -82,9 +82,22 @@ struct SessionRow: Codable, Identifiable, Equatable {
 final class SessionIndex: ObservableObject {
     static let shared = SessionIndex()
 
-    /// Mirrors the gateway's `PREVIEW_MAX_CHARS` so a locally-captured preview
-    /// and a REST-fetched one truncate identically.
-    static let previewMaxChars = 200
+    /// Mirrors the gateway CHAT-LIST `PREVIEW_MAX_CHARS` (`api/admin/chat.rs`
+    /// — 120, NOT push's 200) so a locally-captured preview and a REST-fetched
+    /// one truncate identically; run every capture through `previewText`.
+    static let previewMaxChars = 120
+
+    /// Collapse whitespace and clip to `previewMaxChars` with a trailing
+    /// ellipsis — the Swift mirror of the gateway's `truncate_preview`. A local
+    /// capture run through this equals the server's `last_message_text` /
+    /// `last_user_text`, so reconciling it on the next `merge` changes nothing
+    /// (no visible jump). Unicode-scalar counting matches Rust's `chars()`.
+    static func previewText(_ text: String) -> String {
+        let collapsed = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let scalars = collapsed.unicodeScalars
+        if scalars.count <= previewMaxChars { return collapsed }
+        return String(String.UnicodeScalarView(scalars.prefix(previewMaxChars))) + "…"
+    }
     /// Transcript mirrors kept on disk — only the most recently active
     /// sessions; older mirrors are pruned (the gateway replays history on
     /// re-entry, so a pruned mirror only costs a fetch).
@@ -161,7 +174,7 @@ final class SessionIndex: ObservableObject {
     /// (offline/failed tunnel). An attachment-only send (empty text) bumps
     /// activity but keeps the previous preview.
     func recordUserSend(sessionId: String, text: String) {
-        let preview = String(text.prefix(Self.previewMaxChars))
+        let preview = Self.previewText(text)
         let now = Date()
         if let idx = rows.firstIndex(where: { $0.id == sessionId }) {
             if !preview.isEmpty {
@@ -179,6 +192,27 @@ final class SessionIndex: ObservableObject {
                     preview: preview.isEmpty ? nil : preview,
                     userText: preview.isEmpty ? nil : preview, pinned: false))
         }
+        save()
+    }
+
+    /// The agent's final reply landed on this (foreground or still-resident)
+    /// session's leg — capture it as the row's second-line preview locally, the
+    /// assistant-side mirror of `recordUserSend`. Without it the list keeps
+    /// showing the user's last message until the return-to-list REST merge swaps
+    /// in `last_message_text`, a visible jump; recency and title already update
+    /// live (the `SessionActivity` ping / `SessionUpdated` patch), so the preview
+    /// was the one row field with no live path. Mirrors the gateway's tool-free
+    /// final-answer rule; an empty reply (attachment-only) keeps the prior
+    /// preview, matching the gateway's media-only skip. `lastActive` / `userText`
+    /// are untouched — recency rides the ping and `userText` stays the user-only
+    /// label. Unknown ids are ignored; a later merge surfaces them.
+    func recordAgentReply(sessionId: String, text: String) {
+        let preview = Self.previewText(text)
+        guard !preview.isEmpty,
+            let idx = rows.firstIndex(where: { $0.id == sessionId }),
+            rows[idx].preview != preview
+        else { return }
+        rows[idx].preview = preview
         save()
     }
 

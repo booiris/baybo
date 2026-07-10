@@ -245,9 +245,17 @@ final class ChatStore: ObservableObject {
         // Already overflowed while offscreen: the webview re-syncs on the next
         // attach, so don't buffer past the hole the dropped frames left.
         if bridge == nil && needsSyncOnAttach { return }
-        // The outbox observes the same frame stream: a user Echo (ordinal-less,
-        // matching platform_msg_id) flips its entry to `sent`.
-        outboxObserveFrame(frameJson)
+        // Passive observers on the same frame stream, parsed once: a user Echo
+        // (ordinal-less, matching platform_msg_id) advances the outbox; the
+        // turn's terminal assistant `message` updates the chat-list preview in
+        // place. Both run even while offscreen (bridge nil, buffered) so a reply
+        // that lands after the user backs out still updates the list live.
+        if let data = frameJson.data(using: .utf8),
+            let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            outboxObserveFrame(frame)
+            noteChatListPreview(frame)
+        }
         if let bridge {
             bridge.pushFrame(frameJson)
         } else {
@@ -477,16 +485,29 @@ final class ChatStore: ObservableObject {
     /// A frame flowing to the webview: a user Echo (role `user`, a
     /// `platform_msg_id`, no `ordinal`) proves transport, flipping its outbox
     /// entry to `sent`. Durability release happens on a sync/backfill row
-    /// instead (`reconcileOutboxAfterSync`).
-    private func outboxObserveFrame(_ frameJson: String) {
-        guard let data = frameJson.data(using: .utf8),
-            let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            (frame["kind"] as? String) == "message",
+    /// instead (`reconcileOutboxAfterSync`). `frame` is the caller's one-time
+    /// parse of the JSON, shared with `noteChatListPreview`.
+    private func outboxObserveFrame(_ frame: [String: Any]) {
+        guard (frame["kind"] as? String) == "message",
             (frame["role"] as? String) == "user",
             let pmid = frame["platform_msg_id"] as? String, !pmid.isEmpty,
             frame["ordinal"] == nil || frame["ordinal"] is NSNull
         else { return }
         outbox.markEchoed(platformMsgId: pmid)
+    }
+
+    /// The turn's terminal assistant `message` is the authoritative, tool-free
+    /// final answer (the web bundle treats it as such — it supersedes the
+    /// stream and closes the work block). Capture its text as the chat-list
+    /// row's preview so the list's second line updates in place while the chat
+    /// is open (or still resident after backing out), sparing the user the
+    /// user-message→reply jump the return refresh would otherwise show.
+    private func noteChatListPreview(_ frame: [String: Any]) {
+        guard (frame["kind"] as? String) == "message",
+            (frame["role"] as? String) == "assistant",
+            let content = frame["content"] as? String
+        else { return }
+        SessionIndex.shared.recordAgentReply(sessionId: sessionId, text: content)
     }
 
     /// Native holds the `sync_page` it fetched, so it reconciles the outbox
