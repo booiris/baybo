@@ -932,8 +932,9 @@ pub struct SessionPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
     pub title: Option<String>,
-    /// Bound agent profile id. Emitted on the create broadcast so sibling
-    /// tabs can render the agent chip without a refetch; never changes later.
+    /// Bound agent profile id. Carried on broadcasts that (re)construct a
+    /// sidebar row (Create / Unhide) so sibling tabs can render the agent
+    /// chip without a refetch; never changes later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
     pub agent_id: Option<String>,

@@ -1399,7 +1399,7 @@ async fn unhide_session(
                 id: f.as_str().to_owned(),
             }),
             title: session.title.clone(),
-            agent_id: None,
+            agent_id: session.state.agent_id.as_ref().map(|a| a.to_string()),
         },
     );
     Ok(axum::http::StatusCode::NO_CONTENT)

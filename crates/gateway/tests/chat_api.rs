@@ -261,6 +261,10 @@ async fn create_session_binds_agent_profile() {
         builtin_detail.get("agent_id").is_none(),
         "builtin agent_id must normalize to unbound, got {builtin_detail:?}",
     );
+    assert!(
+        builtin_detail.get("agent_framework").is_none(),
+        "an unbound session must not carry agent_framework, got {builtin_detail:?}",
+    );
 
     // ── 6. Unknown agent_id is a 400 ──────────────────────────────────
     post(
@@ -303,6 +307,26 @@ async fn create_session_binds_agent_profile() {
         StatusCode::BAD_REQUEST,
     )
     .await;
+
+    // ── 9. Client-supplied FRESH session_id + agent_id binds too ──────
+    // (exercises the requested-id fresh-create arm's stamping tail).
+    let requested_sid = "client-agent-session-1";
+    let created = post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "session_id": requested_sid, "agent_id": agent_id }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(created["session_id"].as_str(), Some(requested_sid));
+    let detail = get(
+        &router,
+        &format!("/v1/chat/sessions/{requested_sid}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(detail["agent_id"].as_str(), Some(agent_id.as_str()));
+    assert_eq!(detail["agent_framework"].as_str(), Some("baybo"));
 }
 
 /// Seed one session with a completed tool-using turn:

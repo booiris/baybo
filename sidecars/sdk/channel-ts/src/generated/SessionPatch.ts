@@ -55,7 +55,8 @@ folder_id?: FolderChange,
  */
 title?: string, 
 /**
- * Bound agent profile id. Emitted on the create broadcast so sibling
- * tabs can render the agent chip without a refetch; never changes later.
+ * Bound agent profile id. Carried on broadcasts that (re)construct a
+ * sidebar row (Create / Unhide) so sibling tabs can render the agent
+ * chip without a refetch; never changes later.
  */
 agent_id?: string, };
