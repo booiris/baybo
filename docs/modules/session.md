@@ -61,6 +61,7 @@ When a session with an in-flight subagent is deleted, the subagent's cancellatio
 - `compression_count`: incremented after each successful context compression. Used by monitoring / strategy switching to detect runaway growth.
 - `approved_resources`: tool resources the user has granted permanent approval for in this session, populated on each `ApproveAlways` decision. See [`tools.md`](tools.md).
 - `last_llm`: per-session LLM pin — the `baybo.json` entry name this session's turns resolve against, or `None` to follow `default-llm`. Read by the actor spawner as the loop's `initial_llm`; a live actor is re-pinned via `AgentMessage::SetModel`. Set from the chat UI via `PUT /v1/chat/sessions/:id/model`. See [`agent.md`](agent.md) "Per-session model selection".
+- `agent_id` / `agent_framework`: agent-profile binding — which `agent_profiles` row (if any) this session was created under, and a snapshot of that profile's framework at creation. `None` on both = the builtin `baybo` agent (`SessionState::agent_id_or_builtin()` normalizes this to `BUILTIN_AGENT_PROFILE_ID`). Written exactly once, at creation, via the targeted `SessionStore::set_agent_binding` setter — mirrors the `last_llm` anti-clobber pattern, but unlike `last_llm` there is no re-pin path; binding is immutable for the session's life. See [`agent-profiles.md`](agent-profiles.md#session-binding).
 - `extra`: reserved extension fields for experimental features or plugin state.
 
 ### Idle actor reaping — never row deletion
@@ -81,3 +82,4 @@ Session rows and their transcripts are core user data and are **never** dropped 
 | `context` | Owns the in-memory transcript via `ContextManager`; agent loop brokers persistence via this crate  |
 | `agent`   | Re-exports `SessionManager`; Router calls it; `AgentActor` holds the `Session` instance            |
 | `cli` / `gateway` | Operator-facing surfaces consume `baybo_agent::SessionManager`                              |
+| `agent-profiles` | `sessions.{agent_id, agent_framework}` bind a session to an `agent_profiles` row; see [`agent-profiles.md`](agent-profiles.md#session-binding) |

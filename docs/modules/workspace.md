@@ -12,13 +12,15 @@ Pure-data consumers (e.g. `baybo-config`, `baybo-tools`) take this crate with `d
 
 ## Layout
 
-The workspace root is the single **project root** for the entire runtime: every subsystem that needs a persistent path derives its location from it. The root is divided into six top-level subdirectories that describe what kind of content lives there.
+The workspace root is the single **project root** for the entire runtime: every subsystem that needs a persistent path derives its location from it. The root is divided into eight top-level subdirectories that describe what kind of content lives there.
 
 ```text
 <workspace_root>/
-  profile/         # standalone git repo: baybo.json, .mcp.json, identity .md files
+  config/          # standalone git repo: baybo.json, .mcp.json
+  profile/         # standalone git repo: identity .md files
   skills/          # standalone git repo: workspace-local skill definitions
   agents/          # standalone git repo: subagent profile definitions
+  agent-skills/    # standalone git repo: per-agent-profile skill definitions, one subdir per agent id
   state/           # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
   work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), future scratch
   logs/            # not version-controlled: baybo.log.<date>, channel/<type>.log.<date> (sessions/<id>.jsonl is a virtual path, never written)
@@ -38,6 +40,7 @@ checkout rather than polluting the real user home.
 | MCP servers      | `<workspace.path>/config/.mcp.json`        |
 | identity files   | `<workspace.path>/profile/{SOUL,USER,IDENTITY}.md` |
 | skills           | `<workspace.path>/skills/`                 |
+| agent skills     | `<workspace.path>/agent-skills/<agent_id>/<skill>/SKILL.md` |
 | encryption key   | `<workspace.path>/.key/encryption.key`     |
 | storage          | `<workspace.path>/state/storage.db`        |
 | singleton lock   | `<workspace.path>/state/baybo.lock`         |
@@ -54,10 +57,10 @@ New subsystem files belong as a method on `WorkspacePaths`, not as another `work
 
 `WorkspaceManager::ensure_layout` runs at every boot (gateway start, TUI, argv subcommands once `boot::load_config` returns) and is idempotent:
 
-- Creates `config/`, `profile/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `logs/` if missing.
-- Runs `git init --quiet` inside `config/`, `profile/`, `skills/`, and `agents/` if the directory isn't already a git repo (`<dir>/.git` check).
+- Creates `config/`, `profile/`, `skills/`, `agents/`, `agent-skills/`, `.key/`, `state/`, `work/`, `logs/` if missing.
+- Runs `git init --quiet` inside `config/`, `profile/`, `skills/`, `agents/`, and `agent-skills/` if the directory isn't already a git repo (`<dir>/.git` check).
 
-`config/`, `profile/`, `skills/`, and `agents/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the four declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits commit inside `profile/`; skill authors do the same inside `skills/`; subagent profiles commit inside `agents/`. **Never** commit anything from `.key/` — `baybo setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
+`config/`, `profile/`, `skills/`, `agents/`, and `agent-skills/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the five declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits commit inside `profile/`; skill authors do the same inside `skills/`; subagent profiles commit inside `agents/`; per-agent skill authors commit inside `agent-skills/`. **Never** commit anything from `.key/` — `baybo setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
 
 ## Config file resolution
 
@@ -83,9 +86,9 @@ Identity file changes usually affect the system prompt; memory changes usually a
 
 They complement each other without overlapping.
 
-### Why split state/work/logs from profile/skills
+### Why split state/work/logs from the declarative dirs
 
-The split exists so the user's git workflow stays clean: `profile/` and `skills/` are declarative, hand-edited content that belongs in source control; `state/` is mutable runtime state (libsql DB, locks, ports, browser profile) that would create churn or conflicts if committed; `work/` holds tool-generated scratch (uv caches, downloaded Python toolchains, ad-hoc shell output) that has no long-term value; `logs/` is ephemeral. Each of the two declarative dirs is its own git repo, so the boundary is enforced by repo scope rather than a top-level ignore list — users can never accidentally commit `state/` because no enclosing repo includes it.
+The split exists so the user's git workflow stays clean: `config/`, `profile/`, `skills/`, `agents/`, and `agent-skills/` are declarative, hand-edited (or hand-authored-per-agent) content that belongs in source control; `state/` is mutable runtime state (libsql DB, locks, ports, browser profile) that would create churn or conflicts if committed; `work/` holds tool-generated scratch (uv caches, downloaded Python toolchains, ad-hoc shell output) that has no long-term value; `logs/` is ephemeral. Each declarative dir is its own git repo, so the boundary is enforced by repo scope rather than a top-level ignore list — users can never accidentally commit `state/` because no enclosing repo includes it.
 
 ## Constraints
 
@@ -99,6 +102,7 @@ The split exists so the user's git workflow stays clean: `profile/` and `skills/
 | Module | Role |
 |--------|------|
 | `agent` | Reads identity files for system prompt |
-| `skills` | Provides trusted local skill directories |
+| `skills` | Provides trusted local skill directories, including `agent-skills/` for the per-agent overlay ([`skills.md`](skills.md#agent-scoped-overlay)) |
 | `trace` | Identity file version changes are recorded in provenance |
+| `agent-profiles` | `agent-skills/<agent_id>/` is keyed by profile id ([`agent-profiles.md`](agent-profiles.md#session-binding)) |
 | `memory` | Complements without overlapping responsibility |

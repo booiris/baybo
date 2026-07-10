@@ -2,9 +2,9 @@
 
 ## Overview
 
-Agent profiles are user-managed personas: a named, avatar-carrying bundle of system prompt, an execution framework (`baybo` / `claude` / `codex`), and an optional LLM pin. The operator creates and edits them from the web dashboard; a later feature will let a chat session bind to one so the profile drives that session's behavior. Skills are **not** a profile field — the editor displays them read-only, live from the skill registry (managed by the skill system, not configured per agent here).
+Agent profiles are user-managed personas: a named, avatar-carrying bundle of system prompt, an execution framework (`baybo` / `claude` / `codex`), and an optional LLM pin. The operator creates and edits them from the web dashboard's **Agents** page. A web chat session can bind to one at creation time — see [Session binding](#session-binding) — and from then on the profile drives that session's system prompt, LLM pin, and skill overlay. Skills are **not** a profile field — the editor displays them read-only, live from the skill registry (managed by the skill system, not configured per agent here).
 
-**v1 is management-only.** The feature ships the entity, its persistence, full CRUD over `/v1/agents`, and the web **Agents** page — and deliberately **no runtime consumer**: nothing in `baybo-agent`, `baybo-context`, or the spawn path reads `agent_profiles` yet. Binding, allow-list enforcement, and external-framework top-level sessions are all in [Deferred](#deferred).
+The feature ships the entity and its persistence, full CRUD over `/v1/agents`, the web **Agents** page, and the `baybo`-framework runtime consumer: session creation, prompt resolution, LLM precedence, skill scoping, and memory partitioning all read `agent_profiles` for a session bound to a `baybo`-framework agent. `claude` / `codex` profiles are storable and editable today but stay management-only — the external-agent chat leg that would actually run a top-level session under those frameworks is [Deferred](#deferred).
 
 This is a cross-crate feature subsystem, not a crate. The pieces live where their kind of code already lives:
 
@@ -43,13 +43,54 @@ pub struct AgentProfileRow {
 | `system_prompt` | workspace Soul (`assemble_from_workspace`), same as every session today | replaces the Soul for bound sessions |
 | `llm` | follow `default-llm` | pin to this `baybo.json` entry name |
 
-`llm` is stored regardless of `framework` (the server never clears it on a framework switch, so switching never destroys data), but it is genuinely baybo-only: it names a `baybo.json` LLM-pool entry, which an external CLI (billed against its own subscription) can't route through — the editor greys it out for external frameworks. Nothing is consumed yet (v1 is management-only).
+`llm` is stored regardless of `framework` (the server never clears it on a framework switch, so switching never destroys data), but it is genuinely baybo-only: it names a `baybo.json` LLM-pool entry, which an external CLI (billed against its own subscription) can't route through — the editor greys it out for external frameworks. `system_prompt` and `llm` are both consumed live by a bound `baybo`-framework session — see [Session binding](#session-binding).
 
-**Neither skills nor tools are stored on the profile.** Skills are managed by the skill system, not configured per agent — the editor reads them live from the skill registry (`GET /v1/skills`) and shows them read-only; when a future per-agent-workspace model lands, that readout reads the agent's own skill folder instead. Tools are a runtime-global concern (`ToolRegistry` is process-wide by design) and Claude Code / Codex manage their own tool permissions. Storing either as a per-agent allow-list would be dead data in v1, so both are left out.
+**Neither skills nor tools are stored on the profile.** Skills are managed by the skill system, not configured per agent — the editor reads them live from the skill registry (`GET /v1/skills`, `?agent_id=` scoped to the profile's own overlay folder once one is selected — see [Session binding](#session-binding)) and shows them read-only. Tools are a runtime-global concern (`ToolRegistry` is process-wide by design) and Claude Code / Codex manage their own tool permissions. Storing either as a per-agent allow-list would be dead data, so both are left out.
 
 ### The built-in `baybo` profile
 
-Exactly one row is seeded with `id = BUILTIN_AGENT_PROFILE_ID` (`"baybo"`), `name = "baybo"`, `builtin = 1`, `framework = baybo`, every nullable field `NULL`, and its description from the `BUILTIN_AGENT_PROFILE_DESCRIPTION` const in the libsql impl — the row *is* the default behavior. It is **read-only except its avatar** and cannot be deleted: the agent list always has an honest entry for "the assistant you already have", and a future session-binding UI gets a default target without special-casing "no profile".
+Exactly one row is seeded with `id = BUILTIN_AGENT_PROFILE_ID` (`"baybo"`), `name = "baybo"`, `builtin = 1`, `framework = baybo`, every nullable field `NULL`, and its description from the `BUILTIN_AGENT_PROFILE_DESCRIPTION` const in the libsql impl — the row *is* the default behavior. It is **read-only except its avatar** and cannot be deleted: the agent list always has an honest entry for "the assistant you already have", and the session-binding picker (below) gets a default target without special-casing "no profile".
+
+## Session binding
+
+A web chat session is bound to at most one agent profile, **at creation only** — binding is immutable for the session's life. This is the runtime consumer the schema was shaped for.
+
+### Data model: two flat columns, write-once
+
+`sessions` carries `agent_id TEXT` and `agent_framework TEXT` (the `last_llm` anti-clobber pattern — no state-blob write): `NULL` on both means the builtin `baybo` agent, which is every pre-binding row. `SessionState::agent_id_or_builtin()` is the one accessor every consumer uses to turn "maybe bound" into a concrete id — it returns the bound `agent_id` or `BUILTIN_AGENT_PROFILE_ID`.
+
+`SessionStore::set_agent_binding(session_id, agent_id, framework)` is a **targeted, write-once** setter: it only fires `UPDATE … WHERE agent_id IS NULL`, so a session can be bound exactly once and a second call is a no-op (`Ok(false)`). There is no unbind and no rebind — an agent's `framework` is a snapshot of the profile at bind time, not a live read, because a baybo transcript can't be served by an external CLI that has never seen it (framework itself isn't consumed yet; only `baybo`-framework binding is wired through the runtime — see below).
+
+### Creation API
+
+`POST /v1/chat/sessions` takes an optional `agent_id` in the body. Resolution (`resolve_agent_binding` in `crates/gateway/src/api/admin/chat.rs`) is write-time validation with crisp 400s:
+
+| `agent_id` | Result |
+|---|---|
+| absent / `null` / `"baybo"` (`BUILTIN_AGENT_PROFILE_ID`) | unbound — `agent_id`/`agent_framework` stay `NULL` |
+| unknown id | 400 |
+| a known id whose profile `framework != baybo` | 400 "external-framework chat sessions are not supported yet" |
+| a known `baybo`-framework id | bound via `set_agent_binding` |
+| any `agent_id` on a request that resolves to an **existing** session (a client-supplied `session_id` that already has a row) | 400 "cannot set an agent on an existing session" — binding only happens at true creation |
+
+`ChatSessionSummary` and `ChatSessionDetail` (the REST + sync DTOs) carry `agent_id` / `agent_framework` so the client renders the agent chip without a join back to `/v1/agents`; `SessionPatch.agent_id` rides the session-created broadcast and the unhide broadcast (reconstructing a hidden row's chip without a refetch — an unhide is the other place a client first learns about a row it may not have cached).
+
+### Content resolution: identity snapshots, content follows live
+
+The framework snapshot never changes; everything the profile actually contributes is resolved live, at use time, by session's `agent_id_or_builtin()` / `agent_id`:
+
+- **System prompt.** `ContextManager::try_resolve_system_prompt` gains an agent-profile arm below the subagent-profile arm and above the workspace Soul: for a bound session it does a live `AgentProfileStore::get` and uses `row.system_prompt` if `Some`. A `NULL` prompt, a missing row (deleted profile), or a store error all fall through to the workspace Soul with a `warn!` — never a hard failure. This runs both at context seed and at every post-compaction reseed, so an edited prompt lands on the next reseed without restarting the session.
+- **LLM pin.** `resolve_initial_llm` (`crates/agent/src/actor/router/user_input.rs`) is the precedence: the session's explicit `last_llm` pin wins if set; otherwise the bound profile's `llm` is read live from the store; otherwise the pool default. This resolves **at actor spawn / hydration**, not per turn — a profile edit lands the next time the actor is (re)built (cold start, or after an idle reap), while an explicit per-session model switch (`PUT /v1/chat/sessions/{id}/model`) always wins immediately via the existing `AgentMessage::SetModel` re-pin.
+- **Skills.** The agent's overlay folder at `<workspace>/agent-skills/<agent_id>/` is layered on the shared skill set for every listing, lookup, and slash expansion the session makes — see [`skills.md`](skills.md#agent-scoped-overlay).
+- **Memory.** The partition key is `agent_id_or_builtin()` — `"baybo"` for unbound sessions (matching mem0's and OpenViking's pre-existing hardcoded default, so old memories stay exactly where builtin sessions look for them), the profile's ULID for a bound one. See [`memory.md`](memory.md#partitioning-by-agent).
+
+### Deletion tolerance
+
+Deleting a profile with bound sessions is allowed (house style — soft references, read-time tolerance, no FK). A bound session whose profile row is gone falls back to builtin behavior — workspace Soul, default LLM, no agent skill overlay — with a `warn!` at each resolution site, never a session-breaking error. Its memory partition key stays the stored `agent_id` string (not `BUILTIN_AGENT_PROFILE_ID`), so its memories keep their own partition instead of silently merging into the builtin one.
+
+### Not yet wired: subagents and external frameworks
+
+Subagent sessions (`SubagentRegistry` / the spawn router) are never agent-bound — `ContextManager`'s subagent-profile arm and its agent-profile arm are mutually exclusive by construction (a session has `subagent_profile` xor `agent_profile`, never both). A `claude`/`codex` profile can be created and edited, but creating a top-level chat session against one 400s (see the creation-API table above) until the external-agent chat leg lands — [Deferred](#deferred).
 
 ## Design Decisions
 
@@ -140,24 +181,23 @@ Shape changes ride the standard openapi regen chain — see the header of `crate
 `AgentsPage.tsx` + an `/agents` route + an `IconRail` destination, following the house conventions (hand-rolled fetch with refetch-after-mutation, `useAdminClient()`, 401 → `logout()`, `?mock=true` with every mutation short-circuited in mock mode). Layout is a `[sidebar | detail]` split like the chat page.
 
 - **Sidebar**: the agent roster — per-row character face (uploaded avatar > bundled brand image for the builtin > monogram on a deterministic per-agent tint), name (+ lock icon on the builtin), `framework · model` subtitle, coral highlight on the active row; a "New agent" button switches the detail pane to the create form.
-- **Detail**: an inline character-sheet editor (no modal, centered single column), keyed by selection. Header: large avatar portrait + image/remove controls beside the name field, a fixed-min-height meta row (builtin lock badge / id) so switching agents never jumps the layout. Body: description, framework, LLM pin, system prompt, then a full-width **read-only skills readout** — every registered skill listed with its `SKILL.md` description (from `GET /v1/skills`, which returns `{name, description}`), the same live registry for every agent since skills aren't per-profile in v1. A removed LLM entry renders as "(unavailable)"; the LLM pin greys out for external frameworks ("baybo only"). Footer: destructive Delete on the left (custom agents; a confirm dialog follows), Save on the right. For the builtin everything except the avatar is disabled and Save is live only when the avatar changed.
+- **Detail**: an inline character-sheet editor (no modal, centered single column), keyed by selection. Header: large avatar portrait + image/remove controls beside the name field, a fixed-min-height meta row (builtin lock badge / id) so switching agents never jumps the layout. Body: description, framework, LLM pin, system prompt, then a full-width **read-only skills readout** — every skill visible to that agent listed with its `SKILL.md` description (`GET /v1/skills` unscoped for the builtin/no-selection/create-new state, `?agent_id=<id>` scoped to that profile's `agent-skills/` overlay otherwise — mirrors `SkillRegistry::summaries_for_agent`, see [`skills.md`](skills.md#agent-scoped-overlay)). A removed LLM entry renders as "(unavailable)"; the LLM pin greys out for external frameworks ("baybo only"). Footer: destructive Delete on the left (custom agents; a confirm dialog follows), Save on the right. For the builtin everything except the avatar is disabled and Save is live only when the avatar changed.
 - **Avatar**: file input → `POST /v1/blobs` → `PUT /v1/agents/{agent_id}/avatar`; rendering fetches the blob with the bearer into an object URL (an `<img>` can't carry the auth header). The bundled builtin default is `app/web/src/assets/baybo-avatar.webp` (a 256² webp squeezed from `assets/baybo.png`; `avatar_blob_id` stays `NULL`).
-- **No WS**: nothing consumes agent profiles live — no `Frame` variant, no store/context. A `FolderView`-style broadcast can be added when binding lands.
+- **No WS for profile edits**: nothing pushes agent-profile CRUD live — no `Frame` variant, no store/context; the Agents page is refetch-driven. A session's *binding*, by contrast, does ride the wire: `SessionPatch.agent_id` rides the chat page's session-created and unhide broadcasts (see [Session binding](#session-binding)), so sibling tabs render the agent chip without a refetch.
+- **Chat picker + chips** (`app/web/src/pages/chat/AgentPicker.tsx`): a popover on the sidebar's New-chat button, sourced from `GET /v1/agents` — builtin first and preselected so Enter keeps the one-keystroke flow, other agents sorted by name, external-framework agents rendered disabled with a "not supported yet" title. A bound session shows a monogram chip in the sidebar row and the conversation header (name/avatar data joined client-side from the same `GET /v1/agents` fetch, not carried per-message).
 
 ## Constraints
 
 - Feature subsystem, not a crate: no `baybo-agent-profiles` crate until there is behavior beyond CRUD. Domain types in `model`, port in `store`, impl in `storage`, policy in `gateway` handlers.
-- **No runtime coupling in v1.** `ContextManager`, `AgentLoop`, the spawn router, and `SubagentRegistry` are untouched. Deleting a custom profile can strand nothing, because nothing references profiles yet.
+- **Runtime coupling is confined to `baybo`-framework binding.** A bound session resolves prompt/LLM/skills/memory live from the profile (see [Session binding](#session-binding)); the spawn router and `SubagentRegistry` are untouched — subagent sessions are never agent-bound, and `claude`/`codex` profiles cannot be bound to a top-level session yet. Deleting a bound profile is safe by construction: every live-read site tolerates a missing row and falls back to builtin behavior with a `warn!` (see "Deletion tolerance" above) rather than erroring the session.
 - Strictly disjoint from `SubagentProfile` and from the workspace Soul; the only shared vocabulary is `baybo-model` (`ExternalAgentKind`, `LlmEntryName`, the backend tag strings).
-- All cross-entity references are soft (FKs are off): `avatar_blob_id` into `blobs`, `llm` into `baybo.json`. Write-time validation where it's cheap and crisp (llm, avatar), tolerance at read time everywhere.
+- All cross-entity references are soft (FKs are off): `avatar_blob_id` into `blobs`, `llm` into `baybo.json`, `sessions.agent_id` into `agent_profiles`. Write-time validation where it's cheap and crisp (llm, avatar, session-creation `agent_id`), tolerance at read time everywhere.
 - Only `name` carries an explicit length bound (`MAX_AGENT_PROFILE_NAME_CHARS`); `description` and `system_prompt` are deliberately bounded only by the admin request-body limit.
 - Profile rows are user data with a normal delete affordance — the session never-delete rule does not apply — but there is still no background sweeper of any kind, and orphaned avatar blobs stay inert.
 
 ## Deferred
 
-- **Session binding** — the consumer this schema was shaped for: a flat anti-clobber `sessions.agent_id` column with a targeted setter, `PUT /v1/chat/sessions/{session_id}/agent` persisting then live-re-pinning via an `AgentMessage` (the exact `last_llm` split), and `ContextManager` resolving the bound profile's prompt with `NULL` → Soul.
-- **Per-agent skills** — the envisioned model is each agent owning a workspace folder with its own skills (like Claude Code's `.claude/skills/`), discovered live. The read-only skills readout would then read that agent's folder instead of the global registry. This is why skills are deliberately *not* a stored profile allow-list.
-- **External-framework top-level sessions** — `claude`/`codex`/`gemini` currently run only as subagent backends; a profile with an external framework needs the external-agent leg generalized to top-level chat. (`gemini` exists as a runtime backend but isn't offered as an agent-profile framework.)
+- **External-framework top-level sessions** — `claude`/`codex`/`gemini` currently run only as subagent backends; a profile with an external framework needs the external-agent leg generalized to top-level chat, including `sessions.external_resume_key` and working-dir materialization. (`gemini` exists as a runtime backend but isn't offered as an agent-profile framework.) See [`../todo/multi-agent-chat.md`](../todo/multi-agent-chat.md) "External-framework chat leg (Phase 2)".
 - **Markdown export/import** — if git-versioning of personas ever matters; DB stays authoritative.
 - **@-mention / slash selection** — unique names are already reserved for it.
 
@@ -165,11 +205,13 @@ Shape changes ride the standard openapi regen chain — see the header of `crate
 
 | Module | Role |
 |---|---|
-| `model` | `AgentProfileId` (ULID-minted string newtype), `AgentFramework` (+ `to_backend_kind`), `BUILTIN_AGENT_PROFILE_ID`, `MAX_AGENT_PROFILE_NAME_CHARS` |
-| `store` | `AgentProfileRow` / `AgentProfileUpdate` / `AgentProfileStore` port; `StorageError::Conflict` carries duplicate names |
-| `storage` | `LibsqlAgentProfileStore` (async `open` seeds the builtin), `agent_profiles` DDL in `init_db()`, `Store.agent_profile` bundle field |
-| `gateway` | `api/admin/agents.rs` handlers + DTOs, `AdminState.{agent_profile_store, blob_store}`, the shared `validate_llm_pin`; `GET /v1/skills` (now `{name, description}` from `all_summaries_sorted`) and `GET /v1/llm/models` feed the read-only skills readout and the model picker |
-| `skills` | `SkillRegistry::all_summaries_sorted()` is the live source rendered read-only in the skills readout |
-| `agent` | the `LlmPoolHandle` on `AdminState` validates the `llm` pin at write time |
-| `web` | `AgentsPage.tsx`, route + `IconRail` entry, blob upload/render reuse |
-| `subagent` / `context` | **none in v1** — first coupling arrives with session binding (Deferred) |
+| `model` | `AgentProfileId` (ULID-minted string newtype), `AgentFramework` (+ `to_backend_kind`), `BUILTIN_AGENT_PROFILE_ID`, `MAX_AGENT_PROFILE_NAME_CHARS`; `SessionState.{agent_id, agent_framework}` + `agent_id_or_builtin()` |
+| `store` | `AgentProfileRow` / `AgentProfileUpdate` / `AgentProfileStore` port; `StorageError::Conflict` carries duplicate names; `SessionStore::set_agent_binding` (write-once) |
+| `storage` | `LibsqlAgentProfileStore` (async `open` seeds the builtin), `agent_profiles` DDL in `init_db()`, `Store.agent_profile` bundle field; `sessions.{agent_id, agent_framework}` columns |
+| `gateway` | `api/admin/agents.rs` handlers + DTOs, `AdminState.{agent_profile_store, blob_store}`, the shared `validate_llm_pin`; `api/admin/chat.rs` `resolve_agent_binding` at session creation; `GET /v1/skills` (`?agent_id=` scoped) and `GET /v1/llm/models` feed the read-only skills readout and the model picker |
+| `skills` | `SkillRegistry::{load_agent_skills_root, get_scoped, summaries_for_agent}` — the agent-scoped view backing both the runtime overlay and the Agents-page skills readout |
+| `agent` | the `LlmPoolHandle` on `AdminState` validates the `llm` pin at write time; `resolve_initial_llm` (session pin > live profile pin > default) at actor spawn/hydration; `ToolContext.agent_id` threading |
+| `context` | `ContextManager::try_resolve_system_prompt`'s agent-profile arm (live at seed + post-compaction reseed); `agent_scope()` feeds every skill-listing consumer |
+| `memory` | `MemoryContext.agent_id` partition key, sourced from `agent_id_or_builtin()` |
+| `web` | `AgentsPage.tsx` (management + scoped skills readout), `AgentPicker.tsx` + session chips (chat consumption), route + `IconRail` entry, blob upload/render reuse |
+| `subagent` | none — `SubagentProfile` / `SubagentRegistry` are untouched; subagent sessions are never agent-bound |

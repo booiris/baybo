@@ -31,6 +31,21 @@ The first built-in is `baybo-cli` — a non-user-invocable skill that tells the 
     └── scripts/…    # supporting files (not auto-loaded; referenced from the body)
 ```
 
+### Agent-scoped overlay
+
+A chat session bound to an agent profile ([`agent-profiles.md`](agent-profiles.md#session-binding)) sees a second layer on top of the shared set. `SkillRegistry::load_agent_skills_root(<workspace>/agent-skills/)` scans `<root>/<agent_id>/<skill-name>/SKILL.md` for every subdirectory of the agent-skills root (skipping `.git`) and loads each into a separate `agent_skills` map keyed by `(agent_id, skill_name)` — distinct from the shared `skills` map, so one agent's folder can never leak into another agent's, or an unbound session's, listing.
+
+Every scope-aware entry point takes the session's `agent_id: Option<&str>` (`None` = builtin/unbound — shared set only):
+
+- `SkillRegistry::get_scoped(agent, name)` — the agent's overlay first, falling back to the shared set.
+- `SkillRegistry::summaries_for_agent(agent)` — shared ∪ the agent's overlay, sorted by name; `None` is exactly `all_summaries_sorted()`.
+
+**The agent's copy wins on a same-name collision, for that agent only** — other agents and unbound sessions still see the shared skill unchanged. `ContextManager::agent_scope()` threads the bound session's `agent_id` into every consumer of these two methods — the per-turn skill-listing reminder, the `Skill` tool's lookup, and slash-command expansion — so an agent's private skills only ever surface in that agent's own sessions.
+
+`reload()` covers both layers: it re-scans every `load_dir` root into the shared map **and** re-scans the remembered agent-skills root into the per-agent map, so an operator editing either `<workspace>/skills/` or `<workspace>/agent-skills/<agent_id>/` and refreshing (the TUI Skills dashboard's `r` key, or after `SkillInstall`/`SkillUninstall`) picks up both kinds of change in one call.
+
+Risk assessment, trust levels, and validation apply to agent skills identically to shared ones — an agent folder is `Trusted` workspace content, and the assessor's cache keys on content hash regardless of which map the skill came from. `SkillInstall` / `SkillUninstall` still only target the shared `<workspace>/skills/` folder; agent folders are hand-authored.
+
 A minimal `SKILL.md`:
 
 ```markdown
@@ -93,7 +108,11 @@ agent loop publishes a per-turn **system reminder** listing every
 agent-invocable, non-`Untrusted` skill (name, description, optional
 `argument-hint`); the LLM pulls one in by calling the `Skill` tool
 (see [`tools.md`](./tools.md#skill-tool)). The list comes from
-`SkillRegistry::all_summaries_sorted()` — a lightweight projection
+`SkillRegistry::summaries_for_agent(agent_scope)` — `ContextManager::agent_scope()`
+supplies the bound session's `agent_id` (`None` for builtin/unbound, in
+which case this is exactly `all_summaries_sorted()`) so a session only
+ever sees the shared set plus its own [agent overlay](#agent-scoped-overlay).
+Both return a lightweight projection
 (`SkillSummary`) carrying only the fields needed for the listing.
 Cloning every `SkillDefinition`'s `prompt_template` / `allowed_tools`
 / `requirements` per turn would burn allocator pressure proportional
@@ -217,7 +236,8 @@ Skills declare `allowed-tools`, but this is only one input to the upper bound. B
 | `agent` | `AgentLoop` calls `SkillRegistry.select()` and executes skills |
 | `tools` | Skills declare allowed tool sets but don't execute tools directly. The `Skill` builtin (registered from `baybo-skills::tools`, parallel to `baybo-cron::tools`) is the LLM's single entry point for invoking them. |
 | `trace` | Records skill version, source, and execution results |
-| `workspace` | Provides trusted local skill directories for hot reload |
+| `workspace` | Provides trusted local skill directories for hot reload, including the `agent-skills/` root ([`workspace.md`](workspace.md)) |
+| `agent-profiles` | Sessions bound to a profile carry the `agent_id` that scopes the overlay ([`agent-profiles.md`](agent-profiles.md#session-binding)) |
 
 ## References
 

@@ -30,10 +30,11 @@ reason to forbid the whole shape.
 // crates/memory/src/lib.rs
 pub struct RecalledMemory { pub content: String }
 
-// Carries the real (user, session, job) + the trace recorder + the enclosing
+// Carries the real (user, session, job) + the session's agent_id (partition
+// key, see "Partitioning by agent") + the trace recorder + the enclosing
 // memory step. `scoped_llm_call(begin, body)` opens an LlmCall span under that
 // step and hands `body` an Attribution bound to it, for billed sub-calls.
-pub struct MemoryContext { /* user_id, session_id, job_id, recorder, step */ }
+pub struct MemoryContext { /* user_id, agent_id, session_id, job_id, recorder, step */ }
 
 #[async_trait]
 pub trait Memory: Send + Sync {
@@ -94,6 +95,15 @@ Recalled memories enter the prompt as a **persisted, framed** block — never
   until compression folds it. Hidden from the chat bubble surface
   (`from_user() == false`), so it never renders as a user turn.
 - The core does **no** dedup — it injects exactly what `recall` returns.
+
+## Partitioning by agent
+
+`MemoryContext.agent_id` is the partition key threaded through every hook call: the agent loop sets it from `SessionState::agent_id_or_builtin()` — the session's bound [agent profile](agent-profiles.md#session-binding) id, or `BUILTIN_AGENT_PROFILE_ID` (`"baybo"`) for an unbound session. Agent A's session never recalls or writes into Agent B's partition, even though both share one Mem0 project / OpenViking deployment. `"baybo"` matches both backends' pre-existing hardcoded default, so upgrading a workspace that already has real memories keeps them exactly where builtin sessions look for them; only a new custom agent's partition starts empty.
+
+- **mem0**: `recall`'s `POST /v2/memories/search/` filters on `{AND: [{user_id}, {agent_id}]}`; `on_job_complete`'s `POST /v1/memories/` write carries `agent_id` alongside `user_id`.
+- **OpenViking**: every request carries `X-OpenViking-Agent: <agent_id>` (previously hardcoded to `"baybo"` for every session).
+
+Memory tools (`mem0_*`, `viking_*`) get the same scoping through `ToolContext.agent_id` (`Option<AgentProfileId>`; `None` for an unbound session falls back to the backend's own default constant — `mem0::DEFAULT_AGENT_ID` / `openviking::DEFAULT_AGENT`, both `"baybo"`). mem0 tools accept an explicit `agentId` param that overrides the session default per call; OpenViking tools do not expose an override. This is a deliberate **scope-narrowing** from the tools' pre-binding behavior: `mem0_delete{all: true}` and `mem0_list` used to default to every memory the user owned across all agents and now default to the calling session's own agent partition, matching every other tool's default — an explicit `agentId`/cross-agent query is still possible where the tool supports the param.
 
 ## Flow & hook points
 
@@ -173,14 +183,17 @@ the typed config for future backends.
 ### `mem0` (`baybo_memory::mem0`)
 
 Hosted SaaS via the Mem0 Platform REST API. Per-user scope comes from the
-caller's `user_id` at every call; `agent_id` defaults to `"baybo"` (deployment
-identity) on writes and is overridable per tool call. Tool reads accept an
-optional `scope: "session"` that narrows to the current session via Mem0's
-`run_id` (sourced from `ToolContext::session_id`).
+caller's `user_id` at every call; `agent_id` (see [Partitioning by
+agent](#partitioning-by-agent)) scopes both hook calls to the session's bound
+agent — not overridable there. Tool calls default to the same session agent
+via `ToolContext.agent_id` but may override it with an explicit `agentId`
+param. Tool reads separately accept an optional `scope: "session"` that
+narrows to the current session via Mem0's `run_id` (sourced from
+`ToolContext::session_id`).
 
 | Hook | Behaviour |
 | --- | --- |
-| `recall` | `POST /v2/memories/search/` with `{query, filters: {AND: [{user_id}]}, rerank, top_k}`; returns the `memory` text verbatim. |
+| `recall` | `POST /v2/memories/search/` with `{query, filters: {AND: [{user_id}, {agent_id}]}, rerank, top_k}`; returns the `memory` text verbatim. |
 | `on_job_complete` | `POST /v1/memories/` with `{messages: [{user,assistant}], user_id, agent_id}`; the Mem0 server runs LLM-based fact extraction. |
 | `on_session_end` | No-op (Mem0 has no session concept; extraction is per-`add`). |
 | `tools()` | Eight `mem0_*` tools — the model's explicit-signal path (see below). |
@@ -194,9 +207,9 @@ verbatim (`infer: false`) — the model already decided what is worth keeping.
 | `mem0_search` | `POST /v2/memories/search/` | Semantic search; optional `scope` / `categories` / advanced `filters`. |
 | `mem0_add` | `POST /v1/memories/` (`infer: false`) | Store fact(s) verbatim; `category` / `importance` / `metadata`; `longTerm: false` → session-scoped. |
 | `mem0_get` | `GET /v1/memories/{id}/` | Fetch one memory by id. |
-| `mem0_list` | `POST /v2/memories/` | List the user's memories (paginated). |
+| `mem0_list` | `POST /v2/memories/` | List the user's memories in the session's agent partition (paginated); `agentId` overrides. |
 | `mem0_update` | `PUT /v1/memories/{id}/` | Replace a memory's text in place. |
-| `mem0_delete` | `DELETE /v1/memories/{id}/` or `?user_id=` | Delete by id, search-and-delete by `query`, or `all: true` + `confirm: true`. |
+| `mem0_delete` | `DELETE /v1/memories/{id}/` or `?user_id=` | Delete by id, search-and-delete by `query`, or `all: true` + `confirm: true` — `query`/`all` variants scope to the session's agent partition by default; `agentId` overrides. |
 | `mem0_event_list` | `GET /v1/events/` | List recent background processing events. |
 | `mem0_event_status` | `GET /v1/event/{id}/` | Status / latency / results of one event. |
 
@@ -210,9 +223,11 @@ env `<api_key_name>`. `<name>` defaults to `MEM0_API_KEY` when
 ### `openviking` (`baybo_memory::openviking`)
 
 Self-hosted context database. Baybo `SessionId` maps 1:1 to the OpenViking
-session id; `X-OpenViking-Account` (config) and `X-OpenViking-Agent`
-(hardcoded `"baybo"`) carry deployment identity, `X-OpenViking-User` carries
-`MemoryContext::user_id()` per call.
+session id; `X-OpenViking-Account` (config) carries deployment identity,
+`X-OpenViking-Agent` carries `MemoryContext::agent_id()` (the session's bound
+agent, `"baybo"` for an unbound one — see [Partitioning by
+agent](#partitioning-by-agent)), and `X-OpenViking-User` carries
+`MemoryContext::user_id()`, all per call.
 
 | Hook | Behaviour |
 | --- | --- |
@@ -253,10 +268,11 @@ hot-reload, so `setup` prints a restart hint.
 
 | Module      | Role                                                                            |
 | ----------- | ------------------------------------------------------------------------------- |
-| `model`     | `MessageSource::RecalledMemory`, `ChatMessage::recalled_memory`                 |
+| `model`     | `MessageSource::RecalledMemory`, `ChatMessage::recalled_memory`, `BUILTIN_AGENT_PROFILE_ID` |
 | `llm`       | `Attribution`; `BillableLlm`/`BoundBilledLlm` (memory's billed chat handle)     |
-| `tools`     | `Tool` / `ToolManifest` for `Memory::tools()`                                   |
+| `tools`     | `Tool` / `ToolManifest` for `Memory::tools()`; `ToolContext.agent_id` defaults memory-tool scoping |
 | `context`   | `<recalled_memory>` framing + `append_recalled_memory` + budget                 |
+| `agent-profiles` | `SessionState::agent_id_or_builtin()` is the source of `MemoryContext.agent_id` (see [Partitioning by agent](#partitioning-by-agent)) |
 | `agent`     | Drives `recall` / `on_job_complete`; `AgentLoopConfig.memory`                   |
 | `config`    | `MemoryConfig` (typed knobs + opaque `extra`)                                   |
 | `trace`     | `StepKind::MemoryRecall` / `MemoryWrite`                                         |

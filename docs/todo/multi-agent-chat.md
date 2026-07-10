@@ -36,7 +36,7 @@ Everything that is **content** follows the profile live, resolved at use time:
 | Facet | Resolved | Live effect of a profile edit |
 |---|---|---|
 | `system_prompt` | every context seed / post-compaction reseed | next seed/reseed picks it up |
-| `llm` pin | every turn | next turn (unless the session explicitly switched models) |
+| `llm` pin | resolved at actor spawn/hydration — an explicit per-session switch wins immediately; a profile edit lands on the next hydration | next hydration (cold start, or after an idle reap), unless the session explicitly switched models |
 | agent skill folder | per-turn listing + `Skill` tool call (hot-reloadable) | next turn |
 | name / avatar | display only, client-side | refetch |
 
@@ -53,6 +53,15 @@ pub struct AgentBinding {
     // + a store handle for live content lookups (prompt, llm pin)
 }
 ```
+
+**Phase 1 realization:** no separate `AgentBinding` type exists yet — the same
+two fields live directly on `Session.state.{agent_id, agent_framework}`
+(`SessionState::agent_id_or_builtin()` is the "baybo for unbound" accessor),
+and the store handle is a plain `Arc<dyn AgentProfileStore>` threaded to the
+handful of consumers that need a live read (`ContextManager`, the router's
+`resolve_initial_llm`). Same data, no extra indirection; a named `AgentBinding`
+struct is worth introducing only when Phase 2's external-framework branch
+needs one value to carry through the turn-dispatch seam.
 
 - **`framework = Baybo`** — today's `AgentLoop`, parameterized by the binding:
   prompt resolution gains an agent-profile arm, skill listing takes an agent
@@ -78,6 +87,12 @@ agent_id            TEXT,   -- NULL = builtin baybo (all existing rows)
 agent_framework     TEXT,   -- NULL = baybo; AgentFramework::as_str() snapshot at creation
 external_resume_key TEXT    -- external sessions only; write-once, from the CLI's init event
 ```
+
+Phase 1 ships only `agent_id` and `agent_framework` — both are cheap guarded
+`ALTER TABLE` migrations, landed and consumed as described in this document.
+`external_resume_key` has no baybo-framework use, so it lands with the Phase 2
+PR alongside the code that writes and reads it (also a cheap guarded ALTER —
+there is no reason to pre-add an unused column).
 
 - No `agent_profiles` schema change — the v1 shape was designed for this.
 - The external chat working dir derives deterministically —
