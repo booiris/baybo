@@ -15,6 +15,18 @@ import {
  * — clients sometimes drop messages with malformed text. */
 export const TELEGRAM_CAPTION_MAX = 1024;
 
+/** Raster formats `sendPhoto` actually accepts. The wire's `image` kind is a
+ * *rendering* hint — it means "a surface that draws images should draw this" —
+ * so it also covers `image/svg+xml`, which `sendPhoto` rejects outright. Ship
+ * anything outside this set as a document rather than lose the file. */
+const TELEGRAM_PHOTO_MIMES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+  "image/bmp",
+]);
+
 /** Anything grammy's `InputFile` constructor accepts as the file source.
  * We hand it a `Uint8Array` in production: grammy's bundled multipart
  * code runs on bun via `--target=bun`, and `yield* webReadableStream`
@@ -47,7 +59,9 @@ export async function sendTelegramAttachment(
     const opts = { ...captionOpt, ...thread };
     switch (att.kind) {
       case "image":
-        return bot.api.sendPhoto(chat.chatId, file, opts);
+        return TELEGRAM_PHOTO_MIMES.has(att.mime_type)
+          ? bot.api.sendPhoto(chat.chatId, file, opts)
+          : bot.api.sendDocument(chat.chatId, file, opts);
       case "audio":
         // Voice notes (`audio/ogg` with OPUS) render with the bubble
         // waveform; everything else is treated as music.

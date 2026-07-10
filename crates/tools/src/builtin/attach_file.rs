@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use baybo_model::{ContentBlock, TrustLevel};
+use baybo_model::{BlobRef, ContentBlock, TrustLevel};
 use baybo_store::BlobStore;
 use futures::StreamExt;
 use serde::Deserialize;
@@ -158,20 +158,36 @@ impl Tool for AttachFileTool {
             .await
             .map_err(|e| ToolError::Execution(format!("blob upload: {e}")))?;
 
-        let attachment = ContentBlock::File {
-            blob: blob_ref,
-            filename: filename.clone(),
-            mime_type: mime.clone(),
-        };
-
         // The agent loop hoists these attachments onto the turn's final
         // assistant message, so the file persists with the transcript and
         // survives a reload. Nothing has reached the user yet — say so, or
         // the model reports a delivery that a cancelled turn never makes.
         Ok(ToolOutput::WithAttachments {
             text: format!("Attached {filename} ({size} bytes, {mime}) to your final reply."),
-            attachments: vec![attachment],
+            attachments: vec![media_block(blob_ref, filename, mime)],
         })
+    }
+}
+
+/// Pick the block variant by MIME, because the variant *is* the wire's
+/// `AttachmentKind` (`split_content` maps one to the other) and `kind` is what
+/// makes a surface render a thumbnail instead of a paperclip chip. This mirrors
+/// `attachmentKind` in `app/ios/web/src/types.ts` and the web chat's own
+/// bucketing, which that comment already names the gateway as sharing.
+///
+/// `Image` / `Audio` carry no filename — the model has no slot for one, and no
+/// surface shows a name beside a rendered image.
+fn media_block(blob: BlobRef, filename: String, mime_type: String) -> ContentBlock {
+    if mime_type.starts_with("image/") {
+        ContentBlock::Image { blob, mime_type }
+    } else if mime_type.starts_with("audio/") {
+        ContentBlock::Audio { blob, mime_type }
+    } else {
+        ContentBlock::File {
+            blob,
+            filename,
+            mime_type,
+        }
     }
 }
 
@@ -272,6 +288,39 @@ mod tests {
             other => panic!("expected File block, got {other:?}"),
         }
         assert_eq!(mem.len(), 1);
+    }
+
+    /// The block variant IS the wire's `AttachmentKind`, and `kind` is what
+    /// decides thumbnail vs paperclip chip. A `File` block for a PNG showed the
+    /// agent's screenshot as `📎 chart.png`.
+    #[tokio::test]
+    async fn media_is_bucketed_by_mime_not_hardcoded_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
+        let tool = AttachFileTool::new(store);
+
+        let cases: [(&str, &str, &str); 4] = [
+            ("chart.png", "image", "image/png"),
+            ("diagram.svg", "image", "image/svg+xml"),
+            ("note.mp3", "audio", "audio/mpeg"),
+            ("report.pdf", "file", "application/pdf"),
+        ];
+        for (name, want_kind, want_mime) in cases {
+            let p = dir.path().join(name);
+            tokio::fs::write(&p, b"bytes").await.unwrap();
+            let out = tool.execute(json!({ "path": p }), &ctx()).await.unwrap();
+            let ToolOutput::WithAttachments { attachments, .. } = out else {
+                panic!("expected WithAttachments for {name}");
+            };
+            let (kind, mime) = match &attachments[0] {
+                ContentBlock::Image { mime_type, .. } => ("image", mime_type),
+                ContentBlock::Audio { mime_type, .. } => ("audio", mime_type),
+                ContentBlock::File { mime_type, .. } => ("file", mime_type),
+                other => panic!("expected media block for {name}, got {other:?}"),
+            };
+            assert_eq!(kind, want_kind, "{name}");
+            assert_eq!(mime, want_mime, "{name}");
+        }
     }
 
     #[tokio::test]
