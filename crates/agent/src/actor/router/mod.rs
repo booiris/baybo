@@ -111,6 +111,15 @@ impl RateLimiter {
     }
 }
 
+/// LLM parameters resolved at actor spawn: the effective model pin and the
+/// bound agent profile's reasoning effort. Cheap to clone; `Default` = pool
+/// default model, provider-configured effort.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnLlmChoice {
+    pub initial_llm: Option<LlmEntryName>,
+    pub reasoning_effort: Option<baybo_model::ReasoningEffort>,
+}
+
 /// Builds and spawns an [`AgentActor`] for `session`, returning its
 /// mailbox. `actor_token` is installed as the actor's
 /// `VolatileResources::actor_token` — callers that need to cancel
@@ -126,7 +135,7 @@ impl RateLimiter {
 pub type ActorSpawner = Arc<
     dyn Fn(
             Session,
-            /* initial_llm */ Option<LlmEntryName>,
+            /* llm_choice */ SpawnLlmChoice,
             mpsc::Sender<AgentOutput>,
             /* actor_token */ CancellationToken,
         ) -> MailboxSender<AgentMessage>
@@ -146,11 +155,11 @@ pub(crate) fn build_oneshot_actor(
     actor_spawner: &ActorSpawner,
     parent_token: &CancellationToken,
     session: Session,
-    initial_llm: Option<LlmEntryName>,
+    llm_choice: SpawnLlmChoice,
     response_tx: mpsc::Sender<AgentOutput>,
 ) -> (MailboxSender<AgentMessage>, CancellationToken) {
     let actor_token = parent_token.child_token();
-    let mailbox = actor_spawner(session, initial_llm, response_tx, actor_token.clone());
+    let mailbox = actor_spawner(session, llm_choice, response_tx, actor_token.clone());
     (mailbox, actor_token)
 }
 
@@ -163,9 +172,10 @@ pub struct Router {
     cost_manager: Arc<CostManager>,
     rate_limiter: RateLimiter,
     actor_spawner: ActorSpawner,
-    /// Live agent-profile reads for [`user_input::resolve_initial_llm`] —
+    /// Live agent-profile reads for [`user_input::resolve_spawn_llm`] —
     /// spawn-time LLM precedence needs the bound profile's current `llm`
-    /// pin, not a snapshot taken at router construction.
+    /// pin (and its `reasoning_effort`), not a snapshot taken at router
+    /// construction.
     agent_profile_store: Arc<dyn AgentProfileStore>,
     /// Job lifecycle handle — subscribe to terminal-event broadcasts and
     /// reconcile via the store on broadcast lag.
@@ -290,7 +300,7 @@ impl Router {
     fn spawn_oneshot_actor(
         &self,
         session: Session,
-        initial_llm: Option<LlmEntryName>,
+        llm_choice: SpawnLlmChoice,
         response_tx: mpsc::Sender<AgentOutput>,
         parent_token: &CancellationToken,
     ) -> (MailboxSender<AgentMessage>, CancellationToken) {
@@ -298,7 +308,7 @@ impl Router {
             &self.actor_spawner,
             parent_token,
             session,
-            initial_llm,
+            llm_choice,
             response_tx,
         )
     }

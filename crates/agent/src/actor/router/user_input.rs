@@ -8,8 +8,7 @@ use baybo_channels::{
 };
 use baybo_job::{CancelReason, JobStatusKind};
 use baybo_model::{
-    ChannelType, ContentBlock, ControlEventKind, JobId, LlmEntryName, MessageMetadata, Session,
-    SessionId,
+    ChannelType, ContentBlock, ControlEventKind, JobId, MessageMetadata, Session, SessionId,
 };
 use baybo_store::AgentProfileStore;
 use tracing::{debug, warn};
@@ -17,7 +16,7 @@ use tracing::{debug, warn};
 use crate::actor::AgentMessage;
 use crate::actor::supervisor::InFlightJob;
 
-use super::Router;
+use super::{Router, SpawnLlmChoice};
 
 /// How long `/stop` waits for a cancelled turn to fully unwind (persisting its
 /// partial assistant row) before anchoring the stop control events. Generous —
@@ -25,27 +24,44 @@ use super::Router;
 /// durable stop log indefinitely.
 const STOP_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Effective initial LLM pin for a spawning actor: the session's explicit
-/// pin wins; otherwise the bound agent profile's pin (read live, so a
-/// profile edit lands on the next hydration); otherwise pool default.
-pub(crate) async fn resolve_initial_llm(
+/// Effective LLM parameters for a spawning actor: the session's explicit
+/// model pin wins for the MODEL, but the bound agent profile is still
+/// fetched (even when the pin is set) because `reasoning_effort` only ever
+/// comes from the profile — read live, so a profile edit lands on the next
+/// hydration. Unbound sessions skip the fetch entirely and carry only the
+/// session's pin (or pool default).
+pub(crate) async fn resolve_spawn_llm(
     store: &Arc<dyn AgentProfileStore>,
     session: &Session,
-) -> Option<LlmEntryName> {
-    if let Some(pin) = &session.state.last_llm {
-        return Some(pin.clone());
-    }
-    let agent_id = session.state.agent_id.as_ref()?;
-    match store.get(agent_id).await {
-        Ok(Some(profile)) => profile.llm,
-        Ok(None) => None,
+) -> SpawnLlmChoice {
+    let Some(agent_id) = session.state.agent_id.as_ref() else {
+        return SpawnLlmChoice {
+            initial_llm: session.state.last_llm.clone(),
+            ..Default::default()
+        };
+    };
+    let profile = match store.get(agent_id).await {
+        Ok(Some(profile)) => profile,
+        Ok(None) => {
+            return SpawnLlmChoice {
+                initial_llm: session.state.last_llm.clone(),
+                ..Default::default()
+            };
+        }
         Err(e) => {
             warn!(
                 agent_id = %agent_id, error = %e,
-                "agent profile llm lookup failed; using default-llm"
+                "agent profile lookup failed at spawn; using defaults"
             );
-            None
+            return SpawnLlmChoice {
+                initial_llm: session.state.last_llm.clone(),
+                ..Default::default()
+            };
         }
+    };
+    SpawnLlmChoice {
+        initial_llm: session.state.last_llm.clone().or(profile.llm),
+        reasoning_effort: profile.reasoning_effort,
     }
 }
 
@@ -165,15 +181,16 @@ impl Router {
 
         // Route to the session's actor, lazily spawning one if the
         // session has no live actor yet. The spawner pins the loop to
-        // `resolve_initial_llm`'s precedence — the session's explicit
+        // `resolve_spawn_llm`'s precedence — the session's explicit
         // model-switch pin, else the bound agent profile's `llm`, else
-        // pool default. A live actor is re-pinned in place via
-        // `AgentMessage::SetModel`, so this read only matters for a cold
-        // spawn / post-eviction hydration. (`SubagentSpawnRequest` is the
-        // other path that pins a non-default model, via `model_tier`.)
-        // Resolved here (before the sync `route_or_spawn` closure) because
-        // the profile lookup is async and the closure isn't.
-        let pinned = resolve_initial_llm(&self.agent_profile_store, &session).await;
+        // pool default (plus the bound profile's `reasoning_effort`). A
+        // live actor is re-pinned in place via `AgentMessage::SetModel`,
+        // so this read only matters for a cold spawn / post-eviction
+        // hydration. (`SubagentSpawnRequest` is the other path that pins a
+        // non-default model, via `model_tier`.) Resolved here (before the
+        // sync `route_or_spawn` closure) because the profile lookup is
+        // async and the closure isn't.
+        let llm_choice = resolve_spawn_llm(&self.agent_profile_store, &session).await;
         let response_tx = self.supervisor.response_tx().clone();
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
@@ -184,7 +201,7 @@ impl Router {
                 AgentMessage::UserInput(Box::new(incoming)),
                 || {
                     let actor_token = parent_token.child_token();
-                    actor_spawner(session, pinned, response_tx, actor_token)
+                    actor_spawner(session, llm_choice, response_tx, actor_token)
                 },
             )
             .await;
@@ -344,7 +361,7 @@ impl Router {
         session: &baybo_model::Session,
         message: AgentMessage,
     ) -> bool {
-        let pinned = resolve_initial_llm(&self.agent_profile_store, session).await;
+        let llm_choice = resolve_spawn_llm(&self.agent_profile_store, session).await;
         let response_tx = self.supervisor.response_tx().clone();
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
@@ -352,7 +369,7 @@ impl Router {
         self.supervisor
             .route_or_spawn(session_id, message, || {
                 let actor_token = parent_token.child_token();
-                actor_spawner(session, pinned, response_tx, actor_token)
+                actor_spawner(session, llm_choice, response_tx, actor_token)
             })
             .await
     }
@@ -610,6 +627,7 @@ fn build_stop_notice(cancelled_turn: bool, background: &[(SessionId, InFlightJob
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baybo_model::LlmEntryName;
     use tokio_util::sync::CancellationToken;
 
     fn text(s: &str) -> Vec<ContentBlock> {
@@ -721,7 +739,7 @@ mod tests {
             framework: baybo_model::AgentFramework::Baybo,
             llm,
             allowed_models: Vec::new(),
-            reasoning_effort: None,
+            reasoning_effort: Some(baybo_model::ReasoningEffort::High),
             builtin: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -729,7 +747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_llm_prefers_session_pin_then_profile_pin() {
+    async fn spawn_llm_resolves_pin_and_effort() {
         use baybo_store::test_support::MemoryAgentProfileStore;
         let store = MemoryAgentProfileStore::new();
         store.insert(profile_row("A1", Some(LlmEntryName::from("profile-pin"))));
@@ -737,26 +755,33 @@ mod tests {
 
         let mut session = make_session();
 
-        // Unbound, no pin → None (pool default).
-        assert_eq!(resolve_initial_llm(&store, &session).await, None);
+        // Unbound → all defaults, no fetch.
+        let choice = resolve_spawn_llm(&store, &session).await;
+        assert_eq!(choice.initial_llm, None);
+        assert_eq!(choice.reasoning_effort, None);
 
-        // Bound, no explicit pin → profile pin.
+        // Bound, no explicit pin → profile pin + profile effort.
         session.state.agent_id = Some(baybo_model::AgentProfileId::from("A1"));
+        let choice = resolve_spawn_llm(&store, &session).await;
+        assert_eq!(choice.initial_llm, Some(LlmEntryName::from("profile-pin")));
         assert_eq!(
-            resolve_initial_llm(&store, &session).await,
-            Some(LlmEntryName::from("profile-pin"))
+            choice.reasoning_effort,
+            Some(baybo_model::ReasoningEffort::High)
         );
 
-        // Explicit session pin always wins.
+        // Explicit session pin wins for the MODEL, effort still applies.
         session.state.last_llm = Some(LlmEntryName::from("user-pick"));
+        let choice = resolve_spawn_llm(&store, &session).await;
+        assert_eq!(choice.initial_llm, Some(LlmEntryName::from("user-pick")));
         assert_eq!(
-            resolve_initial_llm(&store, &session).await,
-            Some(LlmEntryName::from("user-pick"))
+            choice.reasoning_effort,
+            Some(baybo_model::ReasoningEffort::High)
         );
 
-        // Deleted profile degrades to default.
-        session.state.last_llm = None;
+        // Deleted profile degrades to pin-only defaults.
         session.state.agent_id = Some(baybo_model::AgentProfileId::from("GONE"));
-        assert_eq!(resolve_initial_llm(&store, &session).await, None);
+        let choice = resolve_spawn_llm(&store, &session).await;
+        assert_eq!(choice.initial_llm, Some(LlmEntryName::from("user-pick")));
+        assert_eq!(choice.reasoning_effort, None);
     }
 }

@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
-use crate::actor::router::{ActorSpawner, build_oneshot_actor};
+use crate::actor::router::{ActorSpawner, SpawnLlmChoice, build_oneshot_actor};
 use crate::actor::subagent::await_subagent_terminal;
 use crate::actor::supervisor::AgentSupervisor;
 use crate::external_agent::{
@@ -312,7 +312,10 @@ impl ActorSubagentSpawner {
             &self.actor_spawner,
             &effective_parent_token,
             child_session,
-            llm,
+            SpawnLlmChoice {
+                initial_llm: llm,
+                ..Default::default()
+            },
             output_tx,
         );
 

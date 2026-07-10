@@ -25,7 +25,9 @@ use baybo_job::JobLifecycle;
 use baybo_job::test_support::MemoryJobStore;
 use baybo_llm::test_support::StubLlm;
 use baybo_llm::{LlmCompletion, ModelPricing};
-use baybo_model::{ChannelType, ContentBlock, LlmEntryName, MessageMetadata, Session, User};
+use baybo_model::{
+    ChannelType, ContentBlock, LlmEntryName, MessageMetadata, ReasoningEffort, Session, User,
+};
 use baybo_security::test_support::MemorySecretStore;
 use baybo_security::{LeakDetector, SecretVault};
 use baybo_skills::SkillRegistry;
@@ -198,6 +200,9 @@ pub struct AgentTestHarnessBuilder {
     /// fixture whose call blocks until cancelled) when `StubLlm`'s
     /// return-immediately contract doesn't fit.
     llm: Option<Arc<dyn LlmCompletion>>,
+    /// Per-agent reasoning effort fed to the loop's `AgentLoopConfig`.
+    /// Defaults to `None` (provider-default effort).
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -217,6 +222,7 @@ impl Default for AgentTestHarnessBuilder {
             compression_threshold: None,
             memory: None,
             llm: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -317,6 +323,13 @@ impl AgentTestHarnessBuilder {
     /// that blocks until its future is dropped, to test in-flight cancellation.
     pub fn with_llm(mut self, llm: Arc<dyn LlmCompletion>) -> Self {
         self.llm = Some(llm);
+        self
+    }
+
+    /// Set the per-agent reasoning effort threaded into the main loop's
+    /// `ChatRequest`s. Defaults to `None` (provider-default effort).
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
         self
     }
 
@@ -498,6 +511,7 @@ impl AgentTestHarnessBuilder {
         let agent_loop = AgentLoop::from_config(baybo_agent::agent_loop::AgentLoopConfig {
             llm_pool,
             initial_llm: None,
+            reasoning_effort: self.reasoning_effort,
             tool_registry: tool_registry.clone(),
             tool_executor: tool_executor.clone(),
             context_manager,

@@ -391,6 +391,10 @@ pub struct AgentLoop {
     /// The pin this loop resolves: `None` ⇒ pool default (user / cron
     /// actors); `Some` ⇒ a subagent's pinned entry name.
     initial_llm: Option<LlmEntryName>,
+    /// Per-agent reasoning effort for the MAIN loop's LLM calls; side-calls
+    /// (title generation, background compression, the progress observer)
+    /// stay provider-default regardless of this setting.
+    reasoning_effort: Option<baybo_model::ReasoningEffort>,
     tool_registry: Arc<ToolRegistry>,
     tool_executor: Arc<ToolExecutor>,
     context_manager: ContextManager,
@@ -462,6 +466,9 @@ pub struct AgentLoopConfig {
     pub llm_pool: crate::runtime::llm_pool::LlmPoolHandle,
     /// Initial pick for the active LLM. `None` ⇒ pool default.
     pub initial_llm: Option<LlmEntryName>,
+    /// Per-agent reasoning effort for the MAIN loop's LLM calls; side-calls
+    /// stay provider-default.
+    pub reasoning_effort: Option<baybo_model::ReasoningEffort>,
     pub tool_registry: Arc<ToolRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
     pub context_manager: ContextManager,
@@ -509,6 +516,7 @@ impl AgentLoop {
         let AgentLoopConfig {
             llm_pool,
             initial_llm,
+            reasoning_effort,
             tool_registry,
             tool_executor,
             context_manager,
@@ -528,6 +536,7 @@ impl AgentLoop {
             llm_client,
             llm_pool,
             initial_llm,
+            reasoning_effort,
             tool_registry,
             tool_executor,
             context_manager,
@@ -1460,7 +1469,7 @@ impl AgentLoop {
             messages: self.context_manager.messages_for_llm(),
             temperature: None,
             tools: tool_defs,
-            reasoning_effort: None,
+            reasoning_effort: self.reasoning_effort.map(|e| e.as_str().to_owned()),
         };
 
         let input_messages = self.context_manager.build_call_input_marker().await;

@@ -488,6 +488,31 @@ async fn reasoning_deltas_round_trip_as_thinking_block_on_tool_loop() {
 }
 
 #[tokio::test]
+async fn main_loop_requests_carry_configured_reasoning_effort() {
+    let mut harness = AgentTestHarness::builder()
+        .with_reasoning_effort(baybo_model::ReasoningEffort::High)
+        .build();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("ok".into())]);
+    harness.send_text("hello").await.unwrap();
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let reqs = harness.stub_llm.captured_requests();
+    assert!(!reqs.is_empty());
+    assert_eq!(reqs[0].reasoning_effort.as_deref(), Some("high"));
+    harness.shutdown().await;
+
+    let mut plain = AgentTestHarness::builder().build();
+    plain
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("ok".into())]);
+    plain.send_text("hello").await.unwrap();
+    plain.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(plain.stub_llm.captured_requests()[0].reasoning_effort, None);
+    plain.shutdown().await;
+}
+
+#[tokio::test]
 async fn injection_marker_in_user_input_logs_warn() {
     // Capture tracing on this thread BEFORE building the harness so the
     // actor's spawn picks up the thread-local default subscriber.

@@ -4,7 +4,7 @@ use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
 
-use super::Router;
+use super::{Router, SpawnLlmChoice};
 
 impl Router {
     /// Handle a cron trigger by minting a fresh session and routing a
@@ -53,8 +53,12 @@ impl Router {
         );
 
         let response_tx = self.supervisor.response_tx().clone();
-        let (sender, _actor_token) =
-            self.spawn_oneshot_actor(session, None, response_tx, &self.actor_parent_token);
+        let (sender, _actor_token) = self.spawn_oneshot_actor(
+            session,
+            SpawnLlmChoice::default(),
+            response_tx,
+            &self.actor_parent_token,
+        );
 
         let trigger_msg = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),

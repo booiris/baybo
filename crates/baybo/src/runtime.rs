@@ -814,15 +814,19 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         ));
         Arc::new(
             move |session: baybo_model::Session,
-                  initial_llm: Option<LlmEntryName>,
+                  llm_choice: baybo_agent::router::SpawnLlmChoice,
                   response_tx: mpsc::Sender<AgentOutput>,
                   actor_token: CancellationToken| {
-                // `initial_llm` is `Some` either when the router's
-                // subagent handler resolved a model for a child (from the
-                // spawn request's `model_tier`) or when a user-channel
-                // session carries a per-session pin in
+                // `llm_choice.initial_llm` is `Some` either when the
+                // router's subagent handler resolved a model for a child
+                // (from the spawn request's `model_tier`) or when a
+                // user-channel session carries a per-session pin in
                 // `session.state.last_llm` (the chat model switch) that
                 // `handle_incoming` forwarded here; `None` ⇒ pool default.
+                // `llm_choice.reasoning_effort` comes from the bound agent
+                // profile (resolved at the router regardless of whether the
+                // model itself was pinned) and threads into the MAIN loop's
+                // LLM calls only.
 
                 // `summary_state_dir` connects the compressor's
                 // fast-path to the background refresh runner's output.
@@ -831,7 +835,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // See `docs/background-compression.md`.
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_pool: Arc::clone(&llm_pool),
-                    initial_llm,
+                    initial_llm: llm_choice.initial_llm,
+                    reasoning_effort: llm_choice.reasoning_effort,
                     tool_registry: Arc::clone(&tool_registry),
                     tool_executor: Arc::clone(&tool_executor),
                     context_manager: ContextManager::from_config(ContextManagerConfig {
