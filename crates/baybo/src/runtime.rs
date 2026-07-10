@@ -257,6 +257,10 @@ pub async fn build_managers(
                 "loaded skills from workspace"
             );
         }
+        let agent_loaded = reg.load_agent_skills_root(&workspace_paths.agent_skills_dir());
+        if agent_loaded > 0 {
+            info!(count = agent_loaded, "loaded per-agent skills");
+        }
         reg
     };
     let subagent_registry = {

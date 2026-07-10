@@ -57,9 +57,14 @@ impl From<&SkillDefinition> for SkillSummary {
 /// `RwLock<SkillRegistry>` wrapping at every call site.
 pub struct SkillRegistry {
     skills: DashMap<String, SkillDefinition>,
+    /// Per-agent overlay skills keyed `(agent_id, skill_name)`; loaded from
+    /// `<workspace>/agent-skills/<agent_id>/<skill>/SKILL.md`.
+    agent_skills: DashMap<(String, String), SkillDefinition>,
     /// Directories passed to `load_dir`, in first-seen order, so `reload`
     /// can replay the same scans without callers tracking paths.
     load_dirs: RwLock<Vec<PathBuf>>,
+    /// Root passed to `load_agent_skills_root`, replayed by `reload`.
+    agent_skills_root: RwLock<Option<PathBuf>>,
 }
 
 impl Default for SkillRegistry {
@@ -72,7 +77,9 @@ impl SkillRegistry {
     pub fn new() -> Self {
         Self {
             skills: DashMap::new(),
+            agent_skills: DashMap::new(),
             load_dirs: RwLock::new(Vec::new()),
+            agent_skills_root: RwLock::new(None),
         }
     }
 
@@ -155,6 +162,78 @@ impl SkillRegistry {
         loaded
     }
 
+    /// Scan `<root>/<agent_id>/<skill>/SKILL.md` into the per-agent overlay.
+    /// Remembers `root` so `reload` replays the scan. Returns the number of
+    /// agent skills loaded. A missing root is not an error (no agents have
+    /// private skills yet).
+    pub fn load_agent_skills_root(&self, root: &Path) -> usize {
+        *self.agent_skills_root.write() = Some(root.to_path_buf());
+        self.scan_agent_root(root)
+    }
+
+    fn scan_agent_root(&self, root: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return 0;
+        };
+        let mut loaded = 0;
+        for agent_entry in entries.flatten() {
+            let agent_dir = agent_entry.path();
+            if !agent_dir.is_dir() {
+                continue;
+            }
+            let Some(agent_id) = agent_entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            // Skip the git metadata of the agent-skills repo itself.
+            if agent_id == ".git" {
+                continue;
+            }
+            loaded += self.scan_agent_dir(&agent_id, &agent_dir);
+        }
+        loaded
+    }
+
+    /// Load every `<dir>/<name>/SKILL.md` under `dir` into the per-agent
+    /// overlay for `agent_id`. Mirrors `scan_dir` (depth-1 subdirs, require
+    /// `<sub>/SKILL.md`, log-and-skip on parse failure) but inserts into
+    /// `agent_skills` keyed by `(agent_id, skill_name)` instead of the
+    /// shared map.
+    fn scan_agent_dir(&self, agent_id: &str, dir: &Path) -> usize {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(err) => {
+                debug!(
+                    path = %dir.display(),
+                    error = %err,
+                    "agent skill directory not available; skipping"
+                );
+                return 0;
+            }
+        };
+
+        let mut loaded = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if !path.join("SKILL.md").is_file() {
+                continue;
+            }
+            match load_skill_from_dir(&path) {
+                Ok(skill) => {
+                    self.agent_skills
+                        .insert((agent_id.to_owned(), skill.name.clone()), skill);
+                    loaded += 1;
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to load agent skill");
+                }
+            }
+        }
+        loaded
+    }
+
     /// Re-scan every directory previously passed to `load_dir` and rebuild
     /// the skill set from what's on disk. Skills removed from disk drop
     /// out, edits take effect, and new subdirectories appear. Returns the
@@ -168,7 +247,12 @@ impl SkillRegistry {
         for dir in &dirs {
             self.scan_dir(dir);
         }
-        self.skills.len()
+        let root = self.agent_skills_root.read().clone();
+        self.agent_skills.clear();
+        if let Some(root) = root {
+            self.scan_agent_root(&root);
+        }
+        self.skills.len() + self.agent_skills.len()
     }
 
     /// Remove a skill by name.
@@ -179,6 +263,17 @@ impl SkillRegistry {
     /// Look up a skill by name, returning a cloned definition.
     pub fn get(&self, name: &str) -> Option<SkillDefinition> {
         self.skills.get(name).map(|e| e.value().clone())
+    }
+
+    /// Scoped lookup: the agent's overlay first, then the shared set.
+    /// `None` = shared set only (unbound / builtin sessions).
+    pub fn get_scoped(&self, agent: Option<&str>, name: &str) -> Option<SkillDefinition> {
+        if let Some(agent) = agent
+            && let Some(hit) = self.agent_skills.get(&(agent.to_owned(), name.to_owned()))
+        {
+            return Some(hit.value().clone());
+        }
+        self.get(name)
     }
 
     /// List all registered skill names.
@@ -210,6 +305,24 @@ impl SkillRegistry {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// Shared ∪ the agent's overlay (overlay wins on a name collision),
+    /// sorted by name. `None` = shared only — equals `all_summaries_sorted`.
+    pub fn summaries_for_agent(&self, agent: Option<&str>) -> Vec<SkillSummary> {
+        let mut by_name: std::collections::BTreeMap<String, SkillSummary> = self
+            .skills
+            .iter()
+            .map(|e| (e.key().clone(), SkillSummary::from(e.value())))
+            .collect();
+        if let Some(agent) = agent {
+            for e in self.agent_skills.iter() {
+                if e.key().0 == agent {
+                    by_name.insert(e.key().1.clone(), SkillSummary::from(e.value()));
+                }
+            }
+        }
+        by_name.into_values().collect()
     }
 
     /// Case-insensitive substring search across `name`, `description`, and
@@ -685,5 +798,79 @@ mod tests {
         // No dirs were tracked, so reload clears everything and scans nothing.
         assert_eq!(reg.reload(), 0);
         assert!(reg.get("in-memory").is_none());
+    }
+
+    #[test]
+    fn agent_scoped_skills_overlay_shared_set() {
+        let reg = SkillRegistry::new();
+        let shared = tempfile::tempdir().unwrap();
+        let agents = tempfile::tempdir().unwrap();
+
+        // shared: `greet`, `deploy`
+        for name in ["greet", "deploy"] {
+            let d = shared.path().join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: shared {name}\n---\nshared body {name}\n"),
+            )
+            .unwrap();
+        }
+        // agent A1: private `review` + overriding `greet`
+        for name in ["review", "greet"] {
+            let d = agents.path().join("A1").join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: agent {name}\n---\nagent body {name}\n"),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(reg.load_dir(shared.path()), 2);
+        assert_eq!(reg.load_agent_skills_root(agents.path()), 2);
+
+        // Unscoped view: shared only.
+        let names: Vec<String> = reg
+            .summaries_for_agent(None)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, ["deploy", "greet"]);
+        assert_eq!(
+            reg.get_scoped(None, "greet").unwrap().description,
+            "shared greet"
+        );
+        assert!(reg.get_scoped(None, "review").is_none());
+
+        // A1's view: shared ∪ overlay, overlay wins on collision, name-sorted.
+        let a1: Vec<(String, String)> = reg
+            .summaries_for_agent(Some("A1"))
+            .into_iter()
+            .map(|s| (s.name, s.description))
+            .collect();
+        assert_eq!(
+            a1,
+            [
+                ("deploy".into(), "shared deploy".into()),
+                ("greet".into(), "agent greet".into()),
+                ("review".into(), "agent review".into()),
+            ]
+        );
+        assert_eq!(
+            reg.get_scoped(Some("A1"), "greet").unwrap().description,
+            "agent greet"
+        );
+        // Unknown agent sees shared only.
+        assert!(reg.get_scoped(Some("A2"), "review").is_none());
+
+        // reload() replays both scans.
+        std::fs::remove_dir_all(agents.path().join("A1").join("review")).unwrap();
+        reg.reload();
+        assert!(reg.get_scoped(Some("A1"), "review").is_none());
+        assert_eq!(
+            reg.get_scoped(Some("A1"), "greet").unwrap().description,
+            "agent greet"
+        );
     }
 }
