@@ -323,6 +323,23 @@ mod tests {
         }
     }
 
+    async fn raw_allowed_models(
+        store: &LibsqlAgentProfileStore,
+        id: &AgentProfileId,
+    ) -> Option<String> {
+        let mut rows = store
+            .pool
+            .conn()
+            .query(
+                "SELECT allowed_models FROM agent_profiles WHERE id = ?1",
+                libsql::params![id.as_str().to_string()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("row exists");
+        row.get::<Option<String>>(0).unwrap()
+    }
+
     fn content_update(name: &str) -> AgentProfileUpdate {
         AgentProfileUpdate {
             name: name.to_owned(),
@@ -537,12 +554,22 @@ mod tests {
         let reset = store.get(&row.id).await.unwrap().unwrap();
         assert!(reset.allowed_models.is_empty());
         assert!(reset.reasoning_effort.is_none());
+        assert_eq!(
+            raw_allowed_models(&store, &row.id).await,
+            None,
+            "full-replace reset must store SQL NULL, not \"[]\""
+        );
 
         // Empty set stores NULL (round-trips as empty, not "[]").
         let plain = custom_row("Plain");
         store.create(&plain).await.unwrap();
         let plain_back = store.get(&plain.id).await.unwrap().unwrap();
         assert!(plain_back.allowed_models.is_empty());
+        assert_eq!(
+            raw_allowed_models(&store, &plain.id).await,
+            None,
+            "empty-set create must store SQL NULL, not \"[]\""
+        );
     }
 
     #[tokio::test]
