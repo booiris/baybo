@@ -30,6 +30,17 @@ const FRAMEWORKS: { value: AgentFramework; label: string }[] = [
 
 const BAYBO_ONLY_HINT = 'baybo framework only — ignored by external frameworks';
 
+// Mock-mode seed for the skills readout, applied by the same effect that
+// owns the live fetch so mock and real modes share one data path.
+const MOCK_SKILLS: SkillInfo[] = [
+  { name: 'brainstorm', description: 'Generate and expand ideas quickly.' },
+  { name: 'commit-helper', description: 'Draft conventional-commit messages from a diff.' },
+  { name: 'weekly-report', description: "Summarize the week's work into a report." },
+];
+
+// A dead skills source must not masquerade as "nothing registered".
+const SKILLS_LOAD_ERROR = 'Failed to load skills for the editor — retry Refresh.';
+
 // Mirrors `baybo_model::MAX_AGENT_PROFILE_NAME_CHARS` (the server cap).
 const MAX_AGENT_NAME_CHARS = 64;
 
@@ -70,11 +81,6 @@ export function AgentsPage() {
     async function fetchData() {
       if (isMock) {
         setAgents(MOCK_AGENT_PROFILES);
-        setRegisteredSkills([
-          { name: 'brainstorm', description: 'Generate and expand ideas quickly.' },
-          { name: 'commit-helper', description: 'Draft conventional-commit messages from a diff.' },
-          { name: 'weekly-report', description: "Summarize the week's work into a report." },
-        ]);
         setLlmNames(['primary', 'fast']);
         setLoading(false);
         setError(null);
@@ -83,13 +89,12 @@ export function AgentsPage() {
       setLoading(true);
       setError(null);
       try {
-        const [agentsRes, skillsRes, llmRes] = await Promise.all([
+        const [agentsRes, llmRes] = await Promise.all([
           client.GET('/v1/agents'),
-          client.GET('/v1/skills'),
           client.GET('/v1/llm/models'),
         ]);
         if (canceled) return;
-        for (const r of [agentsRes, skillsRes, llmRes]) {
+        for (const r of [agentsRes, llmRes]) {
           if (r.response.status === 401) {
             logout();
             return;
@@ -100,16 +105,10 @@ export function AgentsPage() {
           return;
         }
         setAgents(agentsRes.data?.items ?? []);
-        setRegisteredSkills(
-          (skillsRes.data?.items ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)),
-        );
         setLlmNames((llmRes.data?.items ?? []).map((m) => m.name));
         // A dead picker source must not masquerade as "nothing registered".
-        const failed: string[] = [];
-        if (skillsRes.error || !skillsRes.response.ok) failed.push('skills');
-        if (llmRes.error || !llmRes.response.ok) failed.push('models');
-        if (failed.length > 0) {
-          setError(`Failed to load ${failed.join(', ')} for the editor — retry Refresh.`);
+        if (llmRes.error || !llmRes.response.ok) {
+          setError('Failed to load models for the editor — retry Refresh.');
         }
       } catch (e) {
         if (canceled) return;
@@ -145,36 +144,61 @@ export function AgentsPage() {
     setSelected(agents[0].id);
   }, [agents, selected]);
 
-  // Skills readout is scoped to the selected agent: the shared registry set
-  // for the builtin, that profile's skill folder overlaid on the shared set
-  // otherwise (mirrors `GET /v1/skills?agent_id`'s own semantics). Refetches
-  // whenever the selection resolves to a different real agent row; the
-  // create-form selection ('new') and no-selection leave the last-loaded
-  // list in place — the bootstrap fetch above already seeded it unscoped.
-  useEffect(() => {
-    if (isMock) return;
-    if (selected === null || selected === 'new') return;
+  // The skills readout's query scope for the current selection: a concrete
+  // agent id for a non-builtin profile, `null` for the builtin / no
+  // selection / the create form / a just-created id whose row hasn't landed
+  // yet (all of which read the shared registry set). Derived as a primitive
+  // so the effect below refires only when the scope actually changes — not
+  // when `agents` merely gets a new array reference on every refresh.
+  const skillsScopeAgentId = (() => {
+    if (selected === null || selected === 'new') return null;
     const agent = agents.find((a) => a.id === selected);
-    if (!agent) return;
+    return agent && !agent.builtin ? agent.id : null;
+  })();
+
+  // Single owner of the skills readout (the bootstrap effect above
+  // deliberately does NOT touch it): fetches on mount, whenever the
+  // selection's scope changes, and on every `refresh()` (Refresh button +
+  // post-Save/Create/Delete) via `refreshKey` — always with the current
+  // scope, so a refresh while a non-builtin agent is selected can't
+  // transiently clobber the readout with the unscoped list. Unscoped for
+  // the builtin/none/'new'; scoped to the profile's skill folder overlaid
+  // on the shared set otherwise (mirrors `GET /v1/skills?agent_id`).
+  useEffect(() => {
+    if (isMock) {
+      setRegisteredSkills(MOCK_SKILLS);
+      return;
+    }
     let cancelled = false;
     void (async () => {
-      const { data, error, response } = await client.GET('/v1/skills', {
-        params: { query: agent.builtin ? {} : { agent_id: agent.id } },
-      });
-      if (cancelled) return;
-      if (response.status === 401) {
-        logout();
-        return;
+      try {
+        const { data, error: apiError, response } = await client.GET('/v1/skills', {
+          params: {
+            query: skillsScopeAgentId ? { agent_id: skillsScopeAgentId } : {},
+          },
+        });
+        if (cancelled) return;
+        if (response.status === 401) {
+          logout();
+          return;
+        }
+        if (apiError || !response.ok) {
+          setError(SKILLS_LOAD_ERROR);
+          return;
+        }
+        setRegisteredSkills(
+          (data?.items ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)),
+        );
+      } catch {
+        if (!cancelled) {
+          setError(SKILLS_LOAD_ERROR);
+        }
       }
-      if (error || !response.ok) return;
-      setRegisteredSkills(
-        (data?.items ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)),
-      );
     })();
     return () => {
       cancelled = true;
     };
-  }, [client, selected, agents, isMock, logout]);
+  }, [client, skillsScopeAgentId, refreshKey, isMock, logout]);
 
   const refresh = useCallback(() => setRefreshKey((k) => k + 1), []);
 
