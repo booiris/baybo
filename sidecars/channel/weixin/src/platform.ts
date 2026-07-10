@@ -229,6 +229,15 @@ export class WeixinPlatform implements BotPlatform<WeixinBotHandle, WeixinChat> 
         });
         captionRemaining = "";
       }
+      // Every attachment failed to fetch, so the caption never rode along.
+      // `onMessage` takes this path *instead of* `sendText` whenever a reply
+      // carries media, so without this the whole answer goes silent.
+      if (captionRemaining) {
+        this.logger.warn(
+          "weixin sendMedia: no attachment shipped; sending the reply as text",
+        );
+        await this.sendText(handle, chat, payload.text);
+      }
       void this.cancelTyping(handle, chat);
     } catch (err) {
       if (isSessionExpired(err)) {

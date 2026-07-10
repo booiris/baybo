@@ -1145,7 +1145,6 @@ export function ChatPage() {
           case 'tool_completed':
           case 'status':
           case 'message':
-          case 'attachment':
           case 'notice':
           case 'approval_requested':
           case 'task_list':
@@ -3331,35 +3330,6 @@ export function routeInboundFrame(
           [sid]: {
             ...view,
             transcript: finalizeMessage(view.transcript, role, frame.content, hasAttachments),
-          },
-        };
-      });
-      return;
-    }
-    case 'attachment': {
-      // Media a tool produced mid-turn (a sent file, a screenshot).
-      // Render it as its OWN standalone bubble — deliberately NOT folded
-      // into the open work block and NOT closing the turn, so the
-      // in-flight reply keeps streaming afterwards.
-      if (frame.attachments.length === 0) return;
-      const sid = frame.session_id;
-      setViews((prev) => {
-        const view = prev[sid] ?? EMPTY_VIEW;
-        return {
-          ...prev,
-          [sid]: {
-            ...view,
-            transcript: [
-              ...view.transcript,
-              {
-                key: `attachment-${view.transcript.length}-${Date.now()}`,
-                role: 'assistant',
-                text: '',
-                hasAttachments: true,
-                attachments: frame.attachments,
-                createdAt: new Date().toISOString(),
-              },
-            ],
           },
         };
       });

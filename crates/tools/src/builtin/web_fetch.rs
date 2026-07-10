@@ -66,7 +66,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use baybo_llm::{BilledChat, ChatRequest};
-use baybo_model::{ChatMessage, ContentBlock, SHA256_PREFIX};
+use baybo_model::{ChatMessage, ContentBlock, blob_content_digest};
 use baybo_store::BlobStore;
 use dom_smoothie::Readability;
 use htmd::HtmlToMarkdown;
@@ -706,8 +706,7 @@ fn extract_article(raw_html: &str, host: &str) -> String {
 /// on disk — the path is still computed (so the response header has a
 /// stable shape) but the file won't exist.
 fn blob_local_path(state_dir: &Path, blob_id: &str, mime: &str) -> Option<PathBuf> {
-    let hex_all = blob_id.strip_prefix(SHA256_PREFIX)?;
-    let hex = hex_all.split('.').next()?;
+    let hex = blob_content_digest(blob_id)?;
     if hex.len() < 2 {
         return None;
     }

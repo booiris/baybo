@@ -123,8 +123,7 @@ impl Channel {
             | AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolCompleted { .. }
             | AgentEvent::Status(_)
-            | AgentEvent::Progress(_)
-            | AgentEvent::Attachment(_) => {
+            | AgentEvent::Progress(_) => {
                 let mut buf = self.in_flight.entry(session_id.clone()).or_default();
                 // Coalesce a run of same-kind text deltas into the trailing
                 // entry so the buffer is bounded by text size, not delta count.

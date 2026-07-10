@@ -504,16 +504,6 @@ async fn agent_output_to_frame(
             active,
             started_at,
         },
-        // Reuse `split_content`'s media→`WireAttachment` mapping; the
-        // text half is empty for the media-only blocks this carries.
-        AgentEvent::Attachment(blocks) => {
-            let (_text, attachments) = split_content(&blocks, blob_store).await;
-            Frame::Attachment {
-                session_id,
-                user_id,
-                attachments,
-            }
-        }
     }
 }
 

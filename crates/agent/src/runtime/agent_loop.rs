@@ -85,6 +85,56 @@ fn summarize_text(s: &str) -> String {
     }
 }
 
+/// Content identity of a media block. Keys on the blob's digest, never on the
+/// `blob_id` — every `put` mints a fresh read token, so the same bytes staged
+/// twice carry two different ids.
+fn media_digest(block: &ContentBlock) -> Option<&str> {
+    match block {
+        ContentBlock::Image { blob, .. }
+        | ContentBlock::Audio { blob, .. }
+        | ContentBlock::File { blob, .. } => blob.content_digest(),
+        _ => None,
+    }
+}
+
+/// Fold a tool's attachments into the turn's accumulator, skipping content the
+/// turn already staged. `AttachFile` called twice on one path stages the same
+/// bytes twice; the reply must show the user that file once. A block with no
+/// digest (a malformed id, or a non-media block a tool wrongly passed) has no
+/// identity to compare, so it rides through untouched.
+fn extend_unique_attachments(acc: &mut Vec<ContentBlock>, incoming: &[ContentBlock]) {
+    for block in incoming {
+        if let Some(digest) = media_digest(block)
+            && acc
+                .iter()
+                .filter_map(media_digest)
+                .any(|seen| seen == digest)
+        {
+            continue;
+        }
+        acc.push(block.clone());
+    }
+}
+
+/// Name what the user is about to receive rather than counting blocks —
+/// the work block reads better as "report.pdf" than "1 attachment(s)".
+fn summarize_attachments(blocks: &[ContentBlock]) -> String {
+    let named: Vec<&str> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::File { filename, .. } => Some(filename.as_str()),
+            ContentBlock::Image { mime_type, .. } | ContentBlock::Audio { mime_type, .. } => {
+                Some(mime_type.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if named.is_empty() {
+        return format!("{} attachment(s)", blocks.len());
+    }
+    truncate_summary(&named.join(", "))
+}
+
 /// Derive the `(status, summary)` for a finished tool call's
 /// `ToolCompleted` progress event from its result. Presentation-only and
 /// content-light; the summary still passes the leak boundary before it is
@@ -94,10 +144,9 @@ fn tool_completion_summary(result: &anyhow::Result<ToolOutput>) -> (ToolStatus, 
     match result {
         Ok(ToolOutput::Text(s)) => (ToolStatus::Ok, summarize_text(s)),
         Ok(ToolOutput::Json(_)) => (ToolStatus::Ok, "ok".to_string()),
-        Ok(ToolOutput::WithAttachments { attachments, .. }) => (
-            ToolStatus::Ok,
-            format!("{} attachment(s)", attachments.len()),
-        ),
+        Ok(ToolOutput::WithAttachments { attachments, .. }) => {
+            (ToolStatus::Ok, summarize_attachments(attachments))
+        }
         Ok(ToolOutput::MultiModalText { llm_images, .. }) => {
             (ToolStatus::Ok, format!("{} image(s)", llm_images.len()))
         }
@@ -266,21 +315,6 @@ impl baybo_tools::SessionNotifier for DeltaTxNotifier {
             event: AgentEvent::Notice { level, text },
         });
     }
-
-    fn emit_attachment(&self, blocks: &[ContentBlock]) {
-        if blocks.is_empty() {
-            return;
-        }
-        // Media carries no free text, so no leak boundary applies. `try_send`
-        // (like `emit`) drops on a full channel rather than blocking the
-        // sync tool path.
-        let _ = self.tx.try_send(AgentOutput {
-            session_id: self.session_id.clone(),
-            user_id: self.user_id.clone(),
-            channel: self.channel.clone(),
-            event: AgentEvent::Attachment(blocks.to_vec()),
-        });
-    }
 }
 
 /// What one `LlmIteration` step's body produced. The terminal-vs-loop
@@ -290,8 +324,8 @@ impl baybo_tools::SessionNotifier for DeltaTxNotifier {
 enum IterationOutcome {
     /// Final assistant response — caller returns this from `run_inner`.
     /// `outgoing.content` is both the channel-bound reply and the persisted
-    /// assistant turn (text / thinking); tool media was delivered live as it
-    /// was produced, never bundled here.
+    /// assistant turn: text / thinking, plus any media the turn's tools
+    /// produced (`ToolOutput::WithAttachments`) folded in at the tail.
     Final { outgoing: OutgoingMessage },
     /// LLM emitted tool calls; loop continues. `task_mutated` is `true`
     /// when one of this iteration's tool calls changed the planning
@@ -818,6 +852,10 @@ impl AgentLoop {
         // Accumulates this job's user-authored input (initial prompt + any
         // mid-turn interjections) for the `on_job_complete` write at turn end.
         let mut job_user_input: Vec<ContentBlock> = memory_query.clone().unwrap_or_default();
+        // Media the turn's tools produced (`ToolOutput::WithAttachments`),
+        // folded into the final assistant row so it persists. Dropped on any
+        // non-`Final` exit: attachments are durable only when the turn is.
+        let mut turn_attachments: Vec<ContentBlock> = Vec::new();
 
         // Iterative LLM loop
         let mut iterations = 0;
@@ -944,6 +982,7 @@ impl AgentLoop {
                         iter_delta_tx,
                         notifier.clone(),
                         &cancel_token,
+                        &mut turn_attachments,
                     );
                     async move { Ok((LifecycleOutcome::Ok, fut.await?)) }
                 },
@@ -1006,9 +1045,10 @@ impl AgentLoop {
             }
         }
 
-        // If we exhausted iterations, return what we have. Any media the
-        // tools produced was already delivered live as it was produced, so
-        // there's nothing to append here.
+        // If we exhausted iterations, return what we have. `turn_attachments`
+        // is dropped with the rest of this turn's locals: this path persists
+        // no assistant row, so folding media into `content` would deliver it
+        // live and then lose it on the next resync.
         let content = vec![ContentBlock::Text(
             "I've reached the maximum number of processing steps. Please try again with a simpler request.".to_string(),
         )];
@@ -1057,6 +1097,7 @@ impl AgentLoop {
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         cancel_token: &CancellationToken,
+        turn_attachments: &mut Vec<ContentBlock>,
     ) -> anyhow::Result<IterationOutcome> {
         let (response, llm_span_id) = match self
             .call_llm_with_retry(session, span_recorder, &step, delta_tx, cancel_token)
@@ -1085,11 +1126,15 @@ impl AgentLoop {
         if response.tool_calls.is_empty() {
             // Use content_blocks when available, falling back to the
             // text string.
-            let response_blocks = if response.content_blocks.is_empty() {
+            let mut response_blocks = if response.content_blocks.is_empty() {
                 vec![ContentBlock::Text(response.content.clone())]
             } else {
                 response.content_blocks.clone()
             };
+            // Media the turn's tools produced rides out on this row. The
+            // provider conversion drops media blocks from an assistant
+            // message, so replaying this row to the LLM stays valid.
+            response_blocks.extend(std::mem::take(turn_attachments));
 
             let final_text = baybo_llm::multimodal::extract_text(&response_blocks);
 
@@ -1100,9 +1145,8 @@ impl AgentLoop {
             );
 
             // The reply blocks are both the channel-bound content and the
-            // persisted assistant row (tool media was delivered live, never
-            // bundled here). Capture the persisted ordinal so the channel
-            // adapter can stamp the live `Frame::Message`.
+            // persisted assistant row. Capture the persisted ordinal so the
+            // channel adapter can stamp the live `Frame::Message`.
             let assistant_msg = ChatMessage::assistant(response_blocks.clone());
             let ordinal = self.context_manager.append(&assistant_msg).await;
 
@@ -1303,11 +1347,15 @@ impl AgentLoop {
                 Ok(ToolOutput::Json(v)) => {
                     serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
                 }
-                // A tool that delivers media to the user does so itself via
-                // `ctx.notifier.emit_attachment` (e.g. `SendFile`); the loop
-                // forwards only the text result to the LLM.
-                Ok(ToolOutput::WithAttachments { text, .. })
-                | Ok(ToolOutput::MultiModalText { text, .. }) => text.clone(),
+                // Media a tool produced for the *user* (e.g. `AttachFile`) is
+                // hoisted onto the turn's final assistant row; the LLM sees
+                // only the text result. `MultiModalText`'s images are for the
+                // LLM's own next turn, so they are NOT hoisted here.
+                Ok(ToolOutput::WithAttachments { text, attachments }) => {
+                    extend_unique_attachments(turn_attachments, attachments);
+                    text.clone()
+                }
+                Ok(ToolOutput::MultiModalText { text, .. }) => text.clone(),
                 Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
                 Err(e) => {
                     if let Some(denied) = e.downcast_ref::<baybo_tools::ToolError>()

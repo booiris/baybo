@@ -8,7 +8,6 @@ import type { SessionPatch } from "./SessionPatch";
 import type { SlashCommandSpec } from "./SlashCommandSpec";
 import type { TaskView } from "./TaskView";
 import type { TurnSnapshot } from "./TurnSnapshot";
-import type { WireAttachment } from "./WireAttachment";
 import type { WireWorkStep } from "./WireWorkStep";
 
 /**
@@ -22,7 +21,7 @@ export type Frame = { "kind": "register", token: string, channel_type: string, }
  * Newest persisted `session_messages.ordinal` at snapshot
  * time; `None` for a session with no rows yet.
  */
-as_of_ordinal?: bigint, turn: TurnSnapshot, work_steps?: Array<WireWorkStep>, pending_approvals?: Array<ApprovalCard>, tasks?: Array<TaskView>, } | { "kind": "gap", session_id?: string, } | { "kind": "message" } & Message | { "kind": "messages", messages: Array<Message>, } | { "kind": "attachment", session_id: string, user_id?: string, attachments: Array<WireAttachment>, } | { "kind": "answer_delta", session_id: string, user_id?: string, text: string, } | { "kind": "reasoning", session_id: string, user_id?: string, text: string, } | { "kind": "tool_started", session_id: string, user_id?: string, call_id: string, tool: string, label?: string, } | { "kind": "tool_completed", session_id: string, user_id?: string, call_id: string, status: string, summary: string, } | { "kind": "status", session_id: string, user_id?: string, phase: string, } | { "kind": "notice", session_id: string, user_id?: string, level: string, text: string, 
+as_of_ordinal?: bigint, turn: TurnSnapshot, work_steps?: Array<WireWorkStep>, pending_approvals?: Array<ApprovalCard>, tasks?: Array<TaskView>, } | { "kind": "gap", session_id?: string, } | { "kind": "message" } & Message | { "kind": "messages", messages: Array<Message>, } | { "kind": "answer_delta", session_id: string, user_id?: string, text: string, } | { "kind": "reasoning", session_id: string, user_id?: string, text: string, } | { "kind": "tool_started", session_id: string, user_id?: string, call_id: string, tool: string, label?: string, } | { "kind": "tool_completed", session_id: string, user_id?: string, call_id: string, status: string, summary: string, } | { "kind": "status", session_id: string, user_id?: string, phase: string, } | { "kind": "notice", session_id: string, user_id?: string, level: string, text: string, 
 /**
  * `true` for a *transient* mid-turn progress update (the progress
  * observer) rather than a terminal notice. Clients that render a

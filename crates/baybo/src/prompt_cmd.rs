@@ -343,17 +343,15 @@ async fn consume_inprocess_turn(
             }
             AgentEvent::Notice { level, text } => eprint_notice(level, &text),
             // Transient turn progress (reasoning, tool steps, compaction
-            // status, observer narration, the planning checklist) and
-            // out-of-band media (attachments) aren't part of the one-shot
-            // text answer.
+            // status, observer narration, the planning checklist) isn't part
+            // of the one-shot text answer.
             AgentEvent::Reasoning(_)
             | AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolCompleted { .. }
             | AgentEvent::Status(_)
             | AgentEvent::Progress(_)
             | AgentEvent::TaskList(_)
-            | AgentEvent::TurnState { .. }
-            | AgentEvent::Attachment(_) => {}
+            | AgentEvent::TurnState { .. } => {}
         }
     }
     writer.finish_incomplete()

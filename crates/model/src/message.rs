@@ -99,12 +99,34 @@ pub struct BlobRef {
     pub blob_id: String,
 }
 
+impl BlobRef {
+    /// See [`blob_content_digest`].
+    pub fn content_digest(&self) -> Option<&str> {
+        blob_content_digest(&self.blob_id)
+    }
+}
+
 /// Algorithm prefix on every [`BlobRef::blob_id`]. The full id is
 /// `"sha256:<64 lower-hex>.<read-token>"`, so a content-addressed blob is
 /// recognizable at a glance while the suffix stays the read capability. Lives in
 /// `model` (next to [`BlobRef`]) so both the server (`baybo-store`, which mints
 /// ids) and the device client (which parses them) reference one source of truth.
 pub const SHA256_PREFIX: &str = "sha256:";
+
+/// The content-addressed half of a `blob_id` — the SHA-256 hex, without the
+/// algorithm prefix or the trailing read token.
+///
+/// Every `BlobStore::put` mints a **fresh** read token, so two writes of
+/// identical bytes yield two distinct `blob_id`s that share this digest. The
+/// digest, not the id, is a blob's content identity; comparing ids to answer
+/// "is this the same file?" silently always says no. `None` for a malformed id.
+pub fn blob_content_digest(blob_id: &str) -> Option<&str> {
+    blob_id
+        .strip_prefix(SHA256_PREFIX)?
+        .split('.')
+        .next()
+        .filter(|hex| !hex.is_empty())
+}
 
 /// Where a [`ChatMessage`] row came from — its provenance, independent of the
 /// LLM-facing [`Role`]. Several distinct origins all ride as a `Role::User`
@@ -412,6 +434,37 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn identical_bytes_staged_twice_share_a_digest_but_not_an_id() {
+        // The shape `BlobStore::put` mints: same content, fresh read token.
+        let hex = "a".repeat(64);
+        let first = BlobRef {
+            blob_id: format!("{SHA256_PREFIX}{hex}.tok-one"),
+        };
+        let second = BlobRef {
+            blob_id: format!("{SHA256_PREFIX}{hex}.tok-two"),
+        };
+        assert_ne!(first.blob_id, second.blob_id);
+        assert_eq!(first.content_digest(), Some(hex.as_str()));
+        assert_eq!(first.content_digest(), second.content_digest());
+    }
+
+    #[test]
+    fn a_malformed_blob_id_has_no_digest() {
+        for id in ["", "sha256:", "md5:abcdef", "abcdef", "sha256:.tok"] {
+            assert_eq!(blob_content_digest(id), None, "id={id:?}");
+        }
+    }
+
+    #[test]
+    fn a_tokenless_id_is_all_digest() {
+        let hex = "b".repeat(64);
+        assert_eq!(
+            blob_content_digest(&format!("{SHA256_PREFIX}{hex}")),
+            Some(hex.as_str())
+        );
+    }
 
     #[test]
     fn tool_result_meta_round_trips() {

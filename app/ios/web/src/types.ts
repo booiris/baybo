@@ -125,8 +125,6 @@ export type WireFrame =
       newest_ordinal?: number | null;
       has_more: boolean;
     }
-  // Server-pushed standalone media a tool produced mid-turn (its own bubble).
-  | { kind: "attachment"; user_id?: string; attachments?: WireAttachment[] }
   // Synthesized NATIVE-side (not a wire frame): one sync page — the one
   // forward-recovery pull. `since_ordinal` echoes the request's cursor so a
   // baseline (`null`) REPLACE is distinguishable from a difference merge.

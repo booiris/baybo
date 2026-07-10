@@ -1,4 +1,5 @@
-//! `SendFile` — stream a local file to the user as a channel attachment.
+//! `AttachFile` — stream a local file into the blob store and attach it to
+//! the turn's final assistant reply.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -17,28 +18,24 @@ use crate::{
     ResourceAccess, Tool, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
 };
 
+const TOOL_NAME: &str = "AttachFile";
 const MAX_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_MIB: u64 = MAX_BYTES / 1024 / 1024;
 
-static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "Send a local file to the user as a channel attachment (Telegram \
-         document/photo/video, WeChat file, …). The file is streamed from \
-         disk; supports any MIME up to {MAX_MIB} MiB. Sensitive paths (SSH \
-         keys, .env, /etc/shadow, …) are blocked. After calling, write \
-         only a brief textual confirmation — do NOT paste the file's \
-         contents into your reply. Use this instead of pasting binary or \
-         large text into messages.\n\n\
-         PATHS: `path` MUST be an absolute filesystem path. Relative paths \
-         are rejected."
-    )
-});
+const DESCRIPTION_TEMPLATE: &str = r#"Give the user a local file — it arrives as an attachment in the chat. Any MIME type, up to {{max_mib}} MiB. Use it instead of pasting binary or large text into a message, and don't paste the contents after attaching.
 
-pub struct SendFileTool {
+DELIVERY: the file attaches to your FINAL reply, not to this call; several calls in one turn share that reply.
+
+PATHS: `path` MUST be absolute. Sensitive paths (SSH keys, .env, /etc/shadow, …) are blocked."#;
+
+static DESCRIPTION: LazyLock<String> =
+    LazyLock::new(|| DESCRIPTION_TEMPLATE.replace("{{max_mib}}", &MAX_MIB.to_string()));
+
+pub struct AttachFileTool {
     blob_store: Arc<dyn BlobStore>,
 }
 
-impl SendFileTool {
+impl AttachFileTool {
     pub fn new(blob_store: Arc<dyn BlobStore>) -> Self {
         Self { blob_store }
     }
@@ -54,9 +51,9 @@ struct Params {
 }
 
 #[async_trait]
-impl Tool for SendFileTool {
+impl Tool for AttachFileTool {
     fn name(&self) -> &str {
-        "SendFile"
+        TOOL_NAME
     }
 
     fn description(&self) -> String {
@@ -69,7 +66,7 @@ impl Tool for SendFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the file to send."
+                    "description": "Absolute path to the file to attach."
                 },
                 "filename": {
                     "type": "string",
@@ -111,16 +108,16 @@ impl Tool for SendFileTool {
             .unwrap_or_default()
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
+    async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
-        require_absolute(&p.path, "SendFile", "path")?;
+        require_absolute(&p.path, TOOL_NAME, "path")?;
 
         if baybo_security::is_sensitive_path(&p.path) {
-            tracing::warn!(path = %p.path.display(), "SendFile refused sensitive path");
+            tracing::warn!(path = %p.path.display(), "{TOOL_NAME} refused sensitive path");
             return Err(ToolError::Execution(format!(
-                "refused to send sensitive path {} — credential-bearing files are blocked by security policy",
+                "refused to attach sensitive path {} — credential-bearing files are blocked by security policy",
                 p.path.display()
             )));
         }
@@ -167,34 +164,28 @@ impl Tool for SendFileTool {
             mime_type: mime.clone(),
         };
 
-        // Deliver the file to the user's channel as its own out-of-band
-        // message via the notifier — the live channel on a UserChat turn;
-        // a no-op when there's no live channel (cron / subagent). The
-        // returned text is the LLM-facing confirmation.
-        let text = match &ctx.notifier {
-            Some(notifier) => {
-                notifier.emit_attachment(std::slice::from_ref(&attachment));
-                format!("Sent {filename} ({size} bytes, {mime}) to user.")
-            }
-            None => format!(
-                "Prepared {filename} ({size} bytes, {mime}), but this turn has no live channel to deliver it on."
-            ),
-        };
-        Ok(ToolOutput::Text(text))
+        // The agent loop hoists these attachments onto the turn's final
+        // assistant message, so the file persists with the transcript and
+        // survives a reload. Nothing has reached the user yet — say so, or
+        // the model reports a delivery that a cancelled turn never makes.
+        Ok(ToolOutput::WithAttachments {
+            text: format!("Attached {filename} ({size} bytes, {mime}) to your final reply."),
+            attachments: vec![attachment],
+        })
     }
 }
 
 /// Build the `(Arc<dyn Tool>, ToolManifest)` pair for registration.
 pub fn tool(blob_store: Arc<dyn BlobStore>) -> (Arc<dyn Tool>, ToolManifest) {
-    let send = SendFileTool::new(blob_store);
+    let attach = AttachFileTool::new(blob_store);
     let manifest = ToolManifest {
-        name: send.name().to_string(),
-        description: send.description(),
+        name: attach.name().to_string(),
+        description: attach.description(),
         trust_level: TrustLevel::Trusted,
-        parameters_schema: send.parameters_schema(),
+        parameters_schema: attach.parameters_schema(),
         capabilities: vec![ToolCapability::ReadFile],
     };
-    (Arc::new(send), manifest)
+    (Arc::new(attach), manifest)
 }
 
 fn guess_mime(path: &Path) -> &'static str {
@@ -254,39 +245,20 @@ mod tests {
         }
     }
 
-    /// Captures the media `SendFile` delivers via `emit_attachment` so a
-    /// test can assert the blocks that reach the channel.
-    #[derive(Default)]
-    struct RecordingNotifier {
-        attachments: parking_lot::Mutex<Vec<ContentBlock>>,
-    }
-
-    impl crate::SessionNotifier for RecordingNotifier {
-        fn emit(&self, _level: crate::NoticeLevel, _summary: &str, _detail: &str) {}
-        fn emit_attachment(&self, blocks: &[ContentBlock]) {
-            self.attachments.lock().extend(blocks.iter().cloned());
-        }
-    }
-
     #[tokio::test]
-    async fn sends_pdf_with_inferred_mime() {
+    async fn attaches_pdf_with_inferred_mime() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("report.pdf");
         tokio::fs::write(&p, b"%PDF-1.4 fake").await.unwrap();
         let mem = Arc::new(MemoryBlobStore::new());
-        let tool = SendFileTool::new(Arc::clone(&mem) as Arc<dyn BlobStore>);
+        let tool = AttachFileTool::new(Arc::clone(&mem) as Arc<dyn BlobStore>);
 
-        let recorder = Arc::new(RecordingNotifier::default());
-        let mut cx = ctx();
-        cx.notifier = Some(recorder.clone() as Arc<dyn crate::SessionNotifier>);
-
-        let out = tool.execute(json!({ "path": p }), &cx).await.unwrap();
-        let ToolOutput::Text(text) = out else {
-            panic!("expected Text, got {out:?}");
+        let out = tool.execute(json!({ "path": p }), &ctx()).await.unwrap();
+        let ToolOutput::WithAttachments { text, attachments } = out else {
+            panic!("expected WithAttachments, got {out:?}");
         };
         assert!(text.contains("report.pdf"));
 
-        let attachments = recorder.attachments.lock();
         assert_eq!(attachments.len(), 1);
         match &attachments[0] {
             ContentBlock::File {
@@ -310,7 +282,7 @@ mod tests {
         let key = ssh.join("id_rsa");
         tokio::fs::write(&key, "FAKE").await.unwrap();
         let store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
-        let tool = SendFileTool::new(store);
+        let tool = AttachFileTool::new(store);
 
         let err = tool
             .execute(json!({ "path": key }), &ctx())
@@ -326,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_relative_path() {
         let store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
-        let tool = SendFileTool::new(store);
+        let tool = AttachFileTool::new(store);
         let err = tool
             .execute(json!({ "path": "rel.txt" }), &ctx())
             .await
@@ -341,7 +313,7 @@ mod tests {
     async fn refuses_directory() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
-        let tool = SendFileTool::new(store);
+        let tool = AttachFileTool::new(store);
 
         let err = tool
             .execute(json!({ "path": dir.path() }), &ctx())
@@ -357,23 +329,22 @@ mod tests {
         let p = dir.path().join("blob.bin");
         tokio::fs::write(&p, b"raw bytes").await.unwrap();
         let store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
-        let tool = SendFileTool::new(store);
+        let tool = AttachFileTool::new(store);
 
-        let recorder = Arc::new(RecordingNotifier::default());
-        let mut cx = ctx();
-        cx.notifier = Some(recorder.clone() as Arc<dyn crate::SessionNotifier>);
-
-        tool.execute(
-            json!({
-                "path": p,
-                "filename": "report.bin",
-                "mime": "application/x-custom"
-            }),
-            &cx,
-        )
-        .await
-        .unwrap();
-        let attachments = recorder.attachments.lock();
+        let out = tool
+            .execute(
+                json!({
+                    "path": p,
+                    "filename": "report.bin",
+                    "mime": "application/x-custom"
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::WithAttachments { attachments, .. } = out else {
+            panic!("expected WithAttachments, got {out:?}");
+        };
         match &attachments[0] {
             ContentBlock::File {
                 filename,

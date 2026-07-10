@@ -36,6 +36,7 @@ pub use llm_entry_name::LlmEntryName;
 pub use message::{
     BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role, SHA256_PREFIX,
     TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX, ThinkingContent, ToolResultMeta,
+    blob_content_digest,
 };
 pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};

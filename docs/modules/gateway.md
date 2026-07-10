@@ -697,8 +697,9 @@ The full frame set (see `crates/wire/src/lib.rs`):
   echo of inbound to other subscribers out), `Messages { messages }` (a
   client → server **atomic batch** — the web "send all queued at once"
   path, coalesced into one turn), `AnswerDelta` (incremental answer text,
-  server → client), `Notice` (out-of-band warn/error), `Attachment
-  { session_id, user_id, attachments }` (mid-turn tool-emitted media).
+  server → client), `Notice` (out-of-band warn/error). Tool-emitted media
+  rides `Message.attachments` on the turn's terminal assistant reply — there
+  is no standalone attachment frame.
 - **Turn progress (server → client, live-update only):** `Reasoning`
   (incremental thinking), `ToolStarted` / `ToolCompleted` (tool-call
   lifecycle), `TaskList { items }` (the agent's live task-checklist),

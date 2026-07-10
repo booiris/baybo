@@ -1335,13 +1335,6 @@ export function Transcript({
         ]);
         break;
       }
-      case "attachment":
-        if (frame.attachments && frame.attachments.length > 0) {
-          const attachments = frame.attachments;
-          foldStreamingIntoProse();
-          setMessages((m) => [...m, { id: uid(), role: "assistant", content: "", attachments }]);
-        }
-        break;
       case "answer_delta":
         appendStreaming(frame.text);
         break;

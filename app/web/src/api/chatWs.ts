@@ -169,12 +169,6 @@ export type Frame =
    *  message at once" path). Delivered to the actor atomically so its
    *  coalescing can't lose stragglers to per-message intake latency. */
   | { kind: 'messages'; messages: WireMessage[] }
-  | {
-      kind: 'attachment';
-      session_id: string;
-      user_id?: string;
-      attachments: WireAttachment[];
-    }
   | { kind: 'answer_delta'; session_id: string; user_id?: string; text: string }
   | { kind: 'reasoning'; session_id: string; user_id?: string; text: string }
   | {

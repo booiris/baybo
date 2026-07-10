@@ -167,15 +167,6 @@ pub enum AgentEvent {
         /// restarting at zero.
         started_at: Option<DateTime<Utc>>,
     },
-    /// Media a tool produced mid-turn (a sent file, a screenshot), to be
-    /// delivered to the user as its **own** message the moment the tool
-    /// returns — distinct from `Message` (the turn's terminal reply) so it
-    /// carries no turn-completion semantics and clients render it as a
-    /// standalone bubble rather than folding it into the in-flight turn.
-    /// Only the media blocks (`Image` / `Audio` / `File`); never echoed
-    /// back to the LLM. Dropped on non-streaming turns (cron / subagent)
-    /// where there is no live channel.
-    Attachment(Vec<ContentBlock>),
 }
 
 /// Outcome of a finished tool call, carried by

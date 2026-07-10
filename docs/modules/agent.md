@@ -182,7 +182,7 @@ Per-tool `max_timeout()`:
 | Bash | 600s | `tools/src/builtin/bash/mod.rs` — per-call `timeout_ms` and the sandbox spawn tighten further |
 | WebFetch | 120s | `tools/src/builtin/web_fetch.rs` — connect phase capped at 10s independently |
 | Grep / Glob | 60s | `tools/src/builtin/{grep,glob_tool}.rs` |
-| send_local_file | 60s | `tools/src/builtin/send_local_file.rs` |
+| attach_file | 60s | `tools/src/builtin/attach_file.rs` |
 | Skill read (risk-assessed) | 60s | `skills/src/tools.rs` |
 | Skill install pipeline | 120s | `skills/src/tools.rs` |
 | MCP tool | 60s | `tools/src/mcp/tool.rs` |

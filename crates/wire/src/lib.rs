@@ -556,22 +556,6 @@ pub enum Frame {
     /// same N rows, then runs one merged turn with one reply. Outbound never
     /// uses this kind.
     Messages { messages: Vec<Message> },
-    /// Server → client: media a tool produced mid-turn (a sent file, a
-    /// screenshot), delivered as its **own** message. Unlike a terminal
-    /// [`Frame::Message`] it carries no `role` / `ordinal` and no turn-
-    /// completion meaning: clients render it as a standalone bubble
-    /// (or, for sidecars, a standalone platform send) and must NOT fold
-    /// it into — or close — an in-flight turn's work block. Sidecars
-    /// deliver the attachments exactly as they would a `Message`'s;
-    /// surfaces that can't render media drop it. `user_id` mirrors
-    /// `Message` so sidecars route by platform user without a reverse map.
-    Attachment {
-        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        session_id: SessionId,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        user_id: String,
-        attachments: Vec<WireAttachment>,
-    },
     /// Server → client: incremental assistant **answer** text chunk for
     /// the in-flight response on a session (the reply prose — distinct
     /// from `Reasoning`, the thinking trace). Channels without a partial
@@ -861,7 +845,6 @@ impl Frame {
             Frame::Subscribe { session_id }
             | Frame::Unsubscribe { session_id }
             | Frame::SubscribeState { session_id, .. }
-            | Frame::Attachment { session_id, .. }
             | Frame::AnswerDelta { session_id, .. }
             | Frame::Reasoning { session_id, .. }
             | Frame::ToolStarted { session_id, .. }

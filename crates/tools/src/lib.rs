@@ -291,16 +291,6 @@ pub enum NoticeLevel {
 /// tools should not `await` notice delivery.
 pub trait SessionNotifier: Send + Sync {
     fn emit(&self, level: NoticeLevel, summary: &str, detail: &str);
-
-    /// Deliver media a tool produced (a sent file, …) to the session's
-    /// channel as its own standalone, out-of-band message — distinct from
-    /// the turn's final reply, so it does not complete the turn. `blocks`
-    /// are media only (`Image` / `Audio` / `File`). Default no-op for
-    /// notifiers with no live channel (cron, tests); the live notifier
-    /// routes it to the channel. Sync, fire-and-forget.
-    fn emit_attachment(&self, blocks: &[baybo_model::ContentBlock]) {
-        let _ = blocks;
-    }
 }
 
 /// No-op notifier for tests and for call sites that don't have a
@@ -702,8 +692,11 @@ pub enum ToolOutput {
     Error(String),
     /// Tool result that also delivers attachments to the user channel.
     /// `text` is what the LLM sees as the tool result; `attachments`
-    /// are hoisted into the assistant's `OutgoingMessage` by the agent
-    /// loop and the channel sidecar then sends them out-of-band.
+    /// (media only — `Image` / `Audio` / `File`) are accumulated across the
+    /// turn by the agent loop and folded into the final assistant message,
+    /// so they persist with the transcript and survive a reload. They reach
+    /// clients on `Frame::Message.attachments`; a turn that never reaches a
+    /// clean final response drops them.
     WithAttachments {
         text: String,
         attachments: Vec<baybo_model::ContentBlock>,
@@ -713,11 +706,12 @@ pub enum ToolOutput {
     /// appends `text` as the normal text-only `ToolResult`, then emits
     /// a follow-up `Role::User` message carrying `llm_images` so a
     /// vision-capable provider receives them through the standard
-    /// multimodal user-content path. The same images are also mirrored
-    /// into the final `OutgoingMessage` so the user channel sees them.
+    /// multimodal user-content path. These images are for the model, not
+    /// the user: they never reach a channel. Use [`ToolOutput::WithAttachments`]
+    /// to show media to the user.
     ///
-    /// Invariant (asserted by [`MultiModalText::new`]): every entry of
-    /// `llm_images` is `ContentBlock::Image`. Other variants are
+    /// Invariant (asserted by [`ToolOutput::multi_modal_text`]): every entry
+    /// of `llm_images` is `ContentBlock::Image`. Other variants are
     /// silently dropped at construction.
     MultiModalText {
         text: String,
