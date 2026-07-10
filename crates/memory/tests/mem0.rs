@@ -489,6 +489,7 @@ async fn tool_list_returns_all_memories() {
 
     let body = captured.bodies.lock().last().unwrap().clone();
     assert_eq!(body["filters"]["AND"][0]["user_id"], "u-8");
+    assert_eq!(body["filters"]["AND"][1]["agent_id"], "baybo");
     let q = captured.queries.lock().last().unwrap().clone();
     assert!(q.contains("page_size=100"), "query was: {q}");
 }
@@ -585,6 +586,9 @@ async fn tool_delete_all_with_confirm_scopes_to_user() {
     let m = build(&base_url(&server));
 
     let tool = tool_by_name(&m, TOOL_DELETE);
+
+    // Unbound ctx: bulk delete scopes to the builtin agent namespace, never
+    // the user's whole cross-agent store.
     let ctx = tool_context("u-11");
     let out = tool
         .execute(json!({"all": true, "confirm": true}), &ctx)
@@ -595,6 +599,19 @@ async fn tool_delete_all_with_confirm_scopes_to_user() {
 
     let q = captured.queries.lock().last().unwrap().clone();
     assert!(q.contains("user_id=u-11"), "query was: {q}");
+    assert!(q.contains("agent_id=baybo"), "query was: {q}");
+
+    // Bound ctx: the session's agent becomes the default scope.
+    let mut bound_ctx = tool_context("u-11");
+    bound_ctx.agent_id = Some("A1".into());
+    let _ = tool
+        .execute(json!({"all": true, "confirm": true}), &bound_ctx)
+        .await
+        .unwrap();
+
+    let q = captured.queries.lock().last().unwrap().clone();
+    assert!(q.contains("user_id=u-11"), "query was: {q}");
+    assert!(q.contains("agent_id=A1"), "query was: {q}");
 }
 
 #[tokio::test]
