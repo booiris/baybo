@@ -1460,6 +1460,7 @@ impl AgentLoop {
             messages: self.context_manager.messages_for_llm(),
             temperature: None,
             tools: tool_defs,
+            reasoning_effort: None,
         };
 
         let input_messages = self.context_manager.build_call_input_marker().await;
@@ -2467,6 +2468,7 @@ impl AgentLoop {
             messages,
             temperature: None,
             tools: Vec::new(),
+            reasoning_effort: None,
         };
 
         // Throttle on attempt, not just success — a failing or empty call

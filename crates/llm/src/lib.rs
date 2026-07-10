@@ -231,8 +231,19 @@ pub struct TokenUsage {
 pub struct ChatRequest {
     pub messages: Vec<baybo_model::ChatMessage>,
     pub temperature: Option<f32>,
+    /// Per-request reasoning-effort ask (profile-driven). Providers that
+    /// support it clamp to the concrete model's range; all others ignore
+    /// it. `None` = the provider's own configured behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub tools: Vec<ToolDefinitionForLlm>,
 }
+
+/// Key under rig's `additional_params` carrying the per-request effort
+/// across the `CompletionRequest` boundary. Namespaced so it can never be
+/// mistaken for a provider API parameter; only set when the target model
+/// variant is known to read it.
+pub(crate) const REQUEST_REASONING_EFFORT_PARAM: &str = "baybo_reasoning_effort";
 
 /// A tool definition in the format expected by the LLM layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -500,6 +511,13 @@ fn repack_completion<R>(
 }
 
 impl AnyCompletionModel {
+    /// Whether this variant reads [`REQUEST_REASONING_EFFORT_PARAM`] from
+    /// `additional_params`. Gating the bridge here keeps the marker out of
+    /// every other provider's request payload.
+    pub(crate) fn accepts_request_reasoning_effort(&self) -> bool {
+        matches!(self, Self::OpenAiSubscription(_))
+    }
+
     async fn completion(
         &self,
         request: CompletionRequest,
@@ -683,7 +701,16 @@ impl LlmClient {
             "sending chat request"
         );
 
-        let rig_request = self.build_completion_request(request).await;
+        let mut rig_request = self.build_completion_request(request).await;
+        // `build_completion_request` always leaves `additional_params: None`
+        // today, so this unconditionally overwrites it; revisit if that
+        // ever changes.
+        if let Some(effort) = &request.reasoning_effort
+            && self.model.accepts_request_reasoning_effort()
+        {
+            rig_request.additional_params =
+                Some(serde_json::json!({ REQUEST_REASONING_EFFORT_PARAM: effort }));
+        }
 
         let response = self
             .model
@@ -712,7 +739,16 @@ impl LlmClient {
             "sending streaming chat request"
         );
 
-        let rig_request = self.build_completion_request(request).await;
+        let mut rig_request = self.build_completion_request(request).await;
+        // `build_completion_request` always leaves `additional_params: None`
+        // today, so this unconditionally overwrites it; revisit if that
+        // ever changes.
+        if let Some(effort) = &request.reasoning_effort
+            && self.model.accepts_request_reasoning_effort()
+        {
+            rig_request.additional_params =
+                Some(serde_json::json!({ REQUEST_REASONING_EFFORT_PARAM: effort }));
+        }
 
         let stream = self
             .model
@@ -1082,6 +1118,7 @@ impl LlmClient {
             ])],
             temperature: Some(0.0),
             tools: vec![],
+            reasoning_effort: None,
         };
         let start = std::time::Instant::now();
         let response = self.chat(&req).await?;

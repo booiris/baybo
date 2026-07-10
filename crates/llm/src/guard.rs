@@ -115,6 +115,7 @@ impl BillableLlm {
             ])],
             temperature: Some(0.0),
             tools: vec![],
+            reasoning_effort: None,
         };
         let start = std::time::Instant::now();
         let response = self.chat(&req).await?;
@@ -201,6 +202,7 @@ mod tests {
             messages: vec![],
             temperature: None,
             tools: vec![],
+            reasoning_effort: None,
         }
     }
 

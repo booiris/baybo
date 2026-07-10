@@ -201,11 +201,11 @@ impl OpenAiSubscriptionCompletionModel {
     /// Open a streaming connection to `<base_url>/codex/responses` with
     /// pre-flight + reactive (401-once) refresh handling.
     pub async fn stream(&self, request: CompletionRequest) -> Result<LlmStream, CompletionError> {
-        let body =
-            build_responses_body(&self.model, self.reasoning_effort, &request).map_err(|msg| {
-                let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
-                CompletionError::RequestError(err)
-            })?;
+        let effort = effective_reasoning_effort(&self.model, self.reasoning_effort, &request);
+        let body = build_responses_body(&self.model, effort, &request).map_err(|msg| {
+            let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
+            CompletionError::RequestError(err)
+        })?;
         let bundle = self
             .ensure_fresh_bundle()
             .await
@@ -395,6 +395,40 @@ impl OpenAiSubscriptionCompletionModel {
             return LlmStream::from_inner(Box::pin(stream));
         }
         LlmStream::from_inner(Box::pin(parse_sse_stream(response)))
+    }
+}
+
+/// The effort for THIS request: an explicit per-request ask (clamped to the
+/// model's range, with a warn when clamping changed it) beats the
+/// construction-baked value.
+fn effective_reasoning_effort(
+    model: &str,
+    baked: Option<&'static str>,
+    request: &CompletionRequest,
+) -> Option<&'static str> {
+    let requested = request
+        .additional_params
+        .as_ref()
+        .and_then(|p| p.get(crate::REQUEST_REASONING_EFFORT_PARAM))
+        .and_then(|v| v.as_str());
+    match requested {
+        None => baked,
+        Some(ask) => {
+            let resolved = super::reasoning::resolve_effort(model, Some(ask));
+            let clamped = match resolved {
+                Some(r) => !r.eq_ignore_ascii_case(ask),
+                None => true, // "none" outcomes can't come from the profile vocab
+            };
+            if clamped {
+                tracing::warn!(
+                    model = %model,
+                    requested = %ask,
+                    resolved = ?resolved,
+                    "per-request reasoning effort clamped to the model's range"
+                );
+            }
+            resolved
+        }
     }
 }
 
@@ -1377,6 +1411,32 @@ mod tests {
         assert!(
             body.get("include").is_none(),
             "include must be absent when reasoning is off"
+        );
+    }
+
+    #[test]
+    fn request_effort_overrides_baked_value() {
+        // Baked "low", request asks "high" → high wins (legal for gpt-5).
+        let mut req = empty_request();
+        req.additional_params =
+            Some(serde_json::json!({ crate::REQUEST_REASONING_EFFORT_PARAM: "high" }));
+        assert_eq!(
+            effective_reasoning_effort("gpt-5", Some("low"), &req),
+            Some("high")
+        );
+        // No request value → baked value.
+        let plain = empty_request();
+        assert_eq!(
+            effective_reasoning_effort("gpt-5", Some("low"), &plain),
+            Some("low")
+        );
+        // Out-of-range request clamps per the model family (gpt-5-pro is high-only).
+        let mut clamped = empty_request();
+        clamped.additional_params =
+            Some(serde_json::json!({ crate::REQUEST_REASONING_EFFORT_PARAM: "minimal" }));
+        assert_eq!(
+            effective_reasoning_effort("gpt-5-pro", Some("high"), &clamped),
+            Some("high")
         );
     }
 

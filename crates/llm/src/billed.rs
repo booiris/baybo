@@ -272,6 +272,7 @@ mod tests {
             messages: vec![],
             temperature: None,
             tools: vec![],
+            reasoning_effort: None,
         }
     }
 

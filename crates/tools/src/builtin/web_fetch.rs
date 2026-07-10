@@ -596,6 +596,7 @@ async fn run_summary(
             ChatMessage::agent_context(vec![ContentBlock::Text(user_text.to_string())]),
         ],
         temperature: Some(0.0),
+        reasoning_effort: None,
         tools: vec![],
     };
     tokio::select! {

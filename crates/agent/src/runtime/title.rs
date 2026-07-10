@@ -49,6 +49,7 @@ impl TitleRunner {
             messages: messages.clone(),
             temperature: None,
             tools: Vec::new(),
+            reasoning_effort: None,
         };
 
         let cancel_ctx = Some((&cancel_token, baybo_job::CancelReason::ParentCancelled));

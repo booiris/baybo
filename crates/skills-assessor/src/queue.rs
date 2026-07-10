@@ -189,6 +189,7 @@ async fn assess_full(
         messages,
         temperature: Some(0.0),
         tools: vec![],
+        reasoning_effort: None,
     };
     let response = llm
         .chat(&request)

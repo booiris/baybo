@@ -181,6 +181,7 @@ async fn run_judge(
             ChatMessage::agent_context(vec![ContentBlock::Text(user.to_string())]),
         ],
         temperature: Some(0.0),
+        reasoning_effort: None,
         tools: vec![],
     };
     let outcome = {

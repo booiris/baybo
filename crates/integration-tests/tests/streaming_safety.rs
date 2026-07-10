@@ -58,6 +58,7 @@ fn req() -> ChatRequest {
         )])],
         temperature: None,
         tools: vec![],
+        reasoning_effort: None,
     }
 }
 
