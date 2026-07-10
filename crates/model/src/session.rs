@@ -318,9 +318,33 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_llm: Option<LlmEntryName>,
 
+    /// Agent-profile binding: which `agent_profiles` row this session was
+    /// created under. `None` = the builtin `baybo` agent (all pre-binding
+    /// rows). Written once at creation via the `set_agent_binding` targeted
+    /// setter; patched from the flat `sessions.agent_id` column on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<crate::AgentProfileId>,
+
+    /// Snapshot of the bound profile's framework at creation. Execution
+    /// identity: a later profile-framework edit must not change how an
+    /// existing transcript is served. `None` = baybo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_framework: Option<crate::AgentFramework>,
+
     /// Reserved extension fields for plugins and experiments.
     #[serde(default)]
     pub extra: HashMap<String, Value>,
+}
+
+impl SessionState {
+    /// The memory / display identity of this session's agent: the bound
+    /// profile id, or the builtin id for unbound sessions.
+    pub fn agent_id_or_builtin(&self) -> &str {
+        self.agent_id
+            .as_ref()
+            .map(crate::AgentProfileId::as_str)
+            .unwrap_or(crate::BUILTIN_AGENT_PROFILE_ID)
+    }
 }
 
 /// A barrier cohort of grouped subagents. Members' results accumulate in
@@ -374,6 +398,30 @@ impl GroupState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_profile::{AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID};
+
+    #[test]
+    fn session_state_agent_binding_defaults_none_and_round_trips() {
+        let state = SessionState::default();
+        assert_eq!(state.agent_id, None);
+        assert_eq!(state.agent_framework, None);
+        assert_eq!(state.agent_id_or_builtin(), BUILTIN_AGENT_PROFILE_ID);
+
+        // Old blobs (no fields) still deserialize.
+        let old: SessionState = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.agent_id, None);
+
+        let bound = SessionState {
+            agent_id: Some(AgentProfileId::from("01ARZ3NDEKTSV4RRFFQ69G5FAV")),
+            agent_framework: Some(AgentFramework::Baybo),
+            ..Default::default()
+        };
+        assert_eq!(bound.agent_id_or_builtin(), "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let json = serde_json::to_string(&bound).unwrap();
+        let back: SessionState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.agent_id, bound.agent_id);
+        assert_eq!(back.agent_framework, Some(AgentFramework::Baybo));
+    }
 
     fn group(expected: usize, sealed: bool, results: usize) -> GroupState {
         GroupState {
