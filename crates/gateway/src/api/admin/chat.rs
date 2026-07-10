@@ -1874,6 +1874,27 @@ async fn resolve_agent_binding(
     Ok(Some((id, profile.framework)))
 }
 
+/// True when `session`'s persisted agent binding is exactly `binding`
+/// (`None` means unbound). The one comparison behind two checks in
+/// [`create_or_load_chat_session`]: idempotent-retry on the
+/// load-existing-session arm (a client resending the same create call
+/// gets the existing session back rather than a 400), and creation-race
+/// honesty on the requested-id fresh arm (`get_or_create_with_agent` may
+/// return a row a concurrent caller seeded, whose binding might not be
+/// this request's).
+fn session_binding_matches(
+    session: &Session,
+    binding: Option<&(AgentProfileId, AgentFramework)>,
+) -> bool {
+    match binding {
+        None => session.state.agent_id.is_none(),
+        Some((agent_id, framework)) => {
+            session.state.agent_id.as_ref() == Some(agent_id)
+                && session.state.agent_framework == Some(*framework)
+        }
+    }
+}
+
 async fn create_or_load_chat_session(
     state: &AdminState,
     requested_session_id: Option<String>,
@@ -1881,57 +1902,61 @@ async fn create_or_load_chat_session(
     channel_type: ChannelType,
     binding: Option<(AgentProfileId, AgentFramework)>,
 ) -> Result<Session> {
-    let mut session =
-        match requested_session_id {
+    let Some(session_id) = requested_session_id else {
+        return match binding {
+            Some((agent_id, framework)) => state
+                .session_manager
+                .create_session_with_agent(user, channel_type, agent_id, framework)
+                .await
+                .map_err(|e| GatewayError::Internal(format!("create chat session: {e}"))),
             None => state
                 .session_manager
                 .create_session(user, channel_type)
                 .await
-                .map_err(|e| GatewayError::Internal(format!("create chat session: {e}")))?,
-            Some(session_id) => {
-                let sid = SessionId::from(session_id.as_str());
-                if let Some(existing) = state.session_manager.get(&sid).await.map_err(|e| {
-                    GatewayError::Internal(format!("load requested chat session: {e}"))
-                })? {
-                    if existing.channel != channel_type
-                        || existing.user.id != user.id
-                        || is_cron_triggered(&existing)
-                    {
-                        return Err(GatewayError::NotFound(format!("chat session {session_id}")));
-                    }
-                    if binding.is_some() {
-                        return Err(GatewayError::BadRequest(
-                            "cannot set an agent on an existing session".into(),
-                        ));
-                    }
-                    return Ok(existing);
-                }
-
-                state
-                    .session_manager
-                    .get_or_create(&sid, user, channel_type)
-                    .await
-                    .map_err(|e| {
-                        GatewayError::Internal(format!("create requested chat session: {e}"))
-                    })?
-            }
+                .map_err(|e| GatewayError::Internal(format!("create chat session: {e}"))),
         };
+    };
 
-    if let Some((agent_id, framework)) = binding {
-        let updated = state
-            .session_manager
-            .set_agent_binding(&session.id, &agent_id, framework)
-            .await
-            .map_err(|e| GatewayError::Internal(format!("bind agent to session: {e}")))?;
-        if !updated {
-            return Err(GatewayError::Internal(
-                "session vanished or was already agent-bound".to_owned(),
-            ));
+    let sid = SessionId::from(session_id.as_str());
+    if let Some(existing) = state
+        .session_manager
+        .get(&sid)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("load requested chat session: {e}")))?
+    {
+        if existing.channel != channel_type
+            || existing.user.id != user.id
+            || is_cron_triggered(&existing)
+        {
+            return Err(GatewayError::NotFound(format!("chat session {session_id}")));
         }
-        session.state.agent_id = Some(agent_id);
-        session.state.agent_framework = Some(framework);
+        // Idempotent retry: a client resending the exact same create call
+        // (same binding, or no binding against an already-unbound row)
+        // gets the existing session back instead of a 400.
+        return if session_binding_matches(&existing, binding.as_ref()) {
+            Ok(existing)
+        } else {
+            Err(GatewayError::BadRequest(
+                "cannot set an agent on an existing session".into(),
+            ))
+        };
     }
-    Ok(session)
+
+    let session = state
+        .session_manager
+        .get_or_create_with_agent(&sid, user, channel_type, binding.clone())
+        .await
+        .map_err(|e| GatewayError::Internal(format!("create requested chat session: {e}")))?;
+    // `get_or_create_with_agent` may have lost a creation race and
+    // returned a row a concurrent caller seeded — re-check the binding
+    // rather than assume it matches what this request asked for.
+    if session_binding_matches(&session, binding.as_ref()) {
+        Ok(session)
+    } else {
+        Err(GatewayError::BadRequest(
+            "cannot set an agent on an existing session".into(),
+        ))
+    }
 }
 
 fn chat_list_channel(authed: Option<&AuthedClient>) -> ChannelType {

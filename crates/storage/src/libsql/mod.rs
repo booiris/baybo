@@ -185,14 +185,15 @@ impl LibsqlPool {
                     read_cursor           INTEGER,
                     -- Auto-generated conversation title; owned by set_title.
                     title                 TEXT,
-                    -- Agent-profile binding, set once by set_agent_binding
-                    -- (the SQL guard `WHERE agent_id IS NULL` makes a
-                    -- second call a no-op, so the pair is structurally
-                    -- write-once). NULL ⇒ the builtin baybo agent. Like
-                    -- the other chat flat columns, `save`'s DO UPDATE
-                    -- omits both so a concurrent `touch` can't clobber
-                    -- the binding; `get` patches `Session.state.agent_id`
-                    -- / `agent_framework` from these columns on read.
+                    -- Agent-profile binding, seeded once in `save`'s INSERT
+                    -- column list (like `hidden` / `pinned`) from
+                    -- `Session.state.{agent_id, agent_framework}` at
+                    -- creation. NULL ⇒ the builtin baybo agent. `save`'s
+                    -- DO UPDATE omits both, and no setter exists at all, so
+                    -- the binding is structurally immutable — there is no
+                    -- code path that can write these columns after the row
+                    -- is created. `get` patches `Session.state.agent_id` /
+                    -- `agent_framework` from these columns on read.
                     agent_id              TEXT,
                     agent_framework       TEXT,
                     data                  TEXT NOT NULL

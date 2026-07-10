@@ -299,11 +299,43 @@ async fn create_session_binds_agent_profile() {
         "expected 'not supported yet' in error, got {err:?}",
     );
 
-    // ── 8. Setting an agent on an existing session is a 400 ───────────
-    post(
+    // ── 8a. Idempotent retry: same session_id + the SAME agent_id it's
+    // already bound to → 200, returns the existing session unchanged
+    // (a client safely resending its create call after e.g. a dropped
+    // response must not see a 400).
+    let retried = post(
         &router,
         "/v1/chat/sessions",
         Body::from(json!({ "session_id": session_id, "agent_id": agent_id }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(retried["session_id"].as_str(), Some(session_id.as_str()));
+
+    // ── 8b. Mismatch: an agent_id against an already-*unbound* existing
+    // session is a 400 ─────────────────────────────────────────────────
+    post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "session_id": builtin_session_id, "agent_id": agent_id }).to_string()),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    // ── 8c. Mismatch: the same session_id + a DIFFERENT agent_id than
+    // it's bound to is a 400 ────────────────────────────────────────────
+    let profile2 = post(
+        &router,
+        "/v1/agents",
+        Body::from(json!({ "name": "helper2" }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    let agent_id2 = profile2["id"].as_str().expect("profile id").to_owned();
+    post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "session_id": session_id, "agent_id": agent_id2 }).to_string()),
         StatusCode::BAD_REQUEST,
     )
     .await;

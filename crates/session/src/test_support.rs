@@ -67,12 +67,17 @@ impl SessionStore for MemorySessionStore {
         let mut data = self.data.lock();
         let mut to_store = session.clone();
         // Flat columns are owned by targeted setters; preserve them across
-        // stale full-blob saves.
+        // stale full-blob saves. `agent_id` / `agent_framework` have no
+        // setter at all — they are seeded once at creation (the first
+        // `save`, when no row exists yet) and never written again by any
+        // later `save`.
         if let Some(existing) = data.get(&session.id) {
             to_store.hidden = existing.hidden;
             to_store.pinned = existing.pinned;
             to_store.folder_id = existing.folder_id.clone();
             to_store.title = existing.title.clone();
+            to_store.state.agent_id = existing.state.agent_id.clone();
+            to_store.state.agent_framework = existing.state.agent_framework;
         }
         data.insert(session.id.clone(), to_store);
         Ok(())
@@ -143,23 +148,6 @@ impl SessionStore for MemorySessionStore {
                 Ok(true)
             }
             None => Ok(false),
-        }
-    }
-
-    async fn set_agent_binding(
-        &self,
-        session_id: &SessionId,
-        agent_id: &baybo_model::AgentProfileId,
-        framework: baybo_model::AgentFramework,
-    ) -> Result<bool> {
-        let mut data = self.data.lock();
-        match data.get_mut(session_id) {
-            Some(s) if s.state.agent_id.is_none() => {
-                s.state.agent_id = Some(agent_id.clone());
-                s.state.agent_framework = Some(framework);
-                Ok(true)
-            }
-            _ => Ok(false),
         }
     }
 

@@ -1357,22 +1357,6 @@ mod tests {
                 None => Ok(false),
             }
         }
-        async fn set_agent_binding(
-            &self,
-            id: &SessionId,
-            agent_id: &baybo_model::AgentProfileId,
-            framework: baybo_model::AgentFramework,
-        ) -> std::result::Result<bool, baybo_store::StorageError> {
-            let mut data = self.sessions.lock();
-            match data.get_mut(id) {
-                Some(s) if s.state.agent_id.is_none() => {
-                    s.state.agent_id = Some(agent_id.clone());
-                    s.state.agent_framework = Some(framework);
-                    Ok(true)
-                }
-                _ => Ok(false),
-            }
-        }
         async fn delete(
             &self,
             _id: &SessionId,

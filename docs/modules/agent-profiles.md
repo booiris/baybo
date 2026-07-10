@@ -55,11 +55,11 @@ Exactly one row is seeded with `id = BUILTIN_AGENT_PROFILE_ID` (`"baybo"`), `nam
 
 A web chat session is bound to at most one agent profile, **at creation only** — binding is immutable for the session's life. This is the runtime consumer the schema was shaped for.
 
-### Data model: two flat columns, write-once
+### Data model: two flat columns, seeded at creation
 
-`sessions` carries `agent_id TEXT` and `agent_framework TEXT` (the `last_llm` anti-clobber pattern — no state-blob write): `NULL` on both means the builtin `baybo` agent, which is every pre-binding row. `SessionState::agent_id_or_builtin()` is the one accessor every consumer uses to turn "maybe bound" into a concrete id — it returns the bound `agent_id` or `BUILTIN_AGENT_PROFILE_ID`.
+`sessions` carries `agent_id TEXT` and `agent_framework TEXT` (the `hidden` / `pinned` INSERT-seeding pattern — no state-blob write, no targeted setter): `NULL` on both means the builtin `baybo` agent, which is every pre-binding row. `SessionState::agent_id_or_builtin()` is the one accessor every consumer uses to turn "maybe bound" into a concrete id — it returns the bound `agent_id` or `BUILTIN_AGENT_PROFILE_ID`.
 
-`SessionStore::set_agent_binding(session_id, agent_id, framework)` is a **targeted, write-once** setter: it only fires `UPDATE … WHERE agent_id IS NULL`, so a session can be bound exactly once and a second call is a no-op (`Ok(false)`). There is no unbind and no rebind — an agent's `framework` is a snapshot of the profile at bind time, not a live read, because a baybo transcript can't be served by an external CLI that has never seen it (framework itself isn't consumed yet; only `baybo`-framework binding is wired through the runtime — see below).
+The binding rides the session-creation INSERT: `SessionManager::create_session_with_agent` / `get_or_create_with_agent` stamp `SessionState.{agent_id, agent_framework}` before the first `store.save()` call, and `save`'s column list carries them into the row's INSERT. `save`'s `ON CONFLICT DO UPDATE` clause omits both columns, and **no setter exists** for them at all — so unlike `last_llm` / `pinned` / `folder_id` (each mutable via its own targeted `UPDATE`), the agent binding is immutable by construction: there is no code path, past creation, that can write these columns. A concurrent creation race (two callers racing the same client-supplied `session_id`) is resolved by whichever `save()` wins the INSERT; the loser's `get_or_create_with_agent` call returns the winner's row, and the gateway compares the returned binding against what it asked for (see [Creation API](#creation-api)) rather than erroring blindly. There is no unbind and no rebind — an agent's `framework` is a snapshot of the profile at bind time, not a live read, because a baybo transcript can't be served by an external CLI that has never seen it (framework itself isn't consumed yet; only `baybo`-framework binding is wired through the runtime — see below).
 
 ### Creation API
 
@@ -70,8 +70,8 @@ A web chat session is bound to at most one agent profile, **at creation only** �
 | absent / `null` / `"baybo"` (`BUILTIN_AGENT_PROFILE_ID`) | unbound — `agent_id`/`agent_framework` stay `NULL` |
 | unknown id | 400 |
 | a known id whose profile `framework != baybo` | 400 "external-framework chat sessions are not supported yet" |
-| a known `baybo`-framework id | bound via `set_agent_binding` |
-| any `agent_id` on a request that resolves to an **existing** session (a client-supplied `session_id` that already has a row) | 400 "cannot set an agent on an existing session" — binding only happens at true creation |
+| a known `baybo`-framework id | bound by seeding it onto `SessionState` before the creation `save()` (`SessionManager::create_session_with_agent` / `get_or_create_with_agent`) |
+| an `agent_id` on a request that resolves to an **existing** session (a client-supplied `session_id` that already has a row) | idempotent retry: the row's binding already equals the request → 200, returns the existing session unchanged; any other case (a different binding, or any binding requested against an unbound row) → 400 "cannot set an agent on an existing session" — binding only happens at true creation |
 
 `ChatSessionSummary` and `ChatSessionDetail` (the REST + sync DTOs) carry `agent_id` / `agent_framework` so the client renders the agent chip without a join back to `/v1/agents`; `SessionPatch.agent_id` rides the session-created broadcast and the unhide broadcast (reconstructing a hidden row's chip without a refetch — an unhide is the other place a client first learns about a row it may not have cached).
 
@@ -206,8 +206,8 @@ Shape changes ride the standard openapi regen chain — see the header of `crate
 | Module | Role |
 |---|---|
 | `model` | `AgentProfileId` (ULID-minted string newtype), `AgentFramework` (+ `to_backend_kind`), `BUILTIN_AGENT_PROFILE_ID`, `MAX_AGENT_PROFILE_NAME_CHARS`; `SessionState.{agent_id, agent_framework}` + `agent_id_or_builtin()` |
-| `store` | `AgentProfileRow` / `AgentProfileUpdate` / `AgentProfileStore` port; `StorageError::Conflict` carries duplicate names; `SessionStore::set_agent_binding` (write-once) |
-| `storage` | `LibsqlAgentProfileStore` (async `open` seeds the builtin), `agent_profiles` DDL in `init_db()`, `Store.agent_profile` bundle field; `sessions.{agent_id, agent_framework}` columns |
+| `store` | `AgentProfileRow` / `AgentProfileUpdate` / `AgentProfileStore` port; `StorageError::Conflict` carries duplicate names |
+| `storage` | `LibsqlAgentProfileStore` (async `open` seeds the builtin), `agent_profiles` DDL in `init_db()`, `Store.agent_profile` bundle field; `sessions.{agent_id, agent_framework}` columns seeded by `save`'s INSERT, immutable thereafter (no setter) |
 | `gateway` | `api/admin/agents.rs` handlers + DTOs, `AdminState.{agent_profile_store, blob_store}`, the shared `validate_llm_pin`; `api/admin/chat.rs` `resolve_agent_binding` at session creation; `GET /v1/skills` (`?agent_id=` scoped) and `GET /v1/llm/models` feed the read-only skills readout and the model picker |
 | `skills` | `SkillRegistry::{load_agent_skills_root, get_scoped, summaries_for_agent}` — the agent-scoped view backing both the runtime overlay and the Agents-page skills readout |
 | `agent` | the `LlmPoolHandle` on `AdminState` validates the `llm` pin at write time; `resolve_initial_llm` (session pin > live profile pin > default) at actor spawn/hydration; `ToolContext.agent_id` threading |

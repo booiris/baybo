@@ -320,14 +320,17 @@ pub struct SessionState {
 
     /// Agent-profile binding: which `agent_profiles` row this session was
     /// created under. `None` = the builtin `baybo` agent (all pre-binding
-    /// rows). Written once at creation via the `set_agent_binding` targeted
-    /// setter; patched from the flat `sessions.agent_id` column on read.
+    /// rows). Seeded by the session-creation INSERT into the flat
+    /// `sessions.agent_id` column; `save`'s upsert never updates that
+    /// column and no setter exists at all, so the binding is structurally
+    /// immutable after creation. Patched from that column on read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<crate::AgentProfileId>,
 
     /// Snapshot of the bound profile's framework at creation. Execution
     /// identity: a later profile-framework edit must not change how an
-    /// existing transcript is served. `None` = baybo.
+    /// existing transcript is served. `None` = baybo. Seeded and made
+    /// immutable the same way as [`Self::agent_id`] — see its doc comment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_framework: Option<crate::AgentFramework>,
 

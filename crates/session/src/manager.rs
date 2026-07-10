@@ -172,6 +172,28 @@ impl SessionManager {
             .await
     }
 
+    /// Mint a brand-new session pre-bound to an agent profile. The binding
+    /// lands on `SessionState` before the first `store.save()` call, so the
+    /// row is seeded with it at INSERT time (see `crates/storage`'s
+    /// `agent_id` / `agent_framework` columns) — there is no window where
+    /// the row exists unbound, and no setter exists to bind it later.
+    pub async fn create_session_with_agent(
+        &self,
+        user: User,
+        channel: ChannelType,
+        agent_id: AgentProfileId,
+        framework: AgentFramework,
+    ) -> Result<Session> {
+        self.create_session_with_id_and_binding(
+            SessionId::new(),
+            user,
+            channel,
+            TriggerSource::User,
+            Some((agent_id, framework)),
+        )
+        .await
+    }
+
     /// Create a session that descends from `parent` via the given
     /// lineage (subagent). The child inherits its trigger from the
     /// parent's root session and gets a fresh session_id prefixed
@@ -222,14 +244,36 @@ impl SessionManager {
         channel: ChannelType,
         trigger: TriggerSource,
     ) -> Result<Session> {
+        self.create_session_with_id_and_binding(id, user, channel, trigger, None)
+            .await
+    }
+
+    /// Shared construction path for every top-level (non-spawned) session:
+    /// stamps an optional agent binding onto `SessionState` before the
+    /// first `save`, so a bound session is never persisted unbound even
+    /// for an instant — the binding rides the same INSERT as the rest of
+    /// the row.
+    async fn create_session_with_id_and_binding(
+        &self,
+        id: SessionId,
+        user: User,
+        channel: ChannelType,
+        trigger: TriggerSource,
+        binding: Option<(AgentProfileId, AgentFramework)>,
+    ) -> Result<Session> {
         let now = Utc::now();
+        let mut state = SessionState::default();
+        if let Some((agent_id, framework)) = binding {
+            state.agent_id = Some(agent_id);
+            state.agent_framework = Some(framework);
+        }
         let session = Session {
             id: id.clone(),
             user,
             channel,
             created_at: now,
             last_active: now,
-            state: SessionState::default(),
+            state,
             root_session_id: id,
             trigger,
             lineage: None,
@@ -249,6 +293,27 @@ impl SessionManager {
         user: User,
         channel: ChannelType,
     ) -> Result<Session> {
+        self.get_or_create_with_agent(session_id, user, channel, None)
+            .await
+    }
+
+    /// Same as [`Self::get_or_create`], but seeds an agent binding onto a
+    /// freshly-created row (a no-op when the session already exists — the
+    /// binding only ever applies at true creation). Used by the gateway's
+    /// requested-id chat-creation arm so a client-supplied `session_id`
+    /// paired with an `agent_id` lands the binding on the same INSERT as
+    /// the rest of the row, with no separate bind step. When a concurrent
+    /// caller wins the creation race, this returns the row the winner
+    /// seeded (which may carry a different binding than requested) rather
+    /// than erroring — callers that care compare the returned session's
+    /// binding against what they asked for.
+    pub async fn get_or_create_with_agent(
+        &self,
+        session_id: &SessionId,
+        user: User,
+        channel: ChannelType,
+        binding: Option<(AgentProfileId, AgentFramework)>,
+    ) -> Result<Session> {
         if let Some(session) = self.store.get(session_id).await? {
             // Idle sessions are NOT deleted on access. Deleting the
             // session row would cascade to `session_messages` and
@@ -263,8 +328,26 @@ impl SessionManager {
             return Ok(session);
         }
         debug!(session_id = %session_id, "session not found, creating new session");
-        self.create_session_with_id(session_id.clone(), user, channel, TriggerSource::User)
-            .await
+        self.create_session_with_id_and_binding(
+            session_id.clone(),
+            user,
+            channel,
+            TriggerSource::User,
+            binding,
+        )
+        .await?;
+        // Re-read rather than trust the just-built local `Session`: a
+        // concurrent caller may have won the INSERT for this same
+        // client-supplied id between the `get` above and the `save` just
+        // issued. `save`'s `ON CONFLICT DO UPDATE` never touches
+        // `agent_id` / `agent_framework`, so whichever caller's INSERT
+        // landed first owns the persisted binding — only a fresh `get`
+        // tells a loser what actually stuck, rather than it echoing back
+        // the binding it merely asked for.
+        self.store
+            .get(session_id)
+            .await?
+            .ok_or_else(|| SessionError::NotFound(format!("session {session_id}")))
     }
 
     pub async fn get(&self, session_id: &SessionId) -> Result<Option<Session>> {
@@ -575,23 +658,6 @@ impl SessionManager {
         }
         debug!(session_id = %session_id, llm = ?llm, "set session llm pin");
         Ok(())
-    }
-
-    /// Bind a session to an agent profile (write-once; see the store docs).
-    /// Returns `Ok(false)` when the row is missing or already bound —
-    /// callers decide whether that's an error.
-    pub async fn set_agent_binding(
-        &self,
-        session_id: &SessionId,
-        agent_id: &AgentProfileId,
-        framework: AgentFramework,
-    ) -> Result<bool> {
-        let updated = self
-            .store
-            .set_agent_binding(session_id, agent_id, framework)
-            .await?;
-        debug!(session_id = %session_id, agent_id = %agent_id, updated, "set session agent binding");
-        Ok(updated)
     }
 
     /// Flip the session's chat-list `pinned` flag — the sidebar "pin to
@@ -940,6 +1006,93 @@ mod tests {
         assert_eq!(session.id, id);
         let reloaded = mgr.get(&id).await.unwrap();
         assert!(reloaded.is_some());
+    }
+
+    #[tokio::test]
+    async fn create_session_with_agent_seeds_binding_before_first_save() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
+
+        let agent_id = baybo_model::AgentProfileId::from("agent-1");
+        let session = mgr
+            .create_session_with_agent(
+                test_user(),
+                ChannelType::http(),
+                agent_id.clone(),
+                baybo_model::AgentFramework::Baybo,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(session.state.agent_id, Some(agent_id.clone()));
+        assert_eq!(
+            session.state.agent_framework,
+            Some(baybo_model::AgentFramework::Baybo)
+        );
+        // The binding is durable — reading the row back from the store
+        // (not the in-memory `Session` handed back by create) shows it.
+        let reloaded = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.state.agent_id, Some(agent_id));
+    }
+
+    #[tokio::test]
+    async fn get_or_create_with_agent_seeds_binding_only_on_creation() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
+
+        // A `None` binding on a fresh id behaves exactly like plain
+        // `get_or_create`.
+        let unbound_id = SessionId::from("cli-unbound");
+        let unbound = mgr
+            .get_or_create_with_agent(&unbound_id, test_user(), ChannelType::tui(), None)
+            .await
+            .unwrap();
+        assert_eq!(unbound.state.agent_id, None);
+
+        // A `Some` binding on a fresh id seeds it at creation.
+        let bound_id = SessionId::from("cli-bound");
+        let agent_id = baybo_model::AgentProfileId::from("agent-2");
+        let bound = mgr
+            .get_or_create_with_agent(
+                &bound_id,
+                test_user(),
+                ChannelType::tui(),
+                Some((agent_id.clone(), baybo_model::AgentFramework::Codex)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bound.state.agent_id, Some(agent_id.clone()));
+        assert_eq!(
+            bound.state.agent_framework,
+            Some(baybo_model::AgentFramework::Codex)
+        );
+
+        // Calling again against the now-existing row returns it unchanged
+        // regardless of the binding argument — creation-only semantics,
+        // no setter to apply it retroactively.
+        let other_agent = baybo_model::AgentProfileId::from("agent-3");
+        let again = mgr
+            .get_or_create_with_agent(
+                &bound_id,
+                test_user(),
+                ChannelType::tui(),
+                Some((other_agent, baybo_model::AgentFramework::Claude)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.state.agent_id, Some(agent_id));
+        assert_eq!(
+            again.state.agent_framework,
+            Some(baybo_model::AgentFramework::Codex)
+        );
     }
 
     fn folder_mgr() -> SessionManager {

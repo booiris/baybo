@@ -163,18 +163,26 @@ impl SessionStore for LibsqlSessionStore {
         let lineage_kind = lineage_kind_str(session).map(|s| s.to_string());
         let hidden_flag: i64 = if session.hidden { 1 } else { 0 };
         let pinned_flag: i64 = if session.pinned { 1 } else { 0 };
+        let agent_id = session
+            .state
+            .agent_id
+            .as_ref()
+            .map(|a| a.as_str().to_string());
+        let agent_framework = session.state.agent_framework.map(|f| f.as_str().to_owned());
         // Upsert in place (NOT `INSERT OR REPLACE`, which delete+reinserts
         // the row). The DO UPDATE clause omits flat columns owned by targeted
-        // setters (`hidden`, `last_llm`, `pinned`, `folder_id`, `title`) so a
-        // stale in-memory `Session` cannot clobber them. `hidden` / `pinned`
-        // are seeded only on a brand-new row; `get` reads all flat columns as
-        // authoritative over the JSON blob.
+        // setters (`hidden`, `last_llm`, `pinned`, `folder_id`, `title`) plus
+        // `agent_id` / `agent_framework`, which have no setter at all — they
+        // are seeded only on a brand-new row (like `hidden` / `pinned`) and
+        // then never written again by any code path, so the agent binding is
+        // structurally immutable rather than merely guard-enforced. `get`
+        // reads all flat columns as authoritative over the JSON blob.
         conn.execute(
             "INSERT INTO sessions \
              (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
               parent_span_id, lineage_kind, created_at, last_active, \
-              hidden, pinned, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+              hidden, pinned, agent_id, agent_framework, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
              ON CONFLICT(id) DO UPDATE SET \
                root_session_id = excluded.root_session_id, \
                trigger_kind = excluded.trigger_kind, \
@@ -197,6 +205,8 @@ impl SessionStore for LibsqlSessionStore {
                 super::time::to_us(session.last_active),
                 hidden_flag,
                 pinned_flag,
+                agent_id,
+                agent_framework,
                 data,
             ],
         )
@@ -242,30 +252,6 @@ impl SessionStore for LibsqlSessionStore {
             )
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_last_llm: {e}")))?;
-        Ok(affected > 0)
-    }
-
-    async fn set_agent_binding(
-        &self,
-        session_id: &SessionId,
-        agent_id: &AgentProfileId,
-        framework: AgentFramework,
-    ) -> Result<bool> {
-        let conn = self.pool.conn();
-        let affected = conn
-            .execute(
-                "UPDATE sessions SET agent_id = ?2, agent_framework = ?3 \
-                 WHERE id = ?1 AND agent_id IS NULL",
-                libsql::params![
-                    session_id.as_str().to_string(),
-                    agent_id.as_str().to_string(),
-                    framework.as_str(),
-                ],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql set_agent_binding: {e}"))
-            })?;
         Ok(affected > 0)
     }
 
@@ -1744,16 +1730,16 @@ mod tests {
         let loaded = store.get(&id).await.unwrap().expect("legacy row present");
         assert_eq!(loaded.state.agent_id, None);
         assert_eq!(loaded.state.agent_framework, None);
-        // And the columns are now writable like any other.
+        // And the columns are now seedable like any other, via the ordinary
+        // creation-time INSERT — there is no separate setter, migrated or
+        // not.
         let agent_id = baybo_model::AgentProfileId::from("01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        assert!(
-            store
-                .set_agent_binding(&id, &agent_id, baybo_model::AgentFramework::Baybo)
-                .await
-                .unwrap()
-        );
+        let mut fresh = make_root_session("legacy-agent-fresh");
+        fresh.state.agent_id = Some(agent_id.clone());
+        fresh.state.agent_framework = Some(baybo_model::AgentFramework::Baybo);
+        store.save(&fresh).await.unwrap();
         assert_eq!(
-            store.get(&id).await.unwrap().unwrap().state.agent_id,
+            store.get(&fresh.id).await.unwrap().unwrap().state.agent_id,
             Some(agent_id)
         );
     }
@@ -1901,14 +1887,10 @@ mod tests {
 
         let mut s = make_root_session("agent-list");
         s.channel = ChannelType::http();
-        store.save(&s).await.unwrap();
         let id = baybo_model::AgentProfileId::from("01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        assert!(
-            store
-                .set_agent_binding(&s.id, &id, baybo_model::AgentFramework::Codex)
-                .await
-                .unwrap()
-        );
+        s.state.agent_id = Some(id.clone());
+        s.state.agent_framework = Some(baybo_model::AgentFramework::Codex);
+        store.save(&s).await.unwrap();
 
         let listed_all = store.list_all().await.unwrap();
         let found = listed_all.iter().find(|x| x.id == s.id).unwrap();
@@ -1928,41 +1910,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_agent_binding_is_write_once_and_survives_save() {
+    async fn agent_binding_is_seeded_at_insert_and_immutable_after() {
+        // No setter exists for `agent_id`/`agent_framework` — the binding
+        // is seeded into the INSERT column list at creation, mirroring
+        // `hidden`/`pinned`. Proving it round-trips through `save`/`get`
+        // AND survives a later full-blob `save` from a stale in-memory
+        // copy (carrying a *different* binding) simultaneously proves the
+        // INSERT-seeding and the `DO UPDATE` omission: there is no code
+        // path, past creation, that can write these columns.
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlSessionStore::new(pool);
-        let s = make_root_session("agent-bound");
-        store.save(&s).await.unwrap();
 
         let id = baybo_model::AgentProfileId::from("01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        assert!(
-            store
-                .set_agent_binding(&s.id, &id, baybo_model::AgentFramework::Baybo)
-                .await
-                .unwrap()
-        );
-        // Write-once: a second bind is refused.
-        assert!(
-            !store
-                .set_agent_binding(&s.id, &id, baybo_model::AgentFramework::Baybo)
-                .await
-                .unwrap()
-        );
-        // Missing row is refused.
-        let ghost = make_root_session("ghost");
-        assert!(
-            !store
-                .set_agent_binding(&ghost.id, &id, baybo_model::AgentFramework::Baybo)
-                .await
-                .unwrap()
-        );
-
-        // A full-blob save (touch path) must not clobber the columns.
+        let mut s = make_root_session("agent-bound");
+        s.state.agent_id = Some(id.clone());
+        s.state.agent_framework = Some(baybo_model::AgentFramework::Baybo);
         store.save(&s).await.unwrap();
+
         let loaded = store.get(&s.id).await.unwrap().expect("row present");
-        assert_eq!(loaded.state.agent_id, Some(id));
+        assert_eq!(loaded.state.agent_id, Some(id.clone()));
         assert_eq!(
             loaded.state.agent_framework,
+            Some(baybo_model::AgentFramework::Baybo)
+        );
+
+        // Re-save a stale in-memory copy carrying a *different* binding —
+        // e.g. a concurrent creation-race loser's own seeded values.
+        // `save`'s DO UPDATE must not clobber the columns this row was
+        // created with.
+        let mut mutated = s.clone();
+        mutated.state.agent_id = Some(baybo_model::AgentProfileId::from("some-other-id"));
+        mutated.state.agent_framework = Some(baybo_model::AgentFramework::Codex);
+        store.save(&mutated).await.unwrap();
+
+        let reloaded = store.get(&s.id).await.unwrap().expect("row present");
+        assert_eq!(
+            reloaded.state.agent_id,
+            Some(id),
+            "save must not clobber the agent binding columns seeded at INSERT"
+        );
+        assert_eq!(
+            reloaded.state.agent_framework,
             Some(baybo_model::AgentFramework::Baybo)
         );
 
