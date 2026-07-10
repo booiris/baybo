@@ -14,10 +14,10 @@ impl WorkspaceManager {
     }
 
     /// Materialise the workspace skeleton: create `config/`, `profile/`,
-    /// `skills/`, `.key/`, `state/`, `work/`, `logs/`, and initialise a
-    /// standalone git repo inside each of `config/`, `profile/`, and
-    /// `skills/` if it isn't one already. Idempotent — safe to call on
-    /// every boot.
+    /// `skills/`, `agents/`, `agent-skills/`, `.key/`, `state/`, `work/`,
+    /// `logs/`, and initialise a standalone git repo inside each of
+    /// `config/`, `profile/`, `skills/`, `agents/`, and `agent-skills/` if
+    /// it isn't one already. Idempotent — safe to call on every boot.
     pub async fn ensure_layout(&self) -> anyhow::Result<()> {
         let paths = WorkspacePaths::new(self.root.clone());
         for dir in [
@@ -25,6 +25,7 @@ impl WorkspaceManager {
             paths.profile_dir(),
             paths.skills_dir(),
             paths.agents_dir(),
+            paths.agent_skills_dir(),
             paths.key_dir(),
             paths.state_dir(),
             // Per-session writable artifacts (currently `summary.md` for
@@ -45,6 +46,7 @@ impl WorkspaceManager {
             paths.profile_dir(),
             paths.skills_dir(),
             paths.agents_dir(),
+            paths.agent_skills_dir(),
         ] {
             ensure_git_repo(&dir).await?;
         }
@@ -172,6 +174,7 @@ mod tests {
             paths.profile_dir(),
             paths.skills_dir(),
             paths.agents_dir(),
+            paths.agent_skills_dir(),
             paths.key_dir(),
             paths.state_dir(),
             paths.work_dir(),
@@ -181,11 +184,12 @@ mod tests {
         }
         // No workspace-root .gitignore should exist anymore.
         assert!(!dir.join(".gitignore").exists());
-        // Each of config/, profile/, and skills/ is its own git repo.
+        // Each of config/, profile/, skills/, agents/, and agent-skills/ is its own git repo.
         assert!(paths.config_dir().join(".git").is_dir());
         assert!(paths.profile_dir().join(".git").is_dir());
         assert!(paths.skills_dir().join(".git").is_dir());
         assert!(paths.agents_dir().join(".git").is_dir());
+        assert!(paths.agent_skills_dir().join(".git").is_dir());
         // .key/ is NOT a git repo — encryption key must never be tracked.
         assert!(!paths.key_dir().join(".git").exists());
 
@@ -194,6 +198,7 @@ mod tests {
         assert!(paths.config_dir().join(".git").is_dir());
         assert!(paths.profile_dir().join(".git").is_dir());
         assert!(paths.skills_dir().join(".git").is_dir());
+        assert!(paths.agent_skills_dir().join(".git").is_dir());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

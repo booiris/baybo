@@ -14,13 +14,14 @@
 //!   profile/           # standalone git repo: *.md identity files
 //!   skills/            # standalone git repo: user skill definitions
 //!   agents/            # standalone git repo: subagent profile definitions
+//!   agent-skills/      # standalone git repo: per-agent-profile skill definitions
 //!   .key/              # not version-controlled: encryption.key
 //!   state/             # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
 //!   work/              # not version-controlled: sandbox FS scope; .uv/ (uv cache + downloaded pythons + tools), other scratch
 //!   logs/              # not version-controlled: baybo.log.YYYY-MM-DD, channel/<type>.log (sessions/<id>.jsonl is virtual — never written)
 //! ```
 //!
-//! `config/`, `profile/`, and `skills/` each get their own `.git` repo on
+//! `config/`, `profile/`, `skills/`, `agents/`, and `agent-skills/` each get their own `.git` repo on
 //! first `ensure_layout`; the workspace root itself is not git-tracked.
 
 use std::path::{Path, PathBuf};
@@ -47,6 +48,12 @@ pub const SKILLS_DIR: &str = "skills";
 /// directory-per-profile ceremony — a profile has no linked-files
 /// concern, only a frontmatter + system-prompt body).
 pub const AGENTS_DIR: &str = "agents";
+
+/// Standalone git repo at `<root>/agent-skills/`: per-agent-profile skill
+/// folders, one subdir per profile id (`agent-skills/<agent_id>/<skill>/
+/// SKILL.md`). Skills here are visible only to chat sessions bound to that
+/// agent, overlaid on the shared `skills/` set.
+pub const AGENT_SKILLS_DIR: &str = "agent-skills";
 
 /// Master encryption-key directory at `<root>/.key/`. Not
 /// version-controlled. Setup mints the key file inside on first run with
@@ -366,6 +373,10 @@ impl WorkspacePaths {
         self.root.join(AGENTS_DIR)
     }
 
+    pub fn agent_skills_dir(&self) -> PathBuf {
+        self.root.join(AGENT_SKILLS_DIR)
+    }
+
     pub fn key_dir(&self) -> PathBuf {
         self.root.join(KEY_DIR)
     }
@@ -577,6 +588,10 @@ mod tests {
         );
         assert_eq!(p.skills_dir(), PathBuf::from("/var/baybo/skills"));
         assert_eq!(p.agents_dir(), PathBuf::from("/var/baybo/agents"));
+        assert_eq!(
+            p.agent_skills_dir(),
+            PathBuf::from("/var/baybo/agent-skills")
+        );
         assert_eq!(p.uv_state_dir(), PathBuf::from("/var/baybo/work/.uv"));
         assert_eq!(p.uv_cache_dir(), PathBuf::from("/var/baybo/work/.uv/cache"));
         assert_eq!(
