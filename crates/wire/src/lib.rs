@@ -932,6 +932,11 @@ pub struct SessionPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
     pub title: Option<String>,
+    /// Bound agent profile id. Emitted on the create broadcast so sibling
+    /// tabs can render the agent chip without a refetch; never changes later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+    pub agent_id: Option<String>,
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
@@ -1339,6 +1344,7 @@ mod tests {
                 pinned: Some(false),
                 folder_id: Some(FolderChange::Set { id: "f1".into() }),
                 title: Some("Reset password flow".into()),
+                agent_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
             },
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -1359,6 +1365,7 @@ mod tests {
                 pinned: None,
                 folder_id: None,
                 title: None,
+                agent_id: None,
             },
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());

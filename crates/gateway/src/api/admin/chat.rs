@@ -44,9 +44,9 @@ use baybo_channels::wire::{
 };
 use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent};
 use baybo_model::{
-    ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind, FolderId,
-    FolderSummary, LlmEntryName, MessageSource, Role, Session, SessionId, ThinkingContent,
-    TriggerSource, User,
+    AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, ChannelType, ChatMessage,
+    ContentBlock, ControlEvent, ControlEventKind, FolderId, FolderSummary, LlmEntryName,
+    MessageSource, Role, Session, SessionId, ThinkingContent, TriggerSource, User,
 };
 use baybo_session::SessionError;
 use chrono::{DateTime, Utc};
@@ -197,6 +197,11 @@ pub struct CreateSessionRequest {
     /// Optional client-supplied session id. If omitted, the gateway mints one.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Agent profile to bind the new session to. Omitted, `null`, or the
+    /// builtin id ⇒ the builtin agent (no binding). Only valid when the
+    /// call actually creates a session.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, ToSchema)]
@@ -519,6 +524,12 @@ pub struct ChatSessionDetail {
     /// Auto-generated conversation title, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Bound agent profile id; absent = the builtin agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Framework snapshot of the binding (`baybo` in Phase 1); absent = baybo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_framework: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -558,6 +569,12 @@ pub struct ChatSessionSummary {
     /// Auto-generated conversation title, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Bound agent profile id; absent = the builtin agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Framework snapshot of the binding (`baybo` in Phase 1); absent = baybo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_framework: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -659,9 +676,15 @@ async fn create_session(
     let authed = authed.as_ref().map(|ext| &ext.0);
     let user = chat_user(authed);
     let channel_type = chat_list_channel(authed);
-    let session =
-        create_or_load_chat_session(&state, requested.session_id, user, channel_type.clone())
-            .await?;
+    let binding = resolve_agent_binding(&state, requested.agent_id.as_deref()).await?;
+    let session = create_or_load_chat_session(
+        &state,
+        requested.session_id,
+        user,
+        channel_type.clone(),
+        binding,
+    )
+    .await?;
     let session_id = session.id.clone();
     // Created emits a full patch — sibling tabs construct the row
     // straight from this without a list refetch.
@@ -679,6 +702,7 @@ async fn create_session(
             // uncategorized.
             folder_id: None,
             title: None,
+            agent_id: session.state.agent_id.as_ref().map(|a| a.to_string()),
         },
     );
     Ok(Json(ChatSessionCreated {
@@ -766,6 +790,8 @@ async fn list_sessions(
             folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
             unread_count: unread as i64,
             title: s.title.clone(),
+            agent_id: s.state.agent_id.as_ref().map(|a| a.to_string()),
+            agent_framework: s.state.agent_framework.map(|f| f.as_str().to_owned()),
         })
         .collect();
     Ok(Json(ChatSessionsList { items }))
@@ -810,6 +836,8 @@ async fn get_session(
         newest_ordinal: page.newest_ordinal,
         last_llm: session.state.last_llm.as_ref().map(|n| n.to_string()),
         title: session.title.clone(),
+        agent_id: session.state.agent_id.as_ref().map(|a| a.to_string()),
+        agent_framework: session.state.agent_framework.map(|f| f.as_str().to_owned()),
     }))
 }
 
@@ -1371,6 +1399,7 @@ async fn unhide_session(
                 id: f.as_str().to_owned(),
             }),
             title: session.title.clone(),
+            agent_id: None,
         },
     );
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -1803,7 +1832,46 @@ fn parse_create_session_request(body: &Bytes) -> Result<CreateSessionRequest> {
             ));
         }
     }
+    if let Some(agent_id) = request.agent_id.as_mut() {
+        *agent_id = agent_id.trim().to_owned();
+        if agent_id.is_empty() {
+            return Err(GatewayError::BadRequest(
+                "agent_id must not be empty".to_owned(),
+            ));
+        }
+    }
     Ok(request)
+}
+
+/// Resolve a requested agent binding at session creation. `None` ⇒ builtin
+/// (unbound). Write-time validation: unknown id and external frameworks are
+/// crisp 400s; the builtin id normalizes to `None` so `NULL` stays the single
+/// representation of "builtin".
+async fn resolve_agent_binding(
+    state: &AdminState,
+    agent_id: Option<&str>,
+) -> Result<Option<(AgentProfileId, AgentFramework)>> {
+    let Some(raw) = agent_id else { return Ok(None) };
+    if raw == BUILTIN_AGENT_PROFILE_ID {
+        return Ok(None);
+    }
+    let id = AgentProfileId::from(raw);
+    let profile = state
+        .agent_profile_store
+        .get(&id)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("load agent profile: {e}")))?
+        .ok_or_else(|| {
+            GatewayError::BadRequest(format!("unknown agent_id {raw:?}; see GET /v1/agents"))
+        })?;
+    if profile.framework != AgentFramework::Baybo {
+        return Err(GatewayError::BadRequest(format!(
+            "agent {:?} runs framework {:?}; external-framework chat sessions are not supported yet",
+            profile.name,
+            profile.framework.as_str(),
+        )));
+    }
+    Ok(Some((id, profile.framework)))
 }
 
 async fn create_or_load_chat_session(
@@ -1811,36 +1879,59 @@ async fn create_or_load_chat_session(
     requested_session_id: Option<String>,
     user: User,
     channel_type: ChannelType,
+    binding: Option<(AgentProfileId, AgentFramework)>,
 ) -> Result<Session> {
-    let Some(session_id) = requested_session_id else {
-        return state
+    let mut session =
+        match requested_session_id {
+            None => state
+                .session_manager
+                .create_session(user, channel_type)
+                .await
+                .map_err(|e| GatewayError::Internal(format!("create chat session: {e}")))?,
+            Some(session_id) => {
+                let sid = SessionId::from(session_id.as_str());
+                if let Some(existing) = state.session_manager.get(&sid).await.map_err(|e| {
+                    GatewayError::Internal(format!("load requested chat session: {e}"))
+                })? {
+                    if existing.channel != channel_type
+                        || existing.user.id != user.id
+                        || is_cron_triggered(&existing)
+                    {
+                        return Err(GatewayError::NotFound(format!("chat session {session_id}")));
+                    }
+                    if binding.is_some() {
+                        return Err(GatewayError::BadRequest(
+                            "cannot set an agent on an existing session".into(),
+                        ));
+                    }
+                    return Ok(existing);
+                }
+
+                state
+                    .session_manager
+                    .get_or_create(&sid, user, channel_type)
+                    .await
+                    .map_err(|e| {
+                        GatewayError::Internal(format!("create requested chat session: {e}"))
+                    })?
+            }
+        };
+
+    if let Some((agent_id, framework)) = binding {
+        let updated = state
             .session_manager
-            .create_session(user, channel_type)
+            .set_agent_binding(&session.id, &agent_id, framework)
             .await
-            .map_err(|e| GatewayError::Internal(format!("create chat session: {e}")));
-    };
-
-    let sid = SessionId::from(session_id.as_str());
-    if let Some(existing) = state
-        .session_manager
-        .get(&sid)
-        .await
-        .map_err(|e| GatewayError::Internal(format!("load requested chat session: {e}")))?
-    {
-        if existing.channel != channel_type
-            || existing.user.id != user.id
-            || is_cron_triggered(&existing)
-        {
-            return Err(GatewayError::NotFound(format!("chat session {session_id}")));
+            .map_err(|e| GatewayError::Internal(format!("bind agent to session: {e}")))?;
+        if !updated {
+            return Err(GatewayError::Internal(
+                "session vanished or was already agent-bound".to_owned(),
+            ));
         }
-        return Ok(existing);
+        session.state.agent_id = Some(agent_id);
+        session.state.agent_framework = Some(framework);
     }
-
-    state
-        .session_manager
-        .get_or_create(&sid, user, channel_type)
-        .await
-        .map_err(|e| GatewayError::Internal(format!("create requested chat session: {e}")))
+    Ok(session)
 }
 
 fn chat_list_channel(authed: Option<&AuthedClient>) -> ChannelType {

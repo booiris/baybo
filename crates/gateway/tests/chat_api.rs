@@ -188,6 +188,123 @@ async fn chat_create_accepts_client_supplied_session_id() {
     assert_eq!(detail["session_id"].as_str(), Some(requested));
 }
 
+#[tokio::test]
+async fn create_session_binds_agent_profile() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    // ── 1. Create a baybo-framework profile ──────────────────────────
+    let profile = post(
+        &router,
+        "/v1/agents",
+        Body::from(json!({ "name": "helper" }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    let agent_id = profile["id"].as_str().expect("profile id").to_owned();
+
+    // ── 2. Create a session bound to it ───────────────────────────────
+    let created = post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "agent_id": agent_id }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    let session_id = created["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+
+    // ── 3. Detail carries the binding ─────────────────────────────────
+    let detail = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(detail["agent_id"].as_str(), Some(agent_id.as_str()));
+    assert_eq!(detail["agent_framework"].as_str(), Some("baybo"));
+
+    // ── 4. List row carries the binding too ───────────────────────────
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let items = list["items"].as_array().expect("items");
+    let row = items
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("created session shows up in the list");
+    assert_eq!(row["agent_id"].as_str(), Some(agent_id.as_str()));
+
+    // ── 5. The builtin id normalizes to unbound ───────────────────────
+    let builtin_created = post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "agent_id": "baybo" }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    let builtin_session_id = builtin_created["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let builtin_detail = get(
+        &router,
+        &format!("/v1/chat/sessions/{builtin_session_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        builtin_detail.get("agent_id").is_none(),
+        "builtin agent_id must normalize to unbound, got {builtin_detail:?}",
+    );
+
+    // ── 6. Unknown agent_id is a 400 ──────────────────────────────────
+    post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "agent_id": "nope" }).to_string()),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    // ── 7. Non-baybo framework is a 400 mentioning "not supported yet" ─
+    let ext_profile = post(
+        &router,
+        "/v1/agents",
+        Body::from(json!({ "name": "ext", "framework": "claude" }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    let ext_agent_id = ext_profile["id"].as_str().expect("profile id").to_owned();
+    let err = post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "agent_id": ext_agent_id }).to_string()),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not supported yet"),
+        "expected 'not supported yet' in error, got {err:?}",
+    );
+
+    // ── 8. Setting an agent on an existing session is a 400 ───────────
+    post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "session_id": session_id, "agent_id": agent_id }).to_string()),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+}
+
 /// Seed one session with a completed tool-using turn:
 /// user(0, "run it") → tool_use(1) → tool_result(2) → reply(3, "done").
 async fn seed_tool_turn_session(

@@ -2914,6 +2914,20 @@
           "skills"
         ],
         "operationId": "list_skills",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "query",
+            "description": "Scope the listing to this agent profile's skill folder overlaid on\nthe shared set. Omitted or the builtin id ⇒ shared set only.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Registered skills with descriptions",
@@ -3738,6 +3752,20 @@
           "has_more"
         ],
         "properties": {
+          "agent_framework": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Framework snapshot of the binding (`baybo` in Phase 1); absent = baybo."
+          },
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bound agent profile id; absent = the builtin agent."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -3804,6 +3832,20 @@
           "unread_count"
         ],
         "properties": {
+          "agent_framework": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Framework snapshot of the binding (`baybo` in Phase 1); absent = baybo."
+          },
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bound agent profile id; absent = the builtin agent."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -4143,6 +4185,13 @@
         "type": "object",
         "description": "Request body for `POST /v1/chat/sessions`.",
         "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Agent profile to bind the new session to. Omitted, `null`, or the\nbuiltin id ⇒ the builtin agent (no binding). Only valid when the\ncall actually creates a session."
+          },
           "session_id": {
             "type": [
               "string",

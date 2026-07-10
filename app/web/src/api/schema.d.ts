@@ -943,6 +943,10 @@ export interface components {
             session_id: string;
         };
         ChatSessionDetail: {
+            /** @description Framework snapshot of the binding (`baybo` in Phase 1); absent = baybo. */
+            agent_framework?: string | null;
+            /** @description Bound agent profile id; absent = the builtin agent. */
+            agent_id?: string | null;
             /** Format: date-time */
             created_at: string;
             /**
@@ -984,6 +988,10 @@ export interface components {
             transcript: components["schemas"]["ChatTranscriptItem"][];
         };
         ChatSessionSummary: {
+            /** @description Framework snapshot of the binding (`baybo` in Phase 1); absent = baybo. */
+            agent_framework?: string | null;
+            /** @description Bound agent profile id; absent = the builtin agent. */
+            agent_id?: string | null;
             /** Format: date-time */
             created_at: string;
             /**
@@ -1254,6 +1262,12 @@ export interface components {
         };
         /** @description Request body for `POST /v1/chat/sessions`. */
         CreateSessionRequest: {
+            /**
+             * @description Agent profile to bind the new session to. Omitted, `null`, or the
+             *     builtin id ⇒ the builtin agent (no binding). Only valid when the
+             *     call actually creates a session.
+             */
+            agent_id?: string | null;
             /** @description Optional client-supplied session id. If omitted, the gateway mints one. */
             session_id?: string | null;
         };
@@ -4006,7 +4020,13 @@ export interface operations {
     };
     list_skills: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Scope the listing to this agent profile's skill folder overlaid on
+                 *     the shared set. Omitted or the builtin id ⇒ shared set only.
+                 */
+                agent_id?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;

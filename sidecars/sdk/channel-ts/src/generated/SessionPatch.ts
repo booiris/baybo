@@ -53,4 +53,9 @@ folder_id?: FolderChange,
 /**
  * Generated conversation title; absent means no change.
  */
-title?: string, };
+title?: string, 
+/**
+ * Bound agent profile id. Emitted on the create broadcast so sibling
+ * tabs can render the agent chip without a refetch; never changes later.
+ */
+agent_id?: string, };
