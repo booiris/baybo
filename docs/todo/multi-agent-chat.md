@@ -79,8 +79,10 @@ stored `agent_id` string, so memories survive and stay partitioned.
 
 ## Data model & storage
 
-Three new flat columns on `sessions` (the `last_llm` anti-clobber pattern; no
-state-blob writes):
+Three new flat columns on `sessions`. `agent_id` / `agent_framework` follow the
+`hidden` / `pinned` INSERT-seeding pattern: seeded by the session-creation
+INSERT, omitted from `save`'s `DO UPDATE SET`, and with no setter — after
+creation no code path can write them:
 
 ```sql
 agent_id            TEXT,   -- NULL = builtin baybo (all existing rows)
