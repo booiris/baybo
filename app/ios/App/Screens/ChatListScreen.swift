@@ -34,16 +34,12 @@ struct ChatListScreen: View {
     private static let undoWindow: Duration = .seconds(3)
     /// Ground for a pinned row — a touch deeper than paper so the pinned block
     /// stands apart. Drawn INSIDE the row content (not `.listRowBackground`) so a
-    /// pin flip never swaps the cell's background configuration mid-move — that
-    /// swap is what blanked the incoming row and stalled the reorder. Constant
-    /// background ⇒ the reorder is a pure move, which `List` slides cleanly.
+    /// pin flip never swaps the cell's background configuration — that swap is
+    /// what blanked the incoming row and stalled the reorder.
     fileprivate static let pinnedRowTint = Color(red: 0.945, green: 0.945, blue: 0.945)
     /// Row content gutter. The pinned tint bleeds back out past it (negative
     /// padding in `SessionRowView`) so it fills edge-to-edge like the old ground.
     fileprivate static let rowHInset: CGFloat = 24
-    /// Tint/badge cross-fade as a row (un)pins — its own timeline, riding
-    /// alongside the positional glide rather than a hard swap.
-    fileprivate static let pinTintFade: Animation = .easeOut(duration: 0.22)
     /// How long the pin mutation waits after the swipe action is tapped, so the
     /// re-sort lands AFTER UIKit has torn down the `.swipeActions` panel.
     ///
@@ -174,9 +170,10 @@ struct ChatListScreen: View {
             }
         }
         .listStyle(.plain)
-        // Glide only pin-driven reorders; a refresh/activity reshuffle keeps its
-        // instant snap (the tick changes solely inside `requestPin`).
-        .animation(AppStore.pinReorderMotion, value: appStore.pinReorderTick)
+        // No reorder animation: every reshuffle — pin, pull-refresh merge,
+        // live-activity recency bump — snaps. A pin tapped from the swipe never
+        // glided anyway (UIKit holds the cell; see `swipeDismissal`), so the
+        // animation only ever dressed up the programmatic `-baybo-demo-pin` path.
         .scrollContentBackground(.hidden)
         .contentMargins(.top, Self.topContentMargin, for: .scrollContent)
         .scrollBounceBehavior(.always)
@@ -250,12 +247,10 @@ struct ChatListScreen: View {
     }
 
     /// Toggle pin, once the swipe panel has closed (`swipeDismissal`). The row
-    /// does NOT glide on this path: `List` skips its move animation while the
-    /// swipe container tears down, so the reorder lands as a jump either way —
-    /// the wait only keeps the destination slot from sitting blank through it.
-    /// `pinReorderMotion` governs the programmatic path (`-baybo-demo-pin`),
-    /// which is the one that actually glides. Haptic fires on the tap, not after
-    /// the wait, so the press still feels immediate.
+    /// jumps to its new slot rather than gliding: `List` will not move the cell
+    /// while the swipe container tears down, so the wait buys nothing but a
+    /// destination slot that stops sitting blank. Haptic fires on the tap, not
+    /// after the wait, so the press still feels immediate.
     private func togglePin(_ row: SessionRow) {
         Haptics.tap()
         Task { @MainActor in
@@ -348,14 +343,18 @@ struct SessionRowView: View {
         // reads as one even block height.
         .frame(minHeight: 52)
         .padding(.vertical, 15)
-        // The pinned ground, drawn in-content so it cross-fades instead of a
-        // hard cell-background swap; negative gutter bleeds it edge-to-edge.
+        // The pinned ground, drawn in-content rather than as the cell's
+        // background configuration; negative gutter bleeds it edge-to-edge.
         .background {
             ChatListScreen.pinnedRowTint
                 .opacity(row.pinned ? 1 : 0)
                 .padding(.horizontal, -ChatListScreen.rowHInset)
                 .allowsHitTesting(false)
-                .animation(ChatListScreen.pinTintFade, value: row.pinned)
+                // Snap with the row. There is no positional glide to ride
+                // alongside, and a cross-fade here would land in the visible
+                // window (the row now arrives the moment `pinned` flips). `nil`
+                // also shields the tint from the archive/undo transactions.
+                .animation(nil, value: row.pinned)
         }
         .contentShape(Rectangle())
     }

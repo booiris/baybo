@@ -489,25 +489,11 @@ final class AppStore: ObservableObject {
         pumpSessionMutation(sessionId)
     }
 
-    /// Glide the pinned row up to (or down from) the top block. `List` honours
-    /// only spring-shaped animations here and clamps them hard (response 0.1 and
-    /// 2.0 both land in the 250–450ms range; any non-spring curve snaps with no
-    /// animation at all) — so read this as "a spring, roughly this snappy", not
-    /// as a duration. It reaches ONLY the programmatic path: a pin tapped from
-    /// the swipe actions never animates, because UIKit stalls the move until the
-    /// swipe panel finishes closing (see `ChatListScreen.swipeDismissal`).
-    static let pinReorderMotion: Animation = .spring(response: 0.4, dampingFraction: 0.8)
-    /// Bumped only by `requestPin`, so the list's `.animation(_, value:)` glides
-    /// pin-driven reorders ONLY — a pull-refresh merge or a live-activity recency
-    /// bump reshuffles instantly, never animating a surprise reorder.
-    @Published private(set) var pinReorderTick = 0
-
     /// Pin or unpin, optimistically: the row re-sorts to the pinned block at
-    /// once and the PUT follows. The tick + the `SessionIndex` flip land in one
-    /// render pass, so the list animates this reorder (and only this one).
+    /// once and the PUT follows. The re-sort is not animated — see the list's
+    /// `swipeDismissal` for why a glide was never reachable from the swipe.
     func requestPin(_ sessionId: String, pinned: Bool) {
         sessionNotice = nil
-        pinReorderTick &+= 1
         SessionIndex.shared.beginPin(sessionId, pinned: pinned)
         pumpSessionMutation(sessionId)
     }
