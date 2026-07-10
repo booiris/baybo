@@ -41,6 +41,12 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     if: ${{ github.event.pull_request.draft == false }}
+    # The Rust jobs carry no TS toolchain, and `baybo-gateway`'s build script
+    # otherwise hard-fails when it cannot compile the embedded dashboard. The
+    # `frontend` job below is what gates `app/web` — it installs pnpm and runs
+    # the very same `pnpm --filter baybo-web build`.
+    env:
+      BAYBO_SKIP_WEBUI: 1
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -50,6 +56,8 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     if: ${{ github.event.pull_request.draft == false }}
+    env:
+      BAYBO_SKIP_WEBUI: 1
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1

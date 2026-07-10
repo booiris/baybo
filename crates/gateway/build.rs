@@ -29,13 +29,19 @@
 //!   tool sidecars with the host's `node` binary (each resolved from
 //!   `PATH`) — no JS runtime is shipped inside the gateway binary.
 //!
-//! The sidecar pipeline degrades gracefully: if `pnpm` is missing,
-//! `node_modules` aren't populated, or the bundler chokes on a
-//! bundle, we emit an assets file with empty slices and print
-//! `cargo:warning=…`.
-//! The gateway supervisor then skips spawning sidecars and logs a
-//! one-liner — `cargo build` itself never fails because of sidecar
-//! packaging trouble.
+//! The two pipelines differ in how they treat failure. The **sidecar**
+//! pipeline degrades gracefully: if `pnpm` is missing, `node_modules`
+//! aren't populated, or the bundler chokes on a bundle, we emit an assets
+//! file with empty slices and print `cargo:warning=…`. The gateway
+//! supervisor then skips spawning sidecars and logs a one-liner —
+//! `cargo build` itself never fails because of sidecar packaging trouble.
+//! Set `BAYBO_REQUIRE_SIDECARS=1` to make that strict for a release build.
+//!
+//! The **WebUI** pipeline does the opposite: a dashboard that will not
+//! compile is a hard `cargo build` error. It used to warn and embed a
+//! placeholder, which meant a type error in `app/web` shipped a broken `/`
+//! for days behind one line of build noise. Set `BAYBO_SKIP_WEBUI=1` to
+//! restore the placeholder when iterating on Rust without the TS toolchain.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -159,6 +165,7 @@ fn pnpm_install_inputs(ws_root: &Path) -> Vec<PathBuf> {
 // ---------------------------------------------------------------------
 
 fn embed_webui(ws_root: &Path) {
+    println!("cargo:rerun-if-env-changed={SKIP_WEBUI_ENV}");
     let web_root = ws_root.join("app/web");
     let dist = web_root.join("dist");
     let index = dist.join("index.html");
@@ -181,18 +188,25 @@ fn embed_webui(ws_root: &Path) {
     }
 
     if should_build {
-        match build_webui(ws_root) {
-            Ok(()) => {
-                if let Some(fingerprint) = source_fingerprint.as_deref()
-                    && let Err(e) = write_webui_build_stamp(&webui_cache_dir, fingerprint)
-                {
-                    println!("cargo:warning=write webui build stamp failed: {e}");
+        if env_flag(SKIP_WEBUI_ENV) {
+            println!(
+                "cargo:warning={SKIP_WEBUI_ENV} is set; embedding the placeholder dashboard instead of building it"
+            );
+        } else {
+            match build_webui(ws_root) {
+                Ok(()) => {
+                    if let Some(fingerprint) = source_fingerprint.as_deref()
+                        && let Err(e) = write_webui_build_stamp(&webui_cache_dir, fingerprint)
+                    {
+                        println!("cargo:warning=write webui build stamp failed: {e}");
+                    }
                 }
-            }
-            Err(e) => {
-                println!(
-                    "cargo:warning=webui build failed ({e}); using existing dist or placeholder"
-                );
+                Err(e) => panic!(
+                    "webui build failed: {e}\n\n\
+                     The dashboard is compiled into the gateway binary, so this is a hard error \
+                     rather than a warning — a stubbed `/` used to ship unnoticed. Fix `app/web`, \
+                     or set {SKIP_WEBUI_ENV}=1 to embed the placeholder while iterating on Rust."
+                ),
             }
         }
     }
@@ -351,6 +365,19 @@ fn write_webui_build_stamp(cache_dir: &Path, fingerprint: &str) -> Result<(), St
         .map_err(|e| format!("write {}: {e}", stamp.display()))
 }
 
+/// Escape hatch for a host without the TS toolchain (or a wedged
+/// `node_modules`): embed the placeholder dashboard instead of failing.
+/// Everything else treats a dashboard that will not compile as a build
+/// error — `cargo:warning` alone let a broken `/` ship for days.
+const SKIP_WEBUI_ENV: &str = "BAYBO_SKIP_WEBUI";
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes")
+    )
+}
+
 fn build_webui(ws_root: &Path) -> Result<(), String> {
     let output = Command::new("pnpm")
         .arg("--filter")
@@ -360,10 +387,13 @@ fn build_webui(ws_root: &Path) -> Result<(), String> {
         .output()
         .map_err(|e| format!("spawn pnpm: {e}"))?;
     if !output.status.success() {
+        // `tsc` reports diagnostics on stdout, not stderr — capture both or
+        // the failure arrives as a bare exit code with no cause.
         return Err(format!(
-            "pnpm build exited {}: {}",
+            "pnpm --filter baybo-web build exited {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
             output.status,
-            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
         ));
     }
     Ok(())
@@ -739,10 +769,7 @@ fn embed_sidecars(ws_root: &Path) {
 const STRICT_SIDECARS_ENV: &str = "BAYBO_REQUIRE_SIDECARS";
 
 fn sidecars_required() -> bool {
-    matches!(
-        std::env::var(STRICT_SIDECARS_ENV).ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes")
-    )
+    env_flag(STRICT_SIDECARS_ENV)
 }
 
 fn sidecar_failure(strict: bool, msg: &str) {
