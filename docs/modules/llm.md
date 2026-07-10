@@ -22,6 +22,35 @@ Core responsibilities:
 
 Subprocess-driven agents (the `claude` binary) are **not** LLM providers and live outside this crate. See [`external-agents.md`](../external-agents.md).
 
+### Reasoning-effort bridge
+
+`ChatRequest` carries an optional per-request reasoning-effort ask:
+
+```rust
+pub struct ChatRequest {
+    pub messages: Vec<baybo_model::ChatMessage>,
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    pub tools: Vec<ToolDefinitionForLlm>,
+}
+```
+
+`None` means "the provider's own configured behavior" — the caller (`AgentLoop::call_llm`, populated from a bound agent profile's `reasoning_effort`; see [`agent-profiles.md`](agent-profiles.md#content-resolution-identity-snapshots-content-follows-live)) only ever sets `Some` when it has an explicit ask. rig's `CompletionRequest` has no native reasoning-effort field, so `LlmClient::chat` / `chat_stream` bridge the value through `additional_params` — a provider-opaque `serde_json::Value` bag rig already threads to every backend — under a namespaced key, `REQUEST_REASONING_EFFORT_PARAM = "baybo_reasoning_effort"` (`crate::lib`), so it can never be mistaken for a real provider API parameter.
+
+The bridge is **gated per variant**, not blanket-injected: `AnyCompletionModel::accepts_request_reasoning_effort()` returns `true` only for `Self::OpenAiSubscription(_)`. `chat` / `chat_stream` build the rig request first, then set `additional_params` **only** when both `request.reasoning_effort.is_some()` and `self.model.accepts_request_reasoning_effort()` — so every other variant's (`OpenAI`, `Anthropic`, `Gemini`, and the `MiniMax`/`DeepSeek` providers that route through them) outbound request body never carries the key at all, not even as an ignored field.
+
+**Provider consumption matrix:**
+
+| Variant | Consumes `reasoning_effort`? |
+|---|---|
+| `OpenAiSubscription` (Codex Responses, incl. any provider routed through it) | Yes — see below |
+| `OpenAI` | No — field never set on the request (gate above) |
+| `Anthropic` (incl. MiniMax, routed through this variant) | No |
+| `Gemini` | No |
+
+`OpenAiSubscription`'s `effective_reasoning_effort` (`providers/openai_subscription/completion_model.rs`) reads the value back out of `additional_params` at request-build time and prefers it over the client's construction-baked effort (from `LlmEntry.reasoning_effort`): `request.additional_params.get(REQUEST_REASONING_EFFORT_PARAM).or(baked)`. Either way the result is run through the existing per-model-family allow-list, `providers/openai_subscription/reasoning.rs::resolve_effort` (e.g. `gpt-5-pro` only accepts `high`; `gpt-5.2+` adds `xhigh`) — an out-of-range ask clamps to the nearest legal value with a `tracing::warn!`, it never fails the call. So a per-request ask always wins over the baked default when present, and always yields *some* resolved value for the model family, clamped rather than rejected.
+
 ### Streaming
 
 `LlmClient::chat_stream()` returns `LlmStream`, a type-erased `futures::Stream<Item = Result<StreamEvent>>`. `StreamEvent` has five variants: `Text`, `ToolCall`, `Reasoning` (incremental delta), `ThinkingBlock(baybo_model::ContentBlock)` (complete structured reasoning block, preserved for providers that require thinking to be echoed back), and `Usage`. The stream maps rig's `StreamedAssistantContent` to these unified events, hiding provider-specific response types.
@@ -53,6 +82,6 @@ Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` thr
 
 | Module | Role |
 |--------|------|
-| `agent` | `AgentLoop` calls `LlmClient::chat()` / `chat_stream()` and handles retries |
+| `agent` | `AgentLoop` calls `LlmClient::chat()` / `chat_stream()` and handles retries; the main loop fills `ChatRequest.reasoning_effort` from `AgentLoopConfig.reasoning_effort` (sourced from a bound agent profile — see [`agent-profiles.md`](agent-profiles.md#content-resolution-identity-snapshots-content-follows-live)); title/observer/compression side-calls leave it `None` |
 | `cost` | Consumes `TokenUsage` and `ModelPricing` to calculate per-call cost |
 | `context` | Provides compressed message history for `ChatRequest` |

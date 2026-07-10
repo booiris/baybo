@@ -80,19 +80,33 @@ the session.
 1. `ChatRequest` gains `reasoning_effort: Option<String>`
    (`#[serde(default, skip_serializing_if = "Option::is_none")]`, beside
    `temperature`).
-2. The router's spawn-time profile fetch (today feeding
-   `resolve_initial_llm`) expands to also carry the profile's
-   `reasoning_effort` into the actor spawner, landing on
+2. The router's spawn-time profile fetch (the session-pin-vs-profile-pin
+   resolver, renamed `resolve_spawn_llm` now that it also carries effort)
+   expands to also carry the profile's `reasoning_effort`, returning a
+   `SpawnLlmChoice { initial_llm, reasoning_effort }` to the actor spawner —
+   the profile is fetched even when the session's own pin is already set,
+   because `reasoning_effort` only ever comes from the profile. It lands on
    `AgentLoopConfig.reasoning_effort: Option<ReasoningEffort>`;
    `AgentLoop::call_llm` fills the request field from it. Side-calls (title
    generation, progress observer, compression) deliberately send `None` —
-   they stay cheap. Liveness matches the `llm` pin: a profile edit lands on
-   the next actor spawn/hydration.
-3. `openai-subscription` provider: keeps its construction-baked value as the
-   fallback; per-request handling becomes
-   `request.reasoning_effort.as_deref().or(baked)` fed through the existing
-   `resolve_effort` per-model-family clamp (out-of-range values clamp with a
-   `warn!`, never fail the call). All other providers ignore the field;
+   they stay cheap. Liveness matches the `llm` pin's spawn-time half: a
+   profile edit lands on the next actor spawn/hydration; unlike the `llm`
+   pin, there is no live re-pin — `AgentMessage::SetModel` only ever carries
+   a model name, so an in-flight actor's effort is fixed until it is next
+   (re)built.
+3. rig's `CompletionRequest` has no native reasoning-effort field, so
+   `LlmClient::chat` / `chat_stream` bridge `ChatRequest.reasoning_effort`
+   through `additional_params` — a provider-opaque JSON bag rig already
+   threads to every backend — under a namespaced key
+   (`baybo_reasoning_effort`), set only when the target provider variant
+   opts in via `AnyCompletionModel::accepts_request_reasoning_effort()`
+   (today only `OpenAiSubscription`), so no other provider's request body
+   ever carries the key. `openai-subscription` provider: keeps its
+   construction-baked value as the fallback; per-request handling reads the
+   key back out of `additional_params` and prefers it over the baked value
+   when present, fed through the existing `resolve_effort` per-model-family
+   clamp (out-of-range values clamp with a `warn!`, never fail the call).
+   All other providers ignore the field entirely — they never see the key;
    [`../modules/llm.md`](../modules/llm.md) documents the consumption matrix.
 
 ## Web
