@@ -202,7 +202,7 @@ struct ChatListScreen: View {
         VStack(spacing: 24) {
             Spacer()
             Text(verbatim: lang.t("list.empty"))
-                .font(Theme.mono(14))
+                .font(Theme.sys(14))
                 .foregroundStyle(Theme.inkSoft)
             Button {
                 compose()
@@ -222,11 +222,11 @@ struct ChatListScreen: View {
     private var undoToast: some View {
         HStack(spacing: 18) {
             Text(verbatim: lang.t("list.archivedToast"))
-                .font(Theme.mono(13))
+                .font(Theme.sys(13))
                 .foregroundStyle(Theme.paper)
             Button(action: undoArchive) {
                 Text(verbatim: lang.t("list.undo"))
-                    .font(Theme.mono(13, weight: .bold))
+                    .font(Theme.sys(13, weight: .bold))
                     .foregroundStyle(Theme.paper)
                     .frame(minHeight: 44)
             }
@@ -370,15 +370,16 @@ struct SessionRowView: View {
     private var textColumn: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(verbatim: headline)
-                .font(Theme.mono(15, weight: .bold))
+                .font(Theme.sys(15, weight: .bold))
                 .foregroundStyle(hasHeadline ? Theme.ink : Theme.inkSoft)
                 .lineLimit(1)
                 .truncationMode(.tail)
             if let preview = row.preview, !preview.isEmpty {
                 Text(verbatim: preview)
-                    .font(Theme.mono(13))
+                    .font(Theme.sys(14))
                     .foregroundStyle(Theme.inkSoft)
                     .lineLimit(2)
+                    .lineSpacing(3)
                     .multilineTextAlignment(.leading)
                     .truncationMode(.tail)
             }
@@ -411,7 +412,7 @@ struct SessionRowView: View {
     private var metaColumn: some View {
         VStack(alignment: .trailing, spacing: 6) {
             Text(verbatim: Self.timeLabel(row.lastActive, locale: langCode))
-                .font(Theme.mono(11))
+                .font(Theme.sys(11))
                 .foregroundStyle(Theme.inkSoft)
             Spacer(minLength: 0)
             trailingMarker
@@ -433,7 +434,7 @@ struct SessionRowView: View {
     /// so it never shows on the row the user is currently viewing.
     private var unreadBadge: some View {
         Text(verbatim: row.unread > 99 ? "99+" : String(row.unread))
-            .font(Theme.mono(11, weight: .medium))
+            .font(Theme.sys(11, weight: .medium))
             .foregroundStyle(Theme.paper)
             .padding(.horizontal, 6)
             .frame(minWidth: 18, minHeight: 18)
