@@ -489,9 +489,13 @@ final class AppStore: ObservableObject {
         pumpSessionMutation(sessionId)
     }
 
-    /// Glide the pinned row up to (or down from) the top block. `List` caps its
-    /// own move duration, so this reads snappy regardless of the spring's tail —
-    /// the point is a visible travel, not a long bounce.
+    /// Glide the pinned row up to (or down from) the top block. `List` honours
+    /// only spring-shaped animations here and clamps them hard (response 0.1 and
+    /// 2.0 both land in the 250–450ms range; any non-spring curve snaps with no
+    /// animation at all) — so read this as "a spring, roughly this snappy", not
+    /// as a duration. It reaches ONLY the programmatic path: a pin tapped from
+    /// the swipe actions never animates, because UIKit stalls the move until the
+    /// swipe panel finishes closing (see `ChatListScreen.swipeDismissal`).
     static let pinReorderMotion: Animation = .spring(response: 0.4, dampingFraction: 0.8)
     /// Bumped only by `requestPin`, so the list's `.animation(_, value:)` glides
     /// pin-driven reorders ONLY — a pull-refresh merge or a live-activity recency

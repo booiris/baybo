@@ -44,6 +44,28 @@ struct ChatListScreen: View {
     /// Tint/badge cross-fade as a row (un)pins — its own timeline, riding
     /// alongside the positional glide rather than a hard swap.
     fileprivate static let pinTintFade: Animation = .easeOut(duration: 0.22)
+    /// How long the pin mutation waits after the swipe action is tapped, so the
+    /// re-sort lands AFTER UIKit has torn down the `.swipeActions` panel.
+    ///
+    /// The row's arrival is not ours to schedule: `List` won't move the cell
+    /// until UIKit releases it ~0.65s after the tap, and nothing on the SwiftUI
+    /// side shortens that — spring vs linear vs no `.animation` at all vs an
+    /// explicit `withAnimation` vs a synchronous mutation were all measured, and
+    /// the last two are *worse* (0.9-1.1s). What we do schedule is when the
+    /// destination slot opens, and it opens the moment `pinned` flips. Mutate
+    /// early and the slot sits blank waiting for the row; mutate late and it
+    /// does not. So this is a blank-gap knob, not a speed knob.
+    ///
+    /// Medians of 3 frame-by-frame runs (iPhone 17 Pro, iOS 26.5):
+    ///
+    ///     dismissal   blank gap   tap -> row arrives
+    ///         0ms       0.637s        0.700s
+    ///       320ms       0.330s        0.665s
+    ///       480ms       0.137s        0.640s   <- knee: gap all but gone, free
+    ///       640ms       0.098s        0.758s   <- past it, arrival slips
+    ///
+    /// Anything under ~300ms lands mid-teardown and is within noise of 0.
+    private static let swipeDismissal: Duration = .milliseconds(660)
 
     /// Archived rows live under the ☰ menu's Archived screen, not here.
     private var visibleRows: [SessionRow] {
@@ -227,13 +249,19 @@ struct ChatListScreen: View {
         armUndoDismiss()
     }
 
-    /// Toggle pin. The row glides to (or down from) the pinned block: the list's
-    /// `.animation(_, value: appStore.pinReorderTick)` animates this reorder only
-    /// — `requestPin` bumps that tick — while refresh/activity reshuffles stay
-    /// instant. The tint/badge cross-fade on their own timeline in `SessionRowView`.
+    /// Toggle pin, once the swipe panel has closed (`swipeDismissal`). The row
+    /// does NOT glide on this path: `List` skips its move animation while the
+    /// swipe container tears down, so the reorder lands as a jump either way —
+    /// the wait only keeps the destination slot from sitting blank through it.
+    /// `pinReorderMotion` governs the programmatic path (`-baybo-demo-pin`),
+    /// which is the one that actually glides. Haptic fires on the tap, not after
+    /// the wait, so the press still feels immediate.
     private func togglePin(_ row: SessionRow) {
         Haptics.tap()
-        appStore.requestPin(row.id, pinned: !row.pinned)
+        Task { @MainActor in
+            try? await Task.sleep(for: Self.swipeDismissal)
+            appStore.requestPin(row.id, pinned: !row.pinned)
+        }
     }
 
     /// (Re-)start the toast's auto-dismiss — consecutive archives keep one
