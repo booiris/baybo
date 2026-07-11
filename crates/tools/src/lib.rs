@@ -789,6 +789,7 @@ mod multi_modal_text_tests {
                 blob_id: format!("sha256:{}", "ab".repeat(32)),
             },
             mime_type: "image/png".into(),
+            filename: None,
         }
     }
 
@@ -821,6 +822,7 @@ mod multi_modal_text_tests {
                     blob_id: "sha256:0".into(),
                 },
                 mime_type: "audio/wav".into(),
+                filename: None,
             },
             ContentBlock::File {
                 blob: BlobRef {

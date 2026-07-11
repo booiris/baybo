@@ -1582,6 +1582,7 @@ mod frame_interjections_tests {
                 blob_id: "sha256:x".into(),
             },
             mime_type: "image/png".into(),
+            filename: None,
         };
         let msgs = vec![ChatMessage::user_interjection(vec![
             ContentBlock::Text("see this".into()),
@@ -1685,6 +1686,7 @@ mod frame_recalled_memories_tests {
                 blob_id: "sha256:y".into(),
             },
             mime_type: "image/png".into(),
+            filename: None,
         };
         let msgs = vec![ChatMessage::recalled_memory(vec![
             ContentBlock::Text("snippet about X".into()),
@@ -1721,6 +1723,7 @@ mod merge_for_llm_tests {
                 blob_id: "sha256:abc".into(),
             },
             mime_type: "image/png".into(),
+            filename: None,
         }
     }
 

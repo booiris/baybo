@@ -878,10 +878,12 @@ fn wire_to_content_blocks(content: String, attachments: Vec<WireAttachment>) -> 
             AttachmentKind::Image => ContentBlock::Image {
                 blob,
                 mime_type: att.mime_type,
+                filename: att.filename,
             },
             AttachmentKind::Audio => ContentBlock::Audio {
                 blob,
                 mime_type: att.mime_type,
+                filename: att.filename,
             },
             AttachmentKind::File => ContentBlock::File {
                 blob,

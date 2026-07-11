@@ -5,10 +5,14 @@ use baybo_model::ContentBlock;
 pub fn content_block_to_text(block: &ContentBlock) -> String {
     match block {
         ContentBlock::Text(text) => text.clone(),
-        ContentBlock::Image { blob, mime_type } => {
+        ContentBlock::Image {
+            blob, mime_type, ..
+        } => {
             format!("[image: {} blob_id={}]", mime_type, blob.blob_id)
         }
-        ContentBlock::Audio { blob, mime_type } => {
+        ContentBlock::Audio {
+            blob, mime_type, ..
+        } => {
             format!("[audio: {} blob_id={}]", mime_type, blob.blob_id)
         }
         ContentBlock::File {
@@ -71,6 +75,7 @@ mod tests {
         let block = ContentBlock::Image {
             blob: sample_blob(),
             mime_type: "image/png".to_string(),
+            filename: None,
         };
         let result = content_block_to_text(&block);
         assert!(result.contains("image/png"));
@@ -82,6 +87,7 @@ mod tests {
         let block = ContentBlock::Audio {
             blob: sample_blob(),
             mime_type: "audio/mp3".to_string(),
+            filename: None,
         };
         let result = content_block_to_text(&block);
         assert!(result.contains("audio"));
@@ -107,6 +113,7 @@ mod tests {
             ContentBlock::Image {
                 blob: sample_blob(),
                 mime_type: "image/png".to_string(),
+                filename: None,
             },
             ContentBlock::Text("second".to_string()),
         ];

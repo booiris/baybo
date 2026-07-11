@@ -528,26 +528,34 @@ pub(crate) async fn split_content(
                 }
                 text.push_str(t);
             }
-            ContentBlock::Image { blob, mime_type } => {
+            ContentBlock::Image {
+                blob,
+                mime_type,
+                filename,
+            } => {
                 if let Some(att) = stat_attachment(
                     blob_store,
                     AttachmentKind::Image,
                     &blob.blob_id,
                     Some(mime_type.clone()),
-                    None,
+                    filename.clone(),
                 )
                 .await
                 {
                     attachments.push(att);
                 }
             }
-            ContentBlock::Audio { blob, mime_type } => {
+            ContentBlock::Audio {
+                blob,
+                mime_type,
+                filename,
+            } => {
                 if let Some(att) = stat_attachment(
                     blob_store,
                     AttachmentKind::Audio,
                     &blob.blob_id,
                     Some(mime_type.clone()),
-                    None,
+                    filename.clone(),
                 )
                 .await
                 {

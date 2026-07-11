@@ -175,13 +175,22 @@ impl Tool for AttachFileTool {
 /// `attachmentKind` in `app/ios/web/src/types.ts` and the web chat's own
 /// bucketing, which that comment already names the gateway as sharing.
 ///
-/// `Image` / `Audio` carry no filename — the model has no slot for one, and no
-/// surface shows a name beside a rendered image.
+/// No surface shows a name BESIDE a rendered image, but the name still rides
+/// along: a client sharing or saving the picture needs the real one (else it
+/// lands in Photos/Files as `attachment.png`).
 fn media_block(blob: BlobRef, filename: String, mime_type: String) -> ContentBlock {
     if mime_type.starts_with("image/") {
-        ContentBlock::Image { blob, mime_type }
+        ContentBlock::Image {
+            blob,
+            mime_type,
+            filename: Some(filename),
+        }
     } else if mime_type.starts_with("audio/") {
-        ContentBlock::Audio { blob, mime_type }
+        ContentBlock::Audio {
+            blob,
+            mime_type,
+            filename: Some(filename),
+        }
     } else {
         ContentBlock::File {
             blob,
@@ -312,14 +321,29 @@ mod tests {
             let ToolOutput::WithAttachments { attachments, .. } = out else {
                 panic!("expected WithAttachments for {name}");
             };
-            let (kind, mime) = match &attachments[0] {
-                ContentBlock::Image { mime_type, .. } => ("image", mime_type),
-                ContentBlock::Audio { mime_type, .. } => ("audio", mime_type),
-                ContentBlock::File { mime_type, .. } => ("file", mime_type),
+            let (kind, mime, got_name) = match &attachments[0] {
+                ContentBlock::Image {
+                    mime_type,
+                    filename,
+                    ..
+                } => ("image", mime_type, filename.clone()),
+                ContentBlock::Audio {
+                    mime_type,
+                    filename,
+                    ..
+                } => ("audio", mime_type, filename.clone()),
+                ContentBlock::File {
+                    mime_type,
+                    filename,
+                    ..
+                } => ("file", mime_type, Some(filename.clone())),
                 other => panic!("expected media block for {name}, got {other:?}"),
             };
             assert_eq!(kind, want_kind, "{name}");
             assert_eq!(mime, want_mime, "{name}");
+            // EVERY kind keeps the real name — an image that loses it reaches the
+            // client nameless and gets shared/saved as `attachment.png`.
+            assert_eq!(got_name.as_deref(), Some(name), "{name} lost its filename");
         }
     }
 

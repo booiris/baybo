@@ -5,13 +5,24 @@ use crate::fingerprint::FileFingerprint;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ContentBlock {
     Text(String),
+    /// `filename` is the ORIGINAL name when one is known — an agent-attached
+    /// image, or an inbound one whose channel supplied a name. It is `Option`
+    /// because plenty of images genuinely arrive nameless (a pasted screenshot,
+    /// a Telegram photo, an MCP-returned bitmap), not to accommodate callers.
+    /// Nothing renders it beside the picture; it exists so a client SHARING or
+    /// saving the image hands over the real name instead of `attachment.png`.
+    /// `#[serde(default)]` keeps transcripts persisted before this field readable.
     Image {
         blob: BlobRef,
         mime_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
     },
     Audio {
         blob: BlobRef,
         mime_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
     },
     File {
         blob: BlobRef,
