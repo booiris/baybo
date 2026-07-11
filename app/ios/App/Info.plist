@@ -24,6 +24,8 @@
 	<string>0.1.0</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Baybo uses the camera to scan the pairing QR code.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Baybo saves a chat image to your photo library when you share it there.</string>
 	<key>UIAppFonts</key>
 	<array>
 		<string>SpaceMono-Regular.ttf</string>

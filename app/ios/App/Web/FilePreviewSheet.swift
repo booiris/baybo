@@ -46,7 +46,10 @@ private struct QuickLookView: UIViewControllerRepresentable {
     }
 }
 
-private struct ShareSheet: UIViewControllerRepresentable {
+/// The system share sheet over a file on disk. Shared with the image viewer's
+/// share button — passing the FILE (not a re-encoded `UIImage`) is what puts the
+/// original bytes and real filename into Save-to-Files / AirDrop / other apps.
+struct ShareSheet: UIViewControllerRepresentable {
     let url: URL
 
     func makeUIViewController(context _: Context) -> UIActivityViewController {

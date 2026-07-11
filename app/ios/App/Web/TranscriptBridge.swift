@@ -330,6 +330,17 @@ extension TranscriptBridge: WKScriptMessageHandler {
             {
                 store?.previewFile(blobId: blobId, filename: filename, mimeType: mimeType)
             }
+        case "viewImage":
+            // A tap on an image bubble — decode the cached blob and present the
+            // full-screen zoomable viewer (images only; files use previewFile).
+            // Name + mime ride along so the viewer's share sheet can hand over the
+            // file under its real name.
+            if let blobId = body["blobId"] as? String {
+                store?.viewImage(
+                    blobId: blobId,
+                    filename: body["filename"] as? String ?? "",
+                    mimeType: body["mimeType"] as? String ?? "")
+            }
         case "retry":
             // The failed-bubble dot was tapped. The webview carries the payload
             // (so retry survives an eviction/relaunch that rebuilt the bubble);
@@ -363,6 +374,13 @@ extension TranscriptBridge: WKScriptMessageHandler {
             if let text = body["text"] as? String, !text.isEmpty {
                 UIPasteboard.general.string = text
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            }
+        case "copyImage":
+            // A long-press on an image bubble. Unlike text, the bytes aren't in
+            // hand — the store fetches the (device-cached) blob, writes it to
+            // UIPasteboard, and fires the haptic on success.
+            if let blobId = body["blobId"] as? String {
+                store?.copyImage(blobId: blobId, mimeType: body["mimeType"] as? String ?? "")
             }
         case "log":
             let level = body["level"] as? String ?? "info"

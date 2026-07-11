@@ -8,6 +8,7 @@ export const zh: typeof en = {
       loadingImage: "图片加载中…",
       tapToLoad: "点按加载图片",
       imageAlt: "图片",
+      viewImage: "查看图片",
       recoverFailed: "无法重新加载历史记录：{{error}}",
       retrySend: "发送失败，点按重试",
       copied: "已复制",

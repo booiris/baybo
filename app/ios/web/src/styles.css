@@ -533,6 +533,13 @@ button {
   max-height: 16rem;
   border-radius: var(--radius);
   object-fit: contain;
+  /* Fade the decoded image in instead of snapping it visible: it sits at
+     opacity 0 while the frame decodes underneath, then eases to 1 the moment the
+     frame gains `.loaded`. */
+  transition: opacity 260ms ease-out;
+  /* Don't let iOS lift the image into a drag-and-drop session on press — a
+     dragged-out image ghost fights both the long-press copy and the scroll. */
+  -webkit-user-drag: none;
 }
 /* An image not yet scrolled near the viewport is a reserved box, not a fetched
    blob (see AttachmentImage) — a history page full of images then costs nothing
@@ -566,6 +573,32 @@ button {
   pointer-events: none;
 }
 .attachment-frame:not(.loaded) .attachment-img { opacity: 0; }
+/* A decoded image is a button: tapping opens the native full-screen viewer
+   (pinch + double-tap-to-restore), a long-press copies it. Strip the UA button
+   chrome so only the image shows; the pointer cursor is a dev-browser nicety,
+   gated to the loaded state. `position:relative` anchors the copy pill. The
+   native iOS image callout (Save/Copy/Share) and text selection are turned OFF
+   so they can't fire their own menu at ~500ms and fight the long-press copy. */
+.attachment-open {
+  position: relative;
+  display: block;
+  max-width: 100%;
+  padding: 0;
+  border: none;
+  background: none;
+  border-radius: var(--radius);
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.attachment-frame.loaded .attachment-open { cursor: pointer; }
+/* No `:active` dim: this button carries the long-press touch listeners, so iOS
+   applies `:active` eagerly on touch-down — a flick-scroll that starts on an
+   image would briefly dim it. The user bubble omits it for the same reason; the
+   copy squish and the viewer opening are the feedback. */
+/* Copy confirm: the same squish-and-pop the user bubble plays. */
+.attachment-open.copied { animation: copy-squish 320ms cubic-bezier(0.34, 1.4, 0.64, 1); }
 /* A failed fetch keeps the same tile, centering only the ↻ retry glyph (tap to
    refetch) — no text label. */
 .attachment-retry {

@@ -161,6 +161,25 @@ export function copyText(text: string): void {
   else void navigator.clipboard?.writeText(text).catch(() => {});
 }
 
+/// Copy an image attachment to the system clipboard. Native fetches the blob
+/// (device-cached from the thumbnail fetch, so near-instant), writes the bytes
+/// to UIPasteboard under their image UTI, and fires the confirming haptic — a
+/// `file://` WKWebView can't put binary image data on the clipboard, and a
+/// long-press timer has no live gesture for `navigator.clipboard` anyway.
+/// Best-effort; a failed copy simply doesn't confirm.
+export function copyImage(blobId: string, mimeType: string): void {
+  postSafe({ type: "copyImage", blobId, mimeType });
+}
+
+/// Open a tapped image full-screen. Native decodes the device-cached blob and
+/// presents its own zoomable viewer (pinch, double-tap-to-restore, black field)
+/// — images take this path; non-image files take `previewFile` (QuickLook). Name
+/// + mime ride along so the viewer's share sheet can hand over the file under its
+/// real name (an agent image usually carries no name; the mime derives one).
+export function viewImage(blobId: string, filename: string, mimeType: string): void {
+  postSafe({ type: "viewImage", blobId, filename, mimeType });
+}
+
 // History fetches are fire-and-forget from Web's perspective: native calls the
 // chat API and pushes back a local `history_page` / `history_failed` frame.
 export function fetchHistory(beforeOrdinal: number | null, limit: number): void {

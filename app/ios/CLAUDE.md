@@ -205,10 +205,28 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   native→web
   `init/pushFrame/setConnEpoch/userSent/blobResult/fileState/setLanguage/setBottomInset/jumpToLatest/requestSync`;
   web→native
-  `ready/sync/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/openUrl/copy/log/jumpVisible`.
+  `ready/sync/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/viewImage/openUrl/copy/copyImage/log/jumpVisible/runState`.
   (`copy` is a user-bubble long-press: native writes `UIPasteboard` + fires a
   haptic, because a `file://` WKWebView rejects `navigator.clipboard` outside a
-  live gesture.) The
+  live gesture. `copyImage` is the image-bubble long-press — same reason, but the
+  bytes aren't in hand, so `ChatStore.copyImage` fetches the device-cached blob
+  and writes it to `UIPasteboard` under its image UTI, i.e. text copies inline in
+  the bridge while an image round-trips the store.) `runState` mirrors whether a
+  turn is in flight to `ChatStore.agentRunning`, which flips the composer's send
+  button to a stop control; a tap sends `/stop` as an ordinary `chatSend` (the
+  agent Router cancels the turn out-of-band; the channel-echoed `/stop` user
+  message is dropped client-side by `isStopCommand`, so no `/stop` bubble). Run
+  state is derived from SELF-CORRECTING signals — `awaitingReply` (optimistic
+  post-send window) `|| workLive` (active work block) `|| streaming` — never the
+  raw `turnActive` latch, which strands true if its closing `turn_state` is lost
+  (offscreen buffer overflow). `awaitingReply` is cleared ONLY by race-free
+  signals — an effect on `workLive||streaming` (real output takes over), the
+  turn's terminal message/notice, `turn_state{inactive}`, `markFailed`, and a
+  `AWAITING_MAX_MS` timeout backstop — NEVER by a `sync_page`/`subscribe_state`:
+  a session-open/reconnect sync is async and lands just after a send, so clearing
+  there dropped the stop button back to send until first output (the "stop
+  appears late" bug). The webview is the single source of turn state — native
+  never re-derives it. The
   `sync` message carries the webview's cursor (`sinceOrdinal`, null = baseline)
   + elected page size; native answers with a synthesized `sync_page` frame (or
   `sync_failed`). Transcript persistence is the per-session mirror file, a pure
@@ -223,6 +241,43 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   (archives, unknown binaries). QuickLook picks its previewer from the file
   extension, and the core's cache names files by digest, so `previewFile` writes
   `<tmp>/baybo-preview/<digest>/<real name>` first.
+  An inline `image` attachment does NOT use this path — a decoded
+  `AttachmentImage` is a button whose tap posts `viewImage` (blob id only), and
+  `ChatStore.viewImage` decodes the device-cached blob into a `UIImage` and
+  presents `ImageViewer` (`App/Screens/ImageViewer.swift`) via
+  `.fullScreenCover`. That is a dedicated `UIScrollView`-backed zoomable viewer
+  (pinch, double-tap-to-fit/restore, single-tap or ✕ to close, image fades onto a
+  black field) rather than QuickLook: QuickLook embedded in a SwiftUI `.sheet`
+  gave no reliable double-tap-to-restore (the sheet's gestures fight it), and the
+  black edge-to-edge field matches chat images where the document previewer's
+  white chrome does not. The blob is already on disk from the thumbnail fetch
+  (`requestBlob` → `blob_download_bytes` writes the cache), so it opens instantly.
+  (Files still use `previewFile` → QuickLook above.)
+  **Compute the zoom fit from the scroll view's `layoutSubviews`, never from
+  `updateUIView`** — SwiftUI calls `updateUIView` BEFORE UIKit lays the scroll
+  view out, so `bounds` is still zero, a `bounds > 0` guard bails, and it never
+  runs again: min = max = zoomScale = 1, the image renders at native size, pinch
+  does nothing, and double-tap has no smaller scale to restore to (this exact bug
+  shipped once). Re-fit only when `bounds.size` actually changes, or the layout
+  passes that zooming itself triggers re-seat the image frame and fight the zoom.
+  The viewer's top-right button opens the system share sheet on the blob
+  materialised under its real name (`writePreviewFile`, shared with the file
+  path) — the FILE, not the decoded `UIImage`, so Save-to-Photos / Files /
+  AirDrop keep the original encoding. That share sheet is why the app carries
+  **`NSPhotoLibraryAddUsageDescription`**: without it iOS TERMINATES the app the
+  moment the user taps "Save Image". `ContentBlock::Image`/`Audio` carry an
+  `Option<String>` filename end to end (`AttachFile` → transcript →
+  `split_content` → `WireAttachment.filename`), so an agent's image shares under
+  its REAL name; a genuinely nameless one (pasted screenshot, MCP bitmap) falls
+  back to `attachment.<ext>` derived from the mime. Transcripts persisted before
+  that field existed still load (`#[serde(default)]`) — they simply have no name,
+  so an OLD message's image keeps sharing as `attachment.png`.
+  **A long-press on the image COPIES it** (`copyImage`, mirroring
+  the user bubble's long-press copy — shared `useLongPress` + the same squish/pill
+  confirm): the trailing tap-click is swallowed (`suppressClick`) so a copy
+  doesn't also open the viewer, and `.attachment-open` turns OFF
+  `-webkit-touch-callout`/`user-select` so iOS's own image callout can't fire at
+  ~500ms and fight the gesture.
   The spinning ring is **indeterminate on purpose** — the byte counter beside it
   (`884 KB / 2.3 MB`) is the progress. Bytes come from the core's `BlobProgress`
   callback (`blob_download_bytes(blob_id, progress)`), rate-limited to one tick

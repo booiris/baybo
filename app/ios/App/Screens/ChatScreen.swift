@@ -78,6 +78,9 @@ struct ChatScreen: View {
         .sheet(item: $store.filePreview) { preview in
             FilePreviewSheet(url: preview.url)
         }
+        .fullScreenCover(item: $store.viewedImage) { viewed in
+            ImageViewer(image: viewed.image, url: viewed.url) { store.viewedImage = nil }
+        }
         .onAppear {
             host.bridge.retarget(to: store)
             store.connectIfNeeded()

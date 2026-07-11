@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 /// A file attachment sitting in the app's temp dir, ready for QuickLook or the
@@ -72,6 +73,8 @@ final class ChatStore: ObservableObject {
     @Published var notice: String?
     /// A tapped file attachment, materialised on disk and awaiting presentation.
     @Published var filePreview: FilePreview?
+    /// A tapped image attachment, decoded and awaiting the full-screen viewer.
+    @Published var viewedImage: ViewedImage?
     /// Whether a turn is in flight for this session — mirrored from the transcript
     /// webview (the single source of truth for turn state) over the bridge. Drives
     /// the composer's send↔stop button. Native never re-derives turn state; it
@@ -803,6 +806,60 @@ final class ChatStore: ObservableObject {
                     blobId: blobId, state: "failed", error: bayboErrorText(error))
             }
         }
+    }
+
+    /// Open a tapped image full-screen. The blob is device-cached (the thumbnail
+    /// fetch wrote it), so this decodes near-instantly; a non-decodable blob
+    /// simply doesn't present. Its own viewer rather than QuickLook so pinch-zoom,
+    /// double-tap-to-restore, and the black chat-image field are guaranteed.
+    func viewImage(blobId: String, filename: String, mimeType: String) {
+        Task {
+            guard let bytes = try? await Baybo.client.blobDownloadBytes(
+                blobId: blobId, progress: nil),
+                let image = UIImage(data: bytes)
+            else { return }
+            // The share sheet hands over the FILE, not the decoded image, so the
+            // original encoding and name reach Photos / Files / AirDrop. A write
+            // failure only costs the share button, never the viewer.
+            let url = try? Self.writePreviewFile(
+                bytes: bytes, blobId: blobId, filename: filename, mimeType: mimeType)
+            viewedImage = ViewedImage(id: blobId, image: image, url: url)
+        }
+    }
+
+    /// Copy an image attachment to the system clipboard (a long-press on the
+    /// image bubble). The blob is device-cached — the thumbnail fetch wrote it —
+    /// so this is a near-instant read. Best-effort: a fetch failure simply
+    /// doesn't confirm (the web side already played its optimistic pill, and
+    /// there is no card listening for an error here).
+    func copyImage(blobId: String, mimeType: String) {
+        Task {
+            guard let bytes = try? await Baybo.client.blobDownloadBytes(
+                blobId: blobId, progress: nil)
+            else { return }
+            // Only confirm (haptic) when something actually landed on the clipboard
+            // — a blob that is neither an image UTI nor a decodable image copies
+            // nothing, and a haptic there would falsely say it worked.
+            if Self.writeImageToPasteboard(bytes: bytes, mimeType: mimeType) {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            }
+        }
+    }
+
+    /// Prefer writing the raw bytes under their image UTI — it keeps the original
+    /// encoding (PNG alpha, an animated GIF) that a re-encoded `UIImage` would
+    /// flatten. Fall back to a decoded image only when the mime yields no image
+    /// UTI (an unknown/blank type). Returns whether anything was copied.
+    private static func writeImageToPasteboard(bytes: Data, mimeType: String) -> Bool {
+        if let type = UTType(mimeType: mimeType), type.conforms(to: .image) {
+            UIPasteboard.general.setData(bytes, forPasteboardType: type.identifier)
+            return true
+        }
+        if let image = UIImage(data: bytes) {
+            UIPasteboard.general.image = image
+            return true
+        }
+        return false
     }
 
     /// `<tmp>/baybo-preview/<blob digest>/<filename>` — the digest directory
