@@ -197,6 +197,9 @@ impl From<AttachmentRef> for crate::core::WireAttachment {
             mime_type: a.mime_type,
             size: a.size,
             filename: a.filename,
+            // Outbound user sends: the composer can't attach audio, so there
+            // is never a duration to carry.
+            duration_ms: None,
         }
     }
 }

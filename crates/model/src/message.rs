@@ -23,11 +23,24 @@ pub enum ContentBlock {
         mime_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
+        /// Playback length in milliseconds, probed from the container at
+        /// attach time (`AttachFile`). `None` when unknown — inbound channel
+        /// audio, unparseable containers, rows persisted before the field
+        /// existed. Carried so a client can show a track's length before any
+        /// byte is downloaded or played.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u32>,
     },
     File {
         blob: BlobRef,
         filename: String,
         mime_type: String,
+        /// Playback length in milliseconds for VIDEO files (video rides the
+        /// `File` kind — it has no block variant of its own), probed from the
+        /// container at attach time. Same contract as `Audio::duration_ms`:
+        /// `None` when unknown or not a video.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u32>,
     },
     /// A tool invocation emitted by the assistant. Stored in conversation
     /// history so subsequent LLM calls see their own prior tool calls.

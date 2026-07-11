@@ -352,6 +352,9 @@ pub struct ChatAttachment {
     pub size: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
+    /// Playback length in ms for `audio` (see `WireAttachment::duration_ms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
 }
 
 impl From<WireAttachment> for ChatAttachment {
@@ -367,6 +370,7 @@ impl From<WireAttachment> for ChatAttachment {
             mime_type: att.mime_type,
             size: att.size,
             filename: att.filename,
+            duration_ms: att.duration_ms,
         }
     }
 }

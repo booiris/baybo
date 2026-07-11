@@ -884,11 +884,13 @@ fn wire_to_content_blocks(content: String, attachments: Vec<WireAttachment>) -> 
                 blob,
                 mime_type: att.mime_type,
                 filename: att.filename,
+                duration_ms: att.duration_ms,
             },
             AttachmentKind::File => ContentBlock::File {
                 blob,
                 filename: att.filename.unwrap_or_default(),
                 mime_type: att.mime_type,
+                duration_ms: att.duration_ms,
             },
         });
     }
@@ -907,6 +909,7 @@ mod tests {
             mime_type: mime.into(),
             size: 7,
             filename: filename.map(str::to_owned),
+            duration_ms: None,
         }
     }
 

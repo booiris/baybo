@@ -539,6 +539,7 @@ pub(crate) async fn split_content(
                     &blob.blob_id,
                     Some(mime_type.clone()),
                     filename.clone(),
+                    None,
                 )
                 .await
                 {
@@ -549,6 +550,7 @@ pub(crate) async fn split_content(
                 blob,
                 mime_type,
                 filename,
+                duration_ms,
             } => {
                 if let Some(att) = stat_attachment(
                     blob_store,
@@ -556,6 +558,7 @@ pub(crate) async fn split_content(
                     &blob.blob_id,
                     Some(mime_type.clone()),
                     filename.clone(),
+                    *duration_ms,
                 )
                 .await
                 {
@@ -566,6 +569,7 @@ pub(crate) async fn split_content(
                 blob,
                 filename,
                 mime_type,
+                duration_ms,
             } => {
                 if let Some(att) = stat_attachment(
                     blob_store,
@@ -573,6 +577,7 @@ pub(crate) async fn split_content(
                     &blob.blob_id,
                     Some(mime_type.clone()),
                     Some(filename.clone()),
+                    *duration_ms,
                 )
                 .await
                 {
@@ -595,6 +600,7 @@ async fn stat_attachment(
     blob_id: &str,
     mime_override: Option<String>,
     filename: Option<String>,
+    duration_ms: Option<u32>,
 ) -> Option<WireAttachment> {
     match blob_store.stat(blob_id).await {
         Ok(meta) => {
@@ -615,6 +621,7 @@ async fn stat_attachment(
                 mime_type: mime_override.unwrap_or(meta.mime_type),
                 size,
                 filename,
+                duration_ms,
             })
         }
         Err(e) => {

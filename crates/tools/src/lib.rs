@@ -823,6 +823,7 @@ mod multi_modal_text_tests {
                 },
                 mime_type: "audio/wav".into(),
                 filename: None,
+                duration_ms: None,
             },
             ContentBlock::File {
                 blob: BlobRef {
@@ -830,6 +831,7 @@ mod multi_modal_text_tests {
                 },
                 filename: "x".into(),
                 mime_type: "application/pdf".into(),
+                duration_ms: None,
             },
             img(),
         ];

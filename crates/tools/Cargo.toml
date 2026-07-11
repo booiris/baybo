@@ -47,6 +47,9 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tokio-util = { workspace = true }
+lofty = { workspace = true }
+mp4 = { workspace = true }
+matroska = { workspace = true }
 libc = { workspace = true }
 anyhow = { workspace = true }
 shell-words = { workspace = true }

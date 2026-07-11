@@ -3678,6 +3678,15 @@
           "blob_id": {
             "type": "string"
           },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Playback length in ms for `audio` (see `WireAttachment::duration_ms`).",
+            "minimum": 0
+          },
           "filename": {
             "type": [
               "string",

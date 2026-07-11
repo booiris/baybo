@@ -147,6 +147,8 @@ impl Tool for AttachFileTool {
         });
         let mime = p.mime.unwrap_or_else(|| guess_mime(&p.path).to_string());
 
+        let duration_ms = probe_media_duration_ms(&p.path, &mime).await;
+
         let file = tokio::fs::File::open(&p.path)
             .await
             .map_err(|e| ToolError::Execution(format!("open {}: {e}", p.path.display())))?;
@@ -164,9 +166,58 @@ impl Tool for AttachFileTool {
         // the model reports a delivery that a cancelled turn never makes.
         Ok(ToolOutput::WithAttachments {
             text: format!("Attached {filename} ({size} bytes, {mime}) to your final reply."),
-            attachments: vec![media_block(blob_ref, filename, mime)],
+            attachments: vec![media_block(blob_ref, filename, mime, duration_ms)],
         })
     }
+}
+
+/// A track's playback length, read from the container headers — attach time is
+/// the only moment the file is in hand server-side, and clients want to show a
+/// length before downloading a byte. Audio goes through lofty; video through
+/// the container-specific parsers below (lofty reads no video container).
+/// Best-effort: an unparseable file just ships without a duration; a zero
+/// duration (a container that declares none) counts as unknown.
+/// `spawn_blocking` because all three parsers are sync IO.
+async fn probe_media_duration_ms(path: &Path, mime: &str) -> Option<u32> {
+    let path = path.to_path_buf();
+    let mime = mime.to_string();
+    tokio::task::spawn_blocking(move || {
+        let ms = if mime.starts_with("audio/") {
+            audio_duration_ms(&path)
+        } else if mime == "video/mp4" || mime == "video/quicktime" {
+            mp4_duration_ms(&path)
+        } else if mime == "video/webm" || mime == "video/x-matroska" {
+            webm_duration_ms(&path)
+        } else {
+            None
+        };
+        ms.filter(|&v| v > 0)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn audio_duration_ms(path: &Path) -> Option<u32> {
+    use lofty::file::AudioFile;
+    let file = lofty::read_from_path(path).ok()?;
+    u32::try_from(file.properties().duration().as_millis()).ok()
+}
+
+/// ISO BMFF (`.mp4` / `.mov` — QuickTime shares the box structure): the
+/// `mvhd` movie duration.
+fn mp4_duration_ms(path: &Path) -> Option<u32> {
+    let file = std::fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    let reader = std::io::BufReader::new(file);
+    let mp4 = mp4::Mp4Reader::read_header(reader, size).ok()?;
+    u32::try_from(mp4.duration().as_millis()).ok()
+}
+
+fn webm_duration_ms(path: &Path) -> Option<u32> {
+    let mkv = matroska::open(path).ok()?;
+    let duration = mkv.info.duration?;
+    u32::try_from(duration.as_millis()).ok()
 }
 
 /// Pick the block variant by MIME, because the variant *is* the wire's
@@ -178,7 +229,12 @@ impl Tool for AttachFileTool {
 /// No surface shows a name BESIDE a rendered image, but the name still rides
 /// along: a client sharing or saving the picture needs the real one (else it
 /// lands in Photos/Files as `attachment.png`).
-fn media_block(blob: BlobRef, filename: String, mime_type: String) -> ContentBlock {
+fn media_block(
+    blob: BlobRef,
+    filename: String,
+    mime_type: String,
+    duration_ms: Option<u32>,
+) -> ContentBlock {
     if mime_type.starts_with("image/") {
         ContentBlock::Image {
             blob,
@@ -190,12 +246,14 @@ fn media_block(blob: BlobRef, filename: String, mime_type: String) -> ContentBlo
             blob,
             mime_type,
             filename: Some(filename),
+            duration_ms,
         }
     } else {
         ContentBlock::File {
             blob,
             filename,
             mime_type,
+            duration_ms,
         }
     }
 }

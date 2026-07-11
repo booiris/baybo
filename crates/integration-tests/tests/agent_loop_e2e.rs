@@ -360,6 +360,7 @@ fn file_block(digest_char: char, token: &str, filename: &str) -> ContentBlock {
         },
         filename: filename.to_string(),
         mime_type: "application/pdf".into(),
+        duration_ms: None,
     }
 }
 

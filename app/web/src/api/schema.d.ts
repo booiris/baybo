@@ -882,6 +882,11 @@ export interface components {
         /** @description A blob attachment embedded in a historical chat transcript item. */
         ChatAttachment: {
             blob_id: string;
+            /**
+             * Format: int32
+             * @description Playback length in ms for `audio` (see `WireAttachment::duration_ms`).
+             */
+            duration_ms?: number | null;
             filename?: string | null;
             kind: string;
             mime_type: string;

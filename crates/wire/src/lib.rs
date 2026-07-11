@@ -122,6 +122,13 @@ pub struct WireAttachment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub filename: Option<String>,
+    /// Playback length in milliseconds for `Audio` (probed at attach
+    /// time). `None` when unknown — inbound channel audio, unparseable
+    /// containers, rows persisted before the field existed. Lets a client
+    /// render a track's length before downloading a byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub duration_ms: Option<u32>,
 }
 
 /// The canonical user-visible message in either direction. A single

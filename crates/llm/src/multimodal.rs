@@ -19,6 +19,7 @@ pub fn content_block_to_text(block: &ContentBlock) -> String {
             blob,
             filename,
             mime_type,
+            ..
         } => {
             format!(
                 "[file: {} ({}) blob_id={}]",
@@ -88,6 +89,7 @@ mod tests {
             blob: sample_blob(),
             mime_type: "audio/mp3".to_string(),
             filename: None,
+            duration_ms: None,
         };
         let result = content_block_to_text(&block);
         assert!(result.contains("audio"));
@@ -100,6 +102,7 @@ mod tests {
             blob: sample_blob(),
             filename: "doc.pdf".to_string(),
             mime_type: "application/pdf".to_string(),
+            duration_ms: None,
         };
         let result = content_block_to_text(&block);
         assert!(result.contains("doc.pdf"));
