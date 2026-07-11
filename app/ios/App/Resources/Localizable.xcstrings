@@ -256,6 +256,23 @@
         }
       }
     },
+    "chat.stop" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stop"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "停止"
+          }
+        }
+      }
+    },
     "chat.tooLarge" : {
       "extractionState" : "stale",
       "localizations" : {

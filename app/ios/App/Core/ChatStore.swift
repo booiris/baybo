@@ -53,6 +53,10 @@ final class ChatStore: ObservableObject {
     /// refetched on re-attach (`overflowBufferedFrames`) instead of growing
     /// without bound. Generous enough that a normal turn flushes intact.
     static let maxBufferedFrames = 2000
+    /// Full leading-slash form of the stop command (mirrors the gateway's
+    /// `STOP_COMMAND`). Delivered as an ordinary chat send; the agent Router
+    /// recognises it out-of-band and cancels the in-flight turn.
+    static let stopCommand = "/stop"
 
     let sessionId: String
     /// Whether this session already exists on the gateway — an existing
@@ -68,6 +72,11 @@ final class ChatStore: ObservableObject {
     @Published var notice: String?
     /// A tapped file attachment, materialised on disk and awaiting presentation.
     @Published var filePreview: FilePreview?
+    /// Whether a turn is in flight for this session — mirrored from the transcript
+    /// webview (the single source of truth for turn state) over the bridge. Drives
+    /// the composer's send↔stop button. Native never re-derives turn state; it
+    /// only reflects what the webview reports.
+    @Published private(set) var agentRunning = false
 
     /// Increments on every successful dial; the webview uses it to retry
     /// attachments that raced ahead of the leg going live, and — the sync-loop
@@ -483,6 +492,38 @@ final class ChatStore: ObservableObject {
                 try await Baybo.client.chatMarkRead(sessionId: sessionId, ordinal: ordinal)
             } catch {
                 NSLog("baybo: mark read: %@", bayboErrorText(error))
+            }
+        }
+    }
+
+    /// The transcript reported whether a turn is in flight (from its turn state
+    /// plus the optimistic post-send window). Deduped so an unchanged report
+    /// doesn't publish a redundant `objectWillChange`.
+    func setAgentRunning(_ running: Bool) {
+        if agentRunning != running { agentRunning = running }
+    }
+
+    /// Cancel the session's in-flight turn: deliver `/stop` over the live leg.
+    /// The gateway's agent Router intercepts it out-of-band (before routing a
+    /// turn), so it never becomes a user message / bubble; it cancels the turn
+    /// and every subagent it spawned. Fire-and-forget and deliberately lighter
+    /// than `send` — no optimistic bubble, no outbox enrolment: a stop that
+    /// fails leaves the turn running and the user can tap again. When the leg is
+    /// mid-reconnect (a turn keeps running server-side while `connState` briefly
+    /// leaves `.connected`) we don't silently drop the tap — kick a redial so the
+    /// leg comes back and re-syncs, and the user can stop again once connected.
+    func stopAgent() {
+        guard connState == .connected else {
+            if connState != .draft { connect() }
+            return
+        }
+        let msgId = UUID().uuidString
+        Task {
+            do {
+                try await Baybo.client.chatSend(
+                    sessionId: sessionId, text: Self.stopCommand, msgId: msgId, attachments: [])
+            } catch {
+                NSLog("baybo: stop: %@", bayboErrorText(error))
             }
         }
     }

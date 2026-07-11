@@ -136,6 +136,15 @@ export function postJumpVisible(visible: boolean): void {
   postSafe({ type: "jumpVisible", visible });
 }
 
+/// The composer's send button is native and flips to a stop affordance while a
+/// turn is in flight. The webview is the single source of truth for turn state
+/// (SubscribeState reconstruction, the finalization-race handling), so it mirrors
+/// the run state over; a `/stop` tap comes back as an ordinary chat send native
+/// side. Fire-and-forget; native dedups.
+export function postRunState(running: boolean): void {
+  postSafe({ type: "runState", running });
+}
+
 /// Markdown links must not navigate the transcript webview away — native opens
 /// them in the system browser instead. Dev browser: plain window.open.
 export function openUrl(url: string): void {

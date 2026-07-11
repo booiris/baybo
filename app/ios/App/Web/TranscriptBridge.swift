@@ -342,6 +342,10 @@ extension TranscriptBridge: WKScriptMessageHandler {
             }
         case "jumpVisible":
             jumpVisible = (body["visible"] as? Bool) ?? false
+        case "runState":
+            // The transcript's turn is/ isn't in flight — drives the composer's
+            // send↔stop button on the store this webview currently targets.
+            store?.setAgentRunning((body["running"] as? Bool) ?? false)
         case "openUrl":
             // Markdown links leave the app for the system browser — navigating
             // the transcript webview itself would replace the thread.

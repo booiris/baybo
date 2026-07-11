@@ -19,6 +19,7 @@ import {
   persistState,
   postJumpVisible,
   postMarkRead,
+  postRunState,
   postSyncRequest,
   previewFile,
   queryFileState,
@@ -100,9 +101,18 @@ function transcriptItemToRow(item: TranscriptRowItem): Row | null {
     };
   }
   if (item.kind === "notice") {
+    // The `/stop` acknowledgement renders as a compact "Stopped" indicator, not
+    // the gateway's raw multi-line text (matches the live path).
+    if (isStopAckNotice(item.text ?? "")) {
+      return { id: item.id, role: "notice", content: "", stopped: true };
+    }
     return { id: item.id, role: "notice", content: item.text ?? "" };
   }
   const role = item.role === "user" ? "user" : "assistant";
+  // The gateway persists `/stop` as a `Command` control event, which
+  // reconstructs as a user MESSAGE row (`control_event_item`). Drop it, mirroring
+  // the live-echo drop — the button issues `/stop`, it is never a chat bubble.
+  if (role === "user" && isStopCommand(item.text ?? "")) return null;
   // A user row keeps its send's `platform_msg_id` as the render id (the live
   // echo path's key), so an optimistic bubble reconciles by id; an assistant
   // row uses the stable `m<ordinal>` id.
@@ -131,6 +141,13 @@ const SYNC_MERGE_LIMIT = 200;
 /// every 3 minutes, skipped when any frame arrived within the interval.
 /// Backstops a lost `gap` nudge and suspended-app windows.
 const SAFETY_TICK_MS = 180_000;
+
+/// Hard ceiling on the optimistic post-send run-state window (`awaitingReply`).
+/// A real turn clears it far sooner — via its first output or its terminal frame
+/// — so this only fires when BOTH were missed (a disconnect that hid the turn's
+/// output and its close), un-sticking the composer's stop button. Well above any
+/// realistic pre-first-token latency, so it never expires under a live turn.
+const AWAITING_MAX_MS = 30_000;
 
 /// How close to the top of the chat log (px) triggers a scroll-up fetch of the
 /// next older page. A small band so the load fires just before the user hits the
@@ -164,6 +181,28 @@ const LAZY_IMAGE_ROOT_MARGIN = "400px 0px";
 /// so every scroll-position op targets `document.scrollingElement`.
 function scrollEl(): HTMLElement | null {
   return document.scrollingElement as HTMLElement | null;
+}
+
+/// Recognise a `/stop` the way the gateway's parser does (leading `/`, first
+/// token, tolerant of a `@bot` suffix / trailing args), so the client can drop
+/// the command's user echo — the native stop button issues `/stop` as an
+/// ordinary send and it must never render as a message bubble. Mirrors
+/// app/web's `isStopCommand`.
+function isStopCommand(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/")) return false;
+  const cmd = trimmed.slice(1).split(/[\s@]/, 1)[0]?.toLowerCase();
+  return cmd === "stop";
+}
+
+/// A `/stop` acknowledgement notice from the gateway (`build_stop_notice`):
+/// `"Stopped.\n- Cancelled the in-progress reply."`, a background-task variant,
+/// or the no-op `"Nothing in progress to stop."`. These are text-channel chatter
+/// that read oddly as a chat bubble (worst when a thinking-only turn is stopped
+/// before any work block exists), so the transcript drops them entirely.
+function isStopAckNotice(text: string): boolean {
+  const t = text.trim();
+  return t.startsWith("Stopped.") || t === "Nothing in progress to stop.";
 }
 
 function ordinalFromMessageId(id: string): number | null {
@@ -751,6 +790,16 @@ const MessageRow = memo(function MessageRow({
   const longPress = useLongPress(copy);
 
   if (m.role === "notice") {
+    if (m.stopped) {
+      // Compact stand-in for the gateway's `/stop` acknowledgement: a hairline
+      // rule flanking a small square + "Stopped", centered.
+      return (
+        <div className="stopped-indicator" role="status">
+          <span className="stopped-mark" aria-hidden="true" />
+          {t("chat.stopped")}
+        </div>
+      );
+    }
     return <div className="bubble notice">{m.content}</div>;
   }
 
@@ -848,6 +897,14 @@ export function Transcript({
   useEffect(() => {
     turnActiveRef.current = turnActive;
   }, [turnActive]);
+  // Optimistic "a send is in flight, awaiting the turn to start" — mirrors the
+  // web chat's `awaitingReply`. It bridges the gap between a user send and the
+  // server's first `turn_state{active}` so the composer's stop button appears
+  // the instant the user sends, and — until interjection ships — typing can't
+  // flip it back to a send button mid-turn. Cleared the moment the server speaks
+  // about the turn (turn_state / subscribe_state / an assistant reply / a
+  // terminal notice) or the send fails, so it can never strand the stop button.
+  const [awaitingReply, setAwaitingReply] = useState(false);
   // The full streamed answer so far. State updates are coalesced through one
   // rAF per frame burst — every push crosses the bridge as its own JS task, so
   // without this each delta would re-render (and re-parse markdown) alone.
@@ -1105,6 +1162,9 @@ export function Transcript({
   // (red retry dot) state. Guarded on "sending" so a late failure can't stomp a
   // bubble the echo already delivered.
   const markFailed = useCallback((msgId: string) => {
+    // The send never reached the gateway, so no turn will start — leave the
+    // optimistic awaiting window so the stop button doesn't strand.
+    setAwaitingReply(false);
     setMessages((rows) =>
       rows.map((r) =>
         r.role === "user" && r.id === msgId && r.sendState === "sending" ? { ...r, sendState: "failed" } : r,
@@ -1116,6 +1176,8 @@ export function Transcript({
   // and flip the bubble back to sending so the spinner returns while it retries.
   const retryMessage = useCallback((m: ChatMsg) => {
     retrySend({ msgId: m.id, text: m.content, attachments: m.attachments ?? [] });
+    // Re-enter the awaiting window — the resend can start a turn.
+    setAwaitingReply(true);
     setMessages((rows) =>
       rows.map((r) => (r.role === "user" && r.id === m.id ? { ...r, sendState: "sending" } : r)),
     );
@@ -1582,6 +1644,14 @@ export function Transcript({
           markSent(frame.platform_msg_id); // server confirmed the send — stop the spinner
           return; // our own message / already rendered
         }
+        // The native stop BUTTON issues `/stop` as an ordinary chat send; the
+        // channel echoes every inbound message to subscribers BEFORE the agent
+        // Router intercepts `/stop` out-of-band, so the echo arrives here. Native
+        // mints no optimistic bubble for it (it isn't in `sentIds`), and the
+        // durable record folds `/stop` into the cancelled work block — never a
+        // message row — so left alone the echo renders a stray "/stop" bubble
+        // that lingers. Drop it (a typed `/stop` already returned above by id).
+        if (role === "user" && isStopCommand(frame.content)) return;
         if (ordinal !== null && renderedOrdinals.current.has(ordinal)) {
           if (role === "user" && frame.platform_msg_id) sentIds.current.add(frame.platform_msg_id);
           return;
@@ -1596,6 +1666,7 @@ export function Transcript({
           // trigger for the follow-up sync that closes the dirty window.
           closeWork();
           clearStreaming();
+          setAwaitingReply(false);
           recordEndedTurn(activeTurnStart.current);
           activeTurnStart.current = null;
           if (rebaseDirty.current) runSync();
@@ -1667,6 +1738,10 @@ export function Transcript({
         if (frame.active) {
           activeTurnStart.current = frame.started_at ? Date.parse(frame.started_at) : null;
         } else {
+          // Turn ended — end the optimistic run-state window (its work block /
+          // streaming, if any, close alongside). Kept on the ACTIVE branch so a
+          // slow first token doesn't briefly drop the stop button.
+          setAwaitingReply(false);
           closeWork();
           recordEndedTurn(activeTurnStart.current);
           activeTurnStart.current = null;
@@ -1681,6 +1756,14 @@ export function Transcript({
         if (frame.turn.active && frame.turn.started_at) {
           activeTurnStart.current = Date.parse(frame.turn.started_at);
         }
+        // Do NOT clear the optimistic window here: a `subscribe_state` arrives on
+        // every (re)connect, and the send-then-connect path (a first message on a
+        // fresh session) delivers `turn.active:false` in the gap AFTER our send
+        // but BEFORE the turn starts — clearing here would drop the stop button
+        // back to send until the first output (the "stop appears late" bug). A
+        // real turn is reflected by applySubscribeState rebuilding the work block
+        // / streaming reply; a genuinely idle window self-expires (see the
+        // `awaitingReply` timeout) and is cleared by the turn's terminal frame.
         applySubscribeState(frame.turn, frame.work_steps ?? []);
         break;
       case "gap":
@@ -1694,8 +1777,21 @@ export function Transcript({
           // Mid-turn progress narration belongs to the work block, not the log.
           foldStreamingIntoProse();
           pushWorkStep({ kind: "status", text: frame.text });
+        } else if (isStopAckNotice(frame.text)) {
+          // A `/stop` acknowledgement. Don't mint a client row for it: the
+          // gateway persists this notice, and reconstruction renders it as the
+          // compact "Stopped" indicator (`n<seq>` id). Minting a local `uid` row
+          // too would double it on the next sync / a relaunch (two ids, same
+          // event). Instead end the optimistic window, freeze any open work
+          // block, and pull the durable indicator in via one sync.
+          setAwaitingReply(false);
+          setMessages((rows) => freezeActiveWork(rows));
+          runSync();
         } else {
-          // A terminal notice folds into an open block rather than cutting it.
+          // A terminal notice (a server rejection, a degraded-mode banner) means
+          // no turn is starting — end the optimistic window so the stop button
+          // can't strand.
+          setAwaitingReply(false);
           foldTerminalNotice(frame.level, frame.text);
         }
         break;
@@ -1744,6 +1840,9 @@ export function Transcript({
   const handleUserSent = (payload: UserSentPayload) => {
     sentIds.current.add(payload.msgId);
     followRef.current = true;
+    // Optimistically enter the "awaiting reply" window so the composer's stop
+    // button appears immediately, before the first `turn_state` lands.
+    setAwaitingReply(true);
     setMessages((m) => [
       ...m,
       {
@@ -1922,6 +2021,52 @@ export function Transcript({
   const lastRow = messages[messages.length - 1];
   const workLive = lastRow !== undefined && lastRow.role === "work" && lastRow.active;
 
+  // Mirror the turn's run state to native so the composer's send button flips to
+  // a stop affordance while a turn runs. Derived from SELF-CORRECTING signals
+  // only — an active work block, a streaming reply, or the optimistic post-send
+  // window — deliberately NOT the raw `turnActive` latch. That latch strands true
+  // when its closing `turn_state{active:false}` is lost (an offscreen buffer
+  // overflow drops it, and a `sync_page` carries no turn state to re-derive it),
+  // which would freeze the composer on the stop button and block every send.
+  // On mount this posts `false`, resetting a native store that carried a stale
+  // run state across a session switch; the flushed/live frames re-raise it.
+  const running = awaitingReply || workLive || streaming.length > 0;
+  useEffect(() => {
+    postRunState(running);
+  }, [running]);
+
+  // Hand the optimistic post-send window off to the real run signals the instant
+  // the turn produces output (a work block or a streamed reply). Doing it here —
+  // NOT in `applySyncPage` — is deliberate: a session-open / reconnect sync is
+  // async, so its `sync_page` often lands just AFTER a send and would clear the
+  // just-set window mid-flight, dropping the stop button back to send until the
+  // first output (the "stop appears late" bug). `workLive`/`streaming` are also
+  // what a buffer-overflow recovery sync clears, so once output has started the
+  // window is no longer load-bearing and dropping it here can't strand it.
+  useEffect(() => {
+    if (workLive || streaming.length > 0) setAwaitingReply(false);
+  }, [workLive, streaming]);
+
+  // Race-free backstop: the optimistic window self-expires so a missed turn-end
+  // (a disconnect that hid both the send's output and the turn's close) can't
+  // strand the stop button. Deliberately not tied to any sync/subscribe frame —
+  // those race a fresh send — and long enough that a live turn always clears it
+  // first via output or its terminal frame.
+  useEffect(() => {
+    if (!awaitingReply) return;
+    const id = window.setTimeout(() => setAwaitingReply(false), AWAITING_MAX_MS);
+    return () => window.clearTimeout(id);
+  }, [awaitingReply]);
+
+  // Collapse adjacent "Stopped" indicators to one: the live indicator (a
+  // client `uid`) and its durable notice row (`n<seq>`, re-delivered by a later
+  // sync) are the same event and would otherwise stack two identical marks.
+  const renderRows = messages.filter((m, i) => {
+    if (m.role !== "notice" || !m.stopped) return true;
+    const prev = messages[i - 1];
+    return !(prev && prev.role === "notice" && prev.stopped);
+  });
+
   return (
     <>
       <div className="chat-log" ref={logRef}>
@@ -1933,7 +2078,7 @@ export function Transcript({
             {t("chat.loadOlder")}
           </button>
         )}
-        {messages.map((m) =>
+        {renderRows.map((m) =>
           m.role === "work" ? (
             <WorkBlockView key={m.id} row={m} onToggle={handleWorkToggle} />
           ) : (

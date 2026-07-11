@@ -158,6 +158,11 @@ export type ChatMsg = {
   // when the server echoes the message back. On restore a stale "sending" is
   // stripped (the leg is gone), but "failed" persists so the retry dot survives.
   sendState?: "sending" | "failed";
+  // A `role:"notice"` row that stands in for the gateway's `/stop`
+  // acknowledgement: rendered as a compact "Stopped" indicator instead of the
+  // raw multi-line notice text (which reads oddly as a bubble). `content` is
+  // unused for these.
+  stopped?: boolean;
 };
 
 /// One entry in a turn's work block — the agent's process (thinking, tool

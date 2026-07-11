@@ -472,6 +472,27 @@ button {
   overflow-wrap: anywhere;
 }
 
+/* The `/stop` acknowledgement, compact: a small filled square (echoing the
+   composer's stop glyph) + "Stopped", centered and soft — the monochrome
+   stand-in for the gateway's raw multi-line notice text. */
+.stopped-indicator {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.15rem 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: var(--color-ink-soft);
+}
+.stopped-mark {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 1.5px;
+  background: var(--color-ink-soft);
+}
+
 /* Scroll-up "load earlier" affordance: a centered hairline pill, monospace
    chrome (it's chrome, not a message body), soft like the rest of the UI. */
 .load-older {

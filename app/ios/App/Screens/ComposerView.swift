@@ -74,20 +74,34 @@ struct ComposerView: View {
                             }
                     }
 
+                // While a turn runs the button is a stop control (cancel via
+                // `/stop`), independent of the field: typing can't turn it back
+                // into a send button mid-turn (interjection is future work). Idle,
+                // it's the send button, enabled only with a draft.
                 Button {
-                    send()
+                    if store.agentRunning {
+                        store.stopAgent()
+                    } else {
+                        send()
+                    }
                 } label: {
                     Circle()
-                        .fill(hasDraft ? Theme.ink : Theme.line)
+                        .fill(store.agentRunning || hasDraft ? Theme.ink : Theme.line)
                         .frame(width: 36, height: 36)
                         .overlay(
-                            Image(systemName: "arrow.up")
-                                .font(.system(size: 15, weight: .semibold))
+                            // A filled square is the "stop generating" affordance
+                            // (ChatGPT-style); the up arrow is send. One Image so
+                            // the glyph morphs between the two states.
+                            Image(systemName: store.agentRunning ? "stop.fill" : "arrow.up")
+                                .font(.system(size: store.agentRunning ? 13 : 15, weight: .semibold))
                                 .foregroundStyle(Theme.paper)
+                                .contentTransition(.symbolEffect(.replace))
                         )
+                        .animation(.easeInOut(duration: 0.2), value: store.agentRunning)
                 }
-                .disabled(!hasDraft)
-                .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.send")))
+                .disabled(!store.agentRunning && !hasDraft)
+                .accessibilityLabel(
+                    Text(verbatim: Lang.shared.t(store.agentRunning ? "chat.stop" : "chat.send")))
                 .padding(.trailing, 6)
                 .padding(.bottom, 6)
             }

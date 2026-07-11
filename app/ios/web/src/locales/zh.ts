@@ -11,6 +11,7 @@ export const zh: typeof en = {
       recoverFailed: "无法重新加载历史记录：{{error}}",
       retrySend: "发送失败，点按重试",
       copied: "已复制",
+      stopped: "已停止",
       working: "思考中",
       worked: "思考了片刻",
       workedFor: "思考了 {{dur}}",
