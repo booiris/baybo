@@ -9,6 +9,15 @@ export type WireAttachment = {
   filename?: string;
 };
 
+/** The content-addressed half of a `blob_id` (`sha256:<hex>.<read-token>`) — the
+ * web mirror of the core's `blob_content_digest`. Every upload of the same bytes
+ * mints a FRESH read token, so two ids can name one blob; the digest, not the
+ * id, is a blob's identity. The `sha256:` prefix rides along — this is only ever
+ * a local map key, never sent back over the wire. */
+export function blobContentDigest(blobId: string): string {
+  return blobId.split(".")[0] ?? blobId;
+}
+
 /** Bucket a mime type into the wire attachment kind — same rule the web chat and
  * gateway use (the kind selects the agent-side content block). */
 export function attachmentKind(mime: string): WireAttachment["kind"] {
@@ -205,6 +214,11 @@ export type PersistedState = {
   lastOrdinal: number | null;
   oldestOrdinal: number | null;
   hasMoreOlder: boolean;
+  /// Natural `[width, height]` of every image this thread has decoded, keyed by
+  /// blob DIGEST (never the id — its read token rotates). Lets a re-open reserve
+  /// each image's exact box before its bytes arrive, so the transcript doesn't
+  /// resize under the reader. Absent on a mirror written before this existed.
+  imageDims?: Record<string, [number, number]>;
 };
 
 let uidCounter = 0;

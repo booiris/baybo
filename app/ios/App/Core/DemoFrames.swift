@@ -1,5 +1,6 @@
 #if DEBUG
     import Foundation
+    import UIKit
 
     /// `-baybo-demo-frames` (DEBUG launch arg): feeds one canned turn through
     /// the transcript bridge — user bubble, thinking trace, a tool call,
@@ -11,6 +12,102 @@
         private static let demoFramesArg = "-baybo-demo-frames"
         private static let demoAttachmentsArg = "-baybo-demo-attachments"
         private static let demoDownloadArg = "-baybo-demo-download"
+        private static let demoImagesArg = "-baybo-demo-images"
+
+        /// Natural pixel sizes the demo images decode to — a spread that makes a
+        /// wrongly-reserved box obvious: a portrait that grows its row, a banner
+        /// that shrinks it, a thumbnail under every cap, a square the height cap
+        /// clamps. The declared `size` is nominal (the fake bytes are a flat PNG).
+        private static let demoImageSizes: [(id: String, width: Int, height: Int)] = [
+            ("sha256:demoimg1.tok", 768, 1024),
+            ("sha256:demoimg2.tok", 1600, 400),
+            ("sha256:demoimg3.tok", 80, 60),
+            ("sha256:demoimg4.tok", 900, 900),
+        ]
+
+        private static var demoImageAttachments: [[String: Any]] {
+            demoImageSizes.map {
+                [
+                    "kind": "image", "blob_id": $0.id, "mime_type": "image/png",
+                    "size": $0.width * $0.height * 4,
+                ]
+            }
+        }
+
+        /// `-baybo-demo-images` (DEBUG): one agent turn carrying the four images
+        /// above and a text row UNDER them — that row's y-position is the whole
+        /// test. A first run (empty mirror) paints the 12rem loading tiles, then
+        /// each image releases to its real height and shoves the row around; the
+        /// sizes it records mean a SECOND run of the same session reserves each
+        /// box up front and the row must not move at all. Runs with no gateway:
+        /// `requestBlob` is served locally (see `serveDemoImageIfRequested`).
+        func startDemoImagesIfRequested() {
+            guard ProcessInfo.processInfo.arguments.contains(Self.demoImagesArg) else { return }
+            // ONLY the throwaway demo session: this feeder both persists a turn
+            // into the session's durable mirror and writes its registry row, so
+            // pointing it at a real conversation (`-baybo-open-session`) would
+            // corrupt one.
+            guard sessionId == AppStore.debugSessionId else { return }
+            // Register the session the way a real send would: an unregistered
+            // session is not "mirror-worthy", so `TranscriptStore.prune` deletes
+            // its mirror on the next list sync — and the second run, the one that
+            // has to restore the recorded image sizes, would open with none.
+            SessionIndex.shared.recordUserSend(sessionId: sessionId, text: "把那几张图发我")
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                pushDemoUserSent(msgId: "demo-img-user", text: "把那几张图发我")
+                pushDemo(["kind": "turn_state", "active": true])
+                try? await Task.sleep(for: .milliseconds(400))
+                pushDemo([
+                    "kind": "message", "role": "assistant", "content": "都在这儿了。",
+                    "platform_msg_id": "demo-img-1", "ordinal": 1,
+                    "attachments": Self.demoImageAttachments,
+                ])
+                pushDemo([
+                    "kind": "message", "role": "assistant",
+                    "content": "ANCHOR — this row must not move between the pre-load and post-load frames.",
+                    "platform_msg_id": "demo-img-2", "ordinal": 2,
+                ])
+                pushDemo(["kind": "turn_state", "active": false])
+            }
+        }
+
+        /// Serve a demo image's bytes with no gateway and no blob leg: a flat PNG
+        /// at the declared pixel size, behind a delay long enough to screenshot
+        /// the layout BEFORE the bytes land — which is exactly the frame the
+        /// reserved box has to already be right in.
+        func serveDemoImageIfRequested(id: Int, blobId: String) -> Bool {
+            guard let demo = Self.demoImageSizes.first(where: { $0.id == blobId }) else {
+                return false
+            }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(2))
+                guard let png = Self.demoImagePng(width: demo.width, height: demo.height) else {
+                    return
+                }
+                pushDemoBlobResult(
+                    id: id, dataBase64: png.base64EncodedString(), mimeType: "image/png")
+            }
+            return true
+        }
+
+        /// Scale 1 is load-bearing: the renderer defaults to the screen's (3x),
+        /// which would decode three times the size the box was reserved at.
+        private static func demoImagePng(width: Int, height: Int) -> Data? {
+            let size = CGSize(width: width, height: height)
+            let format = UIGraphicsImageRendererFormat.default()
+            format.scale = 1
+            return UIGraphicsImageRenderer(size: size, format: format).image { ctx in
+                UIColor(white: 0.85, alpha: 1).setFill()
+                ctx.fill(CGRect(origin: .zero, size: size))
+                UIColor(white: 0.35, alpha: 1).setStroke()
+                let diagonal = UIBezierPath()
+                diagonal.move(to: .zero)
+                diagonal.addLine(to: CGPoint(x: width, y: height))
+                diagonal.lineWidth = CGFloat(max(width, height)) / 40
+                diagonal.stroke()
+            }.pngData()
+        }
 
         /// `-baybo-demo-download` (with `-baybo-demo-attachments`): push the
         /// `fileState` messages a real download would, so the card's idle →

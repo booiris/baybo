@@ -336,6 +336,10 @@ final class ChatStore: ObservableObject {
         ) {
             bridge?.fileState(blobId: blobId, state: state, loaded: loaded, total: total)
         }
+
+        func pushDemoBlobResult(id: Int, dataBase64: String, mimeType: String) {
+            bridge?.blobResult(id: id, dataBase64: dataBase64, mimeType: mimeType, error: nil)
+        }
     #endif
 
     // MARK: - Sending
@@ -732,6 +736,11 @@ final class ChatStore: ObservableObject {
     }
 
     func requestBlob(id: Int, blobId: String) {
+        #if DEBUG
+            // `-baybo-demo-images` serves its own bytes — an image is the one
+            // attachment kind that can't be faked from a frame alone.
+            if serveDemoImageIfRequested(id: id, blobId: blobId) { return }
+        #endif
         Task {
             do {
                 // A thumbnail fetch: nobody is watching the byte count, and the

@@ -278,6 +278,24 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   doesn't also open the viewer, and `.attachment-open` turns OFF
   `-webkit-touch-callout`/`user-select` so iOS's own image callout can't fire at
   ~500ms and fight the gesture.
+  **An image the transcript has decoded before shows NO loading state at all.**
+  Every decode records the image's natural `[w,h]` (keyed by the blob's sha256
+  DIGEST — the read token rotates, the digest doesn't) into
+  `PersistedState.imageDims`, so it rides the per-session mirror to disk. On the
+  next open the bubble is `sized`: `.attachment-bubble.sized` (styles.css) solves
+  the same contain-fit the `<img>` will (`min(100%, natural, --attachment-max-h ×
+  ratio)` + `aspect-ratio`) and reserves the EXACT final box from the first paint
+  — no 12rem tile, no spinner, no release. That release was the bug: a re-opened
+  thread grew/shrank every image row as its bytes landed (measured: page height
+  3332 → 3396 px on ONE image), and WKWebView has no scroll anchoring to absorb
+  it, so the page shook under the reader. The fit MUST be solved on the BUBBLE:
+  the frame's containing block is the bubble, a shrink-to-fit flex item, where a
+  `%` width is cyclic and WebKit resolves it to zero (a 0×0 reservation). The
+  mirror can outlive its blobs (a restored backup carries the transcript, not the
+  blob cache), so the spinner still exists inside the reserved box — just delayed
+  400ms in CSS, invisible on the cache hit it exists to skip. An image with no
+  recorded size (first view, a scrolled-up history page) keeps the old tile and
+  records its size on the way through.
   The spinning ring is **indeterminate on purpose** — the byte counter beside it
   (`884 KB / 2.3 MB`) is the progress. Bytes come from the core's `BlobProgress`
   callback (`blob_download_bytes(blob_id, progress)`), rate-limited to one tick
@@ -342,8 +360,20 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   `-baybo-demo-download` to it and native pushes the `fileState` messages a real
   download would, walking the first card idle → loading (ring + byte counter) →
   ready over ~6s (shoot at ~4s / ~5.5s / ~9s); it drives the exact web reducer
-  the native path drives, only the bytes are fake. A file chip renders
-  straight from the frame, while the `image` kind would need a live blob leg.
+  the native path drives, only the bytes are fake. A file chip renders straight
+  from the frame; the `image` kind needs bytes, so `-baybo-demo-images` (DEBUG)
+  serves its own: one agent turn carrying four images of deliberately different
+  aspect ratios (portrait / banner / thumbnail / square) plus a text row UNDER
+  them, and `ChatStore.requestBlob` short-circuits the demo blob ids to a locally
+  rendered PNG at the declared size (2s delay, so the pre-decode frame is
+  screenshot-able). That text row's y-position is the test: run once (tiles →
+  release → it moves), relaunch (sizes restored → nothing moves). **The second
+  run only works on an UNBOUND simulator** — a bound one's list merge keeps only
+  remote rows, so the demo's local-only session is dropped from the registry and
+  `TranscriptStore.prune` deletes its mirror before the relaunch can restore it.
+  On a bound sim use `-baybo-open-session <id>` (DEBUG) to open a REAL session
+  with images and compare `document.scrollHeight` at mount vs after the decode —
+  they must be equal.
   `-baybo-demo-jump` scrolls the log off the newest edge at
   4s (native glass jump button pops) and runs the native jump path at 7s.
   `-baybo-demo-keyboard` raises the keyboard 2s in and drops

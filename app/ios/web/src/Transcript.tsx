@@ -1,10 +1,14 @@
 import {
+  createContext,
   memo,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type ReactNode,
   type TouchEvent as ReactTouchEvent,
 } from "react";
@@ -33,6 +37,7 @@ import {
 import { MarkdownBody } from "./Markdown";
 import { WorkBlockView } from "./WorkBlock";
 import {
+  blobContentDigest,
   uid,
   type ChatMsg,
   type PersistedState,
@@ -173,6 +178,11 @@ const GLIDE_SETTLE_CAP_MS = 1200;
 /// scrolls in, while a back-history page's off-screen images stay unfetched. See
 /// AttachmentImage.
 const LAZY_IMAGE_ROOT_MARGIN = "400px 0px";
+
+/// Cap on the remembered image sizes (see `ImageDimsStore`). An entry is ~60
+/// bytes and a thread's images are bounded in practice — this only stops a
+/// pathological session from growing the mirror without limit.
+const MAX_IMAGE_DIMS = 512;
 
 /// The transcript scrolls the WKWebView's MAIN FRAME (the document), not an
 /// inner `overflow:auto` div. A nested overflow scroller inside WKWebView owns
@@ -362,6 +372,38 @@ function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
   return out;
 }
 
+/// The natural pixel size of every image this thread has decoded, keyed by blob
+/// digest and mirrored to disk with the rows (`PersistedState.imageDims`). A hit
+/// means the image rendered here before — so its blob is on the device and its
+/// box can be reserved at the exact final size before a single byte crosses the
+/// bridge, which is what keeps a re-opened thread from resizing under the reader
+/// (see `AttachmentBubble`). Carried on a context rather than props: the value's
+/// identity is stable for the transcript's life, so recording a size re-renders
+/// nothing and `MessageRow`'s memo survives.
+type ImageDimsStore = {
+  get(digest: string): [number, number] | undefined;
+  record(digest: string, width: number, height: number): void;
+};
+
+const ImageDimsContext = createContext<ImageDimsStore | null>(null);
+
+/// Rebuild the map from a restored mirror, dropping anything that isn't a usable
+/// size — a zero or garbage dimension would poison the reserved box's ratio (CSS
+/// divides by it), and the mirror is on-disk JSON, not a trusted type.
+function restoreImageDims(
+  raw: Record<string, [number, number]> | undefined,
+): Map<string, [number, number]> {
+  const out = new Map<string, [number, number]>();
+  for (const [digest, dims] of Object.entries(raw ?? {})) {
+    if (!Array.isArray(dims)) continue;
+    const [w, h] = dims;
+    if (typeof w !== "number" || typeof h !== "number") continue;
+    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) continue;
+    out.set(digest, [w, h]);
+  }
+  return out;
+}
+
 /// One image attachment in a bubble: lazily downloads the blob via the bridge
 /// (cached on device) once its row scrolls near the viewport, wraps it in an
 /// object URL, shows a spinner while loading and a tap-to-retry on failure. The
@@ -383,6 +425,7 @@ function AttachmentImage({
   connEpoch: number;
 }) {
   const { t } = useTranslation();
+  const imageDims = useContext(ImageDimsContext);
   // Load-once gate — flips true when the placeholder nears the viewport and
   // never falls back, so scrolling past a loaded image doesn't refetch it.
   const [visible, setVisible] = useState(false);
@@ -555,7 +598,18 @@ function AttachmentImage({
             alt={attachment.filename ?? t("chat.imageAlt")}
             decoding="async"
             draggable={false}
-            onLoad={() => setLoaded(true)}
+            onLoad={(e) => {
+              // Remember the decoded size: it's what lets the NEXT open of this
+              // thread reserve this image's exact box up front instead of
+              // flashing a loading tile and then resizing (see
+              // `AttachmentBubble`). A zero dimension is never recorded — the
+              // reserved box divides by it.
+              const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
+              if (w > 0 && h > 0) {
+                imageDims?.record(blobContentDigest(attachment.blob_id), w, h);
+              }
+              setLoaded(true);
+            }}
             onError={() => setFailed(true)}
           />
           {copied !== 0 && (
@@ -577,6 +631,20 @@ function AttachmentImage({
 /// One attachment on its OWN bubble — a lazy-loaded image tile or a named file
 /// chip, never sharing the text bubble. `children` carries the send-state chrome
 /// when this is a user message's last bubble (an image-only send).
+///
+/// An image whose size this thread already knows (`ImageDimsStore` — it decoded
+/// here before, so its blob is on the device) is `sized`: the bubble reserves the
+/// image's EXACT final box from the first paint, and the loading tile is dropped
+/// (`.attachment-bubble.sized` in styles.css). Nothing under it moves when the
+/// bytes land — an already-downloaded image no longer resizes the page, which is
+/// what shook a re-opened thread as each 12rem tile released to its real height.
+/// The box lives on the BUBBLE and not on the frame inside it: the frame's
+/// containing block is this bubble, a shrink-to-fit flex item, so a percentage
+/// width there is cyclic and resolves to zero.
+///
+/// Read once, at mount: a size recorded later belongs to an image that is already
+/// painted at its natural size, and re-reading would resize the bubble underneath
+/// it. The next open picks the entry up.
 function AttachmentBubble({
   attachment,
   connEpoch,
@@ -589,11 +657,24 @@ function AttachmentBubble({
   children?: ReactNode;
 }) {
   const isImage = attachment.kind === "image";
-  const classes = ["attachment-bubble", isImage ? "" : "file", className ?? ""]
+  const imageDims = useContext(ImageDimsContext);
+  const [sized] = useState(() =>
+    isImage ? imageDims?.get(blobContentDigest(attachment.blob_id)) : undefined,
+  );
+  const classes = [
+    "attachment-bubble",
+    isImage ? "" : "file",
+    sized ? "sized" : "",
+    className ?? "",
+  ]
     .filter(Boolean)
     .join(" ");
+  // Bare numbers, no unit: the reserved box divides one by the other.
+  const box = sized
+    ? ({ "--img-w": String(sized[0]), "--img-h": String(sized[1]) } as CSSProperties)
+    : undefined;
   return (
-    <div className={classes}>
+    <div className={classes} style={box}>
       {isImage ? (
         <AttachmentImage attachment={attachment} connEpoch={connEpoch} />
       ) : (
@@ -1082,16 +1163,51 @@ export function Transcript({
   const glideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(glideTimer.current), []);
 
+  // Sizes of the images this thread has decoded, restored from the mirror and
+  // rewritten with it. Held in a ref (not state) and handed out on a context
+  // whose identity never changes: recording a size must not re-render the
+  // transcript — every row would re-render on every image that lands.
+  // Lazily, via useState: `useRef(restoreImageDims(...))` would rebuild the whole
+  // map on EVERY render (useRef's argument is a value, not an initializer) —
+  // including every rAF-coalesced streaming tick. The Map is mutated in place, so
+  // its identity is stable and the setter is never needed.
+  const [imageDims] = useState(() => restoreImageDims(restored?.imageDims));
+  // The persist effect below only runs when the ROWS change, so a newly recorded
+  // image size would never reach disk on its own. Keep the latest payload's
+  // closure here and let `record` fire it directly — the bridge debounces, so a
+  // burst of decodes still collapses into one write.
+  const persistLatest = useRef<() => void>(() => {});
+  const imageDimsStore = useMemo<ImageDimsStore>(
+    () => ({
+      get: (digest) => imageDims.get(digest),
+      record: (digest, width, height) => {
+        const known = imageDims.get(digest);
+        if (known && known[0] === width && known[1] === height) return;
+        // Insertion-ordered, so the oldest entry is the first key.
+        if (imageDims.size >= MAX_IMAGE_DIMS) {
+          const oldest = imageDims.keys().next().value;
+          if (oldest !== undefined) imageDims.delete(oldest);
+        }
+        imageDims.set(digest, [width, height]);
+        persistLatest.current();
+      },
+    }),
+    [imageDims],
+  );
+
   // Mirror the thread to native on every change so a webview reload / app
   // relaunch restores it (via init.restoredState). Debounced bridge-side.
   useEffect(() => {
-    persistState({
-      messages,
-      lastOrdinal: lastOrdinal.current,
-      oldestOrdinal: oldestOrdinal.current,
-      hasMoreOlder,
-    });
-  }, [messages, hasMoreOlder]);
+    persistLatest.current = () =>
+      persistState({
+        messages,
+        lastOrdinal: lastOrdinal.current,
+        oldestOrdinal: oldestOrdinal.current,
+        hasMoreOlder,
+        imageDims: Object.fromEntries(imageDims),
+      });
+    persistLatest.current();
+  }, [messages, hasMoreOlder, imageDims]);
 
   // Open the thread at its newest edge — a restored thread would otherwise
   // mount showing its OLDEST rows. Pre-paint, so the top never flashes by.
@@ -2141,7 +2257,7 @@ export function Transcript({
   });
 
   return (
-    <>
+    <ImageDimsContext.Provider value={imageDimsStore}>
       <div className="chat-log" ref={logRef}>
         {loadingOlder && <div className="older-spinner" aria-hidden="true" />}
         {hasMoreOlder && !loadingOlder && (
@@ -2170,6 +2286,6 @@ export function Transcript({
           </div>
         )}
       </div>
-    </>
+    </ImageDimsContext.Provider>
   );
 }

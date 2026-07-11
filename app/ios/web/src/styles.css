@@ -20,6 +20,11 @@
 
   --radius: 14px;
   --radius-pill: 9999px;
+  /* Tallest an inline image renders. One source of truth: the <img> clamps to
+     it, and a reserved box (`.attachment-bubble.sized`) has to solve the SAME
+     cap or the box and the image it holds disagree — which is the shift the
+     reservation exists to remove. */
+  --attachment-max-h: 16rem;
   --chat-row-gap: 1.5rem;
   --md-block-gap: 0.75rem;
 
@@ -530,7 +535,7 @@ button {
 .attachment-img {
   display: block;
   max-width: 100%;
-  max-height: 16rem;
+  max-height: var(--attachment-max-h);
   border-radius: var(--radius);
   object-fit: contain;
   /* Fade the decoded image in instead of snapping it visible: it sits at
@@ -557,7 +562,7 @@ button {
   max-width: 100%;
   height: 12rem;
   background: var(--color-surface);
-  border: 1px solid var(--color-line);
+  border: 1px solid var(--color-ink);
   border-radius: var(--radius);
   overflow: hidden;
 }
@@ -573,12 +578,13 @@ button {
   pointer-events: none;
 }
 .attachment-frame:not(.loaded) .attachment-img { opacity: 0; }
-/* A decoded image is a button: tapping opens the native full-screen viewer
-   (pinch + double-tap-to-restore), a long-press copies it. Strip the UA button
-   chrome so only the image shows; the pointer cursor is a dev-browser nicety,
-   gated to the loaded state. `position:relative` anchors the copy pill. The
-   native iOS image callout (Save/Copy/Share) and text selection are turned OFF
-   so they can't fire their own menu at ~500ms and fight the long-press copy. */
+/* A decoded image is a button: tapping opens the native full-screen previewer
+   (QuickLook — zoom + share), the same path a file card uses; a long-press
+   copies it. Strip the UA button chrome so only the image shows; the pointer
+   cursor is a dev-browser nicety, gated to the loaded state. `position:relative`
+   anchors the copy pill. The native iOS image callout (Save/Copy/Share) and text
+   selection are turned OFF so they can't fire their own menu at ~500ms and fight
+   the custom long-press copy. */
 .attachment-open {
   position: relative;
   display: block;
@@ -596,7 +602,7 @@ button {
 /* No `:active` dim: this button carries the long-press touch listeners, so iOS
    applies `:active` eagerly on touch-down — a flick-scroll that starts on an
    image would briefly dim it. The user bubble omits it for the same reason; the
-   copy squish and the viewer opening are the feedback. */
+   copy squish + QuickLook opening are the feedback. */
 /* Copy confirm: the same squish-and-pop the user bubble plays. */
 .attachment-open.copied { animation: copy-squish 320ms cubic-bezier(0.34, 1.4, 0.64, 1); }
 /* A failed fetch keeps the same tile, centering only the ↻ retry glyph (tap to
@@ -606,6 +612,85 @@ button {
   color: var(--color-ink-soft);
 }
 .attachment-retry:active { opacity: 0.7; transform: none; }
+
+/* AN IMAGE THIS THREAD HAS ALREADY DECODED (its size came back with the mirror,
+   so its blob is on the device) skips the loading tile entirely and reserves its
+   EXACT final box from the first paint. It is the box that matters: the 12rem
+   tile releasing to each image's real height is what resized the transcript
+   mid-read — several images compounding it shook the whole page — and no spinner
+   is honest anyway when the bytes are a disk read away.
+
+   `width` solves the same contain-fit the <img> resolves (natural width, capped
+   by the column and by the max height), and `aspect-ratio` then derives the
+   height — so the reserved box IS the decoded box and nothing moves when the
+   image lands. It sits on the BUBBLE, not on the frame inside it: the frame's
+   containing block is the bubble, a shrink-to-fit flex item under `.msg-group`,
+   where a percentage width is cyclic and WebKit resolves it to ZERO (a 0x0
+   reservation, i.e. no fix at all). The file card above sizes itself the same way.
+
+   --img-w / --img-h are inline BARE numbers; a unit, a zero, or a missing var
+   invalidates the calc and `width` falls back to `auto` (a full-bleed image).
+   Hence the `sized` class as the gate — never a var() fallback, which would
+   quietly reserve a 1:1 box. */
+.attachment-bubble.sized {
+  width: min(
+    100%,
+    calc(var(--img-w) * 1px),
+    calc(var(--attachment-max-h) * var(--img-w) / var(--img-h))
+  );
+}
+/* Every state takes that one box — unfetched placeholder, loading frame, retry
+   tile, decoded image — so the swaps between them have no geometry left to
+   change. (0,3,0) outranks the 12rem tile's (0,2,0). */
+.attachment-bubble.sized .attachment-placeholder,
+.attachment-bubble.sized .attachment-frame,
+.attachment-bubble.sized .attachment-retry {
+  position: relative;
+  width: 100%;
+  height: auto;
+  aspect-ratio: var(--img-w) / var(--img-h);
+}
+/* ...but a retry tile is a TAP TARGET, and a banner-shaped image reserves a box
+   too short to hit (1600x400 lands at 88px, and it only gets worse). A failure is
+   already the exceptional state, so let that one box grow rather than ship an
+   untappable ↻. */
+.attachment-bubble.sized .attachment-retry {
+  min-height: 2.75rem;
+}
+/* Blank, not chrome: the wait is a disk read, and a bordered tile that appears
+   for two frames and vanishes is exactly the flicker being removed. (The retry
+   tile above keeps its border — a failure has something to say.) */
+.attachment-bubble.sized .attachment-placeholder,
+.attachment-bubble.sized .attachment-frame:not(.loaded) {
+  background: none;
+  border: 0;
+}
+/* The bubble already solved the fit, so the image just fills it — a second,
+   independent constraint solve could disagree by a sub-pixel and shift. */
+.attachment-bubble.sized .attachment-open { width: 100%; }
+.attachment-bubble.sized .attachment-img {
+  width: 100%;
+  height: auto;
+  max-height: none;
+}
+/* A mirror can outlive its blobs (a restored backup carries the transcript, not
+   the blob cache), and that fetch is a real download — a box that just sits
+   blank for seconds is worse than a tile. So hold the spinner back: invisible on
+   the cache hit this whole rule exists for, present before the wait turns into a
+   mystery. Delay-gated in CSS, so it costs no layout either way. */
+.attachment-bubble.sized .attachment-spinner {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  animation:
+    send-spin 0.7s linear infinite,
+    attachment-spinner-in 160ms ease-out 400ms both;
+}
+@keyframes attachment-spinner-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
 /* File cards share one width so a stack of them keeps a straight edge (the
    bubble otherwise shrinks to each filename). Capped so a lone card doesn't
    stretch across the whole reading column. */

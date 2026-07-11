@@ -94,6 +94,14 @@ final class AppStore: ObservableObject {
     /// headless UI tests assert on the optimistic flip staying put.
     private var demoHomeMode = false
 
+    #if DEBUG
+        /// The session `-baybo-open-chat` pushes. The demo frame feeders key on
+        /// it so they can only ever write into this throwaway conversation — a
+        /// demo turn pushed into a REAL session (`-baybo-open-session`) would land
+        /// in that session's durable mirror and registry row.
+        static let debugSessionId = "debug-session"
+    #endif
+
     init() {
         AppStore.shared = self
         // The chat list's live unread/recency source: connection-global
@@ -113,7 +121,19 @@ final class AppStore: ObservableObject {
         }
         if ProcessInfo.processInfo.arguments.contains("-baybo-open-chat") {
             route = .home
-            chatPath = [.session("debug-session")]
+            chatPath = [.session(Self.debugSessionId)]
+            return
+        }
+        // `-baybo-open-session <id>`: push a REAL (bound, registry-known) session
+        // headlessly. The demo sessions above are local-only, so a list merge
+        // drops their row and prunes their mirror — anything that has to survive a
+        // relaunch (a restored transcript, the image sizes it carries) can only be
+        // verified on a session the gateway actually knows.
+        let args = ProcessInfo.processInfo.arguments
+        if let flag = args.firstIndex(of: "-baybo-open-session"), flag + 1 < args.count {
+            route = .home
+            chatPath = [.session(args[flag + 1])]
+            restoreOnLaunch()
             return
         }
         if ProcessInfo.processInfo.arguments.contains("-baybo-demo-switch") {
