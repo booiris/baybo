@@ -37,10 +37,10 @@ struct ImageViewer: View {
                 .opacity(shown ? 1 : 0)
             VStack {
                 HStack {
-                    circleButton("xmark", action: onClose)
+                    ViewerChromeButton(symbol: "xmark", action: onClose)
                     Spacer()
                     if url != nil {
-                        circleButton("square.and.arrow.up") { sharing = true }
+                        ViewerChromeButton(symbol: "square.and.arrow.up") { sharing = true }
                     }
                 }
                 .padding(.horizontal, 16)
@@ -59,8 +59,15 @@ struct ImageViewer: View {
         }
     }
 
-    /// The viewer's chrome: a glass disc over the image, legible on any picture.
-    private func circleButton(_ symbol: String, action: @escaping () -> Void) -> some View {
+}
+
+/// Full-screen viewer chrome (image viewer, video player): a glass disc over
+/// the content, legible on any frame.
+struct ViewerChromeButton: View {
+    let symbol: String
+    let action: () -> Void
+
+    var body: some View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 15, weight: .semibold))

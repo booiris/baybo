@@ -112,20 +112,28 @@
         /// `-baybo-demo-download` (with `-baybo-demo-attachments`): push the
         /// `fileState` messages a real download would, so the card's idle →
         /// loading (spinner + byte counter) → ready transition is
-        /// screenshot-verifiable with no gateway and no blob leg. It drives the
-        /// exact web reducer the native path drives; only the bytes are fake.
+        /// screenshot-verifiable with no gateway and no blob leg. Drives the
+        /// first FILE card and the VIDEO tile together — the tile's centered
+        /// determinate ring and corner byte counter walk the same reducer.
+        /// The video's `ready` makes its card request a poster, which
+        /// `serveDemoVideoPosterIfRequested` answers locally.
         private func driveDemoDownloadIfRequested() async {
             guard ProcessInfo.processInfo.arguments.contains(Self.demoDownloadArg) else { return }
-            let blobId = Self.demoFileAttachments[0]["blob_id"] as? String ?? ""
-            let total = Self.demoFileAttachments[0]["size"] as? Int ?? 0
+            let cards = [Self.demoFileAttachments[0], Self.demoVideoAttachment]
             try? await Task.sleep(for: .milliseconds(1500))
             for step in 1...6 {
-                let loaded = UInt64(total * step / 8)
-                pushDemoFileState(
-                    blobId: blobId, state: "loading", loaded: loaded, total: UInt64(total))
+                for card in cards {
+                    let blobId = card["blob_id"] as? String ?? ""
+                    let total = card["size"] as? Int ?? 0
+                    pushDemoFileState(
+                        blobId: blobId, state: "loading",
+                        loaded: UInt64(total * step / 8), total: UInt64(total))
+                }
                 try? await Task.sleep(for: .milliseconds(700))
             }
-            pushDemoFileState(blobId: blobId, state: "ready")
+            for card in cards {
+                pushDemoFileState(blobId: card["blob_id"] as? String ?? "", state: "ready")
+            }
         }
 
         /// Spread the file chip has to survive: a long name that must clip, a
@@ -150,9 +158,43 @@
             ],
         ]
 
+        /// An audio card (play affordance once ready) and a video tile
+        /// (centered disc + corner chip). Both render straight from the frame;
+        /// real playback needs real bytes, so tapping them here only exercises
+        /// the download affordance.
+        private static let demoAudioAttachment: [String: Any] = [
+            "kind": "audio", "blob_id": "sha256:demoaudio.tok",
+            "mime_type": "audio/mpeg", "size": 3_481_600,
+            "filename": "morning-light-sketch.mp3",
+            "duration_ms": 203_000,
+        ]
+
+        private static let demoVideoAttachment: [String: Any] = [
+            "kind": "file", "blob_id": "sha256:demovideo.tok",
+            "mime_type": "video/mp4", "size": 24_804_352,
+            "filename": "landing-flow-capture.mp4",
+            "duration_ms": 83_000,
+        ]
+
+        /// Serve the demo video's poster with no gateway: a flat 1280×720 PNG
+        /// plus a fake duration, so the downloaded tile (poster + play disc +
+        /// duration chip) is screenshot-verifiable headlessly.
+        func serveDemoVideoPosterIfRequested(id: Int, blobId: String) -> Bool {
+            guard blobId == Self.demoVideoAttachment["blob_id"] as? String else { return false }
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(600))
+                guard let png = Self.demoImagePng(width: 1280, height: 720) else { return }
+                pushDemoVideoPoster(
+                    id: id, dataBase64: png.base64EncodedString(),
+                    width: 1280, height: 720, durationMs: 83_000)
+            }
+            return true
+        }
+
         /// `-baybo-demo-attachments` (DEBUG): one short agent turn carrying the
-        /// file chips above, so the attachment styling fits on a single
-        /// screenshot instead of scrolling off above a long markdown answer.
+        /// file chips above plus the audio card and video tile, so the
+        /// attachment styling fits on a single screenshot instead of scrolling
+        /// off above a long markdown answer.
         func startDemoAttachmentsIfRequested() {
             guard ProcessInfo.processInfo.arguments.contains(Self.demoAttachmentsArg) else {
                 return
@@ -166,7 +208,8 @@
                     "kind": "message", "role": "assistant",
                     "content": "已生成好了，附件里有角色卡和这一季的架构评审。",
                     "platform_msg_id": "demo-att-1", "ordinal": 1,
-                    "attachments": Self.demoFileAttachments,
+                    "attachments": Self.demoFileAttachments
+                        + [Self.demoAudioAttachment, Self.demoVideoAttachment],
                 ])
                 pushDemo(["kind": "turn_state", "active": false])
                 // The same card renders right-aligned on a user send, under the

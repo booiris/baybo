@@ -774,3 +774,135 @@ button {
   letter-spacing: 0.03em;
   color: var(--color-ink-soft);
 }
+
+/* ---- audio cards ------------------------------------------------------- */
+/* The audio card keeps the file card's frame; only the glyph slot's meaning
+   changes (download → play/pause). While a track is engaged the scrubber sits
+   between name and meta: a hit area tall enough for a finger around a hairline
+   rail (drawn as a centered pseudo-element), the played part inked. */
+.audio-track {
+  position: relative;
+  width: 100%;
+  height: 14px;
+  margin: 0.1rem 0;
+  /* A horizontal scrub must not become a page scroll. */
+  touch-action: none;
+}
+.audio-track::before {
+  content: "";
+  position: absolute;
+  inset: 50% 0 auto;
+  height: 3px;
+  margin-top: -1.5px;
+  border-radius: 2px;
+  background: var(--color-line);
+}
+.audio-track-fill {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  height: 3px;
+  margin-top: -1.5px;
+  border-radius: 2px;
+  background: var(--color-ink);
+  pointer-events: none;
+}
+
+/* ---- video tiles -------------------------------------------------------- */
+/* Video shares the file card's width so a mixed stack keeps a straight edge. */
+.attachment-bubble.video { width: min(100%, 19rem); }
+/* The tile is one big button. Its ratio rides in on --video-ar (clamped
+   JS-side to keep the reading column sane); the same height cap as images so
+   the two media kinds obey one rule. The cover-fit poster absorbs any clamp
+   as a crop. */
+.attachment-video {
+  position: relative;
+  display: block;
+  width: 100%;
+  aspect-ratio: var(--video-ar, 1.7778);
+  max-height: var(--attachment-max-h);
+  padding: 0;
+  background: var(--color-surface);
+  border: 1px solid var(--color-ink);
+  border-radius: var(--radius);
+  overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
+}
+.attachment-video:active { opacity: 0.85; }
+/* Mid-download the tile is inert; a press that does nothing must not pretend. */
+.attachment-video.loading:active { opacity: 1; }
+/* Once the poster paints the frame IS the edge — the ink border was only
+   there to give the blank pre-download surface a boundary (same idiom as
+   images, whose loaded <img> carries no border). `.failed` below still wins:
+   an error must stay visible even over a stale poster. */
+.attachment-video.has-poster { border-color: transparent; }
+.attachment-video.failed { border-color: var(--color-err); }
+.attachment-video.failed .video-disc-glyph { color: var(--color-err); }
+.video-poster {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  -webkit-user-drag: none;
+}
+.video-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+/* The centered control: a translucent paper disc so the glyph/ring stays
+   legible over any poster frame, in the monochrome idiom (no glass here — the
+   webview has no material to sample). */
+.video-disc {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--color-paper) 86%, transparent);
+  border: 1px solid var(--color-ink);
+}
+.video-disc-glyph {
+  width: 1.3rem;
+  height: 1.3rem;
+  color: var(--color-ink);
+  /* Optically center the play triangle (its mass leans left). */
+  transform: translateX(0.05rem);
+}
+/* Determinate ring: the tile knows the blob's total, so the arc IS the
+   progress (the corner chip counts the bytes). Start at 12 o'clock. */
+.video-ring {
+  width: 2.1rem;
+  height: 2.1rem;
+  transform: rotate(-90deg);
+}
+.video-ring-rail,
+.video-ring-fill {
+  fill: none;
+  stroke-width: 2.5;
+}
+.video-ring-rail { stroke: var(--color-line); }
+.video-ring-fill {
+  stroke: var(--color-ink);
+  stroke-linecap: round;
+  transition: stroke-dashoffset 200ms linear;
+}
+/* Size pre-download, byte counter mid-download, duration once known. */
+.video-chip {
+  position: absolute;
+  right: 0.45rem;
+  bottom: 0.4rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--color-paper) 86%, transparent);
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  line-height: 1.4;
+  letter-spacing: 0.03em;
+  color: var(--color-ink);
+}

@@ -7,6 +7,9 @@ export type WireAttachment = {
   mime_type: string;
   size: number;
   filename?: string;
+  /** Playback length in ms for `audio`, probed server-side at attach time —
+   * what lets the card show a track's length before any byte is downloaded. */
+  duration_ms?: number;
 };
 
 /** The content-addressed half of a `blob_id` (`sha256:<hex>.<read-token>`) — the

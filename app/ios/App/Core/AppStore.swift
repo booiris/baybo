@@ -627,6 +627,9 @@ final class AppStore: ObservableObject {
         let stores = Array(chatStores.values)
         chatStores.removeAll()
         chatStoreLRU.removeAll()
+        // A track from the departing binding must not keep playing (or hold
+        // the Now Playing entry) into the landing screen / next binding.
+        AudioPlayerCenter.shared.stop()
         transcriptHost?.teardown()
         transcriptHost = nil
         prewarmedDraftId = nil

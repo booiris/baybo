@@ -98,6 +98,10 @@ targets:
         # Required by the image viewer's share sheet: without it, tapping "Save
         # Image" TERMINATES the app (add-only access still needs a purpose string).
         NSPhotoLibraryAddUsageDescription: "Baybo saves a chat image to your photo library when you share it there."
+        # Chat audio (AudioPlayerCenter) keeps playing through lock/background;
+        # Now Playing + remote commands give it the Control Center transport.
+        UIBackgroundModes:
+          - audio
         BayboKeychainAccessGroup: "$(AppIdentifierPrefix)com.baybo.app"
         # Space Mono (OFL, App/Resources/Fonts) — the style guide's chrome face.
         UIAppFonts:

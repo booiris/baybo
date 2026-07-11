@@ -126,6 +126,35 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("fileState", jsonObjectLiteral(payload))
     }
 
+    /// One audio track's engine state (see `AudioPlayerCenter`): play/pause
+    /// flips, 2 Hz position ticks, and the `stopped` reset on end/usurp.
+    func audioState(blobId: String, state: String, position: Double, duration: Double) {
+        let payload: [String: Any] = [
+            "blobId": blobId,
+            "state": state,
+            "position": position,
+            "duration": duration,
+        ]
+        call("audioState", jsonObjectLiteral(payload))
+    }
+
+    /// Answer to `requestVideoPoster`: the poster frame's JPEG bytes plus the
+    /// natural size and duration, or `dataBase64: nil` + error.
+    func videoPoster(
+        id: Int, dataBase64: String?, width: Int, height: Int, durationMs: Int,
+        error: String? = nil
+    ) {
+        let payload: [String: Any] = [
+            "id": id,
+            "dataBase64": dataBase64 as Any,
+            "width": width,
+            "height": height,
+            "durationMs": durationMs,
+            "error": error as Any,
+        ]
+        call("videoPoster", jsonObjectLiteral(payload))
+    }
+
     func setLanguage(_ lang: String) {
         call("setLanguage", jsonLiteral(lang))
     }
@@ -340,6 +369,41 @@ extension TranscriptBridge: WKScriptMessageHandler {
                     blobId: blobId,
                     filename: body["filename"] as? String ?? "",
                     mimeType: body["mimeType"] as? String ?? "")
+            }
+        case "audioToggle":
+            if let blobId = body["blobId"] as? String,
+                let filename = body["filename"] as? String,
+                let mimeType = body["mimeType"] as? String
+            {
+                store?.audioToggle(blobId: blobId, filename: filename, mimeType: mimeType)
+            }
+        case "audioSeek":
+            if let blobId = body["blobId"] as? String,
+                let position = (body["position"] as? NSNumber)?.doubleValue
+            {
+                store?.audioSeek(blobId: blobId, position: position)
+            }
+        case "queryAudioState":
+            if let blobId = body["blobId"] as? String {
+                store?.queryAudioState(blobId: blobId)
+            }
+        case "playVideo":
+            // A tap on a downloaded video tile — materialise and present the
+            // native full-screen player.
+            if let blobId = body["blobId"] as? String,
+                let filename = body["filename"] as? String,
+                let mimeType = body["mimeType"] as? String
+            {
+                store?.playVideo(blobId: blobId, filename: filename, mimeType: mimeType)
+            }
+        case "requestVideoPoster":
+            if let id = (body["id"] as? NSNumber)?.intValue,
+                let blobId = body["blobId"] as? String,
+                let filename = body["filename"] as? String,
+                let mimeType = body["mimeType"] as? String
+            {
+                store?.requestVideoPoster(
+                    id: id, blobId: blobId, filename: filename, mimeType: mimeType)
             }
         case "retry":
             // The failed-bubble dot was tapped. The webview carries the payload

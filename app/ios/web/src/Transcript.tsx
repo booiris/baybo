@@ -14,22 +14,29 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import {
+  audioSeek,
+  audioToggle,
   blobObjectUrl,
   copyText,
   downloadFile,
   fetchHistory,
   log,
+  onAudioState,
   onFileState,
   persistState,
+  playVideo,
   postJumpVisible,
   postMarkRead,
   postRunState,
   postSyncRequest,
   previewFile,
+  queryAudioState,
   queryFileState,
+  requestVideoPoster,
   retrySend,
   viewImage,
   subscribeTranscript,
+  type AudioStatePayload,
   type FileState,
   type UserSentPayload,
 } from "./bridge";
@@ -599,13 +606,15 @@ function AttachmentBubble({
   children?: ReactNode;
 }) {
   const isImage = attachment.kind === "image";
+  const isAudio = attachment.kind === "audio";
+  const isVideo = isVideoAttachment(attachment);
   const imageDims = useContext(ImageDimsContext);
   const [sized] = useState(() =>
     isImage ? imageDims?.get(blobContentDigest(attachment.blob_id)) : undefined,
   );
   const classes = [
     "attachment-bubble",
-    isImage ? "" : "file",
+    isImage ? "" : isVideo ? "video" : "file",
     sized ? "sized" : "",
     className ?? "",
   ]
@@ -619,12 +628,22 @@ function AttachmentBubble({
     <div className={classes} style={box}>
       {isImage ? (
         <AttachmentImage attachment={attachment} connEpoch={connEpoch} />
+      ) : isVideo ? (
+        <AttachmentVideo attachment={attachment} />
+      ) : isAudio ? (
+        <AttachmentAudio attachment={attachment} />
       ) : (
         <AttachmentFile attachment={attachment} />
       )}
       {children}
     </div>
   );
+}
+
+/// Video has no wire kind of its own — it rides `file` (the gateway buckets
+/// only image/audio specially) — so the tile is elected by mime here.
+function isVideoAttachment(attachment: WireAttachment): boolean {
+  return attachment.kind === "file" && attachment.mime_type.startsWith("video/");
 }
 
 /// Binary units, and only as much precision as disambiguates: `812 B`,
@@ -695,6 +714,35 @@ const GLYPH_DOWNLOAD = (
   </>
 );
 
+/// A play triangle, stroked like the rest of the glyph set (nothing filled).
+const GLYPH_PLAY = (
+  <path
+    d="M7.6 5.1v9.8l7.6-4.9z"
+    stroke="currentColor"
+    strokeWidth="1.2"
+    strokeLinejoin="round"
+  />
+);
+
+/// Two pause bars.
+const GLYPH_PAUSE = (
+  <path
+    d="M7.7 5.6v8.8M12.3 5.6v8.8"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+  />
+);
+
+/// `m:ss` (`h:mm:ss` past an hour) — playback positions and video durations.
+function formatTime(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = String(s % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+}
+
 /// One file attachment's on-device lifecycle. Native owns the truth (the blob
 /// cache is a directory iOS may purge), so the card asks on every mount rather
 /// than trusting a `ready` it saw before.
@@ -758,6 +806,306 @@ function AttachmentFile({ attachment }: { attachment: WireAttachment }) {
         </span>
         <span className="file-meta">{meta}</span>
       </span>
+    </button>
+  );
+}
+
+/// Mirror of one blob's slice of the native audio engine (there is ONE player
+/// app-wide — see `AudioPlayerCenter`). Subscribed by blob id like `fileState`,
+/// so a 2 Hz position tick re-renders one card; the mount-time query resyncs a
+/// card that appears mid-playback (session switch, thread reload).
+function useAudioState(blobId: string): AudioStatePayload {
+  const [audio, setAudio] = useState<AudioStatePayload>({
+    blobId,
+    state: "stopped",
+    position: 0,
+    duration: 0,
+  });
+
+  useEffect(() => {
+    const unsubscribe = onAudioState(blobId, setAudio);
+    queryAudioState(blobId);
+    return unsubscribe;
+  }, [blobId]);
+
+  return audio;
+}
+
+/// The seek bar under a playing/paused track. A drag scrubs locally (the fill
+/// follows the finger, not the engine) and commits one `audioSeek` on lift; the
+/// committed value keeps rendering until the ENGINE's next push lands (native
+/// answers a seek with an optimistic state, so that's near-immediate), because
+/// falling back to the stale pre-seek `position` would snap the fill backwards
+/// for the round trip. Pointer events stop at the bar so a scrub never toggles
+/// the card under it; `touch-action: none` (CSS) keeps a horizontal drag from
+/// scrolling the thread.
+function AudioTrack({
+  blobId,
+  position,
+  duration,
+}: {
+  blobId: string;
+  position: number;
+  duration: number;
+}) {
+  const barRef = useRef<HTMLDivElement | null>(null);
+  const [scrub, setScrub] = useState<number | null>(null);
+  const committed = useRef(false);
+
+  useEffect(() => {
+    if (committed.current) {
+      committed.current = false;
+      setScrub(null);
+    }
+  }, [position, duration]);
+
+  const fracAt = (clientX: number): number => {
+    const rect = barRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return 0;
+    return Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+  };
+
+  const shown = scrub ?? (duration > 0 ? position / duration : 0);
+
+  return (
+    <div
+      ref={barRef}
+      className="audio-track"
+      onPointerDown={(e) => {
+        e.stopPropagation();
+        committed.current = false;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        setScrub(fracAt(e.clientX));
+      }}
+      onPointerMove={(e) => {
+        if (scrub !== null && !committed.current) setScrub(fracAt(e.clientX));
+      }}
+      onPointerUp={(e) => {
+        e.stopPropagation();
+        if (scrub === null || committed.current) return;
+        audioSeek(blobId, scrub * duration);
+        committed.current = true;
+      }}
+      onPointerCancel={() => {
+        committed.current = false;
+        setScrub(null);
+      }}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <span className="audio-track-fill" style={{ width: `${shown * 100}%` }} />
+    </div>
+  );
+}
+
+/// An audio attachment: the file card's layout with the glyph slot promoted to
+/// a play/pause control once the bytes are on disk. The ENGINE is native
+/// (AVPlayer on the device-cached blob, `audioToggle` over the bridge): bytes
+/// never cross as base64, the ringer switch can't silence it, and playback
+/// survives backing out of the chat — the card is only a mirror. Until
+/// downloaded it behaves exactly like a file card (tap fetches, ring + byte
+/// counter), so a history page of audio costs nothing until asked for.
+function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
+  const { t } = useTranslation();
+  const { state, loaded } = useFileState(attachment.blob_id);
+  const audio = useAudioState(attachment.blob_id);
+  const type = typeLabel(attachment);
+  const name = attachment.filename ?? type;
+  const [head, tail] = splitForMiddleEllipsis(name);
+  const playing = audio.state === "playing";
+  // Once the engine has touched this track the meta line becomes time and the
+  // scrubber appears; `stopped` (never played / ended / usurped) reads like a
+  // fresh file card again.
+  const engaged = state === "ready" && audio.state !== "stopped" && audio.duration > 0;
+
+  // At rest the track's length rides the WIRE (`duration_ms`, probed at
+  // attach time), so it shows before any byte is downloaded — the engine only
+  // takes over the meta line once the track is engaged.
+  const meta =
+    state === "loading"
+      ? `${formatBytes(loaded)} / ${formatBytes(attachment.size)}`
+      : engaged
+        ? `${formatTime(audio.position)} / ${formatTime(audio.duration)}`
+        : [
+            attachment.filename ? type : null,
+            attachment.duration_ms != null ? formatTime(attachment.duration_ms / 1000) : null,
+            formatBytes(attachment.size),
+          ]
+            .filter(Boolean)
+            .join(" · ");
+
+  const onTap = useCallback(() => {
+    if (state === "loading") return;
+    if (state === "ready") audioToggle(attachment.blob_id, name, attachment.mime_type);
+    else downloadFile(attachment.blob_id);
+  }, [state, attachment.blob_id, attachment.mime_type, name]);
+
+  return (
+    <button
+      type="button"
+      className={`attachment-file audio ${state}`}
+      onClick={onTap}
+      aria-label={playing ? t("chat.audioPause") : t("chat.audioPlay")}
+    >
+      <span className="file-glyph-slot">
+        <svg className="file-glyph" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+          {state !== "ready" ? GLYPH_DOWNLOAD : playing ? GLYPH_PAUSE : GLYPH_PLAY}
+        </svg>
+        {state === "loading" && <span className="file-spinner" aria-hidden="true" />}
+      </span>
+      <span className="file-text">
+        <span className="file-name">
+          <span className="file-name-head">{head}</span>
+          {tail && <span className="file-name-tail">{tail}</span>}
+        </span>
+        {engaged && (
+          <AudioTrack
+            blobId={attachment.blob_id}
+            position={audio.position}
+            duration={audio.duration}
+          />
+        )}
+        <span className="file-meta">{meta}</span>
+      </span>
+    </button>
+  );
+}
+
+/// Tile ratios stay within a band — an ultra-wide strip or a 9:16 portrait
+/// column would blow the reading column open; the cover-fit poster absorbs the
+/// difference as a crop.
+const VIDEO_RATIO_DEFAULT = 16 / 9;
+const VIDEO_RATIO_MIN = 3 / 4;
+
+function clampVideoRatio(ratio: number): number {
+  return Math.min(VIDEO_RATIO_DEFAULT, Math.max(VIDEO_RATIO_MIN, ratio));
+}
+
+/// Determinate download ring, centered on the video tile. `r` in a 36-unit
+/// viewBox; the CSS rotates the start to 12 o'clock.
+const VIDEO_RING_RADIUS = 14;
+const VIDEO_RING_CIRCUMFERENCE = 2 * Math.PI * VIDEO_RING_RADIUS;
+
+function VideoProgressRing({ fraction }: { fraction: number }) {
+  const clamped = Math.min(1, Math.max(0, fraction));
+  return (
+    <span className="video-disc" aria-hidden="true">
+      <svg className="video-ring" viewBox="0 0 36 36">
+        <circle className="video-ring-rail" cx="18" cy="18" r={VIDEO_RING_RADIUS} />
+        <circle
+          className="video-ring-fill"
+          cx="18"
+          cy="18"
+          r={VIDEO_RING_RADIUS}
+          strokeDasharray={VIDEO_RING_CIRCUMFERENCE}
+          strokeDashoffset={VIDEO_RING_CIRCUMFERENCE * (1 - clamped)}
+        />
+      </svg>
+    </span>
+  );
+}
+
+/// A video attachment: a fixed-width tile in the image idiom, not a file chip.
+/// Undownloaded it's a blank surface with a centered download disc and the size
+/// in the corner chip; while fetching, the disc becomes a DETERMINATE ring (the
+/// attachment declares its total) and the chip counts bytes; once on disk,
+/// native supplies a poster frame + duration (`requestVideoPoster`,
+/// AVAssetImageGenerator over the bridge) and the disc becomes a play glyph —
+/// tap hands the file to the native full-screen player. The poster's natural
+/// size is recorded in `ImageDimsStore`, so a re-opened thread draws this tile
+/// at the right ratio from the first paint.
+function AttachmentVideo({ attachment }: { attachment: WireAttachment }) {
+  const { t } = useTranslation();
+  const { state, loaded } = useFileState(attachment.blob_id);
+  const imageDims = useContext(ImageDimsContext);
+  const digest = blobContentDigest(attachment.blob_id);
+  const [dims, setDims] = useState(() => imageDims?.get(digest));
+  const [poster, setPoster] = useState<string | null>(null);
+  // Seeded from the WIRE (probed at attach time) so the length shows before a
+  // byte is downloaded; the poster reply overwrites it with the local probe.
+  const [durationMs, setDurationMs] = useState<number | null>(attachment.duration_ms ?? null);
+  const name = attachment.filename ?? typeLabel(attachment);
+
+  useEffect(() => {
+    if (state !== "ready") return;
+    let owned: string | null = null;
+    let cancelled = false;
+    requestVideoPoster(attachment.blob_id, name, attachment.mime_type)
+      .then((p) => {
+        if (cancelled) {
+          URL.revokeObjectURL(p.url);
+          return;
+        }
+        owned = p.url;
+        setPoster(p.url);
+        setDurationMs(p.durationMs);
+        if (p.width > 0 && p.height > 0) {
+          imageDims?.record(digest, p.width, p.height);
+          setDims([p.width, p.height]);
+        }
+      })
+      .catch(() => {
+        // No poster is cosmetic — the blank tile still downloads and plays.
+      });
+    return () => {
+      cancelled = true;
+      if (owned) {
+        URL.revokeObjectURL(owned);
+        // The render must never reference the revoked URL: a `ready → failed`
+        // flip (blob purged, download error) re-runs this effect, and keeping
+        // the stale poster would paint a broken <img>. On unmount these are
+        // no-ops. The duration falls back to the wire's value, not null — the
+        // track's length is still true.
+        setPoster(null);
+        setDurationMs(attachment.duration_ms ?? null);
+      }
+    };
+    // name/digest derive from the attachment; `state` flipping to ready is the
+    // real clock here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state, attachment.blob_id, attachment.mime_type]);
+
+  const ratio = clampVideoRatio(dims ? dims[0] / dims[1] : VIDEO_RATIO_DEFAULT);
+  const fraction = attachment.size > 0 ? loaded / attachment.size : 0;
+  // Pre-download the chip pairs length with cost (`1:23 · 24 MB` — the size is
+  // what a tap commits to); once the bytes are local only the length matters.
+  const chip =
+    state === "loading"
+      ? `${formatBytes(loaded)} / ${formatBytes(attachment.size)}`
+      : durationMs === null
+        ? formatBytes(attachment.size)
+        : state === "ready"
+          ? formatTime(durationMs / 1000)
+          : `${formatTime(durationMs / 1000)} · ${formatBytes(attachment.size)}`;
+
+  const onTap = useCallback(() => {
+    if (state === "loading") return;
+    if (state === "ready") playVideo(attachment.blob_id, name, attachment.mime_type);
+    else downloadFile(attachment.blob_id);
+  }, [state, attachment.blob_id, attachment.mime_type, name]);
+
+  return (
+    <button
+      type="button"
+      className={`attachment-video ${state}${poster ? " has-poster" : ""}`}
+      style={{ "--video-ar": String(ratio) } as CSSProperties}
+      onClick={onTap}
+      aria-label={state === "ready" ? t("chat.videoPlay") : t("chat.videoDownload")}
+    >
+      {poster && (
+        <img className="video-poster" src={poster} alt="" draggable={false} aria-hidden="true" />
+      )}
+      <span className="video-overlay" aria-hidden="true">
+        {state === "loading" ? (
+          <VideoProgressRing fraction={fraction} />
+        ) : (
+          <span className="video-disc">
+            <svg className="video-disc-glyph" viewBox="0 0 20 20" fill="none">
+              {state === "ready" ? GLYPH_PLAY : GLYPH_DOWNLOAD}
+            </svg>
+          </span>
+        )}
+      </span>
+      <span className="video-chip">{chip}</span>
     </button>
   );
 }

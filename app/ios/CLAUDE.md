@@ -203,9 +203,9 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   400ms; the core coalesces concurrent dials.
 - **Bridge** (`App/Web/TranscriptBridge.swift` ⇄ `web/src/bridge.ts`):
   native→web
-  `init/pushFrame/setConnEpoch/userSent/blobResult/fileState/setLanguage/setBottomInset/jumpToLatest/requestSync`;
+  `init/pushFrame/setConnEpoch/userSent/blobResult/fileState/audioState/videoPoster/setLanguage/setBottomInset/jumpToLatest/requestSync`;
   web→native
-  `ready/sync/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/viewImage/openUrl/copy/log/jumpVisible/runState`.
+  `ready/sync/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/viewImage/audioToggle/audioSeek/queryAudioState/playVideo/requestVideoPoster/openUrl/copy/log/jumpVisible/runState`.
   (`copy` is a user-bubble long-press: native writes `UIPasteboard` + fires a
   haptic, because a `file://` WKWebView rejects `navigator.clipboard` outside a
   live gesture.) `runState` mirrors whether a
@@ -306,6 +306,83 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   Cards subscribe to `fileState` **by blob id** (`onFileState`), so a progress
   tick re-renders one card and `MessageRow`'s memo survives — and two cards on
   the same blob (an agent's file the user quotes back) update together.
+  **Bridge ANSWERS buffer across the detach window like frames do**: a
+  `fileState` (or `videoPoster` reply) that lands while no webview is attached
+  is stashed in the store (`pendingFileStates` last-write-wins per blob /
+  `pendingPosterReplies`) and flushed on `attachBridge` — a download whose
+  terminal `ready` fell while the user was parked on the list used to wedge
+  its card at `loading` forever, because a SAME-session re-attach remounts
+  nothing and so re-queries nothing. A flushed poster reply whose session
+  switched away settles nothing web-side (`init` cleared `posterPending`) and
+  is ignored.
+- **Audio attachments** (`kind == "audio"`) render as the file card with the
+  glyph slot promoted to a play/pause control once the blob is on disk
+  (`AttachmentAudio`; the download flow is the file card's, unchanged). The
+  track's LENGTH rides the wire — `WireAttachment.duration_ms`, probed by
+  `AttachFile` via lofty at attach time (the one moment the file is in hand
+  server-side) and carried through `ContentBlock::Audio` → `split_content` →
+  the REST `ChatAttachment` — so the resting card reads `MP3 · 3:23 · 3.3 MB`
+  before any byte is downloaded or played; `None` (inbound channel audio, old
+  rows) just drops the middle segment. The ENGINE is native — `AudioPlayerCenter` (`App/Core/AudioPlayerCenter.swift`),
+  ONE `AVPlayer` app-wide — driven over the bridge
+  (`audioToggle`/`audioSeek`/`queryAudioState` in, `audioState` pushes out:
+  play/pause flips, 2 Hz position ticks, `stopped` on end/usurp). Native
+  rather than an in-webview `<audio>` because the bytes never cross the bridge
+  as base64, AVAudioSession `.playback` means the ringer switch can't silence
+  it, and the track keeps playing when the user backs out of the chat —
+  `UIBackgroundModes: audio` (project.yml) + Now Playing + remote commands
+  give it lock-screen/Control Center transport. Playback runs off the
+  materialised preview file (`materializePreviewFile` — AVPlayer sniffs the
+  container by extension). Starting a track stops the previous one and tells
+  its card `stopped`; a card mounting mid-playback resyncs via
+  `queryAudioState`; `resetChatStores` (logout/rebind) stops the player
+  outright. Engine-truth invariants (each covers a wedge that review found):
+  the card mirrors EVERY engine flip via KVO on `timeControlStatus` — the
+  system pauses without any interruption notice (headphones unplugged, a
+  stall) and the card would otherwise wedge on "playing" with an inverted
+  toggle; `AVPlayerItem.status == .failed` / `failedToPlayToEndTime` reset the
+  card to rest (an unplayable blob must not play dead air forever); "is it
+  playing" checks are `timeControlStatus != .paused` (right after `play()` the
+  engine sits in `.waiting…` — intent is playing); an `ended` latch keeps a
+  finished track answering `stopped` to late `queryAudioState` (the player
+  stays loaded for instant replay, but a remounting card must not resync to an
+  engaged "paused @ 0:00" the live card never showed). While a track is
+  engaged the card grows a seek bar (`AudioTrack`): drags scrub locally,
+  commit ONE `audioSeek` on lift, and the committed value keeps rendering
+  until the engine's next push (native answers a seek with an optimistic
+  state) — dropping it at lift would snap the fill back to the pre-seek
+  playhead. `touch-action: none` so a scrub never scrolls the thread.
+- **Video attachments** (`kind == "file"` + `video/*` mime — video has no wire
+  kind of its own; `isVideoAttachment` elects the tile by mime) render as a
+  fixed-width tile in the image idiom (`AttachmentVideo`): undownloaded, a
+  blank surface with a centered download disc and `1:23 · 24 MB` in a corner
+  chip — the LENGTH rides the wire like audio's (`ContentBlock::File` carries
+  `duration_ms` for videos; `AttachFile` probes mp4/mov via the `mp4` crate
+  and webm/mkv via `matroska`), the size is what a tap commits to, and once
+  the bytes are local the chip drops to just the length;
+  while fetching, the disc becomes a DETERMINATE progress ring (the attachment
+  declares its total; the corner chip counts bytes); downloaded, native
+  supplies a poster frame + duration over `requestVideoPoster`
+  (`AVAssetImageGenerator` on the materialised file, first frame downscaled to
+  ≤1024px JPEG — cached as `poster.jpg` + `poster.json` beside the preview
+  file, because the tile re-requests on EVERY remount and the generator is too
+  heavy to re-run each time) and the disc becomes a play glyph. Tapping a
+  downloaded tile
+  posts `playVideo` → `ChatStore.videoPlayback` presents `VideoPlayerScreen`
+  (`App/Screens/VideoPlayerScreen.swift`) via `.fullScreenCover`: an embedded
+  `AVPlayerViewController` on a black field with the viewer chrome's ✕ disc
+  (`ViewerChromeButton`, shared with `ImageViewer`) — embedded AVKit shows no
+  Done button, only owned presentations get one. Chat audio is stopped before
+  the video presents (two engines over one AVAudioSession fight), and
+  `playVideo` bails if the bridge detached while the file materialised — the
+  user backed out, and presenting late would arm a stale `fullScreenCover` for
+  the NEXT entry. Poster/play materialisations coalesce in-flight per target
+  path (`previewMaterializations`) so a poster request racing a play tap
+  doesn't hold the video in memory twice. The poster's
+  natural size is recorded into the same `ImageDimsStore`/`imageDims` mirror
+  keyed by blob digest, so a re-opened thread reserves the tile's ratio from
+  the first paint; the ratio is clamped to [3:4, 16:9] (`clampVideoRatio`) and
+  the cover-fit poster absorbs the clamp as a crop.
 - **Keyboard**: the transcript webview is FULL-BLEED and its frame never
   tracks the keyboard — a keyboard-resized WKWebView relayouts once, async,
   at the final size, so content sits still through the slide and snaps at the
@@ -346,12 +423,21 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   (thinking → tool → streamed markdown → finalize) through the real bridge —
   screenshot the sim at ~3s/~6s/~12s. `-baybo-open-chat -baybo-demo-attachments`
   pushes a short agent turn carrying three FILE attachments (long name / nameless
-  blob / sub-KB) plus a user send carrying one, so the file-card styling is
-  screenshot-verifiable at ~4s on BOTH sides with no gateway. Add
+  blob / sub-KB) plus an audio card and a video tile, plus a user send carrying
+  one file, so the attachment styling is screenshot-verifiable at ~4s on BOTH
+  sides with no gateway. Add
   `-baybo-demo-download` to it and native pushes the `fileState` messages a real
-  download would, walking the first card idle → loading (ring + byte counter) →
-  ready over ~6s (shoot at ~4s / ~5.5s / ~9s); it drives the exact web reducer
-  the native path drives, only the bytes are fake. A file chip renders straight
+  download would, walking the first file card AND the video tile idle → loading
+  (file: ring + byte counter; video: centered determinate ring + corner byte
+  chip) → ready over ~6s (shoot at ~4s / ~5.5s / ~10s); it drives the exact web
+  reducer the native path drives, only the bytes are fake. The video's `ready`
+  makes its card request a poster, served locally (flat 1280×720 PNG + fake
+  1:23 duration, ~600ms later) — so the downloaded tile (poster + play disc +
+  duration chip) screenshots headlessly too; real playback and real poster
+  generation still need real blobs (a live session). Once the poster paints,
+  the tile's ink border goes transparent (`.attachment-video.has-poster`) —
+  the frame is the edge, matching the image idiom; `.failed`'s err border
+  still wins over it. A file chip renders straight
   from the frame; the `image` kind needs bytes, so `-baybo-demo-images` (DEBUG)
   serves its own: one agent turn carrying four images of deliberately different
   aspect ratios (portrait / banner / thumbnail / square) plus a text row UNDER

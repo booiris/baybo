@@ -81,6 +81,9 @@ struct ChatScreen: View {
         .fullScreenCover(item: $store.viewedImage) { viewed in
             ImageViewer(image: viewed.image, url: viewed.url) { store.viewedImage = nil }
         }
+        .fullScreenCover(item: $store.videoPlayback) { playback in
+            VideoPlayerScreen(url: playback.url) { store.videoPlayback = nil }
+        }
         .onAppear {
             host.bridge.retarget(to: store)
             store.connectIfNeeded()
