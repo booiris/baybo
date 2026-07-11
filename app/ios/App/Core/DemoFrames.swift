@@ -176,6 +176,23 @@
             "duration_ms": 83_000,
         ]
 
+        /// Stand-in bytes for a demo blob a share/preview wants materialised —
+        /// enough for the system share sheet (and QuickLook, for the PDF) to
+        /// present headlessly; the media ones are NOT playable.
+        static func demoMaterializeBytes(blobId: String) -> Data? {
+            let pdfId = demoFileAttachments[0]["blob_id"] as? String
+            let audioId = demoAudioAttachment["blob_id"] as? String
+            let videoId = demoVideoAttachment["blob_id"] as? String
+            switch blobId {
+            case pdfId:
+                return Data("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n".utf8)
+            case audioId, videoId:
+                return Data(count: 4096)
+            default:
+                return nil
+            }
+        }
+
         /// Serve the demo video's poster with no gateway: a flat 1280×720 PNG
         /// plus a fake duration, so the downloaded tile (poster + play disc +
         /// duration chip) is screenshot-verifiable headlessly.

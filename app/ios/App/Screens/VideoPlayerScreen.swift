@@ -9,10 +9,15 @@ import SwiftUI
 /// before this presented — see `ChatStore.playVideo`).
 struct VideoPlayerScreen: View {
     let onClose: () -> Void
+    /// The materialised file under its real name — the share sheet's item
+    /// (mirrors the image viewer's top-right share).
+    private let url: URL
     @State private var player: AVPlayer
+    @State private var sharing = false
 
     init(url: URL, onClose: @escaping () -> Void) {
         self.onClose = onClose
+        self.url = url
         _player = State(initialValue: AVPlayer(url: url))
     }
 
@@ -25,6 +30,7 @@ struct VideoPlayerScreen: View {
                 HStack {
                     ViewerChromeButton(symbol: "xmark", action: onClose)
                     Spacer()
+                    ViewerChromeButton(symbol: "square.and.arrow.up") { sharing = true }
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
@@ -32,6 +38,9 @@ struct VideoPlayerScreen: View {
             }
         }
         .statusBarHidden(true)
+        .sheet(isPresented: $sharing) {
+            ShareSheet(url: url)
+        }
         .onAppear {
             let session = AVAudioSession.sharedInstance()
             try? session.setCategory(.playback, mode: .moviePlayback)

@@ -205,7 +205,7 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   native→web
   `init/pushFrame/setConnEpoch/userSent/blobResult/fileState/audioState/videoPoster/setLanguage/setBottomInset/jumpToLatest/requestSync`;
   web→native
-  `ready/sync/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/viewImage/audioToggle/audioSeek/queryAudioState/playVideo/requestVideoPoster/openUrl/copy/log/jumpVisible/runState`.
+  `ready/sync/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/shareFile/viewImage/audioToggle/audioSeek/queryAudioState/playVideo/requestVideoPoster/openUrl/copy/log/jumpVisible/runState`.
   (`copy` is a user-bubble long-press: native writes `UIPasteboard` + fires a
   haptic, because a `file://` WKWebView rejects `navigator.clipboard` outside a
   live gesture.) `runState` mirrors whether a
@@ -306,6 +306,14 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   Cards subscribe to `fileState` **by blob id** (`onFileState`), so a progress
   tick re-renders one card and `MessageRow`'s memo survives — and two cards on
   the same blob (an agent's file the user quotes back) update together.
+  **A long-press on any DOWNLOADED file / audio / video card shares it**
+  (`useSharePress` → `shareFile` → `ChatStore.fileShare` → the system sheet on
+  the materialised file, real name intact). The synthetic click that follows
+  the lift is swallowed in the capture phase so a share never also
+  downloads/plays/previews; an undownloaded card ignores the hold and keeps
+  its plain tap. The audio card's seek bar stops `touchstart` propagation so a
+  slow scrub can't arm the share. Images share from inside their viewer; the
+  video player carries the same top-right share button.
   **Bridge ANSWERS buffer across the detach window like frames do**: a
   `fileState` (or `videoPoster` reply) that lands while no webview is attached
   is stashed in the store (`pendingFileStates` last-write-wins per blob /

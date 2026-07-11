@@ -359,6 +359,15 @@ extension TranscriptBridge: WKScriptMessageHandler {
             {
                 store?.previewFile(blobId: blobId, filename: filename, mimeType: mimeType)
             }
+        case "shareFile":
+            // A long-press on a downloaded file / audio / video card — raise
+            // the system share sheet on the materialised file.
+            if let blobId = body["blobId"] as? String,
+                let filename = body["filename"] as? String,
+                let mimeType = body["mimeType"] as? String
+            {
+                store?.shareFile(blobId: blobId, filename: filename, mimeType: mimeType)
+            }
         case "viewImage":
             // A tap on an image bubble — decode the cached blob and present the
             // full-screen zoomable viewer (images only; files use previewFile).

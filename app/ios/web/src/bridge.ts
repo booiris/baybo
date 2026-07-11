@@ -330,6 +330,13 @@ export function previewFile(blobId: string, filename: string, mimeType: string):
   postSafe({ type: "previewFile", blobId, filename, mimeType });
 }
 
+/// Hand the downloaded blob to the system share sheet under its real name (a
+/// long-press on a file / audio / video card — the image viewer has its own
+/// share button). Native materialises the file exactly like previewFile.
+export function shareFile(blobId: string, filename: string, mimeType: string): void {
+  postSafe({ type: "shareFile", blobId, filename, mimeType });
+}
+
 // ---- audio playback (native engine) -----------------------------------------
 
 /// Same per-blob fan-out as `fileStateListeners`: a 2 Hz position tick

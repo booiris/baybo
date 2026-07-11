@@ -9,6 +9,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
   type TouchEvent as ReactTouchEvent,
 } from "react";
@@ -34,6 +35,7 @@ import {
   queryFileState,
   requestVideoPoster,
   retrySend,
+  shareFile,
   viewImage,
   subscribeTranscript,
   type AudioStatePayload,
@@ -791,8 +793,16 @@ function AttachmentFile({ attachment }: { attachment: WireAttachment }) {
     else downloadFile(attachment.blob_id);
   }, [state, attachment.blob_id, attachment.mime_type, name]);
 
+  const share = useSharePress(
+    useCallback(() => {
+      if (state !== "ready") return false;
+      shareFile(attachment.blob_id, name, attachment.mime_type);
+      return true;
+    }, [state, attachment.blob_id, attachment.mime_type, name]),
+  );
+
   return (
-    <button type="button" className={`attachment-file ${state}`} onClick={onTap}>
+    <button type="button" className={`attachment-file ${state}`} onClick={onTap} {...share}>
       <span className="file-glyph-slot">
         <svg className="file-glyph" viewBox="0 0 20 20" fill="none" aria-hidden="true">
           {state === "ready" ? GLYPH_FILE : GLYPH_DOWNLOAD}
@@ -871,6 +881,10 @@ function AudioTrack({
     <div
       ref={barRef}
       className="audio-track"
+      // A still finger resting on the track (a slow scrub) must not arm the
+      // card's long-press share — touch events propagate independently of the
+      // pointer events captured below.
+      onTouchStart={(e) => e.stopPropagation()}
       onPointerDown={(e) => {
         e.stopPropagation();
         committed.current = false;
@@ -939,12 +953,21 @@ function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
     else downloadFile(attachment.blob_id);
   }, [state, attachment.blob_id, attachment.mime_type, name]);
 
+  const share = useSharePress(
+    useCallback(() => {
+      if (state !== "ready") return false;
+      shareFile(attachment.blob_id, name, attachment.mime_type);
+      return true;
+    }, [state, attachment.blob_id, attachment.mime_type, name]),
+  );
+
   return (
     <button
       type="button"
       className={`attachment-file audio ${state}`}
       onClick={onTap}
       aria-label={playing ? t("chat.audioPause") : t("chat.audioPlay")}
+      {...share}
     >
       <span className="file-glyph-slot">
         <svg className="file-glyph" viewBox="0 0 20 20" fill="none" aria-hidden="true">
@@ -1083,6 +1106,14 @@ function AttachmentVideo({ attachment }: { attachment: WireAttachment }) {
     else downloadFile(attachment.blob_id);
   }, [state, attachment.blob_id, attachment.mime_type, name]);
 
+  const share = useSharePress(
+    useCallback(() => {
+      if (state !== "ready") return false;
+      shareFile(attachment.blob_id, name, attachment.mime_type);
+      return true;
+    }, [state, attachment.blob_id, attachment.mime_type, name]),
+  );
+
   return (
     <button
       type="button"
@@ -1090,6 +1121,7 @@ function AttachmentVideo({ attachment }: { attachment: WireAttachment }) {
       style={{ "--video-ar": String(ratio) } as CSSProperties}
       onClick={onTap}
       aria-label={state === "ready" ? t("chat.videoPlay") : t("chat.videoDownload")}
+      {...share}
     >
       {poster && (
         <img className="video-poster" src={poster} alt="" draggable={false} aria-hidden="true" />
@@ -1188,6 +1220,47 @@ function useLongPress(onLongPress: () => void): {
   );
 
   return { onTouchStart, onTouchMove, onTouchEnd: cancel };
+}
+
+/// Long-press → share, for a card that ALSO has a tap action: when the press
+/// fires, the synthetic click that follows the lift is swallowed in the
+/// capture phase, so a share never also downloads/plays/previews. `onShare`
+/// returns whether it fired — an undownloaded card shares nothing, and its
+/// follow-up click must stay a plain tap. The suppression re-arms on the next
+/// touch, so a fired press whose click never materialised (finger dragged
+/// away after the fire) can't eat a later genuine tap.
+function useSharePress(onShare: () => boolean): {
+  onTouchStart: (e: ReactTouchEvent) => void;
+  onTouchMove: (e: ReactTouchEvent) => void;
+  onTouchEnd: () => void;
+  onClickCapture: (e: ReactMouseEvent) => void;
+} {
+  const suppress = useRef(false);
+  const fire = useCallback(() => {
+    if (onShare()) suppress.current = true;
+  }, [onShare]);
+  const press = useLongPress(fire);
+  const pressStart = press.onTouchStart;
+  const onTouchStart = useCallback(
+    (e: ReactTouchEvent) => {
+      suppress.current = false;
+      pressStart(e);
+    },
+    [pressStart],
+  );
+  const onClickCapture = useCallback((e: ReactMouseEvent) => {
+    if (suppress.current) {
+      suppress.current = false;
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, []);
+  return {
+    onTouchStart,
+    onTouchMove: press.onTouchMove,
+    onTouchEnd: press.onTouchEnd,
+    onClickCapture,
+  };
 }
 
 /// One finalized transcript row, rendered as a GROUP of stacked bubbles: each

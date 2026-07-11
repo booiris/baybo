@@ -78,6 +78,9 @@ struct ChatScreen: View {
         .sheet(item: $store.filePreview) { preview in
             FilePreviewSheet(url: preview.url)
         }
+        .sheet(item: $store.fileShare) { share in
+            ShareSheet(url: share.url)
+        }
         .fullScreenCover(item: $store.viewedImage) { viewed in
             ImageViewer(image: viewed.image, url: viewed.url) { store.viewedImage = nil }
         }

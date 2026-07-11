@@ -82,6 +82,8 @@ final class ChatStore: ObservableObject {
     @Published var notice: String?
     /// A tapped file attachment, materialised on disk and awaiting presentation.
     @Published var filePreview: FilePreview?
+    /// A long-pressed attachment awaiting the system share sheet.
+    @Published var fileShare: FilePreview?
     /// A tapped image attachment, decoded and awaiting the full-screen viewer.
     @Published var viewedImage: ViewedImage?
     /// A tapped (downloaded) video attachment, awaiting the full-screen player.
@@ -909,6 +911,26 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// A card long-press: hand the blob to the system share sheet under its
+    /// real name, so Files / AirDrop / Save-to-Photos keep the original bytes
+    /// and name — the same materialisation the previewer and players use.
+    /// (Images share from inside their viewer instead.)
+    func shareFile(blobId: String, filename: String, mimeType: String) {
+        Task {
+            do {
+                let url = try await materializePreviewFile(
+                    blobId: blobId, filename: filename, mimeType: mimeType)
+                // Backed out mid-materialise: don't arm a stale sheet for the
+                // next entry (same on-screen token as playVideo).
+                guard bridge != nil else { return }
+                fileShare = FilePreview(url: url)
+            } catch {
+                pushFileState(
+                    blobId: blobId, state: "failed", error: bayboErrorText(error))
+            }
+        }
+    }
+
     /// Open a tapped image full-screen. The blob is device-cached (the thumbnail
     /// fetch wrote it), so this decodes near-instantly; a non-decodable blob
     /// simply doesn't present. Its own viewer rather than QuickLook so pinch-zoom,
@@ -1082,6 +1104,14 @@ final class ChatStore: ObservableObject {
     ) async throws -> URL {
         let url = try Self.previewFileURL(blobId: blobId, filename: filename, mimeType: mimeType)
         if FileManager.default.fileExists(atPath: url.path) { return url }
+        #if DEBUG
+            // Demo blobs have no gateway to fetch from; a locally-served stand-in
+            // lets share/preview present headlessly (see DemoFrames).
+            if let demo = Self.demoMaterializeBytes(blobId: blobId) {
+                try demo.write(to: url, options: .atomic)
+                return url
+            }
+        #endif
         if let inFlight = previewMaterializations[url] {
             return try await inFlight.value
         }
