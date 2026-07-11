@@ -899,10 +899,11 @@ final class ChatStore: ObservableObject {
     func previewFile(blobId: String, filename: String, mimeType: String) {
         Task {
             do {
-                let bytes = try await Baybo.client.blobDownloadBytes(
-                    blobId: blobId, progress: nil)
-                let url = try Self.writePreviewFile(
-                    bytes: bytes, blobId: blobId, filename: filename, mimeType: mimeType)
+                let url = try await materializePreviewFile(
+                    blobId: blobId, filename: filename, mimeType: mimeType)
+                // Backed out mid-materialise: don't arm a stale sheet for the
+                // next entry (same on-screen token as playVideo/shareFile).
+                guard bridge != nil else { return }
                 filePreview = FilePreview(url: url)
             } catch {
                 pushFileState(

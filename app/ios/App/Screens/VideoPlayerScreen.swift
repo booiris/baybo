@@ -2,21 +2,20 @@ import AVKit
 import SwiftUI
 
 /// Full-screen player for a downloaded chat video: AVKit's transport controls
-/// on a black field, with the viewer chrome's close disc top-left — an
-/// embedded `AVPlayerViewController` has no Done button (AVKit only adds one
-/// to presentations it owns). Playback starts on appear; the audio session is
-/// `.playback`, so the ringer switch can't mute it (chat audio was stopped
-/// before this presented — see `ChatStore.playVideo`).
+/// on a black field. At full-screen size the embedded `AVPlayerViewController`
+/// renders its OWN close button (top-left) whose tap dismisses the hosting
+/// cover — so the viewer chrome contributes only the share disc top-right; a
+/// second ✕ would duplicate AVKit's. Playback starts on appear; the audio
+/// session is `.playback`, so the ringer switch can't mute it (chat audio was
+/// stopped before this presented — see `ChatStore.playVideo`).
 struct VideoPlayerScreen: View {
-    let onClose: () -> Void
     /// The materialised file under its real name — the share sheet's item
     /// (mirrors the image viewer's top-right share).
     private let url: URL
     @State private var player: AVPlayer
     @State private var sharing = false
 
-    init(url: URL, onClose: @escaping () -> Void) {
-        self.onClose = onClose
+    init(url: URL) {
         self.url = url
         _player = State(initialValue: AVPlayer(url: url))
     }
@@ -28,7 +27,6 @@ struct VideoPlayerScreen: View {
                 .ignoresSafeArea()
             VStack {
                 HStack {
-                    ViewerChromeButton(symbol: "xmark", action: onClose)
                     Spacer()
                     ViewerChromeButton(symbol: "square.and.arrow.up") { sharing = true }
                 }

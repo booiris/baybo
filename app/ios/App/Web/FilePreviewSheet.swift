@@ -6,12 +6,37 @@ import UIKit
 /// (it is macOS-only), so this wraps `QLPreviewController` — and falls back to
 /// the share sheet for the types QuickLook cannot render (archives, arbitrary
 /// binaries), where "save to Files" is the only useful action anyway.
+///
+/// Embedded QuickLook has NO chrome of its own (AVKit-style: only owned
+/// presentations get a nav bar), so the viewer discs are overlaid — ✕ to
+/// close, share top-right — in the image viewer's idiom, but inked: document
+/// previews are typically white, where the dark-field viewers' white glyphs
+/// would vanish.
 struct FilePreviewSheet: View {
     let url: URL
+    let onClose: () -> Void
+    @State private var sharing = false
 
     var body: some View {
         if QLPreviewController.canPreview(url as QLPreviewItem) {
-            QuickLookView(url: url).ignoresSafeArea()
+            ZStack {
+                QuickLookView(url: url).ignoresSafeArea()
+                VStack {
+                    HStack {
+                        ViewerChromeButton(symbol: "xmark", tint: .primary, action: onClose)
+                        Spacer()
+                        ViewerChromeButton(symbol: "square.and.arrow.up", tint: .primary) {
+                            sharing = true
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    Spacer()
+                }
+            }
+            .sheet(isPresented: $sharing) {
+                ShareSheet(url: url)
+            }
         } else {
             ShareSheet(url: url)
         }

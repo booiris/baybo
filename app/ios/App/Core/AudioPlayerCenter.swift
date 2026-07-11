@@ -8,9 +8,11 @@ import MediaPlayer
 ///
 /// Native rather than an in-webview `<audio>` on purpose: the bytes never
 /// cross the bridge as base64, `.playback` means the ringer switch can't
-/// silence it, and the track keeps playing when the user backs out of the
-/// chat — with the `audio` background mode, through lock too, controllable
-/// from Control Center (Now Playing + remote commands below).
+/// silence it, and — with the `audio` background mode — a track keeps playing
+/// through lock/background while the user stays in the chat, controllable
+/// from Control Center (Now Playing + remote commands below). Backing out to
+/// the chat LIST stops it (`AppStore.chatPath`'s didSet): audio with no
+/// visible card to control it reads as a bug.
 ///
 /// One player app-wide: starting a track stops whatever else was playing and
 /// tells the usurped card it `stopped`.
@@ -23,8 +25,8 @@ final class AudioPlayerCenter {
     private static let tickInterval = CMTime(seconds: 0.5, preferredTimescale: 600)
 
     /// The single webview's bridge — refreshed on every card message, so pushes
-    /// land in the live transcript. A tick for a track that keeps playing while
-    /// another session is on screen simply finds no listener web-side.
+    /// land in the live transcript. A push for a blob whose card left the tree
+    /// simply finds no listener web-side.
     private weak var bridge: TranscriptBridge?
     private var player: AVPlayer?
     private var blobId: String?

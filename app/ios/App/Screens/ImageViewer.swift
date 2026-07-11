@@ -61,20 +61,24 @@ struct ImageViewer: View {
 
 }
 
-/// Full-screen viewer chrome (image viewer, video player): a glass disc over
-/// the content, legible on any frame.
+/// Full-screen viewer chrome (image viewer, video player, file preview): a
+/// glass disc over the content. White glyphs by default — the media viewers
+/// sit on black fields; the file preview overrides to `.primary`, because a
+/// white glyph vanishes on a white document page.
 struct ViewerChromeButton: View {
     let symbol: String
+    var tint: Color = .white
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(tint)
                 .frame(width: 34, height: 34)
                 .background(.ultraThinMaterial, in: Circle())
         }
+        .accessibilityIdentifier("viewer.\(symbol)")
     }
 }
 

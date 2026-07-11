@@ -46,7 +46,27 @@ final class AppStore: ObservableObject {
     /// The NavigationStack path over the chat list. A session opened from the
     /// list/compose/push resets it to `[.session(id)]`; one opened from the
     /// archived screen appends, so the pop chain runs chat → archived → list.
-    @Published var chatPath: [ChatRoute] = []
+    ///
+    /// Popping the last conversation off the stack stops chat audio: a track
+    /// playing over the list — with no visible card to control it — reads as
+    /// a bug, not a feature. The path only changes on navigation, so
+    /// lock-screen/background playback while parked IN a chat is untouched.
+    /// (`ChatScreen.onDisappear` can't be this hook: it also fires under
+    /// fullScreenCovers like the image viewer.)
+    @Published var chatPath: [ChatRoute] = [] {
+        didSet {
+            if Self.hasSession(oldValue) && !Self.hasSession(chatPath) {
+                AudioPlayerCenter.shared.stop()
+            }
+        }
+    }
+
+    private static func hasSession(_ path: [ChatRoute]) -> Bool {
+        path.contains { route in
+            if case .session = route { return true }
+            return false
+        }
+    }
     /// Landing / pairing status line (localized, already resolved).
     @Published var status: String?
     @Published var busy = false

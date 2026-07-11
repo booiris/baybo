@@ -342,9 +342,13 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   play/pause flips, 2 Hz position ticks, `stopped` on end/usurp). Native
   rather than an in-webview `<audio>` because the bytes never cross the bridge
   as base64, AVAudioSession `.playback` means the ringer switch can't silence
-  it, and the track keeps playing when the user backs out of the chat —
-  `UIBackgroundModes: audio` (project.yml) + Now Playing + remote commands
-  give it lock-screen/Control Center transport. Playback runs off the
+  it, and — with `UIBackgroundModes: audio` (project.yml) + Now Playing +
+  remote commands — a track keeps playing through lock/background with
+  Control Center transport while the user stays IN the chat. Backing out to
+  the chat LIST stops it (`AppStore.chatPath`'s didSet, when the last
+  `.session` route leaves the stack — NOT `ChatScreen.onDisappear`, which
+  also fires under fullScreenCovers like the image viewer): audio with no
+  visible card to control it reads as a bug. Playback runs off the
   materialised preview file (`materializePreviewFile` — AVPlayer sniffs the
   container by extension). Starting a track stops the previous one and tells
   its card `stopped`; a card mounting mid-playback resyncs via

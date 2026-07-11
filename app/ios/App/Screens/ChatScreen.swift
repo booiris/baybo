@@ -76,7 +76,7 @@ struct ChatScreen: View {
         }
         .background(Theme.paper)
         .sheet(item: $store.filePreview) { preview in
-            FilePreviewSheet(url: preview.url)
+            FilePreviewSheet(url: preview.url) { store.filePreview = nil }
         }
         .sheet(item: $store.fileShare) { share in
             ShareSheet(url: share.url)
@@ -85,7 +85,7 @@ struct ChatScreen: View {
             ImageViewer(image: viewed.image, url: viewed.url) { store.viewedImage = nil }
         }
         .fullScreenCover(item: $store.videoPlayback) { playback in
-            VideoPlayerScreen(url: playback.url) { store.videoPlayback = nil }
+            VideoPlayerScreen(url: playback.url)
         }
         .onAppear {
             host.bridge.retarget(to: store)
