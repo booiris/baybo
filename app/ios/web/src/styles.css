@@ -740,11 +740,15 @@ button {
 @keyframes file-spin {
   to { transform: rotate(360deg); }
 }
-/* `min-width: 0` is what lets the name actually ellipsize inside the flex row. */
+/* `min-width: 0` is what lets the name actually ellipsize inside the flex row;
+   `flex: 1` makes the column claim the row's remaining width instead of
+   shrink-wrapping the name — the audio card's seek bar is 100% of THIS column,
+   and without the grow it was only ever as long as the filename. */
 .file-text {
   display: flex;
   flex-direction: column;
   gap: 0.05rem;
+  flex: 1 1 auto;
   min-width: 0;
 }
 /* Middle ellipsis: the head absorbs the clipping, the tail never shrinks, so
