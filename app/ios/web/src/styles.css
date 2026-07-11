@@ -578,15 +578,13 @@ button {
   pointer-events: none;
 }
 .attachment-frame:not(.loaded) .attachment-img { opacity: 0; }
-/* A decoded image is a button: tapping opens the native full-screen previewer
-   (QuickLook — zoom + share), the same path a file card uses; a long-press
-   copies it. Strip the UA button chrome so only the image shows; the pointer
-   cursor is a dev-browser nicety, gated to the loaded state. `position:relative`
-   anchors the copy pill. The native iOS image callout (Save/Copy/Share) and text
-   selection are turned OFF so they can't fire their own menu at ~500ms and fight
-   the custom long-press copy. */
+/* A decoded image is a button: tapping opens the native full-screen zoomable
+   image viewer (`viewImage` → pinch, double-tap-to-restore). Strip the UA button
+   chrome so only the image shows; the pointer cursor is a dev-browser nicety,
+   gated to the loaded state. The native iOS image callout (Save/Copy/Share) and
+   text selection are turned OFF so a long-press can't fire its own menu at ~500ms
+   and fight the tap or the scroll. */
 .attachment-open {
-  position: relative;
   display: block;
   max-width: 100%;
   padding: 0;
@@ -599,12 +597,9 @@ button {
   user-select: none;
 }
 .attachment-frame.loaded .attachment-open { cursor: pointer; }
-/* No `:active` dim: this button carries the long-press touch listeners, so iOS
-   applies `:active` eagerly on touch-down — a flick-scroll that starts on an
-   image would briefly dim it. The user bubble omits it for the same reason; the
-   copy squish + QuickLook opening are the feedback. */
-/* Copy confirm: the same squish-and-pop the user bubble plays. */
-.attachment-open.copied { animation: copy-squish 320ms cubic-bezier(0.34, 1.4, 0.64, 1); }
+/* No `:active` dim: a flick-scroll that starts on the image would otherwise
+   briefly dim it, since iOS applies `:active` eagerly on touch-down. The user
+   bubble omits it for the same reason; opening the viewer is the feedback. */
 /* A failed fetch keeps the same tile, centering only the ↻ retry glyph (tap to
    refetch) — no text label. */
 .attachment-retry {

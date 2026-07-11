@@ -836,41 +836,6 @@ final class ChatStore: ObservableObject {
         }
     }
 
-    /// Copy an image attachment to the system clipboard (a long-press on the
-    /// image bubble). The blob is device-cached — the thumbnail fetch wrote it —
-    /// so this is a near-instant read. Best-effort: a fetch failure simply
-    /// doesn't confirm (the web side already played its optimistic pill, and
-    /// there is no card listening for an error here).
-    func copyImage(blobId: String, mimeType: String) {
-        Task {
-            guard let bytes = try? await Baybo.client.blobDownloadBytes(
-                blobId: blobId, progress: nil)
-            else { return }
-            // Only confirm (haptic) when something actually landed on the clipboard
-            // — a blob that is neither an image UTI nor a decodable image copies
-            // nothing, and a haptic there would falsely say it worked.
-            if Self.writeImageToPasteboard(bytes: bytes, mimeType: mimeType) {
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            }
-        }
-    }
-
-    /// Prefer writing the raw bytes under their image UTI — it keeps the original
-    /// encoding (PNG alpha, an animated GIF) that a re-encoded `UIImage` would
-    /// flatten. Fall back to a decoded image only when the mime yields no image
-    /// UTI (an unknown/blank type). Returns whether anything was copied.
-    private static func writeImageToPasteboard(bytes: Data, mimeType: String) -> Bool {
-        if let type = UTType(mimeType: mimeType), type.conforms(to: .image) {
-            UIPasteboard.general.setData(bytes, forPasteboardType: type.identifier)
-            return true
-        }
-        if let image = UIImage(data: bytes) {
-            UIPasteboard.general.image = image
-            return true
-        }
-        return false
-    }
-
     /// `<tmp>/baybo-preview/<blob digest>/<filename>` — the digest directory
     /// keeps two blobs that share a filename apart, and lets a re-open reuse the
     /// file already written.

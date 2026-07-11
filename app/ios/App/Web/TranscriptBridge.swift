@@ -375,13 +375,6 @@ extension TranscriptBridge: WKScriptMessageHandler {
                 UIPasteboard.general.string = text
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             }
-        case "copyImage":
-            // A long-press on an image bubble. Unlike text, the bytes aren't in
-            // hand — the store fetches the (device-cached) blob, writes it to
-            // UIPasteboard, and fires the haptic on success.
-            if let blobId = body["blobId"] as? String {
-                store?.copyImage(blobId: blobId, mimeType: body["mimeType"] as? String ?? "")
-            }
         case "log":
             let level = body["level"] as? String ?? "info"
             let message = body["message"] as? String ?? ""

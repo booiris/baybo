@@ -205,13 +205,10 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   native→web
   `init/pushFrame/setConnEpoch/userSent/blobResult/fileState/setLanguage/setBottomInset/jumpToLatest/requestSync`;
   web→native
-  `ready/sync/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/viewImage/openUrl/copy/copyImage/log/jumpVisible/runState`.
+  `ready/sync/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/viewImage/openUrl/copy/log/jumpVisible/runState`.
   (`copy` is a user-bubble long-press: native writes `UIPasteboard` + fires a
   haptic, because a `file://` WKWebView rejects `navigator.clipboard` outside a
-  live gesture. `copyImage` is the image-bubble long-press — same reason, but the
-  bytes aren't in hand, so `ChatStore.copyImage` fetches the device-cached blob
-  and writes it to `UIPasteboard` under its image UTI, i.e. text copies inline in
-  the bridge while an image round-trips the store.) `runState` mirrors whether a
+  live gesture.) `runState` mirrors whether a
   turn is in flight to `ChatStore.agentRunning`, which flips the composer's send
   button to a stop control; a tap sends `/stop` as an ordinary `chatSend` (the
   agent Router cancels the turn out-of-band; the channel-echoed `/stop` user
@@ -272,12 +269,6 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   back to `attachment.<ext>` derived from the mime. Transcripts persisted before
   that field existed still load (`#[serde(default)]`) — they simply have no name,
   so an OLD message's image keeps sharing as `attachment.png`.
-  **A long-press on the image COPIES it** (`copyImage`, mirroring
-  the user bubble's long-press copy — shared `useLongPress` + the same squish/pill
-  confirm): the trailing tap-click is swallowed (`suppressClick`) so a copy
-  doesn't also open the viewer, and `.attachment-open` turns OFF
-  `-webkit-touch-callout`/`user-select` so iOS's own image callout can't fire at
-  ~500ms and fight the gesture.
   **An image the transcript has decoded before shows NO loading state at all.**
   Every decode records the image's natural `[w,h]` (keyed by the blob's sha256
   DIGEST — the read token rotates, the digest doesn't) into

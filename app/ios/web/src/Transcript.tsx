@@ -15,7 +15,6 @@ import {
 import { useTranslation } from "react-i18next";
 import {
   blobObjectUrl,
-  copyImage,
   copyText,
   downloadFile,
   fetchHistory,
@@ -443,15 +442,6 @@ function AttachmentImage({
   // The reserved placeholder box the observer watches until the row nears the
   // viewport.
   const holderRef = useRef<HTMLDivElement | null>(null);
-  // Long-press-to-copy confirm, mirroring the user text bubble: `copied` is a
-  // replay nonce (0 = idle) that re-mounts the pill on every copy; `suppressClick`
-  // swallows the trailing tap-click so a long-press copies WITHOUT also opening
-  // the viewer.
-  const [copied, setCopied] = useState(0);
-  const [toastBelow, setToastBelow] = useState(false);
-  const openRef = useRef<HTMLButtonElement | null>(null);
-  const copyTimer = useRef<number | undefined>(undefined);
-  const suppressClick = useRef(false);
 
   // Arm the lazy gate: observe the placeholder and load once it enters the
   // preload band. Disconnects on the first intersection. Without
@@ -515,26 +505,6 @@ function AttachmentImage({
     if (failedRef.current) setAttempt((a) => a + 1);
   }, [connEpoch]);
 
-  useEffect(() => () => clearTimeout(copyTimer.current), []);
-
-  // Long-press copies the image (native fetches the cached blob, writes
-  // UIPasteboard, fires the haptic). Guarded on `loaded` so a still-decoding
-  // spinner isn't a copy target. The pill floats above by default; flip it below
-  // when the image sits under the native header (same clearance the bubble uses).
-  const onCopy = useCallback(() => {
-    if (!loaded) return;
-    copyImage(attachment.blob_id, attachment.mime_type);
-    suppressClick.current = true;
-    const el = openRef.current;
-    const logEl = el?.closest(".chat-log");
-    const inset = logEl ? parseFloat(getComputedStyle(logEl).paddingTop) || 0 : 0;
-    setToastBelow(!!el && el.getBoundingClientRect().top - inset < TOAST_HEADER_CLEARANCE_PX);
-    setCopied((n) => n + 1);
-    clearTimeout(copyTimer.current);
-    copyTimer.current = window.setTimeout(() => setCopied(0), COPY_TOAST_MS);
-  }, [loaded, attachment.blob_id, attachment.mime_type]);
-  const longPress = useLongPress(onCopy);
-
   if (!visible) {
     return <div ref={holderRef} className="attachment-placeholder" aria-hidden="true" />;
   }
@@ -563,33 +533,15 @@ function AttachmentImage({
       {!loaded && <span className="attachment-spinner" aria-hidden="true" />}
       {url && (
         // Tap opens the image full-screen in the native zoomable viewer
-        // (`viewImage` → pinch, double-tap-to-restore); long-press copies it (see
-        // `onCopy`). A button wraps the img (not an onClick on it) so the wrapper
-        // stays put across the load — the img never remounts and its onLoad fires
-        // once.
+        // (`viewImage` → pinch, double-tap-to-restore). A button wraps the img
+        // (not an onClick on it) so the wrapper stays put across the load — the
+        // img never remounts and its onLoad fires once.
         <button
-          ref={openRef}
           type="button"
-          className={`attachment-open${copied !== 0 ? " copied" : ""}`}
-          onClick={() => {
-            // A long-press already copied — swallow the click it leaves behind
-            // rather than also opening the viewer.
-            if (suppressClick.current) {
-              suppressClick.current = false;
-              return;
-            }
-            viewImage(attachment.blob_id, attachment.filename ?? "", attachment.mime_type);
-          }}
-          onTouchStart={(e) => {
-            // Clear any stale suppression from a prior press whose click never
-            // arrived (a long-press then a drag synthesizes no click), so it
-            // can't swallow this gesture's tap.
-            suppressClick.current = false;
-            longPress.onTouchStart(e);
-          }}
-          onTouchMove={longPress.onTouchMove}
-          onTouchEnd={longPress.onTouchEnd}
-          onTouchCancel={longPress.onTouchEnd}
+          className="attachment-open"
+          onClick={() =>
+            viewImage(attachment.blob_id, attachment.filename ?? "", attachment.mime_type)
+          }
           aria-label={t("chat.viewImage")}
         >
           <img
@@ -612,16 +564,6 @@ function AttachmentImage({
             }}
             onError={() => setFailed(true)}
           />
-          {copied !== 0 && (
-            <span
-              key={copied}
-              className={`copy-toast${toastBelow ? " copy-toast-below" : ""}`}
-              aria-hidden="true"
-            >
-              <span className="copy-toast-check">✓</span>
-              {t("chat.copied")}
-            </span>
-          )}
         </button>
       )}
     </div>
