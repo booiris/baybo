@@ -66,7 +66,14 @@ final class AudioPlayerCenter {
         stopCurrent(notifyStopped: true)
         self.blobId = blobId
         self.title = title
-        let item = AVPlayerItem(url: url)
+        // Precise timing is load-bearing, not a nicety: for headerless/VBR
+        // containers AVPlayer's default duration is a bitrate GUESS (a 4:00
+        // ogg reported 5:04), which the card displays and the seek bar maps
+        // fractions onto — a scrub near the end would seek past the audio.
+        // The local-file scan this asks for is cheap.
+        let asset = AVURLAsset(
+            url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+        let item = AVPlayerItem(asset: asset)
         let player = AVPlayer(playerItem: item)
         self.player = player
         installObservers(item: item, player: player)

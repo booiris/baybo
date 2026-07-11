@@ -841,22 +841,29 @@ function useAudioState(blobId: string): AudioStatePayload {
   return audio;
 }
 
-/// The seek bar under a playing/paused track. A drag scrubs locally (the fill
-/// follows the finger, not the engine) and commits one `audioSeek` on lift; the
-/// committed value keeps rendering until the ENGINE's next push lands (native
-/// answers a seek with an optimistic state, so that's near-immediate), because
-/// falling back to the stale pre-seek `position` would snap the fill backwards
-/// for the round trip. Pointer events stop at the bar so a scrub never toggles
-/// the card under it; `touch-action: none` (CSS) keeps a horizontal drag from
-/// scrolling the thread.
+/// The audio card's seek bar — rendered in EVERY state so the card's height
+/// never jumps as playback starts/ends. Until the engine is engaged the bar is
+/// inert and empty: no handlers, so a tap on it bubbles to the card (play) and
+/// a hold arms the share like anywhere else on the card.
+///
+/// Engaged, a drag scrubs locally (the fill follows the finger, not the
+/// engine) and commits one `audioSeek` on lift; the committed value keeps
+/// rendering until the ENGINE's next push lands (native answers a seek with an
+/// optimistic state, so that's near-immediate), because falling back to the
+/// stale pre-seek `position` would snap the fill backwards for the round trip.
+/// Pointer events stop at the bar so a scrub never toggles the card under it;
+/// `touch-action: none` (CSS) keeps a horizontal drag from scrolling the
+/// thread.
 function AudioTrack({
   blobId,
   position,
   duration,
+  interactive,
 }: {
   blobId: string;
   position: number;
   duration: number;
+  interactive: boolean;
 }) {
   const barRef = useRef<HTMLDivElement | null>(null);
   const [scrub, setScrub] = useState<number | null>(null);
@@ -874,6 +881,14 @@ function AudioTrack({
     if (!rect || rect.width <= 0) return 0;
     return Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
   };
+
+  if (!interactive) {
+    return (
+      <div className="audio-track" aria-hidden="true">
+        <span className="audio-track-fill" style={{ width: "0%" }} />
+      </div>
+    );
+  }
 
   const shown = scrub ?? (duration > 0 ? position / duration : 0);
 
@@ -927,13 +942,25 @@ function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
   const [head, tail] = splitForMiddleEllipsis(name);
   const playing = audio.state === "playing";
   // Once the engine has touched this track the meta line becomes time and the
-  // scrubber appears; `stopped` (never played / ended / usurped) reads like a
-  // fresh file card again.
+  // scrubber goes live; `stopped` (never played / ended / usurped) reads like
+  // a resting card again.
   const engaged = state === "ready" && audio.state !== "stopped" && audio.duration > 0;
 
+  // The engine's duration is PRECISE (the asset is opened with precise
+  // timing) and permanently supersedes the wire's probe — after playback ends
+  // the resting meta must not fall back to an estimate the play just
+  // disproved. Held in a ref: it only matters on renders something else
+  // already triggered.
+  const engineDurationMs = useRef(0);
+  useEffect(() => {
+    if (audio.duration > 0) engineDurationMs.current = audio.duration * 1000;
+  }, [audio.duration]);
+  const restDurationMs =
+    engineDurationMs.current > 0 ? engineDurationMs.current : (attachment.duration_ms ?? null);
+
   // At rest the track's length rides the WIRE (`duration_ms`, probed at
-  // attach time), so it shows before any byte is downloaded — the engine only
-  // takes over the meta line once the track is engaged.
+  // attach time), so it shows before any byte is downloaded — the engine
+  // takes over once it has loaded the real thing.
   const meta =
     state === "loading"
       ? `${formatBytes(loaded)} / ${formatBytes(attachment.size)}`
@@ -941,7 +968,7 @@ function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
         ? `${formatTime(audio.position)} / ${formatTime(audio.duration)}`
         : [
             attachment.filename ? type : null,
-            attachment.duration_ms != null ? formatTime(attachment.duration_ms / 1000) : null,
+            restDurationMs != null ? formatTime(restDurationMs / 1000) : null,
             formatBytes(attachment.size),
           ]
             .filter(Boolean)
@@ -980,13 +1007,12 @@ function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
           <span className="file-name-head">{head}</span>
           {tail && <span className="file-name-tail">{tail}</span>}
         </span>
-        {engaged && (
-          <AudioTrack
-            blobId={attachment.blob_id}
-            position={audio.position}
-            duration={audio.duration}
-          />
-        )}
+        <AudioTrack
+          blobId={attachment.blob_id}
+          position={audio.position}
+          duration={audio.duration}
+          interactive={engaged}
+        />
         <span className="file-meta">{meta}</span>
       </span>
     </button>

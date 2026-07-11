@@ -327,11 +327,16 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   glyph slot promoted to a play/pause control once the blob is on disk
   (`AttachmentAudio`; the download flow is the file card's, unchanged). The
   track's LENGTH rides the wire — `WireAttachment.duration_ms`, probed by
-  `AttachFile` via lofty at attach time (the one moment the file is in hand
+  `AttachFile` at attach time (the one moment the file is in hand
   server-side) and carried through `ContentBlock::Audio` → `split_content` →
   the REST `ChatAttachment` — so the resting card reads `MP3 · 3:23 · 3.3 MB`
   before any byte is downloaded or played; `None` (inbound channel audio, old
-  rows) just drops the middle segment. The ENGINE is native — `AudioPlayerCenter` (`App/Core/AudioPlayerCenter.swift`),
+  rows) just drops the middle segment. The probe must not trust headers or
+  extensions (measured on synthetic 240s files): a VBR MP3 without a Xing
+  header estimates 6× off from first-frame bitrate math, so `audio/mpeg` gets
+  a full frame walk (`mp3-duration`); an Opus stream inside `.ogg` fails
+  lofty's extension guess, so lofty runs behind a content sniff
+  (`guess_file_type`). The ENGINE is native — `AudioPlayerCenter` (`App/Core/AudioPlayerCenter.swift`),
   ONE `AVPlayer` app-wide — driven over the bridge
   (`audioToggle`/`audioSeek`/`queryAudioState` in, `audioState` pushes out:
   play/pause flips, 2 Hz position ticks, `stopped` on end/usurp). Native
@@ -354,8 +359,15 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   engine sits in `.waiting…` — intent is playing); an `ended` latch keeps a
   finished track answering `stopped` to late `queryAudioState` (the player
   stays loaded for instant replay, but a remounting card must not resync to an
-  engaged "paused @ 0:00" the live card never showed). While a track is
-  engaged the card grows a seek bar (`AudioTrack`): drags scrub locally,
+  engaged "paused @ 0:00" the live card never showed). The engine opens the
+  asset with `AVURLAssetPreferPreciseDurationAndTiming` — the default
+  duration is a bitrate GUESS on headerless/VBR containers (a 4:00 ogg
+  reported 5:04), and the seek bar maps fractions onto it, so an imprecise
+  duration also mis-aims every scrub; the card remembers the precise engine
+  duration and never falls back to the wire estimate it disproved. The seek
+  bar (`AudioTrack`) renders in EVERY state so the card's height never jumps
+  as playback starts/ends — inert and empty until the engine engages (a tap
+  on it bubbles to the card and just plays). Engaged: drags scrub locally,
   commit ONE `audioSeek` on lift, and the committed value keeps rendering
   until the engine's next push (native answers a seek with an optimistic
   state) — dropping it at lift would snap the fill back to the pre-seek
