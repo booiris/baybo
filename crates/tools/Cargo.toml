@@ -48,6 +48,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tokio-util = { workspace = true }
 lofty = { workspace = true }
+mp3-duration = { workspace = true }
 mp4 = { workspace = true }
 matroska = { workspace = true }
 libc = { workspace = true }

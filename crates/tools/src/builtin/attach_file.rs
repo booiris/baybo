@@ -182,7 +182,15 @@ async fn probe_media_duration_ms(path: &Path, mime: &str) -> Option<u32> {
     let path = path.to_path_buf();
     let mime = mime.to_string();
     tokio::task::spawn_blocking(move || {
-        let ms = if mime.starts_with("audio/") {
+        let ms = if mime == "audio/mpeg" {
+            // MP3 first: header math (first-frame bitrate × size) lies for VBR
+            // files without a correct Xing header — both lofty here and
+            // AVPlayer's default estimate on the device get it wrong, and the
+            // card's number must match what actually plays. A frame walk is
+            // the only honest count; fall back to the estimate if the walk
+            // chokes on a malformed tail.
+            mp3_duration_ms(&path).or_else(|| audio_duration_ms(&path))
+        } else if mime.starts_with("audio/") {
             audio_duration_ms(&path)
         } else if mime == "video/mp4" || mime == "video/quicktime" {
             mp4_duration_ms(&path)
@@ -198,9 +206,25 @@ async fn probe_media_duration_ms(path: &Path, mime: &str) -> Option<u32> {
     .flatten()
 }
 
+fn mp3_duration_ms(path: &Path) -> Option<u32> {
+    let duration = mp3_duration::from_path(path).ok()?;
+    u32::try_from(duration.as_millis()).ok()
+}
+
 fn audio_duration_ms(path: &Path) -> Option<u32> {
     use lofty::file::AudioFile;
-    let file = lofty::read_from_path(path).ok()?;
+    use lofty::probe::Probe;
+    // Sniff the container by CONTENT, not extension: an Opus stream inside a
+    // `.ogg` fails the extension guess (lofty assumes Vorbis there) and would
+    // ship without a duration. Measured on synthetic 240s files: the
+    // extension path errors on Opus-in-.ogg; the sniff reads both Vorbis and
+    // Opus exactly.
+    let file = Probe::open(path)
+        .ok()?
+        .guess_file_type()
+        .ok()?
+        .read()
+        .ok()?;
     u32::try_from(file.properties().duration().as_millis()).ok()
 }
 
@@ -486,6 +510,34 @@ mod tests {
                 assert_eq!(mime_type, "application/x-custom");
             }
             other => panic!("expected File block, got {other:?}"),
+        }
+    }
+
+    /// The duration probe must not trust headers or extensions — both lied in
+    /// the field (a 4:00 ogg showed 3:41 at rest and 5:04 playing). The 2s
+    /// fixtures pin the two failure classes: a VBR MP3 without a Xing header
+    /// (first-frame bitrate math reported ~6× off; the frame walk is honest)
+    /// and an Opus stream inside `.ogg` (lofty's extension guess assumes
+    /// Vorbis and errors; the content sniff reads it exactly).
+    #[tokio::test]
+    async fn duration_probe_survives_vbr_mp3_and_opus_in_ogg() {
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/audio");
+        let cases = [
+            ("vbr-noxing-2s.mp3", "audio/mpeg"),
+            ("opus-2s.ogg", "audio/ogg"),
+            ("vorbis-2s.ogg", "audio/ogg"),
+        ];
+        for (file, mime) in cases {
+            let path = Path::new(fixtures).join(file);
+            let ms = probe_media_duration_ms(&path, mime)
+                .await
+                .unwrap_or_else(|| panic!("{file}: no duration"));
+            // Encoders pad a trailing partial frame; ±25% still catches both
+            // regressions (the estimate was 600% off, the parse a hard error).
+            assert!(
+                (1500..=2500).contains(&ms),
+                "{file}: got {ms}ms for a 2s fixture"
+            );
         }
     }
 }
