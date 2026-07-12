@@ -4,8 +4,9 @@ The native successor of `app/mobile` (the Tauri shell): a **SwiftUI app** whose
 screens, header, and composer are native — so the iOS keyboard never touches web
 content — with **only the chat transcript** rendered in a WKWebView, and the
 transport/crypto core kept in **Rust behind UniFFI**. For app behavior the root
-`/CLAUDE.md` applies; the visual system follows `app/mobile/CLAUDE.md`
-(monochrome soft line minimalism) until this app grows its own guide.
+`/CLAUDE.md` applies; the visual system follows the retired Tauri app's guide
+(monochrome soft line minimalism — the file went with `app/mobile`, read it with
+`git show 6141f57b^:app/mobile/CLAUDE.md`) until this app grows its own.
 
 ## Layout
 
@@ -18,10 +19,9 @@ bindgen/              — uniffi-bindgen CLI (separate member so the `cli`
                         feature never unifies into the lib build)
 project.yml           — xcodegen spec (the committed source of truth)
 App/                  — SwiftUI sources + resources
-NotificationExtension/ — NSE Swift sources (copied from app/mobile/apple;
-                        dedupe when app/mobile retires)
+NotificationExtension/ — NSE Swift sources (the sole copy — app/mobile is gone)
 web/                  — the transcript-only Vite/React bundle
-scripts/              — build-core.sh, build-app.sh, install.mjs
+scripts/              — build-core.sh, build-app.sh, install.mjs, verify-nse.sh
 Generated/ Externals/ — build products (gitignored): BayboCore.swift + .xcframework
 ```
 
@@ -78,7 +78,8 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 - The `PairedRecord` / `DirectCredentials` JSON field names are the on-keychain
   byte format shared with Tauri-shell installs.
 - NSE `Info.plist` key `BayboKeychainAccessGroup`; push payload/decrypt
-  contract unchanged (see `app/mobile/apple/README.md` while it exists).
+  contract unchanged (see `docs/modules/mobile/relay-push-security.md` § Notify
+  flow and `docs/modules/mobile/companion.md` § Push preview).
 - APNs environment is passed from Swift (`ClientConfig.apnsEnv`, per build
   config) — never `cfg!(debug_assertions)` in Rust, which usually compiles in
   release even for debug apps.
@@ -118,24 +119,30 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   relay merge `chat_list_sessions()` over it on appear/foreground/pull: direct
   uses REST `GET /v1/chat/sessions` with the stored Bearer plus
   `x-baybo-device-id`, while relay uses the Noise-protected API tunnel. Remote
-  wins for existence (a row missing remotely was hidden elsewhere) unless the
-  local row saw newer activity. Per-session transcript mirrors live in
-  `Application Support/baybo/transcripts/<id>.json`
+  wins for existence (a row missing remotely was hidden elsewhere): in-flight
+  local mutations (`pendingMutations`) and the `mutationEpoch` guard beat a
+  stale snapshot; otherwise server values win wholesale — a local row only fills
+  fields the server left nil (never overrides them). Per-session transcript
+  mirrors live in `Application Support/baybo/transcripts/<id>.json`
   (pruned to the ~10 most recent); the legacy single-session UserDefaults keys
   (`ChatDefaults`) are migrated once and retired.
 - **Live list unread**: the gateway broadcasts a throttled `Frame::SessionActivity`
   (per-session ping, no content) to EVERY connection on the `device` channel —
-  subscribed or not — when a session's turn completes (`SessionPulse`, now
-  installed on `device` as well as `http`; TUI is excluded). The FFI transport
-  special-cases that frame in `dispatch_inbound_frame`, routing it to a
+  subscribed or not — when a user send echoes or a session's turn completes
+  (`SessionPulse`, now installed on `device` as well as `http`; TUI is
+  excluded). The FFI transport special-cases that frame in
+  `dispatch_inbound_frame`, routing it to a
   connection-global `SessionListSink` (set once via `set_session_list_sink`)
   instead of the per-session `FrameSink` — so a session the device never opened
   still updates the list. `SessionActivityHandler` → `SessionIndex.noteActivity`
-  bumps `SessionRow.unread` (local-only, persisted; ignored for the foreground
-  session and for unknown ids) and recency; `ChatScreen` enter/leave marks the
-  foreground session and clears its badge. Relay warms the leg via
-  `relay_preconnect`; direct via `direct_preconnect` (both best-effort on
-  launch/foreground) so the pings arrive while parked on the list.
+  bumps `SessionRow.unread` and recency (persisted; ignored for the foreground
+  session and unknown ids) as a between-pulls accelerator — the badge is
+  server-computed (`unreadCount` on the list summary) and reconciled on every
+  list merge, and the webview's `mark_read` advances the server-side read cursor
+  (`chat_mark_read`) so the badge clears across devices. `ChatScreen`
+  enter/leave marks the foreground session and clears its badge. Relay warms the
+  leg via `relay_preconnect`; direct via `direct_preconnect` (both best-effort
+  on launch/foreground) so the pings arrive while parked on the list.
 - **Push tap routing**: the gateway embeds `session_id` INSIDE the encrypted
   preview plaintext (never the outer APNs payload — C stays blind, matching the
   hashed collapse-id invariant). The NSE decodes it (optional field; the pinned
@@ -203,9 +210,9 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   400ms; the core coalesces concurrent dials.
 - **Bridge** (`App/Web/TranscriptBridge.swift` ⇄ `web/src/bridge.ts`):
   native→web
-  `init/pushFrame/setConnEpoch/userSent/blobResult/fileState/audioState/videoPoster/setLanguage/setBottomInset/jumpToLatest/requestSync`;
+  `init/pushFrame/setConnEpoch/userSent/sendFailed/blobResult/fileState/audioState/videoPoster/setLanguage/setBottomInset/jumpToLatest/requestSync/flushPersist`;
   web→native
-  `ready/sync/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/shareFile/viewImage/audioToggle/audioSeek/queryAudioState/playVideo/requestVideoPoster/openUrl/copy/log/jumpVisible/runState`.
+  `ready/shown/sync/mark_read/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/shareFile/viewImage/audioToggle/audioSeek/queryAudioState/playVideo/requestVideoPoster/retry/openUrl/copy/log/jumpVisible/runState`.
   (`copy` is a user-bubble long-press: native writes `UIPasteboard` + fires a
   haptic, because a `file://` WKWebView rejects `navigator.clipboard` outside a
   live gesture.) Tool approvals deliberately add NO bridge message in either
@@ -550,12 +557,14 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   between tabs) is the SYSTEM's, and getting that authentic morph is exactly why
   the custom bar was dropped. Kept monochrome via `.tint(Theme.ink)` (ink
   selected item, neutral system-glass capsule, no accent hue); tab icons are
-  thin line SF Symbols (`sparkles`/`square.stack.3d.up`/`message`/
+  thin line SF Symbols (`waveform.path.ecg`/`square.stack.3d.up`/`message`/
   `gearshape`). The remaining CUSTOM glass surfaces are the chat composer
   dock, the jump-to-latest button, and the Chats header's compose circle
-  (`square.and.pencil`) — a recorded deviation from the `app/mobile/CLAUDE.md`
-  flat-monochrome system, which still governs everything else. History (see git
-  log, don't re-tread): a custom glass pill bar was built first — `matchedGeometry`
+  (`square.and.pencil`) — a recorded deviation from the flat-monochrome system
+  inherited from the retired Tauri app's guide
+  (`git show 6141f57b^:app/mobile/CLAUDE.md`), which still governs everything
+  else. History (see git log, don't re-tread): a custom glass pill bar was built
+  first — `matchedGeometry`
   chip → then a `GlassEffectContainer`+`glassEffectID` morph (which cross-faded on
   far hops and threw a red chromatic fringe) → then a single sliding-`.position`
   lozenge with a drag gel-stretch; none matched the native selection stretch, so
@@ -578,9 +587,9 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   native taps call `jumpToLatest` back; the composer-top geometry is measured
   on the ComposerView alone so the button never inflates the web inset.
 
-## Transcript hydration (sync-protocol v2 — read BEFORE touching hydration/lifecycle)
+## Transcript sync (sync-protocol v2 — read BEFORE touching sync/lifecycle)
 
-The old seven-cell hydration matrix is **retired**. Transcript hydration and
+The old seven-cell hydration matrix is **retired**. Transcript loading and
 forward recovery are now **one loop** (`docs/sync-protocol.md`), identical on
 both legs (same web bundle, same `GatewayJsonClient` API surface):
 
@@ -658,10 +667,8 @@ absent → retry resumes.
 - The old Tauri webview's localStorage (active session id + transcript mirror)
   is deliberately NOT migrated (owner's call — data gets reconstructed by hand);
   first launch after upgrade starts a fresh session. Gateway history is intact.
-- `verify-nse.sh` still lives in app/mobile and targets the Tauri project;
-  port it when app/mobile retires.
 - Voice input has no composer affordance anymore — the mic placeholder button
-  was removed with the Liquid Glass restyle (the Tauri app still shows one).
+  was removed with the Liquid Glass restyle (the deleted Tauri app had one).
   Wiring real capture later means re-adding the button, not just filling in a
   handler.
 

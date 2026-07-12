@@ -67,8 +67,8 @@ exchange:
 
 ```
         app (P, initiator)                       gateway (A, responder)
-msg1 ─► Hello { rendezvous_id, e }    claim the slot by rendezvous_id,
-        (psk pre-mixed, then e)       load the secret from the vault,
+msg1 ─► Hello { rendezvous_id, e }    claim the in-memory slot by rendezvous_id
+        (psk pre-mixed, then e)       (it holds the secret),
                                       build the XXpsk0 responder
 msg2 ◄─ HandshakeReply { msg }        (e, ee, s, es) — app now holds the gw static (in h)
 msg3 ─► HandshakeFinal { msg }        (s, se) — app static + the DeviceHello body as payload
@@ -77,14 +77,17 @@ msg3 ─► HandshakeFinal { msg }        (s, se) — app static + the DeviceHel
         show on phone; user accepts   publish to slot; operator confirms
 msg4 ─► Sealed( DeviceConfirm )       (transport msg)
 msg5 ◄─ Sealed( GatewayWelcome )      (transport msg, only after the operator confirms;
-                                       carries the active auth_token)
+                                       carries the active auth_token + gateway_push_pubkey)
+msg6 ─► Sealed( DeviceDelegation )    (transport msg; the device signs the welcome's
+                                       gateway_push_pubkey, authorizing it to manage the
+                                       device's APNs binding at C — see relay-push-security.md)
 ```
 
 `DeviceHello`'s non-static fields (`device_id`, `apns_token`, `apns_env`) ride as
 the **msg3 payload** (authenticated by the app static); the statics themselves are
 XX handshake tokens, not payload fields — so neither `DeviceHello` nor
-`GatewayWelcome` carries a `static_pubkey`. `DeviceConfirm` / `GatewayWelcome` are
-transport-mode messages (snow's implicit nonce).
+`GatewayWelcome` carries a `static_pubkey`. `DeviceConfirm` / `GatewayWelcome` /
+`DeviceDelegation` are transport-mode messages (snow's implicit nonce).
 
 (Implemented in `crates/device-proto/src/psk_pair.rs`: `PskHandshake` /
 `PskTransport` over `snow`. SPAKE2 — `pake.rs` and the `spake2` dep — is deleted.)
@@ -152,10 +155,11 @@ the QR secret leaks (shoulder-surf / forward); the operator prompt defaults to
 
 The secret lives only in the in-memory `DevicePairingSlot` (zeroized on drop) —
 never a plaintext column, never the durable `DeviceRow`, never `device list`,
-`GatewayWelcome`, `PairedSummary` (the ts-rs DTO returned to the webview), or any
-log. Only `rendezvous_id` (public) reaches those places — it is what `device list`
-and the durable row record. Observability logs at most a hashed `rendezvous_id`,
-never the secret or the confirm code.
+`GatewayWelcome`, `PairedSummary` (the uniffi record the iOS app renders after
+pairing), or any log. Only `rendezvous_id` (public) reaches those places — it is
+what `device list` and the durable row record. Observability logs at most the
+public `rendezvous_id` (device ids are logged hashed via `short_hash`), never the
+secret or the confirm code.
 
 ## Design constraints
 
@@ -163,14 +167,15 @@ never the secret or the confirm code.
   aborts, no token. An absent `s=` in the QR → the app refuses to pair (no silent
   downgrade).
 - **Fresh + single-use.** A new secret + rendezvous id per pairing, consumed and
-  zeroized on `complete`, never reused. XXpsk0's `ee` gives forward secrecy even if
+  zeroized on `stage`, never reused. XXpsk0's `ee` gives forward secrecy even if
   the secret later leaks; single-use keeps any leak window to one rendezvous.
 - **Relay-only.** Pairing runs exclusively over the relay; there is no direct/LAN
   pairing route. The prologue binds `endpoint`, which is what prevents cross-relay
   binding.
 - **Relay admission (`remote_api_key`) is orthogonal.** It is C's *own* per-tenant
   anti-abuse allow-list on a multi-tenant host (a per-key connection cap, two-level
-  bandwidth limits, and `guest`/`registered` tiers; resolved through one shared
+  bandwidth limits, and optional per-key expiry — the default `guest` key is an
+  ordinary admitted key, not a special class; resolved through one shared
   `Admission::resolve` seam), **not** protection against a hostile C — the PSK is
   what defends the app↔gateway channel. A leaked `remote_api_key` only lets someone
   burn C's quota (rotated control-plane-side, relay-agnostic); it can never MITM a
@@ -186,7 +191,8 @@ availability only (the PSK still blocks MITM). Mitigations:
 
 - the gateway **re-parks its host leg immediately** on a PSK-auth failure (no
   backoff), so a leg-stealer can't impose latency on the real app's retry;
-- a **per-rendezvous `/pair/join` rate limit** + a warn metric on PSK failures;
+- a **per-rendezvous `/pair/join` rate limit** (the relay warns once per window
+  when it trips);
 - the app **times out** the handshake reply, so a relay can't pin it open;
 - the typeable QR fallback is removed — on a render failure the command errors out
   asking for a wider terminal, never a shortened secret and never written to disk.
@@ -206,4 +212,4 @@ availability only (the PSK still blocks MITM). Mitigations:
 - `crates/gateway/src/channel/device_pair.rs` / `relay_pair.rs` — the A-side
   `drive()` + the relay host manager (re-park on PSK failure).
 - `crates/pairing/src/device_service.rs` — `mint` (returns rendezvous id + secret)
-  / `complete` (stores only `rendezvous_id`).
+  / `stage` + `approve_staged` (consume the slot; store only `rendezvous_id`).

@@ -10,7 +10,7 @@ Its job is:
   `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `JobStore`,
   `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`,
   `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`,
-  `DeviceStore`, `SkillRiskStore`) via libsql
+  `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`) via libsql
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
@@ -23,7 +23,8 @@ Because the trait contracts and their row/DTO types live in `baybo-store` (a lea
 Every `*Store` trait contract lives in `baybo-store`; `baybo-storage` only *implements* them. Most traits trade in plain value types (`baybo-model` domain types, or row/DTO types defined alongside the trait in `baybo-store`). Two of them — `JobStore` and `TraceStore` — trade in **row DTOs** (`JobRow` / `JobTransitionRow`, `StepRow` / `SpanRow` / `SpanEventRow`: a queryable key plus the serialized entity in a `data` column) so the trait can sit in the leaf ports crate while the rich `Job` / `Step` / `Span` types — which carry the state-machine and recorder logic — stay in `baybo-job` / `baybo-trace`. Those two crates own the `to_row` / `from_row` conversions and convert at the call boundary. `TraceStore::list_unfinished_steps` is the recovery-oriented indexed query: it returns steps that are themselves open or have an open child span, including detached steps under terminal jobs.
 
 ```
-libsql/session.rs         → impl SessionStore + SessionSummaryStore   (traits + StoredMessage / SessionSummaryRow from baybo-store)
+libsql/session.rs         → impl SessionStore                         (trait + StoredMessage from baybo-store)
+libsql/session_summary.rs → impl SessionSummaryStore                  (trait + SessionSummaryRow from baybo-store)
 libsql/trace.rs           → impl TraceStore                           (trait from baybo-store; rows ↔ Step/Span/SpanEvent via baybo-trace)
 libsql/secret.rs          → impl SecretStore                          (trait from baybo-store; one secrets table shared by minted placeholders, mcp.* creds, and user_env.* user secrets)
 libsql/job.rs             → impl JobStore                             (trait from baybo-store; rows ↔ Job via baybo-job)
@@ -37,6 +38,7 @@ libsql/blob.rs            → impl BlobStore                            (trait +
 libsql/session_folder.rs  → impl SessionFolderStore                   (trait + SessionFolderRow from baybo-store)
 libsql/task.rs            → impl TaskStore                            (trait + TaskPatch from baybo-store)
 libsql/device.rs          → impl DeviceStore                          (trait + DeviceRow / DeviceStatus from baybo-store)
+libsql/agent_profile.rs   → impl AgentProfileStore                    (trait + AgentProfileRow / AgentProfileUpdate from baybo-store)
 ```
 
 Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `libsql/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one.
@@ -45,9 +47,9 @@ Each file above holds its store's queries, but the table DDL is not colocated: e
 
 The conversation transcript itself is **not** stored on `Session` — it's owned by `baybo_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for new turns, `apply_session_compaction` for `/compact`, `load_active_session_messages` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions).
 
-The row schema carries **no read/unread state** — there is no `read_at`, `seen`, or unread-count column, and none exists anywhere server-side. "Unread" is a purely client-side derivation: the web sidebar counts `Frame::SessionActivity` pulses (see [channels.md](channels.md)) and the cron inbox tracks acknowledged fires in `localStorage`; neither is persisted, so read status doesn't survive a cleared browser or follow the user across devices. Adding server-trusted read state would be a from-scratch change spanning storage → `baybo-model` → gateway API → web.
+Read/unread state is **server-side at session granularity**: a `read_cursor` flat column on `sessions` holds the highest `session_messages.ordinal` a viewer has read. It is advanced max-wins (a lower ordinal is a no-op) by `PUT /v1/chat/sessions/:id/read` via `SessionStore::set_read_cursor` — the same targeted-UPDATE anti-clobber discipline as `hidden` / `last_llm` — and the chat list endpoint derives each row's `unread_count` from it. The web sidebar seeds its badge from that server-computed `unread_count` and bumps it live on `Frame::SessionActivity` pulses (see [channels.md](channels.md)); only the cron inbox still tracks acknowledged fires client-side in `localStorage`.
 
-`CostStore` and `SkillRiskStore` are unique in that their data types have no separate domain crate, so those types (`RiskVerdict` / `RiskLevel`, plus cost's `MicroUsd`-based rows) sit next to the trait in `baybo-store` — that keeps `baybo-skills` LLM-free while still letting the assessor crate persist verdicts against an opaque row type. `ChannelPairingStore` follows the same pattern: its row + status types (`ChannelPairingRow`, `PairingStatus`) live alongside the trait in `baybo-store`, so `baybo-pairing` depends on the ports crate alone rather than owning its own persistence contract.
+`SkillRiskStore` is unique in that its data types have no separate domain crate, so those types (`RiskVerdict` / `RiskLevel`) sit next to the trait in `baybo-store` — that keeps `baybo-skills` LLM-free while still letting the assessor crate persist verdicts against an opaque row type. (`CostStore` needs no row DTOs at all: it trades in plain `baybo-model` types — `CostRecord` / `CostSummary` and `MicroUsd`.) `ChannelPairingStore` follows the same pattern as `SkillRiskStore`: its row + status types (`ChannelPairingRow`, `PairingStatus`) live alongside the trait in `baybo-store`, so `baybo-pairing` depends on the ports crate alone rather than owning its own persistence contract.
 
 `SkillRiskStore` persists two kinds of rows:
 
@@ -114,11 +116,14 @@ applies the `superseded_by > N` form above. They agree only at the instant
 before the referenced rows are superseded — which holds because a reference is
 captured at call time (rows still active) and the at-most-one-compaction-in-
 flight invariant rules out a concurrent supersede. A differential test pins the
-equivalence so the two filters can't drift apart silently. The remaining helpers
-— `latest_session_ordinal`, `count_active_messages`, `active_index_of_ordinal` —
-exist to anchor and validate those references.
+equivalence so the two filters can't drift apart silently. Three anchoring
+helpers — `latest_session_ordinal`, `count_active_messages`,
+`active_index_of_ordinal` — exist to anchor and validate those references; the
+sync/backfill read surface (`load_active_session_messages_tail` / `_since`,
+`find_message_ordinal_by_platform_msg_id`) is covered in
+[sync-protocol.md](../sync-protocol.md).
 
-**Recovery read — full load today, a deferred bound.** The other consumer of
+**Recovery read — full load today, a deferred bound.** Another consumer of
 `load_session_messages_with_supersede` is the post-compaction transcript
 recovery read: the compaction summary embeds a virtual `logs/sessions/<id>.jsonl`
 path, and a `Read` of it is served by `baybo_agent`'s `SessionTranscriptReader`
@@ -156,8 +161,8 @@ Task rows are removed by `TaskUpdate(status: "deleted")` — a plain single-row
 `DELETE` of one task — or reaped by the `sessions` cascade; never a session or
 transcript row, so the never-delete-session-data rule is never in tension here. `TaskStore::list` skips
 a row whose stored `status` is unrecognized (written by a future variant) rather
-than failing the whole call, mirroring the session-blob skip discipline. Like
-every other table here, unread/acknowledged state is **not** stored server-side.
+than failing the whole call, mirroring the session-blob skip discipline. Task
+rows themselves carry no unread/acknowledged state.
 
 ### Single backend: libsql
 
@@ -179,7 +184,7 @@ Table schemas are created centrally in `LibsqlPool::init_db()`, but each Store s
 
 ### JSON field strategy
 
-Fields difficult to fully structure (`SessionState.extra`, `Job.input/output`) are stored as JSON. The trace stack stores the entire entity as a JSON `data` blob; queryable fields (`job_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns SQLite keeps in lockstep with `data` automatically — no two-side write contract for the storage layer to enforce. The security requirement still applies: values must already be sanitized before persistence.
+Fields difficult to fully structure (`SessionState.extra`, `Job.input` / `Job.final_result`) are stored as JSON. The trace stack stores the entire entity as a JSON `data` blob; queryable fields (`job_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns SQLite keeps in lockstep with `data` automatically — no two-side write contract for the storage layer to enforce. The security requirement still applies: values must already be sanitized before persistence.
 
 ### Transaction boundaries
 

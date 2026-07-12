@@ -29,7 +29,7 @@ Messages pass through `SecurityGateway::sanitize_input()` immediately after chan
 
 ### LLM-response defensive scrubbing
 
-`SecurityGateway::sanitize_llm_response(&mut LlmResponse)` is called in `AgentLoop::call_llm` *before* the response is recorded to the trace, pushed onto `session.messages`, or passed to the memory manager. It scans `content`, each `ContentBlock::Text`, `thinking`, and every string leaf inside `tool_calls[*].arguments`, minting placeholders and writing them back in place. An LLM that fabricates a secret-shaped string therefore cannot leak it through any downstream sink — the JSON dump stored by `SpanResult::LlmResponse` sees only placeholders.
+`SecurityGateway::sanitize_llm_response(&mut LlmResponse)` is called in `AgentLoop::call_llm` *before* the response is recorded to the trace, pushed onto `session.messages`, or passed to the memory manager. It scans `content`, each `ContentBlock::Text`, `thinking`, and every string leaf inside `tool_calls[*].arguments`, minting placeholders and writing them back in place. An LLM that fabricates a secret-shaped string therefore cannot leak it through any downstream sink — the `LlmCallResult` recorded at span finalize (`SpanFinalize::LlmCall`) sees only placeholders.
 
 ### Output re-sanitization
 
@@ -52,7 +52,7 @@ For the flushable prefix the gateway runs the scan/mint/vault pipeline, and the 
 
 ### Tool-argument reveal boundary
 
-`ToolExecutor::execute` captures `SpanInput::ToolExecution { parameters: params.clone() }` (placeholder form) *before* the reveal happens, then calls `reveal_in_value` on a separate copy and passes that copy to the tool. The trace and approval prompt see placeholders; the tool receives plaintext for its real API call. On return, `sanitize_tool_output` runs on the `ToolOutput` so that any echoed secret is re-minted and vaulted before the value flows into the trace, the next LLM call's `ToolResult`, or memory.
+`ToolExecutor::execute` records `ToolCallBegin { params: params.clone(), .. }` (placeholder form) on the tool-call span *before* the reveal happens, then calls `reveal_in_value` on a separate copy and passes that copy to the tool. The trace and approval prompt see placeholders; the tool receives plaintext for its real API call. On return, `sanitize_tool_output` runs on the `ToolOutput` so that any echoed secret is re-minted and vaulted before the value flows into the trace, the next LLM call's `ToolResult`, or memory.
 
 ### Prompt-injection defense
 
@@ -63,11 +63,11 @@ Injection markers (`ignore previous`, fake turn prefixes, ChatML/LLaMA control t
 
 ### Tool-output structural wrapping
 
-`baybo_context::prompts::tool_output::wrap_tool_output(tool_name, content, warning_rules)` (in `baybo-context`, not this crate) wraps the result in `<tool_output name="...">...</tool_output>`. The tool name is XML-attribute-escaped; any literal `</tool_output` inside the body is neutralized with a zero-width space between the slash and the tag name so untrusted content cannot forge the closing boundary. `warning_rules` are the injection-marker rule names the caller pulled from this crate's `InjectionDetector::scan`; passing them as plain strings keeps `baybo-context` free of an `baybo-security` dependency. The agent loop applies this wrap to every tool result before appending it to `ContentBlock::ToolResult`.
+`baybo_context::prompts::tool_output::wrap_tool_output(tool_name, content, warning_rules)` (in `baybo-context`, not this crate) wraps the result in `<tool_output name="...">...</tool_output>`. The tool name is XML-attribute-escaped; any literal `</tool_output` inside the body is neutralized with a zero-width space between the `<` and the slash so untrusted content cannot forge the closing boundary. `warning_rules` are the injection-marker rule names the caller pulled from this crate's `InjectionDetector::scan`; passing them as plain strings keeps `baybo-context` free of an `baybo-security` dependency. The agent loop applies this wrap to every tool result before appending it to `ContentBlock::ToolResult`.
 
 ### Tool-output length cap
 
-`baybo_context::prompts::tool_output::cap_tool_output(content, spill_path)` (in `baybo-context`, not this crate) truncates to `MAX_TOOL_OUTPUT_BYTES` on a UTF-8 char boundary and appends a truncation notice; when `spill_path` is set the notice points the model at the full payload (readable back via the `Read` tool). The cap runs **before** wrapping so the notice lands inside the `<tool_output>` envelope. Individual tools keep their own tighter bounds (`Bash` 64 KiB, `WebFetch` 256 KiB, `Grep` 500 hits, `Read` 2000 lines × 2000 chars/line, `Glob` 1000 paths) — this cap is a final defense for any tool that didn't apply one.
+`baybo_context::prompts::tool_output::cap_tool_output(content, spill_path)` (in `baybo-context`, not this crate) truncates to `MAX_TOOL_OUTPUT_BYTES` on a UTF-8 char boundary and appends a truncation notice; when `spill_path` is set the notice points the model at the full payload (readable back via the `Read` tool). The cap runs **before** wrapping so the notice lands inside the `<tool_output>` envelope. Individual tools keep their own tighter bounds (`Bash` 64 KiB, `WebFetch` 256 KiB, `Grep` 500 hits, `Read` 800 lines default (5000 max) × 2000 bytes/line, `Glob` 1000 paths) — this cap is a final defense for any tool that didn't apply one.
 
 ### Sensitive-path filter
 
@@ -112,13 +112,17 @@ encrypted with the same master key as everything else in the vault, so
 commands or pasted credentials typed into the TUI never appear as
 plaintext on disk.
 
-### Least-privilege injection (deferred)
+### Least-privilege injection
 
-Per-tool secret declaration and `ScopedSecretAccessor` were removed pending the
-finalized tool system. Until they return, `SecretVault` backs
-`SecurityGateway` placeholder storage and reveal; tools receive plaintext only
-through the tool-argument reveal boundary described above, never via
-`ToolContext`.
+Tools never open the vault directly. The agent layer implements
+`baybo_tools::SecretAccess` on top of `SecurityGateway` + `UserSecretManager`
+and injects it via `ToolContext::secrets`; `Bash` resolves declared
+`secret_env` names to plaintext for child-process env injection through
+`SecretAccess::resolve_env`, and `redact` reuses the gateway's mint/vault
+pipeline so injected values stay reveal-able. See
+[`secret-management.md`](../secret-management.md). Placeholder-bearing tool
+arguments still reach plaintext only through the tool-argument reveal boundary
+described above.
 
 ### Network decision boundary
 
@@ -127,11 +131,11 @@ Security only decides allow/deny. It does not execute network access. There is n
 ## Constraints
 
 - Primitives crate — no session/channel/storage dependencies
-- Trace records only sanitized `SpanInput` and `SpanResult` (including tool-call arguments)
+- Trace records only sanitized span begin/finalize payloads (`ToolCallBegin.params`, `LlmCallResult`, `ToolCallResult`) — including tool-call arguments
 - Job `input/output` stores sanitized versions only
 - Structured logs must not print `SecretValue` directly; reveal warnings log only a SHA-256 fingerprint prefix
 - Placeholder generation is deterministic per secret — same secret → same placeholder → single vault entry
-- The only code path permitted to hold plaintext at egress is the tool executor's post-reveal `params_revealed` on its way into `tool_registry.execute`; stream deltas, outgoing messages, trace, memory, and persistence all carry placeholder form
+- Plaintext at egress is permitted only at three points: the tool executor's post-reveal `params_revealed` into `tool_registry.execute`, `reveal_llm_response` on tool-side LLM replies (`billed_chat`), and `SecretAccess::resolve_env` for child-process env injection; stream deltas, outgoing messages, trace, memory, and persistence all carry placeholder form
 - Injection detection is log-only at inbound and log-plus-wrap at tool output; never auto-block user input on injection markers alone
 - Any tool that reads filesystem paths MUST apply `is_sensitive_path` at its entry point, regardless of approval-gate status
 - Any tool that emits HTTP MUST apply both layers of the SSRF floor (`validate_url_with`-equivalent literal-IP rejection + a `SafeResolver`-equivalent DNS-time resolved-IP filter using `is_blocked_ip`) at its entry point, regardless of approval-gate status
@@ -143,4 +147,4 @@ Security only decides allow/deny. It does not execute network access. There is n
 | `channels` | Input messages go to `agent::security::SecurityGateway` first |
 | `agent` | `agent::security::SecurityGateway` and `SecretVault` own business logic |
 | `trace` / `job` | Receive only sanitized payloads and placeholders |
-| `storage` | Defines `SecretStore` trait; provides libsql implementation |
+| `store` / `storage` | `baybo-store` defines the `SecretStore` trait; `baybo-storage` provides the libsql implementation |

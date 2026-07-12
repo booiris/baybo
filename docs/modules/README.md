@@ -18,7 +18,7 @@ Bottom-up along the dependency graph:
 ### Foundational Types Layer
 
 - **model** — Shared content primitives (ChatMessage, ContentBlock, Role, BlobRef, MessageMetadata, MessageSource), governance types (TrustLevel, ArtifactSource, ExtensionManifest), and pure-data persistence types (`CronJob` family, `CostRecord`/`CostSummary`/`TimeRange`). No business traits.
-- **store** — `baybo-store`: the persistence **ports** crate. Owns the shared `StorageError` and every `*Store` trait contract (`SessionStore`, `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `JobStore`, `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`, `ChannelPairingStore`, `ChannelSessionStore`, `ChannelBotStore`, `DeviceStore`, `SkillRiskStore`) plus the row/DTO types those traits exchange. Depends only on `model`; `baybo-storage` is the libsql adapter that implements the traits. `JobStore` / `TraceStore` trade in row DTOs (`JobRow` / `JobTransitionRow`, `StepRow` / `SpanRow` / `SpanEventRow` — a queryable key plus the serialized entity in `data`) so the trait can sit here as a leaf while the rich `Job` / `Step` / `Span` types and their state-machine / recorder logic stay in `job` / `trace`, which own the `to_row` / `from_row` conversions.
+- **store** — `baybo-store`: the persistence **ports** crate. Owns the shared `StorageError` and every `*Store` trait contract (`SessionStore`, `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `JobStore`, `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`, `ChannelPairingStore`, `ChannelSessionStore`, `ChannelBotStore`, `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`) plus the row/DTO types those traits exchange. Depends only on `model`; `baybo-storage` is the libsql adapter that implements the traits. `JobStore` / `TraceStore` trade in row DTOs (`JobRow` / `JobTransitionRow`, `StepRow` / `SpanRow` / `SpanEventRow` — a queryable key plus the serialized entity in `data`) so the trait can sit here as a leaf while the rich `Job` / `Step` / `Span` types and their state-machine / recorder logic stay in `job` / `trace`, which own the `to_row` / `from_row` conversions.
 - **config** — Root `BayboConfig` with JSON loading and `validate()`. Sections (llm, agent, session, channels, security, tools, trace, cost, workspace). Uses mirror structs to stay decoupled from domain crates.
 
 ### Ingress and Security Boundary Layer
@@ -38,13 +38,13 @@ Bottom-up along the dependency graph:
 - **workspace** — Identity files and long-running configuration.
 - **cron** — Cron scheduling: the `CronScheduler` business logic and `CronError`, standard cron syntax. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`) now live in `model` (re-exported here for back-compat); the `CronStore` trait lives in `store`.
 - **context** — Per-actor token budget + compression strategy + transcript ownership (`ContextManager`). Pure in-memory; persistence is the agent loop's job, brokered through `SessionStore` from `session`.
-- **session** — Owns the session business logic: the `SessionManager` facade (CRUD, timeout cleanup, transcript / summary persistence helpers) and `SessionError` (with `From<StorageError>`). The `SessionStore` / `SessionSummaryStore` traits and their `StoredMessage` / `SessionSummaryRow` row types now live in `store`; session domain types (`User`, `ChannelType`, `Session`, `SessionState`, `TriggerSource`, `Lineage`) live in `model`; `baybo-storage` provides the libsql implementations. A `Session` is the top of one trace tree (1 trace = 1 session); subagent spawn creates new sessions linked through `Lineage`.
+- **session** — Owns the session business logic: the `SessionManager` facade (CRUD, idle-session listing for the actor reaper (`idle_sessions` — never deletes rows), transcript / summary persistence helpers) and `SessionError` (with `From<StorageError>`). The `SessionStore` / `SessionSummaryStore` traits and their `StoredMessage` / `SessionSummaryRow` row types now live in `store`; session domain types (`User`, `ChannelType`, `Session`, `SessionState`, `TriggerSource`, `Lineage`) live in `model`; `baybo-storage` provides the libsql implementations. A `Session` is the top of one trace tree (1 trace = 1 session); subagent spawn creates new sessions linked through `Lineage`.
 
 ### Runtime and Observability Layer
 
 - **trace** — Trace types + row conversions + lifecycle recorder: `Step` / `Span` / `SpanEvent` domain types and the `SpanRecorder` lifecycle facade with its `TraceEvent` / `TraceEventStream` broadcast bus. The `TraceStore` trait lives in `store` and trades in `StepRow` / `SpanRow` / `SpanEventRow`; this crate owns the `to_row` / `from_row` conversions and converts at the recorder boundary. Half-open-span recovery utility included. Closed strong-typed enums; OTel-aligned naming.
 - **job** — Job types + row conversions + state machine + lifecycle orchestrator: `Job` (with `origin`), `JobStatus`, `JobInputKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, and the `JobLifecycle` persistence orchestrator (with `JobCancellationRegistry` and lifecycle-event bus). The `JobStore` trait lives in `store` and trades in `JobRow` / `JobTransitionRow`; this crate owns the state machine and the `to_row` / `from_row` conversions. `Cancelled` and `Failed` are independent terminal states.
-- **memory** — Pluggable long-term memory: a single `Memory` trait (one registered `Arc<dyn Memory>`, storage-opaque) with `recall` (sync) + `on_job_complete`/`on_session_end` (background) hooks + `tools()`. Core ships the trait + a `NoopMemory` default; no real backend yet (runtime wires `None`, an inert no-op path). The agent loop drives recall/write for `UserChat`+`Cron` jobs; recalled memories inject as framed `MessageSource::RecalledMemory` rows, never `Role::System`. See `docs/modules/memory.md`.
+- **memory** — Pluggable long-term memory: a single `Memory` trait (one registered `Arc<dyn Memory>`, storage-opaque) with `recall` (sync) + `on_job_complete`/`on_session_end` (background) hooks + `tools()`. Core ships the trait + a `NoopMemory` default; real backends ship in `crates/memory/src/backends/` (OpenViking, Mem0), selected by `MemoryProvider` in `baybo_memory::boot::build_memory_backend`; the runtime wires `None` (inert no-op) only when memory is disabled or `provider = noop`. The agent loop drives recall/write for `UserChat`+`Cron` jobs; recalled memories inject as framed `MessageSource::RecalledMemory` rows, never `Role::System`. See `docs/modules/memory.md`.
 - **cost** — LLM-call spend tracking: the `CostManager` (synchronous in-memory accumulator + async persist + `LlmCallGuard` bridge via `cost_call_guard`) and `CostError`. The `CostStore` trait lives in `store`; data types (`CostRecord`, `CostSummary`, `TimeRange`) live in `model`. Integer `MicroUsd` arithmetic — never floats.
 - **query** — Read-only analytics surface (`QueryApi`) over Session / Job / Step / Span / Cost. One `QueryError` collapses four upstream store error types; CLI and gateway admin handlers use it without re-deriving error shape.
 
@@ -58,15 +58,15 @@ Bottom-up along the dependency graph:
 - **bootstrap** — Binary entry point (`crates/baybo/src/main.rs`) and `boot` submodule. Loads `BayboConfig`, translates each section into domain types, and wires the Arc graph that `agent` consumes. Unit-tested mappings live in `boot`; Arc lifetime management stays in `main.rs`.
 - **cli** — Operator-facing command layer (`baybo-cli`). One `clap` tree drives both argv-mode commands (`baybo config show`) and in-conversation slash commands (`/config show`). Read-only and mutating commands share a single dispatcher; slash input that resolves to a CLI command never enters the agent's context. User-invocable skills are the one sanctioned exception: `/<skill>` is forwarded to the agent as a normal chat message so `SkillRegistry::select` can narrow on the exact-match branch.
 - **[tui](tui.md)** — Interactive terminal UI (`baybo-tui`). Ratatui + Crossterm frontend driven by a WS+MessagePack `WsTransport` client of `baybo-gateway`; no local manager graph, no workspace singleton. Hosts `TuiAdapter`, `TuiSlashHandler`, and `TuiDashboardProvider`. Input-history persistence is delivered over the same WS via `Frame::HistorySnapshot` / `Frame::HistoryAppend` — the TUI never opens the vault itself. Depends on `baybo-channels` for shared trait definitions only.
-- **[gateway](gateway.md)** — Headless HTTP backend (`baybo-gateway`). One axum server is both a `ChannelType::Http` adapter (chat flows through the normal Router path) and an admin REST/SSE API mirroring the CLI families. Auth is a dynamic per-install token stored in `SecretVault`; platform service units live behind `linux` / `macos` Cargo features (one knob per OS; reuse these for any future platform-specific gateway code). Driven by the `baybo gateway …` command tree.
+- **[gateway](gateway.md)** — Headless HTTP backend (`baybo-gateway`). One axum server is both a `ChannelType::http()` adapter (chat flows through the normal Router path) and an admin REST/SSE API mirroring the CLI families. Auth is a dynamic per-install token stored in `SecretVault`; platform service units live behind `linux` / `macos` Cargo features (one knob per OS; reuse these for any future platform-specific gateway code). Driven by the `baybo gateway …` command tree.
 
 ## Feature Subsystems (cross-crate)
 
 - [agent-profiles.md](agent-profiles.md) — User-managed chat personas (`AgentProfile`): DB-backed profiles bundling name, description, avatar (blob), system prompt (`NULL` = Soul), framework (`baybo`/`claude`/`codex`), and an optional LLM pin, with a locked built-in `baybo` row. Skills are shown read-only live from the registry, not stored on the profile. Spans `model` (id + framework types), `store`/`storage` (`AgentProfileStore` + `agent_profiles` table), `gateway` (`/v1/agents` CRUD), and the web **Agents** page. v1 is management-only — no runtime consumer reads profiles yet; distinct from `subagent`'s `SubagentProfile`.
-- [mobile/companion.md](mobile/companion.md) — The iOS companion app (`app/mobile`): scan-to-connect pairing + end-to-end-encrypted remote notifications. Spans `device-proto` (XXpsk0 pairing + Noise IK content + AEAD previews), `pairing` (`DevicePairingService`), `gateway` (the A-side host leg, content responder, relay-content manager, push dispatcher), and the separate `remote-host/` workspace (C — blind relay + APNs). 1:1 binding, the content/pairing relay path, push pipeline, and the cross-workspace e2e harness.
+- [mobile/companion.md](mobile/companion.md) — The iOS companion app (`app/ios`: SwiftUI `App/` + Rust `ffi/`): scan-to-connect pairing + end-to-end-encrypted remote notifications. Spans `device-proto` (XXpsk0 pairing + Noise IK content + AEAD previews), `pairing` (`DevicePairingService`), `gateway` (the A-side host leg, content responder, relay-content manager, push dispatcher), and the separate `remote-host/` workspace (C — blind relay + APNs). 1:1 binding, the content/pairing relay path, push pipeline, and the cross-workspace e2e harness.
 - [mobile/pairing-security.md](mobile/pairing-security.md) — The pairing **threat model** and crypto design: why device pairing is safe against a hostile relay. The `rendezvous_id` / 256-bit-`secret` split, `Noise_XXpsk0`, the high-entropy-secret invariant, prologue binding, confirm-code channel binding, and secret hygiene.
 - [mobile/relay-push-security.md](mobile/relay-push-security.md) — The mobile scan-to-pair, relay, and push security note: QR bootstrap, Noise IK content legs, encrypted APNs previews, remote-host transparency, proof sketches, and explicit security boundaries.
-- [mobile/blob-transfer.md](mobile/blob-transfer.md) — Dedicated relay blob legs for mobile attachment download/upload, including chat-priority bandwidth, token-gated `BlobStore::open_at`, upload limits, and the mobile Rust/Tauri/TS client.
+- [mobile/blob-transfer.md](mobile/blob-transfer.md) — Dedicated relay blob legs for mobile attachment download/upload, including chat-priority bandwidth, token-gated `BlobStore::open_at`, upload limits, and the iOS Swift + Rust-FFI client (`app/ios`).
 
 ## Cross-Cutting Guides
 
@@ -77,32 +77,31 @@ Bottom-up along the dependency graph:
 
 ```
 model (owns Session/User/ChannelType/SessionState + message types; no internal deps)
-  ├── channels ──► model
-  ├── llm ──► model
-  ├── context ──► model
-  ├── security ──► model, channels
-  ├── trace ──► model, context, job
-  ├── tools ──► model
-  ├── cron ──► model
-  ├── skills ──► model
-  ├── skills-assessor ──► skills, storage, llm, model
-  └── job (no internal deps)
+  ├── channels ──► model, wire, tools
+  ├── llm ──► model, security
+  ├── security ──► model, store
+  ├── trace ──► model, store, job
+  ├── tools ──► model, llm, security, session, store, storage, trace, workspace
+  ├── cron ──► model, store, tools
+  ├── skills ──► model, workspace, tools
+  ├── skills-assessor ──► skills, store, llm, model
+  ├── job ──► model, store
+  ├── config ──► model, workspace
   └── workspace (no internal deps)
-  └── config (no internal deps; external only)
 
 store     ──► model (ports crate: every *Store trait contract + the row/DTO types they exchange + StorageError; no logic)
 storage   ──► store, model (implements every *Store trait from the ports crate; exposes the Store DI bundle + libsql + retry; sole backend: libsql)
 janitor   ──► store, workspace, model (best-effort background sweeps; consumes ChannelPairingStore; spawned by the gateway)
-context   ──► model, llm, skills, session, subagent, tools, trace (owns ContextManager; pure in-memory; resolves subagent_type→system prompt; persistence routed via SessionStore)
+context   ──► model, llm, skills, session, subagent, tools, trace, workspace (owns ContextManager; pure in-memory; resolves subagent_type→system prompt; persistence routed via SessionStore)
 session   ──► model, store (owns SessionManager + SessionError; the SessionStore / SessionSummaryStore traits live in store)
 pairing   ──► model, store (owns PairingService + code generator; consumes ChannelPairingStore + ChannelPairingRow + PairingStatus from the ports crate)
 sandbox   ──► (no internal deps; OS sandbox runner consumed by agent)
 subagent  ──► model, session, tools (typed subagents + spawn_subagent tool; owns its Tool like skills/cron; profiles from <workspace>/agents/)
 task      ──► model, store, tools (planning-checklist Task* tools over the TaskStore trait; owns its Tool like cron/skills/subagent)
-agent     ──► model, llm, tools, subagent, skills, skills-assessor, workspace, context, session, trace, job, memory, cost, cron, security, sandbox, storage, channels
+agent     ──► model, llm, tools, subagent, skills, skills-assessor, workspace, context, session, trace, job, memory, cost, cron, security, sandbox, store, storage, channels
 gateway   ──► agent, channels, config, context, cron, cost, job, llm, model, pairing, query, security, session, skills, storage, store, tools, trace, workspace
-tui       ──► channels, model, tools (trait defs + shared types; talks to gateway over HTTP+SSE)
-setup     ──► channels, config, gateway, llm, model, security, storage, workspace (interactive first-run wizard; baybo-cli's llm-add/channel-add wrap its flow primitives)
+tui       ──► channels, model, tools (trait defs + shared types; talks to gateway over WS+MessagePack)
+setup     ──► agent, channels, config, gateway, llm, model, security, storage, store, workspace (interactive first-run wizard; baybo-cli's llm-add/channel-add wrap its flow primitives)
 bootstrap ──► config + all domain crates it assembles (entry point only)
 ```
 

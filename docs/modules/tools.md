@@ -16,33 +16,44 @@ Core responsibilities:
 Modeled after Claude Code's
 [tools reference](https://code.claude.com/docs/en/tools-reference). Tool
 names match the strings the LLM uses in function calls and operators use in
-permission rules.
+permission rules. The table covers the tools the LLM actually sees — the
+`baybo-tools::builtin` set plus the Cron/Skill/Task/subagent/memory families
+registered at runtime — not just `baybo-tools::builtin`.
 
 | Tool                                                                                                                                                                                                                                                                  | Status      | Notes                                                                                                       |
 | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------- |
 | `Read`, `Write`, `Edit`                                                                                                                                                                                                                                               | implemented | file I/O on absolute paths. `Edit` carries extra guards when `file_path` resolves under `<workspace>/profile/`: writes are restricted to the three identity files (`SOUL.md`, `USER.md`, `IDENTITY.md`), the existing file is capped at 1 MiB, and after a successful write the change is staged and committed to `profile/`'s standalone git repo with a fixed `Baybo <baybo@local>` author and `--no-verify` (audit history, not a hand-curated repo). Detached HEAD or commit failure leaves the file write in place and surfaces a `commit_warning` in the tool output. A profile edit does **not** change the running session's system prompt mid-turn; `ContextManager` re-resolves it on the next compaction (see [`agent.md`](agent.md)), so the edit takes effect from then on. |
 | `Bash`                                                                                                                                                                                                                                                                | implemented | `sh -c` under the configured `permission` policy. `auto` and `manual` use the OS sandbox in **permissive filesystem** mode when an inner sandbox runner is available; if Baybo detects an outer container/sandbox, Bash silently skips the inner sandbox, and if no backend is available on a non-container host, Bash warns and runs without it. `free` runs directly while keeping the tool-layer work-dir jail and uv shim. Network enabled. No env/cwd persistence across calls. See `docs/modules/sandbox.md#filesystem-policy-workspace-vs-permissive`. |
-| `Glob`, `Grep`                                                                                                                                                                                                                                                        | implemented | basic walkdir + regex; will be upgraded if throughput becomes an issue                                      |
+| `Glob`, `Grep`                                                                                                                                                                                                                                                        | implemented | shell out to the `rg` (ripgrep) binary (`Glob` = `rg --files --glob`, mtime-sorted; `Grep` parses `--json`/`--null` output). Sensitive paths are filtered from `Grep` results via `baybo_security::is_sensitive_path`. See [`external-commands.md`](../external-commands.md) for the `rg` dependency. |
 | `WebFetch`                                                                                                                                                                                                                                                            | implemented | renders the response as Markdown; when `prompt` is supplied, the agent layer has bound a side LLM into `ToolContext::llm` (gateway/runtime path binds `Some`, argv-mode leaves `None`), AND the rendered content is at least `SUMMARY_MIN_CHARS` (2048 chars), runs a fixed-system extraction pass and returns the model's reply instead of the raw body. Shorter pages and LLM-less builds fall through to raw markdown — the prompt is silently ignored. |
 | `AttachFile`                                                                                                                                                                                                                                                            | implemented | streams a local file into `BlobStore`; the loop attaches it to the turn's final reply                                      |
 | `Now`                                                                                                                                                                                                                                                                 | implemented | returns the current UTC + host-local time so the LLM can anchor relative-time reasoning; no parameters, no capabilities |
+| `SecretAdd`, `SecretList`, `SecretCheck`                                                                                                                                                                                                                              | implemented | value-blind user-secret management (`builtin/secret.rs`); no delete tool — deletion is CLI-only. See [Secret access](#secret-access) |
+| `JobList`, `JobStop`                                                                                                                                                                                                                                                  | implemented | view and kill the conversation's in-flight background jobs (detached subagents and `Bash` commands) via `BackgroundJobControl`; outside a user-facing session they report nothing in flight |
 | `Echo`                                                                                                                                                                                                                                                                | debug-only  | returns params verbatim; registered only under `debug_assertions` for round-trip smoke-testing              |
 | `CronCreate`, `CronDelete`, `CronList`                                                                                                                                                                                                                                | implemented | live in `baybo-cron::tools` (not `baybo-tools::builtin`) because they hold `Arc<CronScheduler>`; registered from `crates/baybo/src/runtime.rs` after the scheduler is constructed |
 | `Skill`                                                                                                                                                                                                                                                               | implemented | lives in `baybo-skills::tools` (parallel to `baybo-cron::tools`) because it holds `Arc<SkillRegistry>` + `Arc<dyn SkillRiskCheck>`; registered from `crates/baybo/src/runtime.rs` after the assessor is constructed. Mode 1 (no `file_path`) returns the SKILL.md body plus a categorized inventory of helper files (`references/`, `templates/`, `scripts/`, `other`). Mode 2 (`file_path` set) returns a sub-file's contents with path-traversal protections. Risk assessor and `required_env` approval gate fire on every call. |
 | `SkillInstall`                                                                                                                                                                                                                                                        | implemented | lives in `baybo-skills::tools` alongside `Skill`. Validates a source directory (must contain a parseable SKILL.md, must be outside the workspace skills dir, must not collide with an existing install), runs the risk assessor (`Dangerous` aborts with `ToolError::Denied`), copies the tree to `<workspace>/skills/<name>/` via a temp-dir-and-rename for atomicity, then triggers `SkillRegistry::reload()` so the new skill is available next turn. Declares `WriteFile` capability scoped to the skills dir. |
 | `SkillUninstall`                                                                                                                                                                                                                                                      | implemented | symmetric counterpart to `SkillInstall`. Looks up the skill by name, refuses if it has no on-disk source or its canonicalized `source_path` doesn't sit under the workspace skills dir (so registry-only or third-party-mounted skills aren't deletable), removes the directory recursively, then triggers `SkillRegistry::reload()`. Same `WriteFile` capability scoping. |
-| `TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`                                                                                                                                                                                                                      | implemented | the session planning checklist — live in `baybo-task::tools` (hold `Arc<dyn TaskStore>`); registered from `crates/baybo/src/runtime.rs`. The agent loop re-injects the list every turn and emits it to the web checklist. See [`task.md`](task.md). |
+| `TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`                                                                                                                                                                                                                      | implemented | the session planning checklist — live in `baybo-task::tools` (hold `Arc<dyn TaskStore>`); registered from `crates/baybo/src/runtime.rs`. The agent loop re-injects a throttled model-facing reminder (a nudge after ~10 turns without task management) and emits the live list to the web checklist unthrottled. See [`task.md`](task.md). |
+| `spawn_subagent`                                                                                                                                                                                                                                                      | implemented | lives in `baybo-subagent::tool` (holds the spawner, subagent registry, session manager, and the shared `SubagentDispatchLimiter`); registered from `crates/baybo/src/runtime.rs`. See the concurrency section below for why it is `Independent`. |
+| `viking_recall`, `viking_store`, `viking_forget`, `viking_archive_expand`                                                                                                                                                                                             | implemented | the memory backend's own tools (`crates/memory/src/backends/openviking.rs`); registered from `crates/baybo/src/runtime.rs` as builtins whenever memory is enabled — whatever `Memory::tools()` yields. See [`memory.md`](memory.md). |
 | `Agent`, `AskUserQuestion`, `SendMessage`, `EnterPlanMode`/`ExitPlanMode`, `EnterWorktree`/`ExitWorktree`, `LSP`, `Monitor`, `NotebookEdit`, `TaskStop`/`TaskOutput`, `ToolSearch`, `WebSearch`, `Team*`                                                               | TODO stub   | lives in `builtin::todo`; not auto-registered — each depends on a backing subsystem that has not yet landed (`TaskStop`/`TaskOutput` need the background-task runtime) |
 
-`ToolRegistry::with_defaults(blob_store, workspace_paths)` registers the
-implemented set with `TrustLevel::Trusted` manifests declaring their
+`ToolRegistry::with_defaults(blob_store, workspace_paths, proxy, permission)`
+registers the implemented set with `TrustLevel::Trusted` manifests declaring their
 capabilities (`ReadFile`, `WriteFile`, `Http`, `ExecCommand`). No LLM handle is
-threaded through the constructor or the `default_tools(blob_store, workspace_paths)`
+threaded through the constructor or the
+`default_tools(blob_store, workspace_paths, proxy, permission)`
 factory; `WebFetch`'s prompt-driven extraction reads its LLM from the per-call
 `ToolContext::llm` slot the agent layer binds at tool-call time. `workspace_paths`
 is forwarded to `Edit` (and `Write`/`Bash`) so the `profile/` write guard binds to
-the real workspace rather than a path-string heuristic. `AttachFile` is part of this
-default set and uses the supplied `BlobStore` to stage channel attachments.
+the real workspace rather than a path-string heuristic. `proxy` is the optional
+egress proxy handed to `WebFetch` (which also uses the supplied `BlobStore` to
+archive the fetched raw content), and `permission` is the shared
+`LivePermissionMode` handle described in the Bash permission policy section.
+`AttachFile` is part of this default set and uses the supplied `BlobStore` to
+stage channel attachments.
 Stubs exist so downstream can register them once their backing subsystem is
 ready without having to invent the tool name/schema at that point.
 
@@ -156,15 +167,21 @@ The `Skill` builtin is the LLM's entry point for declarative skills.
 Lives in `baybo-skills::tools` so it can take `Arc<SkillRegistry>`
 without `baybo-tools` gaining a dep edge into `baybo-skills`.
 
-- **Visibility:** the per-turn system reminder in `AgentLoop` lists
-  every `agent_invocable && trust_level != Untrusted` skill. The
-  `Skill` tool itself is always registered; when the registry is
-  empty the reminder is skipped, so the LLM never sees a usable list
-  and won't call.
-- **Slash sugar:** `/<cmd> [args]` synthesizes a deterministic
-  iteration-0 `Skill(name, args)` call before iter-1, so slash and
-  LLM-driven invocations share one execution path (risk assessor,
-  env-var approval, trace provenance).
+- **Visibility:** `ContextManager::ensure_seeded` appends a skill
+  reminder once per fresh session — a persisted `Role::User`
+  agent-context row (`render_skill_reminder`) listing every
+  `agent_invocable && trust_level != Untrusted` skill. The `Skill`
+  tool itself is always registered; when the registry is empty the
+  reminder is skipped, so the LLM never sees a usable list and won't
+  call.
+- **Slash expansion:** `/<cmd> [args]` is expanded before the first
+  LLM call by `ContextManager::expand_slash_command`: the skill's body
+  (via `baybo_skills::render_skill_for_slash`, `{{session_id}}`
+  substituted) is appended as a hidden agent-context row. This
+  deliberately skips the risk assessor — an explicit user slash command
+  is treated as authorized. Linked sub-files still carry an inventory +
+  hint so the model pulls them with a follow-up `Skill` tool call, which
+  does run the full gate (risk assessor, env-var approval).
 - **Manifest:** `TrustLevel::Trusted`, no capabilities — the tool
   itself only renders metadata and reads files inside the
   operator-controlled skill directory; outbound side effects all
@@ -184,8 +201,8 @@ without `baybo-tools` gaining a dep edge into `baybo-skills`.
   *values* are never templated into the response; the skill body is
   expected to instruct downstream tool calls on how to read them.
 
-See [`skills.md`](./skills.md#selection-pipeline) for how the agent
-loop publishes the per-turn skill list.
+See [`skills.md`](./skills.md#selection-pipeline) for how the skill
+list is rendered and reused for slash-command matching.
 
 ### Capability-driven governance
 
@@ -256,8 +273,10 @@ Current overrides:
 - `WebFetchTool` → 120 s — slow upstreams need headroom, but a stuck host shouldn't pin a turn forever; `connect_timeout` independently caps the connect phase at 10 s.
 - `SkillInstallTool` → 120 s — risk-assessor LLM call + recursive directory copy + registry hot-reload, against bundles that may carry templates + scripts + reference docs.
 - `GlobTool`, `GrepTool`, `AttachFileTool`, `SkillTool`, `McpTool` → 60 s — recursive walks against large monorepos (`Glob`, `Grep`), 100-MiB file streams into the blob store (`AttachFile`), the per-call risk-assessor LLM round-trip (`Skill`), and arbitrary upstream MCP servers (`McpTool`) all routinely overflow the 30 s default.
+- `SpawnSubagentTool` → 30 days (`TOOL_WAIT_BACKSTOP`) — a foreground spawn blocks on its child's whole lifetime, so the outer deadline is a backstop, not a budget.
+- `viking_store` → config-driven (`OpenViking` `timeouts.store_max`).
 
-All other builtins (`Read`, `Write`, `Edit`, `Echo`, `Now`, `CronCreate`, `CronDelete`, `CronList`, `SkillUninstall`, every `todo` stub) use the default — they're either pure data ops or fail fast.
+All other tools (`Read`, `Write`, `Edit`, `Echo`, `Now`, `Secret*`, `JobList`, `JobStop`, `CronCreate`, `CronDelete`, `CronList`, `SkillUninstall`, `Task*`, the other `viking_*` tools, every `todo` stub) use the default — they're either pure data ops or fail fast.
 
 ### Per-tool concurrency
 
@@ -282,11 +301,11 @@ Two emission styles share the same sink:
 - **Phase timers** — use `start_timer(&ctx.events, "phase_name")` for the common scoped-duration case. The returned RAII guard emits a `ToolEventPayload::Phase { duration_ms }` on `Drop`, so timing a scope is one line.
 - **Rich payloads** — call `events.emit(action, ToolEventPayload::HttpFetch { … })` (or `LlmCall { … }`) directly when the observation carries content. Producers MUST truncate large string fields before emitting; the executor enforces a second-layer per-call byte cap.
 
-The agent's `ToolExecutor` builds a per-call `SpanEventRecorder` (`crates/agent/src/tool_executor.rs`), threads it through `ctx.events`, and drains the buffered `(action, payload)` entries into `SpanEventKind::ToolEvent` span events after the tool returns — regardless of success, failure, or timeout. The drain runs every text field in the payload through `SecurityGateway::sanitize_stream_fragment` so any leaked secrets are minted into placeholders before they hit the trace store. There is no entry-count cap; the only guard is a 64 MiB ceiling on the total text bytes carried by payloads from a single tool call. Entries that would push the running total past that ceiling are dropped silently — the trace is best-effort, not load-bearing. The trace view (`app/web/src/pages/TraceSessionPage.tsx`) renders each event under the tool span's Events tab.
+The agent's `ToolExecutor` builds a per-call `SpanEventRecorder` (`crates/agent/src/runtime/tool_executor.rs`), threads it through `ctx.events`, and drains the buffered `(action, payload)` entries into `SpanEventKind::ToolEvent` span events after the tool returns — regardless of success, failure, or timeout. The drain runs every text field in the payload through `SecurityGateway::sanitize_stream_fragment` so any leaked secrets are minted into placeholders before they hit the trace store. There is no entry-count cap; the only guard is a 64 MiB ceiling on the total text bytes carried by payloads from a single tool call. Entries that would push the running total past that ceiling are dropped silently — the trace is best-effort, not load-bearing. The trace view (`app/web/src/pages/TraceSessionPage.tsx`) renders each event under the tool span's Events tab.
 
 `WebFetchTool` is the reference consumer:
 
-- Phase timers: `http_request`, `read_body`, `html_to_markdown` (HTML only), `llm_summary` (prompt + side-LLM only), `read_error_body` (non-2xx).
+- Phase timers: `http_request`, `read_body`, `extract_article` (HTML readability extraction + markdown render), `archive_raw_blob` (raw-content archival into `BlobStore`), `llm_summary` (prompt + side-LLM only), `read_error_body` (non-2xx).
 - `HttpFetch` payload on `http_response` (both success and failure paths): status, byte count, content-type, and a UTF-8-bounded rendered-body preview.
 - `LlmCall` payload on `llm_summary` (success path): model id, the full assembled user message handed to the side LLM, and the model's response (each producer-truncated to `MAX_SUMMARY_INPUT_BYTES` / `MAX_OUTPUT_BYTES`).
 
@@ -295,7 +314,7 @@ The agent's `ToolExecutor` builds a per-call `SpanEventRecorder` (`crates/agent/
 - Depends on `baybo-llm`, `baybo-model`, `baybo-security`, `baybo-storage`, `baybo-workspace`, plus `rmcp` + `oauth2` + `axum` (callback listener) for the MCP client
 - Does not install third-party artifacts
 - Defines the `ApprovalGate` trait but never implements the user-facing UX — the per-connection gate is built by the gateway's WS sidecar (`ChannelApprovalGate` backed by an `ApprovalQueue`), and the TUI renders the resulting prompts inline in its scrollback
-- `artifact_hash` must be recorded in `trace::ExecutionProvenance`
+- `artifact_hash` must be recorded as `tool_artifact_hash` on the `ToolCall` span's `trace::ToolCallBegin` — today `ToolManifest` carries no artifact hash, so the executor writes an empty string
 
 ## Collaboration
 

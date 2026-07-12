@@ -21,7 +21,7 @@ The layering follows the `session_summaries` precedent:
 
 - **`baybo-model`** — the value types (`Task`, `TaskStatus`, `TaskId`) plus the
   tool-name consts (`TASK_CREATE_TOOL_NAME`, …, `TASK_MUTATING_TOOL_NAMES`).
-  Pure data, shared one-way like `PendingSubagentResult`.
+  Pure data, shared one-way like `PendingBackgroundResult`.
 - **`baybo-store`** — the `TaskStore` trait + `TaskPatch` (the ports contract).
 - **`baybo-storage`** — `LibsqlTaskStore` over the dedicated `session_tasks`
   table.

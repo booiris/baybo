@@ -200,7 +200,7 @@ into the close edge — no special-case `TurnState` broadcast in the runner.
 
 ## Related
 
-- `crates/channels/src/types.rs` (`AgentOutput` / `AgentEvent` / `ToolStatus`), `crates/channels/src/wire.rs` (`Frame`)
+- `crates/channels/src/types.rs` (`AgentOutput` / `AgentEvent` / `ToolStatus`), `crates/wire/src/lib.rs` (`Frame` — its own `wire` crate, re-exported as `baybo_channels::wire`)
 - `crates/agent/src/runtime/agent_loop.rs` (`chat_streaming`, `run_iteration`); `crates/agent/src/runtime/tool_executor.rs` (future per-tool emission point)
 - `crates/trace/src/recorder.rs` (`TraceEventStream` — the audit bus this deliberately does *not* use)
 - [`docs/mid-turn-user-interjection.md`](mid-turn-user-interjection.md) — sibling cross-cutting agent-loop feature

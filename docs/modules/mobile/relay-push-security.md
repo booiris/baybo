@@ -46,7 +46,7 @@ C is allowed to see:
 - Relay route identifiers: pairing `rendezvous_id`, content `relay_node_id`, and
   C-minted `relay_key`.
 - Relay connection source address, connection time, close time, byte lengths,
-  timing, and traffic class (`chat` or `blob`).
+  timing, and traffic class (`chat`, `api`, or `blob`).
 - Push registration metadata: `device_id` (a 32-byte Ed25519 public key, hex),
   APNs token, APNs environment, and the binding-authentication fields
   (`gateway_pubkey`, `delegation`, `sig`, `counter`).
@@ -69,8 +69,8 @@ Relevant code:
 - Operator command: `crates/cli/src/commands/device.rs`
 - A-side pairing host: `crates/gateway/src/channel/relay_pair.rs`
 - A-side XXpsk0 driver: `crates/gateway/src/channel/device_pair.rs`
-- P-side scanner and UI: `app/mobile/src/App.tsx`
-- P-side pairing pump: `app/mobile/src-tauri/src/pairing.rs`
+- P-side scanner UI: `app/ios/App/Screens/ScanView.swift` (QR payload parse: `app/ios/ffi/src/qr.rs`)
+- P-side pairing pump: `app/ios/ffi/src/relay/pairing.rs`
 
 The scan flow exists to deliver one high-entropy secret out of band and to bind
 the user-visible pairing action to a live cryptographic transcript.
@@ -123,15 +123,17 @@ fails. A short fallback would be offline-crackable by a hostile relay.
    manual pairing-code fallback.
 3. If `h` is absent, the app uses the built-in default relay endpoint. The
    current CLI includes `h`.
-4. Immediately after a valid scan, the app calls the Tauri `pair_begin` command
-   with `endpoint`, `rendezvous_id`, `secret`, and optional `remote_api_key`.
+4. Immediately after a valid scan, the app calls the FFI `pair_begin` method
+   (`BayboClient::pair_begin`) with `endpoint`, `rendezvous_id`, `secret`, and
+   optional `remote_api_key`.
 5. `pair_begin` dials C's app-side pairing route:
    `GET /pair/join/{rendezvous_id}` with `x-remote-api-key: <k>`.
 6. P decodes `s` and requires exactly 32 bytes. Anything shorter or malformed is
    rejected before the handshake starts.
-7. P loads or creates its long-term Noise static identity from the keychain. The
-   `device_id` is derived from the public key prefix, so re-pairing the same
-   physical device keeps a stable identity.
+7. P loads or creates its long-term Noise static identity from the keychain, plus
+   a separate Ed25519 push identity; the `device_id` is
+   `device-<hex(ed25519 pubkey)>`, so re-pairing the same physical device keeps a
+   stable identity.
 8. P sends `Hello { rendezvous_id, msg=e }`, starting XXpsk0 as initiator with
    the QR secret as PSK.
 
@@ -153,7 +155,7 @@ fails. A short fallback would be offline-crackable by a hostile relay.
      device row.
    - A stores the per-device `push_key` in `SecretVault`.
    - A persists APNs registration material for retry.
-   - A returns `auth_token`, gateway static public key, `relay_node_id`, and
+   - A returns `auth_token`, gateway push public key, `relay_node_id`, and
      relay settings in the sealed welcome.
    - P stores the paired record and its device Ed25519 identity in its private
      keychain, and the `push_key` in the shared App Group keychain.
@@ -370,8 +372,8 @@ gateway's push signing key, which it never holds.
 
 Relevant code:
 
-- P transport: `app/mobile/src-tauri/src/content.rs`
-- P crypto/session core: `app/mobile/core/src/content.rs`
+- P transport: `app/ios/ffi/src/relay/chat.rs` (generic frame pump: `app/ios/ffi/src/transport.rs`)
+- P crypto/session core: `app/ios/ffi/src/core/content.rs`
 - A relay control manager: `crates/gateway/src/channel/relay_content.rs`
 - A Noise responder: `crates/gateway/src/channel/device_content.rs`
 - C relay protocol: `remote-host/crates/protocol/src/relay.rs`
@@ -445,8 +447,8 @@ Relevant code:
 
 - A push dispatcher (preview + signed register/notify): `crates/gateway/src/push/mod.rs`
 - A delegation capture at pairing: `crates/gateway/src/channel/device_pair.rs`
-- A token refresh on the content leg: `crates/gateway/src/channel/device_content.rs`
-- P APNs token capture: `app/mobile/src-tauri/src/push_register.rs`
+- A token refresh endpoint (`POST /v1/mobile/apns-token`): `crates/gateway/src/api/admin/push.rs`
+- P APNs token capture: `app/ios/App/AppDelegate.swift` → `app/ios/ffi/src/apns.rs` (`BayboClient::set_apns_token`)
 - Delegation crypto (A signs, C verifies, byte layout pinned):
   `crates/device-proto/src/delegation.rs`, `remote-host/crates/push/src/delegation.rs`
 - AEAD framing: `crates/device-proto/src/aead.rs`
@@ -456,9 +458,9 @@ Relevant code:
 - C push HTTP routes: `remote-host/crates/push/src/http.rs`
 - C device-token store: `remote-host/crates/push/src/store.rs`
 - P NSE decrypt path:
-  `app/mobile/apple/NotificationExtension/NotificationService.swift`
+  `app/ios/NotificationExtension/NotificationService.swift`
 - P NSE keychain path:
-  `app/mobile/apple/NotificationExtension/PushKeyStore.swift`
+  `app/ios/NotificationExtension/PushKeyStore.swift`
 
 The push flow has two stages: **register** the device's APNs binding with C
 (gateway-signed, once per `(device, token)`), then per pushable turn **notify** —
@@ -549,8 +551,12 @@ Preview construction:
 4. A frames the plaintext preview as JSON:
 
 ```json
-{ "title": "Baybo", "body": "..." }
+{ "title": "Baybo", "body": "...", "session_id": "..." }
 ```
+
+   The `session_id` rides inside the sealed plaintext — never the outer APNs
+   payload — so the app can deep-link a notification tap to its conversation
+   while C stays blind to session ids. Older NSE builds ignore the field.
 
 Encryption and `/notify`:
 
@@ -567,7 +573,7 @@ Encryption and `/notify`:
 ```json
 {
   "device_id": "device-<hex(ed25519 pubkey)>",
-  "collapse_id": "<hex(sha256(device_id || ':' || session_id))[..16]>",
+  "collapse_id": "<hex(sha256(device_id || ':' || session_id)[..16])>",
   "bid": "device-...",
   "enc": "base64(ciphertext||tag)",
   "n": "base64(nonce)",
@@ -618,14 +624,14 @@ guarantee.
 
 The sections above describe the **scan-to-pair** (Noise device) path. The
 **direct** transport — connect by typing a gateway URL + admin token, no pairing
-(see [`companion.md`](companion.md) and `app/mobile/src-tauri/src/direct/`) — has
+(see [`companion.md`](companion.md) and `app/ios/ffi/src/direct/`) — has
 no Noise handshake to bootstrap push from, yet can still deliver lock-screen
 pushes by provisioning the *same* binding over the admin-token TLS REST surface.
 
 Relevant code:
 
-- App registration: `app/mobile/src-tauri/src/direct/push.rs` (Tauri command
-  `direct_push_register`).
+- App registration: `app/ios/ffi/src/direct/push.rs` (`register`, exposed as
+  `BayboClient::register_push`).
 - Gateway endpoints: `crates/gateway/src/api/admin/push.rs`
   (`GET /v1/push/params`, `POST /v1/push/register`).
 - Gateway binding store: `crates/gateway/src/push/web.rs`.
@@ -983,4 +989,4 @@ not from C admission.
 - `remote-host/crates/relay/src/broker.rs` - C blind relay broker.
 - `remote-host/crates/relay/src/serve.rs` - C relay WS routes and admission.
 - `remote-host/crates/push/src/notify.rs` - C push pipeline.
-- `app/mobile/apple/NotificationExtension/NotificationService.swift` - P-side NSE decrypt path.
+- `app/ios/NotificationExtension/NotificationService.swift` - P-side NSE decrypt path.

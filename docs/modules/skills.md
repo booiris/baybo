@@ -9,7 +9,7 @@ The `skills` crate defines, loads, selects, and hot-reloads declarative skills w
 Core responsibilities:
 
 - Skill definition with source, version, and trust level
-- Invocation matching: `/<cmd>` narrows to one skill, anything else returns the full registered set for the model to choose from
+- Invocation matching: `/<cmd>` expands the one matching skill; otherwise the model picks from a per-session listing and pulls a skill in via the `Skill` tool
 - Constrain which tools a skill may call
 
 ## Skill file format
@@ -61,11 +61,11 @@ All fields are optional. When omitted, `name` falls back to the directory name.
 
 Skill names must match `[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}` — the same characters permitted in the `/<name>` slash command. Display strings with spaces or slashes are rejected at load time.
 
-The prompt body is injected wrapped in a `<skill name="…" version="…">…</skill>` block assembled by `render::render_skill_block`. Escaping is applied lazily at render time — the in-memory `SkillDefinition` keeps the author's original text for CLI display, while the rendered block runs every field through XML-attribute / tag-breakout escapes. Every `<skill` / `</skill` occurrence inside the body (case-insensitive, tolerant of whitespace and null bytes) has its leading `<` replaced with `&lt;`. Together with the restricted name/version grammars this closes the tag-forging class of attacks end-to-end.
+When a skill definition is re-broadcast after context compaction (the skill trailer in `baybo-context`), the prompt body is wrapped in a `<skill name="…" version="…">…</skill>` block assembled by `render::render_skill_block`. Escaping is applied lazily at render time — the in-memory `SkillDefinition` keeps the author's original text for CLI display, while the rendered block runs every field through XML-attribute / tag-breakout escapes. Every `<skill` / `</skill` occurrence inside the body (case-insensitive, tolerant of whitespace and null bytes) has its leading `<` replaced with `&lt;`. Together with the restricted name/version grammars this closes the tag-forging class of attacks end-to-end.
 
 Unsupported YAML features (anchors, folded/literal block scalars, nested mappings) are **rejected** rather than silently mis-parsed — keeps the author's intent honest and the parser small.
 
-The Markdown body becomes `prompt_template` and is injected as a system message when the skill is selected.
+The Markdown body becomes `prompt_template`; it reaches the model as the `Skill` tool's JSON result, or as a hidden agent-context row when invoked via `/<name>`.
 
 ## Design Decisions
 
@@ -78,7 +78,7 @@ Every skill exposes two independent entry points; both default on:
 
 A `/deploy` skill that's too dangerous to auto-trigger sets `disable-model-invocation: true`; a `legacy-system-context` reference that isn't actionable as a command sets `user-invocable: false`. A regex-based pattern trigger is **not** modelled — use `description` plus model decision instead.
 
-The `/<name>` entry point is surfaced on channel adapters by `baybo-cli`'s `CliSlashHandler`: `commands()` lists every skill with `command.is_some()` so TUI autocomplete shows them alongside built-ins, and `handle()` returns `PassThrough` for `/<skill>` so the raw line reaches the agent and `select()` narrows on the exact match. See [`cli.md`](./cli.md#skill-shortcut) and [`tui.md`](./tui.md#skill-shortcuts) for the full wiring.
+The `/<name>` entry point is surfaced on channel adapters by `baybo-cli`'s `CliSlashHandler`: `commands()` lists every skill with `command.is_some()` so TUI autocomplete shows them alongside built-ins, and `handle()` returns `PassThrough` for `/<skill>` so the raw line reaches the agent and `ContextManager::expand_slash_command` matches the leading `/<cmd>` against the invocable skill set and injects the skill body. See [`cli.md`](./cli.md#skill-shortcut) and [`tui.md`](./tui.md#slash-completion) for the full wiring.
 
 ### Three-tier trust model
 
@@ -89,8 +89,10 @@ The `/<name>` entry point is surfaced on channel adapters by `baybo-cli`'s `CliS
 ### Selection pipeline
 
 Skills are no longer auto-injected at user-turn start. Instead the
-agent loop publishes a per-turn **system reminder** listing every
-agent-invocable, non-`Untrusted` skill (name, description, optional
+agent loop seeds a session-start **system reminder** (an agent-context
+row appended by `ContextManager::ensure_seeded`, re-broadcast after
+each compaction via the skill trailer) listing every agent-invocable,
+non-`Untrusted` skill (name, description, optional
 `argument-hint`); the LLM pulls one in by calling the `Skill` tool
 (see [`tools.md`](./tools.md#skill-tool)). The list comes from
 `SkillRegistry::all_summaries_sorted()` — a lightweight projection
@@ -103,19 +105,22 @@ stable across-turn ordering. When the registry is empty,
 `SkillRegistry::is_empty()` short-circuits before the projection
 runs at all.
 
-Slash invocations short-circuit through the same code path: when the
-user types `/<cmd> [args]`, the agent loop synthesizes a deterministic
-iteration-0 `Skill` tool call (`{skill: <name>, args: <rest>}`) before
-the first LLM call. The tool runs through `ToolExecutor::execute`
-exactly like an LLM-invoked call, so risk assessment, env-var
-approval, and trace provenance all flow through one path.
+Slash invocations are expanded before the first LLM call by
+`ContextManager::expand_slash_command`: when the trailing user message
+is `/<cmd> [args]` matching an invocable skill, the skill's body
+(`render_skill_for_slash`, `{{session_id}}` substituted, plus a
+linked-files inventory hint when the skill ships sub-files) is
+appended as a hidden agent-context row. Unlike an LLM-issued `Skill`
+tool call this deliberately skips the risk assessor — an explicit user
+slash command is treated as authorized. Sub-file fetches the model
+issues afterwards still go through the gated `Skill` tool.
 
-`SkillRegistry::select` is retained for `baybo skills check` /
-operator inspection and still has the same two cases (slash narrows
-to one; anything else returns the full set), but it is no longer
-consulted by `AgentLoop` to decide what gets injected — only to
-populate the per-turn list. `score` on every returned
-`SkillCandidate` is `1.0`; the field is kept on the struct for future
+`SkillRegistry::select` still exists with the same two cases (exact
+`/<cmd>` narrows to one; anything else returns the full set) but
+currently has no production callers — slash matching goes through
+`detect_slash_invocation` in `baybo-context` and the per-turn list
+through `all_summaries_sorted`. `score` on every returned
+`SkillCandidate` is `1.0`; the method and field are kept for future
 ranking work.
 
 Downstream gating happens lazily, on call:
@@ -207,14 +212,14 @@ Skills declare `allowed-tools`, but this is only one input to the upper bound. B
 
 - Depends on `baybo-model`, `baybo-tools`, and `baybo-workspace` (the last for `baybo_workspace::paths::BIN_NAME`), plus `regex`, `dashmap`, `walkdir`, and `uuid`
 - Does not call `llm` or execute tools directly
-- The crate's own `SkillInstall` / `SkillUninstall` tools (see below) are the supported way to add or remove a workspace skill at runtime; nothing else here mutates the installed set
+- The crate's own `SkillInstall` / `SkillUninstall` tools (see “Skill installation” above) are the supported way to add or remove a workspace skill at runtime; nothing else here mutates the installed set
 - Every skill execution must record `skill_name`, `skill_version`, `source`, `trust_level` in Trace
 
 ## Collaboration
 
 | Module | Role |
 |--------|------|
-| `agent` | `AgentLoop` calls `SkillRegistry.select()` and executes skills |
+| `agent` | `AgentLoop` (via `ContextManager`) seeds the skill-listing reminder, expands `/<cmd>` invocations, and executes the `Skill` tool the model calls |
 | `tools` | Skills declare allowed tool sets but don't execute tools directly. The `Skill` builtin (registered from `baybo-skills::tools`, parallel to `baybo-cron::tools`) is the LLM's single entry point for invoking them. |
 | `trace` | Records skill version, source, and execution results |
 | `workspace` | Provides trusted local skill directories for hot reload |
