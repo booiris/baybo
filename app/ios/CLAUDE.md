@@ -32,9 +32,79 @@ scripts/build-app.sh             # web → rust xcframework → xcodegen → sim
 scripts/build-app.sh --device --release
 node scripts/install.mjs         # archive + export + devicectl install (USB)
 cargo clippy --workspace --all-targets --all-features   # zero warnings
-cargo test --workspace           # host tests (QR parser etc.)
+cargo nextest run --workspace    # ffi host tests
 (cd web && pnpm build)           # tsc --noEmit + vite build
 ```
+
+## Tests
+
+Four tiers. The whole base — Rust + the transcript bundle — is plain Linux work
+and runs on ubuntu in CI at 1x; only the Swift half pays the macOS 10x.
+
+```bash
+# Rust core (app/ios workspace — the ROOT workspace excludes it, so the root
+# `cargo test --workspace` has never covered any of this)
+cargo nextest run --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# Transcript bundle (own pnpm workspace — the root `frontend` job never sees it)
+(cd web && pnpm test)     # vitest: reducers, sync cursor, bridge isolation
+(cd web && pnpm build)    # tsc --noEmit -> enforces web/src/wireSentinel.ts
+
+# Swift. Build once, then run either bundle against the built products.
+xcodegen generate
+xcodebuild build-for-testing -project Baybo.xcodeproj -scheme Baybo \
+  -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest' \
+  -derivedDataPath build/DerivedData
+xcodebuild test-without-building -project Baybo.xcodeproj -scheme Baybo \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest' \
+  -derivedDataPath build/DerivedData -only-testing:BayboTests    # or :BayboUITests
+```
+
+- **`ffi/`** — inline `#[cfg(test)] mod tests`. The load-bearing ones pin things
+  no other check can see: the `PairedRecord` / `DirectCredentials` **golden JSON**
+  (the on-keychain byte format is a frozen upgrade contract — break it and every
+  upgraded install silently loses its gateway binding), `dispatch_inbound_frame`'s
+  four routing invariants, the `invalid_token` untyped-string chain, and
+  `since_ordinal` serializing as an **explicit null** (add `skip_serializing_if`
+  and a baseline REPLACE quietly becomes an APPEND).
+- **`web/`** — vitest + jsdom over the pure reducers, NOT the DOM. Mounting
+  `<Transcript>` was tried and rejected: jsdom reports `scrollHeight` as 0, so
+  every follow/pin/jump branch degenerates. The simulator demo flags cover what a
+  reducer test cannot.
+- **`Tests/` (`BayboTests`)** — Swift Testing (`@Test`/`#expect`), a
+  **host-application** bundle (hostless would relink the Rust staticlib and make
+  `Lang.t` return bare keys). `ChatStore` takes an injected `any
+  BayboClientProtocol` — the protocol UniFFI already generates — so the frame
+  paths, the approval queue, and the outbox's two-stage confirmation are testable
+  with no gateway. XCTest stays for `BayboUITests` (Swift Testing has no UI API);
+  both bundles coexist.
+- **`UITests/` (`BayboUITests`)** — XCUITest over the `-baybo-*` fixture flags.
+  Non-gating in CI (gesture/timing driven). Reserve it for what is *unreachable*
+  below the seam: SwiftUI hit-testing (the stroke-only pill whose flanks were
+  dead), UIKit swipe thresholds, presentation-binding lifecycles, the native↔web
+  bridge round-trip. Everything else is 100x cheaper as a reducer test.
+
+**`BayboUITestCase` is the base class and every smoke must use its `launch(_:)`.**
+It pins three things a test cannot get right by accident:
+`-baybo-reset-store` (below), `-baybo.lang en` (our strings), and
+`-AppleLanguages (en)` (the *system* chrome — AVKit, the share sheet — which
+follows the simulator's locale, not our UserDefaults key; without it a test
+matching system chrome by label passes locally and fails on a runner).
+
+**`-baybo-reset-store`** (DEBUG, `AppDelegate`) wipes `Application Support/baybo`
+before anything reads it. The demo fixtures use FIXED session ids, so without it
+each launch APPENDS its canned turn to the same persisted mirror — and one
+simulator is shared across a suite, so the attachment demo reached six video
+tiles and a by-label query that is unambiguous on a fresh install started
+matching six elements. Demo flags are only hermetic with it.
+
+CI (`.github/workflows/ci.yml`): `ios-checks` (ubuntu, gating) runs the Rust and
+web tiers; `ios-sim` (macos-26, gating build + unit tests, non-gating UI smokes)
+runs the Swift half. Both are path-filtered — and the filter deliberately
+includes `crates/{wire,device-proto,model}` and `remote-host/`, because the ffi
+workspace path-depends on them and a root-crate change can break the iOS build
+without touching `app/ios` at all.
 
 The Rust core is built OUTSIDE Xcode (no shell build phase): `build-app.sh` runs
 `build-core.sh` (cargo per-target + uniffi-bindgen + create-xcframework)
