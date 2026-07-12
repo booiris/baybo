@@ -284,8 +284,13 @@ async fn request(
     }
 
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
+    // Snapshot the epoch BEFORE the dial, not after. A dial that straddles the
+    // app's `.background` edge would otherwise be stamped with the epoch the
+    // barrier just bumped TO, and parked — which is precisely the zombie the
+    // barrier exists to prevent.
+    let epoch = pool().epoch();
     let io = dial_tunnel_leg(&record, &local, remote_host_protocol::relay::LegClass::Api).await?;
-    let mut leg = PooledLeg::fresh(io, key, pool().epoch());
+    let mut leg = PooledLeg::fresh(io, key, epoch);
 
     // No first-byte shortcut on a fresh socket: it cannot be a zombie, and a slow
     // gateway is not a dead one. And no retry either — a fresh leg that fails means

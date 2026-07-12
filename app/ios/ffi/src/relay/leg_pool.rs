@@ -269,6 +269,11 @@ pub(crate) async fn warm() {
 
     let local =
         device_proto::noise::StaticKeypair::from_parts(record.noise_public, record.noise_secret);
+    // Snapshot the epoch BEFORE the dial: one that straddles the app's
+    // `.background` edge must not be stamped with the epoch the barrier just
+    // bumped TO, or it would be parked as exactly the zombie the barrier exists
+    // to prevent.
+    let epoch = pool().epoch();
     match super::tunnel::dial_tunnel_leg(
         &record,
         &local,
@@ -277,7 +282,7 @@ pub(crate) async fn warm() {
     .await
     {
         Ok(io) => {
-            let leg = PooledLeg::fresh(io, key, pool().epoch());
+            let leg = PooledLeg::fresh(io, key, epoch);
             if let Some(orphan) = pool().park_unproven(leg) {
                 orphan.io.close().await;
             }
@@ -381,6 +386,32 @@ mod tests {
             pool.park(in_flight, reuse(60_000)).is_some(),
             "and the one that was in flight cannot come back either"
         );
+    }
+
+    /// The epoch a leg carries is the one that was current when its DIAL STARTED,
+    /// never the one current when the dial finished. A dial that straddles the
+    /// `.background` edge would otherwise be stamped with the epoch the barrier
+    /// just bumped to — and parked as exactly the zombie the barrier exists to
+    /// prevent, since the suspend is about to take its socket.
+    #[test]
+    fn a_dial_that_straddles_the_barrier_is_orphaned() {
+        let pool = ApiLegPool::<ScriptedFrames>::new();
+        let k = key("node-a");
+
+        // What the dial path does: snapshot, then await.
+        let epoch_at_dial_start = pool.epoch();
+        pool.invalidate(); // the app backgrounded mid-dial
+        let dialed = PooledLeg::fresh(
+            LegIo::new(ScriptedFrames::new(vec![])),
+            k.clone(),
+            epoch_at_dial_start,
+        );
+
+        assert!(
+            pool.park(dialed, reuse(60_000)).is_some(),
+            "a leg dialed into a world that has since ended must not be parked"
+        );
+        assert!(pool.take(&k).is_none());
     }
 
     #[test]
