@@ -110,11 +110,12 @@ impl<F: TunnelFrames> PooledLeg<F> {
         }
     }
 
-    /// Re-stamp the leg for parking. `reuse` is the gateway's offer from the
-    /// response it just answered; `None` means it never made one (an old gateway,
-    /// or a blob leg) and the leg is not poolable at all.
-    fn park_stamp(&mut self, reuse: TunnelReuse) {
-        self.ttl = ttl_for(reuse);
+    /// Re-stamp the leg for parking. `ttl` is the caller's already-validated share
+    /// of the gateway's offer — taking it rather than a `TunnelReuse` keeps the
+    /// zero-budget case from being re-introduced here, where it would silently park
+    /// a leg nobody can ever take.
+    fn park_stamp(&mut self, ttl: Duration) {
+        self.ttl = ttl;
         self.parked_mono = Instant::now();
         self.parked_wall = SystemTime::now();
     }
@@ -150,6 +151,22 @@ struct PoolInner<F: TunnelFrames> {
     epoch: u64,
 }
 
+impl<F: TunnelFrames> PoolInner<F> {
+    /// Drop every leg no caller could ever be handed. Dropping one closes its
+    /// socket.
+    ///
+    /// Nothing else reaps. `take` only ever saw the legs stacked ABOVE the one it
+    /// wanted, so a `Vec` of three corpses was indistinguishable from a healthy
+    /// full pool at the cap check — and the cap would then throw away a leg the
+    /// gateway had just blessed, or the one `warm()` paid four round trips to
+    /// dial, while the corpses kept their slots.
+    fn prune(&mut self) {
+        let epoch = self.epoch;
+        self.legs
+            .retain(|leg| leg.epoch == epoch && leg.within_ttl());
+    }
+}
+
 pub(crate) struct ApiLegPool<F: TunnelFrames = NoiseFrames> {
     /// `parking_lot`, and NEVER held across an await. It guards a `Vec` and a
     /// counter; the serialization that actually matters is ownership (see the
@@ -175,16 +192,12 @@ impl<F: TunnelFrames> ApiLegPool<F> {
     /// rather than waiting for one.
     pub(crate) fn take(&self, key: &BindingKey) -> Option<PooledLeg<F>> {
         let mut inner = self.inner.lock();
+        inner.prune();
         let epoch = inner.epoch;
-        while let Some(leg) = inner.legs.pop() {
-            if leg.usable(key, epoch) {
-                let mut leg = leg;
-                leg.was_pooled = true;
-                return Some(leg);
-            }
-            // Unusable: dropping it closes the socket. Keep looking.
-        }
-        None
+        let idx = inner.legs.iter().rposition(|leg| leg.usable(key, epoch))?;
+        let mut leg = inner.legs.remove(idx);
+        leg.was_pooled = true;
+        Some(leg)
     }
 
     /// Hand a leg back, if it is still worth holding.
@@ -200,13 +213,21 @@ impl<F: TunnelFrames> ApiLegPool<F> {
         let Some(reuse) = reuse else {
             return Some(leg);
         };
+        // A budget the client margin swallows whole is not an offer: the leg would
+        // be parked with a zero TTL and could never be handed to anyone. Say no
+        // here rather than hold a socket nobody can use.
+        let ttl = ttl_for(reuse);
+        if ttl.is_zero() {
+            return Some(leg);
+        }
         let mut inner = self.inner.lock();
+        inner.prune();
         // The pool was invalidated (backgrounded, logged out, re-paired) while this
         // request was in flight. The leg belongs to a world that is gone.
         if leg.epoch != inner.epoch || inner.legs.len() >= MAX_POOLED_LEGS {
             return Some(leg);
         }
-        leg.park_stamp(reuse);
+        leg.park_stamp(ttl);
         leg.was_pooled = false;
         inner.legs.push(leg);
         None
@@ -216,6 +237,7 @@ impl<F: TunnelFrames> ApiLegPool<F> {
     /// it carries `UNPROVEN_LEG_TTL` rather than an advertised budget.
     fn park_unproven(&self, leg: PooledLeg<F>) -> Option<PooledLeg<F>> {
         let mut inner = self.inner.lock();
+        inner.prune();
         if leg.epoch != inner.epoch || inner.legs.len() >= MAX_POOLED_LEGS {
             return Some(leg);
         }
@@ -225,7 +247,8 @@ impl<F: TunnelFrames> ApiLegPool<F> {
 
     /// Whether a leg is already warm for this binding.
     fn has_usable(&self, key: &BindingKey) -> bool {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        inner.prune();
         let epoch = inner.epoch;
         inner.legs.iter().any(|leg| leg.usable(key, epoch))
     }
@@ -412,6 +435,93 @@ mod tests {
             "a leg dialed into a world that has since ended must not be parked"
         );
         assert!(pool.take(&k).is_none());
+    }
+
+    /// Stamp a leg as parked long ago. `park` re-stamps, so a corpse has to be aged
+    /// AFTER it is in the pool.
+    fn age_all(pool: &ApiLegPool<ScriptedFrames>) {
+        let mut inner = pool.inner.lock();
+        for leg in inner.legs.iter_mut() {
+            leg.parked_wall = SystemTime::now() - Duration::from_secs(3600);
+        }
+    }
+
+    fn depth(pool: &ApiLegPool<ScriptedFrames>) -> usize {
+        pool.inner.lock().legs.len()
+    }
+
+    /// The cap has to count legs a caller could actually be HANDED. Counting the raw
+    /// Vec made three corpses indistinguishable from a healthy full pool — so
+    /// `warm()` paid four round trips to dial a leg and then threw it away, which is
+    /// the exact opposite of what it exists for.
+    #[test]
+    fn corpses_do_not_squat_the_cap() {
+        let pool = ApiLegPool::<ScriptedFrames>::new();
+        let k = key("node-a");
+        for _ in 0..MAX_POOLED_LEGS {
+            assert!(pool.park(leg(&pool, &k), reuse(60_000)).is_none());
+        }
+        age_all(&pool);
+
+        assert!(!pool.has_usable(&k), "all three are dead");
+        assert!(
+            pool.park_unproven(leg(&pool, &k)).is_none(),
+            "a freshly warmed leg must not be evicted by three corpses"
+        );
+        assert_eq!(
+            depth(&pool),
+            1,
+            "and the corpses are gone, not just skipped"
+        );
+        assert!(pool.take(&k).is_some());
+    }
+
+    /// Same root, the other reader: `park` must not throw away a leg the gateway
+    /// just blessed in order to keep dead ones.
+    #[test]
+    fn a_live_leg_is_never_evicted_in_favour_of_a_corpse() {
+        let pool = ApiLegPool::<ScriptedFrames>::new();
+        let k = key("node-a");
+        for _ in 0..MAX_POOLED_LEGS {
+            assert!(pool.park(leg(&pool, &k), reuse(60_000)).is_none());
+        }
+        age_all(&pool);
+
+        assert!(
+            pool.park(leg(&pool, &k), reuse(60_000)).is_none(),
+            "the live leg is kept"
+        );
+        assert_eq!(depth(&pool), 1);
+    }
+
+    /// `take` used to pop from the tail, so a stale leg UNDER a live one was never
+    /// even looked at — it kept its fd until some later caller happened to pop past
+    /// it.
+    #[test]
+    fn a_stale_leg_beneath_a_live_one_is_still_reaped() {
+        let pool = ApiLegPool::<ScriptedFrames>::new();
+        let k = key("node-a");
+        assert!(pool.park(leg(&pool, &k), reuse(60_000)).is_none());
+        age_all(&pool); // the first one is now a corpse…
+        assert!(pool.park(leg(&pool, &k), reuse(60_000)).is_none()); // …under a live one
+
+        assert!(pool.take(&k).is_some(), "the live leg is handed out");
+        assert_eq!(depth(&pool), 0, "and the corpse under it did not survive");
+    }
+
+    /// The margin exists so the CLIENT always closes first. A gateway whose budget
+    /// the margin swallows whole has offered nothing usable — parking such a leg
+    /// would hold a socket with a zero TTL that no caller could ever be given.
+    #[test]
+    fn a_budget_under_the_margin_is_not_an_offer() {
+        let pool = ApiLegPool::<ScriptedFrames>::new();
+        let k = key("node-a");
+
+        assert!(
+            pool.park(leg(&pool, &k), reuse(5_000)).is_some(),
+            "handed back to close, not parked dead"
+        );
+        assert_eq!(depth(&pool), 0);
     }
 
     #[test]

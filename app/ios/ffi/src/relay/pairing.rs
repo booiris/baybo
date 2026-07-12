@@ -471,6 +471,15 @@ async fn finish_pair(
         .map_err(|e| format!("persist active binding: {e}"))?;
     crate::keychain::store_paired_record(&bytes)
         .map_err(|e| format!("persist paired record: {e}"))?;
+    // A fresh scan overwrites an existing pairing WITHOUT going through
+    // `forget_pairing`, and re-pairing the SAME gateway keeps every field of the
+    // leg pool's `BindingKey` — the Noise static and the signing key that
+    // `device_id` derives from are never deleted, and the gateway's static key and
+    // relay node id do not move. So a leg parked before the re-pair would pass
+    // every reuse gate while carrying the gateway's snapshot of the auth token it
+    // has just rotated away: a 401, and (because a 401 is a perfectly well-formed
+    // response) one that gets re-parked with a refreshed TTL. Drop them.
+    super::leg_pool::pool().invalidate();
     // One app binds one Baybo: a fresh scan-pairing supersedes any direct-login
     // credentials so the two binding modes can't both linger. Best-effort — the
     // marker above keeps resolution correct even if this leaves the direct creds.
@@ -490,6 +499,13 @@ pub(crate) fn paired_device() -> Option<String> {
 /// unpaired state. One app binds one gateway, so there is exactly one record to
 /// drop. Idempotent — succeeds even if nothing was stored.
 pub(crate) fn forget_pairing() -> Result<(), String> {
+    // Every warm API leg belongs to the binding we are dropping. Each one holds a
+    // gateway-side `AuthenticatedDevice` snapshotted at ITS handshake, so a leg
+    // that outlives the credentials answers with a token the gateway has already
+    // rotated away. Do this HERE rather than in each caller: `logout`, a direct
+    // login that supersedes a pairing, and a re-pair all reach this function, and
+    // none of them should have to remember.
+    super::leg_pool::pool().invalidate();
     // Read the record first to learn the device_id, so its push key
     // (`baybo.push-key.<device_id>`) is cleared too; a missing record is fine.
     if let Some(record) = load_paired_record()? {
@@ -707,6 +723,29 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&record).expect("serialize"),
             GOLDEN_RECORD_JSON
+        );
+    }
+
+    /// Dropping the binding has to drop the warm API legs with it.
+    ///
+    /// The gateway resolves a leg's `AuthenticatedDevice` ONCE, at its handshake, so
+    /// a leg that outlives the credentials keeps presenting a token the gateway has
+    /// already rotated away. And re-pairing the SAME gateway changes NOTHING the leg
+    /// pool keys on — the Noise static and the signing key `device_id` derives from
+    /// are never deleted, and the gateway's static key and relay node id do not move
+    /// — so without this the pool would hand a freshly re-paired app a leg that 401s
+    /// every call.
+    #[test]
+    fn forgetting_a_pairing_drops_every_warm_api_leg() {
+        let before = super::super::leg_pool::pool().epoch();
+
+        // The keychain wipe may fail on a host build; the invalidation runs first
+        // precisely because it must not depend on it.
+        let _ = forget_pairing();
+
+        assert!(
+            super::super::leg_pool::pool().epoch() > before,
+            "a leg must not outlive the credentials it was authenticated with"
         );
     }
 }

@@ -86,6 +86,20 @@ enum BodyDrain {
     Drained,
     Abandoned,
 }
+
+/// The reuse offer that may ride out on a response head.
+///
+/// `reuse` is the ONLY thing the client reads, and `LegState` is the only thing
+/// that closes the leg. Computing them independently let them drift: a response
+/// on a leg we were about to hang up on still advertised a 60s budget, so the
+/// client parked a corpse and served the next call from it. Deriving one from the
+/// other makes that unrepresentable.
+fn offer(reuse: Option<TunnelReuse>, state: LegState) -> Option<TunnelReuse> {
+    match state {
+        LegState::Reusable => reuse,
+        LegState::MustClose => None,
+    }
+}
 const TUNNEL_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TUNNEL_UPLOAD_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HEADER_CONTENT_LENGTH: &str = "content-length";
@@ -344,8 +358,17 @@ async fn handle_http_forward<Si: BinarySink, So: BinarySource>(
         .oneshot(req)
         .await
         .map_err(|e| format!("forward tunnel HTTP request: {e}"))?;
-    send_http_response(sink, transport, head.request_id, response, reuse).await?;
-    Ok(LegState::Reusable)
+    // Nothing to drain and the response goes out whole, so this leg survives.
+    let leg_state = LegState::Reusable;
+    send_http_response(
+        sink,
+        transport,
+        head.request_id,
+        response,
+        offer(reuse, leg_state),
+    )
+    .await?;
+    Ok(leg_state)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -417,16 +440,25 @@ async fn handle_http_body_forward<Si: BinarySink, So: BinarySource>(
     let response = response_task
         .await
         .map_err(|e| format!("forward tunnel HTTP task failed: {e}"))??;
-    send_http_response(sink, transport, request_id, response, reuse).await?;
-    Ok(match drain {
+    let leg_state = match drain {
         BodyDrain::Drained => LegState::Reusable,
         // The router answered without reading the body (a 401 before any extractor
         // touched it). The peer may still be writing chunks addressed to a request
         // we have finished, so the next `next_request` would decode them as this
         // leg's future. Deliver the response — the client needs that status — then
-        // hang up.
+        // hang up, and say so on the head: `offer` is what stops us telling the
+        // client to keep a leg we are closing under it.
         BodyDrain::Abandoned => LegState::MustClose,
-    })
+    };
+    send_http_response(
+        sink,
+        transport,
+        request_id,
+        response,
+        offer(reuse, leg_state),
+    )
+    .await?;
+    Ok(leg_state)
 }
 
 fn build_forward_request(
@@ -1262,6 +1294,12 @@ mod session_tests {
 
         let (head, _) = phone.read_response(1).await;
         assert_eq!(status_of(&head), 404, "the client still gets its answer");
+        assert_eq!(
+            reuse_of(&head),
+            None,
+            "and a leg we are about to close must not advertise reuse — the client \
+             reads NOTHING else, so it would park a corpse and serve the next call from it"
+        );
         assert!(
             phone.hung_up().await,
             "but the leg cannot survive a body it never drained"

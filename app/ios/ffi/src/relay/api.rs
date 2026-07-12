@@ -24,14 +24,28 @@ const HEADER_CONTENT_TYPE: &str = "content-type";
 /// per-request budget at all before: a leg that went quiet mid-response simply
 /// hung, forever, and took its caller with it.
 const TUNNEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a POOLED leg gets to produce its first response byte.
+/// How long a POOLED leg gets to answer before we give up on it.
 ///
-/// A parked leg can be a zombie — the NAT dropped its flow, or the process was
+/// A parked leg can be a zombie — a NAT dropped its flow, or the process was
 /// suspended and the socket went with it — and there is no signal for that but
-/// silence. This pins the cost of one at 4s rather than the full request budget.
-/// It is the only new tail-latency mode leg reuse introduces; a freshly dialed
-/// socket cannot be a blackhole, which is why it does not apply there.
-const POOLED_LEG_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(4);
+/// silence, so this bounds what a zombie costs instead of letting it run to the
+/// full request budget.
+///
+/// **It cannot tell a dead leg from a slow gateway.** The gateway sends the
+/// response head only AFTER the router has fully served the request, so silence
+/// here measures the gateway's SERVICE TIME as much as the leg's liveness. That
+/// is why this is not tighter: at 4s, a `/sync?limit=200` that takes five seconds
+/// on a loaded self-hosted gateway would be abandoned and replayed on a fresh leg
+/// — making the gateway run that same expensive scan twice, precisely when it is
+/// least able to. (The abandoned execution keeps running: the tunnel has no
+/// cancellation, so its task is blocked in `oneshot` and only discovers the dead
+/// leg when it tries to write.)
+///
+/// 15s sits above the p99 of every pooled route (they are all bounded libsql
+/// reads and writes) while still capping a zombie well under the 30s request
+/// budget. The dual-clock staleness check and the `.background` barrier are what
+/// actually keep zombies rare; this is only the backstop.
+const POOLED_LEG_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) struct GatewayApi;
 
@@ -277,7 +291,7 @@ async fn request(
         // the ONE failure worth retrying, and only when the route can survive being
         // run twice.
         let retry = should_retry(&outcome, leg.was_pooled, replay);
-        settle(leg, outcome.reuse).await;
+        settle(leg, parkable(outcome.reuse, &outcome.result)).await;
         if !retry {
             return outcome.result.map_err(String::from);
         }
@@ -304,7 +318,7 @@ async fn request(
         TUNNEL_REQUEST_TIMEOUT,
     )
     .await;
-    settle(leg, outcome.reuse).await;
+    settle(leg, parkable(outcome.reuse, &outcome.result)).await;
     outcome.result.map_err(String::from)
 }
 
@@ -312,6 +326,21 @@ async fn request(
 async fn settle(leg: PooledLeg, reuse: Option<TunnelReuse>) {
     if let Some(orphan) = pool().park(leg, reuse) {
         orphan.io.close().await;
+    }
+}
+
+/// The offer to park on, once the response has been judged.
+///
+/// An auth rejection is a perfectly well-formed response — body drained, framing
+/// intact — so the reuse rules would happily park it. But 401/403 means the
+/// gateway's snapshot of our credentials is stale: it resolves `AuthenticatedDevice`
+/// ONCE, at the leg's handshake, and a re-pair rotates the token underneath it. And
+/// because parking RE-STAMPS the TTL, such a leg would keep renewing itself and
+/// rejecting every caller that took it. Bound the damage to the one request.
+fn parkable(reuse: Option<TunnelReuse>, result: &Result<Vec<u8>, LegError>) -> Option<TunnelReuse> {
+    match result {
+        Err(LegError::Http { status: 401 | 403 }) => None,
+        _ => reuse,
     }
 }
 
