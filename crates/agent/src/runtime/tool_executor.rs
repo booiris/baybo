@@ -37,8 +37,9 @@ const APPROVAL_PARAMS_PREVIEW_LEN: usize = 512;
 const APPROVAL_HEADROOM: Duration = Duration::from_secs(300);
 
 /// Cap on the failure-reason string we copy out of a `ToolOutput::Error`
-/// payload. The full text is still preserved verbatim in the span's
-/// `result.output`; this bound only governs the row-level reason label.
+/// payload. This bound governs only the row-level reason label; the body
+/// lands in the span's `result.output`, itself capped at
+/// `MAX_TOOL_OUTPUT_BYTES` (see [`cap_trace_output`]).
 const FAILURE_REASON_MAX_BYTES: usize = 512;
 
 /// Hard cap on the total byte size of text fields carried inside the
@@ -139,9 +140,9 @@ fn truncate_for_reason(s: &str, max_bytes: usize) -> String {
 /// `Json(Object)` are unaffected — those are the cases that previously
 /// rendered correctly (e.g. `NowTool` returns `Json({...})`), so we
 /// preserve their on-disk shape verbatim.
-fn tool_output_to_trace_value(output: &ToolOutput) -> Value {
+fn tool_output_to_trace_value(output: &ToolOutput) -> (Value, Option<usize>) {
     use serde_json::Map;
-    match output {
+    let value = match output {
         ToolOutput::Text(s) => {
             let mut m = Map::new();
             m.insert("type".into(), Value::String("text".into()));
@@ -175,7 +176,68 @@ fn tool_output_to_trace_value(output: &ToolOutput) -> Value {
             // keep the historical shape exactly.
             serde_json::to_value(output).unwrap_or(Value::Null)
         }
+    };
+    cap_trace_output(value)
+}
+
+/// Cap the span's copy of a tool result at the same byte budget the LLM
+/// transcript uses. The transcript copy is capped *and* spilled to a file one
+/// layer up (`AgentLoop::cap_tool_output`); the span kept the raw payload, so a
+/// single 285 KB `Grep` result was stored verbatim forever — a third copy of
+/// bytes the model never saw.
+///
+/// Capping happens here, after the variant-shaping match, so no variant can
+/// bypass it: the struct variants (`WithAttachments` / `MultiModalText`) route
+/// through `serde_json::to_value` and would slip past a per-variant cap.
+/// Attachments themselves are `BlobRef` pointers, not bytes, so only the
+/// text-bearing payload is ever large.
+///
+/// Returns the untruncated serialized length when it cut, for
+/// `ToolCallResult::output_truncated_from`.
+fn cap_trace_output(value: Value) -> (Value, Option<usize>) {
+    use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+
+    let full_len = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
+    if full_len <= MAX_TOOL_OUTPUT_BYTES {
+        return (value, None);
     }
+
+    // Over budget. Keep the type tag (the viewer keys off it) and replace the
+    // body with a capped rendering of whatever carried the bytes.
+    let Value::Object(map) = &value else {
+        return (value, None);
+    };
+    let tag = map
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("json")
+        .to_string();
+    // The field the payload actually lives in, per the shapes built above.
+    let (field, body) = match tag.as_str() {
+        "text" => (
+            "text",
+            map.get("text").and_then(Value::as_str).map(String::from),
+        ),
+        "error" => (
+            "error",
+            map.get("error").and_then(Value::as_str).map(String::from),
+        ),
+        _ => ("text", None),
+    };
+    let body = body.unwrap_or_else(|| {
+        // `json` and the struct variants have no single string field — render
+        // the whole thing and cap that.
+        serde_json::to_string(&value).unwrap_or_default()
+    });
+
+    let mut cut = MAX_TOOL_OUTPUT_BYTES.min(body.len());
+    while cut > 0 && !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("type".into(), Value::String(tag));
+    out.insert(field.into(), Value::String(body[..cut].to_string()));
+    (Value::Object(out), Some(full_len))
 }
 
 /// A finished tool call: whatever the call produced, plus the approval decision
@@ -689,7 +751,8 @@ impl ToolExecutor {
                             .sanitize_tool_output(&mut output)
                             .await
                             .map_err(|e| anyhow::anyhow!("sanitize_tool_output: {e}"))?;
-                        let output_value = tool_output_to_trace_value(&output);
+                        let (output_value, output_truncated_from) =
+                            tool_output_to_trace_value(&output);
                         let success = !matches!(output, ToolOutput::Error(_));
                         let outcome = if success {
                             LifecycleOutcome::Ok
@@ -718,6 +781,7 @@ impl ToolExecutor {
                             SpanFinalize::ToolCall(ToolCallResult {
                                 output: output_value,
                                 success,
+                                output_truncated_from,
                             }),
                             outcome,
                             output,
@@ -764,19 +828,24 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+
     #[test]
     fn trace_value_preserves_text_payload() {
-        let v = tool_output_to_trace_value(&ToolOutput::Text("hello world".into()));
+        let (v, truncated) = tool_output_to_trace_value(&ToolOutput::Text("hello world".into()));
         assert_eq!(v, json!({ "type": "text", "text": "hello world" }));
+        assert_eq!(truncated, None);
     }
 
     #[test]
     fn trace_value_preserves_error_payload() {
-        let v = tool_output_to_trace_value(&ToolOutput::Error("read_page failed: …".into()));
+        let (v, truncated) =
+            tool_output_to_trace_value(&ToolOutput::Error("read_page failed: …".into()));
         assert_eq!(
             v,
             json!({ "type": "error", "error": "read_page failed: …" })
         );
+        assert_eq!(truncated, None);
     }
 
     #[test]
@@ -785,7 +854,7 @@ mod tests {
         // shape — type tag flattened into the inner map — is what the
         // web UI is already showing for spans like Now, so changing
         // it would invalidate older traces.
-        let v = tool_output_to_trace_value(&ToolOutput::Json(json!({
+        let (v, truncated) = tool_output_to_trace_value(&ToolOutput::Json(json!({
             "utc": "2026-01-01T00:00:00Z",
             "timezone": "UTC",
         })));
@@ -797,11 +866,59 @@ mod tests {
                 "timezone": "UTC",
             })
         );
+        assert_eq!(truncated, None);
     }
 
     #[test]
     fn trace_value_wraps_non_object_json_payload() {
-        let v = tool_output_to_trace_value(&ToolOutput::Json(json!("scalar")));
+        let (v, truncated) = tool_output_to_trace_value(&ToolOutput::Json(json!("scalar")));
         assert_eq!(v, json!({ "type": "json", "value": "scalar" }));
+        assert_eq!(truncated, None);
+    }
+
+    /// A 285 KB `Grep` result used to be stored verbatim in the span — a third
+    /// copy of bytes the model never saw (its transcript copy is capped and
+    /// spilled). The span copy now rides the same budget and says so.
+    #[test]
+    fn trace_value_caps_oversized_text_and_records_original_size() {
+        let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES * 3);
+        let (v, truncated) = tool_output_to_trace_value(&ToolOutput::Text(big));
+
+        let text = v["text"].as_str().expect("text field survives the cap");
+        assert_eq!(v["type"], "text", "the type tag must survive");
+        assert!(
+            text.len() <= MAX_TOOL_OUTPUT_BYTES,
+            "capped text must fit the budget, got {}",
+            text.len()
+        );
+        let original = truncated.expect("truncation must be reported");
+        assert!(
+            original > MAX_TOOL_OUTPUT_BYTES * 3,
+            "the reported original length must be the full serialized size"
+        );
+    }
+
+    /// The struct variants route through `serde_json::to_value`, so a cap
+    /// applied per-variant to Text/Error/Json only would let them through.
+    #[test]
+    fn trace_value_caps_oversized_struct_variant() {
+        let (v, truncated) = tool_output_to_trace_value(&ToolOutput::MultiModalText {
+            text: "y".repeat(MAX_TOOL_OUTPUT_BYTES * 2),
+            llm_images: vec![],
+        });
+        assert!(
+            serde_json::to_string(&v).unwrap().len() <= MAX_TOOL_OUTPUT_BYTES + 64,
+            "no variant may bypass the cap"
+        );
+        assert!(truncated.is_some());
+    }
+
+    /// Truncation must not split a multi-byte character.
+    #[test]
+    fn trace_value_cap_lands_on_a_char_boundary() {
+        let big = "★".repeat(MAX_TOOL_OUTPUT_BYTES); // 3 bytes each
+        let (v, _) = tool_output_to_trace_value(&ToolOutput::Text(big));
+        let text = v["text"].as_str().expect("still valid UTF-8 text");
+        assert!(text.chars().all(|c| c == '★'), "no mangled char at the cut");
     }
 }

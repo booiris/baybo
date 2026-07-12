@@ -84,6 +84,20 @@ pub enum ToolEventPayload {
 - `placeholder_ids` are kept in `SanitizeHit` so replay can resolve them via `SecretVault`
 - Apply uniform sanitization to every `SpanKind` result variant — error paths included
 
+### ToolCall output storage
+
+`ToolCallResult.output` is capped at `baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES`
+— the same budget the LLM transcript uses. The model never saw more than that
+either: its copy is capped *and* spilled to a file under the workspace, so
+storing the raw payload in the span only ever bought a third copy nobody reads
+(a single 285 KB `Grep` result once sat in a span verbatim). The cap is applied
+in `tool_output_to_trace_value` (`crates/agent/src/runtime/tool_executor.rs`)
+*after* the per-variant shaping, so the struct variants
+(`WithAttachments` / `MultiModalText`), which route through
+`serde_json::to_value`, cannot bypass it. When it cuts, the untruncated
+serialized length lands in `output_truncated_from` so the viewer says the output
+is partial rather than implying the tool returned only that much.
+
 ### Single-table persistence
 
 Step and Span lifecycle writes go to the canonical tables (`steps`, `spans`, `span_events`). Each row stores the entity as a single JSON `data` blob; queryable fields (`job_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns that SQLite keeps in lockstep with `data` automatically. There is no two-side write contract — adding a new field is a serde change in `baybo-trace`, no schema migration. New indexed lookups need a new generated column; that is the only schema change vector.
