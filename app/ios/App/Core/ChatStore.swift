@@ -386,12 +386,22 @@ final class ChatStore: ObservableObject {
             pushFrame(frameJson)
         }
 
+        /// Through the SAME buffered emitters the real download path uses, not
+        /// straight at `bridge?`. A demo drive runs on a timer from launch, but
+        /// the transcript webview boots on its own schedule — several times
+        /// slower on a hosted CI runner than on a dev Mac. An optional-chained
+        /// push at a bridge that has not attached yet is silently DROPPED, so
+        /// the cards never left `idle` and the UI smokes read it as the product
+        /// failing to download. Production already solved this (the detach
+        /// window); the demo just wasn't using it.
         func pushDemoFileState(
             blobId: String, state: String, loaded: UInt64? = nil, total: UInt64? = nil
         ) {
-            bridge?.fileState(blobId: blobId, state: state, loaded: loaded, total: total)
+            pushFileState(blobId: blobId, state: state, loaded: loaded, total: total)
         }
 
+        /// The web side asks for a blob and native answers, so this reply cannot
+        /// outrun the bridge that carried the request — no buffer needed.
         func pushDemoBlobResult(id: Int, dataBase64: String, mimeType: String) {
             bridge?.blobResult(id: id, dataBase64: dataBase64, mimeType: mimeType, error: nil)
         }
@@ -399,7 +409,7 @@ final class ChatStore: ObservableObject {
         func pushDemoVideoPoster(
             id: Int, dataBase64: String, width: Int, height: Int, durationMs: Int
         ) {
-            bridge?.videoPoster(
+            pushVideoPoster(
                 id: id, dataBase64: dataBase64, width: width, height: height,
                 durationMs: durationMs)
         }

@@ -24,6 +24,14 @@ class BayboUITestCase: XCTestCase {
     /// drive's wall-clock instead.
     static let videoReadyLabel = "Play video"
 
+    /// Ceiling for anything the transcript WEBVIEW renders. Deliberately far
+    /// looser than the 3-5s the native chrome gets: a WKWebView content process
+    /// spins up cold, and a hosted runner does it several times slower than a
+    /// dev Mac (the same four attachment cases take ~60s locally and ~270s
+    /// there). Keep the NATIVE waits tight — a slow button is a bug — and spend
+    /// the patience only where the wait is a web runtime booting.
+    static let webviewTimeout: TimeInterval = 60
+
     override func setUp() {
         super.setUp()
         continueAfterFailure = false

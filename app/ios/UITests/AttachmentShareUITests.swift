@@ -24,7 +24,7 @@ final class AttachmentShareUITests: BayboUITestCase {
     private func launchAndPressPdfCard() -> XCUIApplication {
         let app = launch(Self.demoArguments)
         let card = pdfCard(app)
-        XCTAssertTrue(card.waitForExistence(timeout: 10), "demo PDF card must render")
+        XCTAssertTrue(card.waitForExistence(timeout: Self.webviewTimeout), "demo PDF card must render")
         waitForDemoDownload(app)
         card.press(forDuration: 0.7)
         return app
@@ -96,7 +96,7 @@ final class AttachmentShareUITests: BayboUITestCase {
     func testPreviewChromeSharesAndCloses() {
         let app = launch(Self.demoArguments)
         let card = pdfCard(app)
-        XCTAssertTrue(card.waitForExistence(timeout: 10))
+        XCTAssertTrue(card.waitForExistence(timeout: Self.webviewTimeout))
         waitForDemoDownload(app)
         card.tap()
 
