@@ -530,6 +530,19 @@ final class ChatStore: ObservableObject {
     /// the `sync_page` frame back for the webview to apply.
     func requestSync(sinceOrdinal: Int64?, limit: UInt32) {
         guard listed || remoteSessionEnsured else {
+            #if DEBUG
+                // A demo fixture pushes a canned turn into this very draft, and
+                // the empty baseline page below would REPLACE it away (see
+                // `isDrivingCannedTurn`). Unwind the webview's in-flight guard
+                // without touching the thread — `sync_failed` does exactly that.
+                if Self.isDrivingCannedTurn {
+                    pushSynthesizedFrame([
+                        "kind": "sync_failed",
+                        "error": "demo fixture: no gateway to sync against",
+                    ])
+                    return
+                }
+            #endif
             // A draft has nothing to pull yet — but the webview already flipped
             // its in-flight guard, so we MUST reply. An empty baseline
             // `sync_page` clears it (an empty REPLACE keeps the optimistic
