@@ -1,12 +1,22 @@
 # Relay API Tunnel: Leg Reuse
 
-**Status: proposed, not implemented.** This document is the design for making the
-relay-mode API tunnel leg serve more than one request. Nothing here is on
-`master` yet. The "Today" sections describe shipped behaviour and are accurate;
-everything under [Design](#design) is a proposal, staged in
-[Rollout](#rollout).
+**Status: implemented.** One relay API tunnel leg now serves many requests.
 
-## Today: one leg per request
+- **Stage 0** — the gateway request loop, `LegState`/`BodyDrain`, and the
+  `TunnelReuse` wire field (`crates/gateway/src/channel/api_tunnel.rs`,
+  `crates/device-proto/src/api_tunnel.rs`).
+- **Stage 1** — the client's framing hygiene: `LegIo`, request-id checking, the
+  frame queue, non-2xx draining, empty-body normalization, and the first
+  per-request timeout (`app/ios/ffi/src/relay/{tunnel,api,blob}.rs`).
+- **Stage 2** — the leg pool, the `.background` barrier, and `Replayable`
+  (`app/ios/ffi/src/relay/leg_pool.rs`, `gateway_api.rs`, `App/BayboApp.swift`).
+- **Stage 3** — the pre-dialed warm leg and the decoupled APNs POST
+  (`leg_pool::warm`, `apns.rs`).
+
+The "Today" sections below describe the behaviour this replaced, and are kept
+because the reasoning only makes sense against it.
+
+## What this replaced: one leg per request
 
 On the relay leg, **every** gateway REST call dials a brand-new Noise tunnel.
 `relay::api::request` (`app/ios/ffi/src/relay/api.rs:97`) does, per call:
@@ -436,7 +446,7 @@ pub(crate) enum Replayable { Yes, No }
 | `PUT …/read {ordinal}` | ✔ | server-side max-wins, monotonic |
 | `DELETE …/{id}` | ✔ | soft `set_hidden(true)` (session rows are never deleted) |
 | `POST /v1/mobile/apns-token` | ✔ `Yes` | upsert per device |
-| **`POST /v1/blobs`** | ✘ `No` | **every put mints a fresh `blob_id`** (which is exactly why attachment dedup keys on the sha256 digest). Blob legs are never pooled, so this can never be reached — `Replayable::No` exists so that wiring uploads into the pool **fails to compile.** |
+| **`POST /v1/blobs`** | ✘ `No` | **every put mints a fresh `blob_id`** (which is exactly why attachment dedup keys on the sha256 digest). Uploads go through `GatewayBlobClient` on a one-shot blob leg, never through `GatewayJsonClient`, so they cannot reach the pool at all — `Replayable::No` is the marker that makes wiring them in later **fail to compile** rather than double-run in the field. It is deliberately unconstructed today. |
 
 Chat message sends never go through `GatewayJsonClient` — they ride the chat leg
 as `Frame`s (`transport.rs`). There is no "duplicate user message" hazard on this
@@ -577,32 +587,66 @@ a lifetime cap to a blob leg** — it would guillotine a legitimate 10-minute up
 
 ## Rollout
 
-**Stage 0 — gateway (shippable alone; a no-op for today's clients).** ~1 day.
-`LegClass` threading + the loop + `LegState`/`BodyDrain` + the desync table +
-straggler drain + the `TunnelReuse` field. An old client sends one request and
-closes; the gateway returns `Ok(())` at once. **Ship this on its own — it fixes the
-`tx.send` detonator regardless.**
+All four stages have landed, each as its own commit, in this order. Stages 0 and
+1 stand alone: they fix bugs that existed before any of this, and neither depends
+on the other.
 
-**Stage 1 — client hygiene (still one-shot legs, no pool).** ~0.5 day. `LegIo` +
-request_id checking + the frame queue + non-2xx draining + empty-body normalization
-+ `TUNNEL_REQUEST_TIMEOUT` (there is **no** per-request timeout today). **Shippable
-alone**; it fixes three latent bugs and does not depend on Stage 0.
+**Stage 0 — the gateway.** `LegClass` threading + the request loop +
+`LegState`/`BodyDrain` + the desync table + the straggler drain + the
+`TunnelReuse` field. A no-op for every client shipped so far: it sends one
+request and closes, and the loop exits on that EOF at once. Fixes the `tx.send`
+detonator regardless.
 
-**Stage 2 — the pool + the barrier + `Replayable`.** ~1.5 days. This is where the
-win starts, and the only stage that needs both Stage 0 and Stage 1 in place.
+**Stage 1 — client framing hygiene, still on one-shot legs.** `LegIo` +
+request-id checking + the frame queue + non-2xx draining + empty-body
+normalization + `TUNNEL_REQUEST_TIMEOUT` (there had been no per-request budget at
+all). A `TunnelFrames` seam went in underneath so the framing rules could be
+tested against a scripted gateway — no relay, no socket, no crypto — which is
+also what Stage 2's pool tests use.
 
-**Stage 3 — pre-dial + APNs decoupling.** ~0.5 day. Takes the cold list refresh's
-dial off the critical path — the largest single win.
+**Stage 2 — the pool, the barrier, `Replayable`.** Where the win starts, and the
+only stage that needs both of the others.
 
-**Instrument before Stage 2.** Add a counter on `dial_tunnel_leg(LegClass::Api)` and
-a `take()` hit-rate counter, and run a day of real usage. How much of the real call
-graph is human-paced serial (list appears → 2s later a tap → sync) versus a
-same-millisecond fan decides whether `MAX_POOLED_LEGS` is 2 or 4 — and whether Stage
-2 is worth it at all. Stages 0 and 1 should ship either way; they fix bugs that exist
-now.
+**Stage 3 — the pre-dialed leg and the decoupled APNs POST.** Takes the cold list
+refresh's dial off the critical path.
 
-Total ≈3.5 days plus a manual device regression on a relay binding (CI does not
-cover `app/ios`).
+### Deviations from the design as written
+
+- `PooledLeg` / `ApiLegPool` are **generic over the `TunnelFrames` seam**
+  (defaulted to `NoiseFrames`), which the design did not call for. Without it the
+  pool could only ever hold a leg backed by a real socket, and none of its rules —
+  the TTLs, the epoch, the binding gate, the two clocks — would have been testable
+  at all.
+- `should_retry` is a **pure function**, lifted out of the request path. The
+  at-least-once bargain is the fragile part of this change, not the plumbing
+  around it, and it deserved to be readable and tested on its own.
+- The APNs refresh is **skipped entirely when the token is unchanged**, which is
+  the steady state. The design only required it to stop gating `transport::connect`;
+  the skip is what makes a foreground (up to a dozen resident stores reconnecting)
+  stop firing a dozen identical POSTs.
+
+### Still owed: measurement
+
+**Nothing here has been measured.** `MAX_POOLED_LEGS = 3` is a guess, and so is the
+claim that a warm leg is usually there when the next call comes. The number that
+settles both is the shape of the real call graph: how much of it is human-paced
+serial (list appears → two seconds later a tap → sync), where reuse hits every
+time, versus a same-millisecond fan, where it hits `K/N`.
+
+Put a counter on `dial_tunnel_leg(LegClass::Api)` and one on `ApiLegPool::take`'s
+hit rate, run a day of real usage, and let that decide whether `MAX_POOLED_LEGS`
+should be 2 or 4. The staging was chosen so this can be answered after the fact
+rather than guessed at up front — Stages 0 and 1 earn their keep either way,
+because they fix bugs that predate all of this.
+
+### Still owed: a device regression
+
+CI does not cover `app/ios` beyond the Rust and web tiers plus the simulator Swift
+suite, and none of that exercises a real relay. On a relay binding, by hand: list →
+open a chat → sync → mark-read; background for 60s and for 30 minutes, then
+foreground; kill the gateway mid-burst; re-pair while a request is in flight. And
+run one pass against an **old gateway binary** — the skew path is the one thing
+here that no test in the repo can reach.
 
 ## What this costs
 

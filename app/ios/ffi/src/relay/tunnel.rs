@@ -30,6 +30,8 @@ use crate::core::{
 };
 use crate::transport::WsStream;
 
+pub(crate) use device_proto::api_tunnel::TunnelReuse;
+
 /// The id every request on a one-shot blob leg carries. Blob legs are never
 /// reused (the gateway refuses to advertise reuse on them), so their ids never
 /// need to advance.
@@ -72,13 +74,14 @@ impl From<LegError> for String {
 }
 
 /// A response head, once it has been matched to the request that asked for it.
-///
-/// The wire also carries the gateway's `reuse` offer here; nothing reads it yet
-/// (every leg is still one-shot), which is exactly the old behaviour.
 #[derive(Debug)]
 pub(crate) struct ResponseHead {
     pub(crate) status: u16,
     pub(crate) body_len: Option<u64>,
+    /// The gateway's offer to hold this leg open for another request. `None` from
+    /// an old gateway, and from every blob leg — which is what makes "blobs are
+    /// never pooled" something this side does not have to remember.
+    pub(crate) reuse: Option<TunnelReuse>,
 }
 
 /// The wire under a leg: sealed frames in, decoded frames out.
@@ -196,10 +199,15 @@ impl<F: TunnelFrames> LegIo<F> {
                 request_id: id,
                 status,
                 body_len,
+                reuse,
                 ..
             } => {
                 self.check_id(id, request_id)?;
-                Ok(ResponseHead { status, body_len })
+                Ok(ResponseHead {
+                    status,
+                    body_len,
+                    reuse,
+                })
             }
             // The gateway sends an Error INSTEAD of a head, and only ever when the
             // leg is already finished on its side (an Error frame has no `reuse`
@@ -349,6 +357,11 @@ pub(crate) mod testing {
         pub(crate) script: Deque<Vec<TunnelResponse>>,
         pub(crate) sent: Vec<TunnelRequest>,
         pub(crate) closed: bool,
+        /// A leg that takes writes and never answers — a zombie whose flow a NAT
+        /// dropped, or whose socket went with a suspended process. There is no
+        /// signal for one but silence, which is what the first-byte budget exists
+        /// to bound.
+        silent: bool,
     }
 
     impl ScriptedFrames {
@@ -357,6 +370,14 @@ pub(crate) mod testing {
                 script: script.into(),
                 sent: Vec::new(),
                 closed: false,
+                silent: false,
+            }
+        }
+
+        pub(crate) fn silent() -> Self {
+            Self {
+                silent: true,
+                ..Self::new(vec![])
             }
         }
     }
@@ -368,6 +389,9 @@ pub(crate) mod testing {
         }
 
         async fn recv(&mut self) -> Result<Vec<TunnelResponse>, LegError> {
+            if self.silent {
+                std::future::pending::<()>().await;
+            }
             self.script
                 .pop_front()
                 .ok_or_else(|| LegError::dead("scripted gateway ran out of messages"))
@@ -379,12 +403,22 @@ pub(crate) mod testing {
     }
 
     pub(crate) fn head(request_id: u64, status: u16, body_len: u64) -> TunnelResponse {
+        reusable_head(request_id, status, body_len, None)
+    }
+
+    /// A head from a gateway that offers to hold the leg open.
+    pub(crate) fn reusable_head(
+        request_id: u64,
+        status: u16,
+        body_len: u64,
+        reuse: Option<TunnelReuse>,
+    ) -> TunnelResponse {
         TunnelResponse::Head {
             request_id,
             status,
             headers: vec![],
             body_len: Some(body_len),
-            reuse: None,
+            reuse,
         }
     }
 

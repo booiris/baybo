@@ -167,6 +167,7 @@ impl GatewayJsonClient for DirectHttp {
         &'a self,
         path: &'a str,
         body: Vec<u8>,
+        _replay: crate::gateway_api::Replayable,
     ) -> impl std::future::Future<Output = Result<T, String>> + Send + 'a
     where
         T: DeserializeOwned + Send + 'static,
@@ -188,6 +189,7 @@ impl GatewayJsonClient for DirectHttp {
         &'a self,
         path: &'a str,
         body: Vec<u8>,
+        _replay: crate::gateway_api::Replayable,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
         async move {
             let resp = self

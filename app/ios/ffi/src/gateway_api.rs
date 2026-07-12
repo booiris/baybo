@@ -13,6 +13,31 @@ pub(crate) const PATH_BLOBS: &str = "/v1/blobs";
 /// Content-type for every JSON-bodied request, shared by both legs.
 pub(crate) const MEDIA_TYPE_JSON: &str = "application/json";
 
+/// Whether a write may be re-sent after a TRANSPORT failure.
+///
+/// The relay leg pool can lose a warm leg between requests through nobody's fault
+/// — the gateway reclaimed it, the relay flapped, a NAT dropped the flow — and it
+/// retries such a request once. That replay is **at-least-once**, not
+/// exactly-once: the gateway runs the router FIRST and answers second, so a
+/// failure before the response head does NOT prove the request had no effect.
+///
+/// It is safe here only because the server keys every effect on CLIENT-supplied
+/// data — the session id we minted, the APNs token we hold — so a replay converges
+/// on the same state. `Replayable::No` exists so that wiring a route without that
+/// property into the pool fails to compile rather than double-running in the
+/// field. `GET` / `PUT` / `DELETE` take no such parameter: they are idempotent by
+/// HTTP contract, and every one on this surface was checked against that claim.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Replayable {
+    Yes,
+    /// Reserved for a write whose effect is keyed SERVER-side — `POST /v1/blobs`
+    /// mints a fresh `blob_id` on every put, which is why attachment dedup keys on
+    /// the sha256 digest instead. Blob legs are never pooled, so this is
+    /// unreachable today, and that is the point.
+    #[allow(dead_code)]
+    No,
+}
+
 pub(crate) trait GatewayJsonClient {
     fn get_json<'a, T>(
         &'a self,
@@ -25,6 +50,7 @@ pub(crate) trait GatewayJsonClient {
         &'a self,
         path: &'a str,
         body: Vec<u8>,
+        replay: Replayable,
     ) -> impl Future<Output = Result<T, String>> + Send + 'a
     where
         T: DeserializeOwned + Send + 'static;
@@ -33,6 +59,7 @@ pub(crate) trait GatewayJsonClient {
         &'a self,
         path: &'a str,
         body: Vec<u8>,
+        replay: Replayable,
     ) -> impl Future<Output = Result<(), String>> + Send + 'a;
 
     fn put_empty<'a>(
@@ -187,7 +214,11 @@ pub(crate) async fn create_session<C: GatewayJsonClient + Sync>(
 ) -> Result<String, String> {
     let body = serde_json::to_vec(&CreateSessionRequest { session_id })
         .map_err(|e| format!("encode create session request: {e}"))?;
-    let created: ChatSessionCreated = client.post_json(PATH_CHAT_SESSIONS, body).await?;
+    // `get_or_create`, keyed on the session id WE minted: a replay lands on the
+    // same row.
+    let created: ChatSessionCreated = client
+        .post_json(PATH_CHAT_SESSIONS, body, Replayable::Yes)
+        .await?;
     Ok(created.session_id)
 }
 
@@ -359,7 +390,10 @@ pub(crate) async fn update_apns_token<C: GatewayJsonClient + Sync>(
         apns_env,
     })
     .map_err(|e| format!("encode APNs token update: {e}"))?;
-    client.post_empty(PATH_MOBILE_APNS_TOKEN, body).await
+    // An upsert per device: the same token posted twice is the same state.
+    client
+        .post_empty(PATH_MOBILE_APNS_TOKEN, body, Replayable::Yes)
+        .await
 }
 
 pub(crate) async fn upload_bytes<C: GatewayBlobClient + Sync>(
@@ -471,6 +505,7 @@ mod tests {
             &'a self,
             path: &'a str,
             body: Vec<u8>,
+            _replay: Replayable,
         ) -> impl Future<Output = Result<T, String>> + Send + 'a
         where
             T: DeserializeOwned + Send + 'static,
@@ -485,6 +520,7 @@ mod tests {
             &'a self,
             path: &'a str,
             body: Vec<u8>,
+            _replay: Replayable,
         ) -> impl Future<Output = Result<(), String>> + Send + 'a {
             async move {
                 self.record("POST", path, &body);
