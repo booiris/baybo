@@ -186,11 +186,15 @@ jobs:
   # Swift/Xcode half pays the 10x macOS multiplier.
   # ---------------------------------------------------------------------------
 
+  # TEMPORARILY DISABLED — the iOS suite was eating too much CI budget.
+  # To restore, put the original gate back:
+  #   if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
+  # This is the cheap half (Linux, 1x). The expensive half is `ios-sim` below.
   ios-checks:
     name: iOS core (rust + transcript bundle)
     needs: changes
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
+    if: false
     steps:
       - uses: actions/checkout@v4
       # No toolchain file under app/ios — rustup walks UP to the root
@@ -238,7 +242,13 @@ jobs:
     # it produces. macos-26 (arm64) ships Xcode 26.5 with iOS 26.2/26.4/26.5
     # simulator runtimes preinstalled — no -downloadPlatform needed.
     runs-on: macos-26
-    if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios_native == 'true' }}
+    # TEMPORARILY DISABLED — this is the one that actually hurt: a macOS runner is
+    # billed at 10x Linux minutes (40-minute timeout), and `ios_native` fires on
+    # any change under crates/{wire,device-proto,model}/ or remote-host/, so plenty
+    # of PRs with nothing iOS-shaped about them were paying for it.
+    # To restore, put the original gate back:
+    #   if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios_native == 'true' }}
+    if: false
     timeout-minutes: 40
     defaults:
       run:
