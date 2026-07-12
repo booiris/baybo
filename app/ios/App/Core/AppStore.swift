@@ -284,6 +284,21 @@ final class AppStore: ObservableObject {
             route = .home
             consumePendingPushRoute()
             prewarmTranscriptHost()
+            resumeStrandedSends()
+        }
+    }
+
+    /// Sends that outlived the process. `ChatStore.send` enrols the outbox
+    /// before it touches the network, so a kill in that window can leave a
+    /// message for a session the gateway never heard of and the list never
+    /// showed — unreachable from the UI and drained by nothing. Re-drive every
+    /// session that still has one: the store ensures its remote row, lists it,
+    /// and dials, and the dial's reconciliation gate looks each entry up before
+    /// resending. Idempotent and cheap on the common path — logout wipes the
+    /// outboxes, so an unbound install finds an empty directory.
+    private func resumeStrandedSends() {
+        for sessionId in OutboxStore.pendingSessionIds(in: SessionIndex.supportDirectory()) {
+            chatStore(for: sessionId).resumePersistedSends()
         }
     }
 
@@ -304,6 +319,10 @@ final class AppStore: ObservableObject {
         for store in chatStores.values {
             store.scheduleReconnect()
         }
+        // Re-armed on every foreground, not just launch: an LRU eviction can
+        // cancel a recovery's timers mid-flight, and a recovery that failed
+        // offline deserves the next live leg.
+        resumeStrandedSends()
         if route == .home {
             prewarmTranscriptHost()
         }

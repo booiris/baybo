@@ -175,6 +175,35 @@ struct ChatStoreOutboxTests {
         #expect(await waitUntil { outbox.entries().isEmpty })
     }
 
+    /// The gate's ONE exemption: the send that drove this very dial. Its row is
+    /// microseconds old, so the lookup races the gateway's own persist, answers
+    /// `found: false`, and `resumeSending` re-arms it for a blind resend at the
+    /// next 3 s tick — a second transmission of a message still in flight, well
+    /// inside the 10 s the echo needs, spent for nothing.
+    @Test func theDialsOwnSendIsExemptFromTheGate() async {
+        store.send(text: "hello", attachments: [])
+        #expect(await waitUntil { store.connState == .connected })
+
+        _ = await waitUntil(timeout: Self.negativeTimeout) { !client.lookupCalls.isEmpty }
+        #expect(client.lookupCalls.isEmpty, "a lookup would race the gateway's own persist")
+        #expect(
+            outbox.entries().first?.lastSentAt != 0,
+            "and its `found: false` would re-arm the entry for an immediate resend")
+        #expect(outbox.entries().first?.transmissions == 1)
+    }
+
+    /// Only that one entry is exempt. An entry from an EARLIER leg rode a
+    /// connection that is gone; it is exactly what the gate exists for, and the
+    /// dial it happens to share with a fresh send must still resolve it.
+    @Test func anEarlierEntryIsStillGatedOnTheSameDial() async {
+        enrol("msg-old")
+        client.answerLookup(platformMsgId: "msg-old", found: true, ordinal: 5)
+
+        store.send(text: "hello", attachments: [])
+        #expect(await waitUntil { client.lookupCalls.map(\.platformMsgId) == ["msg-old"] })
+        #expect(await waitUntil { !outbox.entries().contains { $0.platformMsgId == "msg-old" } })
+    }
+
     /// A `failed` entry is the user's red dot; the reconnect gate leaves it
     /// alone — only a manual retry revives it.
     @Test func reconnectIgnoresAFailedEntry() async {
