@@ -67,6 +67,7 @@ Bottom-up along the dependency graph:
 - [mobile/pairing-security.md](mobile/pairing-security.md) — The pairing **threat model** and crypto design: why device pairing is safe against a hostile relay. The `rendezvous_id` / 256-bit-`secret` split, `Noise_XXpsk0`, the high-entropy-secret invariant, prologue binding, confirm-code channel binding, and secret hygiene.
 - [mobile/relay-push-security.md](mobile/relay-push-security.md) — The mobile scan-to-pair, relay, and push security note: QR bootstrap, Noise IK content legs, encrypted APNs previews, remote-host transparency, proof sketches, and explicit security boundaries.
 - [mobile/blob-transfer.md](mobile/blob-transfer.md) — Dedicated relay blob legs for mobile attachment download/upload, including chat-priority bandwidth, token-gated `BlobStore::open_at`, upload limits, and the iOS Swift + Rust-FFI client (`app/ios`).
+- [mobile/relay-api-tunnel.md](mobile/relay-api-tunnel.md) — **Proposed, not implemented.** Making the relay API tunnel leg serve more than one request. Today every relay-mode REST call (list / sync / create / mark-read / archive / pin) dials a whole new WSS + Noise IK leg — ~5 phone-side round trips each. The design: a `reuse` field on `TunnelResponse::Head` as the only capability signal (skew-safe both ways), a gateway request loop with a typed desync table, and a wait-free K-deep client leg pool with a dual-clock staleness check for iOS suspension. Also catalogues three latent client bugs that the one-shot leg currently masks.
 
 ## Cross-Cutting Guides
 
