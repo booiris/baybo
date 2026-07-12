@@ -108,6 +108,21 @@ final class OutboxStore {
         now().timeIntervalSince1970 - entry.lastSentAt >= Self.echoTimeout
     }
 
+    /// Session ids with a persisted outbox. A relaunch reads this to find sends
+    /// the previous process enrolled — including for a session that never
+    /// reached `SessionIndex`, which nothing else can reach
+    /// (`AppStore.resumeStrandedSends`). Session ids are UUIDs, so the file
+    /// name's `/` sanitisation never fires and the basename IS the id.
+    nonisolated static func pendingSessionIds(in supportDirectory: URL) -> [String] {
+        let contents =
+            (try? FileManager.default.contentsOfDirectory(
+                at: directory(in: supportDirectory), includingPropertiesForKeys: nil)) ?? []
+        return
+            contents
+            .filter { $0.pathExtension == "json" }
+            .map { $0.deletingPathExtension().lastPathComponent }
+    }
+
     // MARK: - Mutations
 
     /// Record a fresh send: state `sending`, the transmission already counted

@@ -409,6 +409,23 @@
         }
       }
     },
+    "chat.removeFailedAttachment" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remove the image that failed to upload"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请先移除上传失败的图片"
+          }
+        }
+      }
+    },
     "chat.send" : {
       "extractionState" : "stale",
       "localizations" : {

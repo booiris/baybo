@@ -491,13 +491,60 @@ final class ChatStore: ObservableObject {
             connEpoch += 1
             connState = .connected
             bridge?.setConnEpoch(connEpoch)
-            reconcileOutboxOnConnect()
+            reconcileOutboxOnConnect(justSent: msgId)
         } catch {
             guard gen >= generation else { throw error }
             connState = .offline
             scheduleRetry()
             throw error
         }
+    }
+
+    /// Adopt sends a previous process enrolled. `send` writes the outbox BEFORE
+    /// it touches the network — so a kill in that window leaves entries for a
+    /// session the gateway was never told about and `SessionIndex` never listed,
+    /// and nothing would ever drain them: `connect()` is a no-op on a draft, the
+    /// sweep only fires on a connected leg, and compose mints a FRESH id, so the
+    /// conversation is unreachable from the list. Ensure the row, list it, then
+    /// dial: the dial's reconciliation gate looks every entry up before any
+    /// resend, so a send that did land (and whose echo we simply never saw) is
+    /// released rather than re-run. Best-effort — a failure retries on the next
+    /// launch or foreground.
+    func resumePersistedSends() {
+        guard outbox.entries().contains(where: { $0.state != .failed }) else { return }
+        Task {
+            do {
+                try await ensureRemoteSession()
+                // The row exists now, so this is no longer a draft — without the
+                // flip `connect()` would refuse it and the entries would strand
+                // exactly as they just did.
+                if connState == .draft {
+                    connState = .connecting
+                }
+                // The kill landed before `dispatchSend`'s `recordUserSend`: the
+                // list never learned about this conversation. Register it so the
+                // pending message is visible while it redelivers. An already
+                // listed row is left alone — `recordUserSend` would rewind its
+                // preview to the user's question.
+                if !index.contains(sessionId: sessionId), let text = strandedPreviewText() {
+                    index.recordUserSend(sessionId: sessionId, text: text)
+                }
+                connect()
+            } catch {
+                NSLog("baybo: resume persisted sends: %@", bayboErrorText(error))
+            }
+        }
+    }
+
+    /// The newest un-failed entry's text — the list preview for a conversation
+    /// the registry never learned about. Attachment-only sends carry none.
+    private func strandedPreviewText() -> String? {
+        let text =
+            outbox.entries()
+            .filter { $0.state != .failed }
+            .max(by: { $0.createdAt < $1.createdAt })?
+            .text
+        return (text?.isEmpty ?? true) ? nil : text
     }
 
     private func ensureRemoteSession() async throws {
@@ -758,7 +805,9 @@ final class ChatStore: ObservableObject {
     /// confirmation (the loop's sync runs first as the reconciliation gate — the
     /// webview drives it off the connEpoch bump). The gateway-restart crash
     /// window (echoed, never persisted) is exactly what this recovers.
-    private func reconcileOutboxOnConnect() {
+    /// `justSent` is the message this very dial carried (`sendWhenReady`), if
+    /// any — it is exempt, see below.
+    private func reconcileOutboxOnConnect(justSent: String? = nil) {
         // Reconciliation gate: resolve each unconfirmed entry by a per-key
         // durability point lookup BEFORE any resend. A blind resend here would
         // double-run a send that IS durable when the gateway restarted and
@@ -769,6 +818,13 @@ final class ChatStore: ObservableObject {
         // resend). This is the iOS analogue of the web loop's "sync first".
         for entry in outbox.entries() {
             guard entry.state == .sending || entry.state == .sent else { continue }
+            // The send that DROVE this dial is microseconds old: the gateway has
+            // not persisted it yet, so the lookup races its own write, answers
+            // `found: false`, and `resumeSending` re-arms it for a blind resend
+            // at the next 3 s tick — spending a transmission on a message still
+            // in flight, well inside the 10 s the echo needs. The sweep already
+            // owns it; every OTHER entry rode a previous leg and is fair game.
+            guard entry.platformMsgId != justSent else { continue }
             resolveUnknownEntry(platformMsgId: entry.platformMsgId)
         }
         startOutboxTimerIfNeeded()
@@ -777,9 +833,10 @@ final class ChatStore: ObservableObject {
     /// One (re)transmission of an outbox entry on the live leg (same
     /// `platform_msg_id`, safe inside the gateway's dedup window). Replays the
     /// entry's attachments too, so a retried image/file send stays that message
-    /// rather than degrading to text-only.
+    /// rather than degrading to text-only. Only `sweepOutbox` calls this, and it
+    /// holds the `connected` check — a second guard here would silently swallow
+    /// the transmission it was already counted for.
     private func resendOutboxEntry(_ entry: OutboxEntry) {
-        guard connState == .connected else { return }
         outbox.recordTransmission(platformMsgId: entry.platformMsgId)
         let attachments = entry.attachments.map(Self.toAttachmentRef)
         Task {
@@ -837,9 +894,24 @@ final class ChatStore: ObservableObject {
         }
     }
 
-    /// One retry-sweep pass. Returns `true` when the outbox is idle (no
-    /// `sending`/`sent` entries left) so the timer can stop.
-    private func sweepOutbox() -> Bool {
+    /// One retry-sweep pass. Returns `true` when the timer should stop — the
+    /// outbox is idle, or the leg is down. Not `private`: `outboxTimer` is its
+    /// only production caller, but a test steps it directly rather than sleeping
+    /// through `retryTick` on every assertion.
+    @discardableResult
+    func sweepOutbox() -> Bool {
+        // A transmission is only ever spent on the wire, so a down leg can
+        // neither resend an entry nor legitimately fail one — the outbox exists
+        // precisely to outlive the outage. Park the sweep and let the reconnect
+        // edge (`reconcileOutboxOnConnect`) re-arm it, rather than ticking on a
+        // condition that cannot pass: the resend used to bail on its own
+        // `connected` guard AFTER the sweep had already elected it, so
+        // `transmissions` never grew, `resendExhausted` never became true, the
+        // entry could never reach `failed`, and the 3 s timer ran forever.
+        guard connState == .connected else {
+            outboxTimer = nil
+            return true
+        }
         var active = false
         for entry in outbox.entries() {
             guard entry.state == .sending || entry.state == .sent else { continue }

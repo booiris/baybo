@@ -5,7 +5,10 @@ import SwiftUI
 /// in-field send. Interaction contract preserved from the web composer:
 /// * staged picks count as a draft, so an attachment-only send works with an
 ///   empty field;
-/// * send is gated while any staged item is uploading (`waitingUpload` notice);
+/// * send is gated while any staged item is uploading (`waitingUpload` notice),
+///   and blocked outright while one FAILED to upload (`removeFailedAttachment`)
+///   — it carries no blob, and shipping the message without it would drop the
+///   user's image in silence;
 /// * picks over 100 MiB are rejected up front (`tooLarge`), matching the
 ///   gateway's blob cap.
 struct ComposerView: View {
@@ -283,6 +286,14 @@ struct ComposerView: View {
     private func send() {
         if staged.contains(where: { $0.state.isUploading }) {
             store.notice = Lang.shared.t("chat.waitingUpload")
+            return
+        }
+        // A pick whose upload failed has no blob to reference, so it can't ride
+        // the send — and dropping it silently ships the message MINUS the image
+        // the user attached, with nothing to say so. Block on it instead: the
+        // thumbnail's ✕ is right there.
+        if staged.contains(where: { $0.state.isError }) {
+            store.notice = Lang.shared.t("chat.removeFailedAttachment")
             return
         }
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
