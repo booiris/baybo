@@ -530,13 +530,15 @@ async fn open_data_leg(
         "relay-content: data leg established"
     );
     match class {
-        // Tunnel legs are one-shot request/response legs, so they are NOT
-        // deduped. Concurrent tunnel transfers are bounded by the relay's
-        // per-key connection cap. (The leg's own AbortHandle oneshot goes unused;
-        // drop it.)
+        // Tunnel legs are never deduped: an `Api` leg may serve several requests
+        // in sequence and a `Blob` leg carries one long transfer, but a device
+        // legitimately runs more than one of either at a time. Concurrency is
+        // bounded by the relay's per-key connection cap. (The leg's own
+        // AbortHandle oneshot goes unused; drop it.) The class travels with the
+        // leg because only `Api` may be reused — see `run_api_tunnel_over_relay`.
         LegClass::Api | LegClass::Blob => {
             drop(ah_rx);
-            run_api_tunnel_over_relay(ws, state).await;
+            run_api_tunnel_over_relay(ws, class, state).await;
         }
         // Chat dedups to one live leg per device: learn our own AbortHandle (sent
         // right after spawn) so a fresh leg aborts a stale predecessor; if it never
