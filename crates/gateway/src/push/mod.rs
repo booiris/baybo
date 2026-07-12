@@ -432,10 +432,23 @@ impl PushDispatcher {
             .map(Arc::clone)
     }
 
-    /// True iff this terminal event should buzz a phone: a successfully-
-    /// completed real user turn.
+    /// True iff this terminal event might buzz a phone: a successfully-
+    /// completed turn whose reply a user is meant to read.
+    ///
+    /// Three kinds qualify — a real user turn, and both halves of the cron
+    /// story: a **recurring** fire, whose session is a conversation the user
+    /// reads the result in, and the **delivery** of a one-shot's result into
+    /// the conversation that scheduled it. A recurring fire is only confirmed
+    /// once the session is loaded (`dispatch_completed`) — a cron session that
+    /// is *not* a conversation is a private workspace nobody would open.
+    /// Everything else (compaction, subagents, their notifications) is
+    /// machinery, not a message.
     pub fn should_dispatch(ev: &JobLifecycleEvent) -> bool {
-        matches!(ev.phase, JobPhase::Completed { .. }) && ev.kind == JobInputKind::UserChat
+        matches!(ev.phase, JobPhase::Completed { .. })
+            && matches!(
+                ev.kind,
+                JobInputKind::UserChat | JobInputKind::Cron | JobInputKind::CronNotification
+            )
     }
 
     /// Dispatch on the completed edge of a real user turn. The reply's ordinal
@@ -465,8 +478,8 @@ impl PushDispatcher {
         // Skip a vanished session (nothing to preview), but otherwise fan out to
         // every approved device — one gateway = one app, so there is no per-user
         // scoping to apply.
-        match self.session_manager.get(&ev.session_id).await {
-            Ok(Some(_)) => {}
+        let session = match self.session_manager.get(&ev.session_id).await {
+            Ok(Some(session)) => session,
             Ok(None) => {
                 tracing::debug!(
                     session = %ev.session_id,
@@ -482,6 +495,18 @@ impl PushDispatcher {
                 );
                 return;
             }
+        };
+        // A one-shot fire's session is a private workspace: its reply is
+        // delivered into the conversation that scheduled it, and *that*
+        // delivery pushes (as a `CronNotification`). Pushing here as well would
+        // buzz the phone twice for one scheduled task, with the deep link
+        // pointing at a session the user cannot even open.
+        if ev.kind == JobInputKind::Cron && !session.trigger.is_cron_conversation() {
+            tracing::debug!(
+                session = %ev.session_id,
+                "push: one-shot cron fire pushes from its origin conversation; not pushing here"
+            );
+            return;
         }
         // Fan out to every approved paired device AND every direct-mode device push
         // binding — one gateway = one user, so there is no per-user scoping.
@@ -934,28 +959,24 @@ mod tests {
     }
 
     #[test]
-    fn dispatches_only_completed_user_turns() {
-        // The one buzzing case.
-        assert!(PushDispatcher::should_dispatch(&event(
-            JobPhase::Completed {
-                reply_ordinal: None
-            },
-            JobInputKind::UserChat,
-        )));
-        // `/compact` has its own input kind and must NOT buzz.
-        assert!(!PushDispatcher::should_dispatch(&event(
-            JobPhase::Completed {
-                reply_ordinal: None
-            },
-            JobInputKind::Compact,
-        )));
-        // Non-terminal, and non-user inputs.
-        assert!(!PushDispatcher::should_dispatch(&event(
-            JobPhase::Started,
-            JobInputKind::UserChat,
-        )));
+    fn dispatches_only_completed_turns_a_user_is_meant_to_read() {
+        // The three buzzing cases: a real user turn, a cron fire (confirmed to
+        // be a conversation once the session is loaded), and the delivery of a
+        // one-shot fire's result into the conversation that scheduled it.
         for kind in [
+            JobInputKind::UserChat,
             JobInputKind::Cron,
+            JobInputKind::CronNotification,
+        ] {
+            assert!(PushDispatcher::should_dispatch(&event(
+                JobPhase::Completed {
+                    reply_ordinal: None
+                },
+                kind,
+            )));
+        }
+        // Machinery, not messages.
+        for kind in [
             JobInputKind::Compact,
             JobInputKind::Spawned,
             JobInputKind::SubagentNotification,
@@ -967,7 +988,11 @@ mod tests {
                 kind,
             )));
         }
-        // Failed / cancelled turns don't buzz either.
+        // Non-terminal edges, and failed / cancelled turns, don't buzz.
+        assert!(!PushDispatcher::should_dispatch(&event(
+            JobPhase::Started,
+            JobInputKind::UserChat,
+        )));
         assert!(!PushDispatcher::should_dispatch(&event(
             JobPhase::Failed,
             JobInputKind::UserChat,

@@ -1458,4 +1458,53 @@ mod tests {
         let loaded = mgr.load_active_session_messages(&session.id).await.unwrap();
         assert!(loaded.is_empty());
     }
+
+    /// The unread badge counts what a user is meant to read: final assistant
+    /// replies past their read cursor. A cron notification — a one-shot fire's
+    /// result appended to the conversation that scheduled it — is exactly that,
+    /// even though no LLM call produced it, so it must raise the badge like any
+    /// other reply. This is what makes the redesign need no cron-specific
+    /// unread plumbing at all.
+    #[tokio::test]
+    async fn unread_counts_a_cron_notification_as_a_reply() {
+        use baybo_model::{ChatMessage, ContentBlock};
+
+        let mgr = SessionManager::new(
+            Arc::new(MemorySessionStore::new()),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
+        let session = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+
+        // The user's own message is not something they need to be told about.
+        mgr.append_session_message(
+            &session.id,
+            &ChatMessage::user(vec![ContentBlock::Text("remind me at 6".into())]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mgr.unread_reply_count(&session.id, 99).await.unwrap(), 0);
+
+        // The delivered cron result: a real, unread reply.
+        let ordinal = mgr
+            .append_session_message(
+                &session.id,
+                &ChatMessage::cron_notification(vec![ContentBlock::Text(
+                    r#"⏰ Scheduled task "Dinner reminder" ran:
+
+time to eat"#
+                        .into(),
+                )]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mgr.unread_reply_count(&session.id, 99).await.unwrap(), 1);
+
+        // Reading the conversation clears it.
+        mgr.set_read_cursor(&session.id, ordinal).await.unwrap();
+        assert_eq!(mgr.unread_reply_count(&session.id, 99).await.unwrap(), 0);
+    }
 }

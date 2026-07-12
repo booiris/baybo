@@ -410,6 +410,10 @@ pub struct CreateCronRequest {
     pub user_id: String,
     #[serde(default)]
     pub channel: Option<ChannelType>,
+    /// Short human name for the job. Names the conversation a recurring fire
+    /// opens and heads the result a one-shot reports back to the conversation
+    /// that scheduled it.
+    pub title: String,
     pub text: String,
     /// IANA timezone (e.g. `"Asia/Shanghai"`) used to evaluate the cron
     /// expression and to render time fields in responses. Required —
@@ -518,6 +522,7 @@ impl From<baybo_job::JobStatus> for JobStatus {
 pub enum JobInputKind {
     UserChat,
     Cron,
+    CronNotification,
     Compact,
     Spawned,
     SubagentNotification,
@@ -528,6 +533,7 @@ impl From<baybo_job::JobInputKind> for JobInputKind {
         match v {
             baybo_job::JobInputKind::UserChat => Self::UserChat,
             baybo_job::JobInputKind::Cron => Self::Cron,
+            baybo_job::JobInputKind::CronNotification => Self::CronNotification,
             baybo_job::JobInputKind::Compact => Self::Compact,
             baybo_job::JobInputKind::Spawned => Self::Spawned,
             baybo_job::JobInputKind::SubagentNotification => Self::SubagentNotification,
@@ -644,6 +650,9 @@ pub struct CronJob {
     pub id: String,
     pub user_id: String,
     pub channel: ChannelType,
+    /// Short human name for the job. Empty for rows created before the field
+    /// existed — clients fall back to the prompt.
+    pub title: String,
     pub schedule: CronSchedule,
     pub prompt: String,
     pub timezone: String,
@@ -662,6 +671,7 @@ impl From<baybo_cron::CronJob> for CronJob {
             id: v.id,
             user_id: v.user_id,
             channel: v.channel.into(),
+            title: v.title,
             schedule: v.schedule.into(),
             prompt: v.prompt,
             timezone: v.timezone,

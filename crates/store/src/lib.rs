@@ -31,7 +31,7 @@ pub use channel_bot::{ChannelBotRow, ChannelBotStore};
 pub use channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
 pub use channel_session::ChannelSessionStore;
 pub use cost::CostStore;
-pub use cron::CronStore;
+pub use cron::{CronStore, ExecutionCompletion};
 pub use device::{DeviceRow, DeviceStatus, DeviceStore};
 pub use error::StorageError;
 pub use job::{JobRow, JobStore, JobTransitionRow};

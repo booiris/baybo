@@ -9,7 +9,8 @@
 use async_trait::async_trait;
 use baybo_model::{CronExecution, CronJob, ExecutionStatus};
 use baybo_store::StorageError;
-use baybo_store::cron::{CronStore, Result};
+use baybo_store::cron::{CronStore, ExecutionCompletion, Result};
+use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
 
@@ -51,6 +52,10 @@ fn execution_from_row(row: &libsql::Row) -> Result<CronExecution> {
     };
     Ok(exec)
 }
+
+/// Columns every execution query selects, in the order
+/// [`execution_from_row`] indexes them.
+const EXECUTION_COLS: &str = "id, job_id, user_id, scheduled_fire_time, triggered_at, status, data";
 
 fn execution_status_str(status: ExecutionStatus) -> &'static str {
     match status {
@@ -389,8 +394,85 @@ impl CronStore for LibsqlCronStore {
             .pool
             .conn()
             .query(
-                "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE status = ?1",
+                &format!("SELECT {EXECUTION_COLS} FROM cron_executions WHERE status = ?1"),
                 libsql::params![execution_status_str(status).to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
+        {
+            out.push(execution_from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    // ── Delivery ledger ──
+    //
+    // The full ledger lives in the `data` blob (read-modify-write below);
+    // `completed_at` / `notified_at` are also projected into columns so the
+    // boot re-drive's scan is an indexed query rather than a full-table
+    // deserialize. Both writers are single (the waiter stamps completion, the
+    // origin actor stamps the resolution), so no read-modify-write race.
+
+    async fn record_execution_completion(
+        &self,
+        execution_id: &str,
+        completion: ExecutionCompletion,
+    ) -> Result<()> {
+        let mut exec = self.load_execution(execution_id).await?;
+        exec.fire_session_id = Some(completion.fire_session_id);
+        exec.outcome = Some(completion.outcome);
+        exec.reply_ordinal = completion.reply_ordinal;
+        exec.completed_at = Some(completion.completed_at);
+        let data = serialize_execution(&exec)?;
+
+        self.pool
+            .conn()
+            .execute(
+                "UPDATE cron_executions SET completed_at = ?1, data = ?2 WHERE id = ?3",
+                libsql::params![
+                    completion.completed_at.timestamp_micros(),
+                    data,
+                    execution_id.to_string(),
+                ],
+            )
+            .await
+            .map_err(|e| StorageError::Storage(format!("libsql update: {e}")))?;
+        Ok(())
+    }
+
+    async fn mark_execution_notified(&self, execution_id: &str, at: DateTime<Utc>) -> Result<()> {
+        let mut exec = self.load_execution(execution_id).await?;
+        exec.notified_at = Some(at);
+        let data = serialize_execution(&exec)?;
+
+        self.pool
+            .conn()
+            .execute(
+                "UPDATE cron_executions SET notified_at = ?1, data = ?2 WHERE id = ?3",
+                libsql::params![at.timestamp_micros(), data, execution_id.to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Storage(format!("libsql update: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>> {
+        let mut rows = self
+            .pool
+            .conn()
+            .query(
+                &format!(
+                    "SELECT {EXECUTION_COLS} FROM cron_executions \
+                     WHERE completed_at IS NOT NULL AND notified_at IS NULL \
+                     ORDER BY completed_at ASC"
+                ),
+                (),
             )
             .await
             .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
@@ -407,12 +489,54 @@ impl CronStore for LibsqlCronStore {
     }
 }
 
+impl LibsqlCronStore {
+    /// Load one execution for a read-modify-write of its ledger. The row's
+    /// `data` blob carries every ledger field; the `status` column overrides
+    /// the blob's copy (see [`execution_from_row`]).
+    async fn load_execution(&self, execution_id: &str) -> Result<CronExecution> {
+        let mut rows = self
+            .pool
+            .conn()
+            .query(
+                &format!("SELECT {EXECUTION_COLS} FROM cron_executions WHERE id = ?1"),
+                libsql::params![execution_id.to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
+
+        match rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
+        {
+            Some(row) => execution_from_row(&row),
+            None => Err(StorageError::NotFound(execution_id.to_string())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use baybo_model::ChannelType;
     use baybo_model::{CronSchedule, CronStatus};
     use chrono::Utc;
+
+    /// A real row from a pre-redesign database: no `title`, no `timezone`, and
+    /// none of the delivery-ledger fields. Rows like this are sitting in every
+    /// deployed workspace, so they must load — and must not look like they are
+    /// awaiting a delivery that never had a chance to happen.
+    const LEGACY_EXECUTION_JSON: &str = r#"{
+        "id":"01a1c0d1-9819-4174-8122-60a49b28f1a4",
+        "job_id":"9d0e5af1-f4dc-457b-8192-2ac72b5aef5f",
+        "user_id":"device-7b26",
+        "channel":"device",
+        "schedule":{"kind":"at","time":"2026-07-06T01:21:50Z"},
+        "prompt":"Send the user a reminder",
+        "scheduled_fire_time":"2026-07-06T01:21:50Z",
+        "triggered_at":"2026-07-06T01:21:56Z",
+        "status":"dispatched"
+    }"#;
 
     fn future_dt() -> chrono::DateTime<Utc> {
         chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
@@ -426,6 +550,7 @@ mod tests {
             id: id.to_string(),
             user_id: user_id.to_string(),
             channel: ChannelType::tui(),
+            title: "test job".to_string(),
             schedule: CronSchedule::cron("0 9 * * *"),
             prompt: "test".to_string(),
             timezone: "UTC".to_string(),
@@ -444,18 +569,13 @@ mod tests {
         // by repeat fixture rows.
         let salt: i64 = id.chars().map(|c| c as i64).sum();
         let scheduled = future_dt() + chrono::Duration::microseconds(salt);
-        CronExecution {
-            id: id.to_string(),
-            job_id: job_id.to_string(),
-            user_id: user_id.to_string(),
-            channel: ChannelType::tui(),
-            schedule: CronSchedule::cron("0 9 * * *"),
-            prompt: "test".to_string(),
-            scheduled_fire_time: scheduled,
-            triggered_at: future_dt(),
-            status: ExecutionStatus::Pending,
-            origin_session_id: None,
-        }
+        let mut exec = CronExecution::pending(
+            &test_job(job_id, user_id, CronStatus::Enabled),
+            scheduled,
+            future_dt(),
+        );
+        exec.id = id.to_string();
+        exec
     }
 
     #[tokio::test]
@@ -654,6 +774,188 @@ mod tests {
 
         let u1 = store.list_executions_by_user("u1").await.unwrap();
         assert_eq!(u1.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delivery_ledger_round_trips_and_drives_the_awaiting_scan() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlCronStore::new(pool);
+
+        store
+            .record_execution(&test_execution("ce-led", "cj-led", "u1"))
+            .await
+            .unwrap();
+        // A dispatched-but-unfinished fire is not awaiting delivery yet.
+        assert!(
+            store
+                .list_executions_awaiting_delivery()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let completed_at = future_dt();
+        store
+            .record_execution_completion(
+                "ce-led",
+                ExecutionCompletion {
+                    fire_session_id: "cron-fire".into(),
+                    outcome: baybo_model::ExecutionOutcome::Success,
+                    reply_ordinal: Some(12),
+                    completed_at,
+                },
+            )
+            .await
+            .unwrap();
+
+        let awaiting = store.list_executions_awaiting_delivery().await.unwrap();
+        assert_eq!(awaiting.len(), 1);
+        let exec = &awaiting[0];
+        assert_eq!(exec.id, "ce-led");
+        assert_eq!(exec.reply_ordinal, Some(12));
+        assert_eq!(
+            exec.outcome,
+            Some(baybo_model::ExecutionOutcome::Success),
+            "the full ledger round-trips through the data blob"
+        );
+        assert_eq!(
+            exec.fire_session_id.as_ref().map(|s| s.as_str()),
+            Some("cron-fire")
+        );
+        assert_eq!(exec.completed_at, Some(completed_at));
+
+        // Resolving the delivery takes it out of the scan for good.
+        store
+            .mark_execution_notified("ce-led", future_dt())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_executions_awaiting_delivery()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let stored = store.load_execution("ce-led").await.unwrap();
+        assert!(stored.notified_at.is_some());
+        assert!(!stored.awaits_delivery());
+    }
+
+    /// A database written before the delivery ledger existed must open, keep
+    /// serving its rows, and stay out of the boot re-drive's scan.
+    ///
+    /// The fixture is a real pre-redesign DB *file*: the old `cron_executions`
+    /// schema (no `completed_at` / `notified_at`) with a real row in it, opened
+    /// through the normal path so the `ALTER TABLE` migrations actually run.
+    /// An in-memory pool would create the table from the current `CREATE` and
+    /// prove nothing about upgrading an existing workspace.
+    #[tokio::test]
+    async fn legacy_execution_rows_survive_the_ledger_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+
+        // The schema exactly as it shipped before this change.
+        let legacy = libsql::Builder::new_local(&db_path).build().await.unwrap();
+        let conn = legacy.connect().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_executions (
+                 id                  TEXT    PRIMARY KEY,
+                 job_id              TEXT    NOT NULL,
+                 user_id             TEXT    NOT NULL,
+                 scheduled_fire_time INTEGER NOT NULL DEFAULT 0,
+                 triggered_at        INTEGER NOT NULL,
+                 status              TEXT    NOT NULL DEFAULT 'pending',
+                 data                TEXT    NOT NULL
+             );",
+        )
+        .await
+        .expect("create the pre-redesign table");
+        conn.execute(
+            "INSERT INTO cron_executions \
+             (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            libsql::params![
+                "01a1c0d1-9819-4174-8122-60a49b28f1a4",
+                "9d0e5af1-f4dc-457b-8192-2ac72b5aef5f",
+                "device-7b26",
+                0_i64,
+                0_i64,
+                "dispatched",
+                LEGACY_EXECUTION_JSON,
+            ],
+        )
+        .await
+        .expect("insert a row the old code would have written");
+        drop(conn);
+        drop(legacy);
+
+        // Boot the new code against that file: `open` runs the schema init,
+        // which must ALTER the existing table rather than fail on it.
+        let pool = LibsqlPool::open(&db_path)
+            .await
+            .expect("a pre-redesign database must open");
+
+        let store = LibsqlCronStore::new(pool);
+        let loaded = store
+            .list_executions_by_job("9d0e5af1-f4dc-457b-8192-2ac72b5aef5f")
+            .await
+            .expect("legacy row must deserialize");
+        assert_eq!(loaded.len(), 1);
+        let exec = &loaded[0];
+        assert_eq!(exec.status, ExecutionStatus::Dispatched);
+        assert!(
+            exec.title.is_empty(),
+            "no title existed when it was written"
+        );
+        assert!(exec.outcome.is_none());
+        assert!(
+            !exec.awaits_delivery(),
+            "a fire from before the ledger never completed *into* it, so there is \
+             nothing to re-drive — otherwise every boot would replay old fires"
+        );
+
+        assert!(
+            store
+                .list_executions_awaiting_delivery()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the re-drive scan must ignore pre-ledger rows"
+        );
+
+        // The migrated columns are real: a completion stamps them and the scan
+        // then finds the row.
+        store
+            .record_execution_completion(
+                "01a1c0d1-9819-4174-8122-60a49b28f1a4",
+                ExecutionCompletion {
+                    fire_session_id: "cron-x".into(),
+                    outcome: baybo_model::ExecutionOutcome::Success,
+                    reply_ordinal: Some(1),
+                    completed_at: future_dt(),
+                },
+            )
+            .await
+            .expect("ledger columns exist after migration");
+        assert_eq!(
+            store
+                .list_executions_awaiting_delivery()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_writes_reject_unknown_execution() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlCronStore::new(pool);
+        let err = store
+            .mark_execution_notified("ghost", future_dt())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::NotFound(_)));
     }
 
     #[tokio::test]

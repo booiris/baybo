@@ -39,6 +39,54 @@ pub fn frame_cron_prompt(job_id: &str, prompt: &str) -> String {
     format!("{CRON_TAG_PREFIX}{job_id}] {FRAMING_BODY}\n\n{INSTRUCTION_LABEL}\n{prompt}")
 }
 
+/// Header of a one-shot fire's result, delivered into the conversation that
+/// scheduled it. `{{title}}` is the job's display title.
+///
+/// The framing is baked into the persisted row rather than applied wire-side
+/// (as the user/interjection envelopes are): this row is `Role::Assistant`, so
+/// the model reads it back as something it already said — and it must read the
+/// *same* bytes the user sees, or the two would disagree about what was
+/// reported. It also means a boot-time re-delivery reproduces the row exactly.
+///
+/// English, like every other prompt in the tree: the model reads this back as
+/// its own words, so a header in a fixed non-English language would put words
+/// in its mouth it never chose. The *body* — the fire's own reply — carries
+/// whatever language the job's prompt asked for, so a Chinese reminder still
+/// reads as Chinese.
+const NOTIFICATION_HEADER_SUCCESS: &str = r#"⏰ Scheduled task "{{title}}" ran:"#;
+const NOTIFICATION_HEADER_FAILED: &str = r#"⏰ Scheduled task "{{title}}" failed:"#;
+
+/// Body used when a fire completed but produced no text (a tool-only or empty
+/// reply). The notification still lands — a scheduled task must never report
+/// nothing — it just says so.
+const NOTIFICATION_BLANK_BODY: &str = "It ran, but produced no output.";
+
+/// Body used when a failed fire left no error detail to quote.
+const NOTIFICATION_FAILURE_UNKNOWN: &str = "No error detail was recorded.";
+
+/// The leading text block of a one-shot cron notification: a header naming the
+/// job, followed by `body` (the fire's reply text, a blank-run fallback, or the
+/// failure reason). The caller appends any non-text blocks of the fire's reply
+/// (images, files) after this one, so nothing the fire produced is lost.
+pub fn frame_cron_notification(title: &str, failed: bool, body: &str) -> String {
+    let header = if failed {
+        NOTIFICATION_HEADER_FAILED
+    } else {
+        NOTIFICATION_HEADER_SUCCESS
+    }
+    .replace("{{title}}", title);
+
+    let body = body.trim();
+    let body = if !body.is_empty() {
+        body
+    } else if failed {
+        NOTIFICATION_FAILURE_UNKNOWN
+    } else {
+        NOTIFICATION_BLANK_BODY
+    };
+    format!("{header}\n\n{body}")
+}
+
 /// Recover the original instruction from synthesized cron content, for
 /// operator-facing previews.
 ///
@@ -102,5 +150,38 @@ mod tests {
     #[test]
     fn returns_untagged_content_unchanged() {
         assert_eq!(original_cron_prompt("just text"), "just text");
+    }
+
+    /// The header is English (it is the assistant's own voice, like every other
+    /// prompt in the tree) while the body is whatever the fire actually
+    /// produced — a job asked to remind the user in Chinese still reports in
+    /// Chinese under an English header. Title and body are both passed through
+    /// verbatim.
+    #[test]
+    fn notification_headers_name_the_job_and_carry_the_body() {
+        let ok = frame_cron_notification("每日新闻", false, "今天的三条新闻…");
+        assert!(
+            ok.starts_with(r#"⏰ Scheduled task "每日新闻" ran:"#),
+            "{ok}"
+        );
+        assert!(ok.ends_with("今天的三条新闻…"));
+
+        let failed = frame_cron_notification("Daily news", true, "provider timed out");
+        assert!(
+            failed.starts_with(r#"⏰ Scheduled task "Daily news" failed:"#),
+            "{failed}"
+        );
+        assert!(failed.ends_with("provider timed out"));
+    }
+
+    /// A fire that produced nothing still notifies — silence is the one
+    /// outcome a scheduled reminder must never have.
+    #[test]
+    fn empty_body_falls_back_per_outcome() {
+        let blank = frame_cron_notification("Reminder", false, "   ");
+        assert!(blank.ends_with(NOTIFICATION_BLANK_BODY), "{blank}");
+
+        let failed = frame_cron_notification("Reminder", true, "");
+        assert!(failed.ends_with(NOTIFICATION_FAILURE_UNKNOWN), "{failed}");
     }
 }

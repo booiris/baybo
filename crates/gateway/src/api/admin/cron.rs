@@ -63,14 +63,15 @@ async fn create_cron(
         .unwrap_or(ChannelTypeModel::http());
     let job = state
         .cron_scheduler
-        .create_job(
-            &req.user_id,
+        .create_job(baybo_cron::NewCronJob {
+            user_id: req.user_id,
             channel,
+            title: req.title,
             schedule,
-            req.text,
-            req.timezone,
-            req.origin_session_id.map(Into::into),
-        )
+            prompt: req.text,
+            timezone: req.timezone,
+            origin_session_id: req.origin_session_id.map(Into::into),
+        })
         .await
         .map_err(|e| GatewayError::Cron(e.to_string()))?;
     Ok((StatusCode::CREATED, Json(CronJob::from(job))))

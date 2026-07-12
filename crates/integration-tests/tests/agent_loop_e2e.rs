@@ -1568,6 +1568,10 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
     let mut session = SessionBuilder::new().build();
     session.trigger = TriggerSource::Cron {
         cron_job_id: "cj-demo".into(),
+        origin_session_id: None,
+        // A recurring fire: its own session is the conversation, so its reply
+        // dispatches out through the channel (what this test asserts on).
+        conversation: true,
     };
     let mut harness = AgentTestHarness::builder().session(session).build();
 
@@ -1586,7 +1590,9 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
         .mailbox
         .send(AgentMessage::CronTrigger {
             job_id: "cj-demo".into(),
+            title: "greeting".into(),
             prompt: "你好".into(),
+            delivery: baybo_agent::actor::CronDelivery::Channel,
         })
         .await
         .unwrap();
@@ -1633,6 +1639,492 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
     assert_eq!(
         baybo_context::prompts::cron::original_cron_prompt(framed),
         "你好"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A one-shot fire's result reaches the conversation that scheduled it — the
+/// whole point of the one-shot path. The fire ran in its own isolated session
+/// (invisible, dispatching nothing); this drives what the router's cron waiter
+/// hands over afterwards, through the real actor.
+///
+/// Asserts the four things the delivery must do, none of which involve an LLM
+/// call: the framed result lands in the transcript as an assistant row, it goes
+/// out to the channel, the delivery ledger is resolved (so no boot re-drive
+/// replays it), and **no inference runs** — the fire already did the thinking.
+#[tokio::test]
+async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
+    use baybo_model::{ChatMessage, CronExecution, ExecutionOutcome, PendingCronResult};
+    use baybo_store::{CronStore, ExecutionCompletion};
+
+    let mut harness = AgentTestHarness::builder().build();
+    let origin_id = harness.session.id.clone();
+
+    // The fire's own session, with the reply it produced. In production the
+    // fire actor wrote this; the ordinal is what its job's `Completed` edge
+    // carried.
+    let fire_session = harness
+        .session_manager
+        .create_session_with_trigger(
+            harness.session.user.clone(),
+            harness.session.channel.clone(),
+            TriggerSource::Cron {
+                cron_job_id: "cj-dinner".into(),
+                origin_session_id: Some(origin_id.clone()),
+                conversation: false,
+            },
+        )
+        .await
+        .expect("create fire session");
+    let reply_ordinal = harness
+        .session_manager
+        .append_session_message(
+            &fire_session.id,
+            &ChatMessage::assistant(vec![ContentBlock::Text("该吃晚饭了".into())]),
+        )
+        .await
+        .expect("append fire reply");
+
+    // The execution ledger, as the waiter leaves it just before delivering.
+    let job = baybo_model::CronJob {
+        id: "cj-dinner".into(),
+        user_id: harness.session.user.id.clone(),
+        channel: harness.session.channel.clone(),
+        title: "晚饭提醒".into(),
+        timezone: "Asia/Shanghai".into(),
+        schedule: baybo_model::CronSchedule::at(chrono::Utc::now()),
+        prompt: "Remind the user to eat dinner".into(),
+        status: baybo_model::CronStatus::Executed,
+        last_triggered_at: None,
+        next_trigger_at: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        origin_session_id: Some(origin_id.clone()),
+    };
+    let execution = CronExecution::pending(&job, chrono::Utc::now(), chrono::Utc::now());
+    harness
+        .cron_store
+        .record_execution(&execution)
+        .await
+        .expect("record execution");
+    harness
+        .cron_store
+        .record_execution_completion(
+            &execution.id,
+            ExecutionCompletion {
+                fire_session_id: fire_session.id.clone(),
+                outcome: ExecutionOutcome::Success,
+                reply_ordinal: Some(reply_ordinal),
+                completed_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("record completion");
+    assert!(
+        harness
+            .cron_store
+            .execution(&execution.id)
+            .expect("execution row")
+            .awaits_delivery(),
+        "the fire is finished but its result has not reached the conversation yet"
+    );
+
+    let pending = PendingCronResult {
+        execution_id: execution.id.clone(),
+        cron_job_id: "cj-dinner".into(),
+        job_title: "晚饭提醒".into(),
+        fire_session_id: fire_session.id.clone(),
+        reply_ordinal: Some(reply_ordinal),
+        outcome: ExecutionOutcome::Success,
+        failure_reason: None,
+        completed_at: chrono::Utc::now(),
+    };
+    harness
+        .mailbox
+        .send(AgentMessage::CronResultReady(Box::new(pending.clone())))
+        .await
+        .unwrap();
+
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let messages: Vec<&str> = outs
+        .iter()
+        .filter_map(|o| match &o.event {
+            AgentEvent::Message(m) => m.content.iter().find_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        messages.len(),
+        1,
+        "the result is delivered exactly once, got {outs:?}"
+    );
+    let delivered = messages[0];
+    assert!(
+        delivered.contains(r#"Scheduled task "晚饭提醒" ran:"#),
+        "the notification names the job: {delivered}"
+    );
+    assert!(
+        delivered.contains("该吃晚饭了"),
+        "and carries what the fire actually said, in the fire's own language: {delivered}"
+    );
+
+    // No inference: the fire already produced the answer, so delivering it must
+    // not cost another LLM call (nor let the model decide to stay quiet).
+    assert!(
+        harness.stub_llm.captured_requests().is_empty(),
+        "delivering a cron result must not call the LLM"
+    );
+
+    // The transcript row is real and provenance-stamped, so a reload shows it
+    // and the next turn reads it back as something already reported.
+    let rows = harness
+        .session_manager
+        .load_active_session_messages(&origin_id)
+        .await
+        .expect("load origin transcript");
+    let notification = rows
+        .iter()
+        .find(|m| m.source() == baybo_model::MessageSource::CronNotification)
+        .expect("the notification is persisted in the origin conversation");
+    assert_eq!(notification.role, Role::Assistant);
+
+    // Ledger resolved → the boot re-drive won't replay this delivery.
+    let stored = harness
+        .cron_store
+        .execution(&execution.id)
+        .expect("execution row");
+    assert!(
+        !stored.awaits_delivery(),
+        "the delivery must resolve the ledger, got {stored:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A crash between the transcript append and the ledger stamp makes the boot
+/// re-drive replay a delivery that already landed. The dedup key on the session
+/// row is what keeps that from appending a second copy — the transcript stays
+/// exactly-once even though the delivery itself is at-least-once.
+#[tokio::test]
+async fn replayed_cron_result_does_not_duplicate_the_notification() {
+    use baybo_model::{ChatMessage, CronExecution, ExecutionOutcome, PendingCronResult};
+    use baybo_store::{CronStore, ExecutionCompletion};
+
+    let mut harness = AgentTestHarness::builder().build();
+    let origin_id = harness.session.id.clone();
+
+    let fire_session = harness
+        .session_manager
+        .create_session_with_trigger(
+            harness.session.user.clone(),
+            harness.session.channel.clone(),
+            TriggerSource::Cron {
+                cron_job_id: "cj-1".into(),
+                origin_session_id: Some(origin_id.clone()),
+                conversation: false,
+            },
+        )
+        .await
+        .expect("create fire session");
+    let reply_ordinal = harness
+        .session_manager
+        .append_session_message(
+            &fire_session.id,
+            &ChatMessage::assistant(vec![ContentBlock::Text("done".into())]),
+        )
+        .await
+        .expect("append fire reply");
+
+    let job = baybo_model::CronJob {
+        id: "cj-1".into(),
+        user_id: harness.session.user.id.clone(),
+        channel: harness.session.channel.clone(),
+        title: "reminder".into(),
+        timezone: "UTC".into(),
+        schedule: baybo_model::CronSchedule::at(chrono::Utc::now()),
+        prompt: "do it".into(),
+        status: baybo_model::CronStatus::Executed,
+        last_triggered_at: None,
+        next_trigger_at: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        origin_session_id: Some(origin_id.clone()),
+    };
+    let execution = CronExecution::pending(&job, chrono::Utc::now(), chrono::Utc::now());
+    harness
+        .cron_store
+        .record_execution(&execution)
+        .await
+        .unwrap();
+    harness
+        .cron_store
+        .record_execution_completion(
+            &execution.id,
+            ExecutionCompletion {
+                fire_session_id: fire_session.id.clone(),
+                outcome: ExecutionOutcome::Success,
+                reply_ordinal: Some(reply_ordinal),
+                completed_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let pending = PendingCronResult {
+        execution_id: execution.id.clone(),
+        cron_job_id: "cj-1".into(),
+        job_title: "reminder".into(),
+        fire_session_id: fire_session.id.clone(),
+        reply_ordinal: Some(reply_ordinal),
+        outcome: ExecutionOutcome::Success,
+        failure_reason: None,
+        completed_at: chrono::Utc::now(),
+    };
+    // Deliver, then replay the very same execution — exactly what the boot
+    // re-drive does when the ledger stamp was lost.
+    for _ in 0..2 {
+        harness
+            .mailbox
+            .send(AgentMessage::CronResultReady(Box::new(pending.clone())))
+            .await
+            .unwrap();
+        let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    }
+
+    let rows = harness
+        .session_manager
+        .load_active_session_messages(&origin_id)
+        .await
+        .expect("load origin transcript");
+    let notifications = rows
+        .iter()
+        .filter(|m| m.source() == baybo_model::MessageSource::CronNotification)
+        .count();
+    assert_eq!(
+        notifications, 1,
+        "a replayed delivery must not append the result twice"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A recurring fire owns its conversation, so a fire that FAILS must report
+/// that there as a real notification row — not merely a notice.
+///
+/// The difference is not cosmetic: a row survives a reload, is read back by the
+/// model on a follow-up turn, raises the conversation's unread badge, and rides
+/// a `CronNotification` job's `Completed { reply_ordinal }` edge to the user's
+/// phone. A notice does none of those, so a failed scheduled task would show up
+/// as an unbadged, unpushed conversation the user has to notice by themselves.
+#[tokio::test]
+async fn a_failed_recurring_fire_reports_a_real_notification_in_its_conversation() {
+    use baybo_model::MessageSource;
+
+    let mut session = SessionBuilder::new().build();
+    session.trigger = TriggerSource::Cron {
+        cron_job_id: "cj-news".into(),
+        origin_session_id: None,
+        conversation: true,
+    };
+    let session_id = session.id.clone();
+    let mut harness = AgentTestHarness::builder().session(session).build();
+
+    // The fire's turn fails outright.
+    harness
+        .stub_llm
+        .push_response_err(LlmError::Config("provider exploded".into()));
+
+    harness
+        .mailbox
+        .send(AgentMessage::CronTrigger {
+            job_id: "cj-news".into(),
+            title: "Daily news".into(),
+            prompt: "Summarise the news".into(),
+            delivery: baybo_agent::actor::CronDelivery::Channel,
+        })
+        .await
+        .unwrap();
+
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let delivered = outs
+        .iter()
+        .find_map(|o| match &o.event {
+            AgentEvent::Message(m) => m.content.iter().find_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a failed fire must dispatch a message, got {outs:?}"));
+    assert!(
+        delivered.contains(r#"Scheduled task "Daily news" failed:"#),
+        "and it must say the scheduled task failed: {delivered}"
+    );
+
+    // It is a real, durable assistant row — which is what makes it survive a
+    // reload, count as unread, and drive push.
+    let rows = harness
+        .session_manager
+        .load_active_session_messages(&session_id)
+        .await
+        .expect("load the fire's transcript");
+    let notification = rows
+        .iter()
+        .find(|m| m.source() == MessageSource::CronNotification)
+        .expect("the failure is persisted as a notification row");
+    assert_eq!(notification.role, Role::Assistant);
+
+    assert_eq!(
+        harness
+            .session_manager
+            .unread_reply_count(&session_id, 99)
+            .await
+            .unwrap(),
+        1,
+        "a failed scheduled task must raise the conversation's unread badge",
+    );
+
+    harness.shutdown().await;
+}
+
+/// A notification whose transcript row does not reach the store is a **failed**
+/// delivery, not a quiet one: the row would exist only in the live actor's
+/// memory, a reload would show nothing, and the push has no durable row to
+/// preview. So nothing may be recorded as delivered — the ledger must stay
+/// unresolved so the boot re-drive retries it.
+///
+/// The append returns `Option<i64>` and logs-and-swallows a store error, so
+/// treating `None` as success would silently mark the reminder delivered and
+/// then lose it. This pins that it doesn't.
+#[tokio::test]
+async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() {
+    use baybo_model::{CronExecution, ExecutionOutcome, PendingCronResult};
+    use baybo_store::{CronStore, ExecutionCompletion};
+
+    let mut harness = AgentTestHarness::builder().build();
+    let origin_id = harness.session.id.clone();
+
+    let job = baybo_model::CronJob {
+        id: "cj-1".into(),
+        user_id: harness.session.user.id.clone(),
+        channel: harness.session.channel.clone(),
+        title: "reminder".into(),
+        timezone: "UTC".into(),
+        schedule: baybo_model::CronSchedule::at(chrono::Utc::now()),
+        prompt: "do it".into(),
+        status: baybo_model::CronStatus::Executed,
+        last_triggered_at: None,
+        next_trigger_at: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        origin_session_id: Some(origin_id.clone()),
+    };
+    let execution = CronExecution::pending(&job, chrono::Utc::now(), chrono::Utc::now());
+    harness
+        .cron_store
+        .record_execution(&execution)
+        .await
+        .unwrap();
+    harness
+        .cron_store
+        .record_execution_completion(
+            &execution.id,
+            ExecutionCompletion {
+                fire_session_id: "cron-fire".into(),
+                // Blank: the delivery needs no reply row to read, so the only
+                // store write under test is the notification's own append.
+                outcome: ExecutionOutcome::Blank,
+                reply_ordinal: None,
+                completed_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // The transcript is unwritable from here on.
+    harness.memory_session_store.fail_appends(true);
+
+    harness
+        .mailbox
+        .send(AgentMessage::CronResultReady(Box::new(PendingCronResult {
+            execution_id: execution.id.clone(),
+            cron_job_id: "cj-1".into(),
+            job_title: "reminder".into(),
+            fire_session_id: "cron-fire".into(),
+            reply_ordinal: None,
+            outcome: ExecutionOutcome::Blank,
+            failure_reason: None,
+            completed_at: chrono::Utc::now(),
+        })))
+        .await
+        .unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let stored = harness
+        .cron_store
+        .execution(&execution.id)
+        .expect("execution row");
+    assert!(
+        stored.awaits_delivery(),
+        "an unpersisted notification must stay on the re-drive's list, got {stored:?}"
+    );
+    assert!(
+        stored.notified_at.is_none(),
+        "and must not be stamped as notified"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A fire that failed still notifies. Silence is the one outcome a scheduled
+/// task must never have — a reminder that evaporates because the provider
+/// errored is this feature's worst failure mode, so the conversation says so.
+#[tokio::test]
+async fn failed_one_shot_cron_fire_still_notifies_the_conversation() {
+    use baybo_model::{ExecutionOutcome, PendingCronResult};
+
+    let mut harness = AgentTestHarness::builder().build();
+
+    let pending = PendingCronResult {
+        execution_id: "ce-failed".into(),
+        cron_job_id: "cj-2".into(),
+        job_title: "每日新闻".into(),
+        // A failed fire has no reply row to read: the notification is built
+        // from the outcome alone.
+        fire_session_id: "cron-gone".into(),
+        reply_ordinal: None,
+        outcome: ExecutionOutcome::Failed,
+        failure_reason: Some("provider timed out".into()),
+        completed_at: chrono::Utc::now(),
+    };
+    harness
+        .mailbox
+        .send(AgentMessage::CronResultReady(Box::new(pending)))
+        .await
+        .unwrap();
+
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let delivered = outs
+        .iter()
+        .find_map(|o| match &o.event {
+            AgentEvent::Message(m) => m.content.iter().find_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .expect("a failed fire must still notify, got {outs:?}");
+    assert!(
+        delivered.contains(r#"Scheduled task "每日新闻" failed:"#),
+        "the notification says the scheduled task failed: {delivered}"
+    );
+    assert!(
+        delivered.contains("provider timed out"),
+        "and why: {delivered}"
     );
 
     harness.shutdown().await;

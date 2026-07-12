@@ -21,6 +21,7 @@ use serde_json::Value;
 pub enum JobInputKind {
     UserChat,
     Cron,
+    CronNotification,
     Compact,
     Spawned,
     SubagentNotification,
@@ -40,6 +41,15 @@ pub enum JobInput {
     },
     Cron {
         action_payload: Value,
+    },
+    /// Delivery of a one-shot cron fire's result into the conversation that
+    /// scheduled it. Runs **no inference** — the actor appends the framed
+    /// result and dispatches it — but opens a real job so the delivery has
+    /// lifecycle, and so its `Completed { reply_ordinal }` edge drives the
+    /// push dispatcher off the row it just appended (the same durable-row
+    /// contract as a user turn). `content` is the notification as persisted.
+    CronNotification {
+        content: Vec<ContentBlock>,
     },
     /// User-requested foreground compaction (`/compact`). It opens a real job
     /// so compression steps and spans have lifecycle, but it is not a chat
@@ -61,6 +71,7 @@ impl JobInput {
         match self {
             JobInput::UserChat { .. } => JobInputKind::UserChat,
             JobInput::Cron { .. } => JobInputKind::Cron,
+            JobInput::CronNotification { .. } => JobInputKind::CronNotification,
             JobInput::Compact => JobInputKind::Compact,
             JobInput::Spawned { .. } => JobInputKind::Spawned,
             JobInput::SubagentNotification { .. } => JobInputKind::SubagentNotification,

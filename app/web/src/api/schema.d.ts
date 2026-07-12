@@ -104,22 +104,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/chat/cron-messages": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_cron_messages"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/chat/folders": {
         parameters: {
             query?: never;
@@ -894,56 +878,6 @@ export interface components {
             size: number;
         };
         /**
-         * @description One entry in the cron-messages list. Each row corresponds to a
-         *     distinct cron fire (cron creates a fresh session per trigger, so
-         *     `session_id` uniquely identifies the fire). The chat surface
-         *     surfaces these in a right-side notification pane rather than the
-         *     main sidebar so unattended cron output doesn't bury user-driven
-         *     conversations.
-         */
-        ChatCronMessage: {
-            /**
-             * @description Cron job that produced this fire. Stable across fires of the
-             *     same job; missing in the (theoretically impossible) case of a
-             *     trigger without a job id.
-             */
-            cron_job_id: string;
-            /**
-             * Format: date-time
-             * @description When the cron session was created — the actual fire time, to
-             *     within scheduler tick precision.
-             */
-            fired_at: string;
-            /**
-             * Format: date-time
-             * @description Latest activity timestamp on the session. Lets the panel sort
-             *     by "freshest" without the client having to fetch transcripts.
-             */
-            last_active: string;
-            /**
-             * @description The user-facing prompt for this fire. Truncated to
-             *     [`PREVIEW_MAX_CHARS`]. The persisted user row carries the cron
-             *     dispatcher's fire-time framing; `baybo_context::prompts::cron::original_cron_prompt`
-             *     recovers the instruction as configured so the panel shows that,
-             *     not the framing boilerplate.
-             */
-            prompt: string;
-            /**
-             * @description Latest assistant text — what the agent produced in response.
-             *     `None` while the fire is still running or if the agent emitted
-             *     only tool calls / attachments.
-             */
-            response?: string | null;
-            /**
-             * @description The session created for this cron fire. Reuse against
-             *     `/v1/chat/sessions/{id}` to drill into the full transcript.
-             */
-            session_id: string;
-        };
-        ChatCronMessagesList: {
-            items: components["schemas"]["ChatCronMessage"][];
-        };
-        /**
          * @description Response from `GET /v1/chat/sessions/{session_id}/messages` — the
          *     per-`platform_msg_id` durability probe. `found: false` is a provable
          *     absence (the key was never persisted for this session), which lets
@@ -1291,6 +1225,12 @@ export interface components {
              *     must commit to one explicitly.
              */
             timezone: string;
+            /**
+             * @description Short human name for the job. Names the conversation a recurring fire
+             *     opens and heads the result a one-shot reports back to the conversation
+             *     that scheduled it.
+             */
+            title: string;
             user_id: string;
         };
         CreateFolderRequest: {
@@ -1318,6 +1258,11 @@ export interface components {
             schedule: components["schemas"]["CronSchedule"];
             status: components["schemas"]["CronStatus"];
             timezone: string;
+            /**
+             * @description Short human name for the job. Empty for rows created before the field
+             *     existed — clients fall back to the prompt.
+             */
+            title: string;
             /** Format: date-time */
             updated_at: string;
             user_id: string;
@@ -1388,7 +1333,7 @@ export interface components {
          * @description Wire mirror of [`baybo_job::JobInputKind`] — what payload fed the job.
          * @enum {string}
          */
-        JobInputKind: "user_chat" | "cron" | "compact" | "spawned" | "subagent_notification";
+        JobInputKind: "user_chat" | "cron" | "cron_notification" | "compact" | "spawned" | "subagent_notification";
         /**
          * @description Wire mirror of a job's origin (the owning session's root trigger,
          *     [`baybo_model::TriggerKind`]).
@@ -2249,42 +2194,6 @@ export interface operations {
             };
         };
     };
-    list_cron_messages: {
-        parameters: {
-            query?: {
-                /**
-                 * @description Maximum number of cron messages to return. Defaults to
-                 *     [`DEFAULT_CRON_MESSAGE_LIMIT`], clamped to
-                 *     [`MAX_CRON_MESSAGE_LIMIT`].
-                 */
-                limit?: number | null;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Cron-triggered http sessions with prompt + agent response previews, newest fire first */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ChatCronMessagesList"];
-                };
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
     list_folders: {
         parameters: {
             query?: never;
@@ -2545,10 +2454,15 @@ export interface operations {
                 /** @description Include hidden sessions in the response. Defaults to false. */
                 include_hidden?: boolean;
                 /**
-                 * @description Include cron-triggered sessions in the response. Defaults to
-                 *     false so the chat sidebar stays free of background fires; the
-                 *     dedicated `GET /v1/chat/cron-messages` endpoint surfaces those
-                 *     in their own pane.
+                 * @description Include **every** cron-triggered session, not just the ones that are
+                 *     conversations in their own right. Defaults to false.
+                 *
+                 *     A recurring fire opens a real conversation (`TriggerSource::Cron
+                 *     { conversation: true }`) and is listed like any other. What this flag
+                 *     admits is the rest: one-shot fire sessions — private workspaces whose
+                 *     result is reported into the conversation that scheduled them — and
+                 *     historical fires from before that distinction existed. An operator
+                 *     escape hatch, not a chat-sidebar affordance.
                  */
                 include_cron?: boolean;
             };
@@ -3331,6 +3245,11 @@ export interface operations {
                             schedule: components["schemas"]["CronSchedule"];
                             status: components["schemas"]["CronStatus"];
                             timezone: string;
+                            /**
+                             * @description Short human name for the job. Empty for rows created before the field
+                             *     existed — clients fall back to the prompt.
+                             */
+                            title: string;
                             /** Format: date-time */
                             updated_at: string;
                             user_id: string;

@@ -7,10 +7,11 @@ edition.workspace = true
 doctest = false
 
 [features]
-# Exposes test fixtures (e.g. `NeverShutdown`) to downstream crates' tests.
-# Enable via `baybo-cron = { workspace = true, features = ["test-support"] }`
-# in a dev-dependency. Not enabled by default; production builds never see
-# these items.
+# Exposes test fixtures (`NeverShutdown`, `InMemoryCronStore`) to downstream
+# crates' tests. Enable via
+# `baybo-cron = { workspace = true, features = ["test-support"] }` in a
+# dev-dependency. Not enabled by default; production builds never see these
+# items.
 test-support = []
 
 [dependencies]
@@ -30,3 +31,7 @@ cron = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# `ToolContext::for_test` — the tool tests build a context per trigger kind.
+baybo-tools = { workspace = true, features = ["test-support"] }

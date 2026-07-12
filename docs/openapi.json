@@ -530,51 +530,6 @@
         }
       }
     },
-    "/v1/chat/cron-messages": {
-      "get": {
-        "tags": [
-          "chat"
-        ],
-        "operationId": "list_cron_messages",
-        "parameters": [
-          {
-            "name": "limit",
-            "in": "query",
-            "description": "Maximum number of cron messages to return. Defaults to\n[`DEFAULT_CRON_MESSAGE_LIMIT`], clamped to\n[`MAX_CRON_MESSAGE_LIMIT`].",
-            "required": false,
-            "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
-              "minimum": 0
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Cron-triggered http sessions with prompt + agent response previews, newest fire first",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ChatCronMessagesList"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/chat/folders": {
       "get": {
         "tags": [
@@ -885,7 +840,7 @@
           {
             "name": "include_cron",
             "in": "query",
-            "description": "Include cron-triggered sessions in the response. Defaults to\nfalse so the chat sidebar stays free of background fires; the\ndedicated `GET /v1/chat/cron-messages` endpoint surfaces those\nin their own pane.",
+            "description": "Include **every** cron-triggered session, not just the ones that are\nconversations in their own right. Defaults to false.\n\nA recurring fire opens a real conversation (`TriggerSource::Cron\n{ conversation: true }`) and is listed like any other. What this flag\nadmits is the rest: one-shot fire sessions — private workspaces whose\nresult is reported into the conversation that scheduled them — and\nhistorical fires from before that distinction existed. An operator\nescape hatch, not a chat-sidebar affordance.",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -1822,6 +1777,7 @@
                           "id",
                           "user_id",
                           "channel",
+                          "title",
                           "schedule",
                           "prompt",
                           "timezone",
@@ -1871,6 +1827,10 @@
                           },
                           "timezone": {
                             "type": "string"
+                          },
+                          "title": {
+                            "type": "string",
+                            "description": "Short human name for the job. Empty for rows created before the field\nexisted — clients fall back to the prompt."
                           },
                           "updated_at": {
                             "type": "string",
@@ -3701,62 +3661,6 @@
           }
         }
       },
-      "ChatCronMessage": {
-        "type": "object",
-        "description": "One entry in the cron-messages list. Each row corresponds to a\ndistinct cron fire (cron creates a fresh session per trigger, so\n`session_id` uniquely identifies the fire). The chat surface\nsurfaces these in a right-side notification pane rather than the\nmain sidebar so unattended cron output doesn't bury user-driven\nconversations.",
-        "required": [
-          "session_id",
-          "cron_job_id",
-          "fired_at",
-          "last_active",
-          "prompt"
-        ],
-        "properties": {
-          "cron_job_id": {
-            "type": "string",
-            "description": "Cron job that produced this fire. Stable across fires of the\nsame job; missing in the (theoretically impossible) case of a\ntrigger without a job id."
-          },
-          "fired_at": {
-            "type": "string",
-            "format": "date-time",
-            "description": "When the cron session was created — the actual fire time, to\nwithin scheduler tick precision."
-          },
-          "last_active": {
-            "type": "string",
-            "format": "date-time",
-            "description": "Latest activity timestamp on the session. Lets the panel sort\nby \"freshest\" without the client having to fetch transcripts."
-          },
-          "prompt": {
-            "type": "string",
-            "description": "The user-facing prompt for this fire. Truncated to\n[`PREVIEW_MAX_CHARS`]. The persisted user row carries the cron\ndispatcher's fire-time framing; `baybo_context::prompts::cron::original_cron_prompt`\nrecovers the instruction as configured so the panel shows that,\nnot the framing boilerplate."
-          },
-          "response": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Latest assistant text — what the agent produced in response.\n`None` while the fire is still running or if the agent emitted\nonly tool calls / attachments."
-          },
-          "session_id": {
-            "type": "string",
-            "description": "The session created for this cron fire. Reuse against\n`/v1/chat/sessions/{id}` to drill into the full transcript."
-          }
-        }
-      },
-      "ChatCronMessagesList": {
-        "type": "object",
-        "required": [
-          "items"
-        ],
-        "properties": {
-          "items": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ChatCronMessage"
-            }
-          }
-        }
-      },
       "ChatMessageLookup": {
         "type": "object",
         "description": "Response from `GET /v1/chat/sessions/{session_id}/messages` — the\nper-`platform_msg_id` durability probe. `found: false` is a provable\nabsence (the key was never persisted for this session), which lets\nthe client outbox resume its retry machine; `found: true` confirms\ndurability without consuming a retry transmission.",
@@ -4168,6 +4072,7 @@
         "required": [
           "schedule",
           "user_id",
+          "title",
           "text",
           "timezone"
         ],
@@ -4197,6 +4102,10 @@
           "timezone": {
             "type": "string",
             "description": "IANA timezone (e.g. `\"Asia/Shanghai\"`) used to evaluate the cron\nexpression and to render time fields in responses. Required —\nevery time the API speaks is anchored to this zone, so callers\nmust commit to one explicitly."
+          },
+          "title": {
+            "type": "string",
+            "description": "Short human name for the job. Names the conversation a recurring fire\nopens and heads the result a one-shot reports back to the conversation\nthat scheduled it."
           },
           "user_id": {
             "type": "string"
@@ -4241,6 +4150,7 @@
           "id",
           "user_id",
           "channel",
+          "title",
           "schedule",
           "prompt",
           "timezone",
@@ -4290,6 +4200,10 @@
           },
           "timezone": {
             "type": "string"
+          },
+          "title": {
+            "type": "string",
+            "description": "Short human name for the job. Empty for rows created before the field\nexisted — clients fall back to the prompt."
           },
           "updated_at": {
             "type": "string",
@@ -4483,6 +4397,7 @@
         "enum": [
           "user_chat",
           "cron",
+          "cron_notification",
           "compact",
           "spawned",
           "subagent_notification"

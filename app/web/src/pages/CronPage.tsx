@@ -122,8 +122,9 @@ export function CronPage() {
     if (debouncedFilter.trim()) {
       const q = debouncedFilter.toLowerCase().trim();
       const matchId = item.id.toLowerCase().includes(q);
+      const matchTitle = item.title.toLowerCase().includes(q);
       const matchPrompt = item.prompt.toLowerCase().includes(q);
-      if (!matchId && !matchPrompt) return false;
+      if (!matchId && !matchTitle && !matchPrompt) return false;
     }
     
     return true;
@@ -291,6 +292,7 @@ export function CronPage() {
             <thead>
               <tr>
                 <th className={`${thCell} w-[150px]`}>ID</th>
+                <th className={`${thCell} w-[200px]`}>Title</th>
                 <th className={`${thCell} w-[140px]`}>Status</th>
                 <th className={`${thCell} w-[280px]`}>Schedule</th>
                 <th className={`${thCell} w-[120px]`}>Channel</th>
@@ -304,7 +306,7 @@ export function CronPage() {
               {items.length === 0 && !loading && (
                 <tr>
                   <td
-                    colSpan={8}
+                    colSpan={9}
                     className="px-6 py-10 text-center text-ink-soft text-[0.9rem]"
                   >
                     No cron jobs found.
@@ -317,6 +319,12 @@ export function CronPage() {
                   <tr key={job.id} className="hover:bg-gray-50">
                     <td className={cell}>
                       <code className="font-mono text-[0.85rem]">{job.id}</code>
+                    </td>
+                    <td className={cell}>
+                      {/* Jobs created before titles existed fall back to their prompt. */}
+                      <span className="text-[0.9rem] font-bold line-clamp-1">
+                        {job.title || job.prompt}
+                      </span>
                     </td>
                     <td className={cell}>{statusBadge(job.status)}</td>
                     <td className={cell}>{scheduleDisplay(job.schedule, job.timezone)}</td>

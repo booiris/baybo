@@ -463,6 +463,16 @@ impl LibsqlPool {
                     scheduled_fire_time INTEGER NOT NULL DEFAULT 0,
                     triggered_at        INTEGER NOT NULL,
                     status              TEXT    NOT NULL DEFAULT 'pending',
+                    -- Delivery ledger for a one-shot fire's result (Unix µs;
+                    -- NULL = not yet). `completed_at` is set when the fire's
+                    -- turn ends, `notified_at` when its result reached the
+                    -- origin conversation (or was terminally dropped) — the
+                    -- pair drives the boot re-drive scan. The full ledger
+                    -- (outcome, reply ordinal, fire session) rides in `data`;
+                    -- these two are columns so the scan is a query, not a
+                    -- full-table deserialize.
+                    completed_at        INTEGER,
+                    notified_at         INTEGER,
                     data                TEXT    NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_cron_executions_job_id ON cron_executions(job_id);
@@ -606,6 +616,8 @@ impl LibsqlPool {
             "ALTER TABLE session_messages ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN read_cursor INTEGER",
+            "ALTER TABLE cron_executions ADD COLUMN completed_at INTEGER",
+            "ALTER TABLE cron_executions ADD COLUMN notified_at INTEGER",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {
@@ -616,11 +628,11 @@ impl LibsqlPool {
             }
         }
 
-        // Index on the migration-added `sessions.folder_id` column. Created
-        // AFTER the ALTER loop, not in the schema batch above: on a legacy DB
-        // the column doesn't exist until the ALTER runs, so a batch-time
-        // CREATE INDEX referencing it would fail. `IF NOT EXISTS` keeps it
-        // idempotent on every subsequent boot.
+        // Indexes on migration-added columns. Created AFTER the ALTER loop,
+        // not in the schema batch above: on a legacy DB the column doesn't
+        // exist until the ALTER runs, so a batch-time CREATE INDEX referencing
+        // it would fail. `IF NOT EXISTS` keeps them idempotent on every
+        // subsequent boot.
         self.conn
             .execute(
                 "CREATE INDEX IF NOT EXISTS idx_sessions_folder \
@@ -629,6 +641,18 @@ impl LibsqlPool {
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to create idx_sessions_folder: {e}"))?;
+
+        // Serves the boot re-drive's "completed but not yet delivered" scan.
+        self.conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_cron_executions_awaiting_delivery \
+                 ON cron_executions(completed_at) WHERE notified_at IS NULL",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("failed to create idx_cron_executions_awaiting_delivery: {e}")
+            })?;
 
         Ok(())
     }

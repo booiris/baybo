@@ -220,11 +220,16 @@ impl Job {
         self.status.is_terminal()
     }
 
-    /// Whether this job represents user-visible turn activity. `/compact`
-    /// has its own input kind and is excluded even though it runs a real job
-    /// to record compression trace/cost.
+    /// Whether this job represents a reply being produced — work a user waits
+    /// on, and `/stop` can interrupt. `/compact` runs a real job (to record
+    /// compression trace/cost) but produces no reply; a cron-result delivery
+    /// appends a reply the fire *already* produced, with no inference of its
+    /// own, so there is nothing in flight to wait on or stop.
     pub fn is_turn(&self) -> bool {
-        !matches!(self.input, JobInput::Compact)
+        !matches!(
+            self.input,
+            JobInput::Compact | JobInput::CronNotification { .. }
+        )
     }
 
     /// What payload fed this job — projected from `input`. Display only.

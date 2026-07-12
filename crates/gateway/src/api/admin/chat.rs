@@ -49,8 +49,8 @@ use baybo_channels::wire::{
 use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent};
 use baybo_model::{
     ApprovalDecision, ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind,
-    FolderId, FolderSummary, LlmEntryName, MessageSource, Role, Session, SessionId,
-    ThinkingContent, TriggerSource, User,
+    FolderId, FolderSummary, LlmEntryName, Role, Session, SessionId, ThinkingContent,
+    TriggerSource, User,
 };
 use baybo_session::SessionError;
 use chrono::{DateTime, Utc};
@@ -79,7 +79,6 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(delete_session))
         .routes(routes!(unhide_session))
         .routes(routes!(slash_manifest))
-        .routes(routes!(list_cron_messages))
         .routes(routes!(list_folders))
         .routes(routes!(create_folder))
         .routes(routes!(update_folder))
@@ -94,10 +93,15 @@ pub struct ListSessionsQuery {
     /// Include hidden sessions in the response. Defaults to false.
     #[serde(default)]
     pub include_hidden: bool,
-    /// Include cron-triggered sessions in the response. Defaults to
-    /// false so the chat sidebar stays free of background fires; the
-    /// dedicated `GET /v1/chat/cron-messages` endpoint surfaces those
-    /// in their own pane.
+    /// Include **every** cron-triggered session, not just the ones that are
+    /// conversations in their own right. Defaults to false.
+    ///
+    /// A recurring fire opens a real conversation (`TriggerSource::Cron
+    /// { conversation: true }`) and is listed like any other. What this flag
+    /// admits is the rest: one-shot fire sessions — private workspaces whose
+    /// result is reported into the conversation that scheduled them — and
+    /// historical fires from before that distinction existed. An operator
+    /// escape hatch, not a chat-sidebar affordance.
     #[serde(default)]
     pub include_cron: bool,
 }
@@ -143,18 +147,6 @@ const UNREAD_COUNT_CAP: usize = 99;
 /// bubble a deeper walk would reach — so scanning deeper buys almost nothing
 /// while multiplying the per-session tail fetch + deserialize.
 const LAST_MESSAGE_PREVIEW_SCAN: usize = 4;
-
-/// Default page size for the cron-messages list. Tuned to roughly
-/// match what the right-side panel renders before the user scrolls.
-const DEFAULT_CRON_MESSAGE_LIMIT: usize = 50;
-/// Hard cap on the cron-messages list so a curious client can't ask
-/// the gateway to walk thousands of cron sessions in one shot.
-const MAX_CRON_MESSAGE_LIMIT: usize = 200;
-/// How deep to walk a cron session's transcript when extracting the
-/// prompt/response previews. Cron sessions are one-shot — a small
-/// constant covers the realistic shape (the framed trigger prompt
-/// followed by one or two assistant turns).
-const CRON_PREVIEW_SCAN_DEPTH: usize = 12;
 
 /// Query string for `GET /v1/chat/sessions/{session_id}`. Reverse-
 /// paginates the active transcript: the response carries the
@@ -632,55 +624,6 @@ pub struct ChatSessionsList {
     pub items: Vec<ChatSessionSummary>,
 }
 
-/// One entry in the cron-messages list. Each row corresponds to a
-/// distinct cron fire (cron creates a fresh session per trigger, so
-/// `session_id` uniquely identifies the fire). The chat surface
-/// surfaces these in a right-side notification pane rather than the
-/// main sidebar so unattended cron output doesn't bury user-driven
-/// conversations.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ChatCronMessage {
-    /// The session created for this cron fire. Reuse against
-    /// `/v1/chat/sessions/{id}` to drill into the full transcript.
-    pub session_id: String,
-    /// Cron job that produced this fire. Stable across fires of the
-    /// same job; missing in the (theoretically impossible) case of a
-    /// trigger without a job id.
-    pub cron_job_id: String,
-    /// When the cron session was created — the actual fire time, to
-    /// within scheduler tick precision.
-    pub fired_at: DateTime<Utc>,
-    /// Latest activity timestamp on the session. Lets the panel sort
-    /// by "freshest" without the client having to fetch transcripts.
-    pub last_active: DateTime<Utc>,
-    /// The user-facing prompt for this fire. Truncated to
-    /// [`PREVIEW_MAX_CHARS`]. The persisted user row carries the cron
-    /// dispatcher's fire-time framing; `baybo_context::prompts::cron::original_cron_prompt`
-    /// recovers the instruction as configured so the panel shows that,
-    /// not the framing boilerplate.
-    pub prompt: String,
-    /// Latest assistant text — what the agent produced in response.
-    /// `None` while the fire is still running or if the agent emitted
-    /// only tool calls / attachments.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response: Option<String>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ChatCronMessagesList {
-    pub items: Vec<ChatCronMessage>,
-}
-
-/// Query string for `GET /v1/chat/cron-messages`.
-#[derive(Debug, Default, Deserialize, IntoParams)]
-pub struct ListCronMessagesQuery {
-    /// Maximum number of cron messages to return. Defaults to
-    /// [`DEFAULT_CRON_MESSAGE_LIMIT`], clamped to
-    /// [`MAX_CRON_MESSAGE_LIMIT`].
-    #[serde(default)]
-    pub limit: Option<usize>,
-}
-
 /// Wire DTO for slash command entries. Mirror of
 /// [`baybo_channels::wire::SlashCommandSpec`] so the OpenAPI surface
 /// stays inside this crate's DTOs (the wire type lives in
@@ -785,7 +728,7 @@ async fn list_sessions(
     let visible: Vec<Session> = scoped
         .into_iter()
         .filter(|s| query.include_hidden || !s.hidden)
-        .filter(|s| query.include_cron || !is_cron_triggered(s))
+        .filter(|s| query.include_cron || !is_hidden_cron_session(s))
         .collect();
     // Fan out the per-session preview fetch — each row is a single
     // back-of-the-index lookup (`load_last_user_message`,
@@ -1846,53 +1789,6 @@ async fn delete_folder(
 
 #[utoipa::path(
     get,
-    path = "/chat/cron-messages",
-    tag = "chat",
-    params(ListCronMessagesQuery),
-    responses(
-        (status = 200, description = "Cron-triggered http sessions with prompt + agent response previews, newest fire first", body = ChatCronMessagesList),
-        (status = 401, description = "Unauthorized", body = ErrorBody),
-    )
-)]
-async fn list_cron_messages(
-    State(state): State<AdminState>,
-    Query(query): Query<ListCronMessagesQuery>,
-) -> Result<Json<ChatCronMessagesList>> {
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_CRON_MESSAGE_LIMIT)
-        .clamp(1, MAX_CRON_MESSAGE_LIMIT);
-    let scoped = state
-        .session_manager
-        .list_by_channel(&ChannelType::http())
-        .await
-        .map_err(|e| GatewayError::Internal(format!("list cron messages: {e}")))?;
-    // `list_by_channel` already returns rows ordered by `last_active`
-    // desc; the filter preserves order so the take(limit) below is the
-    // freshest N cron fires.
-    let cron_sessions: Vec<Session> = scoped
-        .into_iter()
-        .filter(|s| !s.hidden)
-        .filter_map(|s| match &s.trigger {
-            TriggerSource::Cron { cron_job_id } if !cron_job_id.is_empty() => Some(s),
-            _ => None,
-        })
-        .take(limit)
-        .collect();
-    let manager = state.session_manager.clone();
-    let items = futures::future::join_all(cron_sessions.into_iter().map(|s| {
-        let manager = manager.clone();
-        async move { cron_message_from_session(&manager, s).await }
-    }))
-    .await
-    .into_iter()
-    .flatten()
-    .collect();
-    Ok(Json(ChatCronMessagesList { items }))
-}
-
-#[utoipa::path(
-    get,
     path = "/chat/slash-manifest",
     tag = "chat",
     responses(
@@ -1960,7 +1856,7 @@ async fn create_or_load_chat_session(
     {
         if existing.channel != channel_type
             || existing.user.id != user.id
-            || is_cron_triggered(&existing)
+            || is_hidden_cron_session(&existing)
         {
             return Err(GatewayError::NotFound(format!("chat session {session_id}")));
         }
@@ -2055,78 +1951,16 @@ fn chat_broadcast_channels() -> [ChannelType; 2] {
     [ChannelType::http(), ChannelType::device()]
 }
 
-/// True when the session was spawned by a cron trigger rather than a user
-/// conversation. Cron sessions are filtered out of the chat list unless
-/// `include_cron` is set.
-fn is_cron_triggered(session: &Session) -> bool {
-    matches!(session.trigger, TriggerSource::Cron { .. })
-}
-
-/// Walk a cron session's tail to extract the prompt + freshest
-/// assistant response. Returns `None` only when the walk itself fails;
-/// a fire that's still running (no assistant turn yet) returns the
-/// prompt with `response = None`, and a fire with no decodable rows
-/// at all surfaces empty strings so the panel still pins the
-/// timestamp instead of silently dropping the row.
-async fn cron_message_from_session(
-    manager: &baybo_session::SessionManager,
-    session: Session,
-) -> Option<ChatCronMessage> {
-    let cron_job_id = match &session.trigger {
-        TriggerSource::Cron { cron_job_id } => cron_job_id.clone(),
-        _ => return None,
-    };
-    let tail = manager
-        .history_tail(&session.id, None, CRON_PREVIEW_SCAN_DEPTH)
-        .await
-        .ok()?;
-    let mut prompt: Option<String> = None;
-    let mut response: Option<String> = None;
-    // `history_tail` returns ascending; the cron prompt is the first
-    // user row (oldest) and the assistant response is the freshest
-    // assistant row (newest). Walk forward for the prompt; walk in
-    // reverse for the response so we land on the last assistant turn
-    // even when the agent emitted multiple.
-    for (_ord, _at, msg) in &tail {
-        // The cron prompt persists as a `MessageSource::Cron` row; locate it by
-        // provenance, then strip the framing for display. It rides as a
-        // `Role::User` turn, indistinguishable by role from a skill reminder.
-        if matches!(msg.source(), MessageSource::Cron) {
-            let text = extract_text(&msg.content);
-            prompt = Some(baybo_context::prompts::cron::original_cron_prompt(&text).to_owned());
-            break;
-        }
-    }
-    for (_ord, _at, msg) in tail.iter().rev() {
-        if matches!(msg.role, Role::Assistant) {
-            let text = extract_text(&msg.content);
-            if !text.is_empty() {
-                response = Some(truncate_preview(&text));
-                break;
-            }
-        }
-    }
-    Some(ChatCronMessage {
-        session_id: session.id.to_string(),
-        cron_job_id,
-        fired_at: session.created_at,
-        last_active: session.last_active,
-        prompt: prompt.map(|p| truncate_preview(&p)).unwrap_or_default(),
-        response,
-    })
-}
-
-fn extract_text(content: &[ContentBlock]) -> String {
-    let mut text = String::new();
-    for block in content {
-        if let ContentBlock::Text(t) = block {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(t);
-        }
-    }
-    text
+/// True for a cron fire session that is **not** a conversation of its own: a
+/// one-shot's private workspace (its result is reported into the conversation
+/// that scheduled it), or a historical fire from before recurring fires became
+/// conversations. Such a session is kept out of the chat list and cannot be
+/// attached to — there is nothing there for a user to read or continue.
+///
+/// A recurring fire's session *is* the notification, so it is listed and
+/// replyable like any other conversation.
+fn is_hidden_cron_session(session: &Session) -> bool {
+    matches!(session.trigger, TriggerSource::Cron { .. }) && !session.trigger.is_cron_conversation()
 }
 
 async fn transcript_attachments(

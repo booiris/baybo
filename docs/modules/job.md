@@ -48,10 +48,10 @@ A job is described along two independent axes, each with one source of truth —
 ```rust
 // input kind — what payload fed the job; a projection of JobInput.
 // Display / the denormalised `jobs.kind` column only.
-pub enum JobInputKind { UserChat, Cron, Compact, Spawned, SubagentNotification }
+pub enum JobInputKind { UserChat, Cron, CronNotification, Compact, Spawned, SubagentNotification }
 ```
 
-- **input kind** (`JobInputKind`) — `Job::input_kind()`, projected from `JobInput`. `JobInput` is a strongly typed payload enum whose variants line up 1:1 with `JobInputKind`. `UserChat`, `Cron`, `Spawned`, and `SubagentNotification` are turn jobs; `Compact` is a foreground maintenance command and `Job::is_turn()` excludes it.
+- **input kind** (`JobInputKind`) — `Job::input_kind()`, projected from `JobInput`. `JobInput` is a strongly typed payload enum whose variants line up 1:1 with `JobInputKind`. `UserChat`, `Cron`, `Spawned`, and `SubagentNotification` are turn jobs. `Job::is_turn()` excludes two: `Compact` (a foreground maintenance command, no reply) and `CronNotification` (the delivery of a one-shot cron fire's result into the conversation that scheduled it — it appends a reply the fire already produced, running no inference, so there is nothing in flight for a user to wait on or for `/stop` to interrupt). `CronNotification` still opens a real job: its `Completed { reply_ordinal }` edge is what drives the push dispatcher off the row it just appended, exactly as a user turn does.
 - **origin** (`baybo_model::TriggerKind`, stored on `Job.origin`) — the owning session's root trigger, recorded **as-is** at creation. It is *not* asserted against the payload: `/compact` can run inside a `User`-trigger session while carrying a `Compact` input. Subagent jobs record `origin = Spawned` (their session's inherited root).
 
 `JobOutput` does not split this way — it has only `Message` and `Structured`, the two shapes any job can produce.
@@ -76,7 +76,7 @@ This keeps the state machine invariants co-located with the type and makes them 
 
 `JobLifecycle` does only: load from store → call `job.transition()` → `store.save()` + `store.record_transition()`. No state machine logic in the orchestrator. It additionally owns:
 
-- A `tokio::sync::broadcast` bus that publishes a `JobLifecycleEvent` (id, session, parent, phase, input kind; the `Completed` phase additionally carries the reply's persisted `session_messages.ordinal`) on `Pending → InProgress` and on every `Completed | Failed | Cancelled` transition. Subscribers: the subagent runtime waits for terminal phases, the TurnState projection treats every phase as a recompute trigger, and the push dispatcher filters `Completed` events to real user turns (`kind == UserChat`). Lagging subscribers must reconcile via store reads such as `list_by_session` / `active_turn_started_at` — a dropped event is not re-published.
+- A `tokio::sync::broadcast` bus that publishes a `JobLifecycleEvent` (id, session, parent, phase, input kind; the `Completed` phase additionally carries the reply's persisted `session_messages.ordinal`) on `Pending → InProgress` and on every `Completed | Failed | Cancelled` transition. Subscribers: the subagent runtime waits for terminal phases, the TurnState projection treats every phase as a recompute trigger, and the push dispatcher filters `Completed` events to the kinds a user is meant to read (`UserChat`, `Cron` — confirmed against the session's `conversation` marker — and `CronNotification`). Lagging subscribers must reconcile via store reads such as `list_by_session` / `active_turn_started_at` — a dropped event is not re-published.
 - A `JobCancellationRegistry` mapping `JobId → CancellationToken` for in-flight jobs. `JobLifecycle::cancel` trips the registered token *before* flipping the row, so the running execution observes the cancel before terminal-state observers do. `register_running` returns a RAII `JobCancellationGuard` that unregisters on drop, so an early `?` from the agent loop can't leak entries.
 
 ### Recovery

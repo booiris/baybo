@@ -68,13 +68,16 @@ export type Role = 'system' | 'user' | 'assistant' | 'tool';
 // prompt from a cron fire or an agent-injected reminder — this distinguishes
 // them. 'user' = human channel input; 'user_interjection' = a human message
 // that arrived mid-turn (steering) — also a user bubble, but framed wire-side;
-// 'cron' = a cron fire's framed prompt; 'recalled_memory' = memories recalled
-// from long-term storage, injected (framed) to inform the turn; 'agent' =
-// everything else the agent injects/produces.
+// 'cron' = a cron fire's framed prompt; 'cron_notification' = a one-shot fire's
+// result, appended to the conversation that scheduled it (an assistant bubble,
+// no inference behind it); 'recalled_memory' = memories recalled from long-term
+// storage, injected (framed) to inform the turn; 'agent' = everything else the
+// agent injects/produces.
 export type MessageSource =
   | 'user'
   | 'user_interjection'
   | 'cron'
+  | 'cron_notification'
   | 'recalled_memory'
   | 'agent';
 

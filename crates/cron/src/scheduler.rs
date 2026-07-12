@@ -11,7 +11,7 @@ use tracing::{debug, error, info};
 use crate::error::CronError;
 use crate::shutdown::Shutdown;
 use baybo_model::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
-use baybo_store::CronStore;
+use baybo_store::{CronStore, ExecutionCompletion};
 
 type Result<T> = std::result::Result<T, CronError>;
 
@@ -21,14 +21,67 @@ type Result<T> = std::result::Result<T, CronError>;
 #[derive(Debug, Clone)]
 pub struct CronTriggerEvent {
     pub job_id: String,
+    /// The execution row this fire is recorded under. The agent layer stamps
+    /// the fire's outcome onto it and uses it as the idempotency key when
+    /// delivering a one-shot's result to the origin conversation.
+    pub execution_id: String,
     pub user_id: String,
     pub channel: ChannelType,
+    /// The job's display title — names the fire's conversation (recurring)
+    /// and heads its notification (one-shot).
+    pub title: String,
+    /// The job's IANA timezone — dates the fire's conversation in the zone the
+    /// user scheduled it in.
+    pub timezone: String,
     pub prompt: String,
+    /// Whether the job fires exactly once ([`CronSchedule::At`]). Decides how
+    /// its result is delivered: a one-shot notifies the origin conversation
+    /// and emits nothing under its own session; a recurring fire *is* the
+    /// conversation and dispatches normally.
+    pub one_shot: bool,
     /// The session that originally registered the cron job (if any).
     /// Symmetric to `create_spawned_session` lineage: lets the
     /// downstream actor stamp `TriggerSource::Cron { origin_session_id }`
     /// on the produced session so trace queries can walk back to
-    /// "what user action created this cron job."
+    /// "what user action created this cron job" — and, for a one-shot, so
+    /// the fire's result can be delivered back into that conversation.
+    pub origin_session_id: Option<SessionId>,
+}
+
+impl CronTriggerEvent {
+    /// The fire event for a recorded execution. Everything the agent layer
+    /// needs rides on the execution snapshot, so a job edited or deleted
+    /// between record and dispatch can't change what this fire does.
+    fn for_execution(execution: &CronExecution) -> Self {
+        Self {
+            job_id: execution.job_id.clone(),
+            execution_id: execution.id.clone(),
+            user_id: execution.user_id.clone(),
+            channel: execution.channel.clone(),
+            title: execution.display_title(),
+            timezone: execution.timezone.clone(),
+            prompt: execution.prompt.clone(),
+            one_shot: execution.is_one_shot(),
+            origin_session_id: execution.origin_session_id.clone(),
+        }
+    }
+}
+
+/// Everything needed to create a cron job. A struct rather than seven
+/// positional arguments — `title` / `prompt` / `timezone` are all strings and
+/// transposing them at a call site would compile.
+#[derive(Debug, Clone)]
+pub struct NewCronJob {
+    pub user_id: String,
+    pub channel: ChannelType,
+    /// Short human name for the job (`CronCreate` requires one).
+    pub title: String,
+    pub schedule: CronSchedule,
+    pub prompt: String,
+    /// IANA timezone the schedule is evaluated in.
+    pub timezone: String,
+    /// The conversation this job was created from. For a one-shot, it is also
+    /// where the fire's result will be delivered.
     pub origin_session_id: Option<SessionId>,
 }
 
@@ -64,16 +117,16 @@ impl CronScheduler {
     /// Create a new cron job. Validates the schedule and computes the first
     /// trigger time. A `CronSchedule::At` whose time is already in the past
     /// is rejected.
-    pub async fn create_job(
-        &self,
-        user_id: &str,
-        channel: ChannelType,
-        schedule: CronSchedule,
-        prompt: impl Into<String>,
-        timezone: String,
-        origin_session_id: Option<SessionId>,
-    ) -> Result<CronJob> {
-        let prompt = prompt.into();
+    pub async fn create_job(&self, spec: NewCronJob) -> Result<CronJob> {
+        let NewCronJob {
+            user_id,
+            channel,
+            title,
+            schedule,
+            prompt,
+            timezone,
+            origin_session_id,
+        } = spec;
         validate_schedule(&schedule)?;
         let tz = parse_timezone(&timezone)?;
 
@@ -95,8 +148,9 @@ impl CronScheduler {
 
         let job = CronJob {
             id: uuid::Uuid::new_v4().to_string(),
-            user_id: user_id.to_string(),
+            user_id,
             channel,
+            title,
             schedule,
             prompt,
             timezone,
@@ -110,6 +164,45 @@ impl CronScheduler {
 
         self.store.create(&job).await?;
         Ok(job)
+    }
+
+    /// Stamp a fire's terminal state onto its execution row — see
+    /// [`CronStore::record_execution_completion`]. Called by the agent layer's
+    /// cron waiter before it delivers the result.
+    pub async fn record_execution_completion(
+        &self,
+        execution_id: &str,
+        completion: ExecutionCompletion,
+    ) -> Result<()> {
+        self.store
+            .record_execution_completion(execution_id, completion)
+            .await
+            .map_err(CronError::from)
+    }
+
+    /// Mark a one-shot's result delivered (or terminally dropped) — see
+    /// [`CronStore::mark_execution_notified`].
+    pub async fn mark_execution_notified(
+        &self,
+        execution_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.store
+            .mark_execution_notified(execution_id, at)
+            .await
+            .map_err(CronError::from)
+    }
+
+    /// One-shot executions whose fire completed but whose result never
+    /// reached the origin conversation (crash in the delivery window). The
+    /// agent layer re-drives these at boot; recurring fires are excluded —
+    /// their result lives in their own conversation, with nothing to deliver.
+    pub async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>> {
+        let rows = self.store.list_executions_awaiting_delivery().await?;
+        Ok(rows
+            .into_iter()
+            .filter(CronExecution::is_one_shot)
+            .collect())
     }
 
     /// Delete a cron job by ID.
@@ -231,31 +324,12 @@ impl CronScheduler {
             .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
 
         let now = Utc::now();
-        let execution = CronExecution {
-            id: uuid::Uuid::new_v4().to_string(),
-            job_id: job.id.clone(),
-            user_id: job.user_id.clone(),
-            channel: job.channel.clone(),
-            schedule: job.schedule.clone(),
-            prompt: job.prompt.clone(),
-            scheduled_fire_time: now,
-            triggered_at: now,
-            status: ExecutionStatus::Pending,
-            origin_session_id: job.origin_session_id.clone(),
-        };
+        let execution = CronExecution::pending(&job, now, now);
 
         self.store.record_execution(&execution).await?;
 
-        let event = CronTriggerEvent {
-            job_id: execution.job_id.clone(),
-            user_id: execution.user_id.clone(),
-            channel: execution.channel.clone(),
-            prompt: execution.prompt.clone(),
-            origin_session_id: execution.origin_session_id.clone(),
-        };
-
         self.trigger_tx
-            .send(event)
+            .send(CronTriggerEvent::for_execution(&execution))
             .await
             .map_err(|e| CronError::Storage(format!("failed to dispatch trigger: {e}")))?;
 
@@ -327,15 +401,11 @@ impl CronScheduler {
                 "re-dispatching pending cron execution after restart"
             );
 
-            let event = CronTriggerEvent {
-                job_id: exec.job_id.clone(),
-                user_id: exec.user_id.clone(),
-                channel: exec.channel.clone(),
-                prompt: exec.prompt.clone(),
-                origin_session_id: exec.origin_session_id.clone(),
-            };
-
-            if let Err(e) = self.trigger_tx.send(event).await {
+            if let Err(e) = self
+                .trigger_tx
+                .send(CronTriggerEvent::for_execution(&exec))
+                .await
+            {
                 error!(execution_id = %exec.id, error = %e, "failed to re-dispatch pending execution");
                 continue;
             }
@@ -386,18 +456,7 @@ impl CronScheduler {
             }
 
             // Phase 1: Record execution as Pending
-            let execution = CronExecution {
-                id: uuid::Uuid::new_v4().to_string(),
-                job_id: job.id.clone(),
-                user_id: job.user_id.clone(),
-                channel: job.channel.clone(),
-                schedule: job.schedule.clone(),
-                prompt: job.prompt.clone(),
-                scheduled_fire_time,
-                triggered_at: now,
-                origin_session_id: job.origin_session_id.clone(),
-                status: ExecutionStatus::Pending,
-            };
+            let execution = CronExecution::pending(&job, scheduled_fire_time, now);
             match self
                 .store
                 .record_execution(&execution)
@@ -424,15 +483,11 @@ impl CronScheduler {
             }
 
             // Phase 3: Dispatch trigger
-            let event = CronTriggerEvent {
-                job_id: execution.job_id.clone(),
-                user_id: execution.user_id.clone(),
-                channel: execution.channel,
-                prompt: execution.prompt.clone(),
-                origin_session_id: execution.origin_session_id.clone(),
-            };
-
-            if let Err(e) = self.trigger_tx.send(event).await {
+            if let Err(e) = self
+                .trigger_tx
+                .send(CronTriggerEvent::for_execution(&execution))
+                .await
+            {
                 error!(job_id = %execution.job_id, error = %e, "failed to send cron trigger");
                 // Execution stays Pending — will be recovered on next restart
                 continue;
@@ -533,159 +588,7 @@ fn parse_timezone_or_utc(name: &str, job_id: &str) -> Tz {
 mod tests {
     use super::*;
     use crate::shutdown::NeverShutdown;
-    use async_trait::async_trait;
-    use baybo_store::StorageError;
-    use baybo_store::cron::Result;
-    use parking_lot::Mutex;
-
-    /// In-memory CronStore for testing.
-    struct InMemoryCronStore {
-        jobs: Mutex<Vec<CronJob>>,
-        executions: Mutex<Vec<CronExecution>>,
-    }
-
-    impl InMemoryCronStore {
-        fn new() -> Self {
-            Self {
-                jobs: Mutex::new(Vec::new()),
-                executions: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl CronStore for InMemoryCronStore {
-        async fn create(&self, job: &CronJob) -> Result<()> {
-            self.jobs.lock().push(job.clone());
-            Ok(())
-        }
-
-        async fn get(&self, job_id: &str) -> Result<Option<CronJob>> {
-            Ok(self.jobs.lock().iter().find(|j| j.id == job_id).cloned())
-        }
-
-        async fn save(&self, job: &CronJob) -> Result<()> {
-            let mut jobs = self.jobs.lock();
-            if let Some(existing) = jobs.iter_mut().find(|j| j.id == job.id) {
-                *existing = job.clone();
-                Ok(())
-            } else {
-                Err(StorageError::NotFound(job.id.clone()))
-            }
-        }
-
-        async fn delete(&self, job_id: &str) -> Result<()> {
-            let mut jobs = self.jobs.lock();
-            let len_before = jobs.len();
-            jobs.retain(|j| j.id != job_id);
-            if jobs.len() == len_before {
-                Err(StorageError::NotFound(job_id.to_string()))
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn list_by_user(&self, user_id: &str) -> Result<Vec<CronJob>> {
-            Ok(self
-                .jobs
-                .lock()
-                .iter()
-                .filter(|j| j.user_id == user_id)
-                .cloned()
-                .collect())
-        }
-
-        async fn list_all(&self) -> Result<Vec<CronJob>> {
-            Ok(self.jobs.lock().clone())
-        }
-
-        async fn list_enabled(&self) -> Result<Vec<CronJob>> {
-            Ok(self
-                .jobs
-                .lock()
-                .iter()
-                .filter(|j| j.status == CronStatus::Enabled)
-                .cloned()
-                .collect())
-        }
-
-        async fn list_due(&self, now_us: i64) -> Result<Vec<CronJob>> {
-            Ok(self
-                .jobs
-                .lock()
-                .iter()
-                .filter(|j| {
-                    j.status == CronStatus::Enabled
-                        && j.next_trigger_at
-                            .is_some_and(|t| t.timestamp_micros() <= now_us)
-                })
-                .cloned()
-                .collect())
-        }
-
-        async fn record_execution(&self, exec: &CronExecution) -> Result<()> {
-            self.executions.lock().push(exec.clone());
-            Ok(())
-        }
-
-        async fn list_executions_by_job(&self, job_id: &str) -> Result<Vec<CronExecution>> {
-            Ok(self
-                .executions
-                .lock()
-                .iter()
-                .filter(|e| e.job_id == job_id)
-                .cloned()
-                .collect())
-        }
-
-        async fn list_executions_by_user(&self, user_id: &str) -> Result<Vec<CronExecution>> {
-            Ok(self
-                .executions
-                .lock()
-                .iter()
-                .filter(|e| e.user_id == user_id)
-                .cloned()
-                .collect())
-        }
-
-        async fn has_execution_for_schedule(
-            &self,
-            job_id: &str,
-            scheduled_fire_time_us: i64,
-        ) -> Result<bool> {
-            Ok(self.executions.lock().iter().any(|e| {
-                e.job_id == job_id
-                    && e.scheduled_fire_time.timestamp_micros() == scheduled_fire_time_us
-            }))
-        }
-
-        async fn update_execution_status(
-            &self,
-            execution_id: &str,
-            status: ExecutionStatus,
-        ) -> Result<()> {
-            let mut execs = self.executions.lock();
-            if let Some(exec) = execs.iter_mut().find(|e| e.id == execution_id) {
-                exec.status = status;
-                Ok(())
-            } else {
-                Err(StorageError::NotFound(execution_id.to_string()))
-            }
-        }
-
-        async fn list_executions_by_status(
-            &self,
-            status: ExecutionStatus,
-        ) -> Result<Vec<CronExecution>> {
-            Ok(self
-                .executions
-                .lock()
-                .iter()
-                .filter(|e| e.status == status)
-                .cloned()
-                .collect())
-        }
-    }
+    use crate::test_support::InMemoryCronStore;
 
     fn make_scheduler(
         store: InMemoryCronStore,
@@ -695,7 +598,20 @@ mod tests {
         (scheduler, rx)
     }
 
-    /// Helper: create a prompt-action cron job.
+    /// A `NewCronJob` spec with test defaults; override fields per test.
+    fn spec(user_id: &str, schedule: CronSchedule, prompt: &str) -> NewCronJob {
+        NewCronJob {
+            user_id: user_id.to_string(),
+            channel: ChannelType::tui(),
+            title: "test job".to_string(),
+            schedule,
+            prompt: prompt.to_string(),
+            timezone: "UTC".to_string(),
+            origin_session_id: None,
+        }
+    }
+
+    /// Helper: create a recurring prompt cron job.
     async fn create_prompt_cron(
         scheduler: &CronScheduler,
         user_id: &str,
@@ -703,14 +619,7 @@ mod tests {
         prompt: &str,
     ) -> CronJob {
         scheduler
-            .create_job(
-                user_id,
-                ChannelType::tui(),
-                CronSchedule::cron(expr),
-                prompt,
-                "UTC".to_string(),
-                None,
-            )
+            .create_job(spec(user_id, CronSchedule::cron(expr), prompt))
             .await
             .unwrap()
     }
@@ -738,14 +647,7 @@ mod tests {
         let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
         let fire_at = Utc::now() + chrono::Duration::minutes(5);
         let job = scheduler
-            .create_job(
-                "u1",
-                ChannelType::tui(),
-                CronSchedule::at(fire_at),
-                "later",
-                "UTC".to_string(),
-                None,
-            )
+            .create_job(spec("u1", CronSchedule::at(fire_at), "later"))
             .await
             .unwrap();
         assert!(job.is_one_shot());
@@ -757,14 +659,10 @@ mod tests {
         let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
         let past = Utc::now() - chrono::Duration::minutes(1);
         let err = scheduler
-            .create_job(
-                "u1",
-                ChannelType::tui(),
-                CronSchedule::at(past),
-                "too late",
-                "Asia/Shanghai".to_string(),
-                None,
-            )
+            .create_job(NewCronJob {
+                timezone: "Asia/Shanghai".to_string(),
+                ..spec("u1", CronSchedule::at(past), "too late")
+            })
             .await
             .unwrap_err();
         // Error message must surface "now" so the LLM can self-correct on
@@ -783,14 +681,7 @@ mod tests {
     async fn create_job_with_invalid_cron_expression() {
         let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
         let err = scheduler
-            .create_job(
-                "u1",
-                ChannelType::tui(),
-                CronSchedule::cron("not a cron"),
-                "test",
-                "UTC".to_string(),
-                None,
-            )
+            .create_job(spec("u1", CronSchedule::cron("not a cron"), "test"))
             .await
             .unwrap_err();
         assert!(matches!(err, CronError::InvalidSchedule(_)));
@@ -804,14 +695,10 @@ mod tests {
         use chrono::Timelike;
         let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
         let job = scheduler
-            .create_job(
-                "u1",
-                ChannelType::tui(),
-                CronSchedule::cron("0 9 * * *"),
-                "morning",
-                "Asia/Shanghai".to_string(),
-                None,
-            )
+            .create_job(NewCronJob {
+                timezone: "Asia/Shanghai".to_string(),
+                ..spec("u1", CronSchedule::cron("0 9 * * *"), "morning")
+            })
             .await
             .unwrap();
         let next = job.next_trigger_at.expect("must have next trigger");
@@ -823,14 +710,10 @@ mod tests {
     async fn create_job_rejects_invalid_timezone() {
         let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
         let err = scheduler
-            .create_job(
-                "u1",
-                ChannelType::tui(),
-                CronSchedule::cron("0 9 * * *"),
-                "x",
-                "Mars/Olympus_Mons".to_string(),
-                None,
-            )
+            .create_job(NewCronJob {
+                timezone: "Mars/Olympus_Mons".to_string(),
+                ..spec("u1", CronSchedule::cron("0 9 * * *"), "x")
+            })
             .await
             .unwrap_err();
         assert!(matches!(err, CronError::InvalidSchedule(_)));
@@ -857,14 +740,7 @@ mod tests {
         let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
         let fire_at = Utc::now() + chrono::Duration::seconds(30);
         let job = scheduler
-            .create_job(
-                "u1",
-                ChannelType::tui(),
-                CronSchedule::at(fire_at),
-                "later",
-                "UTC".to_string(),
-                None,
-            )
+            .create_job(spec("u1", CronSchedule::at(fire_at), "later"))
             .await
             .unwrap();
         scheduler.disable_job(&job.id).await.unwrap();
@@ -934,14 +810,7 @@ mod tests {
 
         let fire_at = Utc::now() + chrono::Duration::seconds(30);
         let job = scheduler
-            .create_job(
-                "u1",
-                ChannelType::tui(),
-                CronSchedule::at(fire_at),
-                "run once",
-                "UTC".to_string(),
-                None,
-            )
+            .create_job(spec("u1", CronSchedule::at(fire_at), "run once"))
             .await
             .unwrap();
         let job_id = job.id.clone();
@@ -999,18 +868,24 @@ mod tests {
         let store = InMemoryCronStore::new();
 
         // Manually insert a pending execution row (simulating a crash)
-        let exec = CronExecution {
-            id: "ce-pending".to_string(),
-            job_id: "cj-1".to_string(),
+        let mut job = CronJob {
+            id: "cj-1".to_string(),
             user_id: "u1".to_string(),
             channel: ChannelType::tui(),
+            title: "recovered".to_string(),
             schedule: CronSchedule::cron("* * * * *"),
             prompt: "recover me".to_string(),
-            scheduled_fire_time: Utc::now(),
-            triggered_at: Utc::now(),
-            status: ExecutionStatus::Pending,
+            timezone: "UTC".to_string(),
+            status: CronStatus::Enabled,
+            last_triggered_at: None,
+            next_trigger_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
             origin_session_id: None,
         };
+        job.next_trigger_at = Some(Utc::now());
+        let mut exec = CronExecution::pending(&job, Utc::now(), Utc::now());
+        exec.id = "ce-pending".to_string();
         store.record_execution(&exec).await.unwrap();
 
         let (scheduler, mut rx) = make_scheduler(store);
@@ -1095,14 +970,7 @@ mod tests {
         let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
         let fire_at = Utc::now() + chrono::Duration::minutes(5);
         let job = scheduler
-            .create_job(
-                "u1",
-                ChannelType::tui(),
-                CronSchedule::at(fire_at),
-                "manual one-shot",
-                "UTC".to_string(),
-                None,
-            )
+            .create_job(spec("u1", CronSchedule::at(fire_at), "manual one-shot"))
             .await
             .unwrap();
 
@@ -1126,19 +994,126 @@ mod tests {
         assert!(matches!(err, CronError::NotFound(_)));
     }
 
+    /// The fire event carries everything the agent layer needs to run and
+    /// deliver the fire — including the execution id it stamps the outcome
+    /// onto, and whether the job is one-shot (its result belongs in the origin
+    /// conversation rather than its own).
+    #[tokio::test]
+    async fn trigger_event_carries_execution_title_and_one_shot() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let fire_at = Utc::now() + chrono::Duration::minutes(5);
+        let job = scheduler
+            .create_job(NewCronJob {
+                title: "晚饭提醒".to_string(),
+                ..spec("u1", CronSchedule::at(fire_at), "Remind the user to eat")
+            })
+            .await
+            .unwrap();
+
+        let exec = scheduler.trigger_now(&job.id).await.unwrap();
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.execution_id, exec.id);
+        assert_eq!(event.title, "晚饭提醒");
+        assert!(event.one_shot);
+
+        // A recurring job's fire is not one-shot and titles its own conversation.
+        let recurring = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "news").await;
+        scheduler.trigger_now(&recurring.id).await.unwrap();
+        let event = rx.try_recv().unwrap();
+        assert!(!event.one_shot);
+        assert_eq!(event.title, "test job");
+    }
+
+    /// A title-less legacy job still names its fire — the event falls back to a
+    /// truncated prompt rather than an empty string.
+    #[tokio::test]
+    async fn trigger_event_titles_a_legacy_job_from_its_prompt() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = scheduler
+            .create_job(NewCronJob {
+                title: String::new(),
+                ..spec("u1", CronSchedule::cron("0 9 * * *"), "Summarise the news")
+            })
+            .await
+            .unwrap();
+        scheduler.trigger_now(&job.id).await.unwrap();
+        assert_eq!(rx.try_recv().unwrap().title, "Summarise the news");
+    }
+
+    /// The delivery ledger: a completed fire awaits delivery until it is
+    /// resolved, and only one-shot executions are ever re-driven (a recurring
+    /// fire's result lives in its own conversation — there is nothing to
+    /// deliver elsewhere).
+    #[tokio::test]
+    async fn awaiting_delivery_scan_covers_one_shots_until_resolved() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+
+        let one_shot = scheduler
+            .create_job(spec(
+                "u1",
+                CronSchedule::at(Utc::now() + chrono::Duration::minutes(5)),
+                "once",
+            ))
+            .await
+            .unwrap();
+        let recurring = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "daily").await;
+        let one_shot_exec = scheduler.trigger_now(&one_shot.id).await.unwrap();
+        let recurring_exec = scheduler.trigger_now(&recurring.id).await.unwrap();
+
+        // Neither has completed yet.
+        assert!(
+            scheduler
+                .list_executions_awaiting_delivery()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        for exec_id in [&one_shot_exec.id, &recurring_exec.id] {
+            scheduler
+                .record_execution_completion(
+                    exec_id,
+                    ExecutionCompletion {
+                        fire_session_id: "cron-fire".into(),
+                        outcome: baybo_model::ExecutionOutcome::Success,
+                        reply_ordinal: Some(3),
+                        completed_at: Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let awaiting = scheduler.list_executions_awaiting_delivery().await.unwrap();
+        assert_eq!(
+            awaiting.len(),
+            1,
+            "only the one-shot's result is delivered elsewhere"
+        );
+        assert_eq!(awaiting[0].id, one_shot_exec.id);
+
+        scheduler
+            .mark_execution_notified(&one_shot_exec.id, Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            scheduler
+                .list_executions_awaiting_delivery()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn trigger_carries_origin_session_id_through_event() {
         let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
         let future = Utc::now() + chrono::Duration::hours(1);
         let job = scheduler
-            .create_job(
-                "u1",
-                ChannelType::tui(),
-                CronSchedule::at(future),
-                "lineage carries",
-                "UTC".to_string(),
-                Some("sess-creator".into()),
-            )
+            .create_job(NewCronJob {
+                origin_session_id: Some("sess-creator".into()),
+                ..spec("u1", CronSchedule::at(future), "lineage carries")
+            })
             .await
             .unwrap();
         scheduler.trigger_now(&job.id).await.unwrap();

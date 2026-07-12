@@ -53,6 +53,7 @@ fn rehydrate_message(
         MessageSource::User => ChatMessage::user(content),
         MessageSource::UserInterjection => ChatMessage::user_interjection(content),
         MessageSource::Cron => ChatMessage::cron_fire(content),
+        MessageSource::CronNotification => ChatMessage::cron_notification(content),
         MessageSource::RecalledMemory => ChatMessage::recalled_memory(content),
         MessageSource::Agent => match role {
             Role::User => ChatMessage::agent_context(content),

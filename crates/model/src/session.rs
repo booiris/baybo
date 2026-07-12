@@ -100,7 +100,24 @@ impl std::fmt::Display for ChannelType {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TriggerSource {
     User,
-    Cron { cron_job_id: String },
+    Cron {
+        cron_job_id: String,
+        /// The conversation that created the cron job, carried onto every
+        /// fire session so a `CronCreate` invoked *inside* a fire inherits
+        /// the real user conversation as its origin instead of pointing at
+        /// the (transient, invisible) fire session.
+        #[serde(default)]
+        origin_session_id: Option<SessionId>,
+        /// Whether this fire session is a first-class conversation: listed
+        /// in the chat sidebar, replyable, pushable. True for recurring
+        /// fires — each one *is* the notification. False for one-shot fires
+        /// (their result is delivered into the origin conversation instead)
+        /// and, via the serde default, for every session persisted before
+        /// this field existed — so historical fires stay out of the sidebar
+        /// with no migration.
+        #[serde(default)]
+        conversation: bool,
+    },
 }
 
 impl TriggerSource {
@@ -110,6 +127,33 @@ impl TriggerSource {
             TriggerSource::User => TriggerKind::User,
             TriggerSource::Cron { .. } => TriggerKind::Cron,
         }
+    }
+
+    /// The cron job this session fired for, or `None` for a user session.
+    pub fn cron_job_id(&self) -> Option<&str> {
+        match self {
+            TriggerSource::User => None,
+            TriggerSource::Cron { cron_job_id, .. } => Some(cron_job_id),
+        }
+    }
+
+    /// The conversation that created this session's cron job, if any. Used
+    /// for chained-creation origin inheritance (a `CronCreate` run inside a
+    /// fire) and as the delivery target of a one-shot fire's result.
+    pub fn cron_origin_session_id(&self) -> Option<&SessionId> {
+        match self {
+            TriggerSource::User => None,
+            TriggerSource::Cron {
+                origin_session_id, ..
+            } => origin_session_id.as_ref(),
+        }
+    }
+
+    /// True for a cron fire session that is a first-class conversation
+    /// (recurring fires). Chat-list filtering and the push allowlist key off
+    /// this: a cron session that is *not* a conversation stays invisible.
+    pub fn is_cron_conversation(&self) -> bool {
+        matches!(self, TriggerSource::Cron { conversation, .. } if *conversation)
     }
 }
 
@@ -300,6 +344,17 @@ pub struct SessionState {
     /// for one merged notification.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub background_groups: std::collections::HashMap<String, GroupState>,
+
+    /// `CronExecution` ids whose one-shot result this session has already
+    /// appended (see the actor's `CronResultReady` handler). The delivery
+    /// ledger's `notified_at` stamp is written *after* the append, so a crash
+    /// in that window makes the boot re-drive re-route a result that already
+    /// landed; this set is what keeps the transcript append exactly-once.
+    /// Capped (drop-oldest) — a replayed id that has aged out would at worst
+    /// duplicate one row, which is the direction this design deliberately
+    /// errs in (a duplicate beats a lost notification).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered_cron_executions: Vec<String>,
 
     /// Which backend created this subagent session, plus (for
     /// External) the agent's `workspace_dir` and `resume_key`.
@@ -504,11 +559,30 @@ mod tests {
     fn trigger_source_cron_round_trip() {
         let t = TriggerSource::Cron {
             cron_job_id: "cron-1".into(),
+            origin_session_id: Some(SessionId::from("sess-origin")),
+            conversation: true,
         };
         let s = serde_json::to_string(&t).unwrap();
         let back: TriggerSource = serde_json::from_str(&s).unwrap();
         assert_eq!(back, t);
         assert_eq!(back.kind(), TriggerKind::Cron);
+        assert_eq!(back.cron_job_id(), Some("cron-1"));
+        assert_eq!(
+            back.cron_origin_session_id().map(|s| s.as_str()),
+            Some("sess-origin")
+        );
+        assert!(back.is_cron_conversation());
+    }
+
+    /// A cron session persisted before the visibility marker existed must
+    /// deserialize as "not a conversation" — that default is what keeps
+    /// historical fires out of the chat sidebar with no migration.
+    #[test]
+    fn legacy_cron_trigger_defaults_to_invisible() {
+        let back: TriggerSource =
+            serde_json::from_str(r#"{"kind":"cron","cron_job_id":"cron-old"}"#).unwrap();
+        assert!(!back.is_cron_conversation());
+        assert!(back.cron_origin_session_id().is_none());
     }
 
     #[test]
