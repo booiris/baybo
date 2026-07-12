@@ -5,16 +5,11 @@ import XCTest
 /// archived screen. Runs against `-baybo-open-home` demo rows, where session
 /// mutations resolve locally (no gateway) — the optimistic flip must stay put.
 ///
-/// Cross-launch state notes: the demo seed re-adds rows 1–6 and re-archives
-/// demo-2 on EVERY launch, so deletions and demo-2 flips self-heal between
-/// tests; an archive of any other row persists in sessions.json. Each test
-/// therefore touches its own row and never assumes another row's state.
-final class ArchiveFlowUITests: XCTestCase {
+/// `BayboUITestCase.launch` wipes the device stores first, so every case starts
+/// from the same seeded list regardless of what the previous one did to it.
+final class ArchiveFlowUITests: BayboUITestCase {
     private func launchHome() -> XCUIApplication {
-        let app = XCUIApplication()
-        app.launchArguments = ["-baybo-open-home", "-baybo.lang", "en"]
-        app.launch()
-        return app
+        launch(["-baybo-open-home"])
     }
 
     private func row(_ app: XCUIApplication, _ n: Int) -> XCUIElement {

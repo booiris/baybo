@@ -71,29 +71,54 @@ jobs:
       # workspace-wide, so nextest not running them changes no coverage.
       - run: cargo nextest run --workspace --locked
 
-  # Detects whether this PR touches the render stack, so the (otherwise always-on)
-  # `render-tests` job below can be skipped entirely — a skipped job spins up no
-  # runner, so non-TUI PRs pay zero minutes for it.
+  # Detects which expensive, path-scoped stacks this PR touches, so the jobs
+  # below can be skipped entirely — a skipped job spins up no runner, so a PR
+  # that touches neither the TUI nor the iOS app pays zero minutes for both.
+  # This matters most for `ios-sim`: macOS runners bill at 10x.
   changes:
     name: detect changes
     runs-on: ubuntu-latest
     if: ${{ github.event.pull_request.draft == false }}
     outputs:
       render: ${{ steps.filter.outputs.render }}
+      ios: ${{ steps.filter.outputs.ios }}
+      ios_native: ${{ steps.filter.outputs.ios_native }}
     steps:
       # Full history so the merge-base diff against the PR base resolves.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # Plain git (needs only `contents: read`) — true when this PR touches the
-      # render stack (tui / term-harness).
+      # Plain git (needs only `contents: read`).
       - id: filter
         run: |
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
-              | grep -qE '^crates/(tui|term-harness)/'; then
+          changed() { git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -qE "$1"; }
+
+          # The render stack (tui / term-harness).
+          if changed '^crates/(tui|term-harness)/'; then
             echo "render=true" >> "$GITHUB_OUTPUT"
           else
             echo "render=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # `app/ios` is its own cargo workspace, but it PATH-DEPENDS on
+          # crates/{wire,device-proto,model} and remote-host/ — so a root-crate
+          # change can break the iOS build without touching app/ios at all.
+          # Miss those prefixes and the iOS gate has a hole exactly where the
+          # gateway/app wire contract lives.
+          IOS_DEPS='^(app/ios/|crates/(wire|device-proto|model)/|remote-host/)'
+          if changed "$IOS_DEPS"; then
+            echo "ios=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ios=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # A Mac is needed only for the Swift/Xcode half. A change confined to
+          # app/ios docs (CLAUDE.md) leaves ios_native false and skips the 10x
+          # runner entirely.
+          if changed "^app/ios/(App/|UITests/|Tests/|NotificationExtension/|project\.yml|scripts/|web/|ffi/|bindgen/|Cargo\.)|^crates/(wire|device-proto|model)/|^remote-host/"; then
+            echo "ios_native=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ios_native=false" >> "$GITHUB_OUTPUT"
           fi
 
   # The tmux-driven render/smoke tests are flaky under load, so they're
@@ -149,3 +174,184 @@ jobs:
       - run: pnpm -r --if-present run check
       # node --test suites (channel SDK, channel + browser sidecars)
       - run: pnpm -r --if-present run test
+
+  # ---------------------------------------------------------------------------
+  # iOS. The app lives in two islands the jobs above deliberately cannot see:
+  # `app/ios` is its own cargo workspace (the root one EXCLUDES it, so its unit
+  # tests had never run anywhere but a laptop) and `app/ios/web` is its own pnpm
+  # workspace (`packages: []`, so the root `frontend` job never adopts it).
+  #
+  # Split by what actually needs a Mac. ~2/3 of the iOS suite — the Rust core and
+  # the transcript bundle — is plain Linux work, so it runs at 1x here; only the
+  # Swift/Xcode half pays the 10x macOS multiplier.
+  # ---------------------------------------------------------------------------
+
+  ios-checks:
+    name: iOS core (rust + transcript bundle)
+    needs: changes
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain file under app/ios — rustup walks UP to the root
+      # rust-toolchain.toml, so this is the same channel as every other job.
+      # cache-workspaces is not optional: app/ios has its own target dir and
+      # shares nothing with the root workspace's cache.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: app/ios
+      - uses: taiki-e/install-action@nextest
+      - run: cargo fmt --all --check
+        working-directory: app/ios
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        working-directory: app/ios
+      - run: cargo nextest run --workspace --locked
+        working-directory: app/ios
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: app/ios/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: app/ios/web
+      # vitest over the transcript reducers — the sync cursor, the work-block
+      # folds, and the cross-session bridge isolation.
+      - run: pnpm test
+        working-directory: app/ios/web
+      # `pnpm build` is `tsc --noEmit && vite build`, which is what enforces
+      # web/src/wireSentinel.ts — the compile-time pin of the hand-written frame
+      # mirrors against the ts-rs contract. Until now nothing but a laptop ran it.
+      - run: pnpm build
+        working-directory: app/ios/web
+
+  ios-sim:
+    name: iOS app (build + unit tests; UI smokes non-gating)
+    needs: changes
+    # NOT macos-latest — that label still maps to macos-15, whose simulator set
+    # is iOS 18.x + a churning 26.0/26.1, and the app's deployment target is
+    # 26.0. NOT an -intel/-large runner either: project.yml pins ARCHS arm64 and
+    # excludes x86_64 for the simulator SDK, so an x64 host cannot run the build
+    # it produces. macos-26 (arm64) ships Xcode 26.5 with iOS 26.2/26.4/26.5
+    # simulator runtimes preinstalled — no -downloadPlatform needed.
+    runs-on: macos-26
+    if: ${{ github.event.pull_request.draft == false && needs.changes.outputs.ios_native == 'true' }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: app/ios
+    env:
+      # `brew update` alone burns 1-3 min, billed at 10x.
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install xcodegen
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: aarch64-apple-ios-sim
+          cache-workspaces: app/ios
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: app/ios/web/pnpm-lock.yaml
+
+      # The single biggest cost lever on this job. build-core.sh compiles the
+      # ~286-crate graph TWICE (once for aarch64-apple-ios-sim, once for the
+      # host cdylib that uniffi-bindgen reads) with no sharing between them —
+      # ~8-12 min cold, at 10x. Most iOS PRs touch only Swift or the web bundle,
+      # so key the products on the ffi inputs and skip the whole chain on a hit.
+      - id: core-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/ios/Externals/BayboCore.xcframework
+            app/ios/Generated/BayboCore.swift
+          key: bayboffi-${{ runner.os }}-${{ hashFiles('app/ios/ffi/**', 'app/ios/bindgen/**', 'app/ios/Cargo.lock', 'rust-toolchain.toml', 'crates/wire/**', 'crates/device-proto/**', 'crates/model/**', 'remote-host/**') }}
+
+      # --sim-only also SKIPS the codesign step, so this needs no keychain and no
+      # Apple account (an unsigned xcframework is fine for a simulator build).
+      - name: Rust core -> xcframework + bindings
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: scripts/build-core.sh --sim-only
+
+      # Order is load-bearing, not cosmetic: xcodegen's spec references
+      # Generated/, Externals/ and App/Resources/transcript/, and a missing
+      # source path is a spec VALIDATION ERROR — on a fresh checkout the project
+      # cannot even be generated until all three exist.
+      - name: Transcript bundle -> App/Resources/transcript
+        run: |
+          (cd web && pnpm install --frozen-lockfile && pnpm build)
+          rm -rf App/Resources/transcript
+          mkdir -p App/Resources/transcript
+          cp -R web/dist/. App/Resources/transcript/
+      - run: xcodegen generate
+
+      # The entitlements carry aps-environment, an app group, and
+      # keychain-access-groups $(AppIdentifierPrefix)com.baybo.app — and
+      # $(AppIdentifierPrefix) only resolves from a provisioning profile, which a
+      # runner has no keychain to hold. The simulator enforces neither signatures
+      # nor keychain access groups, so dropping them changes no test behaviour.
+      # CODE_SIGN_ENTITLEMENTS="" and DEVELOPMENT_TEAM="" are the two that
+      # actually defuse this project; the rest are the standard unsigned set.
+      #
+      # OS=latest, never a pinned version: iOS 26.0/26.1 ship an SDK but NO
+      # runtime on this image, and GitHub rotates the runtime set monthly.
+      - name: Build for testing
+        run: |
+          set -o pipefail
+          xcodebuild build-for-testing \
+            -project Baybo.xcodeproj -scheme Baybo -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER="" \
+            | xcbeautify
+
+      # GATING. This is also the only thing in the repo that catches UniFFI seam
+      # drift: Generated/BayboCore.swift is regenerated from the Rust on every
+      # build, so a renamed ffi method breaks the Swift compile and nothing else
+      # anywhere would notice.
+      - name: Unit tests (BayboTests)
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building \
+            -project Baybo.xcodeproj -scheme Baybo \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest' \
+            -derivedDataPath build/DerivedData \
+            -only-testing:BayboTests \
+            -resultBundlePath build/TestResults/unit.xcresult | xcbeautify
+
+      # NON-GATING, same call the repo already makes for the tmux render tests:
+      # these drive real gestures against a simulator and are timing-sensitive
+      # under load. A regression surfaces without wedging merges. Promote to
+      # gating once they have proven stable over a few weeks of real runs.
+      #
+      # A step-level continue-on-error rather than a second job: a separate macOS
+      # job would re-pay runner boot + toolchain setup at 10x to run 4 minutes of
+      # tests it already has the built products for.
+      - name: UI smokes (non-gating)
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building \
+            -project Baybo.xcodeproj -scheme Baybo \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest' \
+            -derivedDataPath build/DerivedData \
+            -only-testing:BayboUITests \
+            -parallel-testing-enabled NO \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 180 \
+            -resultBundlePath build/TestResults/ui.xcresult | xcbeautify
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-xcresult
+          path: app/ios/build/TestResults/

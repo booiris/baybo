@@ -287,3 +287,73 @@ pub trait SessionListSink: Send + Sync {
 pub trait PairAbortListener: Send + Sync {
     fn on_abort(&self, reason: String);
 }
+
+/// The `invalid_token` signal travels from the leg to Swift as an UNTYPED STRING
+/// through three hops — `TransportError::Other(code)` → `.to_string()` →
+/// [`BayboError::from_msg`]'s exact match. Every hop is an equality on the same
+/// literal, so one well-meaning `format!("ws connect: {e}")` anywhere on the path
+/// downgrades `InvalidToken` to `Other { message }` and the login screen silently
+/// stops rendering "token rejected". The tests below pin each hop.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::transport::TransportError;
+
+    /// Hop 1 → 2: the leg's error carries the bare code, and stringifying it (what
+    /// `transport::connect` does at the FFI boundary) must not decorate it.
+    #[test]
+    fn stringifying_the_transport_error_preserves_the_bare_code() {
+        let err = TransportError::Other(INVALID_TOKEN_CODE.to_string());
+        assert_eq!(err.to_string(), INVALID_TOKEN_CODE);
+    }
+
+    /// Hop 3: the exact-match fold at the boundary.
+    #[test]
+    fn the_bare_code_folds_into_the_invalid_token_variant() {
+        assert!(matches!(
+            BayboError::from_msg(INVALID_TOKEN_CODE.to_string()),
+            BayboError::InvalidToken
+        ));
+        assert!(matches!(
+            BayboError::from_msg(NOT_BOUND_MSG.to_string()),
+            BayboError::NotBound
+        ));
+    }
+
+    /// All three hops end to end, exactly as `chat_connect` runs them.
+    #[test]
+    fn a_401_from_the_leg_reaches_swift_as_invalid_token() {
+        let from_leg = TransportError::Other(INVALID_TOKEN_CODE.to_string());
+        let over_the_seam = from_leg.to_string();
+        assert!(matches!(
+            BayboError::from_msg(over_the_seam),
+            BayboError::InvalidToken
+        ));
+    }
+
+    /// The regression this whole chain is fragile to: a decorated message no longer
+    /// matches, so it lands in `Other` and the login screen loses its token-rejected
+    /// state. If this test ever fails because someone made the match fuzzy, make
+    /// sure they did it on purpose.
+    #[test]
+    fn a_decorated_code_does_not_fold_and_is_therefore_forbidden_on_the_path() {
+        let decorated = format!("ws connect: {INVALID_TOKEN_CODE}");
+        assert!(matches!(
+            BayboError::from_msg(decorated),
+            BayboError::Other { .. }
+        ));
+    }
+
+    /// The variants render back as the same codes they folded from, so an error
+    /// crossing the boundary twice (a leg error re-stringified) stays stable.
+    #[test]
+    fn the_error_variants_render_as_the_codes_they_fold_from() {
+        assert_eq!(BayboError::InvalidToken.to_string(), INVALID_TOKEN_CODE);
+        assert_eq!(BayboError::NotBound.to_string(), NOT_BOUND_MSG);
+        assert!(matches!(
+            BayboError::from_msg(BayboError::InvalidToken.to_string()),
+            BayboError::InvalidToken
+        ));
+    }
+}

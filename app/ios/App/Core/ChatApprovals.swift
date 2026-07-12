@@ -68,3 +68,68 @@ struct PendingApproval: Identifiable, Equatable {
         }
     }
 }
+
+/// The pending-approval queue, derived from the frame stream. Extracted from
+/// `ChatStore` because it is the app's densest logic per line and has ZERO
+/// dependencies once separated — no FFI, no bridge, no filesystem.
+///
+/// Four inputs, matching the four ways a prompt appears or goes away:
+/// * `approval_requested` — a new prompt. DEDUPED: the gate's waker re-fires on
+///   the newest queue entry, so the same card legitimately arrives twice;
+/// * `approval_resolved` — someone answered (this device, or another client).
+///   It is broadcast to EVERY session's sink, so it is matched by PROMPT id and
+///   never by session;
+/// * `subscribe_state.pending_approvals` — the authoritative set on
+///   (re)subscribe, which REPLACES the queue (appending would resurrect a card
+///   the user already answered);
+/// * `tool_completed` — the blocked call finished. A gate that TIMES OUT denies
+///   server-side and broadcasts NO `approval_resolved`, so this is the only
+///   signal that retires that card.
+struct ApprovalQueue {
+    private(set) var cards: [PendingApproval] = []
+
+    /// Fold one frame in; `true` when `cards` actually changed. The caller runs
+    /// this on EVERY frame (streamed deltas included), so an unchanged fold must
+    /// not republish.
+    @MainActor
+    mutating func apply(_ frame: [String: Any]) -> Bool {
+        switch frame["kind"] as? String {
+        case "approval_requested":
+            guard let card = PendingApproval.from(frame: frame),
+                !cards.contains(where: { $0.callId == card.callId })
+            else { return false }
+            cards.append(card)
+            return true
+        case "approval_resolved":
+            guard let callId = frame["call_id"] as? String else { return false }
+            return resolve(callId: callId)
+        case "subscribe_state":
+            let authoritative = (frame["pending_approvals"] as? [[String: Any]] ?? [])
+                .compactMap(PendingApproval.from(frame:))
+            guard authoritative != cards else { return false }
+            cards = authoritative
+            return true
+        case "tool_completed":
+            // `call_id` here is the BLOCKED TOOL CALL's id, not the prompt's —
+            // the same JSON key carries a different id on this frame than it
+            // does on `approval_resolved`, so this arm matches `toolCallId`.
+            // Retiring by `callId` instead would silently retire the wrong card
+            // (or none) and still compile.
+            guard let toolCallId = frame["call_id"] as? String,
+                cards.contains(where: { $0.toolCallId == toolCallId })
+            else { return false }
+            cards.removeAll { $0.toolCallId == toolCallId }
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Retire a prompt by its own id — the optimistic dismiss when the user
+    /// answers, and the `approval_resolved` arm above.
+    mutating func resolve(callId: String) -> Bool {
+        guard cards.contains(where: { $0.callId == callId }) else { return false }
+        cards.removeAll { $0.callId == callId }
+        return true
+    }
+}

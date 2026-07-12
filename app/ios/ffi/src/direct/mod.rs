@@ -423,3 +423,209 @@ pub(crate) fn channel_ws_url(base_url: &str) -> Result<String, String> {
         None => Err("stored Baybo address has no http(s) scheme".into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// The exact bytes `login` writes to `baybo.direct-credentials` — the
+    /// upgrade-continuity contract with Tauri-shell installs. Asserted as literal
+    /// TEXT: a round-trip stays green with every field renamed, while a renamed
+    /// field on a real install reads back as `None` and the app silently forgets
+    /// its gateway.
+    const GOLDEN_CREDENTIALS_JSON: &str = r#"{"base_url":"https://gw.example","token":"tok-1"}"#;
+
+    fn golden_credentials() -> DirectCredentials {
+        DirectCredentials {
+            base_url: "https://gw.example".to_string(),
+            token: "tok-1".to_string(),
+        }
+    }
+
+    /// Serve one HTTP/1.1 response. The join handle yields the request head the
+    /// client actually sent, so the auth headers the gateway's admin listener
+    /// validates can be asserted on after the call under test has run.
+    async fn serve_once(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let served = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 2048];
+            let n = sock.read(&mut buf).await.expect("read request");
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(response.as_bytes()).await.expect("write");
+            sock.flush().await.expect("flush");
+            head
+        });
+        (format!("http://{addr}"), served)
+    }
+
+    fn http_for(base_url: &str) -> DirectHttp {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        DirectHttpCache::new(DirectHttpKey::new(
+            DirectCredentials {
+                base_url: base_url.to_string(),
+                token: "tok-1".to_string(),
+            },
+            "device-1".to_string(),
+        ))
+        .expect("build client")
+        .http
+    }
+
+    #[test]
+    fn the_serialized_credentials_are_byte_for_byte_the_frozen_format() {
+        let json = serde_json::to_string(&golden_credentials()).expect("serialize");
+        assert_eq!(json, GOLDEN_CREDENTIALS_JSON);
+    }
+
+    #[test]
+    fn the_credential_field_names_are_frozen() {
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&golden_credentials()).expect("serialize"))
+                .expect("parse");
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["base_url", "token"]);
+    }
+
+    #[test]
+    fn the_golden_credential_blob_decodes_and_re_serializes_to_itself() {
+        let creds: DirectCredentials =
+            serde_json::from_str(GOLDEN_CREDENTIALS_JSON).expect("decode");
+        assert_eq!(creds.base_url, "https://gw.example");
+        assert_eq!(creds.token, "tok-1");
+        assert_eq!(
+            serde_json::to_string(&creds).expect("serialize"),
+            GOLDEN_CREDENTIALS_JSON
+        );
+    }
+
+    #[test]
+    fn an_unknown_credential_field_from_a_newer_build_is_ignored() {
+        let with_extra = r#"{"base_url":"https://gw.example","token":"tok-1","future":"x"}"#;
+        let creds: DirectCredentials = serde_json::from_str(with_extra).expect("decode");
+        assert_eq!(creds.token, "tok-1");
+    }
+
+    /// The coupling under test: `channel_ws_url`'s `strip_prefix` is case-SENSITIVE
+    /// and only ever sees a lowercased scheme because `login` normalizes first. iOS
+    /// autocapitalizes the address field, so `HTTPS://…` is what users actually
+    /// type. Break the lowercasing and login still succeeds — every chat dial then
+    /// fails with "no http(s) scheme".
+    #[test]
+    fn an_uppercase_scheme_survives_normalize_into_a_working_ws_url() {
+        let base = normalize_base("HTTPS://gw.example/");
+        assert_eq!(base, "https://gw.example");
+        assert_eq!(
+            channel_ws_url(&base).expect("ws url"),
+            "wss://gw.example/v1/channel-ws"
+        );
+    }
+
+    #[test]
+    fn an_uppercase_cleartext_scheme_also_survives_the_hop() {
+        let base = normalize_base("  HTTP://192.168.1.9:7000  ");
+        assert_eq!(base, "http://192.168.1.9:7000");
+        assert_eq!(
+            channel_ws_url(&base).expect("ws url"),
+            "ws://192.168.1.9:7000/v1/channel-ws"
+        );
+    }
+
+    /// The proof that the lowercasing is load-bearing rather than cosmetic: fed the
+    /// raw typed address, the ws builder rejects it outright.
+    #[test]
+    fn channel_ws_url_is_case_sensitive_on_the_raw_typed_address() {
+        assert!(channel_ws_url("HTTPS://gw.example").is_err());
+    }
+
+    #[test]
+    fn a_schemeless_address_defaults_to_https_and_dials_wss() {
+        let base = normalize_base("gw.example");
+        assert_eq!(base, "https://gw.example");
+        assert_eq!(
+            channel_ws_url(&base).expect("ws url"),
+            "wss://gw.example/v1/channel-ws"
+        );
+    }
+
+    #[test]
+    fn normalize_base_trims_the_path_slash_but_keeps_the_host_case() {
+        assert_eq!(
+            normalize_base("HTTPS://GW.Example.COM//"),
+            "https://GW.Example.COM"
+        );
+        assert_eq!(normalize_base("   "), "");
+        assert_eq!(normalize_base(""), "");
+    }
+
+    /// A scheme that isn't http(s) is preserved verbatim by `normalize_base` (only
+    /// its case is folded) — `login` is what rejects it, and the ws builder would
+    /// too.
+    #[test]
+    fn a_foreign_scheme_is_rejected_by_the_ws_builder() {
+        let base = normalize_base("FTP://gw.example");
+        assert_eq!(base, "ftp://gw.example");
+        assert!(channel_ws_url(&base).is_err());
+    }
+
+    /// Hop 1 of the invalid-token chain, over a real socket: a REST 401 must come
+    /// back as the bare `invalid_token` CODE. Any prose wrapping here (a
+    /// `format!("…: {e}")`) downgrades it to `BayboError::Other` at the boundary and
+    /// the login screen stops rendering "token rejected".
+    #[tokio::test]
+    async fn a_rest_401_surfaces_as_the_bare_invalid_token_code() {
+        let (base, _served) = serve_once("401 Unauthorized", "").await;
+        let http = http_for(&base);
+        let err = crate::gateway_api::list_sessions(&http)
+            .await
+            .expect_err("401 must fail");
+        assert_eq!(err, INVALID_TOKEN_CODE);
+    }
+
+    /// A non-401 failure must NOT masquerade as a rejected token.
+    #[tokio::test]
+    async fn a_server_error_is_not_folded_into_invalid_token() {
+        let (base, _served) = serve_once("500 Internal Server Error", "").await;
+        let http = http_for(&base);
+        let err = crate::gateway_api::list_sessions(&http)
+            .await
+            .expect_err("500 must fail");
+        assert_ne!(err, INVALID_TOKEN_CODE);
+        assert!(err.contains("500"), "{err}");
+    }
+
+    /// Every direct REST call carries the gateway Bearer AND the device id header;
+    /// the admin listener validates both before it will mark the connection a
+    /// device.
+    #[tokio::test]
+    async fn every_direct_request_carries_the_bearer_and_the_device_id() {
+        let (base, served) = serve_once("200 OK", r#"{"items":[]}"#).await;
+        let http = http_for(&base);
+        crate::gateway_api::list_sessions(&http)
+            .await
+            .expect("list sessions");
+        let head = served.await.expect("server ran").to_lowercase();
+        assert!(head.contains("authorization: bearer tok-1"), "{head}");
+        assert!(
+            head.contains(&format!("{DEVICE_ID_HEADER}: device-1")),
+            "{head}"
+        );
+    }
+}

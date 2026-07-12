@@ -33,10 +33,25 @@ pub(crate) fn set_blob_cache_dir(dir: PathBuf) {
 }
 
 fn blob_cache_dir() -> PathBuf {
-    BLOB_CACHE_DIR
-        .get()
-        .cloned()
-        .unwrap_or_else(|| std::env::temp_dir().join(BLOB_CACHE_SUBDIR))
+    BLOB_CACHE_DIR.get().cloned().unwrap_or_else(fallback_dir)
+}
+
+#[cfg(not(test))]
+fn fallback_dir() -> PathBuf {
+    std::env::temp_dir().join(BLOB_CACHE_SUBDIR)
+}
+
+/// Under test the fallback is per-PROCESS, and that is load-bearing.
+/// `sweep_stale_upload_parts_once` deletes every `*.upload.part` it finds: it
+/// exists to clear parts a previous crashed RUN left behind, and it cannot tell
+/// a dead run's leftovers from another live process's in-flight write. The app
+/// is one process, so that holds. `cargo nextest` is not — it runs each test in
+/// its own process, and on a shared fallback dir one test's sweep deletes
+/// another's live part mid-write, the rename finds no source, and the read comes
+/// back `NotFound`. Test-only: production behaviour is unchanged.
+#[cfg(test)]
+fn fallback_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("{BLOB_CACHE_SUBDIR}-{}", std::process::id()))
 }
 
 #[derive(Clone)]

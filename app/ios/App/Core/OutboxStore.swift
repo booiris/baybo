@@ -60,11 +60,24 @@ final class OutboxStore {
     static let retryTick: Duration = .seconds(3)
 
     private let sessionId: String
+    private let directory: URL
+    /// The retry machine's clock. Injected so the 10 s echo window is testable
+    /// without sleeping through it.
+    private let now: () -> Date
     private var items: [String: OutboxEntry]
 
-    init(sessionId: String) {
+    convenience init(sessionId: String) {
+        self.init(
+            sessionId: sessionId,
+            directory: Self.directory(in: SessionIndex.supportDirectory()),
+            now: Date.init)
+    }
+
+    init(sessionId: String, directory: URL, now: @escaping () -> Date) {
         self.sessionId = sessionId
-        items = Self.read(sessionId: sessionId)
+        self.directory = directory
+        self.now = now
+        items = Self.read(sessionId: sessionId, in: directory)
     }
 
     // MARK: - Reads
@@ -80,7 +93,7 @@ final class OutboxStore {
     func dueForBlindResend(_ entry: OutboxEntry) -> Bool {
         entry.state == .sending
             && entry.transmissions < Self.maxAutoTransmissions
-            && Date().timeIntervalSince1970 - entry.lastSentAt >= Self.echoTimeout
+            && echoWindowLapsed(entry)
     }
 
     /// Whether a `sending` entry exhausted its cap without an echo — it must flip
@@ -88,7 +101,11 @@ final class OutboxStore {
     func resendExhausted(_ entry: OutboxEntry) -> Bool {
         entry.state == .sending
             && entry.transmissions >= Self.maxAutoTransmissions
-            && Date().timeIntervalSince1970 - entry.lastSentAt >= Self.echoTimeout
+            && echoWindowLapsed(entry)
+    }
+
+    private func echoWindowLapsed(_ entry: OutboxEntry) -> Bool {
+        now().timeIntervalSince1970 - entry.lastSentAt >= Self.echoTimeout
     }
 
     // MARK: - Mutations
@@ -96,10 +113,10 @@ final class OutboxStore {
     /// Record a fresh send: state `sending`, the transmission already counted
     /// (only sends that actually hit the wire are enrolled).
     func beginSend(platformMsgId: String, text: String, attachments: [OutboxAttachment]) {
-        let now = Date().timeIntervalSince1970
+        let at = now().timeIntervalSince1970
         items[platformMsgId] = OutboxEntry(
             platformMsgId: platformMsgId, text: text, attachments: attachments,
-            state: .sending, transmissions: 1, createdAt: now, lastSentAt: now)
+            state: .sending, transmissions: 1, createdAt: at, lastSentAt: at)
         persist()
     }
 
@@ -120,10 +137,11 @@ final class OutboxStore {
 
     /// Count one (re)transmission: state back to `sending`, echo timer re-armed.
     func recordTransmission(platformMsgId: String) {
+        let at = now().timeIntervalSince1970
         mutate(platformMsgId) { entry in
             entry.state = .sending
             entry.transmissions += 1
-            entry.lastSentAt = Date().timeIntervalSince1970
+            entry.lastSentAt = at
         }
     }
 
@@ -158,10 +176,10 @@ final class OutboxStore {
             entry.lastSentAt = 0
             items[platformMsgId] = entry
         } else {
-            let now = Date().timeIntervalSince1970
             items[platformMsgId] = OutboxEntry(
                 platformMsgId: platformMsgId, text: text, attachments: attachments,
-                state: .sending, transmissions: 0, createdAt: now, lastSentAt: 0)
+                state: .sending, transmissions: 0,
+                createdAt: now().timeIntervalSince1970, lastSentAt: 0)
         }
         persist()
     }
@@ -175,27 +193,28 @@ final class OutboxStore {
 
     // MARK: - Persistence
 
-    private nonisolated static func directory() -> URL {
-        let dir = SessionIndex.supportDirectory()
-            .appendingPathComponent("outbox", isDirectory: true)
+    nonisolated static func directory(in supportDirectory: URL) -> URL {
+        let dir = supportDirectory.appendingPathComponent("outbox", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
 
-    private nonisolated static func fileURL(for sessionId: String) -> URL {
+    private nonisolated static func fileURL(for sessionId: String, in directory: URL) -> URL {
         let sanitized = sessionId.replacingOccurrences(of: "/", with: "_")
-        return directory().appendingPathComponent("\(sanitized).json")
+        return directory.appendingPathComponent("\(sanitized).json")
     }
 
-    private nonisolated static func read(sessionId: String) -> [String: OutboxEntry] {
-        guard let data = try? Data(contentsOf: fileURL(for: sessionId)),
+    private nonisolated static func read(
+        sessionId: String, in directory: URL
+    ) -> [String: OutboxEntry] {
+        guard let data = try? Data(contentsOf: fileURL(for: sessionId, in: directory)),
             let list = try? JSONDecoder().decode([OutboxEntry].self, from: data)
         else { return [:] }
         return Dictionary(list.map { ($0.platformMsgId, $0) }, uniquingKeysWith: { _, b in b })
     }
 
     private func persist() {
-        let url = Self.fileURL(for: sessionId)
+        let url = Self.fileURL(for: sessionId, in: directory)
         if items.isEmpty {
             try? FileManager.default.removeItem(at: url)
             return
@@ -205,8 +224,8 @@ final class OutboxStore {
     }
 
     /// Wipe every session's outbox — called on logout/rebind alongside
-    /// `TranscriptStore.deleteAll()`.
-    nonisolated static func deleteAll() {
-        try? FileManager.default.removeItem(at: directory())
+    /// `TranscriptStore.deleteAll(in:)`.
+    nonisolated static func deleteAll(in supportDirectory: URL) {
+        try? FileManager.default.removeItem(at: directory(in: supportDirectory))
     }
 }

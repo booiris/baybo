@@ -122,8 +122,29 @@ final class AppStore: ObservableObject {
         static let debugSessionId = "debug-session"
     #endif
 
+    /// XCTest sets this in the host app's environment; the unit bundle is HOSTED
+    /// (see project.yml), so `BayboApp` still constructs this store at launch.
+    static let testEnvironmentKey = "XCTestConfigurationFilePath"
+
+    /// DEBUG-only on purpose: this gate turns the whole app boot into a no-op,
+    /// and the test bundle only ever builds Debug. A release binary must have no
+    /// environment variable that disables it.
+    static var runningUnderTest: Bool {
+        #if DEBUG
+            return ProcessInfo.processInfo.environment[testEnvironmentKey] != nil
+        #else
+            return false
+        #endif
+    }
+
     init() {
         AppStore.shared = self
+        // Under test the store must not boot the world: constructing the client
+        // spins the tokio runtime and reads the keychain, and `restoreOnLaunch`
+        // dials the gateway and rewrites the simulator's real `sessions.json`
+        // out from under the suites. The unit tests drive their own stores with
+        // injected clients and temp support dirs.
+        if Self.runningUnderTest { return }
         // The chat list's live unread/recency source: connection-global
         // `SessionActivity` pings land here for ANY session, subscribed or not.
         Baybo.client.setSessionListSink(sink: SessionActivityHandler())
