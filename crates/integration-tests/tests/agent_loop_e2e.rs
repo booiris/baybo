@@ -1122,15 +1122,19 @@ async fn subagent_notification_keeps_later_spans_persisted() {
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
 
-    for reply in ["turn one", "ack", "turn two"] {
-        harness.stub_llm.push_response(LlmResponse {
-            content: reply.into(),
-            content_blocks: vec![],
-            tool_calls: vec![],
-            usage: TokenUsage::default(),
-            thinking: None,
-        });
-    }
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("turn one".into())]);
+    harness.stub_llm.push_response(LlmResponse {
+        content: "ack".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("turn two".into())]);
 
     harness.send_text("hello").await.expect("user turn 1");
     harness.drain_outputs(Duration::from_millis(500)).await;
@@ -1396,6 +1400,269 @@ async fn failed_subagent_notification_retries_and_delivers() {
     );
 
     harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_ledger_defers_retry_past_inbound_messages() {
+    // An inbound message while the delivery ledger is open must NOT fire an
+    // immediate proactive re-turn behind it (the user turn's request already
+    // carried the persisted prompt row) — retries belong to the timed
+    // backoff arm only. Real (unpaused) time: the 60s backoff cannot fire
+    // inside this test's drains, so "no third LLM call" pins the skip.
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+
+    harness
+        .stub_llm
+        .push_response_err(LlmError::Internal(anyhow::anyhow!("provider blip")));
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("answering you".into())]);
+
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            PendingBackgroundResult::subagent(
+                "bg-defer",
+                "explorer",
+                "find X",
+                SessionId::from("child-D"),
+                "found X",
+                SubagentExitStatus::Completed,
+            ),
+        )))
+        .await
+        .expect("inject BackgroundJobFinished");
+    harness.drain_outputs(Duration::from_millis(300)).await;
+
+    harness.send_text("hello?").await.expect("user turn");
+    harness.drain_outputs(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        harness.stub_llm.captured_requests().len(),
+        2,
+        "failed notification + user turn — and no immediate post-message retry"
+    );
+    let stored = harness
+        .session_manager
+        .get(&session_id)
+        .await
+        .expect("load session")
+        .expect("row present");
+    assert!(
+        stored.state.pending_notification_turn.is_some(),
+        "the ledger stays open for the timed arm; inbound messages don't settle it"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_user_turn_settles_open_ledger_without_a_retry() {
+    // A genuine user turn completing after the prompt row means the model
+    // already saw the results with a chance to report them — the timed
+    // retry must settle the ledger (passive delivery) instead of forcing a
+    // duplicate proactive report with a false "no reply reached the user"
+    // cue.
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+
+    harness
+        .stub_llm
+        .push_response_err(LlmError::Internal(anyhow::anyhow!("provider blip")));
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("answering you".into())]);
+
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            PendingBackgroundResult::subagent(
+                "bg-settle",
+                "explorer",
+                "find X",
+                SessionId::from("child-S"),
+                "found X",
+                SubagentExitStatus::Completed,
+            ),
+        )))
+        .await
+        .expect("inject BackgroundJobFinished");
+    harness.drain_outputs(Duration::from_millis(300)).await;
+
+    harness.send_text("hello?").await.expect("user turn");
+    // Long enough (paused time auto-advances) for the timed retry tick to
+    // fire after the user turn.
+    let outputs = harness.drain_outputs(Duration::from_secs(2000)).await;
+
+    assert_eq!(
+        harness.stub_llm.captured_requests().len(),
+        2,
+        "the settle must not run a third LLM call"
+    );
+    let stored = harness
+        .session_manager
+        .get(&session_id)
+        .await
+        .expect("load session")
+        .expect("row present");
+    assert!(
+        stored.state.pending_notification_turn.is_none(),
+        "a completed user turn settles the ledger at the next tick"
+    );
+    let replies = outputs
+        .iter()
+        .filter(|o| matches!(o.event, AgentEvent::Message(_)))
+        .count();
+    assert_eq!(
+        replies, 1,
+        "exactly one reply (the user turn's), no duplicate report"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_reanchors_prompt_after_compaction_supersedes_it() {
+    // Compaction supersedes every active row and re-inserts the kept slice
+    // at fresh ordinals, so the ledger's recorded ordinal dangles after any
+    // compaction. The retry must detect that and re-append the prompt from
+    // the ledger's frozen content instead of retrying against a reference
+    // the request no longer contains.
+    let mut harness = AgentTestHarness::builder().with_keep_recent(1).build();
+    let session_id = harness.session.id.clone();
+
+    // 1: notification turn fails. 2: user turn reply. 3: /compact's
+    // summariser call. 4: the re-anchored retry's reply.
+    harness
+        .stub_llm
+        .push_response_err(LlmError::Internal(anyhow::anyhow!("provider blip")));
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("answering you".into())]);
+    for reply in ["summary of earlier conversation", "here is the report"] {
+        harness.stub_llm.push_response(LlmResponse {
+            content: reply.into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: TokenUsage::default(),
+            thinking: None,
+        });
+    }
+
+    // A big result so the /compact below actually saves tokens (a tiny
+    // transcript fails the compressor's savings gate and nothing is
+    // superseded).
+    let big_output = "found X, and then some. ".repeat(400);
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            PendingBackgroundResult::subagent(
+                "bg-anchor",
+                "explorer",
+                "find X",
+                SessionId::from("child-A"),
+                &big_output,
+                SubagentExitStatus::Completed,
+            ),
+        )))
+        .await
+        .expect("inject BackgroundJobFinished");
+    harness.drain_outputs(Duration::from_millis(300)).await;
+
+    // A user turn so the compaction's kept tail is NOT the prompt row.
+    harness.send_text("what else?").await.expect("user turn");
+    harness.drain_outputs(Duration::from_millis(300)).await;
+
+    // Force a real compaction through the live loop — window and store move
+    // together, and the prompt row's ordinal now dangles.
+    harness.send_text("/compact").await.expect("compact");
+    let outputs = harness.drain_outputs(Duration::from_secs(2000)).await;
+
+    // The retry re-anchored and delivered.
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            AgentOutput { event: AgentEvent::Message(m), .. }
+                if m.content.iter().any(|b| matches!(
+                    b,
+                    ContentBlock::Text(t) if t.contains("here is the report")
+                ))
+        )),
+        "the re-anchored retry's reply must reach the channel"
+    );
+    let stored = harness
+        .session_manager
+        .get(&session_id)
+        .await
+        .expect("load session")
+        .expect("row present");
+    assert!(
+        stored.state.pending_notification_turn.is_none(),
+        "delivery must close the ledger"
+    );
+    // Exactly one ACTIVE copy of the prompt content: the re-appended row.
+    // (The original is superseded by the compaction.)
+    let active = harness
+        .session_manager
+        .load_active_session_messages(&session_id)
+        .await
+        .expect("load transcript");
+    let active_prompt_rows = active
+        .iter()
+        .filter(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("bg-anchor")))
+        })
+        .count();
+    assert_eq!(
+        active_prompt_rows, 1,
+        "the re-anchored prompt must be the single active copy"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn actor_stop_preserves_last_active() {
+    // The ActorStop final state write (the ledger heal) must NOT bump
+    // `last_active`: the chat list orders by it, and the idle reaper stops
+    // actors *because* they are idle — stamping "now" would hoist every
+    // reaped stale conversation above genuinely recent ones.
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+
+    harness.stub_llm.push_response(LlmResponse {
+        content: "hi".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
+    harness.send_text("hello").await.expect("user turn");
+    harness.drain_outputs(Duration::from_millis(300)).await;
+
+    let session_manager = harness.session_manager.clone();
+    let before = session_manager
+        .get(&session_id)
+        .await
+        .expect("load session")
+        .expect("row present")
+        .last_active;
+
+    harness.shutdown().await;
+
+    let after = session_manager
+        .get(&session_id)
+        .await
+        .expect("load session")
+        .expect("row present")
+        .last_active;
+    assert_eq!(
+        after, before,
+        "the ActorStop final write must preserve last_active, not stamp shutdown time"
+    );
 }
 
 #[tokio::test(start_paused = true)]

@@ -30,9 +30,15 @@ const BACKGROUND_RESULT_TEMPLATE: &str = r#"  <result handle="{{handle}}" type="
 /// un-buries the prompt from behind the failed attempt's partial rows, and it
 /// makes a blank retry reply a genuine "nothing to add" judgment instead of
 /// an "I already answered above" artifact.
-const RETRY_CUE_TEMPLATE: &str = "[delivery attempt {{attempt}} for the background results above was interrupted before a reply reached the user — produce the complete report now.]";
+///
+/// `{{attempt}}` labels the attempt about to run. Worded as "no reply has
+/// reached the user yet" (a statement about the present) rather than
+/// "attempt N was interrupted" — the attempt counter can't distinguish
+/// ran-and-failed from never-ran (a drain whose state persist failed), so
+/// naming a past attempt would sometimes name one that never happened.
+const RETRY_CUE_TEMPLATE: &str = "[no reply for the background results above has reached the user yet — this is delivery attempt {{attempt}}; produce the complete report now.]";
 
-/// Render the persisted retry-cue row for delivery attempt `attempt`
+/// Render the persisted retry-cue row; `attempt` is the attempt about to run
 /// (1-based; attempt 1 is the original drain, so cues start at 2).
 pub fn build_retry_cue(attempt: u32) -> Vec<ContentBlock> {
     vec![ContentBlock::Text(
