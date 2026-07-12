@@ -41,11 +41,22 @@ pub struct MemorySessionStore {
     transcripts: Mutex<HashMap<SessionId, Vec<StoredMessageRow>>>,
     control_events: Mutex<HashMap<SessionId, Vec<ControlEvent>>>,
     read_cursors: Mutex<HashMap<SessionId, i64>>,
+    /// Fault injection: when set, every `append_session_message` fails. Lets a
+    /// test drive the paths that must treat an unpersisted row as a failed
+    /// write rather than a silent success — a transcript append is the one
+    /// store call several delivery guarantees rest on.
+    fail_appends: std::sync::atomic::AtomicBool,
 }
 
 impl MemorySessionStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Make every subsequent transcript append fail.
+    pub fn fail_appends(&self, fail: bool) {
+        self.fail_appends
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Synchronously seed a session row so consumers (`SessionStore::get`,
@@ -210,6 +221,11 @@ impl SessionStore for MemorySessionStore {
         session_id: &SessionId,
         message: &ChatMessage,
     ) -> Result<i64> {
+        if self.fail_appends.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(StorageError::Internal(anyhow::anyhow!(
+                "injected transcript append failure"
+            )));
+        }
         let mut guard = self.transcripts.lock();
         let log = guard.entry(session_id.clone()).or_default();
         let ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);

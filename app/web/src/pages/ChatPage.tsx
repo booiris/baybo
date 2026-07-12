@@ -44,7 +44,6 @@ import {
   type WireWorkStep,
 } from '../api/chatWs';
 import type { components } from '../api/schema';
-import { CronInbox } from '../components/CronInbox';
 import { TaskChecklist } from '../components/chat/TaskChecklist';
 import { AttachmentImage } from './chat/AttachmentImage';
 import { QueuePanel } from './chat/QueuePanel';
@@ -420,15 +419,6 @@ export function ChatPage() {
   // Late-bound `markRead` so the sync loop (defined earlier) can advance the
   // server read cursor without a declaration-order cycle.
   const markReadRef = useRef<(sid: string) => void>(() => {});
-
-  // Bumped whenever the WS reports activity for a session_id we don't
-  // track in the main `sessions` list — cron creates fresh sessions
-  // server-side that the chat-list endpoint filters out, so the only
-  // hint a tab has that a cron fire just happened is a
-  // SessionActivity ping for an unknown id. Cascaded into the
-  // CronInbox panel so it can refetch right when something new lands
-  // instead of waiting on the next 30s poll.
-  const [cronInboxRefresh, setCronInboxRefresh] = useState(0);
 
   const [status, setStatus] = useState<ConnectionStatus>({ state: 'connecting' });
   // Mirrors `status` in a ref so the captured-once `onFrame` closure and the
@@ -1119,13 +1109,12 @@ export function ChatPage() {
             return applySessionActivity(prev, frame.session_id, frame.at, isForeground);
           });
           if (!known) {
-            // Probably a cron-spawned session — those are filtered out
-            // of the main chat list server-side, so the only signal
-            // the tab has is activity for an id it doesn't know.
-            // Nudging the CronInbox panel triggers an immediate
-            // refetch so the fire shows up without waiting on the
-            // polling interval.
-            setCronInboxRefresh((n) => n + 1);
+            // A conversation this tab has never seen just spoke — a recurring
+            // cron fire opening its own conversation, or one started in
+            // another tab. Activity carries no session metadata, so pull the
+            // list to learn what it is; the row then renders with its title
+            // and unread badge like any other.
+            void refetchSessionsAndFolders();
           }
           return;
         }
@@ -2617,7 +2606,6 @@ export function ChatPage() {
 
       {/* Main column */}
       <main className="flex-1 flex flex-col overflow-hidden relative">
-        <CronInbox refreshSignal={cronInboxRefresh} />
         <header className="h-12 px-4 border-b-2 border-black flex items-center justify-between gap-3 bg-canvas">
           <div className="flex items-center gap-2 min-w-0 flex-1">
             {sessionId ? (

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 #[cfg(any(test, feature = "test-support"))]
 use baybo_model::ChannelType;
-use baybo_model::{JobId, SessionId, SpanId, User};
+use baybo_model::{JobId, SessionId, SpanId, TriggerSource, User};
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
@@ -141,6 +141,13 @@ pub trait Tool: Send + Sync {
 /// Context injected into tool execution by the agent layer.
 pub struct ToolContext {
     pub session_id: SessionId,
+    /// What started the session this call runs in. A tool that records the
+    /// calling conversation for later use needs it: `CronCreate` running
+    /// inside a cron fire (fire sessions get the full tool registry) must
+    /// record the fire's *own* origin as the new job's origin, not the
+    /// transient fire session — otherwise a one-shot's result would be
+    /// delivered into a session nobody can see.
+    pub session_trigger: TriggerSource,
     /// Job this tool call belongs to. Tools that emit downstream work
     /// (e.g. spawn a subagent) carry it so the spawned work can be
     /// lineaged back to the originating job. Production wiring sources
@@ -250,6 +257,7 @@ impl ToolContext {
     pub fn for_test() -> Self {
         Self {
             session_id: "test".into(),
+            session_trigger: TriggerSource::User,
             job_id: JobId::default(),
             span_id: SpanId::default(),
             user: User {

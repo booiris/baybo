@@ -10,13 +10,19 @@ pub mod state;
 pub mod subagent;
 pub mod supervisor;
 
+use std::sync::Arc;
+
 use crate::runtime::agent_loop::{InterjectionSource, UserInterjectionInput};
 use baybo_channels::{
     AgentEvent, AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage,
 };
 use baybo_job::JobInput;
-use baybo_model::{ContentBlock, ControlEventKind, LlmEntryName, PendingBackgroundResult};
+use baybo_model::{
+    ContentBlock, ControlEventKind, ExecutionOutcome, LlmEntryName, PendingBackgroundResult,
+    PendingCronResult,
+};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Hard cap on `session.state.pending_background_results`. A parent
@@ -25,6 +31,19 @@ use tracing::{debug, error, info, warn};
 /// the persisted row. Once the cap is reached the oldest entry is
 /// dropped (its content still lives in the child session's trace).
 const MAX_PENDING_BACKGROUND_RESULTS: usize = 64;
+
+/// Hard cap on `session.state.delivered_cron_executions` — the dedup keys of
+/// one-shot results already appended here. Only a crash inside the
+/// append→stamp window can replay a delivery, so a handful of recent keys is
+/// all that is ever consulted; the cap keeps a long-lived conversation's row
+/// from growing without bound.
+const MAX_DELIVERED_CRON_EXECUTIONS: usize = 64;
+
+/// How many rows to pull around a cron fire's reply ordinal when reading it out
+/// of the fire's session. The reply sits exactly at the recorded ordinal; the
+/// small margin tolerates an interleaved row without a second round-trip.
+/// Mirrors the push dispatcher's preview read.
+const FIRE_REPLY_READ_LIMIT: usize = 4;
 
 /// How long after sealing a subagent group the barrier waits for all
 /// members before firing partial + dissolving the cohort (still-running
@@ -67,8 +86,21 @@ pub enum AgentMessage {
     /// transcript row and answers the group with one reply. Non-slash only
     /// (the gateway never batches a slash command).
     UserInputBatch(Vec<IncomingMessage>),
-    /// A cron job fired.
-    CronTrigger { job_id: String, prompt: String },
+    /// A cron job fired. Runs in this (fresh, isolated) session; `delivery`
+    /// decides where the reply goes. `title` names the job in the notification
+    /// a non-reply outcome (failure, or a run that produced nothing) reports.
+    CronTrigger {
+        job_id: String,
+        title: String,
+        prompt: String,
+        delivery: CronDelivery,
+    },
+    /// A one-shot cron fire finished, and its result belongs in **this**
+    /// conversation (the one that scheduled the job). Handled at a turn
+    /// boundary with **no inference**: the actor appends the framed result as
+    /// an assistant row, dispatches it, and resolves the delivery ledger. See
+    /// [`AgentActor::handle_cron_result_ready`].
+    CronResultReady(Box<PendingCronResult>),
     /// A subagent was spawned. Carries the initial prompt assembled by
     /// `Router::handle_subagent_spawn` and the parent's `JobId` for
     /// lineage. The child actor runs `agent_loop.run` with `JobInput::Spawned`;
@@ -102,6 +134,20 @@ pub enum AgentMessage {
     ActorStop,
 }
 
+/// Where a cron fire's reply goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronDelivery {
+    /// Out through this session's own channel — today's behavior, and what a
+    /// **recurring** fire does: its session *is* the conversation the user
+    /// reads the result in.
+    Channel,
+    /// Nowhere, from this session. A **one-shot** fire's session is transient
+    /// and invisible; its result is delivered into the conversation that
+    /// scheduled the job (as a `CronResultReady` there), so dispatching here
+    /// too would notify the user twice.
+    OriginSession,
+}
+
 impl mailbox::Prioritized for AgentMessage {
     fn priority(&self) -> mailbox::MessagePriority {
         use mailbox::MessagePriority;
@@ -111,7 +157,11 @@ impl mailbox::Prioritized for AgentMessage {
             | AgentMessage::CronTrigger { .. }
             | AgentMessage::SubagentSpawned { .. }
             | AgentMessage::SetModel { .. } => MessagePriority::Trigger,
-            AgentMessage::BackgroundJobFinished(_) => MessagePriority::BackgroundJobFinished,
+            // Same tier as a finished background job: both are autonomous
+            // deliveries that wait for a queued user turn but outrank a stop.
+            AgentMessage::BackgroundJobFinished(_) | AgentMessage::CronResultReady(_) => {
+                MessagePriority::BackgroundJobFinished
+            }
             AgentMessage::ActorStop => MessagePriority::Stop,
         }
     }
@@ -413,11 +463,31 @@ impl AgentActor {
                     error!(session_id = %session_id, error = %e, "failed to handle user input");
                 }
             }
-            AgentMessage::CronTrigger { job_id, prompt } => {
-                debug!(session_id = %session_id, job_id = %job_id, "received cron trigger");
-                if let Err(e) = self.dispatch_cron_prompt(&prompt, &job_id).await {
+            AgentMessage::CronTrigger {
+                job_id,
+                title,
+                prompt,
+                delivery,
+            } => {
+                debug!(session_id = %session_id, job_id = %job_id, ?delivery, "received cron trigger");
+                if let Err(e) = self
+                    .dispatch_cron_prompt(&prompt, &job_id, &title, delivery)
+                    .await
+                {
                     error!(session_id = %session_id, job_id = %job_id, error = %e, "failed to handle cron trigger");
+                    // A failed fire would otherwise leave a conversation that
+                    // is empty when opened and never announced itself. Report
+                    // it where the fire lives — but only for a fire that OWNS
+                    // its conversation: a one-shot's failure is reported into
+                    // the conversation that scheduled it, off this job's
+                    // terminal lifecycle edge.
+                    if matches!(delivery, CronDelivery::Channel) {
+                        self.report_cron_outcome(&title, true, &e.to_string()).await;
+                    }
                 }
+            }
+            AgentMessage::CronResultReady(pending) => {
+                self.handle_cron_result_ready(*pending).await;
             }
             AgentMessage::SubagentSpawned {
                 initial_message,
@@ -525,15 +595,27 @@ impl AgentActor {
         result
     }
 
-    /// Dispatch a fired cron job through the agent loop and send the
-    /// response to the output channel.
+    /// Dispatch a fired cron job through the agent loop.
     ///
     /// The cron fire mints a Cron-rooted session, so the job records
     /// `origin = Cron`. The content the LLM sees is framed + appended by
     /// `AgentLoop::append_cron_fire` (which uses `baybo_context::prompts::cron`)
     /// so the model treats it as a task to perform now rather than a live
     /// user message.
-    async fn dispatch_cron_prompt(&mut self, prompt: &str, job_id: &str) -> anyhow::Result<()> {
+    ///
+    /// `delivery` decides what happens to the reply. A recurring fire sends it
+    /// out through this session's own channel — the session *is* the
+    /// conversation the user reads. A one-shot's session is transient and
+    /// invisible, so nothing goes out here: its result is picked up off this
+    /// job's terminal lifecycle edge (by the router's cron waiter) and
+    /// delivered into the conversation that scheduled it.
+    async fn dispatch_cron_prompt(
+        &mut self,
+        prompt: &str,
+        job_id: &str,
+        title: &str,
+        delivery: CronDelivery,
+    ) -> anyhow::Result<()> {
         let job_input = JobInput::Cron {
             action_payload: serde_json::json!({
                 "cron_job_id": job_id,
@@ -547,15 +629,334 @@ impl AgentActor {
         let response = self
             .run_agent_loop(job_input, None, None, None, None)
             .await?;
-        if is_blank_reply(&response.content) {
-            debug!(
-                session_id = %self.durable.session.id,
-                "cron turn produced no output; suppressing send"
-            );
-        } else {
-            self.send_response(response.into(), "cron").await;
+        match delivery {
+            CronDelivery::OriginSession => {}
+            CronDelivery::Channel if is_blank_reply(&response.content) => {
+                // The conversation IS the notification here, so a fire that
+                // produced nothing must still say so. Suppressing the send
+                // would leave a conversation that is empty when opened and —
+                // because clients learn a new conversation exists from the
+                // activity pulse the gateway derives from channel dispatch —
+                // never announced itself at all.
+                self.report_cron_outcome(title, false, "").await;
+            }
+            CronDelivery::Channel => {
+                self.send_response(response.into(), "cron").await;
+            }
         }
         Ok(())
+    }
+
+    /// Report a fire's non-reply outcome — a failure, or a run that produced
+    /// nothing — in **its own** conversation, as the same framed
+    /// `CronNotification` assistant row a one-shot delivers to its origin.
+    ///
+    /// A real row rather than a `Notice`, because the two are not equivalent
+    /// where it counts: a row survives a reload, is read back by the model on a
+    /// follow-up turn, raises the conversation's unread badge, and — riding a
+    /// `CronNotification` job's `Completed { reply_ordinal }` edge — pushes to
+    /// the user's phone. A notice does none of those. So every fire outcome
+    /// produces exactly one notification row, whichever kind of fire it was.
+    ///
+    /// Only for a fire that owns its conversation (`CronDelivery::Channel`). A
+    /// one-shot's outcome is reported into the conversation that *scheduled* it
+    /// (see `handle_cron_result_ready`); reporting from its own invisible
+    /// session as well would notify the user twice for one fire.
+    async fn report_cron_outcome(&mut self, title: &str, failed: bool, detail: &str) {
+        let content = vec![ContentBlock::Text(
+            baybo_context::prompts::cron::frame_cron_notification(title, failed, detail),
+        )];
+        if let Err(e) = self.publish_cron_notification(content, None).await {
+            warn!(
+                session_id = %self.durable.session.id,
+                error = %e,
+                "failed to report the cron fire's outcome in its own conversation"
+            );
+        }
+    }
+
+    /// Append `content` as this session's cron-notification row, open a
+    /// `CronNotification` job so its `Completed { reply_ordinal }` edge drives
+    /// push off the durable row, and dispatch it to the channel. Returns the
+    /// persisted ordinal.
+    ///
+    /// `remember` is the execution to record as delivered once the row is
+    /// durable — the one-shot origin delivery's dedup key. `None` for a fire
+    /// reporting in its own conversation, which has no cross-session ledger to
+    /// keep.
+    ///
+    /// An append that does not reach the store fails the whole publish: the row
+    /// would live only in this actor's memory, the push would have no durable
+    /// row to preview, and a reload would show nothing. The caller decides what
+    /// that means (the origin delivery leaves its ledger unresolved so the
+    /// re-drive retries).
+    async fn publish_cron_notification(
+        &mut self,
+        content: Vec<ContentBlock>,
+        remember: Option<String>,
+    ) -> anyhow::Result<i64> {
+        let session_id = self.durable.session.id.clone();
+        let job_lifecycle = Arc::clone(&self.volatile.job_lifecycle);
+        let origin = self.durable.session.trigger.kind();
+        let ordinal = crate::runtime::scope::with_job(
+            &job_lifecycle,
+            // Not a cancellable turn: the append is a single store write with
+            // nothing to interrupt. The token is never tripped.
+            CancellationToken::new(),
+            crate::runtime::scope::JobSpec {
+                session_id: session_id.clone(),
+                origin,
+                input: JobInput::CronNotification {
+                    content: content.clone(),
+                },
+                parent_job_id: None,
+            },
+            |_job_id| async {
+                let ordinal = self
+                    .volatile
+                    .agent_loop
+                    .append_cron_notification(content.clone())
+                    .await
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("cron notification was not persisted to the transcript")
+                    })?;
+                // Record the dedup key as soon as the row IS durable, still
+                // inside the job scope: everything after this point can fail
+                // (the job's own `complete()` writes to the same store), and a
+                // failure there must not leave an appended row whose execution
+                // the re-drive would replay into a second copy.
+                if let Some(execution_id) = remember.clone() {
+                    self.remember_cron_delivery(execution_id).await;
+                }
+                Ok((
+                    baybo_job::JobOutput::Message {
+                        content: content.clone(),
+                        ordinal: Some(ordinal),
+                    },
+                    ordinal,
+                ))
+            },
+        )
+        .await?;
+
+        let out = AgentOutput {
+            session_id: session_id.clone(),
+            user_id: self.durable.session.user.id.clone(),
+            channel: self.durable.session.channel.clone(),
+            event: AgentEvent::Message(OutgoingMessage {
+                session_id,
+                user_id: self.durable.session.user.id.clone(),
+                channel: self.durable.session.channel.clone(),
+                content,
+                reply_to: None,
+                metadata: baybo_model::MessageMetadata::default(),
+                ordinal: Some(ordinal),
+            }),
+        };
+        self.send_response(out, "cron_notification").await;
+        Ok(ordinal)
+    }
+
+    /// Deliver a finished one-shot cron fire's result into **this**
+    /// conversation — the one that scheduled the job. Runs at a turn boundary
+    /// with **no inference**: the fire already did the thinking, in its own
+    /// isolated session, and re-deriving anything here would cost a second LLM
+    /// call and let the model decide to stay quiet about a reminder the user
+    /// asked for.
+    ///
+    /// Every outcome notifies, including failure and an empty reply
+    /// (`build_cron_notification` frames each) — a scheduled task that
+    /// silently evaporates is the one behaviour this feature must never have.
+    async fn handle_cron_result_ready(&mut self, pending: PendingCronResult) {
+        let session_id = self.durable.session.id.clone();
+        if self
+            .durable
+            .session
+            .state
+            .delivered_cron_executions
+            .contains(&pending.execution_id)
+        {
+            debug!(
+                session_id = %session_id,
+                execution_id = %pending.execution_id,
+                "cron result already delivered to this session; ignoring replay"
+            );
+            // The append survived but the ledger stamp did not (that is the
+            // only way a delivered result gets replayed). Stamp it now so the
+            // boot re-drive stops re-routing it.
+            self.resolve_cron_delivery(&pending.execution_id).await;
+            return;
+        }
+
+        let content = self.build_cron_notification(&pending).await;
+        // A notification landing is exactly what makes a hidden conversation
+        // relevant again — and the push deep-links here, so the conversation
+        // must be in the user's list when they tap it.
+        self.unhide_for_cron_notification().await;
+
+        if let Err(e) = self
+            .publish_cron_notification(content, Some(pending.execution_id.clone()))
+            .await
+        {
+            // Leave the ledger unresolved: the boot re-drive replays this
+            // delivery rather than losing the user's reminder. If the row did
+            // land before the failure, the dedup key landed with it, so the
+            // replay is a no-op.
+            error!(
+                session_id = %session_id,
+                execution_id = %pending.execution_id,
+                error = %e,
+                "cron result delivery failed; leaving it for re-drive"
+            );
+            return;
+        }
+
+        self.resolve_cron_delivery(&pending.execution_id).await;
+        info!(
+            session_id = %session_id,
+            execution_id = %pending.execution_id,
+            cron_job_id = %pending.cron_job_id,
+            "delivered cron result to origin conversation"
+        );
+    }
+
+    /// The notification's content: a header naming the job, the fire's own
+    /// reply text (or a per-outcome fallback), and any media the fire
+    /// produced.
+    async fn build_cron_notification(&self, pending: &PendingCronResult) -> Vec<ContentBlock> {
+        let failed = matches!(pending.outcome, ExecutionOutcome::Failed);
+        let (body, attachments) = match pending.outcome {
+            ExecutionOutcome::Failed => (
+                pending.failure_reason.clone().unwrap_or_default(),
+                Vec::new(),
+            ),
+            ExecutionOutcome::Blank => (String::new(), Vec::new()),
+            ExecutionOutcome::Success => self.read_fire_reply(pending).await,
+        };
+        let header = baybo_context::prompts::cron::frame_cron_notification(
+            &pending.job_title,
+            failed,
+            &body,
+        );
+        let mut content = vec![ContentBlock::Text(header)];
+        content.extend(attachments);
+        content
+    }
+
+    /// The fire's reply, read from its own session at the ordinal the job's
+    /// `Completed` edge carried: its text (joined), plus any non-text blocks
+    /// (images, files) so nothing the fire produced is dropped on the way
+    /// over. An unreadable or absent row yields empty text, which
+    /// `frame_cron_notification` turns into the blank-run fallback rather than
+    /// a silent non-delivery.
+    async fn read_fire_reply(&self, pending: &PendingCronResult) -> (String, Vec<ContentBlock>) {
+        let Some(ordinal) = pending.reply_ordinal else {
+            return (String::new(), Vec::new());
+        };
+        let rows = match self
+            .volatile
+            .session_manager
+            .history_since(&pending.fire_session_id, ordinal - 1, FIRE_REPLY_READ_LIMIT)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    fire_session_id = %pending.fire_session_id,
+                    ordinal,
+                    error = %e,
+                    "failed to read cron fire reply; notifying without its body"
+                );
+                return (String::new(), Vec::new());
+            }
+        };
+        let Some((_, _, reply)) = rows.into_iter().find(|(ord, _, _)| *ord == ordinal) else {
+            warn!(
+                fire_session_id = %pending.fire_session_id,
+                ordinal,
+                "cron fire reply row not found at its recorded ordinal"
+            );
+            return (String::new(), Vec::new());
+        };
+
+        let mut text = String::new();
+        let mut attachments = Vec::new();
+        for block in reply.content {
+            match block {
+                ContentBlock::Text(t) => {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&t);
+                }
+                // Tool traffic and thinking are the fire's internals, not its
+                // report; media it produced is part of the answer.
+                ContentBlock::ToolUse { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::Thinking { .. } => {}
+                other => attachments.push(other),
+            }
+        }
+        (text, attachments)
+    }
+
+    /// Un-hide this conversation so a delivered cron result can't land in a
+    /// list the user removed it from.
+    ///
+    /// Written unconditionally rather than gated on `session.hidden`: that
+    /// field is a snapshot taken when the actor was spawned, and `set_hidden`
+    /// is a targeted column write that never notifies a live actor — so a user
+    /// who hides the conversation while its actor is resident leaves the
+    /// in-memory copy claiming `false`, and a gate would skip the un-hide for
+    /// the one case it exists to cover. The store write is idempotent.
+    async fn unhide_for_cron_notification(&mut self) {
+        if let Err(e) = self
+            .volatile
+            .session_manager
+            .set_hidden(&self.durable.session.id, false)
+            .await
+        {
+            warn!(
+                session_id = %self.durable.session.id,
+                error = %e,
+                "failed to un-hide conversation for cron notification"
+            );
+            return;
+        }
+        self.durable.session.hidden = false;
+    }
+
+    /// Record that this execution's result has landed in the transcript, and
+    /// persist it — the session row is the only thing that survives an actor
+    /// eviction, and it is what makes a replayed delivery a no-op.
+    async fn remember_cron_delivery(&mut self, execution_id: String) {
+        let delivered = &mut self.durable.session.state.delivered_cron_executions;
+        if delivered.len() >= MAX_DELIVERED_CRON_EXECUTIONS {
+            delivered.remove(0);
+        }
+        delivered.push(execution_id);
+        self.persist_session_state_after_pending_change("cron_result_delivered")
+            .await;
+    }
+
+    /// Stamp the execution's delivery as resolved. Failure is logged, not
+    /// propagated: the result is already in the transcript, and an unresolved
+    /// ledger only costs a replayed delivery at the next boot, which the dedup
+    /// set absorbs.
+    async fn resolve_cron_delivery(&self, execution_id: &str) {
+        if let Err(e) = self
+            .volatile
+            .cron_store
+            .mark_execution_notified(execution_id, chrono::Utc::now())
+            .await
+        {
+            warn!(
+                session_id = %self.durable.session.id,
+                execution_id = %execution_id,
+                error = %e,
+                "failed to resolve cron delivery ledger; a boot re-drive will retry it"
+            );
+        }
     }
 
     async fn handle_user_input(&mut self, incoming: IncomingMessage) -> anyhow::Result<()> {
@@ -1329,7 +1730,9 @@ mod tests {
         let (tx, mut rx) = mailbox::channel::<AgentMessage>(16);
         tx.send(AgentMessage::CronTrigger {
             job_id: "j".into(),
+            title: "t".into(),
             prompt: "p".into(),
+            delivery: CronDelivery::Channel,
         })
         .await
         .unwrap();

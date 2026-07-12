@@ -785,6 +785,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let token_calibration = Arc::clone(&token_calibration);
 
         let sessions = Arc::clone(&graph.session_manager);
+        // The actor stamps a one-shot cron result's delivery here once it has
+        // appended it to the scheduling conversation.
+        let cron_store_for_spawn = graph.stores.cron.clone();
         let subagent_registry = Arc::clone(&graph.subagent_registry);
         let workspace_paths_arc = Arc::new(baybo_workspace::WorkspacePaths::new(
             graph.workspace.root.clone(),
@@ -876,6 +879,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         actor_token,
                         supervisor: Some(supervisor_for_spawn.clone()),
                         session_manager: Arc::clone(&sessions),
+                        cron_store: Arc::clone(&cron_store_for_spawn),
                     },
                 );
                 let (sender, mailbox) =
@@ -966,6 +970,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         cost_manager: Arc::clone(&cost_manager),
         actor_spawner: spawn_actor_for,
         job_lifecycle: Arc::clone(&graph.job_lifecycle),
+        cron_store: graph.stores.cron.clone(),
         cron_trigger_rx,
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit: Arc::clone(&graph.rate_limit),

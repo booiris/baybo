@@ -590,7 +590,6 @@ PUT    /v1/chat/sessions/:id/read       clear the unread badge
 PUT    /v1/chat/sessions/:id/folder     file into a folder (null ⇒ Uncategorized)
 DELETE /v1/chat/sessions/:id            hide (row preserved); 204
 POST   /v1/chat/sessions/:id/unhide     restore a hidden session
-GET    /v1/chat/cron-messages           cron-fire sessions with prompt/response previews
 GET    /v1/chat/slash-manifest          slash commands for the composer's /-autocomplete
 GET    /v1/chat/folders                 the conversation-folder tree
 POST   /v1/chat/folders                 create a folder

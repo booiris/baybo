@@ -340,6 +340,10 @@ impl ToolExecutor {
         tool_name: &str,
         params: Value,
         session_id: &SessionId,
+        // What started this session. Reaches the tool as
+        // [`ToolContext::session_trigger`]; `CronCreate` reads it so a job
+        // created inside a cron fire inherits the fire's origin conversation.
+        session_trigger: &baybo_model::TriggerSource,
         user: &User,
         approved_resources: &Arc<Mutex<Vec<ApprovedResource>>>,
         recorder: &Arc<SpanRecorder>,
@@ -587,6 +591,7 @@ impl ToolExecutor {
                 });
                 let ctx = ToolContext {
                     session_id: session_id.clone(),
+                    session_trigger: session_trigger.clone(),
                     job_id,
                     span_id: span_handle.span_id,
                     user: user.clone(),

@@ -181,11 +181,19 @@ pub enum MessageSource {
     /// (`baybo_context::prompts::interjection`). See
     /// `docs/mid-turn-user-interjection.md`.
     UserInterjection,
-    /// A cron job's fire-time framed prompt: synthesized by the agent, so
-    /// hidden from the chat transcript, but surfaced on its own in the
-    /// operator cron inbox (which finds it by this variant rather than by
-    /// sniffing the framing tag out of the content).
+    /// A cron job's fire-time framed prompt: synthesized by the agent and
+    /// hidden from the chat transcript, but tracked distinctly so operator
+    /// surfaces identify a fire by provenance rather than by sniffing the
+    /// framing tag out of the content.
     Cron,
+    /// A one-shot cron job's result, delivered into the conversation that
+    /// created the job. A `Role::Assistant` row the agent appended **without
+    /// running inference** (see the actor's `CronResultReady` handler): the
+    /// fire ran in its own isolated session and this row carries its reply
+    /// framed with a scheduled-task header. The only assistant-role source
+    /// other than [`MessageSource::Agent`] — chat surfaces render it as an
+    /// assistant bubble with a scheduled-task badge.
+    CronNotification,
     /// A block of memories recalled from long-term storage and injected to
     /// inform the current turn. Synthesized by the agent (so hidden from the
     /// chat transcript like [`MessageSource::Agent`]), but tracked distinctly
@@ -210,6 +218,7 @@ impl MessageSource {
             MessageSource::User => "user",
             MessageSource::UserInterjection => "user_interjection",
             MessageSource::Cron => "cron",
+            MessageSource::CronNotification => "cron_notification",
             MessageSource::RecalledMemory => "recalled_memory",
             MessageSource::Agent => "agent",
         }
@@ -224,6 +233,7 @@ impl std::str::FromStr for MessageSource {
             "user" => Ok(MessageSource::User),
             "user_interjection" => Ok(MessageSource::UserInterjection),
             "cron" => Ok(MessageSource::Cron),
+            "cron_notification" => Ok(MessageSource::CronNotification),
             "recalled_memory" => Ok(MessageSource::RecalledMemory),
             "agent" => Ok(MessageSource::Agent),
             other => Err(format!("unknown message source: {other}")),
@@ -308,6 +318,24 @@ impl ChatMessage {
             content,
             platform_msg_id: String::new(),
             source: MessageSource::RecalledMemory,
+        }
+    }
+
+    /// A one-shot cron fire's result, appended to the conversation that created
+    /// the job — the **only** constructor that marks a row
+    /// [`MessageSource::CronNotification`].
+    ///
+    /// `Role::Assistant`, but produced with no inference of its own: the actor's
+    /// `CronResultReady` handler builds `content` by framing the isolated fire
+    /// session's reply (see `baybo_context::prompts::cron::frame_cron_notification`)
+    /// and appends it at a turn boundary. The framing lives in the persisted
+    /// content, so user, model, and boot-time replay all read the same bytes.
+    pub fn cron_notification(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content,
+            platform_msg_id: String::new(),
+            source: MessageSource::CronNotification,
         }
     }
 
@@ -548,6 +576,7 @@ mod tests {
                 MessageSource::User
                 | MessageSource::UserInterjection
                 | MessageSource::Cron
+                | MessageSource::CronNotification
                 | MessageSource::RecalledMemory
                 | MessageSource::Agent => {}
             }
@@ -556,6 +585,7 @@ mod tests {
             MessageSource::User,
             MessageSource::UserInterjection,
             MessageSource::Cron,
+            MessageSource::CronNotification,
             MessageSource::RecalledMemory,
             MessageSource::Agent,
         ]

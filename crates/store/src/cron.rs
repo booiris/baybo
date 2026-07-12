@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use baybo_model::{CronExecution, CronJob, ExecutionStatus};
+use baybo_model::{CronExecution, CronJob, ExecutionOutcome, ExecutionStatus, SessionId};
 
 use crate::StorageError;
 
@@ -58,4 +58,43 @@ pub trait CronStore: Send + Sync {
         &self,
         status: ExecutionStatus,
     ) -> Result<Vec<CronExecution>>;
+
+    // ── Delivery ledger (one-shot result → origin conversation) ──
+
+    /// Stamp the fire's terminal state onto the execution: which session it
+    /// ran in, how it ended, the ordinal of its reply row, and when. Written
+    /// by the cron waiter **before** it routes the result, so a crash between
+    /// here and the origin's append leaves a durable record for the boot
+    /// re-drive to replay.
+    async fn record_execution_completion(
+        &self,
+        execution_id: &str,
+        completion: ExecutionCompletion,
+    ) -> Result<()>;
+
+    /// Mark this execution's delivery **resolved** — the result was appended
+    /// to the origin conversation, or terminally dropped (no usable origin).
+    /// Both stamp `notified_at`, so the re-drive scan converges either way.
+    async fn mark_execution_notified(
+        &self,
+        execution_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()>;
+
+    /// Executions whose fire completed but whose result has not been
+    /// delivered or dropped ([`CronExecution::awaits_delivery`]). Scanned at
+    /// boot to re-drive deliveries lost to a crash.
+    async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>>;
+}
+
+/// The fire's terminal state, stamped onto its [`CronExecution`] by the cron
+/// waiter. Grouped into a struct so the store trait doesn't take five
+/// positional arguments whose types (two `Option`s, a session id) are easy to
+/// transpose at a call site.
+#[derive(Debug, Clone)]
+pub struct ExecutionCompletion {
+    pub fire_session_id: SessionId,
+    pub outcome: ExecutionOutcome,
+    pub reply_ordinal: Option<i64>,
+    pub completed_at: chrono::DateTime<chrono::Utc>,
 }

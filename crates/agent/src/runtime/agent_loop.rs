@@ -370,16 +370,19 @@ pub trait InterjectionSource: Send {
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 /// The recall query for a job, or `None` for job kinds that don't recall.
 /// Memory recall/write run only for `UserChat` and `Cron` jobs — `Compact`,
-/// `Spawned` (subagent), and `SubagentNotification` have no direct user input
-/// and would pollute or double-write. The exhaustive match forces a
-/// classification when a new `JobInput` variant is added.
+/// `Spawned` (subagent), `SubagentNotification`, and `CronNotification` have no
+/// direct user input and would pollute or double-write (a `CronNotification`
+/// also runs no LLM call at all, so there is nothing to recall *for*). The
+/// exhaustive match forces a classification when a new `JobInput` variant is
+/// added.
 fn memory_recall_query(input: &JobInput) -> Option<Vec<ContentBlock>> {
     match input {
         JobInput::UserChat { content } => Some(content.clone()),
         JobInput::Cron { action_payload } => Some(cron_prompt_blocks(action_payload)),
-        JobInput::Compact | JobInput::Spawned { .. } | JobInput::SubagentNotification { .. } => {
-            None
-        }
+        JobInput::Compact
+        | JobInput::Spawned { .. }
+        | JobInput::SubagentNotification { .. }
+        | JobInput::CronNotification { .. } => None,
     }
 }
 
@@ -1220,6 +1223,7 @@ impl AgentLoop {
 
         let executor = Arc::clone(&self.tool_executor);
         let session_id_for_calls = session.id.clone();
+        let session_trigger_for_calls = session.trigger.clone();
         let user_for_calls = session.user.clone();
         // Gate (Copy, captured per closure): only a user-facing session may
         // background a slow command — keeps cron / nested-subagent bash on
@@ -1240,6 +1244,7 @@ impl AgentLoop {
         let exec_futures = response.tool_calls.iter().map(|tc| {
             let executor = Arc::clone(&executor);
             let session_id = session_id_for_calls.clone();
+            let session_trigger = session_trigger_for_calls.clone();
             let user = user_for_calls.clone();
             let approved = Arc::clone(&approved);
             let recorder = Arc::clone(&recorder_for_calls);
@@ -1278,6 +1283,7 @@ impl AgentLoop {
                         &tool_name,
                         arguments,
                         &session_id,
+                        &session_trigger,
                         &user,
                         &approved,
                         &recorder,
@@ -1980,6 +1986,26 @@ impl AgentLoop {
         let msg = ChatMessage::cron_fire(vec![ContentBlock::Text(framed)]);
         self.context_manager.append(&msg).await;
         Ok(())
+    }
+
+    /// Append a one-shot cron fire's result to **this** (the scheduling)
+    /// conversation as a persisted `Role::Assistant` row, and return its
+    /// ordinal.
+    ///
+    /// No inference runs: `content` is the fire's own reply, already framed
+    /// with a scheduled-task header ([`baybo_context::prompts::cron`]). The
+    /// row is stamped `MessageSource::CronNotification`, so chat surfaces can
+    /// badge it and the next real turn reads it back as something the
+    /// assistant already reported. Seeds the system prompt first — the
+    /// notification can be the first thing an otherwise-cold session appends.
+    ///
+    /// `None` when the session runs with no durable store (tests); the caller
+    /// then has no ordinal to push or to record on the job.
+    pub async fn append_cron_notification(&mut self, content: Vec<ContentBlock>) -> Option<i64> {
+        self.context_manager.ensure_seeded().await;
+        self.context_manager
+            .append(&ChatMessage::cron_notification(content))
+            .await
     }
 
     /// Append a subagent-spawned session's initial prompt as a persisted
@@ -3350,6 +3376,8 @@ mod session_end_gate_tests {
         let s = session_with(
             TriggerSource::Cron {
                 cron_job_id: "c-1".into(),
+                origin_session_id: None,
+                conversation: true,
             },
             None,
         );

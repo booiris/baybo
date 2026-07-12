@@ -1454,6 +1454,8 @@ mod resume_validation_tests {
         let mut cron = mk_parent("cr");
         cron.trigger = TriggerSource::Cron {
             cron_job_id: "job-1".into(),
+            origin_session_id: None,
+            conversation: false,
         };
         assert!(!parent_supports_background(&cron));
     }

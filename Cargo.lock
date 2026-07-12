@@ -671,6 +671,7 @@ dependencies = [
  "baybo-cli",
  "baybo-context",
  "baybo-cost",
+ "baybo-cron",
  "baybo-gateway",
  "baybo-job",
  "baybo-llm",
