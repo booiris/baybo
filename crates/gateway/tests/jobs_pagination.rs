@@ -9,7 +9,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use baybo_gateway::test_support::{TEST_ADMIN_TOKEN, build_test_deps};
-use baybo_job::{JobInput, JobShape};
+use baybo_job::JobInput;
 use baybo_model::{ContentBlock, SessionId, TriggerKind};
 
 fn auth(req: Request<Body>) -> Request<Body> {
@@ -32,22 +32,13 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
                 TriggerKind::Cron => JobInput::Cron {
                     action_payload: serde_json::json!({}),
                 },
-                TriggerKind::System => JobInput::System {
-                    payload: baybo_job::SystemJobPayload::Compression(
-                        baybo_model::BackgroundCompressionPayload { up_to_ordinal: 0 },
-                    ),
-                },
                 TriggerKind::Spawned => JobInput::Spawned {
                     initial_prompt: vec![ContentBlock::Text("task".into())],
                 },
             };
-            let shape = match trigger {
-                TriggerKind::System => JobShape::Maintenance,
-                _ => JobShape::Turn,
-            };
             tg.deps
                 .job_lifecycle
-                .start_job(SessionId::from(*sid), *trigger, shape, input, None)
+                .start_job(SessionId::from(*sid), *trigger, input, None)
                 .await
                 .expect("seed job");
         }

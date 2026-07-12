@@ -1,4 +1,4 @@
-//! `JobInputKind`, `JobInput`, `JobShape`, `JobOutput`.
+//! `JobInputKind`, `JobInput`, `JobOutput`.
 //!
 //! A job carries three orthogonal descriptors, each with a single
 //! source of truth:
@@ -8,13 +8,8 @@
 //!   owning session's root trigger, recorded as-is at creation. Not
 //!   asserted against the payload: a maintenance job runs inside a
 //!   `User`-trigger session and records `origin = User` honestly.
-//! - **shape** ([`JobShape`]) — whether the job runs a full agent-loop
-//!   turn or a one-shot maintenance pass. Declared by the code path that
-//!   runs the job, *not* derived from the payload: `/compact` and
-//!   background compression are both `Maintenance` even though only the
-//!   latter carries a `System` input.
 
-use baybo_model::{BackgroundCompressionPayload, ContentBlock};
+use baybo_model::ContentBlock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -26,41 +21,9 @@ use serde_json::Value;
 pub enum JobInputKind {
     UserChat,
     Cron,
-    System,
+    Compact,
     Spawned,
     SubagentNotification,
-}
-
-/// Provenance for [`JobInput::System`] maintenance jobs.
-///
-/// Persisted in `jobs.data` with `#[serde(untagged)]`, `Compression` first,
-/// so a `{"up_to_ordinal":N}` payload loads as `Compression` and an empty
-/// `{}` payload falls through to [`Self::TitleGeneration`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SystemJobPayload {
-    /// Background transcript compression / summary pass.
-    Compression(BackgroundCompressionPayload),
-    /// Empty payload of a legacy standalone title-generation job. No longer
-    /// produced — the title pass now records a `StepKind::TitleGeneration` step
-    /// under its triggering turn's job — but retained so persisted rows load.
-    TitleGeneration {},
-}
-
-/// Whether a job runs a full agent-loop turn or a one-shot maintenance
-/// pass. A turn drives the LLM↔tool loop on behalf of its session; a
-/// maintenance job (background compression, `/compact`) does focused
-/// bookkeeping and never enters the loop. Read via `Job::is_turn()`.
-///
-/// Set by the code path that runs the job — `run()` is a `Turn`,
-/// compression paths are `Maintenance` — rather than inferred from the
-/// payload, which would mislabel a `/compact` (a `UserChat`-input
-/// maintenance pass) as a turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobShape {
-    Turn,
-    Maintenance,
 }
 
 /// What initially fed this job.
@@ -78,11 +41,10 @@ pub enum JobInput {
     Cron {
         action_payload: Value,
     },
-    /// A maintenance task. The payload is provenance; the spawning code path
-    /// decides behaviour.
-    System {
-        payload: SystemJobPayload,
-    },
+    /// User-requested foreground compaction (`/compact`). It opens a real job
+    /// so compression steps and spans have lifecycle, but it is not a chat
+    /// turn and must not drive TurnState or push notifications.
+    Compact,
     Spawned {
         initial_prompt: Vec<ContentBlock>,
     },
@@ -99,7 +61,7 @@ impl JobInput {
         match self {
             JobInput::UserChat { .. } => JobInputKind::UserChat,
             JobInput::Cron { .. } => JobInputKind::Cron,
-            JobInput::System { .. } => JobInputKind::System,
+            JobInput::Compact => JobInputKind::Compact,
             JobInput::Spawned { .. } => JobInputKind::Spawned,
             JobInput::SubagentNotification { .. } => JobInputKind::SubagentNotification,
         }
@@ -125,7 +87,7 @@ pub enum JobOutput {
         #[serde(default)]
         ordinal: Option<i64>,
     },
-    /// Structured payload (for tool-direct cron jobs, system jobs whose
+    /// Structured payload (for tool-direct cron jobs, maintenance jobs whose
     /// product is structured data, etc.).
     Structured { value: Value },
 }
@@ -144,16 +106,8 @@ mod tests {
         };
         assert_eq!(i.input_kind(), JobInputKind::Cron);
 
-        let i = JobInput::System {
-            payload: SystemJobPayload::Compression(BackgroundCompressionPayload {
-                up_to_ordinal: 0,
-            }),
-        };
-        assert_eq!(i.input_kind(), JobInputKind::System);
-        let i = JobInput::System {
-            payload: SystemJobPayload::TitleGeneration {},
-        };
-        assert_eq!(i.input_kind(), JobInputKind::System);
+        let i = JobInput::Compact;
+        assert_eq!(i.input_kind(), JobInputKind::Compact);
 
         let i = JobInput::Spawned {
             initial_prompt: vec![],
@@ -166,44 +120,21 @@ mod tests {
 
     #[test]
     fn input_round_trips_through_serde() {
-        let i = JobInput::System {
-            payload: SystemJobPayload::Compression(BackgroundCompressionPayload {
-                up_to_ordinal: 0,
-            }),
-        };
-        let s = serde_json::to_string(&i).unwrap();
-        let back: JobInput = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.input_kind(), i.input_kind());
-
-        let i = JobInput::System {
-            payload: SystemJobPayload::TitleGeneration {},
-        };
-        let s = serde_json::to_string(&i).unwrap();
-        let back: JobInput = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.input_kind(), i.input_kind());
-    }
-
-    #[test]
-    fn legacy_system_payload_without_variant_tag_still_loads_as_compression() {
-        let legacy = r#"{"kind":"system","payload":{"up_to_ordinal":7}}"#;
-        let back: JobInput = serde_json::from_str(legacy).expect("legacy System payload loads");
-        assert_eq!(back.input_kind(), JobInputKind::System);
-        assert!(matches!(
-            back,
-            JobInput::System {
-                payload: SystemJobPayload::Compression(BackgroundCompressionPayload {
-                    up_to_ordinal: 7
-                })
-            }
-        ));
-        let title = r#"{"kind":"system","payload":{}}"#;
-        let back: JobInput = serde_json::from_str(title).expect("title System payload loads");
-        assert!(matches!(
-            back,
-            JobInput::System {
-                payload: SystemJobPayload::TitleGeneration {}
-            }
-        ));
+        for input in [
+            JobInput::UserChat { content: vec![] },
+            JobInput::Cron {
+                action_payload: serde_json::json!({"cron_job_id": "c1", "prompt": "run"}),
+            },
+            JobInput::Compact,
+            JobInput::Spawned {
+                initial_prompt: vec![ContentBlock::Text("task".into())],
+            },
+            JobInput::SubagentNotification { content: vec![] },
+        ] {
+            let s = serde_json::to_string(&input).unwrap();
+            let back: JobInput = serde_json::from_str(&s).unwrap();
+            assert_eq!(back.input_kind(), input.input_kind());
+        }
     }
 
     #[test]

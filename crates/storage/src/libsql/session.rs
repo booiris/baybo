@@ -127,7 +127,6 @@ impl SessionStore for LibsqlSessionStore {
         let trigger_kind = match session.trigger.kind() {
             baybo_model::TriggerKind::User => "user",
             baybo_model::TriggerKind::Cron => "cron",
-            baybo_model::TriggerKind::System => "system",
             baybo_model::TriggerKind::Spawned => "spawned",
         };
         let parent_session = session
@@ -577,9 +576,8 @@ impl SessionStore for LibsqlSessionStore {
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             // The variant is payload-free, so the kind tag alone
             // reconstructs the `LineageKind` — no JSON decode needed.
-            // An unrecognised tag (e.g. an orphaned legacy
-            // `system_maintenance` row) is skipped rather than erroring
-            // the whole listing.
+            // An unrecognised tag is skipped rather than erroring the whole
+            // listing.
             let kind = match kind_tag.as_str() {
                 LINEAGE_KIND_SUBAGENT => LineageKind::Subagent,
                 _ => continue,
@@ -1415,12 +1413,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_all_skips_undeserializable_legacy_row() {
-        // A row written by an older build can carry a `lineage.kind` this
-        // build doesn't know (here `"system_maintenance"`). `list_all`
-        // must skip that one row (log + continue) and still return every
-        // good session, rather than erroring the whole listing and
-        // 500-ing the CLI picker / web UI.
+    async fn list_all_skips_undeserializable_row() {
+        // A bad row can carry a `lineage.kind` this build doesn't know.
+        // `list_all` must skip that one row (log + continue) and still
+        // return every good session, rather than erroring the whole listing
+        // and 500-ing the CLI picker / web UI.
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlSessionStore::new(pool);
 
@@ -1429,19 +1426,19 @@ mod tests {
 
         // Hand-write such a row straight into the table — the current
         // `save` path can't construct one.
-        let legacy_blob = r#"{
-            "id": "maint-legacy",
+        let bad_blob = r#"{
+            "id": "bad-lineage",
             "user": {"id": "u1", "name": null, "channel": "tui"},
             "channel": "tui",
             "created_at": "2024-01-01T00:00:00Z",
             "last_active": "2024-01-01T00:00:00Z",
             "state": {},
             "root_session_id": "good-1",
-            "trigger": {"kind": "system", "reason": "background_compression"},
-            "lineage": {"parent_session_id": "good-1", "parent_job_id": "job-x", "kind": "system_maintenance"}
+            "trigger": {"kind": "user"},
+            "lineage": {"parent_session_id": "good-1", "parent_job_id": "job-x", "kind": "unknown_kind"}
         }"#;
         assert!(
-            serde_json::from_str::<Session>(legacy_blob).is_err(),
+            serde_json::from_str::<Session>(bad_blob).is_err(),
             "the unknown-lineage-kind blob must not deserialize"
         );
         store
@@ -1452,12 +1449,12 @@ mod tests {
                  (id, root_session_id, trigger_kind, created_at, last_active, data) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 libsql::params![
-                    "maint-legacy".to_string(),
+                    "bad-lineage".to_string(),
                     "good-1".to_string(),
-                    "system".to_string(),
+                    "user".to_string(),
                     super::super::time::to_us(Utc::now()),
                     super::super::time::to_us(Utc::now()),
-                    legacy_blob.to_string(),
+                    bad_blob.to_string(),
                 ],
             )
             .await

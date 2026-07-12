@@ -12,7 +12,7 @@
 //!
 //! * If the DTO should follow, update the mirror here and its `From`
 //!   impl, then run `UPDATE_OPENAPI=1 cargo test -p baybo-gateway
-//!   --test openapi_spec_sync` + `cd web && npm run gen:api`.
+//!   --test all openapi_json_is_in_sync` + `pnpm --filter baybo-web gen:api`.
 //! * If the DTO should stay fixed (back-compat), the conversion
 //!   absorbs the rename/removal here, keeping clients stable.
 //!
@@ -518,7 +518,7 @@ impl From<baybo_job::JobStatus> for JobStatus {
 pub enum JobInputKind {
     UserChat,
     Cron,
-    System,
+    Compact,
     Spawned,
     SubagentNotification,
 }
@@ -528,7 +528,7 @@ impl From<baybo_job::JobInputKind> for JobInputKind {
         match v {
             baybo_job::JobInputKind::UserChat => Self::UserChat,
             baybo_job::JobInputKind::Cron => Self::Cron,
-            baybo_job::JobInputKind::System => Self::System,
+            baybo_job::JobInputKind::Compact => Self::Compact,
             baybo_job::JobInputKind::Spawned => Self::Spawned,
             baybo_job::JobInputKind::SubagentNotification => Self::SubagentNotification,
         }
@@ -542,7 +542,6 @@ impl From<baybo_job::JobInputKind> for JobInputKind {
 pub enum JobOrigin {
     User,
     Cron,
-    System,
     Spawned,
 }
 
@@ -551,25 +550,7 @@ impl From<baybo_model::TriggerKind> for JobOrigin {
         match v {
             baybo_model::TriggerKind::User => Self::User,
             baybo_model::TriggerKind::Cron => Self::Cron,
-            baybo_model::TriggerKind::System => Self::System,
             baybo_model::TriggerKind::Spawned => Self::Spawned,
-        }
-    }
-}
-
-/// Wire mirror of [`baybo_job::JobShape`] — turn vs maintenance.
-#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum JobShape {
-    Turn,
-    Maintenance,
-}
-
-impl From<baybo_job::JobShape> for JobShape {
-    fn from(v: baybo_job::JobShape) -> Self {
-        match v {
-            baybo_job::JobShape::Turn => Self::Turn,
-            baybo_job::JobShape::Maintenance => Self::Maintenance,
         }
     }
 }
@@ -586,8 +567,6 @@ pub struct Job {
     pub input_kind: JobInputKind,
     /// The owning session's root trigger.
     pub origin: JobOrigin,
-    /// Turn vs maintenance.
-    pub shape: JobShape,
     pub status: JobStatus,
     #[schema(value_type = Option<Object>)]
     pub final_result: Option<serde_json::Value>,
@@ -605,7 +584,6 @@ impl From<baybo_job::Job> for Job {
             parent_job_id: v.parent_job_id.map(|p| p.to_string()),
             input_kind: v.input_kind().into(),
             origin: v.origin.into(),
-            shape: v.shape.into(),
             status: v.status.into(),
             final_result: v
                 .final_result

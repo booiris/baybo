@@ -29,11 +29,14 @@ use baybo_agent::compression::reap_orphan_summaries;
 use baybo_context::{
     BackgroundSummaryConfig, SummaryChatRun, TiktokenTokenizer, run_background_summary,
 };
-use baybo_llm::{LlmResponse, TokenUsage, ToolCallInfo};
+use baybo_integration_tests::AgentTestHarness;
+use baybo_job::{Job, JobStore};
+use baybo_llm::{LlmResponse, StreamEvent, TokenUsage, ToolCallInfo};
 use baybo_model::{
     ChannelType, ChatMessage, ContentBlock, Session, SessionId, SessionState, TriggerSource, User,
 };
 use baybo_storage::Store;
+use baybo_trace::{Step, StepKind, TraceStore};
 use baybo_workspace::WorkspacePaths;
 use chrono::Utc;
 use tempfile::TempDir;
@@ -276,6 +279,96 @@ async fn background_pass_writes_summary_and_advances_cursor_without_extra_sessio
         mgr.summary_metadata(&parent.id).await.unwrap().is_some(),
         "fast-path reads session_summaries.cursor"
     );
+}
+
+#[tokio::test]
+async fn agent_background_pass_records_compression_step_on_parent_job() {
+    let workspace_root = TempDir::new().expect("tempdir");
+    let workspace = Arc::new(WorkspacePaths::new(workspace_root.path().to_path_buf()));
+
+    let mut harness = AgentTestHarness::builder()
+        .with_workspace(Arc::clone(&workspace))
+        .with_background_compression()
+        .with_model_context_window(30_000)
+        .with_compression_threshold(0.99)
+        .build();
+
+    harness.stub_llm.push_stream_results(vec![
+        Ok(StreamEvent::Text("done".into())),
+        Ok(StreamEvent::Usage(TokenUsage {
+            input_tokens: 20_000,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })),
+    ]);
+    harness.stub_llm.push_response(LlmResponse {
+        content: "notes are current".into(),
+        content_blocks: vec![ContentBlock::Text("notes are current".into())],
+        tool_calls: vec![],
+        usage: TokenUsage {
+            input_tokens: 500,
+            output_tokens: 20,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
+        thinking: None,
+    });
+
+    harness.send_text("hello ".repeat(18_000)).await.unwrap();
+    let _ = harness.drain_outputs(Duration::from_millis(750)).await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if harness
+                .session_manager
+                .summary_metadata(&harness.session.id)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("background summary metadata should be written");
+
+    let jobs: Vec<Job> = harness
+        .job_store
+        .list_by_session(&harness.session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| Job::from_row(row).unwrap())
+        .collect();
+    assert_eq!(
+        jobs.len(),
+        1,
+        "background compression must not create a separate maintenance job"
+    );
+    let parent_job_id = jobs[0].id;
+
+    let steps: Vec<Step> = harness
+        .trace_store
+        .list_steps_by_job(&parent_job_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| Step::from_row(row).unwrap())
+        .collect();
+    let compression_steps: Vec<_> = steps
+        .iter()
+        .filter(|step| matches!(step.kind, StepKind::Compression))
+        .collect();
+    assert_eq!(
+        compression_steps.len(),
+        1,
+        "background compression should render as one Compression step under the parent job; steps: {steps:#?}"
+    );
+
+    harness.shutdown().await;
 }
 
 /// FS orphan reaper (now FS-only): an on-disk summary directory whose

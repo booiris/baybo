@@ -139,9 +139,12 @@ Writes are asynchronous, with **synchronous fences** before any LLM or tool call
 `baybo_agent::recovery` closes half-open trace rows left by dropped execution.
 At boot, `recover_orphaned_traces_and_jobs` walks non-terminal jobs from the
 prior process, closes pending spans/steps at the last observed child activity,
-and cancels the job as `SystemCrash`. While the process is still alive,
-`recover_panicked_actor_session` performs the same repair for the panicked
-session's active turn jobs, using the actor task's crash time as the close time.
+and cancels the job as `SystemCrash`. It also asks `TraceStore` for unfinished
+steps so detached work under already-terminal jobs (background compression,
+title generation, progress observer) is closed without reopening or cancelling
+the owning job. While the process is still alive, `recover_panicked_actor_session`
+performs the same repair for the panicked session's active turn jobs, using the
+actor task's crash time as the close time.
 
 ## Constraints
 

@@ -326,9 +326,9 @@ The document is checked in at `docs/openapi.json` and kept honest by
 `crates/gateway/tests/openapi_spec_sync.rs`: the test regenerates the
 spec from `v1_router_and_spec()` and compares byte-for-byte. On
 intentional surface changes, run with `UPDATE_OPENAPI=1 cargo test -p
-baybo-gateway --test openapi_spec_sync` to rewrite the snapshot. A
-drifted spec fails CI, which guarantees the frontend can regenerate
-types without hitting a stale file.
+baybo-gateway --test all openapi_json_is_in_sync` to rewrite the
+snapshot. A drifted spec fails CI, which guarantees the frontend can
+regenerate types without hitting a stale file.
 
 The frontend consumes the spec through two tools:
 

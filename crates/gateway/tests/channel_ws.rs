@@ -454,7 +454,6 @@ async fn subscribe_hydrates_turn_state_snapshot() {
         .start_job(
             session.id.clone(),
             baybo_model::TriggerKind::User,
-            baybo_job::JobShape::Turn,
             baybo_job::JobInput::UserChat { content: vec![] },
             None,
         )

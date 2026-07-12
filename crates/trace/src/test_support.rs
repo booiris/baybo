@@ -13,7 +13,7 @@ use baybo_store::trace::Result;
 use baybo_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
 use parking_lot::Mutex;
 
-use crate::{Span, Step};
+use crate::{LifecycleState, Span, Step};
 
 /// In-memory `TraceStore` for tests. Stores rows verbatim; the
 /// `list_*_by_*` filters deserialize to read the parent id out of the
@@ -48,6 +48,30 @@ impl TraceStore for MemoryTraceStore {
             .lock()
             .values()
             .filter(|r| Step::from_row((*r).clone()).is_ok_and(|s| &s.job_id == job_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn list_unfinished_steps(&self) -> Result<Vec<StepRow>> {
+        let unfinished_span_steps: std::collections::HashSet<StepId> = self
+            .spans
+            .lock()
+            .values()
+            .filter_map(|r| Span::from_row(r.clone()).ok())
+            .filter(|s| matches!(s.outcome, LifecycleState::Pending) || s.ended_at.is_none())
+            .map(|s| s.step_id)
+            .collect();
+        Ok(self
+            .steps
+            .lock()
+            .values()
+            .filter(|r| {
+                Step::from_row((*r).clone()).is_ok_and(|s| {
+                    matches!(s.outcome, LifecycleState::Pending)
+                        || s.ended_at.is_none()
+                        || unfinished_span_steps.contains(&s.id)
+                })
+            })
             .cloned()
             .collect())
     }

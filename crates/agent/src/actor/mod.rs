@@ -1016,9 +1016,8 @@ impl AgentActor {
         command_text: String,
         sent_at: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<()> {
-        // `compact_now` mints a turn-kind job, so its start + terminal
-        // transitions drive the web chat's TurnState through the projector
-        // — nothing to emit here.
+        // `compact_now` mints its own maintenance job and returns a control
+        // notice; it does not emit a chat reply from the actor itself.
         let text = self
             .volatile
             .agent_loop

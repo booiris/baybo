@@ -187,7 +187,7 @@ mod tests {
     use crate::actor::mailbox::{self, MailboxReceiver};
     use baybo_channels::OutgoingMessage;
     use baybo_job::test_support::MemoryJobStore;
-    use baybo_job::{JobInput, JobOutput, JobShape};
+    use baybo_job::{JobInput, JobOutput};
     use baybo_model::{ChannelType, MessageMetadata, TriggerKind};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -256,7 +256,6 @@ mod tests {
             .start_job(
                 SessionId::from(CHILD_SESSION),
                 TriggerKind::User,
-                JobShape::Turn,
                 JobInput::Spawned {
                     initial_prompt: vec![ContentBlock::Text("task".into())],
                 },

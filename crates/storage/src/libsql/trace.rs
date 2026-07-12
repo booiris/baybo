@@ -83,6 +83,32 @@ impl TraceStore for LibsqlTraceStore {
         Ok(out)
     }
 
+    async fn list_unfinished_steps(&self) -> Result<Vec<StepRow>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT id, data FROM steps \
+                 WHERE ended_at IS NULL \
+                    OR EXISTS (SELECT 1 FROM spans WHERE spans.step_id = steps.id AND spans.ended_at IS NULL) \
+                 ORDER BY started_at",
+                (),
+            )
+            .await
+            .map_err(|e| err("query unfinished steps", e))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| err("row", e))? {
+            out.push(StepRow {
+                id: row
+                    .get::<String>(0)
+                    .map_err(|e| err("get", e))?
+                    .parse()
+                    .map_err(|e| err("parse step id", e))?,
+                data: row.get::<String>(1).map_err(|e| err("get", e))?,
+            });
+        }
+        Ok(out)
+    }
+
     async fn save_span(&self, span: &SpanRow) -> Result<()> {
         self.pool
             .conn()
@@ -177,8 +203,8 @@ impl TraceStore for LibsqlTraceStore {
 mod tests {
     use super::*;
     use baybo_trace::{
-        LifecycleState, LlmCallInputs, Span, SpanEvent, SpanEventKind, SpanKind, Step, StepKind,
-        ToolCallOrigin,
+        LifecycleOutcome, LifecycleState, LlmCallInputs, Span, SpanEvent, SpanEventKind, SpanKind,
+        Step, StepKind, ToolCallOrigin,
     };
     use chrono::Utc;
 
@@ -291,6 +317,61 @@ mod tests {
         assert!(got_ids.contains(&a1.id) && got_ids.contains(&a2.id));
 
         assert_eq!(store.list_steps_by_job(&job_b).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_unfinished_steps_finds_open_steps_and_open_child_spans() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlTraceStore::new(pool);
+
+        let open_step = make_step(JobId::new());
+        store.save_step(&open_step.to_row().unwrap()).await.unwrap();
+
+        let step_with_open_span = Step {
+            id: StepId::new(),
+            job_id: JobId::new(),
+            kind: StepKind::Compression,
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            outcome: LifecycleState::Done(LifecycleOutcome::Ok),
+        };
+        store
+            .save_step(&step_with_open_span.to_row().unwrap())
+            .await
+            .unwrap();
+        let open_span = make_llm_span(step_with_open_span.id);
+        store.save_span(&open_span.to_row().unwrap()).await.unwrap();
+
+        let finished_step = Step {
+            id: StepId::new(),
+            job_id: JobId::new(),
+            kind: StepKind::LlmIteration,
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            outcome: LifecycleState::Done(LifecycleOutcome::Ok),
+        };
+        store
+            .save_step(&finished_step.to_row().unwrap())
+            .await
+            .unwrap();
+        let mut finished_span = make_llm_span(finished_step.id);
+        finished_span.ended_at = Some(Utc::now());
+        finished_span.outcome = LifecycleState::Done(LifecycleOutcome::Ok);
+        store
+            .save_span(&finished_span.to_row().unwrap())
+            .await
+            .unwrap();
+
+        let ids: std::collections::HashSet<_> = store
+            .list_unfinished_steps()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert!(ids.contains(&open_step.id));
+        assert!(ids.contains(&step_with_open_span.id));
+        assert!(!ids.contains(&finished_step.id));
     }
 
     #[tokio::test]

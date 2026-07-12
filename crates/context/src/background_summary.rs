@@ -150,8 +150,10 @@ pub struct BackgroundSummaryConfig {
     pub cancel_token: CancellationToken,
 }
 
-/// Result of one [`run_background_summary`] pass. Carried back as the
-/// `JobOutput::Structured.value` for the maintenance job.
+/// Result of one [`run_background_summary`] pass. The agent-side background
+/// task records its LLM calls as `Compression` steps under the triggering job
+/// and logs this outcome on failure/success boundaries; no separate
+/// maintenance job is created for the pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundSummaryOutcome {
     pub cursor: i64,

@@ -30,7 +30,7 @@
 
 use std::future::Future;
 
-use baybo_job::{CancelReason, JobInput, JobLifecycle, JobOutput, JobShape};
+use baybo_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
 use baybo_model::{JobId, ParallelGroup, SessionId, TriggerKind};
 use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanHandle, SpanKind,
@@ -49,9 +49,6 @@ pub(crate) struct JobSpec {
     /// The owning session's root trigger — recorded on the job as its
     /// `origin`, independent of `input`.
     pub origin: TriggerKind,
-    /// Whether this job runs a full agent-loop turn or a maintenance
-    /// pass — declared by the spawning path, not inferred from `input`.
-    pub shape: JobShape,
     pub input: JobInput,
     pub parent_job_id: Option<JobId>,
 }
@@ -155,13 +152,7 @@ where
     Fut: Future<Output = anyhow::Result<(JobOutput, T)>>,
 {
     let job = lifecycle
-        .start_job(
-            spec.session_id,
-            spec.origin,
-            spec.shape,
-            spec.input,
-            spec.parent_job_id,
-        )
+        .start_job(spec.session_id, spec.origin, spec.input, spec.parent_job_id)
         .await?;
     let job_id = job.id;
     let _cancel_guard = lifecycle.register_running(job_id, cancel_token.clone());

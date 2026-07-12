@@ -1380,8 +1380,6 @@ export interface components {
             origin: components["schemas"]["JobOrigin"];
             parent_job_id?: string | null;
             session_id: string;
-            /** @description Turn vs maintenance. */
-            shape: components["schemas"]["JobShape"];
             /** Format: date-time */
             started_at?: string | null;
             status: components["schemas"]["JobStatus"];
@@ -1390,18 +1388,13 @@ export interface components {
          * @description Wire mirror of [`baybo_job::JobInputKind`] — what payload fed the job.
          * @enum {string}
          */
-        JobInputKind: "user_chat" | "cron" | "system" | "spawned" | "subagent_notification";
+        JobInputKind: "user_chat" | "cron" | "compact" | "spawned" | "subagent_notification";
         /**
          * @description Wire mirror of a job's origin (the owning session's root trigger,
          *     [`baybo_model::TriggerKind`]).
          * @enum {string}
          */
-        JobOrigin: "user" | "cron" | "system" | "spawned";
-        /**
-         * @description Wire mirror of [`baybo_job::JobShape`] — turn vs maintenance.
-         * @enum {string}
-         */
-        JobShape: "turn" | "maintenance";
+        JobOrigin: "user" | "cron" | "spawned";
         /**
          * @description Wire mirror of [`baybo_job::JobStatus`]. Carries the same payload
          *     the domain enum carries (cancel reason, partial-artifact span IDs);
@@ -3534,8 +3527,6 @@ export interface operations {
                             origin: components["schemas"]["JobOrigin"];
                             parent_job_id?: string | null;
                             session_id: string;
-                            /** @description Turn vs maintenance. */
-                            shape: components["schemas"]["JobShape"];
                             /** Format: date-time */
                             started_at?: string | null;
                             status: components["schemas"]["JobStatus"];

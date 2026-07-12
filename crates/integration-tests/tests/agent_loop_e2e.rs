@@ -204,7 +204,6 @@ async fn turn_state_projector_brackets_a_slow_turn() {
         .start_job(
             session.id.clone(),
             TriggerKind::User,
-            baybo_job::JobShape::Turn,
             JobInput::UserChat { content: vec![] },
             None,
         )

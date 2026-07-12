@@ -2,9 +2,8 @@
 //!
 //! Subscribes to the `JobLifecycle` broadcast bus and, for each
 //! **successfully-completed real user turn** (`phase == Completed`,
-//! `shape == Turn`, `kind == UserChat` — which excludes Cron / System /
-//! Spawned / SubagentNotification *and* `/compact`, a `UserChat`-input but
-//! `Maintenance`-shape job), encrypts a short preview **per approved device**
+//! `kind == UserChat` — which excludes Cron / Compact / Spawned /
+//! SubagentNotification), encrypts a short preview **per approved device**
 //! with that device's push key and POSTs the opaque ciphertext to the remote
 //! host (C). A encrypts, C relays blind, the iOS NSE decrypts — so the preview
 //! is real on the lock screen while C and Apple see only ciphertext.
@@ -28,7 +27,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use base64::Engine;
-use baybo_job::{JobInputKind, JobLifecycle, JobLifecycleEvent, JobPhase, JobShape};
+use baybo_job::{JobInputKind, JobLifecycle, JobLifecycleEvent, JobPhase};
 use baybo_model::{ContentBlock, Role, SessionId};
 use baybo_security::SecretVault;
 use baybo_session::SessionManager;
@@ -434,12 +433,9 @@ impl PushDispatcher {
     }
 
     /// True iff this terminal event should buzz a phone: a successfully-
-    /// completed real user turn. The `shape == Turn` gate is what excludes
-    /// `/compact`.
+    /// completed real user turn.
     pub fn should_dispatch(ev: &JobLifecycleEvent) -> bool {
-        matches!(ev.phase, JobPhase::Completed { .. })
-            && ev.shape == JobShape::Turn
-            && ev.kind == JobInputKind::UserChat
+        matches!(ev.phase, JobPhase::Completed { .. }) && ev.kind == JobInputKind::UserChat
     }
 
     /// Dispatch on the completed edge of a real user turn. The reply's ordinal
@@ -927,14 +923,13 @@ mod tests {
     use super::*;
     use baybo_model::JobId;
 
-    fn event(phase: JobPhase, shape: JobShape, kind: JobInputKind) -> JobLifecycleEvent {
+    fn event(phase: JobPhase, kind: JobInputKind) -> JobLifecycleEvent {
         JobLifecycleEvent {
             job_id: JobId::new(),
             session_id: SessionId::from("s1"),
             parent_job_id: None,
             phase,
             kind,
-            shape,
         }
     }
 
@@ -945,26 +940,23 @@ mod tests {
             JobPhase::Completed {
                 reply_ordinal: None
             },
-            JobShape::Turn,
             JobInputKind::UserChat,
         )));
-        // `/compact` — UserChat input but Maintenance shape — must NOT buzz.
+        // `/compact` has its own input kind and must NOT buzz.
         assert!(!PushDispatcher::should_dispatch(&event(
             JobPhase::Completed {
                 reply_ordinal: None
             },
-            JobShape::Maintenance,
-            JobInputKind::UserChat,
+            JobInputKind::Compact,
         )));
         // Non-terminal, and non-user inputs.
         assert!(!PushDispatcher::should_dispatch(&event(
             JobPhase::Started,
-            JobShape::Turn,
             JobInputKind::UserChat,
         )));
         for kind in [
             JobInputKind::Cron,
-            JobInputKind::System,
+            JobInputKind::Compact,
             JobInputKind::Spawned,
             JobInputKind::SubagentNotification,
         ] {
@@ -972,14 +964,12 @@ mod tests {
                 JobPhase::Completed {
                     reply_ordinal: None
                 },
-                JobShape::Turn,
                 kind,
             )));
         }
         // Failed / cancelled turns don't buzz either.
         assert!(!PushDispatcher::should_dispatch(&event(
             JobPhase::Failed,
-            JobShape::Turn,
             JobInputKind::UserChat,
         )));
     }

@@ -179,6 +179,7 @@ pub struct AgentTestHarnessBuilder {
     spending_limits: SpendingLimits,
     pricing: HashMap<String, ModelPricing>,
     workspace: Option<Arc<baybo_workspace::WorkspacePaths>>,
+    background_compression: bool,
     keep_recent: Option<usize>,
     /// Override for the stub LLM's `context_window`, which becomes the
     /// `ContextManager`'s budget cap after `AgentLoop::from_config`
@@ -210,6 +211,7 @@ impl Default for AgentTestHarnessBuilder {
             spending_limits: SpendingLimits::default(),
             pricing: HashMap::new(),
             workspace: None,
+            background_compression: false,
             keep_recent: None,
             model_context_window: None,
             compression_threshold: None,
@@ -269,6 +271,14 @@ impl AgentTestHarnessBuilder {
     /// fast-path always falls through.
     pub fn with_workspace(mut self, workspace: Arc<baybo_workspace::WorkspacePaths>) -> Self {
         self.workspace = Some(workspace);
+        self
+    }
+
+    /// Wire the agent loop's detached background-compression pass. Off by
+    /// default because most tests use a deliberately fake workspace path and
+    /// should never spawn filesystem-writing background work.
+    pub fn with_background_compression(mut self) -> Self {
+        self.background_compression = true;
         self
     }
 
@@ -433,6 +443,7 @@ impl AgentTestHarnessBuilder {
                 "/nonexistent-baybo-it-workspace",
             )))
         });
+        let background_workspace = self.background_compression.then(|| Arc::clone(&workspace));
         let keep_recent = self.keep_recent.unwrap_or(50);
         let compression_threshold = self.compression_threshold.unwrap_or(0.95);
         let token_calibration = Arc::new(baybo_context::TokenCalibration::new());
@@ -491,7 +502,7 @@ impl AgentTestHarnessBuilder {
             context_manager,
             max_iterations: 20,
             security_gateway: gateway.clone(),
-            workspace_paths: None,
+            workspace_paths: background_workspace,
             // Mirror what production wires so the `on_session_end` hook
             // (which loads the durable transcript via `SessionManager`) is
             // exercisable from tests instead of bailing at the `sessions`
