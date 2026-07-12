@@ -27,6 +27,15 @@
   --attachment-max-h: 16rem;
   --chat-row-gap: 1.5rem;
   --md-block-gap: 0.75rem;
+  /* How wide a code block may grow before it soft-wraps (see `.md pre code`) —
+     a MULTIPLE OF THE READING BAND, so the cap is really a bound on how far the
+     block can be scrolled sideways: 130% = at most 0.3 bands of travel, about
+     58 mono chars on a phone (the band holds ~47). Deliberately not `ch`: that
+     unit resolves against the "0" glyph of the font in force when the style is
+     computed, and the bundled mono webfont is still loading then, so WebKit
+     substitutes the 0.5em fallback and the cap lands ~20% narrower than
+     written (measured: 80ch → 62 chars). */
+  --code-max-width: 130%;
 
   /* Top inset so the thread's oldest visible row starts below the native
      header (status bar + the 42pt glass bar), not under its icons. The
@@ -55,6 +64,18 @@
   user-select: none;
   -webkit-touch-callout: none;
   -webkit-tap-highlight-color: transparent;
+  /* Hold the type scale we actually wrote. WebKit's text autosizing boosts the
+     font of any WRAPPING block laid out wider than the viewport — on the theory
+     that the reader will pinch out to see it — and the code block, which is
+     allowed to overrun the band up to `--code-max-width`, is exactly that: it
+     rendered ~1.5x, dwarfing the prose beside it. (Nothing catches this from
+     inside the page: an absolutely-positioned measuring probe is its own
+     autosize cluster and reads back unboosted, and getComputedStyle reports the
+     unadjusted size — only a screenshot shows it.) The transcript sets every
+     size deliberately and is never pinch-zoomed, so opt out of the whole
+     mechanism rather than fight it per-block. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 * { box-sizing: border-box; }
@@ -303,16 +324,31 @@ button {
   background: var(--color-surface);
   border: 1px solid var(--color-line);
   border-radius: 10px;
-  padding: 0.6rem 0.7rem;
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
+/* Scroll a LITTLE, then wrap. A pure sideways scroller makes a 4 KB base64 line
+   a scroll to nowhere; a pure soft-wrap shatters the alignment of ordinary code
+   that only just overruns the narrow band. So the block sizes to its content
+   (`max-content` = its longest authored line) but is capped at
+   `--code-max-width`: up to the cap it overflows the band and scrolls, past the
+   cap it soft-wraps (`pre-wrap` keeps the authored newlines + indentation,
+   `anywhere` breaks the unbreakable token). `min-width: 100%` keeps a short
+   block full-width. The padding lives HERE, not on the `<pre>`: a scroll
+   container's inline-end padding is dropped from its scrollable overflow, so
+   padding on the `<pre>` would vanish at the right end of a scrolled line. */
 .md pre code {
   display: block;
   border: 0;
   background: none;
-  padding: 0;
+  width: max-content;
+  min-width: 100%;
+  max-width: var(--code-max-width);
+  padding: 0.6rem 0.7rem;
   font-size: 0.78rem;
   line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .md a { color: var(--color-ink); text-decoration: underline; text-underline-offset: 2px; }
 .md blockquote {
@@ -382,8 +418,8 @@ button {
    `overflow-wrap: anywhere` (inherited by every step — reasoning markdown, tool
    label/summary, status text) breaks a long unbroken token (a path, URL, id) so
    a wide work step wraps instead of overflowing the viewport and scrolling the
-   whole document sideways. `<pre>` is exempt (white-space: pre) and keeps its
-   own overflow-x scroll. */
+   whole document sideways. `<pre>` is exempt — it keeps its own bounded
+   overflow-x scroll and soft-wraps past the cap (see `.md pre code`). */
 .work { width: 100%; font-family: var(--font-mono); overflow-wrap: anywhere; }
 .work.active {
   display: flex;
