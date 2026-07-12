@@ -8,7 +8,7 @@ use super::tunnel::{
     REQUEST_ID, collect_response_body, dial_tunnel_leg, expect_response_head, send_request,
 };
 use crate::core::{MAX_TUNNEL_CHUNK, TunnelHeader, TunnelRequest};
-use crate::gateway_api::GatewayJsonClient;
+use crate::gateway_api::{GatewayJsonClient, MEDIA_TYPE_JSON};
 
 const HEADER_CONTENT_TYPE: &str = "content-type";
 
@@ -41,7 +41,7 @@ impl GatewayJsonClient for GatewayApi {
             let body = request(
                 "POST",
                 path,
-                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, "application/json")],
+                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
                 Some(body),
             )
             .await?;
@@ -58,7 +58,7 @@ impl GatewayJsonClient for GatewayApi {
             let _body = request(
                 "POST",
                 path,
-                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, "application/json")],
+                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
                 Some(body),
             )
             .await?;
@@ -75,10 +75,20 @@ impl GatewayJsonClient for GatewayApi {
             let _body = request(
                 "PUT",
                 path,
-                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, "application/json")],
+                vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
                 Some(body),
             )
             .await?;
+            Ok(())
+        }
+    }
+
+    fn delete_empty<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
+        async move {
+            let _body = request("DELETE", path, Vec::new(), None).await?;
             Ok(())
         }
     }

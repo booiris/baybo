@@ -94,8 +94,20 @@ final class PopGestureHostController: UIViewController, UIGestureRecognizerDeleg
         }
         self.nav = nav
         if recognizer.delegate !== self {
-            priorDelegate = recognizer.delegate
-            priorEnabled = recognizer.isEnabled
+            // Two hosts can stack (archived list → chat). Re-appearing under a
+            // peer must inherit the SYSTEM prior the first host captured — not
+            // capture the peer itself, whose weak host dies with the popped
+            // screen and would strand the recognizer armed and delegate-less
+            // at the stack root. Peer inheritance also survives a popToRoot
+            // double-pop, where the top host restores straight to the system
+            // delegate.
+            if let peer = recognizer.delegate as? PopGestureHostController {
+                priorDelegate = peer.priorDelegate
+                priorEnabled = peer.priorEnabled
+            } else {
+                priorDelegate = recognizer.delegate
+                priorEnabled = recognizer.isEnabled
+            }
             nav.interactiveContentPopGestureRecognizer?.require(toFail: recognizer)
         }
         PopVelocityClamp.install(on: recognizer)

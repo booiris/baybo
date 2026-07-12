@@ -25,6 +25,50 @@ type BlobResultPayload = {
   error: string | null;
 };
 
+/// A file attachment's lifecycle, owned by native (the blob cache is on-device
+/// and iOS may purge it, so `ready` is a fact about disk, never a memory).
+export type FileState = "idle" | "loading" | "ready" | "failed";
+
+export type FileStatePayload = {
+  blobId: string;
+  state: FileState;
+  /// Bytes on disk while `loading`. `total` is the blob's full length when the
+  /// server declared one — the card already knows it from the attachment.
+  loaded?: number;
+  total?: number;
+  error?: string;
+};
+
+/// Where the native audio engine is for one blob. `stopped` covers everything
+/// that isn't the current track — never loaded, another track took the player,
+/// or playback ran to the end (position rewound to 0).
+export type AudioPlayState = "playing" | "paused" | "stopped";
+
+export type AudioStatePayload = {
+  blobId: string;
+  state: AudioPlayState;
+  /// Seconds. `duration` is 0 until the asset's metadata has loaded.
+  position: number;
+  duration: number;
+};
+
+type VideoPosterResultPayload = {
+  id: number;
+  dataBase64: string | null;
+  /// Natural pixel size of the poster frame (post-rotation).
+  width: number;
+  height: number;
+  durationMs: number;
+  error: string | null;
+};
+
+export type VideoPoster = {
+  url: string;
+  width: number;
+  height: number;
+  durationMs: number;
+};
+
 type BayboGlobal = {
   init(payload: InitPayload): void;
   pushFrame(frameJson: string): void;
@@ -32,6 +76,9 @@ type BayboGlobal = {
   userSent(payload: UserSentPayload): void;
   sendFailed(msgId: string): void;
   blobResult(payload: BlobResultPayload): void;
+  fileState(payload: FileStatePayload): void;
+  audioState(payload: AudioStatePayload): void;
+  videoPoster(payload: VideoPosterResultPayload): void;
   setLanguage(lang: string): void;
   setBottomInset(px: number): void;
   jumpToLatest(): void;
@@ -121,11 +168,38 @@ export function postJumpVisible(visible: boolean): void {
   postSafe({ type: "jumpVisible", visible });
 }
 
+/// The composer's send button is native and flips to a stop affordance while a
+/// turn is in flight. The webview is the single source of truth for turn state
+/// (SubscribeState reconstruction, the finalization-race handling), so it mirrors
+/// the run state over; a `/stop` tap comes back as an ordinary chat send native
+/// side. Fire-and-forget; native dedups.
+export function postRunState(running: boolean): void {
+  postSafe({ type: "runState", running });
+}
+
 /// Markdown links must not navigate the transcript webview away — native opens
 /// them in the system browser instead. Dev browser: plain window.open.
 export function openUrl(url: string): void {
   if (native) postSafe({ type: "openUrl", url });
   else window.open(url, "_blank", "noopener");
+}
+
+/// Copy text to the system clipboard. Native owns the write (UIPasteboard) and
+/// fires the confirming haptic — a WKWebView rejects `navigator.clipboard`
+/// writes outside a live user gesture, and a long-press timer has none. Dev
+/// browser: best-effort clipboard write so the affordance still works there.
+export function copyText(text: string): void {
+  if (native) postSafe({ type: "copy", text });
+  else void navigator.clipboard?.writeText(text).catch(() => {});
+}
+
+/// Open a tapped image full-screen. Native decodes the device-cached blob and
+/// presents its own zoomable viewer (pinch, double-tap-to-restore, black field)
+/// — images take this path; non-image files take `previewFile` (QuickLook). Name
+/// + mime ride along so the viewer's share sheet can hand over the file under its
+/// real name (an agent image usually carries no name; the mime derives one).
+export function viewImage(blobId: string, filename: string, mimeType: string): void {
+  postSafe({ type: "viewImage", blobId, filename, mimeType });
 }
 
 // History fetches are fire-and-forget from Web's perspective: native calls the
@@ -217,6 +291,151 @@ function settleBlob(payload: BlobResultPayload): void {
   }
 }
 
+// ---- file attachments (download / preview) ---------------------------------
+
+/// Keyed by blob id rather than fanned through the transcript's reducer: every
+/// card subscribes for itself, so a progress tick re-renders one card instead of
+/// the whole thread (and `MessageRow`'s memo survives).
+const fileStateListeners = new Map<string, Set<(payload: FileStatePayload) => void>>();
+
+export function onFileState(
+  blobId: string,
+  listener: (payload: FileStatePayload) => void,
+): () => void {
+  let listeners = fileStateListeners.get(blobId);
+  if (!listeners) {
+    listeners = new Set();
+    fileStateListeners.set(blobId, listeners);
+  }
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) fileStateListeners.delete(blobId);
+  };
+}
+
+/// Ask native whether the blob is already on disk. Answered with a `fileState`.
+export function queryFileState(blobId: string): void {
+  postSafe({ type: "queryFileState", blobId });
+}
+
+/// Start (or join) the download. Native streams `loading` ticks, then `ready`.
+export function downloadFile(blobId: string): void {
+  postSafe({ type: "downloadFile", blobId });
+}
+
+/// Open the downloaded file — QuickLook where iOS can render it, the share
+/// sheet otherwise. Native needs the name and mime to pick the previewer.
+export function previewFile(blobId: string, filename: string, mimeType: string): void {
+  postSafe({ type: "previewFile", blobId, filename, mimeType });
+}
+
+/// Hand the downloaded blob to the system share sheet under its real name (a
+/// long-press on a file / audio / video card — the image viewer has its own
+/// share button). Native materialises the file exactly like previewFile.
+export function shareFile(blobId: string, filename: string, mimeType: string): void {
+  postSafe({ type: "shareFile", blobId, filename, mimeType });
+}
+
+// ---- audio playback (native engine) -----------------------------------------
+
+/// Same per-blob fan-out as `fileStateListeners`: a 2 Hz position tick
+/// re-renders one audio card, not the thread.
+const audioStateListeners = new Map<string, Set<(payload: AudioStatePayload) => void>>();
+
+export function onAudioState(
+  blobId: string,
+  listener: (payload: AudioStatePayload) => void,
+): () => void {
+  let listeners = audioStateListeners.get(blobId);
+  if (!listeners) {
+    listeners = new Set();
+    audioStateListeners.set(blobId, listeners);
+  }
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) audioStateListeners.delete(blobId);
+  };
+}
+
+/// Ask native where its (single, app-wide) audio player is for this blob —
+/// answered with an `audioState` push. A card mounting mid-playback (session
+/// switch, thread reload) resyncs itself this way.
+export function queryAudioState(blobId: string): void {
+  postSafe({ type: "queryAudioState", blobId });
+}
+
+/// Play/pause. The engine is native (AVPlayer on the device-cached blob):
+/// bytes never cross the bridge, the ringer switch can't silence it, and
+/// playback survives leaving the chat. Starting one track stops any other.
+export function audioToggle(blobId: string, filename: string, mimeType: string): void {
+  postSafe({ type: "audioToggle", blobId, filename, mimeType });
+}
+
+export function audioSeek(blobId: string, position: number): void {
+  postSafe({ type: "audioSeek", blobId, position });
+}
+
+// ---- video attachments -------------------------------------------------------
+
+/// Open the downloaded video in the native full-screen player (AVKit controls,
+/// black field). Name + mime pick the on-disk materialisation, as previewFile.
+export function playVideo(blobId: string, filename: string, mimeType: string): void {
+  postSafe({ type: "playVideo", blobId, filename, mimeType });
+}
+
+let posterReqId = 0;
+const posterPending = new Map<
+  number,
+  { resolve: (poster: VideoPoster) => void; reject: (err: Error) => void }
+>();
+
+/// Ask native for a downloaded video's poster frame (AVAssetImageGenerator on
+/// the cached file) plus its natural size and duration. The caller owns the
+/// object URL and must revoke it.
+export function requestVideoPoster(
+  blobId: string,
+  filename: string,
+  mimeType: string,
+): Promise<VideoPoster> {
+  if (!native) return Promise.reject(new Error("no native bridge"));
+  posterReqId += 1;
+  const id = posterReqId;
+  return new Promise((resolve, reject) => {
+    posterPending.set(id, { resolve, reject });
+    try {
+      post({ type: "requestVideoPoster", id, blobId, filename, mimeType });
+    } catch (e) {
+      posterPending.delete(id);
+      reject(new Error(String(e)));
+    }
+  });
+}
+
+function settleVideoPoster(payload: VideoPosterResultPayload): void {
+  const pending = posterPending.get(payload.id);
+  if (!pending) return;
+  posterPending.delete(payload.id);
+  if (payload.dataBase64 === null) {
+    pending.reject(new Error(payload.error ?? "poster failed"));
+    return;
+  }
+  try {
+    const raw = atob(payload.dataBase64);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i += 1) bytes[i] = raw.charCodeAt(i);
+    pending.resolve({
+      url: URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" })),
+      width: payload.width,
+      height: payload.height,
+      durationMs: payload.durationMs,
+    });
+  } catch (e) {
+    pending.reject(new Error(String(e)));
+  }
+}
+
 // ---- inbound dispatch ------------------------------------------------------
 
 export type TranscriptEvents = {
@@ -301,6 +520,7 @@ window.baybo = {
     // Native flushes the old mirror before retargeting; do not post stale state here.
     buffer.length = 0;
     blobPending.clear();
+    posterPending.clear();
     clearTimeout(persistTimer);
     persistTimer = undefined;
     pendingPersist = null;
@@ -323,6 +543,19 @@ window.baybo = {
   },
   blobResult(payload) {
     settleBlob(payload);
+  },
+  fileState(payload) {
+    // A tick for a blob no card is showing (the session switched mid-download)
+    // simply has no listener.
+    for (const listener of fileStateListeners.get(payload.blobId) ?? []) listener(payload);
+  },
+  audioState(payload) {
+    // Playback outlives the chat screen, so a tick for a track whose card left
+    // the tree (session switch) simply has no listener.
+    for (const listener of audioStateListeners.get(payload.blobId) ?? []) listener(payload);
+  },
+  videoPoster(payload) {
+    settleVideoPoster(payload);
   },
   setLanguage(lang) {
     onLanguageCb?.(lang);

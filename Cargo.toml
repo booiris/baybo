@@ -115,6 +115,13 @@ uuid = { version = "1", features = ["v4"] }
 ulid = { version = "1", features = ["serde"] }
 regex = "1"
 aho-corasick = "1"
+# Media container metadata (AttachFile probes a track's duration at attach time):
+# lofty for audio, mp4 for ISO BMFF video (mp4/mov), matroska for webm/mkv,
+# mp3-duration for the MP3 frame walk (header math lies for VBR).
+lofty = "0.22"
+mp3-duration = "0.1"
+mp4 = "0.14"
+matroska = "0.30"
 tokio-util = "0.7"
 tokio-stream = { version = "0.1", features = ["sync"] }
 async-stream = "0.3"

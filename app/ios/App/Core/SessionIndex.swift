@@ -7,35 +7,69 @@ struct SessionRow: Codable, Identifiable, Equatable {
     let id: String
     var createdAt: Date
     var lastActive: Date
-    /// Preview drawn from the most-recent user-authored message; nil for a
-    /// session without a user turn yet.
-    var lastUserText: String?
+    /// Auto-generated conversation title (server-side, from the first user
+    /// question); nil until the title pass has run. The list's bold first line;
+    /// live-updated by a `SessionUpdated` patch (`SessionIndex.applyTitle`).
+    var title: String?
+    /// Second-line preview: the most-recent message regardless of author (user
+    /// prompt or agent reply). Captured locally on send, reconciled to server
+    /// truth (`last_message_text`) on merge; nil for a session with no
+    /// displayable turn yet.
+    var preview: String?
+    /// The most-recent USER message (server `last_user_text`). Drives the bold
+    /// first line's fallback (a short snippet) when there's no title yet — kept
+    /// separate from `preview`, which follows the agent's reply too.
+    var userText: String?
     var pinned: Bool
+    /// Server-side flag (like `pinned`): archived rows live under the Archived
+    /// screen instead of the main list, but keep accruing unread/recency.
+    var archived: Bool
     /// Local-only unread counter — the server never surfaces it. Bumped by a
     /// `SessionActivity` ping for a backgrounded session, cleared on open.
     var unread: Int
 
     init(
-        id: String, createdAt: Date, lastActive: Date, lastUserText: String?,
-        pinned: Bool, unread: Int = 0
+        id: String, createdAt: Date, lastActive: Date, title: String? = nil,
+        preview: String?, userText: String? = nil, pinned: Bool, archived: Bool = false,
+        unread: Int = 0
     ) {
         self.id = id
         self.createdAt = createdAt
         self.lastActive = lastActive
-        self.lastUserText = lastUserText
+        self.title = title
+        self.preview = preview
+        self.userText = userText
         self.pinned = pinned
+        self.archived = archived
         self.unread = unread
     }
 
-    /// `unread` post-dates the first shipped schema, so an older `sessions.json`
-    /// won't carry the key — default it instead of failing the whole decode.
+    /// The pre-Telegram schema stored the preview under `lastUserText`; decode
+    /// it as a fallback so an existing `sessions.json` keeps its captured
+    /// previews across the upgrade instead of flashing blank until the first
+    /// REST merge.
+    private enum LegacyKeys: String, CodingKey { case lastUserText }
+
+    /// `unread` / `archived` / `title` post-date earlier schemas and `preview`
+    /// renamed `lastUserText` — decode each defensively so an older
+    /// `sessions.json` upgrades in place instead of failing the whole decode.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         lastActive = try c.decode(Date.self, forKey: .lastActive)
-        lastUserText = try c.decodeIfPresent(String.self, forKey: .lastUserText)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        // The pre-Telegram schema stored the user's last message under
+        // `lastUserText`; fall back to it for BOTH the preview and the user-text
+        // label so an existing sessions.json upgrades in place.
+        var legacy: String?
+        if let legacyContainer = try? decoder.container(keyedBy: LegacyKeys.self) {
+            legacy = (try? legacyContainer.decodeIfPresent(String.self, forKey: .lastUserText)) ?? nil
+        }
+        preview = try c.decodeIfPresent(String.self, forKey: .preview) ?? legacy
+        userText = try c.decodeIfPresent(String.self, forKey: .userText) ?? legacy
         pinned = try c.decode(Bool.self, forKey: .pinned)
+        archived = try c.decodeIfPresent(Bool.self, forKey: .archived) ?? false
         unread = try c.decodeIfPresent(Int.self, forKey: .unread) ?? 0
     }
 }
@@ -48,13 +82,36 @@ struct SessionRow: Codable, Identifiable, Equatable {
 final class SessionIndex: ObservableObject {
     static let shared = SessionIndex()
 
-    /// Mirrors the gateway's `PREVIEW_MAX_CHARS` so a locally-captured preview
-    /// and a REST-fetched one truncate identically.
-    static let previewMaxChars = 200
+    /// Mirrors the gateway CHAT-LIST `PREVIEW_MAX_CHARS` (`api/admin/chat.rs`
+    /// — 120, NOT push's 200) so a locally-captured preview and a REST-fetched
+    /// one truncate identically; run every capture through `previewText`.
+    static let previewMaxChars = 120
+
+    /// Collapse whitespace and clip to `previewMaxChars` with a trailing
+    /// ellipsis — the Swift mirror of the gateway's `truncate_preview`. A local
+    /// capture run through this equals the server's `last_message_text` /
+    /// `last_user_text`, so reconciling it on the next `merge` changes nothing
+    /// (no visible jump). Unicode-scalar counting matches Rust's `chars()`.
+    static func previewText(_ text: String) -> String {
+        let collapsed = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let scalars = collapsed.unicodeScalars
+        if scalars.count <= previewMaxChars { return collapsed }
+        return String(String.UnicodeScalarView(scalars.prefix(previewMaxChars))) + "…"
+    }
     /// Transcript mirrors kept on disk — only the most recently active
     /// sessions; older mirrors are pruned (the gateway replays history on
     /// re-entry, so a pruned mirror only costs a fetch).
     static let maxMirroredTranscripts = 10
+
+    /// The latest user-intended archive/hide state for a session whose request
+    /// hasn't resolved yet. `merge(remote:)` consults it so a refresh racing an
+    /// in-flight mutation can't rewind the optimistic flip (or re-insert a row
+    /// an in-flight DELETE just removed).
+    enum PendingMutation: Equatable {
+        case archived(Bool)
+        case pinned(Bool)
+        case hidden
+    }
 
     @Published private(set) var rows: [SessionRow] = []
 
@@ -62,6 +119,24 @@ final class SessionIndex: ObservableObject {
     /// The session whose `ChatScreen` is on top. A `SessionActivity` ping for it
     /// is not counted as unread (the user is looking at it); `nil` on the list.
     private var foregroundSessionId: String?
+    /// In-memory only: a kill mid-flight loses the intent and the next merge
+    /// restores server truth, which is the honest fallback.
+    private var pendingMutations: [String: PendingMutation] = [:]
+    /// Rows removed by `beginHide`, kept for the failure rollback (the mirror
+    /// is prune-deleted and stays gone — the hydration matrix's mirror-less
+    /// listed path refetches history).
+    private var hiddenBackups: [String: SessionRow] = [:]
+    /// The archived value last acknowledged by the server, staged when a
+    /// session's FIRST pending mutation lands. A chained failure (archive →
+    /// undo, both dead offline) must roll back here — negating the failed
+    /// intent would re-archive a row the server never archived.
+    private var archiveBaselines: [String: Bool] = [:]
+    /// Same idea as `archiveBaselines`, for the pin toggle.
+    private var pinBaselines: [String: Bool] = [:]
+    /// Bumped on every mutation stage/resolve. A list fetch that STARTED
+    /// before a mutation resolved is a stale snapshot even after the pending
+    /// entry is gone — `merge` compares epochs and drops it.
+    private(set) var mutationEpoch = 0
 
     private init() {
         fileURL = Self.supportDirectory().appendingPathComponent("sessions.json")
@@ -90,7 +165,7 @@ final class SessionIndex: ObservableObject {
         rows.append(
             SessionRow(
                 id: sessionId, createdAt: now, lastActive: now,
-                lastUserText: nil, pinned: false))
+                preview: nil, pinned: false))
         save()
     }
 
@@ -99,19 +174,45 @@ final class SessionIndex: ObservableObject {
     /// (offline/failed tunnel). An attachment-only send (empty text) bumps
     /// activity but keeps the previous preview.
     func recordUserSend(sessionId: String, text: String) {
-        let preview = String(text.prefix(Self.previewMaxChars))
+        let preview = Self.previewText(text)
         let now = Date()
         if let idx = rows.firstIndex(where: { $0.id == sessionId }) {
             if !preview.isEmpty {
-                rows[idx].lastUserText = preview
+                // The just-sent message is both the newest message overall and
+                // the newest USER message, so it drives the preview AND the
+                // bold-line fallback until REST reconciles.
+                rows[idx].preview = preview
+                rows[idx].userText = preview
             }
             rows[idx].lastActive = now
         } else {
             rows.append(
                 SessionRow(
                     id: sessionId, createdAt: now, lastActive: now,
-                    lastUserText: preview.isEmpty ? nil : preview, pinned: false))
+                    preview: preview.isEmpty ? nil : preview,
+                    userText: preview.isEmpty ? nil : preview, pinned: false))
         }
+        save()
+    }
+
+    /// The agent's final reply landed on this (foreground or still-resident)
+    /// session's leg — capture it as the row's second-line preview locally, the
+    /// assistant-side mirror of `recordUserSend`. Without it the list keeps
+    /// showing the user's last message until the return-to-list REST merge swaps
+    /// in `last_message_text`, a visible jump; recency and title already update
+    /// live (the `SessionActivity` ping / `SessionUpdated` patch), so the preview
+    /// was the one row field with no live path. Mirrors the gateway's tool-free
+    /// final-answer rule; an empty reply (attachment-only) keeps the prior
+    /// preview, matching the gateway's media-only skip. `lastActive` / `userText`
+    /// are untouched — recency rides the ping and `userText` stays the user-only
+    /// label. Unknown ids are ignored; a later merge surfaces them.
+    func recordAgentReply(sessionId: String, text: String) {
+        let preview = Self.previewText(text)
+        guard !preview.isEmpty,
+            let idx = rows.firstIndex(where: { $0.id == sessionId }),
+            rows[idx].preview != preview
+        else { return }
+        rows[idx].preview = preview
         save()
     }
 
@@ -158,21 +259,173 @@ final class SessionIndex: ObservableObject {
         save()
     }
 
+    /// A live `SessionUpdated` title patch reached the connection-global list
+    /// sink (`SessionActivityHandler.onTitle`): swap the row's bold first line
+    /// in place. Title is server-authoritative and never mutated locally, so it
+    /// applies unconditionally for a known row; an unknown id waits for a REST
+    /// merge to surface it (the title is also carried on the summary).
+    func applyTitle(sessionId: String, title: String) {
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }), rows[idx].title != title
+        else { return }
+        rows[idx].title = title
+        save()
+    }
+
+    // MARK: - Optimistic archive / hide (server mutations in flight)
+
+    /// Optimistic archive flip: the row moves between the main and archived
+    /// lists at once; the staged intent shields it from a racing merge until
+    /// the PUT resolves. No-ops for a row that is gone or has a delete in
+    /// flight — a stale undo toast must not overwrite a hide intent.
+    func beginArchive(_ sessionId: String, archived: Bool) {
+        guard pendingMutations[sessionId] != .hidden,
+            let idx = rows.firstIndex(where: { $0.id == sessionId })
+        else { return }
+        if pendingMutations[sessionId] == nil {
+            archiveBaselines[sessionId] = rows[idx].archived
+        }
+        pendingMutations[sessionId] = .archived(archived)
+        mutationEpoch += 1
+        setArchivedFlag(sessionId, archived: archived)
+    }
+
+    /// Optimistic pin flip: the row re-sorts to the top block at once; the
+    /// staged intent shields it from a racing merge until the PUT resolves.
+    /// No-ops for a gone row or one with a delete in flight.
+    func beginPin(_ sessionId: String, pinned: Bool) {
+        guard pendingMutations[sessionId] != .hidden,
+            let idx = rows.firstIndex(where: { $0.id == sessionId })
+        else { return }
+        if pendingMutations[sessionId] == nil {
+            pinBaselines[sessionId] = rows[idx].pinned
+        }
+        pendingMutations[sessionId] = .pinned(pinned)
+        mutationEpoch += 1
+        setPinnedFlag(sessionId, pinned: pinned)
+    }
+
+    /// Optimistic delete (soft-hide): remove the row now — `save()`'s prune
+    /// drops the transcript mirror — and suppress the row's remote existence
+    /// in `merge` until the DELETE resolves.
+    func beginHide(_ sessionId: String) {
+        pendingMutations[sessionId] = .hidden
+        mutationEpoch += 1
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
+        hiddenBackups[sessionId] = rows[idx]
+        rows.remove(at: idx)
+        save()
+    }
+
+    func pendingMutation(for sessionId: String) -> PendingMutation? {
+        pendingMutations[sessionId]
+    }
+
+    /// The staged intent reached the server (or was superseded and re-sent):
+    /// remote truth takes over again.
+    func finishMutation(_ sessionId: String) {
+        pendingMutations.removeValue(forKey: sessionId)
+        hiddenBackups.removeValue(forKey: sessionId)
+        archiveBaselines.removeValue(forKey: sessionId)
+        pinBaselines.removeValue(forKey: sessionId)
+        mutationEpoch += 1
+    }
+
+    /// Archive PUT failed with the intent still current: rewind to the last
+    /// server-acknowledged value (NOT the failed intent's negation — after a
+    /// failed archive→undo chain that negation would re-archive a row the
+    /// server never archived).
+    func rollBackArchive(_ sessionId: String) {
+        pendingMutations.removeValue(forKey: sessionId)
+        mutationEpoch += 1
+        guard let baseline = archiveBaselines.removeValue(forKey: sessionId) else { return }
+        setArchivedFlag(sessionId, archived: baseline)
+    }
+
+    /// Pin PUT failed: rewind to the last server-acknowledged value.
+    func rollBackPin(_ sessionId: String) {
+        pendingMutations.removeValue(forKey: sessionId)
+        mutationEpoch += 1
+        guard let baseline = pinBaselines.removeValue(forKey: sessionId) else { return }
+        setPinnedFlag(sessionId, pinned: baseline)
+    }
+
+    /// Hide DELETE failed: re-insert the removed row (its mirror stays gone;
+    /// re-entry refetches history).
+    func rollBackHide(_ sessionId: String) {
+        pendingMutations.removeValue(forKey: sessionId)
+        archiveBaselines.removeValue(forKey: sessionId)
+        mutationEpoch += 1
+        guard let row = hiddenBackups.removeValue(forKey: sessionId),
+            !rows.contains(where: { $0.id == row.id })
+        else { return }
+        rows.append(row)
+        save()
+    }
+
+    /// Plain local flip with no staged intent — rollback and the DEBUG demo
+    /// seed use it; user-driven flips go through `beginArchive`.
+    func setArchivedFlag(_ sessionId: String, archived: Bool) {
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }),
+            rows[idx].archived != archived
+        else { return }
+        rows[idx].archived = archived
+        save()
+    }
+
+    /// Plain local pin flip — rollback and the DEBUG demo seed use it;
+    /// user-driven flips go through `beginPin`.
+    func setPinnedFlag(_ sessionId: String, pinned: Bool) {
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }),
+            rows[idx].pinned != pinned
+        else { return }
+        rows[idx].pinned = pinned
+        save()
+    }
+
     /// Merge the direct leg's REST list (the full non-hidden truth). Remote wins
     /// for existence — a local row missing remotely was hidden/deleted from
     /// another client — and for row fields, unless the local row saw activity
     /// after the remote snapshot (a just-sent message racing the refetch).
     /// Empty remote rows that this device has never listed are draft sessions:
     /// keep them out of the chat list until a send records local activity, or
-    /// the gateway reports user-authored preview text.
-    func merge(remote: [ChatSessionSummary]) {
+    /// the gateway reports user-authored preview text. In-flight mutations
+    /// (`pendingMutations`) beat the fetched snapshot: a pending archive flip
+    /// wins over the remote value, and a pending hide suppresses the remote row
+    /// entirely (this rebuild would otherwise re-insert it). Callers capture
+    /// `mutationEpoch` BEFORE fetching: a snapshot older than the last mutation
+    /// stage/resolve is dropped whole (it could rewind a flip whose pending
+    /// entry has already cleared, or resurrect a just-deleted row); the next
+    /// refresh re-merges.
+    func merge(remote: [ChatSessionSummary], fetchEpoch: Int) {
+        guard fetchEpoch == mutationEpoch else { return }
         var merged: [SessionRow] = []
         let local = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
         for summary in remote {
+            let pending = pendingMutations[summary.sessionId]
+            if pending == .hidden { continue }
             let mine = local[summary.sessionId]
-            let hasRemotePreview = !(summary.lastUserText ?? "").isEmpty
+            // Newest-message preview wins; fall back to the user-only label so
+            // an older gateway (no `last_message_text`) still renders a preview.
+            let remotePreview = summary.lastMessageText ?? summary.lastUserText
+            let hasRemotePreview = !(remotePreview ?? "").isEmpty
             guard mine != nil || hasRemotePreview || summary.pinned else { continue }
+            // Remote title is authoritative, but a live patch may have set it
+            // before this (older) snapshot caught up — keep the local one when
+            // the snapshot has none rather than blanking a title just shown.
+            let title = summary.title ?? mine?.title
 
+            let archived: Bool
+            if case .archived(let flag)? = pending {
+                archived = flag
+            } else {
+                archived = summary.archived
+            }
+            let pinned: Bool
+            if case .pinned(let flag)? = pending {
+                pinned = flag
+            } else {
+                pinned = summary.pinned
+            }
             let createdAt = Self.parseDate(summary.createdAt)
             let lastActive = Self.parseDate(summary.lastActive)
             // `unread` is now server-computed (`unreadCount`), so the pull
@@ -181,29 +434,36 @@ final class SessionIndex: ObservableObject {
             // The live ping (`noteActivity`) still bumps it between pulls as a
             // cheap accelerator.
             let unread = Int(summary.unreadCount)
-            if let mine, mine.lastActive > lastActive {
-                merged.append(
-                    SessionRow(
-                        id: summary.sessionId, createdAt: createdAt,
-                        lastActive: mine.lastActive,
-                        lastUserText: mine.lastUserText ?? summary.lastUserText,
-                        pinned: summary.pinned, unread: unread))
-            } else {
-                merged.append(
-                    SessionRow(
-                        id: summary.sessionId, createdAt: createdAt, lastActive: lastActive,
-                        lastUserText: summary.lastUserText, pinned: summary.pinned,
-                        unread: unread))
-            }
+            // Server data is authoritative — adopt the snapshot's preview / user
+            // text / recency wholesale. A local row NEVER overrides a server
+            // value; it only fills a field the server left nil. (The old
+            // "keep local when mine.lastActive > lastActive" guard compared the
+            // DEVICE clock `recordUserSend` stamps against the SERVER clock, so a
+            // device running ahead pinned a stale just-sent preview forever — the
+            // list showed the question while the transcript already held the
+            // reply.) The optimistic just-sent preview still shows instantly
+            // between refreshes; a merge simply reconciles it to server truth.
+            merged.append(
+                SessionRow(
+                    id: summary.sessionId, createdAt: createdAt, lastActive: lastActive,
+                    title: title,
+                    preview: remotePreview ?? mine?.preview,
+                    userText: summary.lastUserText ?? mine?.userText,
+                    pinned: pinned, archived: archived, unread: unread))
         }
         rows = merged
         save()
     }
 
-    /// Logout / rebind: the rows belong to the old gateway — drop them and
-    /// their transcript mirrors.
+    /// Logout / rebind: the rows belong to the old gateway — drop them, their
+    /// transcript mirrors, and any staged mutations against it.
     func removeAll() {
         rows = []
+        pendingMutations = [:]
+        hiddenBackups = [:]
+        archiveBaselines = [:]
+        pinBaselines = [:]
+        mutationEpoch += 1
         save()
         TranscriptStore.deleteAll()
         OutboxStore.deleteAll()
@@ -247,7 +507,7 @@ final class SessionIndex: ObservableObject {
             rows.append(
                 SessionRow(
                     id: sessionId, createdAt: now, lastActive: now,
-                    lastUserText: nil, pinned: false))
+                    preview: nil, pinned: false))
         }
         if let blob = defaults.string(forKey: ChatDefaults.transcriptState) {
             TranscriptStore.write(sessionId: sessionId, stateJson: blob)
@@ -293,6 +553,14 @@ final class SessionActivityHandler: SessionListSink, @unchecked Sendable {
             MainActor.assumeIsolated {
                 SessionIndex.shared.noteActivity(
                     sessionId: sessionId, source: source, atMillis: atMillis)
+            }
+        }
+    }
+
+    func onTitle(sessionId: String, title: String) {
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                SessionIndex.shared.applyTitle(sessionId: sessionId, title: title)
             }
         }
     }

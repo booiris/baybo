@@ -1308,6 +1308,20 @@ mod tests {
                 None => Ok(false),
             }
         }
+        async fn set_archived(
+            &self,
+            id: &SessionId,
+            archived: bool,
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
+            let mut data = self.sessions.lock();
+            match data.get_mut(id) {
+                Some(s) => {
+                    s.archived = archived;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
         async fn set_folder(
             &self,
             id: &SessionId,
@@ -1618,6 +1632,7 @@ mod tests {
             lineage: None,
             hidden: false,
             pinned: false,
+            archived: false,
             folder_id: None,
             title: None,
         }

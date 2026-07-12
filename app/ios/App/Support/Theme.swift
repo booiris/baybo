@@ -25,6 +25,13 @@ enum Theme {
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.custom("Space Mono", size: size).weight(weight)
     }
+
+    /// The system face (SF Pro), for surfaces that deliberately step out of the
+    /// Space Mono chrome — currently the chat list, which reads as a native,
+    /// content-dense list rather than monospaced chrome.
+    static func sys(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        Font.system(size: size, weight: weight)
+    }
 }
 
 /// Primary CTA — the web `.cta`: soft-filled ink pill, paper text, REGULAR

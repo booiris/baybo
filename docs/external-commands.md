@@ -22,6 +22,12 @@ task containers) provide or skip each one.
 Build/test-only (not runtime): `cargo`, `pnpm` (web build), `musl-gcc` (bench
 musl build), `tmux` (`baybo-term-harness` tests).
 
+`pnpm` is **required to build `baybo-gateway`**: the dashboard is compiled into
+the binary, and `build.rs` hard-fails when it can't be built. Set
+`BAYBO_SKIP_WEBUI=1` to embed the placeholder page and build the backend without
+it. The sidecar half of that build script stays lenient (empty assets +
+`cargo:warning`) unless `BAYBO_REQUIRE_SIDECARS=1`.
+
 ## Bench environment (`bench-bash` + `permission = free`)
 
 The in-container benches (`bench/swe`, `bench/terminal-bench-1.0`) run the real agent

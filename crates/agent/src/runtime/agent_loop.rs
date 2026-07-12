@@ -14,8 +14,8 @@ use baybo_model::{
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use baybo_model::{LineageKind, Session, TriggerSource};
-use baybo_tools::{ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
+use baybo_model::{ControlEventKind, LineageKind, Session, TriggerSource};
+use baybo_tools::{ApprovalDecision, ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
 use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
 };
@@ -29,7 +29,7 @@ use crate::runtime::progress_observer::{
 };
 use crate::runtime::scope::JobSpec;
 
-use crate::runtime::tool_executor::ToolExecutor;
+use crate::runtime::tool_executor::{ExecutedTool, ToolExecutor};
 use crate::security::SecurityGateway;
 use tokio_util::sync::CancellationToken;
 
@@ -83,32 +83,80 @@ fn summarize_text(s: &str) -> String {
     }
 }
 
+/// Content identity of a media block. Keys on the blob's digest, never on the
+/// `blob_id` — every `put` mints a fresh read token, so the same bytes staged
+/// twice carry two different ids.
+fn media_digest(block: &ContentBlock) -> Option<&str> {
+    match block {
+        ContentBlock::Image { blob, .. }
+        | ContentBlock::Audio { blob, .. }
+        | ContentBlock::File { blob, .. } => blob.content_digest(),
+        _ => None,
+    }
+}
+
+/// Fold a tool's attachments into the turn's accumulator, skipping content the
+/// turn already staged. `AttachFile` called twice on one path stages the same
+/// bytes twice; the reply must show the user that file once. A block with no
+/// digest (a malformed id, or a non-media block a tool wrongly passed) has no
+/// identity to compare, so it rides through untouched.
+fn extend_unique_attachments(acc: &mut Vec<ContentBlock>, incoming: &[ContentBlock]) {
+    for block in incoming {
+        if let Some(digest) = media_digest(block)
+            && acc
+                .iter()
+                .filter_map(media_digest)
+                .any(|seen| seen == digest)
+        {
+            continue;
+        }
+        acc.push(block.clone());
+    }
+}
+
+/// Name what the user is about to receive rather than counting blocks —
+/// the work block reads better as "report.pdf" than "1 attachment(s)".
+fn summarize_attachments(blocks: &[ContentBlock]) -> String {
+    let named: Vec<&str> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::File { filename, .. } => Some(filename.as_str()),
+            ContentBlock::Image { mime_type, .. } | ContentBlock::Audio { mime_type, .. } => {
+                Some(mime_type.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if named.is_empty() {
+        return format!("{} attachment(s)", blocks.len());
+    }
+    truncate_summary(&named.join(", "))
+}
+
 /// Derive the `(status, summary)` for a finished tool call's
 /// `ToolCompleted` progress event from its result. Presentation-only and
 /// content-light; the summary still passes the leak boundary before it is
 /// emitted. Mirrors the result match the loop runs for the LLM-facing
 /// `tool_result` text.
-fn tool_completion_summary(result: &anyhow::Result<ToolOutput>) -> (ToolStatus, String) {
-    match result {
+fn tool_completion_summary(executed: &ExecutedTool) -> (ToolStatus, String) {
+    // A recorded `Deny` is the authoritative denial signal, whatever shape the
+    // refusal took: the pre-execute gate raises a typed `ToolError::Denied`,
+    // but a tool that prompts MID-CALL folds the refusal into its own (untyped)
+    // error — and both must read as "denied", not "the tool crashed".
+    if executed.approval == Some(ApprovalDecision::Deny) {
+        return (ToolStatus::Denied, "denied".to_string());
+    }
+    match &executed.output {
         Ok(ToolOutput::Text(s)) => (ToolStatus::Ok, summarize_text(s)),
         Ok(ToolOutput::Json(_)) => (ToolStatus::Ok, "ok".to_string()),
-        Ok(ToolOutput::WithAttachments { attachments, .. }) => (
-            ToolStatus::Ok,
-            format!("{} attachment(s)", attachments.len()),
-        ),
+        Ok(ToolOutput::WithAttachments { attachments, .. }) => {
+            (ToolStatus::Ok, summarize_attachments(attachments))
+        }
         Ok(ToolOutput::MultiModalText { llm_images, .. }) => {
             (ToolStatus::Ok, format!("{} image(s)", llm_images.len()))
         }
         Ok(ToolOutput::Error(msg)) => (ToolStatus::Error, truncate_summary(msg)),
-        Err(e) => {
-            if let Some(baybo_tools::ToolError::Denied { .. }) =
-                e.downcast_ref::<baybo_tools::ToolError>()
-            {
-                (ToolStatus::Denied, "denied".to_string())
-            } else {
-                (ToolStatus::Error, truncate_summary(&e.to_string()))
-            }
-        }
+        Err(e) => (ToolStatus::Error, truncate_summary(&e.to_string())),
     }
 }
 
@@ -264,21 +312,6 @@ impl baybo_tools::SessionNotifier for DeltaTxNotifier {
             event: AgentEvent::Notice { level, text },
         });
     }
-
-    fn emit_attachment(&self, blocks: &[ContentBlock]) {
-        if blocks.is_empty() {
-            return;
-        }
-        // Media carries no free text, so no leak boundary applies. `try_send`
-        // (like `emit`) drops on a full channel rather than blocking the
-        // sync tool path.
-        let _ = self.tx.try_send(AgentOutput {
-            session_id: self.session_id.clone(),
-            user_id: self.user_id.clone(),
-            channel: self.channel.clone(),
-            event: AgentEvent::Attachment(blocks.to_vec()),
-        });
-    }
 }
 
 /// What one `LlmIteration` step's body produced. The terminal-vs-loop
@@ -288,8 +321,8 @@ impl baybo_tools::SessionNotifier for DeltaTxNotifier {
 enum IterationOutcome {
     /// Final assistant response — caller returns this from `run_inner`.
     /// `outgoing.content` is both the channel-bound reply and the persisted
-    /// assistant turn (text / thinking); tool media was delivered live as it
-    /// was produced, never bundled here.
+    /// assistant turn: text / thinking, plus any media the turn's tools
+    /// produced (`ToolOutput::WithAttachments`) folded in at the tail.
     Final { outgoing: OutgoingMessage },
     /// LLM emitted tool calls; loop continues. `task_mutated` is `true`
     /// when one of this iteration's tool calls changed the planning
@@ -813,6 +846,10 @@ impl AgentLoop {
         // Accumulates this job's user-authored input (initial prompt + any
         // mid-turn interjections) for the `on_job_complete` write at turn end.
         let mut job_user_input: Vec<ContentBlock> = memory_query.clone().unwrap_or_default();
+        // Media the turn's tools produced (`ToolOutput::WithAttachments`),
+        // folded into the final assistant row so it persists. Dropped on any
+        // non-`Final` exit: attachments are durable only when the turn is.
+        let mut turn_attachments: Vec<ContentBlock> = Vec::new();
 
         // Iterative LLM loop
         let mut iterations = 0;
@@ -930,6 +967,7 @@ impl AgentLoop {
                         iter_delta_tx,
                         notifier.clone(),
                         &cancel_token,
+                        &mut turn_attachments,
                     );
                     async move { Ok((LifecycleOutcome::Ok, fut.await?)) }
                 },
@@ -1002,9 +1040,10 @@ impl AgentLoop {
             }
         }
 
-        // If we exhausted iterations, return what we have. Any media the
-        // tools produced was already delivered live as it was produced, so
-        // there's nothing to append here.
+        // If we exhausted iterations, return what we have. `turn_attachments`
+        // is dropped with the rest of this turn's locals: this path persists
+        // no assistant row, so folding media into `content` would deliver it
+        // live and then lose it on the next resync.
         let content = vec![ContentBlock::Text(
             "I've reached the maximum number of processing steps. Please try again with a simpler request.".to_string(),
         )];
@@ -1053,6 +1092,7 @@ impl AgentLoop {
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         cancel_token: &CancellationToken,
+        turn_attachments: &mut Vec<ContentBlock>,
     ) -> anyhow::Result<IterationOutcome> {
         let (response, llm_span_id) = match self
             .call_llm_with_retry(session, span_recorder, &step, delta_tx, cancel_token)
@@ -1081,11 +1121,15 @@ impl AgentLoop {
         if response.tool_calls.is_empty() {
             // Use content_blocks when available, falling back to the
             // text string.
-            let response_blocks = if response.content_blocks.is_empty() {
+            let mut response_blocks = if response.content_blocks.is_empty() {
                 vec![ContentBlock::Text(response.content.clone())]
             } else {
                 response.content_blocks.clone()
             };
+            // Media the turn's tools produced rides out on this row. The
+            // provider conversion drops media blocks from an assistant
+            // message, so replaying this row to the LLM stays valid.
+            response_blocks.extend(std::mem::take(turn_attachments));
 
             let final_text = baybo_llm::multimodal::extract_text(&response_blocks);
 
@@ -1096,9 +1140,8 @@ impl AgentLoop {
             );
 
             // The reply blocks are both the channel-bound content and the
-            // persisted assistant row (tool media was delivered live, never
-            // bundled here). Capture the persisted ordinal so the channel
-            // adapter can stamp the live `Frame::Message`.
+            // persisted assistant row. Capture the persisted ordinal so the
+            // channel adapter can stamp the live `Frame::Message`.
             let assistant_msg = ChatMessage::assistant(response_blocks.clone());
             let ordinal = self.context_manager.append(&assistant_msg).await;
 
@@ -1256,10 +1299,18 @@ impl AgentLoop {
 
         // Sequential post-processing: append results in `tool_calls`
         // order so context state stays byte-stable across calls.
-        for (tool_call, tool_result) in response.tool_calls.iter().zip(tool_results) {
-            let (status, raw_summary) = tool_completion_summary(&tool_result);
-            self.emit_tool_completed(delta_tx, session, tool_call.id.clone(), status, raw_summary)
-                .await;
+        for (tool_call, executed) in response.tool_calls.iter().zip(tool_results) {
+            let (status, raw_summary) = tool_completion_summary(&executed);
+            let call_approval = executed.approval;
+            self.emit_tool_completed(
+                delta_tx,
+                session,
+                tool_call.id.clone(),
+                status,
+                raw_summary,
+                call_approval,
+            )
+            .await;
 
             // Count a grouped subagent spawn into its barrier cohort so the
             // turn-end seal knows the member total. Only a *successful
@@ -1269,8 +1320,9 @@ impl AgentLoop {
             // broad: counting it would stall the cohort until its group
             // timeout. A real dispatch returns the ack with its `bg-…` handle.
             let dispatched = matches!(
-                &tool_result,
-                Ok(ToolOutput::Text(t)) if t.starts_with(baybo_model::BACKGROUND_DISPATCH_ACK_PREFIX)
+                &executed.output,
+                Ok(ToolOutput::Text(t))
+                    if t.starts_with(baybo_model::BACKGROUND_DISPATCH_ACK_PREFIX)
             );
             if tool_call.name == baybo_model::SPAWN_SUBAGENT_TOOL_NAME
                 && dispatched
@@ -1294,16 +1346,20 @@ impl AgentLoop {
                     .expected += 1;
             }
 
-            let raw_result_text = match &tool_result {
+            let raw_result_text = match &executed.output {
                 Ok(ToolOutput::Text(s)) => s.clone(),
                 Ok(ToolOutput::Json(v)) => {
                     serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
                 }
-                // A tool that delivers media to the user does so itself via
-                // `ctx.notifier.emit_attachment` (e.g. `SendFile`); the loop
-                // forwards only the text result to the LLM.
-                Ok(ToolOutput::WithAttachments { text, .. })
-                | Ok(ToolOutput::MultiModalText { text, .. }) => text.clone(),
+                // Media a tool produced for the *user* (e.g. `AttachFile`) is
+                // hoisted onto the turn's final assistant row; the LLM sees
+                // only the text result. `MultiModalText`'s images are for the
+                // LLM's own next turn, so they are NOT hoisted here.
+                Ok(ToolOutput::WithAttachments { text, attachments }) => {
+                    extend_unique_attachments(turn_attachments, attachments);
+                    text.clone()
+                }
+                Ok(ToolOutput::MultiModalText { text, .. }) => text.clone(),
                 Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
                 Err(e) => {
                     if let Some(denied) = e.downcast_ref::<baybo_tools::ToolError>()
@@ -1336,25 +1392,30 @@ impl AgentLoop {
             );
 
             // Append tool result to context with the tool_use_id so the
-            // LLM can correlate results with their originating calls. For a
-            // `Read`, stamp the fingerprint it recorded onto the row so the
-            // read-before-write tracker can be rebuilt on hydration (the
-            // fingerprint persists with the transcript but is never sent to
-            // the LLM). `get` returns `None` for a failed/virtual read, which
-            // collapses to a plain `tool_result`.
-            let tool_msg = if tool_call.name == baybo_tools::READ_TOOL_NAME {
-                let meta = tool_call
-                    .arguments
-                    .get("file_path")
-                    .and_then(|v| v.as_str())
-                    .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
-                    .map(|fp| baybo_model::ToolResultMeta {
-                        read_fingerprint: Some(fp),
-                    });
-                ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, meta)
-            } else {
-                ChatMessage::tool_result(tool_call.id.clone(), wrapped)
-            };
+            // LLM can correlate results with their originating calls. The
+            // meta rides the persisted row but is never sent to the LLM: a
+            // `Read` stamps the fingerprint it recorded (so the
+            // read-before-write tracker can be rebuilt on hydration; `get`
+            // returns `None` for a failed/virtual read), and any call that
+            // raised an approval prompt stamps the decision (so reloads can
+            // label the work step). Both `None` collapses to a plain
+            // `tool_result`.
+            let read_fingerprint = (tool_call.name == baybo_tools::READ_TOOL_NAME)
+                .then(|| {
+                    tool_call
+                        .arguments
+                        .get("file_path")
+                        .and_then(|v| v.as_str())
+                        .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
+                })
+                .flatten();
+            let meta = (read_fingerprint.is_some() || call_approval.is_some()).then_some(
+                baybo_model::ToolResultMeta {
+                    read_fingerprint,
+                    approval: call_approval,
+                },
+            );
+            let tool_msg = ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, meta);
             self.context_manager.append(&tool_msg).await;
         }
 
@@ -2250,6 +2311,7 @@ impl AgentLoop {
         call_id: String,
         status: ToolStatus,
         raw_summary: String,
+        approval: Option<ApprovalDecision>,
     ) {
         let Some(tx) = delta_tx else { return };
         let summary = self
@@ -2266,6 +2328,7 @@ impl AgentLoop {
                     call_id,
                     status,
                     summary,
+                    approval,
                 },
             })
             .await;
@@ -2391,6 +2454,10 @@ impl AgentLoop {
                             // Record only what actually reaches the user, so the
                             // next tick dedupes against their real view.
                             observer_state.sent_notices.push(text.clone());
+                            // Durably shadow the line as a `progress` control
+                            // event so a reload reconstructs it into this turn's
+                            // work block (the live frame below is ephemeral).
+                            self.persist_progress_narration(session, &text).await;
                             self.emit_progress(delta_tx, session, text).await;
                         }
                     }
@@ -2500,6 +2567,36 @@ impl AgentLoop {
                 event: AgentEvent::Progress(text),
             })
             .await;
+    }
+
+    /// Persist one progress line as a `progress` control event, anchored after
+    /// the session's newest ordinal so the reconstruction folds it into the
+    /// in-flight turn's work block at the right spot. Best-effort: a missing
+    /// session store (test loops) or a write error just skips the durable
+    /// shadow — the live frame already reached the user.
+    async fn persist_progress_narration(&self, session: &Session, text: &str) {
+        let Some(sessions) = self.sessions.as_ref() else {
+            return;
+        };
+        let after_ordinal = match sessions.latest_session_ordinal(&session.id).await {
+            Ok(max) => max.unwrap_or(-1),
+            Err(e) => {
+                debug!(session_id = %session.id, error = %e, "progress: ordinal lookup failed; skipping persist");
+                return;
+            }
+        };
+        if let Err(e) = sessions
+            .append_control_event(
+                &session.id,
+                after_ordinal,
+                ControlEventKind::Progress,
+                text,
+                chrono::Utc::now(),
+            )
+            .await
+        {
+            debug!(session_id = %session.id, error = %e, "failed to persist progress narration");
+        }
     }
 
     /// Run an on-demand compression pass and return the confirmation
@@ -3234,6 +3331,7 @@ mod session_end_gate_tests {
             lineage,
             hidden: false,
             pinned: false,
+            archived: false,
             folder_id: None,
             title: None,
         }
@@ -3335,5 +3433,49 @@ mod bg_compression_at_most_one_tests {
             may_spawn(&handle),
             "a finished pass must not block the next spawn"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_completion_summary_tests {
+    use super::*;
+
+    fn executed(
+        output: anyhow::Result<ToolOutput>,
+        approval: Option<ApprovalDecision>,
+    ) -> ExecutedTool {
+        ExecutedTool { output, approval }
+    }
+
+    #[test]
+    fn a_recorded_denial_reads_denied_even_though_the_error_is_untyped() {
+        // The regression this pins: a tool that prompts MID-CALL folds the
+        // refusal into its own error, which reaches us as a plain `anyhow`
+        // (the executor sanitizes and re-wraps it, losing the type). Keying
+        // off the error type alone reported that as a crash — an "error" step
+        // with no verdict — while the user had explicitly denied it.
+        let (status, summary) = tool_completion_summary(&executed(
+            Err(anyhow::anyhow!("skill 'x' requires env-var approval")),
+            Some(ApprovalDecision::Deny),
+        ));
+        assert_eq!(status, ToolStatus::Denied);
+        assert_eq!(summary, "denied");
+    }
+
+    #[test]
+    fn an_approved_call_that_then_fails_still_reads_as_an_error() {
+        let (status, _) = tool_completion_summary(&executed(
+            Err(anyhow::anyhow!("boom")),
+            Some(ApprovalDecision::ApproveAlways),
+        ));
+        assert_eq!(status, ToolStatus::Error, "the approval isn't the outcome");
+    }
+
+    #[test]
+    fn an_ungated_call_is_unaffected() {
+        let (status, summary) =
+            tool_completion_summary(&executed(Ok(ToolOutput::Text("3 files".into())), None));
+        assert_eq!(status, ToolStatus::Ok);
+        assert_eq!(summary, "3 files");
     }
 }

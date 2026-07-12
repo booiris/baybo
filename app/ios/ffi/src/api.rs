@@ -71,6 +71,11 @@ pub struct ClientConfig {
     /// Directory for the rotating `baybo.log` (2 MiB × 3 files — the exportable
     /// log bundle). `None` disables file logging (host tests).
     pub log_dir: Option<String>,
+    /// Durable home for downloaded blobs, content-addressed by digest. `None`
+    /// falls back to the OS temp dir, which iOS purges under storage pressure —
+    /// fine for host tests, wrong for a file the user asked to keep. Nothing
+    /// evicts from it; the embedder owns retention.
+    pub blob_cache_dir: Option<String>,
 }
 
 /// Scan-to-pair target parsed from a `baybo://pair` QR payload.
@@ -129,7 +134,19 @@ pub struct ChatSessionSummary {
     /// Preview drawn from the most-recent user-authored message; `None` for a
     /// session without a user turn yet.
     pub last_user_text: Option<String>,
+    /// Preview drawn from the most-recent message regardless of author — the
+    /// newest user prompt or final assistant answer with text. Drives the
+    /// Telegram-style list's second line so the preview follows the
+    /// conversation (an agent reply shows once it lands). `None` on an older
+    /// gateway that predates the field, or a session with no displayable turn;
+    /// the row falls back to `last_user_text` / its title.
+    pub last_message_text: Option<String>,
+    /// Auto-generated conversation title (from the first user question), or
+    /// `None` before the title pass has run. The list renders it as the row's
+    /// bold first line; live updates arrive via [`SessionListSink::on_title`].
+    pub title: Option<String>,
     pub pinned: bool,
+    pub archived: bool,
     /// Server-computed unread reply count (final assistant replies above this
     /// session's read cursor), capped at 99. Accurate across a cold restart /
     /// a device that missed the live `SessionActivity` pings — unlike a
@@ -167,6 +184,31 @@ pub enum AttachmentKind {
     File,
 }
 
+/// A user's answer to a pending tool-approval prompt, echoed back to the
+/// gateway as `Frame::ResolveApproval`.
+///
+/// Deliberately NARROWER than `baybo_model::ApprovalDecision`, which also has
+/// an `ApproveAlways` (a standing, session-wide grant for every resource the
+/// call touches). Other clients offer it; the phone does not — a mis-tap is
+/// likeliest here, and a standing grant is the one decision you can't undo by
+/// paying more attention next time. Leaving the variant out of the FFI means
+/// the app cannot send it even by accident. Decisions made ELSEWHERE still
+/// arrive and render — this type is the send side only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ApprovalDecision {
+    Approve,
+    Deny,
+}
+
+impl From<ApprovalDecision> for crate::core::WireApprovalDecision {
+    fn from(d: ApprovalDecision) -> Self {
+        match d {
+            ApprovalDecision::Approve => Self::Approve,
+            ApprovalDecision::Deny => Self::Deny,
+        }
+    }
+}
+
 impl From<AttachmentRef> for crate::core::WireAttachment {
     fn from(a: AttachmentRef) -> Self {
         let kind = match a.kind {
@@ -180,8 +222,23 @@ impl From<AttachmentRef> for crate::core::WireAttachment {
             mime_type: a.mime_type,
             size: a.size,
             filename: a.filename,
+            // Outbound user sends: the composer can't attach audio, so there
+            // is never a duration to carry.
+            duration_ms: None,
         }
     }
+}
+
+/// Byte progress for one `blob_download_bytes` call. Calls arrive on the core's
+/// tokio workers and are rate-limited by the core, not per network chunk — a
+/// 100 MiB download would otherwise cross the FFI thousands of times.
+#[uniffi::export(with_foreign)]
+pub trait BlobProgress: Send + Sync {
+    /// `downloaded` counts the bytes already on disk for this blob, so a
+    /// **resumed** download opens above zero rather than snapping back. `total`
+    /// is the blob's full length when the server declared one; the caller
+    /// usually knows it already from the attachment's `size`.
+    fn on_progress(&self, downloaded: u64, total: Option<u64>);
 }
 
 /// Where a subscribed chat session's frames land. The binding owns one global
@@ -214,6 +271,13 @@ pub trait SessionListSink: Send + Sync {
     /// `source` is the lowercase `ActivityKind` (`"user"` / `"assistant"`);
     /// `at_millis` is the activity's unix-epoch milliseconds.
     fn on_activity(&self, session_id: String, source: String, at_millis: i64);
+    /// A `SessionUpdated` patch carried a freshly-generated conversation
+    /// `title` for `session_id`. Connection-global like `on_activity` — it
+    /// fires for ANY session on the leg (subscribed or not), so the list can
+    /// swap a row's bold first line the moment the title pass lands without a
+    /// REST refetch. Only the title patch is forwarded; pin / archive / hide
+    /// stay on the optimistic + REST-merge path the list already owns.
+    fn on_title(&self, session_id: String, title: String);
 }
 
 /// Gateway-side cancellation of an in-flight pairing (the operator declined or

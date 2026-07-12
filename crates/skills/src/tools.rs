@@ -867,6 +867,7 @@ mod tests {
             approval: Some(ApprovalHandle::new(
                 Arc::new(AutoDenyGate),
                 Arc::new(Mutex::new(Vec::new())),
+                None,
             )),
             ..ToolContext::for_test()
         }

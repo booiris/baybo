@@ -122,6 +122,13 @@ pub struct WireAttachment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub filename: Option<String>,
+    /// Playback length in milliseconds for `Audio` (probed at attach
+    /// time). `None` when unknown — inbound channel audio, unparseable
+    /// containers, rows persisted before the field existed. Lets a client
+    /// render a track's length before downloading a byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub duration_ms: Option<u32>,
 }
 
 /// The canonical user-visible message in either direction. A single
@@ -277,8 +284,8 @@ impl From<baybo_model::Task> for TaskView {
 }
 
 /// Kind discriminant for a [`WireWorkStep`] — serialized as `"reasoning"` /
-/// `"prose"` / `"tool"`. A typed enum (mirrors [`AttachmentKind`]) so the
-/// discriminant round-trips cleanly through ts-rs.
+/// `"prose"` / `"tool"` / `"status"`. A typed enum (mirrors [`AttachmentKind`])
+/// so the discriminant round-trips cleanly through ts-rs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
@@ -294,6 +301,11 @@ pub enum WireWorkStepKind {
     /// A tool call (started, and — if it finished within the buffered turn —
     /// completed).
     Tool,
+    /// The progress observer's transient narration (`AgentEvent::Progress`) —
+    /// the work block's dim "what's happening now" line. Carried in
+    /// [`WireWorkStep::text`]; the client folds it exactly like the live
+    /// `notice { transient: true }` frame it mirrors.
+    Status,
 }
 
 /// One step inside a turn's in-flight work block, carried in the
@@ -336,6 +348,12 @@ pub struct WireWorkStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub summary: Option<String>,
+    /// Decision the call's approval prompt returned, once it completed
+    /// within the buffered turn; `None` when it never prompted (or is
+    /// still running / still waiting on the prompt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+    pub approval: Option<ApprovalDecision>,
 }
 
 impl WireWorkStep {
@@ -349,6 +367,7 @@ impl WireWorkStep {
             label: None,
             status: None,
             summary: None,
+            approval: None,
         }
     }
 
@@ -362,6 +381,21 @@ impl WireWorkStep {
             label: None,
             status: None,
             summary: None,
+            approval: None,
+        }
+    }
+
+    /// A transient progress-narration step (the progress observer's line).
+    pub fn status(text: String) -> Self {
+        Self {
+            kind: WireWorkStepKind::Status,
+            text,
+            call_id: None,
+            tool: None,
+            label: None,
+            status: None,
+            summary: None,
+            approval: None,
         }
     }
 
@@ -378,6 +412,7 @@ impl WireWorkStep {
             label,
             status: None,
             summary: None,
+            approval: None,
         }
     }
 }
@@ -417,6 +452,11 @@ pub struct TurnSnapshot {
 )]
 pub struct ApprovalCard {
     pub call_id: String,
+    /// `call_id` of the TOOL call the prompt blocks — see
+    /// [`Frame::ApprovalRequested::tool_call_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub user_id: String,
     pub tool: String,
@@ -538,22 +578,6 @@ pub enum Frame {
     /// same N rows, then runs one merged turn with one reply. Outbound never
     /// uses this kind.
     Messages { messages: Vec<Message> },
-    /// Server → client: media a tool produced mid-turn (a sent file, a
-    /// screenshot), delivered as its **own** message. Unlike a terminal
-    /// [`Frame::Message`] it carries no `role` / `ordinal` and no turn-
-    /// completion meaning: clients render it as a standalone bubble
-    /// (or, for sidecars, a standalone platform send) and must NOT fold
-    /// it into — or close — an in-flight turn's work block. Sidecars
-    /// deliver the attachments exactly as they would a `Message`'s;
-    /// surfaces that can't render media drop it. `user_id` mirrors
-    /// `Message` so sidecars route by platform user without a reverse map.
-    Attachment {
-        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
-        session_id: SessionId,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        user_id: String,
-        attachments: Vec<WireAttachment>,
-    },
     /// Server → client: incremental assistant **answer** text chunk for
     /// the in-flight response on a session (the reply prose — distinct
     /// from `Reasoning`, the thinking trace). Channels without a partial
@@ -598,6 +622,8 @@ pub enum Frame {
     /// string (`"ok"` / `"error"` / `"denied"`) like `Notice.level`, so
     /// third-party clients don't need a typed enum; `summary` is a short
     /// result rendering. Pairs with `ToolStarted` by `call_id`.
+    /// `approval` is the decision the call's approval prompt returned
+    /// (absent when it never prompted) so clients can label the step.
     ToolCompleted {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
@@ -606,6 +632,9 @@ pub enum Frame {
         call_id: String,
         status: String,
         summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+        approval: Option<ApprovalDecision>,
     },
     /// Server → client: a coarse turn-phase transition for a transient
     /// status line. `phase` is a lower-case string (today `"compacting"` /
@@ -678,6 +707,13 @@ pub enum Frame {
     /// one can ignore, and the gate will time out server-side.
     ApprovalRequested {
         call_id: String,
+        /// `call_id` of the TOOL call this prompt blocks (the id
+        /// `ToolStarted`/`ToolCompleted` carry — NOT this frame's own
+        /// `call_id`, which is minted per prompt). Lets clients badge
+        /// the exact work step that is waiting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        tool_call_id: Option<String>,
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -843,7 +879,6 @@ impl Frame {
             Frame::Subscribe { session_id }
             | Frame::Unsubscribe { session_id }
             | Frame::SubscribeState { session_id, .. }
-            | Frame::Attachment { session_id, .. }
             | Frame::AnswerDelta { session_id, .. }
             | Frame::Reasoning { session_id, .. }
             | Frame::ToolStarted { session_id, .. }
@@ -921,6 +956,13 @@ pub struct SessionPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub pinned: Option<bool>,
+    /// Flipped by `PUT /v1/chat/sessions/:id/archive`. `true` moves the
+    /// row into the client's archived group, `false` restores it to the
+    /// main list. Carried on Create / Unhide too so a sibling client
+    /// re-adding the row places it correctly immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub archived: Option<bool>,
     /// Set by `PUT /v1/chat/sessions/:id/folder` (and on folder delete,
     /// which clears every direct member to `Uncategorized`). Present means
     /// "the assignment changed to this value"; absent means "no change".
@@ -1079,6 +1121,7 @@ mod tests {
             ],
             pending_approvals: vec![ApprovalCard {
                 call_id: "c1".into(),
+                tool_call_id: Some("t-use-1".into()),
                 user_id: "u1".into(),
                 tool: "fs.read".into(),
                 accesses: vec![ResourceAccess::ReadFile {
@@ -1230,6 +1273,7 @@ mod tests {
         use std::path::PathBuf;
         let frame = Frame::ApprovalRequested {
             call_id: "c1".into(),
+            tool_call_id: Some("t-use-1".into()),
             session_id: "s1".into(),
             user_id: "u1".into(),
             tool: "fs.read".into(),
@@ -1337,6 +1381,7 @@ mod tests {
                 last_active: Some(now),
                 hidden: Some(false),
                 pinned: Some(false),
+                archived: Some(true),
                 folder_id: Some(FolderChange::Set { id: "f1".into() }),
                 title: Some("Reset password flow".into()),
             },
@@ -1357,6 +1402,7 @@ mod tests {
                 last_active: Some(now),
                 hidden: None,
                 pinned: None,
+                archived: None,
                 folder_id: None,
                 title: None,
             },

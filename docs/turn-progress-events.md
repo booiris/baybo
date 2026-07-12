@@ -44,7 +44,7 @@ progress is **opt-in per channel** — the TUI/web render it, sidecars ignore it
 | **Scope** | `Reasoning` (streamed thinking) + tool lifecycle (`ToolStarted` / `ToolCompleted`) + compaction status (`Status(Compacting/Compacted)`). Remaining `Status` phases (Thinking/Responding) deferred — see below. |
 | **Compaction status** | `compress_if_needed` reports `Status(Compacting)` before a pass and `Status(Compacted)` after, gated by a new `ContextManager::needs_compression` so the line shows **only when a pass actually runs** and the end always follows the start (emitted even on a compress error, so it never dangles). `maybe_compress` now calls `needs_compression` for its own threshold gate too (one source of truth). No token-delta summary — matches the plain `/compact` confirmation. Delivered with `await` (low-frequency; the end-clear is load-bearing). |
 | **Tool-lifecycle emission point** | The **agent loop** (`run_iteration`), not the executor: `ToolStarted` for every call before `join_all`, `ToolCompleted` per result after. For the common single-call iteration this is indistinguishable from per-tool timing; concurrent multi-tool batches "start together / finish together" — accepted. Per-tool real-time interleaving is a later upgrade that would move emission into `ToolExecutor::execute`. |
-| **Tool label** | A dedicated `Tool::progress_label(params)` (defaults to `call_label`, exposed to the loop via `ToolRegistry::progress_label`). Kept distinct from `call_label` because that one is an *approval warning* on some tools, not a preview (Bash's `call_label` only fires on destructive commands). Tools surface their most identifying argument through the shared `baybo_tools::progress` helpers — `preview_path` (full path, left-truncated on a `/` boundary so the file name survives), `preview_arg` (whitespace-collapsed, capped at `PROGRESS_LABEL_MAX`), and `preview_search` (`<pattern> · in <path>`): Read/Write/Edit/SendFile → the path, Bash → the command, Grep/Glob → pattern + search root, WebFetch → the URL (inherited from `call_label`), spawn_subagent → `type: summary`, CronCreate → the prompt, CronDelete → the id, Skill(Install/Uninstall) → the skill name/dir. Tools with no identifying argument (Now, CronList, dynamic MCP tools) render a bare `● tool`. |
+| **Tool label** | A dedicated `Tool::progress_label(params)` (defaults to `call_label`, exposed to the loop via `ToolRegistry::progress_label`). Kept distinct from `call_label` because that one is an *approval warning* on some tools, not a preview (Bash's `call_label` only fires on destructive commands). Tools surface their most identifying argument through the shared `baybo_tools::progress` helpers — `preview_path` (full path, left-truncated on a `/` boundary so the file name survives), `preview_arg` (whitespace-collapsed, capped at `PROGRESS_LABEL_MAX`), and `preview_search` (`<pattern> · in <path>`): Read/Write/Edit/AttachFile → the path, Bash → the command, Grep/Glob → pattern + search root, WebFetch → the URL (inherited from `call_label`), spawn_subagent → `type: summary`, CronCreate → the prompt, CronDelete → the id, Skill(Install/Uninstall) → the skill name/dir. Tools with no identifying argument (Now, CronList, dynamic MCP tools) render a bare `● tool`. |
 | **Tool result summary** | Content-**light** by design (line counts, attachment/image counts, `error`/`denied`), never raw output bytes — so a leak can't ride the summary. Derived generically from `ToolOutput`; a tool-authored `Tool::result_summary` is a later refinement. |
 | **Security** | `Reasoning`, `label`, and `summary` are model-/tool-derived text and pass the same sanitize + vault-reveal boundary as `AnswerDelta` (`stream_emit` / `sanitize_stream_fragment`). On a sanitize failure the summary is dropped (empty) rather than risk a leak. |
 | **Ordering / backpressure** | One ordered mpsc. Answer `AnswerDelta` and tool `ToolStarted/ToolCompleted` use `await` (load-bearing / display self-consistency); `Reasoning` uses `try_send` (ephemeral, droppable) — matching how `Notice` already drops on a full channel. The final `Message` is the reconciliation point that clears any in-flight progress UI. |
@@ -54,21 +54,35 @@ progress is **opt-in per channel** — the TUI/web render it, sidecars ignore it
 
 ## Web: reconstructed on reload
 
-The progress **events** are live-only and never persisted — but the web chat
-still shows the collapsed `Worked Xs ›` work block after a page reload by
-**reconstructing** an equivalent view from the persisted *messages*. The
-gateway's `api::admin::chat::reconstruct_transcript` (REST `GET
+Most progress **events** are live-only and never persisted on their own — but
+the web chat still shows the collapsed `Worked Xs ›` work block after a page
+reload by **reconstructing** an equivalent view from the persisted *messages*.
+The gateway's `api::admin::chat::reconstruct_transcript` (REST `GET
 /v1/chat/sessions/:id`) folds each tool-using turn's intermediate rows
 (`Thinking` → reasoning, `ToolUse` + paired `ToolResult` → tool step, mid-turn
 `Text` → prose) into one `work` transcript item before the turn's final reply;
 the client maps it onto the same `WorkBlock` it builds live.
 
+The **one exception is the progress observer's narration** (`AgentEvent::Progress`,
+the transient "what's happening now" line). It has no message row to be rebuilt
+from, so it is persisted in its own right as a `ControlEventKind::Progress`
+control event (`AgentLoop::persist_progress_narration`, anchored after the
+session's newest ordinal). Unlike a notice, reconstruction does **not** give it
+its own row — it folds it INTO the turn's work block as a `status` step
+(`WorkStepKind::Status` / `WireWorkStepKind::Status`), the durable shadow of the
+live `notice { transient: true }` frame. So a reload / reopened conversation
+shows the same narration lines the live view did.
+
 For a tab that loads **mid-turn**, reconstruction has a second source: when the
-session has an active turn, `get_session` also folds the http channel's live,
+session has an active turn, `get_session` also folds the channel's live,
 **not-yet-persisted** in-flight progress buffer (reasoning / answer-delta / tool
-steps that streamed before this tab joined) into the trailing work block via
-`in_flight_work_steps()`, aligning its start with the live `TurnState` — so the
-late joiner sees the steps it missed rather than an empty in-progress block.
+/ progress-narration steps that streamed before this tab joined) into the
+trailing work block via `in_flight_work_steps()`, aligning its start with the
+live `TurnState` — so the late joiner sees the steps it missed rather than an
+empty in-progress block. A progress line reaches the active turn's block from
+both sources at once (its persisted control event AND the live buffer), so the
+fold drops the buffered `status` duplicates by text — the positioned
+control-event copy wins.
 
 Two consequences worth knowing:
 
@@ -83,12 +97,14 @@ Two consequences worth knowing:
 - **Mid-turn join recovery (all chat clients).** The WS never replays
   history. A (re)`Subscribe` on a live turn delivers the whole in-flight
   work block inside the `Frame::SubscribeState` bundle's `work_steps`
-  half (reasoning / tool steps from the same per-session buffer), folded
-  once by `channel::work_steps::in_flight_wire_steps` (the REST
-  `ChatWorkStep` derives from the same `WireWorkStep`). A client that
-  (re)subscribes mid-turn **replaces** its open block with it — never
-  appends, since the buffer is a superset of what it saw live — so the
-  thinking it missed while backgrounded reappears without a full reload.
+  half (reasoning / tool / progress-narration steps from the same
+  per-session buffer), folded once by
+  `channel::work_steps::in_flight_wire_steps` (the REST `ChatWorkStep`
+  derives from the same `WireWorkStep`). A client that (re)subscribes
+  mid-turn **replaces** its open block with it — never appends, since the
+  buffer is a superset of what it saw live (progress-narration `status`
+  steps included, so the REPLACE no longer drops them) — so the thinking
+  it missed while backgrounded reappears without a full reload.
   A turn that **completed** while the client was away is recovered by the
   sync call (`GET /v1/chat/sessions/:id/sync`), which reconstructs closed
   work items and notices at full fidelity on every path — see

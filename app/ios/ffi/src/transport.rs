@@ -35,7 +35,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::api::{FrameSink, SessionListSink};
-use crate::core::{Frame, MobileError, WireAttachment, subscribe_frame};
+use crate::core::{
+    Frame, MobileError, WireApprovalDecision, WireAttachment, resolve_approval_frame,
+    subscribe_frame,
+};
 
 /// The concrete client socket both legs dial.
 pub(crate) type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -146,6 +149,13 @@ enum OutboundCmd {
         text: String,
         msg_id: String,
         attachments: Vec<WireAttachment>,
+    },
+    /// The user's answer to a pending tool-approval prompt. Fire-and-forget:
+    /// the gateway answers by resolving the gate and broadcasting
+    /// `ApprovalResolved`, which arrives on the inbound frame path.
+    ResolveApproval {
+        call_id: String,
+        decision: WireApprovalDecision,
     },
 }
 
@@ -439,6 +449,26 @@ impl SessionRegistry {
         }
     }
 
+    /// Queue the user's answer to a pending approval prompt. Unlike
+    /// [`Self::send`] this takes no session: the prompt's `call_id` is what the
+    /// gateway keys on, and the frame carries no session binding. It still
+    /// needs the leg to be live — a decision made after the pump died is lost,
+    /// and the gate times out server-side (fail-closed).
+    pub(crate) async fn resolve_approval(
+        &self,
+        call_id: String,
+        decision: WireApprovalDecision,
+    ) -> Result<(), TransportError> {
+        if self
+            .try_enqueue(OutboundCmd::ResolveApproval { call_id, decision })
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(TransportError::NotConnected)
+        }
+    }
+
     /// Tear down the live pump (if any) and fence out any dial in flight: the
     /// epoch bump makes a slow establish discard its connection instead of
     /// resurrecting a session the owner just tore down.
@@ -543,6 +573,18 @@ pub(crate) async fn send<L: SessionLeg>(
 ) -> Result<(), String> {
     leg.registry()
         .send(session_id, text, msg_id, attachments)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Echo the user's approval decision back on `leg`'s live pump.
+pub(crate) async fn resolve_approval<L: SessionLeg>(
+    leg: &L,
+    call_id: String,
+    decision: WireApprovalDecision,
+) -> Result<(), String> {
+    leg.registry()
+        .resolve_approval(call_id, decision)
         .await
         .map_err(|e| e.to_string())
 }
@@ -700,6 +742,12 @@ async fn run_pump(
                         let frame = user_frame(&session_id, &text, &msg_id, attachments);
                         (frame, format!("send session={session_id} msg_id={msg_id}"))
                     }
+                    Some(OutboundCmd::ResolveApproval { call_id, decision }) => {
+                        (
+                            resolve_approval_frame(&call_id, decision),
+                            format!("resolve_approval call_id={call_id}"),
+                        )
+                    }
                     None => {
                         log::debug!(
                             "chat connection ended: outbound command channel closed"
@@ -765,6 +813,20 @@ async fn dispatch_inbound_frame(
             );
         }
         return;
+    }
+    // A `SessionUpdated` patch carrying a freshly-generated title: forward it
+    // to the connection-global list sink so a row (subscribed or not) can swap
+    // its bold first line live. NOT a `return` — the frame still falls through
+    // to per-session routing exactly as before (the transcript webview simply
+    // ignores it), so only the added title hop is new behavior. Pin / archive /
+    // hide patches carry no title and stay entirely on the existing path.
+    if let Frame::SessionUpdated { session_id, patch } = &frame
+        && let Some(title) = &patch.title
+    {
+        let sink = list_sink.lock().clone();
+        if let Some(sink) = sink {
+            sink.on_title(session_id.as_str().to_owned(), title.clone());
+        }
     }
     let target = frame
         .routing_session_id()

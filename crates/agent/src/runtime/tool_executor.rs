@@ -178,6 +178,23 @@ fn tool_output_to_trace_value(output: &ToolOutput) -> Value {
     }
 }
 
+/// A finished tool call: whatever the call produced, plus the approval decision
+/// it went through when it raised a prompt.
+///
+/// `output` keeps the call's own `Result` rather than making the whole struct
+/// one, because `approval` must survive EVERY exit — a denial, a tool error, a
+/// timeout — not just success. A mid-call denial (a tool that asks through
+/// [`baybo_tools::ApprovalHandle`] and turns the refusal into its own error) is
+/// exactly the case that loses its verdict otherwise: it reaches the loop as an
+/// untyped error, indistinguishable from a crash.
+pub struct ExecutedTool {
+    pub output: anyhow::Result<ToolOutput>,
+    /// `None` when the call never prompted (covered by a prior grant, or an
+    /// ungated tool). When a call prompts more than once, the LAST decision
+    /// wins — it is the one that shaped the outcome.
+    pub approval: Option<ApprovalDecision>,
+}
+
 /// Executes tools with trust-level validation, approval gating, and
 /// observability recording.
 pub struct ToolExecutor {
@@ -341,11 +358,16 @@ impl ToolExecutor {
         // Per-session read-before-write tracker. `Read` records into it;
         // `Edit`/`Write` enforce against it. Cheap to clone (one `Arc`).
         read_tracker: ReadTracker,
-    ) -> anyhow::Result<ToolOutput> {
+    ) -> ExecutedTool {
         debug!(tool = tool_name, "executing tool");
 
-        if let Some(manifest) = self.tool_registry.get_manifest(tool_name) {
-            self.validate_trust(tool_name, &manifest)?;
+        if let Some(manifest) = self.tool_registry.get_manifest(tool_name)
+            && let Err(e) = self.validate_trust(tool_name, &manifest)
+        {
+            return ExecutedTool {
+                output: Err(e),
+                approval: None,
+            };
         }
 
         let job_id = step.job_id;
@@ -354,11 +376,19 @@ impl ToolExecutor {
         // ownership into `ctx` while `with_span` keeps a borrow for
         // the cancel-aware close-on-Err path.
         let cancel_for_close = cancel_token.clone();
+        let cancel_for_gate = cancel_token.clone();
+
+        // The call's approval decision, written from inside the span body and
+        // read back after it — including on the paths where the body returns
+        // `Err` (denial, tool error, timeout) and the decision would otherwise
+        // die with the closure.
+        let approval_slot: Arc<Mutex<Option<ApprovalDecision>>> = Arc::new(Mutex::new(None));
+        let approval_sink = Arc::clone(&approval_slot);
 
         // Open the tool span up front so denials and approval failures
         // still appear in the trace tree. The handle carries the
         // begin-time kind, so close-time only supplies the result.
-        crate::runtime::scope::with_span(
+        let output = crate::runtime::scope::with_span(
             recorder.as_ref(),
             step,
             job_id,
@@ -412,17 +442,28 @@ impl ToolExecutor {
 
                 if !uncovered.is_empty() {
                     let gate = self.gate_map.get(&user.channel, session_id);
-                    let decision = gate
-                        .request(ApprovalRequest {
-                            call_id: Uuid::new_v4().to_string(),
-                            session_id: session_id.clone(),
-                            user_id: user.id.clone(),
-                            tool: tool_name_owned.clone(),
-                            accesses: uncovered.clone(),
-                            params_preview: preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
-                            description: call_label.clone(),
-                        })
-                        .await;
+                    let request = gate.request(ApprovalRequest {
+                        call_id: Uuid::new_v4().to_string(),
+                        tool_call_id: Some(tool_use_id.clone()),
+                        session_id: session_id.clone(),
+                        user_id: user.id.clone(),
+                        tool: tool_name_owned.clone(),
+                        accesses: uncovered.clone(),
+                        params_preview: preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
+                        description: call_label.clone(),
+                    });
+                    // A prompt parks the turn for up to the gate's timeout, so
+                    // it MUST answer to `/stop` — otherwise cancelling a turn
+                    // that is waiting on the user hangs until the gate denies
+                    // itself minutes later, and the client keeps showing a card
+                    // for a turn that is already unwinding. Dropping the request
+                    // future also unqueues it (the gate's RAII cleanup), so the
+                    // prompt disappears everywhere rather than lingering.
+                    let decision = tokio::select! {
+                        d = request => d,
+                        _ = cancel_for_gate.cancelled() => ApprovalDecision::Deny,
+                    };
+                    *approval_sink.lock() = Some(decision);
                     for access in &uncovered {
                         let _ = recorder
                             .emit_event(
@@ -456,6 +497,16 @@ impl ToolExecutor {
                                 reason: "user denied approval".to_string(),
                             }));
                         }
+                    }
+                    // Approved — but the turn may have been cancelled WHILE the
+                    // prompt was up (the select above only fires when the token
+                    // trips before the answer). Running now would execute a
+                    // side-effecting call on behalf of a turn the user already
+                    // stopped.
+                    if cancel_for_gate.is_cancelled() {
+                        return Err(anyhow::anyhow!(
+                            "tool '{tool_name_owned}' cancelled while awaiting approval"
+                        ));
                     }
                 }
 
@@ -496,9 +547,16 @@ impl ToolExecutor {
                     None
                 };
 
-                // Mid-execution approval handle.
+                // Mid-execution approval handle. The probe clone shares the
+                // handle's decision cell, so after the tool returns we can
+                // read back what any mid-call prompt decided.
                 let approval_gate = self.gate_map.get(&user.channel, session_id);
-                let approval = ApprovalHandle::new(approval_gate, Arc::clone(approved_resources));
+                let approval = ApprovalHandle::new(
+                    approval_gate,
+                    Arc::clone(approved_resources),
+                    Some(tool_use_id.clone()),
+                );
+                let approval_probe = approval.clone();
 
                 // Per-call event sink. Drained into span events after
                 // tool execution so phase timers and richer artifacts
@@ -588,6 +646,16 @@ impl ToolExecutor {
                 )
                 .await;
 
+                // A tool can raise its own prompts mid-execution (through
+                // `ctx.approval`), and those come AFTER the pre-execute gate —
+                // so the handle's last decision wins. Read it here, before any
+                // of the arms below can return early: a mid-call denial reaches
+                // the loop as the tool's own error, and without this the verdict
+                // would be indistinguishable from a crash.
+                if let Some(decision) = approval_probe.last_decision() {
+                    *approval_sink.lock() = Some(decision);
+                }
+
                 // Flush tool-reported events as span events, regardless
                 // of whether the tool succeeded, failed, or hit the
                 // outer timeout. Each entry continues the span-local
@@ -657,10 +725,10 @@ impl ToolExecutor {
                         // `Failed { reason }` and from there into
                         // persisted trace storage. Returning the raw
                         // error would leak any secrets in the original
-                        // text. Downcasts on this path aren't used (the
-                        // `ToolError::Denied` downcast in `agent_loop`
-                        // sees the approval-gate Err, which is built
-                        // separately above).
+                        // text. The error's TYPE is lost here (a
+                        // `ToolError::Denied` a tool raised from a mid-call
+                        // prompt included) — the decision that shaped it rides
+                        // `approval_slot` instead, read back by the caller.
                         let raw = e.to_string();
                         let sanitized = self
                             .security_gateway
@@ -677,7 +745,12 @@ impl ToolExecutor {
                 }
             },
         )
-        .await
+        .await;
+
+        ExecutedTool {
+            output,
+            approval: *approval_slot.lock(),
+        }
     }
 }
 

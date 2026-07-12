@@ -1,22 +1,47 @@
 use serde::{Deserialize, Serialize};
 
+use crate::approval::ApprovalDecision;
 use crate::fingerprint::FileFingerprint;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ContentBlock {
     Text(String),
+    /// `filename` is the ORIGINAL name when one is known — an agent-attached
+    /// image, or an inbound one whose channel supplied a name. It is `Option`
+    /// because plenty of images genuinely arrive nameless (a pasted screenshot,
+    /// a Telegram photo, an MCP-returned bitmap), not to accommodate callers.
+    /// Nothing renders it beside the picture; it exists so a client SHARING or
+    /// saving the image hands over the real name instead of `attachment.png`.
+    /// `#[serde(default)]` keeps transcripts persisted before this field readable.
     Image {
         blob: BlobRef,
         mime_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
     },
     Audio {
         blob: BlobRef,
         mime_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+        /// Playback length in milliseconds, probed from the container at
+        /// attach time (`AttachFile`). `None` when unknown — inbound channel
+        /// audio, unparseable containers, rows persisted before the field
+        /// existed. Carried so a client can show a track's length before any
+        /// byte is downloaded or played.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u32>,
     },
     File {
         blob: BlobRef,
         filename: String,
         mime_type: String,
+        /// Playback length in milliseconds for VIDEO files (video rides the
+        /// `File` kind — it has no block variant of its own), probed from the
+        /// container at attach time. Same contract as `Audio::duration_ms`:
+        /// `None` when unknown or not a video.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u32>,
     },
     /// A tool invocation emitted by the assistant. Stored in conversation
     /// history so subsequent LLM calls see their own prior tool calls.
@@ -64,6 +89,14 @@ pub struct ToolResultMeta {
     /// non-`Read` tool result. See [`FileFingerprint`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_fingerprint: Option<FileFingerprint>,
+    /// Decision the user's approval gate returned for this call — the durable
+    /// record behind the transcript's "approved / always / denied" step label.
+    /// `None` for calls that never raised a prompt (covered by prior grants or
+    /// an ungated tool) and for rows persisted before the field existed. When
+    /// a call prompts more than once (mid-call `ApprovalHandle` asks), the
+    /// last decision wins, which matches the call's final status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalDecision>,
 }
 
 /// Open-tag prefix of the `<tool_output name="...">` envelope the agent wraps
@@ -99,12 +132,34 @@ pub struct BlobRef {
     pub blob_id: String,
 }
 
+impl BlobRef {
+    /// See [`blob_content_digest`].
+    pub fn content_digest(&self) -> Option<&str> {
+        blob_content_digest(&self.blob_id)
+    }
+}
+
 /// Algorithm prefix on every [`BlobRef::blob_id`]. The full id is
 /// `"sha256:<64 lower-hex>.<read-token>"`, so a content-addressed blob is
 /// recognizable at a glance while the suffix stays the read capability. Lives in
 /// `model` (next to [`BlobRef`]) so both the server (`baybo-store`, which mints
 /// ids) and the device client (which parses them) reference one source of truth.
 pub const SHA256_PREFIX: &str = "sha256:";
+
+/// The content-addressed half of a `blob_id` — the SHA-256 hex, without the
+/// algorithm prefix or the trailing read token.
+///
+/// Every `BlobStore::put` mints a **fresh** read token, so two writes of
+/// identical bytes yield two distinct `blob_id`s that share this digest. The
+/// digest, not the id, is a blob's content identity; comparing ids to answer
+/// "is this the same file?" silently always says no. `None` for a malformed id.
+pub fn blob_content_digest(blob_id: &str) -> Option<&str> {
+    blob_id
+        .strip_prefix(SHA256_PREFIX)?
+        .split('.')
+        .next()
+        .filter(|hex| !hex.is_empty())
+}
 
 /// Where a [`ChatMessage`] row came from — its provenance, independent of the
 /// LLM-facing [`Role`]. Several distinct origins all ride as a `Role::User`
@@ -414,6 +469,37 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     #[test]
+    fn identical_bytes_staged_twice_share_a_digest_but_not_an_id() {
+        // The shape `BlobStore::put` mints: same content, fresh read token.
+        let hex = "a".repeat(64);
+        let first = BlobRef {
+            blob_id: format!("{SHA256_PREFIX}{hex}.tok-one"),
+        };
+        let second = BlobRef {
+            blob_id: format!("{SHA256_PREFIX}{hex}.tok-two"),
+        };
+        assert_ne!(first.blob_id, second.blob_id);
+        assert_eq!(first.content_digest(), Some(hex.as_str()));
+        assert_eq!(first.content_digest(), second.content_digest());
+    }
+
+    #[test]
+    fn a_malformed_blob_id_has_no_digest() {
+        for id in ["", "sha256:", "md5:abcdef", "abcdef", "sha256:.tok"] {
+            assert_eq!(blob_content_digest(id), None, "id={id:?}");
+        }
+    }
+
+    #[test]
+    fn a_tokenless_id_is_all_digest() {
+        let hex = "b".repeat(64);
+        assert_eq!(
+            blob_content_digest(&format!("{SHA256_PREFIX}{hex}")),
+            Some(hex.as_str())
+        );
+    }
+
+    #[test]
     fn tool_result_meta_round_trips() {
         let fp = FileFingerprint::new(SystemTime::UNIX_EPOCH + Duration::from_secs(99), 1234);
         let block = ContentBlock::ToolResult {
@@ -421,6 +507,7 @@ mod tests {
             content: "body".into(),
             meta: Some(ToolResultMeta {
                 read_fingerprint: Some(fp),
+                approval: Some(ApprovalDecision::ApproveAlways),
             }),
         };
         let json = serde_json::to_string(&block).unwrap();

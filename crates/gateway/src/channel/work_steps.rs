@@ -26,11 +26,11 @@ fn tool_status_str(status: ToolStatus) -> &'static str {
     }
 }
 
-/// Fold buffered in-flight events into ordered work steps: reasoning / prose
-/// bodies pass through, and a `ToolCompleted` resolves the `status` / `summary`
-/// of the matching earlier `ToolStarted` step (paired by `call_id`; an orphan
-/// completion with no matching start is dropped, matching the live client's
-/// own tolerance). Empty-text reasoning / prose deltas are skipped. The buffer
+/// Fold buffered in-flight events into ordered work steps: reasoning / prose /
+/// progress-narration bodies pass through, and a `ToolCompleted` resolves the
+/// `status` / `summary` of the matching earlier `ToolStarted` step (paired by
+/// `call_id`; an orphan completion with no matching start is dropped, matching
+/// the live client's own tolerance). Empty-text bodies are skipped. The buffer
 /// already coalesces consecutive same-kind text deltas, so a run reads as one
 /// step here.
 pub(crate) fn in_flight_wire_steps(events: Vec<SessionEvent>) -> Vec<WireWorkStep> {
@@ -47,6 +47,9 @@ pub(crate) fn in_flight_wire_steps(events: Vec<SessionEvent>) -> Vec<WireWorkSte
             AgentEvent::AnswerDelta(text) if !text.trim().is_empty() => {
                 steps.push(WireWorkStep::prose(text));
             }
+            AgentEvent::Progress(text) if !text.trim().is_empty() => {
+                steps.push(WireWorkStep::status(text));
+            }
             AgentEvent::ToolStarted {
                 call_id,
                 tool,
@@ -59,12 +62,14 @@ pub(crate) fn in_flight_wire_steps(events: Vec<SessionEvent>) -> Vec<WireWorkSte
                 call_id,
                 status,
                 summary,
+                approval,
             } => {
                 if let Some(&idx) = pending_tools.get(&call_id)
                     && let Some(step) = steps.get_mut(idx)
                 {
                     step.status = Some(tool_status_str(status).to_owned());
                     step.summary = Some(summary);
+                    step.approval = approval;
                 }
             }
             _ => {}
@@ -102,6 +107,7 @@ mod tests {
                 call_id: "c1".into(),
                 status: ToolStatus::Ok,
                 summary: "exit 0".into(),
+                approval: Some(baybo_tools::ApprovalDecision::Approve),
             }),
             ev(AgentEvent::AnswerDelta("the answer".into())),
         ]);
@@ -119,8 +125,28 @@ mod tests {
         assert_eq!(steps[1].label.as_deref(), Some("ls"));
         assert_eq!(steps[1].status.as_deref(), Some("ok"));
         assert_eq!(steps[1].summary.as_deref(), Some("exit 0"));
+        assert_eq!(
+            steps[1].approval,
+            Some(baybo_tools::ApprovalDecision::Approve),
+            "prompted decision rides the snapshot step"
+        );
         assert_eq!(steps[2].kind, WireWorkStepKind::Prose);
         assert_eq!(steps[2].text, "the answer");
+    }
+
+    #[test]
+    fn progress_narration_folds_into_a_status_step() {
+        let steps = in_flight_wire_steps(vec![
+            ev(AgentEvent::Reasoning("thinking".into())),
+            ev(AgentEvent::Progress("Reading the config".into())),
+            // Blank progress is skipped like blank reasoning.
+            ev(AgentEvent::Progress("  ".into())),
+        ]);
+
+        assert_eq!(steps.len(), 2, "reasoning + one status: {steps:?}");
+        assert_eq!(steps[1].kind, WireWorkStepKind::Status);
+        assert_eq!(steps[1].text, "Reading the config");
+        assert!(steps[1].call_id.is_none() && steps[1].tool.is_none());
     }
 
     #[test]
@@ -136,6 +162,7 @@ mod tests {
                 call_id: "ghost".into(),
                 status: ToolStatus::Error,
                 summary: "boom".into(),
+                approval: None,
             }),
             // Blank reasoning is skipped.
             ev(AgentEvent::Reasoning("   ".into())),

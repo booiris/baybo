@@ -1,25 +1,57 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  createContext,
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+  type TouchEvent as ReactTouchEvent,
+} from "react";
 import { useTranslation } from "react-i18next";
 import {
+  audioSeek,
+  audioToggle,
   blobObjectUrl,
+  copyText,
+  downloadFile,
   fetchHistory,
   log,
+  onAudioState,
+  onFileState,
   persistState,
+  playVideo,
   postJumpVisible,
   postMarkRead,
+  postRunState,
   postSyncRequest,
+  previewFile,
+  queryAudioState,
+  queryFileState,
+  requestVideoPoster,
   retrySend,
+  shareFile,
+  viewImage,
   subscribeTranscript,
+  type AudioStatePayload,
+  type FileState,
   type UserSentPayload,
 } from "./bridge";
-import { MarkdownBody } from "./MarkdownBody";
+import { MarkdownBody } from "./Markdown";
 import { WorkBlockView } from "./WorkBlock";
 import {
+  blobContentDigest,
   uid,
   type ChatMsg,
   type PersistedState,
   type Row,
   type TranscriptRowItem,
+  type WireApprovalCard,
   type WireAttachment,
   type WireFrame,
   type WireWorkStepFrame,
@@ -39,6 +71,7 @@ function wireStepToWork(s: WireWorkStepFrame): WorkStep {
       label: s.label || s.tool || "",
       status: s.status ?? "running",
       summary: s.summary || undefined,
+      approval: s.approval || undefined,
     };
   }
   return { kind: s.kind, text: s.text ?? "" };
@@ -56,6 +89,7 @@ function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number]): Wor
       label: s.tool_label || s.tool || "",
       status: s.tool_status ?? "ok",
       summary: s.tool_summary || undefined,
+      approval: s.approval || undefined,
     };
   }
   return { kind: s.kind, text: s.text ?? "" };
@@ -74,6 +108,10 @@ function transcriptItemToRow(item: TranscriptRowItem): Row | null {
       role: "work",
       steps,
       active: false,
+      // Server-anchored turn start — so a reopened/reconciled block's live ticker
+      // is `now − true start`, not `now − localOpen` (the latter inflates across
+      // app-close / re-entry into an absurd "Worked 7h").
+      startedAt: item.work_started_at ? Date.parse(item.work_started_at) : undefined,
       elapsedMs:
         item.work_started_at && item.work_ended_at
           ? Math.max(0, Date.parse(item.work_ended_at) - Date.parse(item.work_started_at))
@@ -81,9 +119,18 @@ function transcriptItemToRow(item: TranscriptRowItem): Row | null {
     };
   }
   if (item.kind === "notice") {
+    // The `/stop` acknowledgement renders as a compact "Stopped" indicator, not
+    // the gateway's raw multi-line text (matches the live path).
+    if (isStopAckNotice(item.text ?? "")) {
+      return { id: item.id, role: "notice", content: "", stopped: true };
+    }
     return { id: item.id, role: "notice", content: item.text ?? "" };
   }
   const role = item.role === "user" ? "user" : "assistant";
+  // The gateway persists `/stop` as a `Command` control event, which
+  // reconstructs as a user MESSAGE row (`control_event_item`). Drop it, mirroring
+  // the live-echo drop — the button issues `/stop`, it is never a chat bubble.
+  if (role === "user" && isStopCommand(item.text ?? "")) return null;
   // A user row keeps its send's `platform_msg_id` as the render id (the live
   // echo path's key), so an optimistic bubble reconciles by id; an assistant
   // row uses the stable `m<ordinal>` id.
@@ -113,6 +160,13 @@ const SYNC_MERGE_LIMIT = 200;
 /// Backstops a lost `gap` nudge and suspended-app windows.
 const SAFETY_TICK_MS = 180_000;
 
+/// Hard ceiling on the optimistic post-send run-state window (`awaitingReply`).
+/// A real turn clears it far sooner — via its first output or its terminal frame
+/// — so this only fires when BOTH were missed (a disconnect that hid the turn's
+/// output and its close), un-sticking the composer's stop button. Well above any
+/// realistic pre-first-token latency, so it never expires under a live turn.
+const AWAITING_MAX_MS = 30_000;
+
 /// How close to the top of the chat log (px) triggers a scroll-up fetch of the
 /// next older page. A small band so the load fires just before the user hits the
 /// very top, hiding the round-trip.
@@ -130,6 +184,17 @@ const FOLLOW_BOTTOM_THRESHOLD_PX = 96;
 /// follow/button state again instead of staying pinned by the in-flight flag.
 const GLIDE_SETTLE_CAP_MS = 1200;
 
+/// How far outside the viewport (px, top + bottom) an image attachment begins
+/// loading its blob — a preload band so an image is usually ready by the time it
+/// scrolls in, while a back-history page's off-screen images stay unfetched. See
+/// AttachmentImage.
+const LAZY_IMAGE_ROOT_MARGIN = "400px 0px";
+
+/// Cap on the remembered image sizes (see `ImageDimsStore`). An entry is ~60
+/// bytes and a thread's images are bounded in practice — this only stops a
+/// pathological session from growing the mirror without limit.
+const MAX_IMAGE_DIMS = 512;
+
 /// The transcript scrolls the WKWebView's MAIN FRAME (the document), not an
 /// inner `overflow:auto` div. A nested overflow scroller inside WKWebView owns
 /// an async scroll node that stays asleep until the first touch — a cold-start
@@ -141,6 +206,28 @@ function scrollEl(): HTMLElement | null {
   return document.scrollingElement as HTMLElement | null;
 }
 
+/// Recognise a `/stop` the way the gateway's parser does (leading `/`, first
+/// token, tolerant of a `@bot` suffix / trailing args), so the client can drop
+/// the command's user echo — the native stop button issues `/stop` as an
+/// ordinary send and it must never render as a message bubble. Mirrors
+/// app/web's `isStopCommand`.
+function isStopCommand(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/")) return false;
+  const cmd = trimmed.slice(1).split(/[\s@]/, 1)[0]?.toLowerCase();
+  return cmd === "stop";
+}
+
+/// A `/stop` acknowledgement notice from the gateway (`build_stop_notice`):
+/// `"Stopped.\n- Cancelled the in-progress reply."`, a background-task variant,
+/// or the no-op `"Nothing in progress to stop."`. These are text-channel chatter
+/// that read oddly as a chat bubble (worst when a thinking-only turn is stopped
+/// before any work block exists), so the transcript drops them entirely.
+function isStopAckNotice(text: string): boolean {
+  const t = text.trim();
+  return t.startsWith("Stopped.") || t === "Nothing in progress to stop.";
+}
+
 function ordinalFromMessageId(id: string): number | null {
   const match = /^m(\d+)$/.exec(id);
   if (!match) return null;
@@ -148,36 +235,158 @@ function ordinalFromMessageId(id: string): number | null {
   return Number.isSafeInteger(n) ? n : null;
 }
 
+/// Durable ordinal out of a server row id — a `m<ordinal>` message OR a
+/// `w<ordinal>` work block. `null` for a client-minted `uid()` (a live block)
+/// or an `n<seq>` notice, neither of which carries an ordinal. Used to place a
+/// re-delivered work block into its own turn during a sync-difference merge.
+function rowOrdinal(id: string): number | null {
+  const match = /^[mw](\d+)$/.exec(id);
+  if (!match) return null;
+  const n = Number(match[1]);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+/// Identity of a work step for dedup when folding two representations of the
+/// same turn's block: a tool step is keyed by its call id (stable across the
+/// live vs reconstructed shapes); text steps by kind + text.
+function workStepKey(s: WorkStep): string {
+  return s.kind === "tool" ? `tool:${s.callId}` : `${s.kind}:${s.text}`;
+}
+
+/// Concatenate two work blocks' steps WITHOUT duplicating shared ones — so
+/// folding a torn turn's disjoint halves appends cleanly, while folding two
+/// overlapping representations of one turn (live + reconstructed) collapses to
+/// a single copy instead of doubling every step.
+function mergeWorkSteps(a: WorkStep[], b: WorkStep[]): WorkStep[] {
+  const seen = new Set(a.map(workStepKey));
+  const out = [...a];
+  for (const s of b) {
+    const k = workStepKey(s);
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/// Freeze EVERY work row still marked `active` into its "Worked Xs" — walk the
+/// whole thread, not just the tail. Called before appending/adopting a fresh
+/// live block so the transcript never holds two open "Working" cards at once:
+/// there is only ever one in-flight turn, hence one active block.
+function freezeActiveWork(rows: Row[]): Row[] {
+  return rows.map((r) =>
+    r.role === "work" && r.active
+      ? { ...r, active: false, elapsedMs: r.elapsedMs ?? (r.startedAt !== undefined ? Date.now() - r.startedAt : undefined) }
+      : r,
+  );
+}
+
+/// Fuse a client work block (`base` — live/restored: freshest streamed steps +
+/// active state) with the server's reconstruction of the SAME turn (`recon` —
+/// authoritative persisted steps + server-anchored timing). One block, not two:
+/// union the steps, anchor `startedAt` to the server's true turn start, and take
+/// the server's duration for the frozen label (while still active the live
+/// ticker rules, so `elapsedMs` stays unset). Keeps `base`'s id/active so a live
+/// block isn't remounted mid-stream.
+function reconcileWork(base: WorkRow, recon: WorkRow): WorkRow {
+  return {
+    ...base,
+    steps: mergeWorkSteps(base.steps, recon.steps),
+    startedAt: recon.startedAt ?? base.startedAt,
+    // Carry the server's authoritative duration even while active (the live
+    // ticker ignores it until the block closes) so the frozen "Worked Xs" is the
+    // server's number regardless of who closes the block first.
+    elapsedMs: recon.elapsedMs ?? base.elapsedMs,
+  };
+}
+
+/// Index in `rows` of the work block belonging to the SAME turn as a work row
+/// of durable ordinal `ord` that has ended up ABOVE the turn's answer bubble.
+/// Scan back over the trailing answer/notice run; accept the preceding work
+/// block only when that run carries an answer ordinal-above `ord`, so a
+/// genuinely later turn's block (its answer not yet on screen) is never
+/// mis-folded. `-1` when there is no such block. Used to re-home a durable
+/// progress `status` block the reopen path can strand below the reply.
+function sameTurnWorkIndex(rows: Row[], ord: number): number {
+  let j = rows.length - 1;
+  let sawTurnAnswer = false;
+  while (j >= 0) {
+    const rj = rows[j];
+    if (rj.role !== "assistant" && rj.role !== "notice") break;
+    const oj = rowOrdinal(rj.id);
+    if (rj.role === "assistant" && oj !== null && oj > ord) sawTurnAnswer = true;
+    j--;
+  }
+  return sawTurnAnswer && j >= 0 && rows[j].role === "work" ? j : -1;
+}
+
 /// Restored rows re-enter with live-turn state INTACT: a work block that was
 /// live at persist stays live ("working"), because exiting and re-entering
 /// mid-turn — or before the agent's final reply — must NOT collapse it to
-/// "worked". The buffered continuation frames extend that same block (keeping
-/// its real `startedAt`), and only its terminal reply / turn-end closes it with
-/// a real "Worked Xs". A block that persisted already-closed stays closed.
-/// Empty blocks have nothing to show; unknown future roles are dropped. Also
-/// folds back together any turn a pre-fix mirror split into two work cards.
+/// "worked". The buffered continuation frames extend that same block, and only
+/// its terminal reply / turn-end closes it. `startedAt` is STRIPPED here: a
+/// persisted client `Date.now()` anchor would make `now − startedAt` count all
+/// the time the app was closed (an absurd "Worked 7h"); the next SubscribeState
+/// / sync re-anchors it to the server's true turn start. A block that persisted
+/// already-closed stays closed. Empty blocks have nothing to show; unknown
+/// future roles are dropped. Also folds back a turn a mirror split in two.
+function clearAwaitingApproval(step: WorkStep): WorkStep {
+  return step.kind === "tool" && step.awaitingApproval
+    ? { ...step, awaitingApproval: undefined }
+    : step;
+}
+
 function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
   const out: Row[] = [];
-  for (const r of rows ?? []) {
+  for (let r of rows ?? []) {
     if (r.role === "work") {
       if (!Array.isArray(r.steps) || r.steps.length === 0) continue;
-      // Heal a mirror already split by the old re-entry bug: a work block that
-      // never closed cleanly (no elapsedMs) directly followed by another work
-      // block is ONE turn torn in two — a healthy turn always has a message
-      // between its block and the next. Fold the pieces into one card, staying
-      // "working" if either half was still live (a turn with no final reply must
-      // not read as "worked"); the split's real duration was lost, so it stays
-      // untimed.
+      // A prompt that was still up when we persisted is NOT still up now: it
+      // was answered, cancelled, or (after 5 minutes) denied by the gate itself
+      // while the app was closed — and none of those signals is redeliverable
+      // (`approval_resolved` isn't even broadcast for a timeout, and the
+      // clearing `tool_completed` is a live-only frame). The pending set is
+      // re-derived from the authoritative `subscribe_state.pending_approvals` on
+      // the next subscribe, so drop the badge rather than let it strand as a
+      // permanent "waiting for approval" on a step nothing can ever clear.
+      r = { ...r, steps: r.steps.map(clearAwaitingApproval) };
+      // Heal a mirror split by the (now-fixed) re-entry bug: two work blocks
+      // directly adjacent (NO message row between) are ONE turn torn apart — a
+      // healthy turn always has a message between its block and the next, so
+      // adjacency alone marks the tear, whether or not either half already
+      // closed. Fold the whole run into one card, staying "working" if any piece
+      // was still live (a turn with no final reply must not read as "worked");
+      // the split's real duration was lost, so it stays untimed. Since the
+      // `withOpenWork` fold-into-frozen-tail invariant now prevents minting a
+      // fresh adjacency split, this only ever folds a LEGACY on-disk mirror
+      // written by a pre-fix build (it re-persists as one row, so it fires once
+      // per such session) — kept as defense-in-depth.
       const prev = out[out.length - 1];
-      if (prev && prev.role === "work" && prev.elapsedMs === undefined) {
+      if (prev && prev.role === "work") {
         out[out.length - 1] = {
           ...prev,
-          steps: [...prev.steps, ...r.steps],
+          steps: mergeWorkSteps(prev.steps, r.steps),
           active: prev.active || r.active,
+          startedAt: undefined,
           elapsedMs: undefined,
         };
       } else {
-        out.push({ ...r });
+        // Heal a DIFFERENT persisted split: a durable progress block that a
+        // prior build's reopen sync stranded AFTER its turn's answer bubble (so
+        // it isn't adjacent to its own block — the adjacency heal above can't
+        // reach it). Fold it back into the turn's pre-answer work block by
+        // ordinal, so a mirror already corrupted by that bug self-corrects on
+        // the next open instead of keeping the stray "Worked" card below the
+        // reply forever (the reopen sync is a no-op once the cursor passed it).
+        const ord = rowOrdinal(r.id);
+        const at = ord !== null ? sameTurnWorkIndex(out, ord) : -1;
+        const target = at >= 0 ? out[at] : undefined;
+        if (target && target.role === "work") {
+          out[at] = { ...target, steps: mergeWorkSteps(target.steps, r.steps), active: target.active || r.active };
+        } else {
+          out.push({ ...r, startedAt: undefined });
+        }
       }
     } else if (r.role === "user" || r.role === "assistant" || r.role === "notice") {
       // A send still "sending" when we persisted can't be in flight after a
@@ -189,11 +398,51 @@ function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
   return out;
 }
 
-/// One image attachment in a bubble: downloads the blob via the bridge (cached
-/// on device), wraps it in an object URL, shows a spinner while loading and a
-/// tap-to-retry on failure. The old in-session previewUrl short-circuit is
-/// gone — native previews don't cross the bridge, so a just-sent image renders
-/// by fetching its own bytes back over requestBlob (device-cached, so fast).
+/// The natural pixel size of every image this thread has decoded, keyed by blob
+/// digest and mirrored to disk with the rows (`PersistedState.imageDims`). A hit
+/// means the image rendered here before — so its blob is on the device and its
+/// box can be reserved at the exact final size before a single byte crosses the
+/// bridge, which is what keeps a re-opened thread from resizing under the reader
+/// (see `AttachmentBubble`). Carried on a context rather than props: the value's
+/// identity is stable for the transcript's life, so recording a size re-renders
+/// nothing and `MessageRow`'s memo survives.
+type ImageDimsStore = {
+  get(digest: string): [number, number] | undefined;
+  record(digest: string, width: number, height: number): void;
+};
+
+const ImageDimsContext = createContext<ImageDimsStore | null>(null);
+
+/// Rebuild the map from a restored mirror, dropping anything that isn't a usable
+/// size — a zero or garbage dimension would poison the reserved box's ratio (CSS
+/// divides by it), and the mirror is on-disk JSON, not a trusted type.
+function restoreImageDims(
+  raw: Record<string, [number, number]> | undefined,
+): Map<string, [number, number]> {
+  const out = new Map<string, [number, number]>();
+  for (const [digest, dims] of Object.entries(raw ?? {})) {
+    if (!Array.isArray(dims)) continue;
+    const [w, h] = dims;
+    if (typeof w !== "number" || typeof h !== "number") continue;
+    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) continue;
+    out.set(digest, [w, h]);
+  }
+  return out;
+}
+
+/// One image attachment in a bubble: lazily downloads the blob via the bridge
+/// (cached on device) once its row scrolls near the viewport, wraps it in an
+/// object URL, shows a spinner while loading and a tap-to-retry on failure. The
+/// lazy gate is load-bearing for history: a back-page can carry dozens of
+/// images, and fetching every blob on mount floods the bridge — each image
+/// crosses as a large base64 string plus a main-thread `atob` decode
+/// (bridge.ts) — which stalls the whole transcript until they all settle (the
+/// whole page fails to appear while paging history). An IntersectionObserver
+/// defers each fetch to when its row actually approaches the screen, so
+/// off-screen history images cost nothing until scrolled to. The old in-session
+/// previewUrl short-circuit is gone — native previews don't cross the bridge, so
+/// a just-sent image renders by fetching its own bytes back over requestBlob
+/// (device-cached, so fast).
 function AttachmentImage({
   attachment,
   connEpoch,
@@ -202,19 +451,57 @@ function AttachmentImage({
   connEpoch: number;
 }) {
   const { t } = useTranslation();
+  const imageDims = useContext(ImageDimsContext);
+  // Load-once gate — flips true when the placeholder nears the viewport and
+  // never falls back, so scrolling past a loaded image doesn't refetch it.
+  const [visible, setVisible] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  // True once the fetched image has actually decoded — the frame reserves a box
+  // and holds the spinner until then, so the swap to the natural size happens in
+  // one step (no 0-height flash mid-decode).
+  const [loaded, setLoaded] = useState(false);
   const [attempt, setAttempt] = useState(0);
   // Mirrors `failed` for the connEpoch retry effect to read without taking
   // `failed` as a dep (which would refetch in a tight loop the instant a fetch
   // fails).
   const failedRef = useRef(false);
+  // The reserved placeholder box the observer watches until the row nears the
+  // viewport.
+  const holderRef = useRef<HTMLDivElement | null>(null);
+
+  // Arm the lazy gate: observe the placeholder and load once it enters the
+  // preload band. Disconnects on the first intersection. Without
+  // IntersectionObserver (not expected on WKWebView; a dev-browser guard) load
+  // eagerly rather than never showing the image.
+  useEffect(() => {
+    if (visible) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setVisible(true);
+      return;
+    }
+    const el = holderRef.current;
+    if (!el) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisible(true);
+          io.disconnect();
+        }
+      },
+      { rootMargin: LAZY_IMAGE_ROOT_MARGIN },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [visible]);
 
   useEffect(() => {
+    if (!visible) return;
     let owned: string | null = null;
     let cancelled = false;
     failedRef.current = false;
     setFailed(false);
+    setLoaded(false);
     setUrl(null);
     blobObjectUrl(attachment.blob_id, attachment.mime_type)
       .then((u) => {
@@ -235,52 +522,797 @@ function AttachmentImage({
       cancelled = true;
       if (owned) URL.revokeObjectURL(owned);
     };
-  }, [attachment.blob_id, attachment.mime_type, attempt]);
+  }, [attachment.blob_id, attachment.mime_type, attempt, visible]);
 
   // A restored image can race ahead of its leg going live, so an early fetch
   // fails before native has a live session. Retry the moment a (re)connect
-  // lands instead of stranding it on tap-to-load.
+  // lands instead of stranding it on tap-to-load. Only bites once visible (an
+  // unfetched off-screen image has no failure to retry).
   useEffect(() => {
     if (failedRef.current) setAttempt((a) => a + 1);
   }, [connEpoch]);
 
+  if (!visible) {
+    return <div ref={holderRef} className="attachment-placeholder" aria-hidden="true" />;
+  }
   if (failed) {
     return (
-      <button className="attachment-retry" onClick={() => setAttempt((a) => a + 1)}>
-        ↻ {t("chat.tapToLoad")}
+      <button
+        className="attachment-retry"
+        onClick={() => setAttempt((a) => a + 1)}
+        aria-label={t("chat.tapToLoad")}
+      >
+        ↻
       </button>
     );
   }
-  if (!url) return <div className="attachment-loading">{t("chat.loadingImage")}</div>;
-  return <img className="attachment-img" src={url} alt={attachment.filename ?? t("chat.imageAlt")} />;
-}
-
-function AttachmentList({
-  attachments,
-  connEpoch,
-}: {
-  attachments: WireAttachment[];
-  connEpoch: number;
-}) {
+  // Reserved box → spinner while the blob is fetched and the image decodes
+  // underneath (invisible until `loaded`), then the box releases to the image's
+  // natural size in one step — no 0-height flash between the loading box and the
+  // painted image. That release is a small, bounded height change; WKWebView has
+  // no scroll anchoring to absorb it if it lands above the fold while reading
+  // history, an accepted tradeoff of not knowing image dimensions up front.
   return (
-    <div className="attachments">
-      {attachments.map((a, i) =>
-        a.kind === "image" ? (
-          <AttachmentImage key={`${a.blob_id}-${i}`} attachment={a} connEpoch={connEpoch} />
-        ) : (
-          <div key={`${a.blob_id}-${i}`} className="attachment-file">
-            📎 {a.filename ?? a.mime_type}
-          </div>
-        ),
+    <div
+      className={`attachment-frame${loaded ? " loaded" : ""}`}
+      aria-label={loaded ? undefined : t("chat.loadingImage")}
+    >
+      {!loaded && <span className="attachment-spinner" aria-hidden="true" />}
+      {url && (
+        // Tap opens the image full-screen in the native zoomable viewer
+        // (`viewImage` → pinch, double-tap-to-restore). A button wraps the img
+        // (not an onClick on it) so the wrapper stays put across the load — the
+        // img never remounts and its onLoad fires once.
+        <button
+          type="button"
+          className="attachment-open"
+          onClick={() =>
+            viewImage(attachment.blob_id, attachment.filename ?? "", attachment.mime_type)
+          }
+          aria-label={t("chat.viewImage")}
+        >
+          <img
+            className="attachment-img"
+            src={url}
+            alt={attachment.filename ?? t("chat.imageAlt")}
+            decoding="async"
+            draggable={false}
+            onLoad={(e) => {
+              // Remember the decoded size: it's what lets the NEXT open of this
+              // thread reserve this image's exact box up front instead of
+              // flashing a loading tile and then resizing (see
+              // `AttachmentBubble`). A zero dimension is never recorded — the
+              // reserved box divides by it.
+              const { naturalWidth: w, naturalHeight: h } = e.currentTarget;
+              if (w > 0 && h > 0) {
+                imageDims?.record(blobContentDigest(attachment.blob_id), w, h);
+              }
+              setLoaded(true);
+            }}
+            onError={() => setFailed(true)}
+          />
+        </button>
       )}
     </div>
   );
 }
 
-/// One finalized transcript row. User messages and notices keep their bubbles;
-/// assistant replies render bubble-less at full thread width as markdown (the
-/// web chat's reading-band layout). Memoized so streaming ticks don't re-parse
-/// every settled message's markdown.
+/// One attachment on its OWN bubble — a lazy-loaded image tile or a named file
+/// chip, never sharing the text bubble. `children` carries the send-state chrome
+/// when this is a user message's last bubble (an image-only send).
+///
+/// An image whose size this thread already knows (`ImageDimsStore` — it decoded
+/// here before, so its blob is on the device) is `sized`: the bubble reserves the
+/// image's EXACT final box from the first paint, and the loading tile is dropped
+/// (`.attachment-bubble.sized` in styles.css). Nothing under it moves when the
+/// bytes land — an already-downloaded image no longer resizes the page, which is
+/// what shook a re-opened thread as each 12rem tile released to its real height.
+/// The box lives on the BUBBLE and not on the frame inside it: the frame's
+/// containing block is this bubble, a shrink-to-fit flex item, so a percentage
+/// width there is cyclic and resolves to zero.
+///
+/// Read once, at mount: a size recorded later belongs to an image that is already
+/// painted at its natural size, and re-reading would resize the bubble underneath
+/// it. The next open picks the entry up.
+function AttachmentBubble({
+  attachment,
+  connEpoch,
+  className,
+  children,
+}: {
+  attachment: WireAttachment;
+  connEpoch: number;
+  className?: string;
+  children?: ReactNode;
+}) {
+  const isImage = attachment.kind === "image";
+  const isAudio = attachment.kind === "audio";
+  const isVideo = isVideoAttachment(attachment);
+  const imageDims = useContext(ImageDimsContext);
+  const [sized] = useState(() =>
+    isImage ? imageDims?.get(blobContentDigest(attachment.blob_id)) : undefined,
+  );
+  const classes = [
+    "attachment-bubble",
+    isImage ? "" : isVideo ? "video" : "file",
+    sized ? "sized" : "",
+    className ?? "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  // Bare numbers, no unit: the reserved box divides one by the other.
+  const box = sized
+    ? ({ "--img-w": String(sized[0]), "--img-h": String(sized[1]) } as CSSProperties)
+    : undefined;
+  return (
+    <div className={classes} style={box}>
+      {isImage ? (
+        <AttachmentImage attachment={attachment} connEpoch={connEpoch} />
+      ) : isVideo ? (
+        <AttachmentVideo attachment={attachment} />
+      ) : isAudio ? (
+        <AttachmentAudio attachment={attachment} />
+      ) : (
+        <AttachmentFile attachment={attachment} />
+      )}
+      {children}
+    </div>
+  );
+}
+
+/// Video has no wire kind of its own — it rides `file` (the gateway buckets
+/// only image/audio specially) — so the tile is elected by mime here.
+function isVideoAttachment(attachment: WireAttachment): boolean {
+  return attachment.kind === "file" && attachment.mime_type.startsWith("video/");
+}
+
+/// Binary units, and only as much precision as disambiguates: `812 B`,
+/// `24 KB`, `2.3 MB`, `140 MB`.
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.round(kb)} KB`;
+  const mb = kb / 1024;
+  return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
+}
+
+/// A short, upper-case type badge. The filename's extension is the most
+/// honest source (`.docx` beats the mime's
+/// `vnd.openxmlformats-officedocument.wordprocessingml.document`); fall back to
+/// the mime subtype with its `+xml` suffix and `vnd.…` vendor path stripped.
+function typeLabel(attachment: WireAttachment): string {
+  const dot = attachment.filename?.lastIndexOf(".") ?? -1;
+  const ext = dot > 0 ? attachment.filename?.slice(dot + 1) : undefined;
+  if (ext && ext.length <= 4) return ext.toUpperCase();
+  const subtype = attachment.mime_type.split("/")[1] ?? attachment.mime_type;
+  const bare = subtype.split(";")[0].split("+")[0].split(".").pop() ?? "";
+  return (bare || attachment.mime_type).toUpperCase();
+}
+
+/// How much of a long filename's tail always survives. `…-Q3-final.pdf` is what
+/// tells a reader this is the final and not the draft; a plain end-ellipsis
+/// throws exactly that away.
+const FILENAME_TAIL_CHARS = 10;
+
+/// Split a name so CSS can ellipsize the head while the tail stays pinned.
+/// Short names take the whole width and get no tail.
+function splitForMiddleEllipsis(name: string): [string, string] {
+  if (name.length <= FILENAME_TAIL_CHARS * 2) return [name, ""];
+  return [name.slice(0, -FILENAME_TAIL_CHARS), name.slice(-FILENAME_TAIL_CHARS)];
+}
+
+/// A document with a folded corner — the file already on this device.
+const GLYPH_FILE = (
+  <>
+    <path
+      d="M11.6 2.6H5.8a1.7 1.7 0 0 0-1.7 1.7v11.4a1.7 1.7 0 0 0 1.7 1.7h8.4a1.7 1.7 0 0 0 1.7-1.7V6.9L11.6 2.6Z"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinejoin="round"
+    />
+    <path d="M11.5 2.7v4.3h4.3" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+  </>
+);
+
+/// An arrow into a tray — tap to fetch. Also what spins inside the ring while
+/// the bytes stream, so the icon never jumps between states.
+const GLYPH_DOWNLOAD = (
+  <>
+    <path
+      d="M10 3.4v9.2M6.4 9.2 10 12.8l3.6-3.6"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <path
+      d="M4.4 14.6v1.2a1.4 1.4 0 0 0 1.4 1.4h8.4a1.4 1.4 0 0 0 1.4-1.4v-1.2"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinecap="round"
+    />
+  </>
+);
+
+/// A play triangle, stroked like the rest of the glyph set (nothing filled).
+const GLYPH_PLAY = (
+  <path
+    d="M7.6 5.1v9.8l7.6-4.9z"
+    stroke="currentColor"
+    strokeWidth="1.2"
+    strokeLinejoin="round"
+  />
+);
+
+/// Two pause bars.
+const GLYPH_PAUSE = (
+  <path
+    d="M7.7 5.6v8.8M12.3 5.6v8.8"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+  />
+);
+
+/// `m:ss` (`h:mm:ss` past an hour) — playback positions and video durations.
+function formatTime(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = String(s % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+}
+
+/// One file attachment's on-device lifecycle. Native owns the truth (the blob
+/// cache is a directory iOS may purge), so the card asks on every mount rather
+/// than trusting a `ready` it saw before.
+function useFileState(blobId: string): { state: FileState; loaded: number } {
+  const [state, setState] = useState<FileState>("idle");
+  const [loaded, setLoaded] = useState(0);
+
+  useEffect(() => {
+    const unsubscribe = onFileState(blobId, (payload) => {
+      setState(payload.state);
+      if (payload.state === "loading") setLoaded(payload.loaded ?? 0);
+    });
+    queryFileState(blobId);
+    return unsubscribe;
+  }, [blobId]);
+
+  return { state, loaded };
+}
+
+/// A non-image attachment: a stroked glyph (never the 📎 emoji — it arrives
+/// coloured and glossy, the one thing this monochrome system has no room for),
+/// the filename middle-clipped on one line, and the type + size beneath. The
+/// wire has carried `size` all along; nothing showed it.
+///
+/// Tapping an undownloaded file fetches it — the glyph becomes an indeterminate
+/// ring and the size turns into a `1.2 MB / 2.3 MB` counter, which is where the
+/// real progress lives. Tapping it once it's on disk opens the preview.
+function AttachmentFile({ attachment }: { attachment: WireAttachment }) {
+  const { state, loaded } = useFileState(attachment.blob_id);
+  const type = typeLabel(attachment);
+  // A nameless blob has nothing better to title itself with than its type, so
+  // the meta line would only repeat it.
+  const name = attachment.filename ?? type;
+  const [head, tail] = splitForMiddleEllipsis(name);
+
+  const meta =
+    state === "loading"
+      ? `${formatBytes(loaded)} / ${formatBytes(attachment.size)}`
+      : attachment.filename
+        ? `${type} · ${formatBytes(attachment.size)}`
+        : formatBytes(attachment.size);
+
+  const onTap = useCallback(() => {
+    if (state === "loading") return;
+    if (state === "ready") previewFile(attachment.blob_id, name, attachment.mime_type);
+    else downloadFile(attachment.blob_id);
+  }, [state, attachment.blob_id, attachment.mime_type, name]);
+
+  const share = useSharePress(
+    useCallback(() => {
+      if (state !== "ready") return false;
+      shareFile(attachment.blob_id, name, attachment.mime_type);
+      return true;
+    }, [state, attachment.blob_id, attachment.mime_type, name]),
+  );
+
+  return (
+    <button type="button" className={`attachment-file ${state}`} onClick={onTap} {...share}>
+      <span className="file-glyph-slot">
+        <svg className="file-glyph" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+          {state === "ready" ? GLYPH_FILE : GLYPH_DOWNLOAD}
+        </svg>
+        {state === "loading" && <span className="file-spinner" aria-hidden="true" />}
+      </span>
+      <span className="file-text">
+        <span className="file-name">
+          <span className="file-name-head">{head}</span>
+          {tail && <span className="file-name-tail">{tail}</span>}
+        </span>
+        <span className="file-meta">{meta}</span>
+      </span>
+    </button>
+  );
+}
+
+/// Mirror of one blob's slice of the native audio engine (there is ONE player
+/// app-wide — see `AudioPlayerCenter`). Subscribed by blob id like `fileState`,
+/// so a 2 Hz position tick re-renders one card; the mount-time query resyncs a
+/// card that appears mid-playback (session switch, thread reload).
+function useAudioState(blobId: string): AudioStatePayload {
+  const [audio, setAudio] = useState<AudioStatePayload>({
+    blobId,
+    state: "stopped",
+    position: 0,
+    duration: 0,
+  });
+
+  useEffect(() => {
+    const unsubscribe = onAudioState(blobId, setAudio);
+    queryAudioState(blobId);
+    return unsubscribe;
+  }, [blobId]);
+
+  return audio;
+}
+
+/// The audio card's seek bar — rendered in EVERY state so the card's height
+/// never jumps as playback starts/ends. Until the engine is engaged the bar is
+/// inert and empty: no handlers, so a tap on it bubbles to the card (play) and
+/// a hold arms the share like anywhere else on the card.
+///
+/// Engaged, a drag scrubs locally (the fill follows the finger, not the
+/// engine) and commits one `audioSeek` on lift; the committed value keeps
+/// rendering until the ENGINE's next push lands (native answers a seek with an
+/// optimistic state, so that's near-immediate), because falling back to the
+/// stale pre-seek `position` would snap the fill backwards for the round trip.
+/// Pointer events stop at the bar so a scrub never toggles the card under it;
+/// `touch-action: none` (CSS) keeps a horizontal drag from scrolling the
+/// thread.
+function AudioTrack({
+  blobId,
+  position,
+  duration,
+  interactive,
+}: {
+  blobId: string;
+  position: number;
+  duration: number;
+  interactive: boolean;
+}) {
+  const barRef = useRef<HTMLDivElement | null>(null);
+  const [scrub, setScrub] = useState<number | null>(null);
+  const committed = useRef(false);
+
+  useEffect(() => {
+    if (committed.current) {
+      committed.current = false;
+      setScrub(null);
+    }
+  }, [position, duration]);
+
+  const fracAt = (clientX: number): number => {
+    const rect = barRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return 0;
+    return Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+  };
+
+  if (!interactive) {
+    return (
+      <div className="audio-track" aria-hidden="true">
+        <span className="audio-track-fill" style={{ width: "0%" }} />
+      </div>
+    );
+  }
+
+  const shown = scrub ?? (duration > 0 ? position / duration : 0);
+
+  return (
+    <div
+      ref={barRef}
+      className="audio-track"
+      // A still finger resting on the track (a slow scrub) must not arm the
+      // card's long-press share — touch events propagate independently of the
+      // pointer events captured below.
+      onTouchStart={(e) => e.stopPropagation()}
+      onPointerDown={(e) => {
+        e.stopPropagation();
+        committed.current = false;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        setScrub(fracAt(e.clientX));
+      }}
+      onPointerMove={(e) => {
+        if (scrub !== null && !committed.current) setScrub(fracAt(e.clientX));
+      }}
+      onPointerUp={(e) => {
+        e.stopPropagation();
+        if (scrub === null || committed.current) return;
+        audioSeek(blobId, scrub * duration);
+        committed.current = true;
+      }}
+      onPointerCancel={() => {
+        committed.current = false;
+        setScrub(null);
+      }}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <span className="audio-track-fill" style={{ width: `${shown * 100}%` }} />
+    </div>
+  );
+}
+
+/// An audio attachment: the file card's layout with the glyph slot promoted to
+/// a play/pause control once the bytes are on disk. The ENGINE is native
+/// (AVPlayer on the device-cached blob, `audioToggle` over the bridge): bytes
+/// never cross as base64, the ringer switch can't silence it, and playback
+/// survives backing out of the chat — the card is only a mirror. Until
+/// downloaded it behaves exactly like a file card (tap fetches, ring + byte
+/// counter), so a history page of audio costs nothing until asked for.
+function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
+  const { t } = useTranslation();
+  const { state, loaded } = useFileState(attachment.blob_id);
+  const audio = useAudioState(attachment.blob_id);
+  const type = typeLabel(attachment);
+  const name = attachment.filename ?? type;
+  const [head, tail] = splitForMiddleEllipsis(name);
+  const playing = audio.state === "playing";
+  // Once the engine has touched this track the meta line becomes time and the
+  // scrubber goes live; `stopped` (never played / ended / usurped) reads like
+  // a resting card again.
+  const engaged = state === "ready" && audio.state !== "stopped" && audio.duration > 0;
+
+  // The engine's duration is PRECISE (the asset is opened with precise
+  // timing) and permanently supersedes the wire's probe — after playback ends
+  // the resting meta must not fall back to an estimate the play just
+  // disproved. Held in a ref: it only matters on renders something else
+  // already triggered.
+  const engineDurationMs = useRef(0);
+  useEffect(() => {
+    if (audio.duration > 0) engineDurationMs.current = audio.duration * 1000;
+  }, [audio.duration]);
+  const restDurationMs =
+    engineDurationMs.current > 0 ? engineDurationMs.current : (attachment.duration_ms ?? null);
+
+  // At rest the track's length rides the WIRE (`duration_ms`, probed at
+  // attach time), so it shows before any byte is downloaded — the engine
+  // takes over once it has loaded the real thing.
+  const meta =
+    state === "loading"
+      ? `${formatBytes(loaded)} / ${formatBytes(attachment.size)}`
+      : engaged
+        ? `${formatTime(audio.position)} / ${formatTime(audio.duration)}`
+        : [
+            attachment.filename ? type : null,
+            restDurationMs != null ? formatTime(restDurationMs / 1000) : null,
+            formatBytes(attachment.size),
+          ]
+            .filter(Boolean)
+            .join(" · ");
+
+  const onTap = useCallback(() => {
+    if (state === "loading") return;
+    if (state === "ready") audioToggle(attachment.blob_id, name, attachment.mime_type);
+    else downloadFile(attachment.blob_id);
+  }, [state, attachment.blob_id, attachment.mime_type, name]);
+
+  const share = useSharePress(
+    useCallback(() => {
+      if (state !== "ready") return false;
+      shareFile(attachment.blob_id, name, attachment.mime_type);
+      return true;
+    }, [state, attachment.blob_id, attachment.mime_type, name]),
+  );
+
+  return (
+    <button
+      type="button"
+      className={`attachment-file audio ${state}`}
+      onClick={onTap}
+      aria-label={playing ? t("chat.audioPause") : t("chat.audioPlay")}
+      {...share}
+    >
+      <span className="file-glyph-slot">
+        <svg className="file-glyph" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+          {state !== "ready" ? GLYPH_DOWNLOAD : playing ? GLYPH_PAUSE : GLYPH_PLAY}
+        </svg>
+        {state === "loading" && <span className="file-spinner" aria-hidden="true" />}
+      </span>
+      <span className="file-text">
+        <span className="file-name">
+          <span className="file-name-head">{head}</span>
+          {tail && <span className="file-name-tail">{tail}</span>}
+        </span>
+        <AudioTrack
+          blobId={attachment.blob_id}
+          position={audio.position}
+          duration={audio.duration}
+          interactive={engaged}
+        />
+        <span className="file-meta">{meta}</span>
+      </span>
+    </button>
+  );
+}
+
+/// Tile ratios stay within a band — an ultra-wide strip or a 9:16 portrait
+/// column would blow the reading column open; the cover-fit poster absorbs the
+/// difference as a crop.
+const VIDEO_RATIO_DEFAULT = 16 / 9;
+const VIDEO_RATIO_MIN = 3 / 4;
+
+function clampVideoRatio(ratio: number): number {
+  return Math.min(VIDEO_RATIO_DEFAULT, Math.max(VIDEO_RATIO_MIN, ratio));
+}
+
+/// Determinate download ring, centered on the video tile. `r` in a 36-unit
+/// viewBox; the CSS rotates the start to 12 o'clock.
+const VIDEO_RING_RADIUS = 14;
+const VIDEO_RING_CIRCUMFERENCE = 2 * Math.PI * VIDEO_RING_RADIUS;
+
+function VideoProgressRing({ fraction }: { fraction: number }) {
+  const clamped = Math.min(1, Math.max(0, fraction));
+  return (
+    <span className="video-disc" aria-hidden="true">
+      <svg className="video-ring" viewBox="0 0 36 36">
+        <circle className="video-ring-rail" cx="18" cy="18" r={VIDEO_RING_RADIUS} />
+        <circle
+          className="video-ring-fill"
+          cx="18"
+          cy="18"
+          r={VIDEO_RING_RADIUS}
+          strokeDasharray={VIDEO_RING_CIRCUMFERENCE}
+          strokeDashoffset={VIDEO_RING_CIRCUMFERENCE * (1 - clamped)}
+        />
+      </svg>
+    </span>
+  );
+}
+
+/// A video attachment: a fixed-width tile in the image idiom, not a file chip.
+/// Undownloaded it's a blank surface with a centered download disc and the size
+/// in the corner chip; while fetching, the disc becomes a DETERMINATE ring (the
+/// attachment declares its total) and the chip counts bytes; once on disk,
+/// native supplies a poster frame + duration (`requestVideoPoster`,
+/// AVAssetImageGenerator over the bridge) and the disc becomes a play glyph —
+/// tap hands the file to the native full-screen player. The poster's natural
+/// size is recorded in `ImageDimsStore`, so a re-opened thread draws this tile
+/// at the right ratio from the first paint.
+function AttachmentVideo({ attachment }: { attachment: WireAttachment }) {
+  const { t } = useTranslation();
+  const { state, loaded } = useFileState(attachment.blob_id);
+  const imageDims = useContext(ImageDimsContext);
+  const digest = blobContentDigest(attachment.blob_id);
+  const [dims, setDims] = useState(() => imageDims?.get(digest));
+  const [poster, setPoster] = useState<string | null>(null);
+  // Seeded from the WIRE (probed at attach time) so the length shows before a
+  // byte is downloaded; the poster reply overwrites it with the local probe.
+  const [durationMs, setDurationMs] = useState<number | null>(attachment.duration_ms ?? null);
+  const name = attachment.filename ?? typeLabel(attachment);
+
+  useEffect(() => {
+    if (state !== "ready") return;
+    let owned: string | null = null;
+    let cancelled = false;
+    requestVideoPoster(attachment.blob_id, name, attachment.mime_type)
+      .then((p) => {
+        if (cancelled) {
+          URL.revokeObjectURL(p.url);
+          return;
+        }
+        owned = p.url;
+        setPoster(p.url);
+        setDurationMs(p.durationMs);
+        if (p.width > 0 && p.height > 0) {
+          imageDims?.record(digest, p.width, p.height);
+          setDims([p.width, p.height]);
+        }
+      })
+      .catch(() => {
+        // No poster is cosmetic — the blank tile still downloads and plays.
+      });
+    return () => {
+      cancelled = true;
+      if (owned) {
+        URL.revokeObjectURL(owned);
+        // The render must never reference the revoked URL: a `ready → failed`
+        // flip (blob purged, download error) re-runs this effect, and keeping
+        // the stale poster would paint a broken <img>. On unmount these are
+        // no-ops. The duration falls back to the wire's value, not null — the
+        // track's length is still true.
+        setPoster(null);
+        setDurationMs(attachment.duration_ms ?? null);
+      }
+    };
+    // name/digest derive from the attachment; `state` flipping to ready is the
+    // real clock here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state, attachment.blob_id, attachment.mime_type]);
+
+  const ratio = clampVideoRatio(dims ? dims[0] / dims[1] : VIDEO_RATIO_DEFAULT);
+  const fraction = attachment.size > 0 ? loaded / attachment.size : 0;
+  // Pre-download the chip pairs length with cost (`1:23 · 24 MB` — the size is
+  // what a tap commits to); once the bytes are local only the length matters.
+  const chip =
+    state === "loading"
+      ? `${formatBytes(loaded)} / ${formatBytes(attachment.size)}`
+      : durationMs === null
+        ? formatBytes(attachment.size)
+        : state === "ready"
+          ? formatTime(durationMs / 1000)
+          : `${formatTime(durationMs / 1000)} · ${formatBytes(attachment.size)}`;
+
+  const onTap = useCallback(() => {
+    if (state === "loading") return;
+    if (state === "ready") playVideo(attachment.blob_id, name, attachment.mime_type);
+    else downloadFile(attachment.blob_id);
+  }, [state, attachment.blob_id, attachment.mime_type, name]);
+
+  const share = useSharePress(
+    useCallback(() => {
+      if (state !== "ready") return false;
+      shareFile(attachment.blob_id, name, attachment.mime_type);
+      return true;
+    }, [state, attachment.blob_id, attachment.mime_type, name]),
+  );
+
+  return (
+    <button
+      type="button"
+      className={`attachment-video ${state}${poster ? " has-poster" : ""}`}
+      style={{ "--video-ar": String(ratio) } as CSSProperties}
+      onClick={onTap}
+      aria-label={state === "ready" ? t("chat.videoPlay") : t("chat.videoDownload")}
+      {...share}
+    >
+      {poster && (
+        <img className="video-poster" src={poster} alt="" draggable={false} aria-hidden="true" />
+      )}
+      <span className="video-overlay" aria-hidden="true">
+        {state === "loading" ? (
+          <VideoProgressRing fraction={fraction} />
+        ) : (
+          <span className="video-disc">
+            <svg className="video-disc-glyph" viewBox="0 0 20 20" fill="none">
+              {state === "ready" ? GLYPH_PLAY : GLYPH_DOWNLOAD}
+            </svg>
+          </span>
+        )}
+      </span>
+      <span className="video-chip">{chip}</span>
+    </button>
+  );
+}
+
+/// Long-press-to-copy on a user bubble: hold ~450ms without dragging (a drag is
+/// a scroll, which cancels). Native owns the clipboard write + confirming haptic
+/// (`copyText`); the web side plays the squish + "copied" pill for
+/// `COPY_TOAST_MS` before it fades.
+const LONG_PRESS_MS = 450;
+const LONG_PRESS_MOVE_CANCEL_PX = 10;
+const COPY_TOAST_MS = 1300;
+/// Below this gap between the bubble's top and the header-covered strip, the
+/// pill would render under the native header overlay — flip it below instead.
+const TOAST_HEADER_CLEARANCE_PX = 30;
+
+/// Fire `onLongPress` after a still ~`LONG_PRESS_MS` press; any drag past
+/// `LONG_PRESS_MOVE_CANCEL_PX` (a scroll) or a lift first cancels it. Touch-only
+/// — the pointer here is always a finger on the transcript webview.
+function useLongPress(onLongPress: () => void): {
+  onTouchStart: (e: ReactTouchEvent) => void;
+  onTouchMove: (e: ReactTouchEvent) => void;
+  onTouchEnd: () => void;
+} {
+  const timer = useRef<number | undefined>(undefined);
+  const origin = useRef<{ x: number; y: number } | null>(null);
+  // The document-level second-finger watch, live only while a press is armed.
+  const docWatch = useRef<((e: TouchEvent) => void) | null>(null);
+
+  const cancel = useCallback(() => {
+    clearTimeout(timer.current);
+    timer.current = undefined;
+    origin.current = null;
+    if (docWatch.current) {
+      document.removeEventListener("touchstart", docWatch.current, true);
+      docWatch.current = null;
+    }
+  }, []);
+
+  // Clear an armed press (timer + document watch) on unmount.
+  useEffect(() => cancel, [cancel]);
+
+  const onTouchStart = useCallback(
+    (e: ReactTouchEvent) => {
+      cancel();
+      if (e.touches.length !== 1) return;
+      const t = e.touches[0];
+      origin.current = { x: t.clientX, y: t.clientY };
+      timer.current = window.setTimeout(() => {
+        cancel();
+        onLongPress();
+      }, LONG_PRESS_MS);
+      // A second finger landing anywhere — even off the bubble — is a pinch or
+      // scroll, not a copy. onTouchStart only re-fires for touches ON the bubble,
+      // so watch the whole document while armed; `cancel` removes the listener.
+      const watch = (ev: TouchEvent) => {
+        if (ev.touches.length > 1) cancel();
+      };
+      docWatch.current = watch;
+      document.addEventListener("touchstart", watch, { passive: true, capture: true });
+    },
+    [cancel, onLongPress],
+  );
+
+  const onTouchMove = useCallback(
+    (e: ReactTouchEvent) => {
+      if (origin.current === null || timer.current === undefined) return;
+      if (e.touches.length !== 1) {
+        cancel();
+        return;
+      }
+      const t = e.touches[0];
+      if (
+        Math.abs(t.clientX - origin.current.x) > LONG_PRESS_MOVE_CANCEL_PX ||
+        Math.abs(t.clientY - origin.current.y) > LONG_PRESS_MOVE_CANCEL_PX
+      ) {
+        cancel();
+      }
+    },
+    [cancel],
+  );
+
+  return { onTouchStart, onTouchMove, onTouchEnd: cancel };
+}
+
+/// Long-press → share, for a card that ALSO has a tap action: when the press
+/// fires, the synthetic click that follows the lift is swallowed in the
+/// capture phase, so a share never also downloads/plays/previews. `onShare`
+/// returns whether it fired — an undownloaded card shares nothing, and its
+/// follow-up click must stay a plain tap. The suppression re-arms on the next
+/// touch, so a fired press whose click never materialised (finger dragged
+/// away after the fire) can't eat a later genuine tap.
+function useSharePress(onShare: () => boolean): {
+  onTouchStart: (e: ReactTouchEvent) => void;
+  onTouchMove: (e: ReactTouchEvent) => void;
+  onTouchEnd: () => void;
+  onClickCapture: (e: ReactMouseEvent) => void;
+} {
+  const suppress = useRef(false);
+  const fire = useCallback(() => {
+    if (onShare()) suppress.current = true;
+  }, [onShare]);
+  const press = useLongPress(fire);
+  const pressStart = press.onTouchStart;
+  const onTouchStart = useCallback(
+    (e: ReactTouchEvent) => {
+      suppress.current = false;
+      pressStart(e);
+    },
+    [pressStart],
+  );
+  const onClickCapture = useCallback((e: ReactMouseEvent) => {
+    if (suppress.current) {
+      suppress.current = false;
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, []);
+  return {
+    onTouchStart,
+    onTouchMove: press.onTouchMove,
+    onTouchEnd: press.onTouchEnd,
+    onClickCapture,
+  };
+}
+
+/// One finalized transcript row, rendered as a GROUP of stacked bubbles: each
+/// image / file attachment is its OWN bubble, separate from the text bubble —
+/// never merged into one. User attachments + text stack right-aligned; assistant
+/// attachments stack left with the reply prose below. Notices keep their single
+/// centered bubble. Memoized so streaming ticks don't re-parse every settled
+/// message's markdown.
 const MessageRow = memo(function MessageRow({
   m,
   connEpoch,
@@ -291,27 +1323,115 @@ const MessageRow = memo(function MessageRow({
   onRetry: (m: ChatMsg) => void;
 }) {
   const { t } = useTranslation();
+
+  // Long-press copy — armed for every row but only wired onto the user text
+  // bubble below (hooks must run unconditionally, ahead of the role returns).
+  // `copyId` is a nonce (0 = idle): bumping it every copy — and keying the pill
+  // on it — forces a fresh mount so the confirm animation REPLAYS even on a
+  // repeat copy inside the toast window (a plain boolean would Object.is-bail
+  // the re-render and the pill would sit frozen).
+  const [copyId, setCopyId] = useState(0);
+  const [toastBelow, setToastBelow] = useState(false);
+  const bubbleRef = useRef<HTMLDivElement | null>(null);
+  const copyTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => clearTimeout(copyTimer.current), []);
+  const copy = useCallback(() => {
+    if (m.role !== "user" || !m.content) return;
+    copyText(m.content);
+    // The pill floats above the bubble by default; a bubble near the top of the
+    // scroll would push it under the native header overlay, so flip it below.
+    const el = bubbleRef.current;
+    const log = el?.closest(".chat-log");
+    const inset = log ? parseFloat(getComputedStyle(log).paddingTop) || 0 : 0;
+    setToastBelow(el !== null && el.getBoundingClientRect().top - inset < TOAST_HEADER_CLEARANCE_PX);
+    setCopyId((n) => n + 1);
+    clearTimeout(copyTimer.current);
+    copyTimer.current = window.setTimeout(() => setCopyId(0), COPY_TOAST_MS);
+  }, [m.role, m.content]);
+  const longPress = useLongPress(copy);
+
+  if (m.role === "notice") {
+    if (m.stopped) {
+      // Compact stand-in for the gateway's `/stop` acknowledgement: a hairline
+      // rule flanking a small square + "Stopped", centered.
+      return (
+        <div className="stopped-indicator" role="status">
+          <span className="stopped-mark" aria-hidden="true" />
+          {t("chat.stopped")}
+        </div>
+      );
+    }
+    return <div className="bubble notice">{m.content}</div>;
+  }
+
+  const attachments = m.attachments ?? [];
+
   if (m.role === "assistant") {
     return (
-      <div className="msg assistant">
-        {m.attachments && m.attachments.length > 0 && (
-          <AttachmentList attachments={m.attachments} connEpoch={connEpoch} />
+      <div className="msg-group assistant">
+        {attachments.map((a, i) => (
+          <AttachmentBubble key={`${a.blob_id}-${i}`} attachment={a} connEpoch={connEpoch} />
+        ))}
+        {m.content && (
+          <div className="msg assistant">
+            <MarkdownBody text={m.content} />
+          </div>
         )}
-        {m.content && <MarkdownBody text={m.content} />}
       </div>
     );
   }
+
+  // A user send: the send indicator (spinner / retry dot) rides the message's
+  // LAST bubble — the text bubble, or the last attachment bubble when the send
+  // carries no text.
+  const sendClass = m.sendState ? ` ${m.sendState}` : "";
+  const sendChrome =
+    m.sendState === "sending" ? (
+      <span className="send-spinner" aria-hidden="true" />
+    ) : m.sendState === "failed" ? (
+      <button className="send-failed" onClick={() => onRetry(m)} aria-label={t("chat.retrySend")}>
+        <span aria-hidden="true">!</span>
+      </button>
+    ) : null;
+  const hasText = m.content.length > 0;
+
   return (
-    <div className={`bubble ${m.role}${m.sendState ? ` ${m.sendState}` : ""}`}>
-      {m.attachments && m.attachments.length > 0 && (
-        <AttachmentList attachments={m.attachments} connEpoch={connEpoch} />
-      )}
-      {m.content}
-      {m.sendState === "sending" && <span className="send-spinner" aria-hidden="true" />}
-      {m.sendState === "failed" && (
-        <button className="send-failed" onClick={() => onRetry(m)} aria-label={t("chat.retrySend")}>
-          <span aria-hidden="true">!</span>
-        </button>
+    <div className="msg-group user">
+      {attachments.map((a, i) => {
+        const carriesSend = !hasText && i === attachments.length - 1;
+        return (
+          <AttachmentBubble
+            key={`${a.blob_id}-${i}`}
+            attachment={a}
+            connEpoch={connEpoch}
+            className={carriesSend && m.sendState ? m.sendState : undefined}
+          >
+            {carriesSend ? sendChrome : null}
+          </AttachmentBubble>
+        );
+      })}
+      {hasText && (
+        <div
+          ref={bubbleRef}
+          className={`bubble user${sendClass}${copyId !== 0 ? " copied" : ""}`}
+          onTouchStart={longPress.onTouchStart}
+          onTouchMove={longPress.onTouchMove}
+          onTouchEnd={longPress.onTouchEnd}
+          onTouchCancel={longPress.onTouchEnd}
+        >
+          {m.content}
+          {sendChrome}
+          {copyId !== 0 && (
+            <span
+              key={copyId}
+              className={`copy-toast${toastBelow ? " copy-toast-below" : ""}`}
+              aria-hidden="true"
+            >
+              <span className="copy-toast-check">✓</span>
+              {t("chat.copied")}
+            </span>
+          )}
+        </div>
       )}
     </div>
   );
@@ -338,6 +1458,14 @@ export function Transcript({
   useEffect(() => {
     turnActiveRef.current = turnActive;
   }, [turnActive]);
+  // Optimistic "a send is in flight, awaiting the turn to start" — mirrors the
+  // web chat's `awaitingReply`. It bridges the gap between a user send and the
+  // server's first `turn_state{active}` so the composer's stop button appears
+  // the instant the user sends, and — until interjection ships — typing can't
+  // flip it back to a send button mid-turn. Cleared the moment the server speaks
+  // about the turn (turn_state / subscribe_state / an assistant reply / a
+  // terminal notice) or the send fails, so it can never strand the stop button.
+  const [awaitingReply, setAwaitingReply] = useState(false);
   // The full streamed answer so far. State updates are coalesced through one
   // rAF per frame burst — every push crosses the bridge as its own JS task, so
   // without this each delta would re-render (and re-parse markdown) alone.
@@ -425,6 +1553,13 @@ export function Transcript({
   // (content grew below with pins suspended → catch up on lift). Without this,
   // any sub-threshold drag sprang back on release.
   const touchStartScrollTop = useRef(0);
+  // scrollHeight captured at touchstart, so touchend re-pins ONLY when content
+  // actually landed during the touch (a hold at the bottom during streaming) —
+  // not on a plain tap. A re-pin scrolls inside the touchend handler, which
+  // makes WebKit cancel the tap's synthetic `click`, so an unconditional re-pin
+  // eats taps on work blocks / buttons whenever `followRef` is set but the
+  // scroll isn't exactly at the bottom.
+  const touchStartScrollHeight = useRef(0);
   // Drives the jump-to-latest button — a render concern, unlike followRef
   // (a ref precisely so scrolling doesn't re-render).
   const [showJump, setShowJump] = useState(false);
@@ -435,16 +1570,51 @@ export function Transcript({
   const glideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(glideTimer.current), []);
 
+  // Sizes of the images this thread has decoded, restored from the mirror and
+  // rewritten with it. Held in a ref (not state) and handed out on a context
+  // whose identity never changes: recording a size must not re-render the
+  // transcript — every row would re-render on every image that lands.
+  // Lazily, via useState: `useRef(restoreImageDims(...))` would rebuild the whole
+  // map on EVERY render (useRef's argument is a value, not an initializer) —
+  // including every rAF-coalesced streaming tick. The Map is mutated in place, so
+  // its identity is stable and the setter is never needed.
+  const [imageDims] = useState(() => restoreImageDims(restored?.imageDims));
+  // The persist effect below only runs when the ROWS change, so a newly recorded
+  // image size would never reach disk on its own. Keep the latest payload's
+  // closure here and let `record` fire it directly — the bridge debounces, so a
+  // burst of decodes still collapses into one write.
+  const persistLatest = useRef<() => void>(() => {});
+  const imageDimsStore = useMemo<ImageDimsStore>(
+    () => ({
+      get: (digest) => imageDims.get(digest),
+      record: (digest, width, height) => {
+        const known = imageDims.get(digest);
+        if (known && known[0] === width && known[1] === height) return;
+        // Insertion-ordered, so the oldest entry is the first key.
+        if (imageDims.size >= MAX_IMAGE_DIMS) {
+          const oldest = imageDims.keys().next().value;
+          if (oldest !== undefined) imageDims.delete(oldest);
+        }
+        imageDims.set(digest, [width, height]);
+        persistLatest.current();
+      },
+    }),
+    [imageDims],
+  );
+
   // Mirror the thread to native on every change so a webview reload / app
   // relaunch restores it (via init.restoredState). Debounced bridge-side.
   useEffect(() => {
-    persistState({
-      messages,
-      lastOrdinal: lastOrdinal.current,
-      oldestOrdinal: oldestOrdinal.current,
-      hasMoreOlder,
-    });
-  }, [messages, hasMoreOlder]);
+    persistLatest.current = () =>
+      persistState({
+        messages,
+        lastOrdinal: lastOrdinal.current,
+        oldestOrdinal: oldestOrdinal.current,
+        hasMoreOlder,
+        imageDims: Object.fromEntries(imageDims),
+      });
+    persistLatest.current();
+  }, [messages, hasMoreOlder, imageDims]);
 
   // Open the thread at its newest edge — a restored thread would otherwise
   // mount showing its OLDEST rows. Pre-paint, so the top never flashes by.
@@ -477,7 +1647,19 @@ export function Transcript({
     if (!box) return;
     const ro = new ResizeObserver(() => {
       const el = scrollEl();
-      if (el && followRef.current && !userTouchingRef.current) el.scrollTop = el.scrollHeight;
+      if (!el) return;
+      // A resize that leaves nothing below the fold — an empty/short draft, or
+      // the prewarm 0→full-size grow when a reused draft first paints — clears a
+      // jump button latched by a transient off-edge scroll during that resize:
+      // onScroll is the only recompute of follow/showJump, and a non-scrollable
+      // thread emits no further scroll event to correct it. Nothing to scroll ⇒
+      // always following, button hidden.
+      if (el.scrollHeight - el.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX) {
+        followRef.current = true;
+        setShowJump(false);
+        return;
+      }
+      if (followRef.current && !userTouchingRef.current) el.scrollTop = el.scrollHeight;
     });
     ro.observe(box);
     return () => ro.disconnect();
@@ -488,18 +1670,22 @@ export function Transcript({
   useEffect(() => {
     const down = () => {
       userTouchingRef.current = true;
-      touchStartScrollTop.current = scrollEl()?.scrollTop ?? 0;
+      const el = scrollEl();
+      touchStartScrollTop.current = el?.scrollTop ?? 0;
+      touchStartScrollHeight.current = el?.scrollHeight ?? 0;
     };
     const up = () => {
       userTouchingRef.current = false;
       const el = scrollEl();
       if (!el) return;
-      // Catch up to the newest edge on lift ONLY for a hold at the bottom
-      // (content grew while pins were suspended) — NOT for a deliberate upward
-      // drag, which must stay where the finger left it (the old unconditional
-      // re-pin sprang every sub-threshold drag back to the bottom).
+      // Catch up to the newest edge on lift ONLY for a hold at the bottom where
+      // content actually GREW while pins were suspended — NOT for a deliberate
+      // upward drag (must stay put), and NOT for a plain tap (re-pinning it
+      // scrolls inside the touchend handler, so WebKit cancels the tap's
+      // synthetic click — taps on work blocks / buttons then need several tries).
       const draggedUp = el.scrollTop < touchStartScrollTop.current - 2;
-      if (followRef.current && !draggedUp) el.scrollTop = el.scrollHeight;
+      const grew = el.scrollHeight - touchStartScrollHeight.current > 1;
+      if (followRef.current && !draggedUp && grew) el.scrollTop = el.scrollHeight;
     };
     window.addEventListener("touchstart", down, { passive: true });
     window.addEventListener("touchend", up, { passive: true });
@@ -523,8 +1709,41 @@ export function Transcript({
     prependAnchor.current = null;
   }, [messages]);
 
+  // A terminal notice that lands mid-turn folds INTO the open work block as a
+  // leveled step, so it doesn't sever the block into two cards (the tail must
+  // stay a work row for `withOpenWork` to keep extending it). Only an active
+  // block folds: those mid-turn notices are live-only (never persisted), so the
+  // folded step can't duplicate a durable row. A notice with no active block —
+  // between turns, or a persisted `/stop`/`/compact` outcome anchored after the
+  // turn — keeps its own centered `role:"notice"` row (its durable shape).
+  const foldTerminalNotice = useCallback((level: string, text: string) => {
+    setMessages((rows) => {
+      const last = rows[rows.length - 1];
+      if (last && last.role === "work" && last.active) {
+        return [...rows.slice(0, -1), { ...last, steps: [...last.steps, { kind: "notice", level, text }] }];
+      }
+      return [...rows, { id: uid(), role: "notice", content: text }];
+    });
+  }, []);
+
   const appendNotice = useCallback((text: string) => {
     setMessages((m) => [...m, { id: uid(), role: "notice", content: text }]);
+  }, []);
+
+  // A user opened a collapsed work block: stop following the newest edge so the
+  // block grows DOWNWARD from its summary. Left following, the pin (ResizeObserver
+  // / layout effect) chases the bottom as the steps insert and shoves the summary
+  // up. Disengage synchronously so it beats the growth's pin; once the steps have
+  // painted, reflect whether the newest edge is now off-screen (jump button).
+  // Only on open — collapsing shrinks content and needs no change.
+  const handleWorkToggle = useCallback((open: boolean) => {
+    if (!open) return;
+    followRef.current = false;
+    requestAnimationFrame(() => {
+      const el = scrollEl();
+      if (!el) return;
+      setShowJump(el.scrollHeight - el.scrollTop - el.clientHeight > FOLLOW_BOTTOM_THRESHOLD_PX);
+    });
   }, []);
 
   // The server acknowledged our own send (its echo arrived by platform_msg_id) —
@@ -539,6 +1758,9 @@ export function Transcript({
   // (red retry dot) state. Guarded on "sending" so a late failure can't stomp a
   // bubble the echo already delivered.
   const markFailed = useCallback((msgId: string) => {
+    // The send never reached the gateway, so no turn will start — leave the
+    // optimistic awaiting window so the stop button doesn't strand.
+    setAwaitingReply(false);
     setMessages((rows) =>
       rows.map((r) =>
         r.role === "user" && r.id === msgId && r.sendState === "sending" ? { ...r, sendState: "failed" } : r,
@@ -550,6 +1772,8 @@ export function Transcript({
   // and flip the bubble back to sending so the spinner returns while it retries.
   const retryMessage = useCallback((m: ChatMsg) => {
     retrySend({ msgId: m.id, text: m.content, attachments: m.attachments ?? [] });
+    // Re-enter the awaiting window — the resend can start a turn.
+    setAwaitingReply(true);
     setMessages((rows) =>
       rows.map((r) => (r.role === "user" && r.id === m.id ? { ...r, sendState: "sending" } : r)),
     );
@@ -596,14 +1820,27 @@ export function Transcript({
   const withOpenWork = useCallback((mutate: (row: WorkRow) => WorkRow) => {
     setMessages((rows) => {
       const last = rows[rows.length - 1];
-      // A restored live block stays `active`, so a re-entry's buffered
-      // continuation extends THIS block (keeping its real startedAt) instead of
-      // opening a second one.
-      if (last && last.role === "work" && last.active) {
+      // A work frame belongs to the tail work block whenever the tail IS one —
+      // even if it was just FROZEN. A restored live block stays `active` and a
+      // re-entry's continuation extends it (keeping its real startedAt); but a
+      // block can also be frozen MID-STREAM by a `turn_state{inactive}` that
+      // raced ahead of a straggler frame — on cancel the gateway emits an
+      // unguarded `tool_completed` through the SAME ordered channel the turn-end
+      // projector rides, so `[tool_started] → turn_state{inactive} → tool_completed`
+      // reaches the client with the block already closed. Folding into the frozen
+      // tail rather than forking is the invariant that keeps ONE turn to ONE card:
+      // withOpenWork never appends a work row adjacent to another (the
+      // `[work][work]` re-entry split). The straggler even resolves its own
+      // still-"running" tool step in place. The block keeps its frozen
+      // `active:false`, so a cancelled turn reads "Worked", not a stuck "Working".
+      if (last && last.role === "work") {
         return [...rows.slice(0, -1), mutate(last)];
       }
+      // Tail is not a work row: this frame opens a NEW block. Freeze EVERY
+      // still-`active` block anywhere in the thread first, so a stale open block
+      // can't linger as a second live "Working" card beside this one.
       const fresh: WorkRow = { id: uid(), role: "work", steps: [], active: true, startedAt: Date.now() };
-      return [...rows, mutate(fresh)];
+      return [...freezeActiveWork(rows), mutate(fresh)];
     });
   }, []);
 
@@ -612,6 +1849,49 @@ export function Transcript({
       withOpenWork((w) => ({ ...w, steps: [...w.steps, step] }));
     },
     [withOpenWork],
+  );
+
+  // Rewrite the tail work block's tool steps IN PLACE. Unlike `withOpenWork`
+  // this never OPENS a block: an approval frame is not a work frame, and
+  // `approval_resolved` is broadcast connection-wide (it carries no session), so
+  // a session with no block open would otherwise sprout an empty "Working" card
+  // every time some other conversation answered a prompt.
+  const rewriteToolSteps = useCallback((mutate: (step: WorkStep) => WorkStep) => {
+    setMessages((rows) => {
+      const last = rows[rows.length - 1];
+      if (!last || last.role !== "work") return rows;
+      const steps = last.steps.map((s) => (s.kind === "tool" ? mutate(s) : s));
+      return [...rows.slice(0, -1), { ...last, steps }];
+    });
+  }, []);
+
+  // A prompt opened on `toolCallId`: badge that step as waiting. Keyed by the
+  // TOOL call's id (`tool_call_id`), which is what the step carries — the
+  // prompt's own `call_id` is a fresh id per prompt and is only stashed so the
+  // matching `approval_resolved` can find the step again.
+  const markStepAwaitingApproval = useCallback(
+    (toolCallId: string, promptId: string) => {
+      rewriteToolSteps((s) =>
+        s.kind === "tool" && s.callId === toolCallId ? { ...s, awaitingApproval: promptId } : s,
+      );
+    },
+    [rewriteToolSteps],
+  );
+
+  // A prompt was answered: clear the waiting badge and label the step with the
+  // decision. Matched by PROMPT id, because that is all `approval_resolved`
+  // carries. The label is provisional until the call completes and the server's
+  // own `approval` lands on it — identical value, but that one is the persisted
+  // twin that survives a reload.
+  const resolveStepApproval = useCallback(
+    (promptId: string, decision: string) => {
+      rewriteToolSteps((s) =>
+        s.kind === "tool" && s.awaitingApproval === promptId
+          ? { ...s, awaitingApproval: undefined, approval: decision }
+          : s,
+      );
+    },
+    [rewriteToolSteps],
   );
 
   // Answer text followed by more work was intermediate: settle it into the
@@ -631,7 +1911,9 @@ export function Transcript({
       const last = rows[rows.length - 1];
       if (!last || last.role !== "work" || !last.active) return rows;
       if (last.steps.length === 0) return rows.slice(0, -1);
-      const elapsedMs = last.startedAt !== undefined ? Date.now() - last.startedAt : undefined;
+      // Prefer the server's authoritative duration (reconciled in) over the
+      // wall-clock fallback, which is only correct for a purely live-watched turn.
+      const elapsedMs = last.elapsedMs ?? (last.startedAt !== undefined ? Date.now() - last.startedAt : undefined);
       return [...rows.slice(0, -1), { ...last, active: false, elapsedMs }];
     });
   }, []);
@@ -658,7 +1940,11 @@ export function Transcript({
   // judged by turn identity (`startedMs` already seen END), never by cursor
   // arithmetic; a stale bundle leaves the transcript untouched.
   const applySubscribeState = useCallback(
-    (turn: { active: boolean; started_at?: string }, wireSteps: WireWorkStepFrame[]) => {
+    (
+      turn: { active: boolean; started_at?: string },
+      wireSteps: WireWorkStepFrame[],
+      pendingApprovals: WireApprovalCard[],
+    ) => {
       const startedMs = turn.started_at ? Date.parse(turn.started_at) : null;
       if (startedMs !== null && endedTurnStarts.current.includes(startedMs)) return;
       if (!turn.active) {
@@ -669,7 +1955,20 @@ export function Transcript({
         return;
       }
       setTurnActive(true);
-      const steps = wireSteps.map(wireStepToWork);
+      // The bundle REPLACES the block's steps, so the awaiting badge has to be
+      // re-derived here too — the `approval_requested` frame that set it may
+      // predate this connection (the prompt outlived a reconnect), and the
+      // rebuilt steps carry no memory of it.
+      const awaitingByCall = new Map(
+        pendingApprovals
+          .filter((c) => c.tool_call_id)
+          .map((c) => [c.tool_call_id as string, c.call_id]),
+      );
+      const steps = wireSteps.map(wireStepToWork).map((s) =>
+        s.kind === "tool" && awaitingByCall.has(s.callId)
+          ? { ...s, awaitingApproval: awaitingByCall.get(s.callId) }
+          : s,
+      );
       const tail = steps[steps.length - 1];
       const tailProse = tail?.kind === "prose";
       const workSteps = tailProse ? steps.slice(0, -1) : steps;
@@ -685,12 +1984,28 @@ export function Transcript({
           // stale empty/restored block if it's the tail.
           return openBlock && openBlock.steps.length === 0 ? rows.slice(0, -1) : rows;
         }
+        // A stale finalization-window bundle: this turn's answer already landed
+        // here (the tail is the committed reply) but the gateway still reports
+        // `turn.active` — its `active_turn_started_at` lingers through the job's
+        // post-answer finalization — and ships a rolling in-flight work window.
+        // Do NOT resurrect the ended turn's work as a second block under the
+        // reply (the [work][reply][work] split). A genuine next turn opens its
+        // block from the live turn_state / reasoning / tool frames that follow,
+        // not from this snapshot.
+        if (!openBlock && last && last.role === "assistant") return rows;
         // Re-open a block a prior restore froze (relaunch mid-turn) and replace
         // its steps; otherwise open a fresh one after the turn's user message.
+        // Anchor `startedAt` to the server turn start (`startedMs`) when the
+        // block has none (restore strips it) so the live ticker reads real
+        // elapsed, not `now − localReopen`.
         const rebuilt: WorkRow = openBlock
-          ? { ...openBlock, steps: workSteps, active: true, startedAt: openBlock.startedAt ?? Date.now(), elapsedMs: undefined }
-          : { id: uid(), role: "work", steps: workSteps, active: true, startedAt: Date.now() };
-        return openBlock ? [...rows.slice(0, -1), rebuilt] : [...rows, rebuilt];
+          ? { ...openBlock, steps: workSteps, active: true, startedAt: openBlock.startedAt ?? startedMs ?? Date.now(), elapsedMs: undefined }
+          : { id: uid(), role: "work", steps: workSteps, active: true, startedAt: startedMs ?? Date.now() };
+        // `rebuilt` is THE in-flight block — freeze any other still-active block
+        // above it so re-opening one never leaves two live "Working" cards.
+        return openBlock
+          ? [...freezeActiveWork(rows.slice(0, -1)), rebuilt]
+          : [...freezeActiveWork(rows), rebuilt];
       });
     },
     [setStreamingText],
@@ -845,11 +2160,36 @@ export function Transcript({
           // Keep the in-flight turn's open work block and any optimistic user
           // sends still awaiting their durable row (echoed-but-unpersisted, or
           // below a rebase floor) — the page can't carry either.
-          const openWork = prev.filter((r) => r.role === "work" && r.active);
+          // Carry only the SINGLE newest active in-flight block across the
+          // rebuild; any earlier still-active block is a stale fork — drop it so
+          // it can't re-appear beside the reconstructed thread.
+          const openWork = prev.filter((r): r is WorkRow => r.role === "work" && r.active).slice(-1);
           const keptSends = prev.filter(
             (r) => r.role === "user" && r.sendState !== undefined && !pageIds.has(r.id),
           );
-          return [...pageRows, ...keptSends, ...openWork];
+          // The page's reconstructed trailing `w<ordinal>` block and the live
+          // in-flight block are the SAME turn. Fuse them into ONE block — keep it
+          // active, adopt the server id + server-anchored timing, union the steps
+          // — instead of rendering both (duplicate/overlapping cards) or dropping
+          // either (losing steps or the correct duration).
+          let rows = pageRows;
+          let carried = openWork;
+          if (openWork.length > 0) {
+            const tail = rows[rows.length - 1];
+            if (tail && tail.role === "work") {
+              rows = [
+                ...rows.slice(0, -1),
+                {
+                  ...tail,
+                  steps: mergeWorkSteps(tail.steps, openWork[0].steps),
+                  active: true,
+                  startedAt: tail.startedAt ?? openWork[0].startedAt,
+                },
+              ];
+              carried = [];
+            }
+          }
+          return [...rows, ...keptSends, ...carried];
         });
         oldestOrdinal.current = frame.oldest_ordinal;
         setHasMoreOlder(frame.has_more_older);
@@ -871,19 +2211,55 @@ export function Transcript({
             next[next.length - 1] = {
               ...last,
               active: false,
-              elapsedMs: last.startedAt !== undefined ? Date.now() - last.startedAt : last.elapsedMs,
+              elapsedMs: last.elapsedMs ?? (last.startedAt !== undefined ? Date.now() - last.startedAt : undefined),
             };
           };
           for (const row of pageRows) {
             const existingIdx = byId.get(row.id);
             if (existingIdx !== undefined) {
-              // A redelivery of a row already on screen — reconcile an
-              // optimistic send's chrome (drop the spinner), otherwise a no-op.
               const existing = next[existingIdx];
+              // A redelivery of a row already on screen: reconcile an optimistic
+              // send's chrome (drop the spinner), or fold a same-id work block's
+              // newer server steps + timing into what's rendered (else a no-op).
               if (existing.role === "user" && existing.sendState !== undefined) {
                 next[existingIdx] = { ...existing, sendState: undefined };
+              } else if (existing.role === "work" && row.role === "work") {
+                next[existingIdx] = reconcileWork(existing, row);
               }
               continue;
+            }
+            // The in-flight turn's reconstructed `w<ordinal>` work block is the
+            // SAME turn as the live/restored block at the tail — RECONCILE into
+            // it (union steps + adopt server timing) rather than rendering a
+            // second card. A turn we don't have yet ends on a non-work tail, so
+            // its own work block is still appended.
+            const tail = next[next.length - 1];
+            if (row.role === "work" && tail && tail.role === "work") {
+              next[next.length - 1] = reconcileWork(tail, row);
+              continue;
+            }
+            // A re-delivered `work` row whose turn ALREADY ended on screen: its
+            // block sits ABOVE the turn's answer bubble (+ any trailing
+            // notices), so the tail isn't work and id-dedup misses — a live
+            // block is keyed by a client `uid()` while the reconstruction keys
+            // it `w<ordinal>`, and even two reconstructions disagree
+            // (`w<first-tool>` for a full tail vs `w<progress-anchor>` for a
+            // difference window). Fold it back into that block instead of
+            // pushing a SECOND card below the answer — the observer's `status`
+            // narration, made durable, is re-delivered by the inclusive
+            // (`after_ordinal >= since`) control-event scan and would otherwise
+            // land as a stray "Worked" block under the reply. Bound the
+            // back-scan to the SAME turn: reconcile only when the trailing run
+            // holds an answer ordinal-above this block, so a genuinely later
+            // turn's block (its answer not yet on screen) still appends.
+            if (row.role === "work") {
+              const ord = rowOrdinal(row.id);
+              const at = ord !== null ? sameTurnWorkIndex(next, ord) : -1;
+              const target = at >= 0 ? next[at] : undefined;
+              if (target && target.role === "work") {
+                next[at] = reconcileWork(target, row);
+                continue;
+              }
             }
             if (row.role === "assistant") closeTrailingWork();
             next.push(row);
@@ -924,6 +2300,14 @@ export function Transcript({
           markSent(frame.platform_msg_id); // server confirmed the send — stop the spinner
           return; // our own message / already rendered
         }
+        // The native stop BUTTON issues `/stop` as an ordinary chat send; the
+        // channel echoes every inbound message to subscribers BEFORE the agent
+        // Router intercepts `/stop` out-of-band, so the echo arrives here. Native
+        // mints no optimistic bubble for it (it isn't in `sentIds`), and the
+        // durable record folds `/stop` into the cancelled work block — never a
+        // message row — so left alone the echo renders a stray "/stop" bubble
+        // that lingers. Drop it (a typed `/stop` already returned above by id).
+        if (role === "user" && isStopCommand(frame.content)) return;
         if (ordinal !== null && renderedOrdinals.current.has(ordinal)) {
           if (role === "user" && frame.platform_msg_id) sentIds.current.add(frame.platform_msg_id);
           return;
@@ -938,6 +2322,7 @@ export function Transcript({
           // trigger for the follow-up sync that closes the dirty window.
           closeWork();
           clearStreaming();
+          setAwaitingReply(false);
           recordEndedTurn(activeTurnStart.current);
           activeTurnStart.current = null;
           if (rebaseDirty.current) runSync();
@@ -954,13 +2339,6 @@ export function Transcript({
         ]);
         break;
       }
-      case "attachment":
-        if (frame.attachments && frame.attachments.length > 0) {
-          const attachments = frame.attachments;
-          foldStreamingIntoProse();
-          setMessages((m) => [...m, { id: uid(), role: "assistant", content: "", attachments }]);
-        }
-        break;
       case "answer_delta":
         appendStreaming(frame.text);
         break;
@@ -996,7 +2374,16 @@ export function Transcript({
           for (let i = steps.length - 1; i >= 0; i -= 1) {
             const s = steps[i];
             if (s.kind === "tool" && s.callId === frame.call_id && s.status === "running") {
-              steps[i] = { ...s, status: frame.status, summary: frame.summary || undefined };
+              steps[i] = {
+                ...s,
+                status: frame.status,
+                summary: frame.summary || undefined,
+                // The call is done, so nothing is waiting on the user any more —
+                // even when the gate TIMED OUT (no `approval_resolved` is
+                // broadcast for that; the completion is the only signal).
+                awaitingApproval: undefined,
+                approval: frame.approval || s.approval,
+              };
               return { ...w, steps };
             }
           }
@@ -1007,15 +2394,32 @@ export function Transcript({
             callId: frame.call_id,
             label: frame.summary || frame.call_id,
             status: frame.status,
+            approval: frame.approval || undefined,
           });
           return { ...w, steps };
         });
+        break;
+      case "approval_requested":
+        // A tool call is blocked on the user. The prompt itself is NATIVE (the
+        // composer's card); the transcript only badges the step that is waiting,
+        // so the user can see WHICH call the card is asking about.
+        if (frame.tool_call_id) markStepAwaitingApproval(frame.tool_call_id, frame.call_id);
+        break;
+      case "approval_resolved":
+        // Answered (here, or on another client). The decision lands on the step
+        // right away rather than waiting for the call to finish — an approved
+        // call keeps running, sometimes for minutes.
+        resolveStepApproval(frame.call_id, frame.decision);
         break;
       case "turn_state":
         setTurnActive(frame.active);
         if (frame.active) {
           activeTurnStart.current = frame.started_at ? Date.parse(frame.started_at) : null;
         } else {
+          // Turn ended — end the optimistic run-state window (its work block /
+          // streaming, if any, close alongside). Kept on the ACTIVE branch so a
+          // slow first token doesn't briefly drop the stop button.
+          setAwaitingReply(false);
           closeWork();
           recordEndedTurn(activeTurnStart.current);
           activeTurnStart.current = null;
@@ -1025,12 +2429,23 @@ export function Transcript({
         }
         break;
       case "subscribe_state":
-        // The one atomic state-plane bundle. iOS surfaces only the turn/work
-        // halves (no approvals/tasks UI); staleness is judged by turn identity.
+        // The one atomic state-plane bundle. iOS renders the turn/work halves
+        // here and the approval half natively (the composer card); the
+        // transcript takes only each pending prompt's `tool_call_id`, to restore
+        // the awaiting badge on the step it blocks. Staleness is judged by turn
+        // identity.
         if (frame.turn.active && frame.turn.started_at) {
           activeTurnStart.current = Date.parse(frame.turn.started_at);
         }
-        applySubscribeState(frame.turn, frame.work_steps ?? []);
+        // Do NOT clear the optimistic window here: a `subscribe_state` arrives on
+        // every (re)connect, and the send-then-connect path (a first message on a
+        // fresh session) delivers `turn.active:false` in the gap AFTER our send
+        // but BEFORE the turn starts — clearing here would drop the stop button
+        // back to send until the first output (the "stop appears late" bug). A
+        // real turn is reflected by applySubscribeState rebuilding the work block
+        // / streaming reply; a genuinely idle window self-expires (see the
+        // `awaitingReply` timeout) and is cleared by the turn's terminal frame.
+        applySubscribeState(frame.turn, frame.work_steps ?? [], frame.pending_approvals ?? []);
         break;
       case "gap":
         // Server-declared loss on this connection — run the one forward-recovery
@@ -1043,8 +2458,22 @@ export function Transcript({
           // Mid-turn progress narration belongs to the work block, not the log.
           foldStreamingIntoProse();
           pushWorkStep({ kind: "status", text: frame.text });
+        } else if (isStopAckNotice(frame.text)) {
+          // A `/stop` acknowledgement. Don't mint a client row for it: the
+          // gateway persists this notice, and reconstruction renders it as the
+          // compact "Stopped" indicator (`n<seq>` id). Minting a local `uid` row
+          // too would double it on the next sync / a relaunch (two ids, same
+          // event). Instead end the optimistic window, freeze any open work
+          // block, and pull the durable indicator in via one sync.
+          setAwaitingReply(false);
+          setMessages((rows) => freezeActiveWork(rows));
+          runSync();
         } else {
-          appendNotice(frame.text);
+          // A terminal notice (a server rejection, a degraded-mode banner) means
+          // no turn is starting — end the optimistic window so the stop button
+          // can't strand.
+          setAwaitingReply(false);
+          foldTerminalNotice(frame.level, frame.text);
         }
         break;
       case "sync_page":
@@ -1083,7 +2512,7 @@ export function Transcript({
         break;
       }
       default:
-        break; // task_list / approvals / ping etc. not surfaced in the transcript
+        break; // task_list / ping etc. not surfaced in the transcript
     }
   };
 
@@ -1092,6 +2521,9 @@ export function Transcript({
   const handleUserSent = (payload: UserSentPayload) => {
     sentIds.current.add(payload.msgId);
     followRef.current = true;
+    // Optimistically enter the "awaiting reply" window so the composer's stop
+    // button appears immediately, before the first `turn_state` lands.
+    setAwaitingReply(true);
     setMessages((m) => [
       ...m,
       {
@@ -1270,8 +2702,54 @@ export function Transcript({
   const lastRow = messages[messages.length - 1];
   const workLive = lastRow !== undefined && lastRow.role === "work" && lastRow.active;
 
+  // Mirror the turn's run state to native so the composer's send button flips to
+  // a stop affordance while a turn runs. Derived from SELF-CORRECTING signals
+  // only — an active work block, a streaming reply, or the optimistic post-send
+  // window — deliberately NOT the raw `turnActive` latch. That latch strands true
+  // when its closing `turn_state{active:false}` is lost (an offscreen buffer
+  // overflow drops it, and a `sync_page` carries no turn state to re-derive it),
+  // which would freeze the composer on the stop button and block every send.
+  // On mount this posts `false`, resetting a native store that carried a stale
+  // run state across a session switch; the flushed/live frames re-raise it.
+  const running = awaitingReply || workLive || streaming.length > 0;
+  useEffect(() => {
+    postRunState(running);
+  }, [running]);
+
+  // Hand the optimistic post-send window off to the real run signals the instant
+  // the turn produces output (a work block or a streamed reply). Doing it here —
+  // NOT in `applySyncPage` — is deliberate: a session-open / reconnect sync is
+  // async, so its `sync_page` often lands just AFTER a send and would clear the
+  // just-set window mid-flight, dropping the stop button back to send until the
+  // first output (the "stop appears late" bug). `workLive`/`streaming` are also
+  // what a buffer-overflow recovery sync clears, so once output has started the
+  // window is no longer load-bearing and dropping it here can't strand it.
+  useEffect(() => {
+    if (workLive || streaming.length > 0) setAwaitingReply(false);
+  }, [workLive, streaming]);
+
+  // Race-free backstop: the optimistic window self-expires so a missed turn-end
+  // (a disconnect that hid both the send's output and the turn's close) can't
+  // strand the stop button. Deliberately not tied to any sync/subscribe frame —
+  // those race a fresh send — and long enough that a live turn always clears it
+  // first via output or its terminal frame.
+  useEffect(() => {
+    if (!awaitingReply) return;
+    const id = window.setTimeout(() => setAwaitingReply(false), AWAITING_MAX_MS);
+    return () => window.clearTimeout(id);
+  }, [awaitingReply]);
+
+  // Collapse adjacent "Stopped" indicators to one: the live indicator (a
+  // client `uid`) and its durable notice row (`n<seq>`, re-delivered by a later
+  // sync) are the same event and would otherwise stack two identical marks.
+  const renderRows = messages.filter((m, i) => {
+    if (m.role !== "notice" || !m.stopped) return true;
+    const prev = messages[i - 1];
+    return !(prev && prev.role === "notice" && prev.stopped);
+  });
+
   return (
-    <>
+    <ImageDimsContext.Provider value={imageDimsStore}>
       <div className="chat-log" ref={logRef}>
         {loadingOlder && <div className="older-spinner" aria-hidden="true" />}
         {hasMoreOlder && !loadingOlder && (
@@ -1281,9 +2759,9 @@ export function Transcript({
             {t("chat.loadOlder")}
           </button>
         )}
-        {messages.map((m) =>
+        {renderRows.map((m) =>
           m.role === "work" ? (
-            <WorkBlockView key={m.id} row={m} />
+            <WorkBlockView key={m.id} row={m} onToggle={handleWorkToggle} />
           ) : (
             <MessageRow key={m.id} m={m} connEpoch={connEpoch} onRetry={retryMessage} />
           ),
@@ -1300,6 +2778,6 @@ export function Transcript({
           </div>
         )}
       </div>
-    </>
+    </ImageDimsContext.Provider>
   );
 }

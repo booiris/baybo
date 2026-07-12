@@ -216,6 +216,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_session_archive"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/folder": {
         parameters: {
             query?: never;
@@ -866,6 +882,11 @@ export interface components {
         /** @description A blob attachment embedded in a historical chat transcript item. */
         ChatAttachment: {
             blob_id: string;
+            /**
+             * Format: int32
+             * @description Playback length in ms for `audio` (see `WireAttachment::duration_ms`).
+             */
+            duration_ms?: number | null;
             filename?: string | null;
             kind: string;
             mime_type: string;
@@ -984,6 +1005,13 @@ export interface components {
             transcript: components["schemas"]["ChatTranscriptItem"][];
         };
         ChatSessionSummary: {
+            /**
+             * @description True when the user has archived this session. Always emitted —
+             *     the list never filters on it, so clients with an archived view
+             *     group rows themselves and clients without one keep showing every
+             *     row; set via `PUT /v1/chat/sessions/{id}/archive`.
+             */
+            archived: boolean;
             /** Format: date-time */
             created_at: string;
             /**
@@ -1000,6 +1028,17 @@ export interface components {
             hidden?: boolean;
             /** Format: date-time */
             last_active: string;
+            /**
+             * @description Preview text drawn from the session's most-recent **displayable**
+             *     message regardless of author — the newest user prompt or final
+             *     assistant answer carrying text, truncated to [`PREVIEW_MAX_CHARS`].
+             *     Telegram-style list clients render this as the row's second line so
+             *     the preview follows the conversation (an agent reply shows once it
+             *     lands), while [`Self::last_user_text`] stays the user-only label the
+             *     web sidebar uses. `None` when the scanned tail holds only tool /
+             *     media rows or the session has no turn yet.
+             */
+            last_message_text?: string | null;
             /**
              * @description Preview text drawn from the session's most-recent user-authored
              *     message, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar
@@ -1181,6 +1220,13 @@ export interface components {
          *     carries the call's name + a re-derived result summary.
          */
         ChatWorkStep: {
+            /**
+             * @description Decision the call's approval prompt returned (`"approve"` /
+             *     `"approve_always"` / `"deny"`), read from the persisted
+             *     `ToolResultMeta`; `None` when the call never prompted (or the row
+             *     predates the field).
+             */
+            approval?: string | null;
             kind: components["schemas"]["WorkStepKind"];
             /** @description Reasoning trace or mid-turn narration body. Empty for `tool` steps. */
             text?: string;
@@ -1659,6 +1705,14 @@ export interface components {
         SetDefaultLlmRequest: {
             name: string;
         };
+        /** @description Request body for `PUT /v1/chat/sessions/{session_id}/archive`. */
+        SetSessionArchiveRequest: {
+            /**
+             * @description `true` to move this session into the archived group, `false` to
+             *     restore it to the main chat list.
+             */
+            archived: boolean;
+        };
         /** @description Request body for `PUT /v1/chat/sessions/{session_id}/folder`. */
         SetSessionFolderRequest: {
             /** @description Target folder id, or `null` to clear the assignment (uncategorized). */
@@ -1802,10 +1856,10 @@ export interface components {
         };
         /**
          * @description Kind of a reconstructed [`ChatWorkStep`] — serialized as
-         *     `"reasoning"` / `"prose"` / `"tool"`.
+         *     `"reasoning"` / `"prose"` / `"tool"` / `"status"`.
          * @enum {string}
          */
-        WorkStepKind: "reasoning" | "prose" | "tool";
+        WorkStepKind: "reasoning" | "prose" | "tool" | "status";
     };
     responses: never;
     parameters: never;
@@ -2642,6 +2696,49 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Hidden (row preserved on the server) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_session_archive: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id to archive or unarchive */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSessionArchiveRequest"];
+            };
+        };
+        responses: {
+            /** @description Archive state updated */
             204: {
                 headers: {
                     [name: string]: unknown;

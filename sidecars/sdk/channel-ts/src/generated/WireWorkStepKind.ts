@@ -2,7 +2,7 @@
 
 /**
  * Kind discriminant for a [`WireWorkStep`] — serialized as `"reasoning"` /
- * `"prose"` / `"tool"`. A typed enum (mirrors [`AttachmentKind`]) so the
- * discriminant round-trips cleanly through ts-rs.
+ * `"prose"` / `"tool"` / `"status"`. A typed enum (mirrors [`AttachmentKind`])
+ * so the discriminant round-trips cleanly through ts-rs.
  */
-export type WireWorkStepKind = "reasoning" | "prose" | "tool";
+export type WireWorkStepKind = "reasoning" | "prose" | "tool" | "status";

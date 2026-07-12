@@ -217,6 +217,17 @@ pub struct Session {
     #[serde(default)]
     pub pinned: bool,
 
+    /// User-facing "archived" flag for the chat list. Set via the chat
+    /// admin `PUT /v1/chat/sessions/:id/archive` endpoint. Presentation
+    /// only — clients group archived rows into their own view; the list
+    /// endpoint does NOT filter on it and new activity does not clear
+    /// it. Like [`Self::pinned`] it is a flat column owned by a targeted
+    /// UPDATE (`set_archived`), not the JSON blob, so a concurrent
+    /// `touch` can't clobber it. Default `false` so legacy JSON blobs
+    /// deserialize.
+    #[serde(default)]
+    pub archived: bool,
+
     /// Which user-created folder this session is filed under in the chat
     /// list (`None` = uncategorized). Set via the chat admin
     /// `PUT /v1/chat/sessions/:id/folder` endpoint. Like [`Self::pinned`]

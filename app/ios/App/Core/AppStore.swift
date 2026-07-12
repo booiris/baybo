@@ -32,12 +32,41 @@ final class AppStore: ObservableObject {
         case settings
     }
 
+    /// One entry on the outer NavigationStack over the home shell: a pushed
+    /// conversation or the archived list.
+    enum ChatRoute: Hashable {
+        case session(String)
+        case archived
+    }
+
     @Published var route: Route = .launching
     @Published var landingView: LandingView = .menu
     /// The selected home section (the bottom menu bar's current tab).
     @Published var homeTab: HomeTab = .chats
-    /// The NavigationStack path over the chat list: at most one pushed session.
-    @Published var chatPath: [String] = []
+    /// The NavigationStack path over the chat list. A session opened from the
+    /// list/compose/push resets it to `[.session(id)]`; one opened from the
+    /// archived screen appends, so the pop chain runs chat → archived → list.
+    ///
+    /// Popping the last conversation off the stack stops chat audio: a track
+    /// playing over the list — with no visible card to control it — reads as
+    /// a bug, not a feature. The path only changes on navigation, so
+    /// lock-screen/background playback while parked IN a chat is untouched.
+    /// (`ChatScreen.onDisappear` can't be this hook: it also fires under
+    /// fullScreenCovers like the image viewer.)
+    @Published var chatPath: [ChatRoute] = [] {
+        didSet {
+            if Self.hasSession(oldValue) && !Self.hasSession(chatPath) {
+                AudioPlayerCenter.shared.stop()
+            }
+        }
+    }
+
+    private static func hasSession(_ path: [ChatRoute]) -> Bool {
+        path.contains { route in
+            if case .session = route { return true }
+            return false
+        }
+    }
     /// Landing / pairing status line (localized, already resolved).
     @Published var status: String?
     @Published var busy = false
@@ -50,6 +79,12 @@ final class AppStore: ObservableObject {
     /// stock `.confirmationDialog` left `isPresented` latched true after a
     /// scrim dismiss, deadening the logout button).
     @Published var confirmLogout = false
+    /// The session a swipe-delete is asking to confirm — hosted in `RootView`
+    /// exactly like the logout confirm, and for the same latch/coverage reasons.
+    @Published var confirmDeleteSession: String?
+    /// Transient archive/delete failure line, rendered by the list headers the
+    /// way compose failures are. Cleared when the next mutation starts.
+    @Published var sessionNotice: String?
     /// Whether the active binding is direct (drives push re-registration).
     @Published private(set) var directBound = false
 
@@ -71,6 +106,21 @@ final class AppStore: ObservableObject {
     static let maxResidentStores = 12
     private var transcriptHost: TranscriptHost?
     private var prewarmedDraftId: String?
+    /// Sessions with an archive/hide request on the wire — the per-session
+    /// serialization gate (`pumpSessionMutation`).
+    private var sessionMutationsInFlight: Set<String> = []
+    /// `-baybo-open-home` (DEBUG): no gateway is bound, so archive/delete
+    /// mutations resolve locally instead of failing + rolling back — the
+    /// headless UI tests assert on the optimistic flip staying put.
+    private var demoHomeMode = false
+
+    #if DEBUG
+        /// The session `-baybo-open-chat` pushes. The demo frame feeders key on
+        /// it so they can only ever write into this throwaway conversation — a
+        /// demo turn pushed into a REAL session (`-baybo-open-session`) would land
+        /// in that session's durable mirror and registry row.
+        static let debugSessionId = "debug-session"
+    #endif
 
     init() {
         AppStore.shared = self
@@ -91,15 +141,27 @@ final class AppStore: ObservableObject {
         }
         if ProcessInfo.processInfo.arguments.contains("-baybo-open-chat") {
             route = .home
-            chatPath = ["debug-session"]
+            chatPath = [.session(Self.debugSessionId)]
+            return
+        }
+        // `-baybo-open-session <id>`: push a REAL (bound, registry-known) session
+        // headlessly. The demo sessions above are local-only, so a list merge
+        // drops their row and prunes their mirror — anything that has to survive a
+        // relaunch (a restored transcript, the image sizes it carries) can only be
+        // verified on a session the gateway actually knows.
+        let args = ProcessInfo.processInfo.arguments
+        if let flag = args.firstIndex(of: "-baybo-open-session"), flag + 1 < args.count {
+            route = .home
+            chatPath = [.session(args[flag + 1])]
+            restoreOnLaunch()
             return
         }
         if ProcessInfo.processInfo.arguments.contains("-baybo-demo-switch") {
             route = .home
-            chatPath = ["demo-a"]
+            chatPath = [.session("demo-a")]
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(5))
-                chatPath = ["demo-b"]
+                chatPath = [.session("demo-b")]
             }
             return
         }
@@ -109,11 +171,55 @@ final class AppStore: ObservableObject {
         // <agents|projects|chats|settings>` preselects a section; a few demo rows
         // seed the list so content ghosts under the glass bar.
         if ProcessInfo.processInfo.arguments.contains("-baybo-open-home") {
+            demoHomeMode = true
+            let args = ProcessInfo.processInfo.arguments
+            // `-baybo-demo-pin` records the pin reorder in isolation: the bottom
+            // row (demo-1, oldest) springs to the top ~2s in. Start with nothing
+            // pinned so it lands at the very top, not below demo-3.
+            let demoPin = args.contains("-baybo-demo-pin")
             for i in 1...6 {
                 SessionIndex.shared.recordUserSend(
                     sessionId: "demo-\(i)", text: "Demo conversation number \(i)")
             }
-            let args = ProcessInfo.processInfo.arguments
+            // Normalize archive state so repeated headless runs start identical
+            // (the container persists across suite runs, and a UI test
+            // deliberately leaves rows archived): only demo-2 starts archived.
+            for i in 1...6 {
+                SessionIndex.shared.setArchivedFlag("demo-\(i)", archived: i == 2)
+                SessionIndex.shared.setPinnedFlag("demo-\(i)", pinned: !demoPin && i == 3)
+            }
+            // Titles + a couple of unread badges so the Telegram-style row (bold
+            // title over grey preview, time + count) is screenshotable; demo-6
+            // stays untitled to exercise the single-line fallback. Past-dated
+            // activity bumps unread WITHOUT reordering (`at` isn't newer than the
+            // row's `lastActive`), so the pin-reorder demo's ordering is intact.
+            let demoTitles = [
+                "demo-1": "Ship the iOS chat list",
+                "demo-2": "Weekend trip planning",
+                "demo-3": "Refactor the sync loop",
+                "demo-4": "Groceries and errands",
+                "demo-5": "Design review notes",
+            ]
+            for (id, title) in demoTitles {
+                SessionIndex.shared.applyTitle(sessionId: id, title: title)
+            }
+            // Reset unread first so repeated headless launches show a stable
+            // count (it persists in sessions.json, so an unbalanced bump would
+            // accumulate across runs), then seed exactly one on two rows.
+            for i in 1...6 {
+                SessionIndex.shared.clearUnread("demo-\(i)")
+            }
+            // Badge demo-1 / demo-5 (not the pinned demo-3) so the screenshot
+            // shows a pinned-but-read row carrying only its tint, no glyph.
+            for id in ["demo-1", "demo-5"] {
+                SessionIndex.shared.noteActivity(sessionId: id, source: "assistant", atMillis: 0)
+            }
+            if demoPin {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(2))
+                    requestPin("demo-1", pinned: true)
+                }
+            }
             if let idx = args.firstIndex(of: "-baybo-home-tab"), idx + 1 < args.count {
                 switch args[idx + 1] {
                 case "agents": homeTab = .agents
@@ -330,6 +436,21 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Open a session from the archived screen: append, so the pop chain runs
+    /// chat → archived → list.
+    func openArchivedSession(_ sessionId: String) {
+        Task {
+            await activateSession(sessionId, ensureListed: true, appendToPath: true)
+        }
+    }
+
+    /// The Chats header's ☰ menu entry: push the archived list. Guarded so a
+    /// stray double-tap can't stack two copies.
+    func openArchived() {
+        guard !chatPath.contains(.archived) else { return }
+        chatPath.append(.archived)
+    }
+
     /// Compose: mint or reuse a local draft id. The durable gateway row is
     /// created on first send, so abandoned drafts do not pollute the session list.
     func startNewChat() async -> String? {
@@ -368,8 +489,12 @@ final class AppStore: ObservableObject {
 
     /// Select the foreground session. The FFI transport keeps one global chat
     /// leg per binding; each opened session subscribes on that leg and keeps its
-    /// sink registered for offscreen buffering.
-    private func activateSession(_ sessionId: String, ensureListed: Bool) async {
+    /// sink registered for offscreen buffering. Push-tap routing deliberately
+    /// keeps the reset path even for an archived session — backing out lands on
+    /// the main list, and the row stays reachable via the ☰ menu.
+    private func activateSession(
+        _ sessionId: String, ensureListed: Bool, appendToPath: Bool = false
+    ) async {
         if ensureListed {
             SessionIndex.shared.touch(sessionId: sessionId)
         }
@@ -377,8 +502,110 @@ final class AppStore: ObservableObject {
         // A conversation always belongs to the Chats section — backing out of it
         // must land on the list, whatever tab launched the compose/push.
         homeTab = .chats
-        chatPath = [sessionId]
+        if appendToPath {
+            if chatPath.last != .session(sessionId) {
+                chatPath.append(.session(sessionId))
+            }
+        } else {
+            chatPath = [.session(sessionId)]
+        }
         await evictIdleStores()
+    }
+
+    // MARK: - Archive / delete (optimistic, serialized per session)
+
+    /// Raise the delete confirm (`ConfirmDialog` in `RootView`) for a swiped row.
+    func promptDeleteSession(_ sessionId: String) {
+        withAnimation(ConfirmDialog.enterMotion) {
+            confirmDeleteSession = sessionId
+        }
+    }
+
+    /// Archive or unarchive, optimistically: the row moves lists at once and
+    /// the PUT follows. Also the undo path (the toast's 撤销 re-sends `false`).
+    func requestArchive(_ sessionId: String, archived: Bool) {
+        sessionNotice = nil
+        SessionIndex.shared.beginArchive(sessionId, archived: archived)
+        pumpSessionMutation(sessionId)
+    }
+
+    /// Pin or unpin, optimistically: the row re-sorts to the pinned block at
+    /// once and the PUT follows. The re-sort is not animated — see the list's
+    /// `swipeDismissal` for why a glide was never reachable from the swipe.
+    func requestPin(_ sessionId: String, pinned: Bool) {
+        sessionNotice = nil
+        SessionIndex.shared.beginPin(sessionId, pinned: pinned)
+        pumpSessionMutation(sessionId)
+    }
+
+    /// Delete (server-side soft-hide), after the confirm dialog: drop the row +
+    /// mirror optimistically, evict any resident store so a dangling
+    /// subscription doesn't keep buffering frames, and send the DELETE.
+    func requestDelete(_ sessionId: String) {
+        sessionNotice = nil
+        if let store = chatStores[sessionId], isEvictable(sessionId, store) {
+            Task { await evictStore(sessionId, store) }
+        }
+        SessionIndex.shared.beginHide(sessionId)
+        pumpSessionMutation(sessionId)
+    }
+
+    /// One in-flight request per session; `SessionIndex.pendingMutation` holds
+    /// the latest desired state. On a stale ack (the user flipped again while
+    /// the request flew — archive→undo inside the 3s toast window is the common
+    /// case) the newer intent is sent instead of resolving; on failure the
+    /// still-current intent rolls back with a notice, a superseded one just
+    /// yields to the newer send. Every user action gets at most one send — no
+    /// retry loops.
+    private func pumpSessionMutation(_ sessionId: String) {
+        guard !sessionMutationsInFlight.contains(sessionId),
+            let desired = SessionIndex.shared.pendingMutation(for: sessionId)
+        else { return }
+        #if DEBUG
+            if demoHomeMode {
+                SessionIndex.shared.finishMutation(sessionId)
+                return
+            }
+        #endif
+        sessionMutationsInFlight.insert(sessionId)
+        Task { @MainActor in
+            do {
+                switch desired {
+                case .archived(let archived):
+                    try await Baybo.client.chatSetArchived(
+                        sessionId: sessionId, archived: archived)
+                case .pinned(let pinned):
+                    try await Baybo.client.chatSetPinned(
+                        sessionId: sessionId, pinned: pinned)
+                case .hidden:
+                    try await Baybo.client.chatHideSession(sessionId: sessionId)
+                }
+                sessionMutationsInFlight.remove(sessionId)
+                if SessionIndex.shared.pendingMutation(for: sessionId) == desired {
+                    SessionIndex.shared.finishMutation(sessionId)
+                } else {
+                    pumpSessionMutation(sessionId)
+                }
+            } catch {
+                sessionMutationsInFlight.remove(sessionId)
+                NSLog("baybo: session mutation: %@", bayboErrorText(error))
+                guard SessionIndex.shared.pendingMutation(for: sessionId) == desired else {
+                    pumpSessionMutation(sessionId)
+                    return
+                }
+                switch desired {
+                case .archived:
+                    SessionIndex.shared.rollBackArchive(sessionId)
+                    sessionNotice = Lang.shared.t("list.archiveFailed")
+                case .pinned:
+                    SessionIndex.shared.rollBackPin(sessionId)
+                    sessionNotice = Lang.shared.t("list.pinFailed")
+                case .hidden:
+                    SessionIndex.shared.rollBackHide(sessionId)
+                    sessionNotice = Lang.shared.t("list.deleteFailed")
+                }
+            }
+        }
     }
 
     /// Bound the resident `chatStores` working set: evict the least-recently-used
@@ -407,7 +634,7 @@ final class AppStore: ObservableObject {
     }
 
     private func isEvictable(_ sessionId: String, _: ChatStore) -> Bool {
-        sessionId != chatPath.last
+        chatPath.last != .session(sessionId)
     }
 
     private func evictStore(_ sessionId: String, _ store: ChatStore) async {
@@ -420,6 +647,9 @@ final class AppStore: ObservableObject {
         let stores = Array(chatStores.values)
         chatStores.removeAll()
         chatStoreLRU.removeAll()
+        // A track from the departing binding must not keep playing (or hold
+        // the Now Playing entry) into the landing screen / next binding.
+        AudioPlayerCenter.shared.stop()
         transcriptHost?.teardown()
         transcriptHost = nil
         prewarmedDraftId = nil

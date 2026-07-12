@@ -20,7 +20,10 @@ import {
   pickInboundMedia,
   type TelegramInboundMedia,
 } from "./media/inbound.js";
-import { sendTelegramAttachment } from "./media/outbound.js";
+import {
+  sendTelegramAttachment,
+  TELEGRAM_CAPTION_MAX,
+} from "./media/outbound.js";
 import { markdownToTelegram, TELEGRAM_PARSE_MODE } from "./markdown.js";
 
 /**
@@ -192,13 +195,30 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
     payload: BotMediaPayload,
   ): Promise<void> {
     // Caption rides with the first attachment only so the user
-    // doesn't see it duplicated across a multi-photo reply.
-    let captionRemaining = payload.text;
+    // doesn't see it duplicated across a multi-photo reply. A reply too
+    // long to survive the caption cap ships as its own text message
+    // instead — captions are truncated, and silently losing the tail of
+    // an agent's answer is worse than a second message.
+    //
+    // `.length` counts UTF-16 units (what the Bot API's limits and entity
+    // offsets are measured in) while `truncateCaption` slices codepoints.
+    // Deliberate: `.length` is never smaller, so anything this admits fits
+    // under the cut and no text is lost. Do NOT "align" the two — spreading
+    // here would admit surrogate-heavy replies that Telegram then truncates.
+    const captionable = payload.text.length <= TELEGRAM_CAPTION_MAX;
+    let captionRemaining = captionable ? payload.text : "";
     for (const att of payload.attachments) {
       const bytes = await this.openAttachmentBytes(att);
       if (!bytes) continue;
       try {
-        await sendTelegramAttachment(bot, chat, att, bytes, captionRemaining);
+        await sendTelegramAttachment(
+          bot,
+          chat,
+          att,
+          bytes,
+          captionRemaining,
+          this.logger,
+        );
         captionRemaining = "";
       } catch (err) {
         this.logger.error(
@@ -206,11 +226,13 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
         );
       }
     }
-    // If every attachment failed to fetch but a caption remains, fall
-    // back to a plain text send so the conversation doesn't go silent.
-    if (captionRemaining) {
+    // Either the text was too long to be a caption, or every attachment
+    // failed to fetch and the caption never shipped. Send it plainly so
+    // neither the answer nor the conversation goes silent.
+    const trailingText = captionable ? captionRemaining : payload.text;
+    if (trailingText) {
       try {
-        await this.sendText(bot, chat, captionRemaining);
+        await this.sendText(bot, chat, trailingText);
       } catch (err) {
         this.logger.error(
           `telegram sendMedia text fallback failed: ${describeError(err)}`,

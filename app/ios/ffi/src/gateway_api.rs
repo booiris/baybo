@@ -10,6 +10,8 @@ use crate::api::ChatSessionSummary;
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
 const PATH_MOBILE_APNS_TOKEN: &str = "/v1/mobile/apns-token";
 pub(crate) const PATH_BLOBS: &str = "/v1/blobs";
+/// Content-type for every JSON-bodied request, shared by both legs.
+pub(crate) const MEDIA_TYPE_JSON: &str = "application/json";
 
 pub(crate) trait GatewayJsonClient {
     fn get_json<'a, T>(
@@ -38,6 +40,11 @@ pub(crate) trait GatewayJsonClient {
         path: &'a str,
         body: Vec<u8>,
     ) -> impl Future<Output = Result<(), String>> + Send + 'a;
+
+    fn delete_empty<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl Future<Output = Result<(), String>> + Send + 'a;
 }
 
 pub(crate) trait GatewayBlobClient {
@@ -50,6 +57,7 @@ pub(crate) trait GatewayBlobClient {
     fn download_blob(
         &self,
         blob_id: String,
+        progress: crate::blob_helper::ProgressSink,
     ) -> impl Future<Output = Result<Vec<u8>, String>> + Send + '_;
 }
 
@@ -75,9 +83,27 @@ struct SessionSummary {
     last_active: String,
     #[serde(default)]
     last_user_text: Option<String>,
+    /// Newest-message preview (any author) — absent on an older gateway.
+    #[serde(default)]
+    last_message_text: Option<String>,
+    /// Auto-generated title — absent until the title pass has run.
+    #[serde(default)]
+    title: Option<String>,
     pinned: bool,
     #[serde(default)]
+    archived: bool,
+    #[serde(default)]
     unread_count: i64,
+}
+
+#[derive(Serialize)]
+struct SetArchivedRequest {
+    archived: bool,
+}
+
+#[derive(Serialize)]
+struct SetPinnedRequest {
+    pinned: bool,
 }
 
 #[derive(Serialize)]
@@ -177,10 +203,46 @@ pub(crate) async fn list_sessions<C: GatewayJsonClient + Sync>(
             created_at: s.created_at,
             last_active: s.last_active,
             last_user_text: s.last_user_text,
+            last_message_text: s.last_message_text,
+            title: s.title,
             pinned: s.pinned,
+            archived: s.archived,
             unread_count: s.unread_count,
         })
         .collect())
+}
+
+pub(crate) async fn set_archived<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_id: String,
+    archived: bool,
+) -> Result<(), String> {
+    validate_path_segment(&session_id, "session_id")?;
+    let body = serde_json::to_vec(&SetArchivedRequest { archived })
+        .map_err(|e| format!("encode set archived request: {e}"))?;
+    let path = format!("{PATH_CHAT_SESSIONS}/{session_id}/archive");
+    client.put_empty(&path, body).await
+}
+
+pub(crate) async fn set_pinned<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    validate_path_segment(&session_id, "session_id")?;
+    let body = serde_json::to_vec(&SetPinnedRequest { pinned })
+        .map_err(|e| format!("encode set pinned request: {e}"))?;
+    let path = format!("{PATH_CHAT_SESSIONS}/{session_id}/pin");
+    client.put_empty(&path, body).await
+}
+
+pub(crate) async fn hide_session<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_id: String,
+) -> Result<(), String> {
+    validate_path_segment(&session_id, "session_id")?;
+    let path = format!("{PATH_CHAT_SESSIONS}/{session_id}");
+    client.delete_empty(&path).await
 }
 
 /// Advance the session's chat-list read cursor (max-wins server-side) — the
@@ -311,8 +373,9 @@ pub(crate) async fn upload_bytes<C: GatewayBlobClient + Sync>(
 pub(crate) async fn download_blob_bytes<C: GatewayBlobClient + Sync>(
     client: &C,
     blob_id: String,
+    progress: crate::blob_helper::ProgressSink,
 ) -> Result<Vec<u8>, String> {
-    client.download_blob(blob_id).await
+    client.download_blob(blob_id, progress).await
 }
 
 fn validate_path_segment(value: &str, name: &str) -> Result<(), String> {

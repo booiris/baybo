@@ -12,6 +12,13 @@ pub enum ControlEventKind {
     NoticeInfo,
     NoticeWarn,
     NoticeError,
+    /// The progress observer's transient narration (`AgentEvent::Progress`) —
+    /// the "what's happening now" line shown live as a folded work-block step.
+    /// Persisted here so a reload reconstructs it INTO the turn's work block
+    /// (unlike a notice, it is not terminal and never gets its own row); the
+    /// reconstruction folds it and must never route it through
+    /// `control_event_item`, so `notice_level` is `None`.
+    Progress,
 }
 
 impl ControlEventKind {
@@ -23,6 +30,7 @@ impl ControlEventKind {
             ControlEventKind::NoticeInfo => "notice_info",
             ControlEventKind::NoticeWarn => "notice_warn",
             ControlEventKind::NoticeError => "notice_error",
+            ControlEventKind::Progress => "progress",
         }
     }
 
@@ -35,6 +43,8 @@ impl ControlEventKind {
             ControlEventKind::NoticeInfo => Some("info"),
             ControlEventKind::NoticeWarn => Some("warn"),
             ControlEventKind::NoticeError => Some("error"),
+            // Not a notice — it folds into the work block, never colors a bar.
+            ControlEventKind::Progress => None,
         }
     }
 }
@@ -48,6 +58,7 @@ impl std::str::FromStr for ControlEventKind {
             "notice_info" => Ok(ControlEventKind::NoticeInfo),
             "notice_warn" => Ok(ControlEventKind::NoticeWarn),
             "notice_error" => Ok(ControlEventKind::NoticeError),
+            "progress" => Ok(ControlEventKind::Progress),
             other => Err(format!("unknown control event kind: {other}")),
         }
     }

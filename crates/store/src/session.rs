@@ -79,6 +79,19 @@ pub trait SessionStore: Send + Sync {
     /// `Session.pinned` from the column at read time.
     async fn set_pinned(&self, session_id: &SessionId, pinned: bool) -> Result<bool>;
 
+    /// Set (or clear, with `false`) the session's chat-list archive flag
+    /// (`PUT /v1/chat/sessions/:id/archive`). Presentation only — the
+    /// list surfaces keep returning archived rows and clients group them;
+    /// new activity never clears the flag. Returns `Ok(true)` when the
+    /// row existed and was updated, `Ok(false)` if no row matched.
+    ///
+    /// Same flat-column discipline as [`Self::set_hidden`]: implementations
+    /// write only the `archived` column and leave the JSON `data` blob
+    /// alone, so a concurrent `save`/`touch` (full-blob rewrite from a
+    /// stale in-memory `Session`) can't clobber the flag. `get` patches
+    /// `Session.archived` from the column at read time.
+    async fn set_archived(&self, session_id: &SessionId, archived: bool) -> Result<bool>;
+
     /// Set (or clear, with `None`) the session's chat-list folder
     /// assignment — the sidebar "move to folder" affordance
     /// (`PUT /v1/chat/sessions/:id/folder`). `None` clears it back to

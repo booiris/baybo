@@ -382,6 +382,7 @@ mod tests {
                         blob_id: "b-1".into(),
                     },
                     mime_type: "image/png".into(),
+                    filename: None,
                 },
                 ContentBlock::Thinking {
                     id: None,

@@ -29,9 +29,9 @@ use std::sync::Arc;
 use crate::core::WireAttachment;
 
 pub use api::{
-    ApnsEnvironment, AttachmentKind, AttachmentRef, BayboError, ChatSessionSummary, ClientConfig,
-    FrameSink, MessageLookup, PairAbortListener, PairChallenge, PairTarget, PairedSummary,
-    SessionListSink,
+    ApnsEnvironment, ApprovalDecision, AttachmentKind, AttachmentRef, BayboError, BlobProgress,
+    ChatSessionSummary, ClientConfig, FrameSink, MessageLookup, PairAbortListener, PairChallenge,
+    PairTarget, PairedSummary, SessionListSink,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -71,6 +71,9 @@ impl BayboClient {
     pub fn new(config: ClientConfig) -> Arc<Self> {
         install_crypto_provider();
         logging::install(config.log_dir);
+        if let Some(dir) = config.blob_cache_dir {
+            blob_helper::set_blob_cache_dir(dir.into());
+        }
         #[cfg(all(debug_assertions, target_os = "ios"))]
         debug_seed_push_key();
         let apns = Arc::new(ApnsState::new(config.apns_env));
@@ -225,6 +228,67 @@ impl BayboClient {
         .await
     }
 
+    /// Archive or unarchive `session_id` for the active binding
+    /// (`PUT /v1/chat/sessions/{id}/archive`). Direct reaches it over REST,
+    /// relay through the Noise-protected API tunnel.
+    pub async fn chat_set_archived(
+        self: Arc<Self>,
+        session_id: String,
+        archived: bool,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::set_archived(&client, session_id, archived).await
+                }
+                ActiveLeg::Relay => {
+                    gateway_api::set_archived(&relay::GatewayApi, session_id, archived).await
+                }
+            }
+        })
+        .await
+    }
+
+    /// Pin or unpin `session_id` to the top of the list for the active binding
+    /// (`PUT /v1/chat/sessions/{id}/pin`). Direct reaches it over REST, relay
+    /// through the Noise-protected API tunnel.
+    pub async fn chat_set_pinned(
+        self: Arc<Self>,
+        session_id: String,
+        pinned: bool,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::set_pinned(&client, session_id, pinned).await
+                }
+                ActiveLeg::Relay => {
+                    gateway_api::set_pinned(&relay::GatewayApi, session_id, pinned).await
+                }
+            }
+        })
+        .await
+    }
+
+    /// Soft-hide `session_id` for the active binding (`DELETE
+    /// /v1/chat/sessions/{id}` — the gateway sets `hidden`, never deleting the
+    /// row or transcript). Direct reaches it over REST, relay through the
+    /// Noise-protected API tunnel.
+    pub async fn chat_hide_session(self: Arc<Self>, session_id: String) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::hide_session(&client, session_id).await
+                }
+                ActiveLeg::Relay => gateway_api::hide_session(&relay::GatewayApi, session_id).await,
+            }
+        })
+        .await
+    }
+
     /// List the gateway's chat sessions (newest first, hidden/cron filtered) for
     /// the active binding. Direct uses the admin REST surface; relay uses the
     /// Noise-protected API tunnel so a NAT'd gateway can still refresh the
@@ -324,6 +388,33 @@ impl BayboClient {
                 }
                 ActiveLeg::Direct => {
                     transport::send(&this.direct, session_id, text, msg_id, attachments).await
+                }
+            }
+        })
+        .await
+    }
+
+    /// Answer a pending tool-approval prompt (`call_id` from the
+    /// `approval_requested` frame, or a `subscribe_state` bundle's
+    /// `pending_approvals` card). Fire-and-forget on the active binding's chat
+    /// leg: the gateway resolves the gate — releasing the blocked tool call —
+    /// and broadcasts `approval_resolved`, which arrives back on the frame
+    /// sink. A decision the leg can't deliver errors here; the server-side gate
+    /// then times out and denies (fail-closed).
+    pub async fn chat_resolve_approval(
+        self: Arc<Self>,
+        call_id: String,
+        decision: ApprovalDecision,
+    ) -> Result<(), BayboError> {
+        let this = self;
+        runtime::run(async move {
+            let decision = decision.into();
+            match active_leg()? {
+                ActiveLeg::Relay => {
+                    transport::resolve_approval(&this.relay, call_id, decision).await
+                }
+                ActiveLeg::Direct => {
+                    transport::resolve_approval(&this.direct, call_id, decision).await
                 }
             }
         })
@@ -540,20 +631,39 @@ impl BayboClient {
     /// transport, returning the verified bytes. Relay sends `GET /v1/blobs/{id}`
     /// over a dedicated E2E API tunnel blob leg into a content-addressed
     /// on-device cache (reused on the next render); direct GETs plain
-    /// `/v1/blobs/{id}` (Bearer + device id).
+    /// `/v1/blobs/{id}` (Bearer + device id). Both legs resume a partial
+    /// download rather than restarting it.
+    ///
+    /// `progress` observes the byte count while it streams; pass `None` when
+    /// nobody is watching (a thumbnail fetch). It never fires for a cache hit —
+    /// ask [`Self::blob_is_cached`] first if that distinction matters.
     pub async fn blob_download_bytes(
         self: Arc<Self>,
         blob_id: String,
+        progress: Option<Arc<dyn BlobProgress>>,
     ) -> Result<Vec<u8>, BayboError> {
         runtime::run(async move {
             match active_leg()? {
-                ActiveLeg::Direct => direct::download_blob_bytes(&self.direct, blob_id).await,
+                ActiveLeg::Direct => {
+                    direct::download_blob_bytes(&self.direct, blob_id, progress).await
+                }
                 ActiveLeg::Relay => {
-                    gateway_api::download_blob_bytes(&relay::GatewayApi, blob_id).await
+                    gateway_api::download_blob_bytes(&relay::GatewayApi, blob_id, progress).await
                 }
             }
         })
         .await
+    }
+
+    /// Is this blob already in the on-device cache? Never downloads, never
+    /// touches the network. The cache lives under the OS temp dir, which iOS
+    /// purges under storage pressure — re-ask rather than remembering a `true`.
+    pub async fn blob_is_cached(self: Arc<Self>, blob_id: String) -> bool {
+        // A probe that cannot fail: if the core task somehow can't run, "not
+        // cached" is the safe answer — the caller just downloads it again.
+        runtime::run(async move { Ok::<_, String>(blob_helper::is_cached(&blob_id).await) })
+            .await
+            .unwrap_or(false)
     }
 }
 

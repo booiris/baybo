@@ -23,7 +23,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::gateway_api::GatewayJsonClient;
+use crate::gateway_api::{GatewayJsonClient, MEDIA_TYPE_JSON};
 use crate::keychain;
 use crate::transport::SessionRegistry;
 
@@ -175,7 +175,7 @@ impl GatewayJsonClient for DirectHttp {
             let resp = self
                 .client()
                 .post(self.url(path))
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, MEDIA_TYPE_JSON)
                 .body(body)
                 .send()
                 .await
@@ -193,7 +193,7 @@ impl GatewayJsonClient for DirectHttp {
             let resp = self
                 .client()
                 .post(self.url(path))
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, MEDIA_TYPE_JSON)
                 .body(body)
                 .send()
                 .await
@@ -211,8 +211,23 @@ impl GatewayJsonClient for DirectHttp {
             let resp = self
                 .client()
                 .put(self.url(path))
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, MEDIA_TYPE_JSON)
                 .body(body)
+                .send()
+                .await
+                .map_err(|e| format!("could not reach Baybo: {e}"))?;
+            parse_empty_response(resp).await
+        }
+    }
+
+    fn delete_empty<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
+        async move {
+            let resp = self
+                .client()
+                .delete(self.url(path))
                 .send()
                 .await
                 .map_err(|e| format!("could not reach Baybo: {e}"))?;

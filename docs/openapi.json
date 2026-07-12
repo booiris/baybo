@@ -1093,6 +1093,60 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/archive": {
+      "put": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "set_session_archive",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to archive or unarchive",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSessionArchiveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Archive state updated"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/folder": {
       "put": {
         "tags": [
@@ -3619,6 +3673,15 @@
           "blob_id": {
             "type": "string"
           },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Playback length in ms for `audio` (see `WireAttachment::duration_ms`).",
+            "minimum": 0
+          },
           "filename": {
             "type": [
               "string",
@@ -3801,9 +3864,14 @@
           "created_at",
           "last_active",
           "pinned",
+          "archived",
           "unread_count"
         ],
         "properties": {
+          "archived": {
+            "type": "boolean",
+            "description": "True when the user has archived this session. Always emitted —\nthe list never filters on it, so clients with an archived view\ngroup rows themselves and clients without one keep showing every\nrow; set via `PUT /v1/chat/sessions/{id}/archive`."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -3822,6 +3890,13 @@
           "last_active": {
             "type": "string",
             "format": "date-time"
+          },
+          "last_message_text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Preview text drawn from the session's most-recent **displayable**\nmessage regardless of author — the newest user prompt or final\nassistant answer carrying text, truncated to [`PREVIEW_MAX_CHARS`].\nTelegram-style list clients render this as the row's second line so\nthe preview follows the conversation (an agent reply shows once it\nlands), while [`Self::last_user_text`] stays the user-only label the\nweb sidebar uses. `None` when the scanned tail holds only tool /\nmedia rows or the session has no turn yet."
           },
           "last_user_text": {
             "type": [
@@ -4005,6 +4080,13 @@
           "kind"
         ],
         "properties": {
+          "approval": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Decision the call's approval prompt returned (`\"approve\"` /\n`\"approve_always\"` / `\"deny\"`), read from the persisted\n`ToolResultMeta`; `None` when the call never prompted (or the row\npredates the field)."
+          },
           "kind": {
             "$ref": "#/components/schemas/WorkStepKind"
           },
@@ -5105,6 +5187,19 @@
           }
         }
       },
+      "SetSessionArchiveRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/chat/sessions/{session_id}/archive`.",
+        "required": [
+          "archived"
+        ],
+        "properties": {
+          "archived": {
+            "type": "boolean",
+            "description": "`true` to move this session into the archived group, `false` to\nrestore it to the main chat list."
+          }
+        }
+      },
       "SetSessionFolderRequest": {
         "type": "object",
         "description": "Request body for `PUT /v1/chat/sessions/{session_id}/folder`.",
@@ -5451,11 +5546,12 @@
       },
       "WorkStepKind": {
         "type": "string",
-        "description": "Kind of a reconstructed [`ChatWorkStep`] — serialized as\n`\"reasoning\"` / `\"prose\"` / `\"tool\"`.",
+        "description": "Kind of a reconstructed [`ChatWorkStep`] — serialized as\n`\"reasoning\"` / `\"prose\"` / `\"tool\"` / `\"status\"`.",
         "enum": [
           "reasoning",
           "prose",
-          "tool"
+          "tool",
+          "status"
         ]
       }
     }

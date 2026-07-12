@@ -1,7 +1,7 @@
 import type { TFunction } from "i18next";
 import { memo, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { MarkdownBody } from "./MarkdownBody";
+import { MarkdownBody } from "./Markdown";
 import type { WorkRow, WorkStep } from "./types";
 
 /// Humanized duration: seconds under a minute, "Xm Ys" under an hour,
@@ -45,7 +45,27 @@ function workedLabel(t: TFunction, elapsedMs?: number): string {
   return t("chat.worked");
 }
 
+/// The step's approval label: "waiting for approval" while the gate holds the
+/// call, then the user's verdict — which persists (`ToolResultMeta::approval`),
+/// so it is still there after a reload. `null` for a call that never prompted,
+/// which is the overwhelming majority.
+function approvalLabel(t: TFunction, step: WorkStep): string | null {
+  if (step.kind !== "tool") return null;
+  if (step.awaitingApproval) return t("chat.approvalWaiting");
+  switch (step.approval) {
+    case "approve":
+      return t("chat.approvalApproved");
+    case "approve_always":
+      return t("chat.approvalApprovedAlways");
+    case "deny":
+      return t("chat.approvalDenied");
+    default:
+      return null;
+  }
+}
+
 function WorkStepView({ step }: { step: WorkStep }) {
+  const { t } = useTranslation();
   switch (step.kind) {
     case "reasoning":
       return (
@@ -62,16 +82,33 @@ function WorkStepView({ step }: { step: WorkStep }) {
       );
     case "status":
       return <div className="step status">{step.text}</div>;
+    case "notice":
+      // An out-of-band notice that landed mid-turn — a leveled line inside the
+      // block, so it doesn't sever the card. Severity reads via the color ramp
+      // (info dim → warn ink → error red); △ is text-presentation (no emoji).
+      return (
+        <div className={`step notice notice-${step.level}`}>
+          <span className="step-glyph">△</span>
+          <span className="step-text">{step.text}</span>
+        </div>
+      );
     case "tool": {
       const failed = step.status === "error" || step.status === "denied";
-      const running = step.status === "running";
+      // A call waiting on the user is NOT "running" — the pulse would read as
+      // work in progress when nothing is happening until the card is answered.
+      const awaiting = Boolean(step.awaitingApproval);
+      const running = step.status === "running" && !awaiting;
+      const approval = approvalLabel(t, step);
       return (
-        <div className={`step tool${failed ? " failed" : ""}${running ? " running" : ""}`}>
+        <div
+          className={`step tool${failed ? " failed" : ""}${running ? " running" : ""}${awaiting ? " awaiting" : ""}`}
+        >
           {/* U+25CF, not U+23FA — the latter takes iOS's blue emoji presentation. */}
           <span className="step-glyph">●</span>
           <span className="step-text">
             {step.label}
             {step.summary ? ` — ${step.summary}` : ""}
+            {approval ? <span className="step-approval">{approval}</span> : null}
           </span>
         </div>
       );
@@ -83,7 +120,17 @@ function WorkStepView({ step }: { step: WorkStep }) {
 /// header and the live step feed; once closed, a dim "Worked Xs ›" summary the
 /// user can tap open, followed by a hairline divider (the web chat's shape,
 /// restyled to the mobile line-minimal system).
-export const WorkBlockView = memo(function WorkBlockView({ row }: { row: WorkRow }) {
+export const WorkBlockView = memo(function WorkBlockView({
+  row,
+  onToggle,
+}: {
+  row: WorkRow;
+  /// Fired with the NEW expanded state on a user tap, so the transcript can
+  /// disengage follow-to-bottom when a block opens — otherwise the pin chases
+  /// the newest edge and the inserted steps shove the summary UP instead of
+  /// opening downward from it.
+  onToggle?: (expanded: boolean) => void;
+}) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
 
@@ -107,7 +154,15 @@ export const WorkBlockView = memo(function WorkBlockView({ row }: { row: WorkRow
   }
   return (
     <div className="work closed">
-      <button type="button" className="work-summary" onClick={() => setExpanded((e) => !e)}>
+      <button
+        type="button"
+        className="work-summary"
+        onClick={() => {
+          const next = !expanded;
+          setExpanded(next);
+          onToggle?.(next);
+        }}
+      >
         <span>{workedLabel(t, row.elapsedMs)}</span>
         <span className={`work-chevron${expanded ? " open" : ""}`}>›</span>
       </button>

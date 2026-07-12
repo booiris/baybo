@@ -78,8 +78,8 @@ bytes. A content session rides one Noise-IK leg over the
 initiator static key to an approved device row, then runs the **same** `wire::Frame` chat
 loop the TUI/web use.
 
-On that loop the gateway emits `Frame::Attachment` carrying `WireAttachment{kind, blob_id,
-mime_type, size, filename}` — a **reference only**. The `WireAttachment` doc
+On that loop the gateway emits `Frame::Message` whose `attachments` carry `WireAttachment{kind,
+blob_id, mime_type, size, filename}` — a **reference only**. The `WireAttachment` doc
 (`crates/wire/src/lib.rs:95-101`) is explicit: the bytes "never ride the WS — they live in
 the gateway's `BlobStore` and are uploaded/fetched out-of-band via `POST/GET /v1/blobs/*`."
 That out-of-band route is HTTP on the gateway — channel-token-authenticated for the TUI
@@ -304,7 +304,7 @@ alone (`blob_path`), and `split_id` never compares the token — **any read path
 bypasses `stat()` has zero token enforcement.**
 
 A device only ever learns a full token-bearing `blob_id` over its **own authenticated chat
-leg** (the agent Noise-seals a `Frame::Attachment` to it). It cannot guess another blob's
+leg** (the agent Noise-seals a `Frame::Message` bearing it). It cannot guess another blob's
 token, so it cannot pull a blob it was never sent — identical to how the existing
 `GET /v1/blobs/{id}` authorizes on the token alone through the shared blob service.
 Defense-in-depth: the blob leg also requires a Noise-IK-approved device row to exist at all.

@@ -32,9 +32,9 @@ use baybo_llm::{LlmError, LlmResponse, ModelPricing, StreamEvent, TokenUsage, To
 use baybo_memory::test_support::RecordingMemory;
 use baybo_memory::{Memory, RecalledMemory};
 use baybo_model::{
-    BACKGROUND_DISPATCH_ACK_PREFIX, ContentBlock, MessageMetadata, MicroUsd,
-    PendingBackgroundResult, Role, SPAWN_SUBAGENT_TOOL_NAME, SessionId, SubagentExitStatus,
-    ThinkingContent, TriggerSource,
+    BACKGROUND_DISPATCH_ACK_PREFIX, BlobRef, ContentBlock, MessageMetadata, MicroUsd,
+    PendingBackgroundResult, Role, SHA256_PREFIX, SPAWN_SUBAGENT_TOOL_NAME, SessionId,
+    SubagentExitStatus, ThinkingContent, TriggerSource,
 };
 use baybo_tools::test_support::RecordingTool;
 use baybo_tools::{Tool, ToolOutput};
@@ -345,6 +345,243 @@ async fn tool_call_round_trip_invokes_recording_tool() {
     harness.shutdown().await;
 }
 
+/// A `ContentBlock::File` shaped like one `BlobStore::put` mints. `digest_char`
+/// is splatted into the 64 hex chars of the digest (the content identity);
+/// `token` is the per-put read capability. Two blocks with the same
+/// `digest_char` and different `token`s are the same bytes staged twice.
+fn file_block(digest_char: char, token: &str, filename: &str) -> ContentBlock {
+    ContentBlock::File {
+        blob: BlobRef {
+            blob_id: format!(
+                "{SHA256_PREFIX}{}.{token}",
+                digest_char.to_string().repeat(64)
+            ),
+        },
+        filename: filename.to_string(),
+        mime_type: "application/pdf".into(),
+        duration_ms: None,
+    }
+}
+
+fn attached_filenames(msg: &baybo_channels::OutgoingMessage) -> Vec<&str> {
+    msg.content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::File { filename, .. } => Some(filename.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Spawn a `RecordingTool` that always answers with one attachment.
+fn attaching_tool(name: &str, block: ContentBlock) -> Arc<RecordingTool> {
+    let tool = Arc::new(RecordingTool::new(name));
+    tool.set_response(ToolOutput::WithAttachments {
+        text: format!("Attached via {name}."),
+        attachments: vec![block],
+    });
+    tool
+}
+
+fn call(id: &str, tool: &str) -> StreamEvent {
+    StreamEvent::ToolCall(ToolCallInfo {
+        id: id.into(),
+        name: tool.into(),
+        arguments: json!({"path": "/tmp/x"}),
+        signature: None,
+    })
+}
+
+fn final_message(outs: &[AgentOutput]) -> &baybo_channels::OutgoingMessage {
+    outs.iter()
+        .find_map(|o| match &o.event {
+            AgentEvent::Message(m) => Some(m),
+            _ => None,
+        })
+        .expect("a final Message")
+}
+
+/// `AttachFile`-style media rides out on the turn's terminal assistant
+/// message, not as a live out-of-band push — that is what makes it survive
+/// a reload (the same blocks land in the persisted `session_messages` row).
+#[tokio::test]
+async fn tool_attachments_are_hoisted_onto_the_final_message() {
+    let tool = attaching_tool("attach_file", file_block('a', "tok", "report.pdf"));
+    let manifest = tool.manifest();
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    harness
+        .stub_llm
+        .push_stream(vec![call("call-1", "attach_file")]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("here it is".into())]);
+
+    harness.send_text("send me the report").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let msg = final_message(&outs);
+    assert!(
+        msg.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("here it is"))),
+        "the reply prose must survive, got {:?}",
+        msg.content
+    );
+    assert_eq!(
+        attached_filenames(msg),
+        vec!["report.pdf"],
+        "the tool's media must be folded into the final message, got {:?}",
+        msg.content
+    );
+    assert!(
+        msg.ordinal.is_some(),
+        "the hoisted row must be persisted so a resync can rebuild it"
+    );
+
+    harness.shutdown().await;
+}
+
+/// Media from several tool calls across several iterations accumulates, and
+/// the accumulator is not carried into a later turn.
+#[tokio::test]
+async fn attachments_accumulate_across_iterations_and_reset_per_turn() {
+    let first = attaching_tool("attach_a", file_block('a', "tok-1", "a.pdf"));
+    let second = attaching_tool("attach_b", file_block('b', "tok-2", "b.pdf"));
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(first.clone() as Arc<dyn Tool>, first.manifest())
+        .with_tool(second.clone() as Arc<dyn Tool>, second.manifest())
+        .build();
+
+    // Turn 1: two tool iterations staging distinct blobs, then the answer.
+    harness
+        .stub_llm
+        .push_stream(vec![call("call-1", "attach_a")]);
+    harness
+        .stub_llm
+        .push_stream(vec![call("call-2", "attach_b")]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("both sent".into())]);
+
+    harness.send_text("send both").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        attached_filenames(final_message(&outs)),
+        vec!["a.pdf", "b.pdf"],
+        "both iterations' media ride the one final message"
+    );
+
+    // Turn 2: no tools. The previous turn's media must not reappear.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("nothing to send".into())]);
+    harness.send_text("just talk").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let leaked = final_message(&outs)
+        .content
+        .iter()
+        .filter(|b| matches!(b, ContentBlock::File { .. }))
+        .count();
+    assert_eq!(
+        leaked, 0,
+        "the accumulator must not leak into the next turn"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A turn whose answer is only the file — no prose — must still reach the
+/// user. `is_blank_reply` (crates/agent/src/actor/mod.rs) suppresses an
+/// all-blank-text reply behind a fallback notice; a media block survives it
+/// only because of the `_ => false` catch-all. Nothing else pins that, and
+/// "simplifying" the guard to look at text blocks alone would silently swallow
+/// every media-only delivery while the rest of the suite stayed green.
+#[tokio::test]
+async fn a_media_only_reply_is_not_suppressed_as_blank() {
+    let tool = attaching_tool("attach_file", file_block('d', "tok", "chart.png"));
+    let manifest = tool.manifest();
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    harness
+        .stub_llm
+        .push_stream(vec![call("call-1", "attach_file")]);
+    // The model answers with whitespace only — the file IS the answer.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("  ".into())]);
+
+    harness.send_text("just the chart, no words").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let msg = final_message(&outs);
+    assert_eq!(
+        attached_filenames(msg),
+        vec!["chart.png"],
+        "a media-only reply must still deliver the file, got {:?}",
+        msg.content
+    );
+    assert!(
+        !outs
+            .iter()
+            .any(|o| matches!(&o.event, AgentEvent::Notice { .. })),
+        "no empty-reply fallback notice for a media-only turn, got {outs:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+/// Staging the same bytes twice in one turn must show the user one file.
+/// The two blobs carry DIFFERENT `blob_id`s — every `put` mints a fresh read
+/// token — and share a digest, so a dedup keyed on the id would let both
+/// through. That is the whole point of keying on the digest.
+#[tokio::test]
+async fn the_same_blob_staged_twice_lands_on_the_reply_once() {
+    let first = attaching_tool("attach_a", file_block('c', "tok-1", "report.pdf"));
+    let second = attaching_tool("attach_b", file_block('c', "tok-2", "report.pdf"));
+    // Same content, two capability ids — exactly what two `AttachFile` calls
+    // on one path produce.
+    assert_ne!(
+        first.manifest().name,
+        second.manifest().name,
+        "distinct tools so the stub LLM can call each once"
+    );
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(first.clone() as Arc<dyn Tool>, first.manifest())
+        .with_tool(second.clone() as Arc<dyn Tool>, second.manifest())
+        .build();
+
+    harness
+        .stub_llm
+        .push_stream(vec![call("call-1", "attach_a")]);
+    harness
+        .stub_llm
+        .push_stream(vec![call("call-2", "attach_b")]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("here it is".into())]);
+
+    harness.send_text("send the report, twice").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(
+        attached_filenames(final_message(&outs)),
+        vec!["report.pdf"],
+        "one blob, one bubble — got {:?}",
+        final_message(&outs).content
+    );
+
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn tool_call_emits_started_and_completed_progress() {
     let tool = Arc::new(RecordingTool::new("echo_tool"));
@@ -381,7 +618,7 @@ async fn tool_call_emits_started_and_completed_progress() {
     assert!(
         outs.iter().any(|o| matches!(
             &o.event,
-            AgentEvent::ToolCompleted { call_id, status, summary }
+            AgentEvent::ToolCompleted { call_id, status, summary, .. }
                 if call_id == "call-1" && *status == ToolStatus::Ok && summary == "3 lines"
         )),
         "expected a ToolCompleted(Ok, \"3 lines\") for the echo_tool call, got {outs:?}"
