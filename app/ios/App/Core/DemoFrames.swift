@@ -13,6 +13,31 @@
         private static let demoAttachmentsArg = "-baybo-demo-attachments"
         private static let demoDownloadArg = "-baybo-demo-download"
         private static let demoImagesArg = "-baybo-demo-images"
+        static let demoApprovalArg = "-baybo-demo-approval"
+        static let demoSwitchArg = "-baybo-demo-switch"
+
+        /// Flags that push a canned TURN — rows that look durable but are backed
+        /// by no gateway — into a session that is only ever a local draft.
+        private static let cannedTurnArgs = [
+            demoFramesArg, demoAttachmentsArg, demoImagesArg, demoApprovalArg, demoSwitchArg,
+        ]
+
+        /// True while such a fixture is driving. `ChatStore.requestSync` reads it:
+        /// a draft's baseline `sync_page` is empty and REPLACES the thread, which
+        /// is exactly right for a real draft (nothing durable exists yet, and the
+        /// optimistic bubble is preserved) and exactly wrong for a demo, whose
+        /// canned rows are neither optimistic nor durable and so get wiped.
+        ///
+        /// It only ever bit us on a slow machine: the webview's mount sync and
+        /// the demo's timer race, and on a dev Mac the sync lands FIRST (wiping
+        /// an empty thread, harmlessly) while a loaded CI runner boots the
+        /// webview slowly enough that the canned turn is replayed first and the
+        /// sync then deletes it. The turn simply vanished, and the UI smokes read
+        /// it as the product failing to render.
+        static var isDrivingCannedTurn: Bool {
+            let args = ProcessInfo.processInfo.arguments
+            return cannedTurnArgs.contains(where: args.contains)
+        }
 
         /// Natural pixel sizes the demo images decode to — a spread that makes a
         /// wrongly-reserved box obvious: a portrait that grows its row, a banner
