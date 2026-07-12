@@ -754,19 +754,16 @@ impl ContextManager {
         self.tokenizer.count_message(&ChatMessage::user(framed))
     }
 
-    /// Append a message to the in-memory transcript + token budget
-    /// **without** persisting it to `session_messages`. The
-    /// subagent-notification turn rebuilds its synthetic prompt from the
-    /// durable `pending_background_results` buffer on every retry, so a
-    /// persisted row would be duplicated on each failed attempt under the
-    /// infinite-backoff retry. The buffer is the source of truth; only the
-    /// model's proactive reply (if any) is persisted. The caller rolls this
-    /// row back via [`Self::restore_messages`] if the turn fails.
-    pub fn append_in_memory(&mut self, msg: &ChatMessage) {
-        let count = self.tokenizer.count_message(msg);
-        record_skill_calls(&mut self.called_skills, msg);
-        self.messages.push(msg.clone());
-        self.per_message_tokens.push(count);
+    /// Remove the tail row after [`Self::append`] reported its persist failed
+    /// (`None`). `append` pushes onto the in-memory window *before* writing
+    /// the store, so a failed persist leaves a row the log doesn't have —
+    /// wedging the window/log lockstep that the trace input markers and the
+    /// compression fast-path rely on. Sound only for the just-appended tail;
+    /// callers must invoke it immediately, before any further append.
+    pub fn pop_unpersisted_tail(&mut self) {
+        self.messages.pop();
+        self.per_message_tokens.pop();
+        self.called_skills = self.called_skills_in(&self.messages);
         self.budget.update(self.count_tokens());
     }
 
@@ -1263,19 +1260,18 @@ impl ContextManager {
     /// active set by ordinal; `suffix` rides inline so hydration can
     /// rebuild the exact `request.messages` the LLM saw. Falls back to a
     /// fully inline marker (prefix + suffix) when the store has no rows
-    /// yet, the lookup errors, or an in-memory-only row (`append_in_memory`)
-    /// makes the active set diverge from the in-memory window.
+    /// yet, the lookup errors, or the active set diverges from the
+    /// in-memory window (a failed persist that wasn't rolled back).
     pub async fn input_marker_with_suffix(&self, suffix: Vec<ChatMessage>) -> LlmCallInputs {
         // Emit a `Persisted` reference only when the anchor ordinal and the
         // prefix count are both known AND the persisted active set mirrors the
         // in-memory window (`count == messages.len()` — the same invariant
-        // `synced_last_ordinal` guards). An in-memory-only row
-        // (`append_in_memory`, e.g. the subagent-notification turn's synthetic
-        // prompt that is deliberately not persisted) would make `prefix_len`
-        // under-count the real prefix; and because the tripwire compares the
-        // reconstructed count against that same `prefix_len`, the omission
-        // would pass silently. Any miss falls back to a self-contained inline
-        // copy.
+        // `synced_last_ordinal` guards). Every append persists its row in
+        // lockstep (a failed persist is popped back off via
+        // `pop_unpersisted_tail`), so a divergence here means a store error
+        // slipped through; the tripwire can't catch an under-counted prefix
+        // (the reconstructed count would match it), so any miss falls back to
+        // a self-contained inline copy instead.
         if let (Ok(Some(last_ordinal)), Ok(prefix_len)) = (
             self.sessions.latest_session_ordinal(&self.session_id).await,
             self.sessions.count_active_messages(&self.session_id).await,
@@ -2142,31 +2138,56 @@ mod tests {
         }
     }
 
-    /// An `append_in_memory` row (the subagent-notification turn's synthetic
-    /// prompt) lives in the window but not in `session_messages`, so the active
-    /// count under-counts the real prefix. A `Persisted` marker would silently
-    /// drop that row on hydration AND slip past the `prefix_len` tripwire (the
-    /// reconstructed count matches the under-counted `prefix_len`), so the
-    /// marker must fall back to a self-contained `Inline` copy of the whole
-    /// window plus the suffix.
+    /// A window/log divergence (a store row the window doesn't have, or vice
+    /// versa) means a `Persisted` marker would hydrate the wrong slice AND
+    /// slip past the `prefix_len` tripwire, so the marker must fall back to a
+    /// self-contained `Inline` copy of the whole window plus the suffix. Every
+    /// append persists in lockstep, so this is defense against a store error
+    /// that slipped through — simulated here by writing a row behind the
+    /// manager's back.
     #[tokio::test]
-    async fn input_marker_falls_back_to_inline_on_in_memory_only_rows() {
+    async fn input_marker_falls_back_to_inline_on_window_log_divergence() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
         ctx.append(&make_msg(Role::System, "sys")).await; // persisted (active = 1)
         ctx.append(&make_msg(Role::User, "hi")).await; // persisted (active = 2)
-        ctx.append_in_memory(&make_msg(Role::User, "subagent done")); // window = 3, active = 2
+        ctx.sessions
+            .append_session_message(&ctx.session_id, &make_msg(Role::User, "behind the back"))
+            .await
+            .expect("direct store append"); // active = 3, window = 2
 
         let suffix = vec![make_msg(Role::User, "observer prompt")];
         match ctx.input_marker_with_suffix(suffix).await {
             LlmCallInputs::Inline(messages) => {
                 assert_eq!(
                     messages.len(),
-                    4,
-                    "Inline must carry the full window (3) + suffix (1) verbatim"
+                    3,
+                    "Inline must carry the full window (2) + suffix (1) verbatim"
                 );
             }
             other => panic!("expected Inline fallback, got {other:?}"),
         }
+    }
+
+    /// `pop_unpersisted_tail` is the failed-persist compensator: `append`
+    /// pushes in-memory before writing the store, so on `None` the caller
+    /// pops the tail to keep window == log. Everything derived from the
+    /// window (budget, per-message cache) must roll back with it.
+    #[tokio::test]
+    async fn pop_unpersisted_tail_restores_window_and_budget() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, "hi")).await;
+        let before_len = ctx.messages().len();
+        let before_budget = ctx.budget().current();
+
+        ctx.append(&make_msg(Role::User, "doomed row")).await;
+        ctx.pop_unpersisted_tail();
+
+        assert_eq!(ctx.messages().len(), before_len);
+        assert_eq!(ctx.budget().current(), before_budget);
+        // The window mirrors the log again... except the store kept the
+        // "doomed" row (this test's store never fails); the marker fallback
+        // covers that divergence. What matters here is the in-memory rollback.
     }
 
     #[tokio::test]

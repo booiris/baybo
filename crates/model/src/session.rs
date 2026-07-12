@@ -345,6 +345,17 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub background_groups: std::collections::HashMap<String, GroupState>,
 
+    /// The delivery ledger for a subagent-notification turn whose prompt row
+    /// is already persisted in the transcript but whose proactive reply has
+    /// not been delivered yet. Opened when a drained batch's prompt row lands
+    /// in `session_messages`; cleared when the turn produces a reply (or the
+    /// attempt cap degrades delivery to passive — the prompt row is durable,
+    /// so the next real turn's model still reads it). Persisted with the
+    /// session so a reaped actor re-drives the turn on hydration, exactly
+    /// like `pending_background_results`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_notification_turn: Option<PendingNotificationTurn>,
+
     /// `CronExecution` ids whose one-shot result this session has already
     /// appended (see the actor's `CronResultReady` handler). The delivery
     /// ledger's `notified_at` stamp is written *after* the append, so a crash
@@ -387,6 +398,25 @@ pub struct SessionState {
     /// Reserved extension fields for plugins and experiments.
     #[serde(default)]
     pub extra: HashMap<String, Value>,
+}
+
+/// Delivery ledger for one outstanding subagent-notification turn. The
+/// ledger is self-sufficient: `content` is the built prompt frozen at drain
+/// time, so a retry never point-reads the transcript — after a compaction
+/// reshuffles ordinals, the prompt is simply re-appended from here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingNotificationTurn {
+    /// The framed notification prompt, exactly as persisted.
+    pub content: Vec<crate::ContentBlock>,
+    /// `session_messages` ordinal of the persisted prompt row. Dangles after
+    /// any compaction (compaction supersedes every active row and re-inserts
+    /// at fresh ordinals), which the retry path detects and repairs by
+    /// re-appending from `content`.
+    pub prompt_ordinal: i64,
+    /// Failed delivery attempts so far. At the actor's attempt cap the
+    /// ledger clears and delivery degrades to passive.
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 /// A barrier cohort of grouped subagents. Members' results accumulate in

@@ -1,9 +1,9 @@
 //! Framing for the autonomous notification turn — the synthetic prompt the
 //! parent session runs when one or more background jobs (detached subagents
 //! and detached `Bash` commands) finish. Built here (pure) so the framing
-//! lives with the rest of the prompt-injection text; the agent actor appends
-//! the result **in-memory only** (rebuilt from the durable
-//! `pending_background_results` buffer on every retry) and never persists it.
+//! lives with the rest of the prompt-injection text; the agent actor persists
+//! the result as a hidden agent-context row and records it on the session's
+//! notification ledger, which drives delivery retries.
 
 use baybo_model::{BackgroundJobKind, ContentBlock, PendingBackgroundResult, SubagentExitStatus};
 
@@ -22,11 +22,29 @@ const BACKGROUND_RESULT_TEMPLATE: &str = r#"  <result handle="{{handle}}" type="
 {{detail}}  </result>
 "#;
 
+/// Cue row appended (persisted) ahead of a notification-turn retry. It is
+/// load-bearing, not decoration: a cancelled attempt's salvage leaves an
+/// assistant row at the transcript tail, and a request ending on an assistant
+/// message is provider *prefill* — rejected outright by Anthropic with
+/// extended thinking on — so the retry needs a user-side tail; it also
+/// un-buries the prompt from behind the failed attempt's partial rows, and it
+/// makes a blank retry reply a genuine "nothing to add" judgment instead of
+/// an "I already answered above" artifact.
+const RETRY_CUE_TEMPLATE: &str = "[delivery attempt {{attempt}} for the background results above was interrupted before a reply reached the user — produce the complete report now.]";
+
+/// Render the persisted retry-cue row for delivery attempt `attempt`
+/// (1-based; attempt 1 is the original drain, so cues start at 2).
+pub fn build_retry_cue(attempt: u32) -> Vec<ContentBlock> {
+    vec![ContentBlock::Text(
+        RETRY_CUE_TEMPLATE.replace("{{attempt}}", &attempt.to_string()),
+    )]
+}
+
 /// Render pending background-job results into nested-XML content for one
-/// notification turn. Pure — the caller owns the buffer so it can restore the
-/// results if the turn fails. The framing rides in this per-turn content
-/// (never the system prompt) so the prompt-cache prefix stays identical to a
-/// normal main-path turn.
+/// notification turn. Pure — the actor freezes the rendered content on the
+/// notification ledger, so a retry re-runs against exactly this prompt. The
+/// framing rides in this per-turn content (never the system prompt) so the
+/// prompt-cache prefix stays identical to a normal main-path turn.
 pub fn build_notification_content(pending: &[PendingBackgroundResult]) -> Vec<ContentBlock> {
     let mut xml = String::from(BACKGROUND_NOTIFICATION_FRAMING);
     xml.push_str("\n\n<background_results>\n");

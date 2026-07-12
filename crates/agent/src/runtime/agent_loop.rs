@@ -9,7 +9,7 @@ use baybo_llm::{
 };
 use baybo_memory::{Memory, MemoryContext};
 use baybo_model::{
-    ChatMessage, ContentBlock, JobId, LlmEntryName, MessageSource, Role, SessionId, ThinkingContent,
+    ChatMessage, ContentBlock, JobId, LlmEntryName, MessageSource, SessionId, ThinkingContent,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -19,7 +19,7 @@ use baybo_tools::{ApprovalDecision, ReadTracker, ToolConcurrency, ToolOutput, To
 use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
@@ -598,21 +598,6 @@ impl AgentLoop {
             .rebuild_from_messages(self.context_manager.messages());
     }
 
-    /// Snapshot the in-memory transcript so a fallible turn can be rolled
-    /// back. Used by the subagent-notification retry path: that turn's
-    /// synthetic prompt is appended in-memory only (not persisted), so on
-    /// failure the actor restores this snapshot to drop the row before the
-    /// next retry rebuilds it — otherwise the live context would stack a copy
-    /// per attempt.
-    pub fn context_snapshot(&self) -> Vec<ChatMessage> {
-        self.context_manager.messages().to_vec()
-    }
-
-    /// Restore a transcript snapshot taken by [`Self::context_snapshot`].
-    pub fn restore_context(&mut self, messages: Vec<ChatMessage>) {
-        self.context_manager.restore_messages(messages);
-    }
-
     /// Load the session's planning checklist, (throttled) refresh the transient
     /// reminder the model sees, and push the live list to any work-block client
     /// (the web checklist) via `delta_tx`. `inject` is the per-turn throttle
@@ -652,16 +637,6 @@ impl AgentLoop {
                 })
                 .await;
         }
-    }
-
-    /// Seed the system prompt (+ skill reminder) if the transcript doesn't
-    /// already lead with it. Idempotent. Exposed so the subagent-notification
-    /// path can establish the (persisted) system row *before* snapshotting the
-    /// context for rollback — otherwise a rollback on a fresh session would
-    /// drop the just-persisted system row in-memory and the next retry would
-    /// re-seed and re-persist it.
-    pub async fn ensure_system_prompt_seeded(&mut self) {
-        self.context_manager.ensure_seeded().await;
     }
 
     /// Run the main conversation loop for a single user message.
@@ -2020,41 +1995,28 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Append the synthetic `SubagentNotification` prompt **in-memory only**.
-    /// It is rebuilt from the durable `pending_background_results` buffer on
-    /// every retry, so persisting per-attempt would stack duplicate hidden
-    /// rows under the infinite-backoff retry. The caller seeds the system
-    /// prompt and snapshots the transcript *before* this so a failed turn can
-    /// roll the row back; `content` is built via
-    /// [`baybo_context::prompts::subagent::build_notification_content`].
-    pub fn append_subagent_notification(&mut self, content: Vec<ContentBlock>) {
-        // Unlike the other append_* helpers this does NOT seed the system
-        // prompt: the caller must have seeded (and snapshotted) *before* this,
-        // so a failed turn's rollback can't drop the system row. Self-seeding
-        // here would append the system row to the tail, after the notification.
-        let seeded = self
-            .context_manager
-            .messages()
-            .first()
-            .is_some_and(|m| m.role == Role::System);
-        debug_assert!(
-            seeded,
-            "append_subagent_notification requires the system prompt already seeded \
-             (call ensure_system_prompt_seeded before snapshotting)"
-        );
-        if !seeded {
-            // Unreachable given the sole caller, but in release (debug_assert
-            // compiled out) don't push the notification ahead of a not-yet-seeded
-            // system row: that would leave messages[0] off the system prompt and
-            // break the prompt-cache prefix. Drop the row and log loudly instead.
-            error!(
-                "append_subagent_notification called before the system prompt was seeded; \
-                 dropping the in-memory notification to keep the transcript prefix intact"
-            );
-            return;
-        }
+    /// Append the `SubagentNotification` prompt as a persisted agent-context
+    /// row (hidden from chat surfaces, like [`Self::append_spawned_prompt`])
+    /// and return its ordinal. Seeds the system prompt first — the
+    /// notification can be the first thing an otherwise-cold session appends.
+    ///
+    /// `None` means the persist failed; the just-pushed row has been popped
+    /// back off the window so the transcript and the log stay in lockstep.
+    /// The caller leaves the batch buffered and retries the whole drain on
+    /// its backoff.
+    pub async fn append_subagent_notification(
+        &mut self,
+        content: Vec<ContentBlock>,
+    ) -> Option<i64> {
+        self.context_manager.ensure_seeded().await;
         let msg = ChatMessage::agent_context(content);
-        self.context_manager.append_in_memory(&msg);
+        match self.context_manager.append(&msg).await {
+            Some(ordinal) => Some(ordinal),
+            None => {
+                self.context_manager.pop_unpersisted_tail();
+                None
+            }
+        }
     }
 
     /// Run a streaming chat request, forwarding each text chunk through

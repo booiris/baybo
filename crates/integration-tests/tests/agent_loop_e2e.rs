@@ -1108,13 +1108,105 @@ async fn subagent_notification_suppresses_empty_reply() {
     harness.shutdown().await;
 }
 
+/// Regression (the storage.db O(N²) bloat): the notification prompt used to
+/// be appended in-memory only, permanently desyncing the window from the
+/// log's active count — every later `llm_call` trace span then fell to
+/// `Inline`, cloning the whole growing transcript per call (24.7 MB / 42% of
+/// a measured production DB). The prompt row is persisted now, so the
+/// window/log lockstep holds by construction and every span stays a
+/// `Persisted` reference through and after the notification turn.
 #[tokio::test]
-async fn subagent_notification_failure_keeps_pending_for_retry() {
+async fn subagent_notification_keeps_later_spans_persisted() {
+    use baybo_trace::{LlmCallInputs, SpanKind, TraceStore};
+
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+
+    for reply in ["turn one", "ack", "turn two"] {
+        harness.stub_llm.push_response(LlmResponse {
+            content: reply.into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: TokenUsage::default(),
+            thinking: None,
+        });
+    }
+
+    harness.send_text("hello").await.expect("user turn 1");
+    harness.drain_outputs(Duration::from_millis(500)).await;
+
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            PendingBackgroundResult::subagent(
+                "bg-1",
+                "explorer",
+                "go look",
+                SessionId::from("child-N"),
+                "found the thing",
+                SubagentExitStatus::Completed,
+            ),
+        )))
+        .await
+        .expect("inject BackgroundJobFinished");
+    harness.drain_outputs(Duration::from_millis(500)).await;
+
+    // The turn *after* the notification is where the old design inlined: the
+    // unpersisted row made the active count under-count the window forever.
+    harness.send_text("and now?").await.expect("user turn 2");
+    harness.drain_outputs(Duration::from_millis(500)).await;
+
+    let trace_store: Arc<dyn TraceStore> = harness.trace_store.clone();
+    let jobs = baybo_store::JobStore::list_all(harness.job_store.as_ref())
+        .await
+        .expect("list jobs");
+    let mut llm_inputs = Vec::new();
+    for job in &jobs {
+        for step in trace_store.list_steps_by_job(&job.id).await.unwrap() {
+            let step = baybo_trace::Step::from_row(step).unwrap();
+            for row in trace_store.list_spans_by_step(&step.id).await.unwrap() {
+                let span = baybo_trace::Span::from_row(row).unwrap();
+                if let SpanKind::LlmCall { begin, .. } = span.kind {
+                    llm_inputs.push(begin.input_messages);
+                }
+            }
+        }
+    }
+
+    assert_eq!(llm_inputs.len(), 3, "one LlmCall span per turn");
+    for (i, input) in llm_inputs.iter().enumerate() {
+        assert!(
+            matches!(input, LlmCallInputs::Persisted { .. }),
+            "span {i} inlined the transcript — the O(N²) span-bloat regression is back: {input:?}"
+        );
+    }
+
+    // And the prompt row is exactly where the spans' references point: in
+    // the durable transcript.
+    let transcript = harness
+        .session_manager
+        .load_active_session_messages(&session_id)
+        .await
+        .expect("load transcript");
+    assert!(
+        transcript.iter().any(|m| m.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::Text(t) if t.contains("bg-1")
+        ))),
+        "the notification prompt must be a persisted transcript row"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn subagent_notification_failure_keeps_ledger_for_retry() {
     // If the autonomous notification turn fails (provider error, cost
-    // rejection, cancellation), the delivered result must NOT be lost — it
-    // stays buffered so a later drain retries it. (Regression: an earlier
-    // version drained + persisted the empty buffer *before* the fallible
-    // turn, dropping the result on any failure.)
+    // rejection, cancellation), the delivered result must NOT be lost. The
+    // prompt row is persisted to the transcript BEFORE the fallible turn and
+    // recorded on the delivery ledger; a failure only bumps the ledger's
+    // attempt count — nothing is rolled back, and the durable prompt row
+    // means even a crashed actor's next real turn reads the results.
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
 
@@ -1142,38 +1234,53 @@ async fn subagent_notification_failure_keeps_pending_for_retry() {
 
     // The turn was attempted (LLM called) …
     assert_eq!(harness.stub_llm.captured_requests().len(), 1);
-    // … but the result is preserved for retry, not dropped.
     let stored = harness
         .session_manager
         .get(&session_id)
         .await
         .expect("load session")
         .expect("row present");
-    assert_eq!(
-        stored.state.pending_background_results.len(),
-        1,
-        "failed notification turn must keep the pending result"
+    // … the batch moved from the buffer onto the delivery ledger …
+    assert!(
+        stored.state.pending_background_results.is_empty(),
+        "the drained batch must not be re-buffered; the ledger owns it now"
     );
-    assert_eq!(
-        stored.state.pending_background_results[0].handle_id,
-        "bg-keep"
+    let ledger = stored
+        .state
+        .pending_notification_turn
+        .as_ref()
+        .expect("failed notification turn must leave the delivery ledger open");
+    assert_eq!(ledger.attempts, 1, "one failed attempt recorded");
+    // … and the prompt row itself is already durable in the transcript, so
+    // the results survive even a crash that loses the ledger.
+    let transcript = harness
+        .session_manager
+        .load_active_session_messages(&session_id)
+        .await
+        .expect("load transcript");
+    assert!(
+        transcript.iter().any(|m| m.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::Text(t) if t.contains("bg-keep")
+        ))),
+        "the notification prompt row must be persisted before the turn runs"
     );
 
     harness.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn failed_subagent_notification_retries_until_success() {
-    // The notification turn retries indefinitely on exponential backoff —
-    // there is NO attempt cap — so a completion is delivered once the
-    // provider recovers, even after MORE failures than the old cap would
-    // have allowed. Paused time auto-advances through the real backoffs, so
-    // this runs instantly.
+async fn failed_subagent_notification_retries_and_delivers() {
+    // The delivery ledger retries a failed notification turn on the timed
+    // backoff — forward-only: the prompt row persists ONCE and each retry
+    // appends a small cue row instead of rebuilding (or duplicating) the
+    // prompt. Paused time auto-advances through the real backoffs, so this
+    // runs instantly.
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
 
-    // Six consecutive failures (past the former 5-attempt cap), then success.
-    for _ in 0..6 {
+    // Two failures, then success (within the attempt cap).
+    for _ in 0..2 {
         harness
             .stub_llm
             .push_response_err(LlmError::Internal(anyhow::anyhow!("provider blip")));
@@ -1201,17 +1308,17 @@ async fn failed_subagent_notification_retries_until_success() {
         .await
         .expect("inject BackgroundJobFinished");
 
-    // Long enough that auto-advance steps past the first retry backoff (60s)
-    // and the retry's reply reaches the channel.
+    // Long enough that auto-advance steps past the retry backoffs and the
+    // retry's reply reaches the channel.
     let outputs = harness.drain_outputs(Duration::from_secs(2000)).await;
 
-    // Attempted at least 7 times (initial + 6 retries) — past the former
-    // cap, proving there is no give-up …
-    assert!(
-        harness.stub_llm.captured_requests().len() >= 7,
-        "a failed notification must retry past the old attempt cap"
+    // Attempted 3 times (initial + 2 retries) …
+    assert_eq!(
+        harness.stub_llm.captured_requests().len(),
+        3,
+        "initial attempt + two ledger retries"
     );
-    // … the retry drained the buffer …
+    // … the delivery settled: buffer empty, ledger closed …
     let stored = harness
         .session_manager
         .get(&session_id)
@@ -1220,7 +1327,11 @@ async fn failed_subagent_notification_retries_until_success() {
         .expect("row present");
     assert!(
         stored.state.pending_background_results.is_empty(),
-        "a successful retry must drain the buffer"
+        "a successful retry must leave the buffer empty"
+    );
+    assert!(
+        stored.state.pending_notification_turn.is_none(),
+        "a delivered notification must close the ledger"
     );
     // … and the retry's reply reached the channel.
     assert!(
@@ -1235,9 +1346,8 @@ async fn failed_subagent_notification_retries_until_success() {
         "the retry's reply must reach the channel"
     );
 
-    // P2 regression: the synthetic notification prompt is appended in-memory
-    // only and rolled back on each failed attempt, so it never accumulates —
-    // not in the successful request, and not in the persisted transcript.
+    // Append-once: the successful request carries the prompt row exactly once
+    // (plus cue rows), never one prompt copy per failed attempt.
     let captured = harness.stub_llm.captured_requests();
     let last_user_text: String = captured
         .last()
@@ -1256,6 +1366,11 @@ async fn failed_subagent_notification_retries_until_success() {
         1,
         "the successful turn must see the result once, not one copy per failed retry: {last_user_text}"
     );
+    assert_eq!(
+        last_user_text.matches("delivery attempt").count(),
+        2,
+        "each retry appends exactly one cue row: {last_user_text}"
+    );
 
     let persisted = harness
         .session_manager
@@ -1271,13 +1386,91 @@ async fn failed_subagent_notification_retries_until_success() {
         })
         .count();
     assert_eq!(
-        persisted_notification_rows, 0,
-        "the in-memory-only notification row must never be persisted, even across failed retries"
+        persisted_notification_rows, 1,
+        "the prompt row persists exactly once across retries"
     );
     let persisted_system_rows = persisted.iter().filter(|m| m.role == Role::System).count();
     assert_eq!(
         persisted_system_rows, 1,
         "the system prompt must be seeded once, not re-seeded on each retry"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn failing_subagent_notification_caps_retries_and_degrades_to_passive() {
+    // At the attempt cap the ledger clears and active retries STOP — but the
+    // results are not lost: the prompt row is durable in the transcript, so
+    // the next real turn's model reads it (passive delivery). The cap exists
+    // because each retry's state persist bumps `last_active`, so an
+    // ever-failing turn would pin the actor resident forever.
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+
+    // More failures queued than the cap will ever consume.
+    for _ in 0..10 {
+        harness
+            .stub_llm
+            .push_response_err(LlmError::Internal(anyhow::anyhow!("provider down")));
+    }
+
+    harness
+        .mailbox
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            PendingBackgroundResult::subagent(
+                "bg-capped",
+                "explorer",
+                "find X",
+                SessionId::from("child-C"),
+                "found X",
+                SubagentExitStatus::Completed,
+            ),
+        )))
+        .await
+        .expect("inject BackgroundJobFinished");
+
+    // Far past every backoff the cap allows; auto-advance makes it instant.
+    let outputs = harness.drain_outputs(Duration::from_secs(5000)).await;
+
+    assert_eq!(
+        harness.stub_llm.captured_requests().len(),
+        5,
+        "active retries must stop at the attempt cap"
+    );
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o.event, AgentEvent::Message(_))),
+        "nothing was delivered — every attempt failed"
+    );
+    let stored = harness
+        .session_manager
+        .get(&session_id)
+        .await
+        .expect("load session")
+        .expect("row present");
+    assert!(
+        stored.state.pending_notification_turn.is_none(),
+        "the cap must close the ledger so the actor can be reaped"
+    );
+    assert!(
+        stored.state.pending_background_results.is_empty(),
+        "the batch is not re-buffered — the durable prompt row carries it"
+    );
+    // Passive delivery: the results survive in the transcript for the next
+    // real turn to read.
+    let persisted = harness
+        .session_manager
+        .load_active_session_messages(&session_id)
+        .await
+        .expect("load persisted transcript");
+    assert!(
+        persisted.iter().any(|m| m.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::Text(t) if t.contains("bg-capped")
+        ))),
+        "the prompt row must remain in the transcript after the cap"
     );
 
     harness.shutdown().await;

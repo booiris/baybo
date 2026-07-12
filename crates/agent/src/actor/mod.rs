@@ -19,7 +19,7 @@ use baybo_channels::{
 use baybo_job::JobInput;
 use baybo_model::{
     ContentBlock, ControlEventKind, ExecutionOutcome, LlmEntryName, PendingBackgroundResult,
-    PendingCronResult,
+    PendingCronResult, PendingNotificationTurn,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -54,15 +54,18 @@ const GROUP_TIMEOUT_MINUTES: i64 = 30;
 /// Exponential-backoff retry schedule for a FAILED `SubagentNotification`
 /// turn. When the turn errors (provider / cost / cancel) and the session is
 /// idle, the actor retries on this backoff so a fire-and-forget completion is
-/// still reported during the idle window. There is **no attempt cap** — a
-/// delivered completion is never dropped, so the actor retries indefinitely
-/// (each step doubling, capped at `NOTIFY_RETRY_MAX_BACKOFF`) until it
-/// succeeds; an inbound message resets the schedule. Trade-off: a session
-/// whose notification turn keeps failing stays resident (each retry bumps
-/// `last_active`, so the idle reaper won't reclaim it) rather than dropping
-/// the completion — the result is also buffered + persisted throughout.
+/// still reported during the idle window. Each step doubles, capped at
+/// `NOTIFY_RETRY_MAX_BACKOFF`; an inbound message resets the schedule.
 const NOTIFY_RETRY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 const NOTIFY_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Delivery attempts for one notification ledger before the actor stops
+/// retrying. The results are NOT lost at the cap: the prompt row is durable
+/// in the transcript, so delivery degrades to *passive* — the next real
+/// turn's model reads the results and reports then. The cap exists because
+/// each retry's state persist bumps `last_active`, so a perpetually failing
+/// turn would otherwise pin the actor resident forever.
+const NOTIFY_TURN_MAX_ATTEMPTS: u32 = 5;
 
 /// Surfaced (as a `Notice`) when a *user* turn yields a blank reply — the
 /// user is waiting, so acknowledge rather than push an empty bubble. Non-user
@@ -308,26 +311,20 @@ impl AgentActor {
             .restore_transcript_from_store()
             .await;
 
-        // A failed `SubagentNotification` turn leaves the buffer non-empty;
-        // rather than wait for the next inbound message, retry on an
-        // exponential backoff (capped at `NOTIFY_RETRY_MAX_BACKOFF`) so a
-        // fire-and-forget completion is still reported during the idle
-        // window. No attempt cap — a delivered completion is never dropped,
-        // so the actor keeps retrying until it succeeds. A real inbound
-        // message wins the race (biased) and resets the backoff.
+        // An undelivered notification (a buffered batch, an open barrier
+        // cohort, or an open delivery ledger) is worked off on an exponential
+        // backoff (capped at `NOTIFY_RETRY_MAX_BACKOFF`) rather than waiting
+        // for the next inbound message, so a fire-and-forget completion is
+        // still reported during the idle window. A real inbound message wins
+        // the race (biased) and resets the backoff. Retries are capped at
+        // `NOTIFY_TURN_MAX_ATTEMPTS`, after which delivery degrades to
+        // passive (the prompt row is durable in the transcript).
         let mut notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
         loop {
-            // Stay on the timed path while there are pending results to retry
-            // OR open barrier cohorts whose group timeout must be enforced
-            // even with no inbound message.
-            let next = if !self
-                .durable
-                .session
-                .state
-                .pending_background_results
-                .is_empty()
-                || self.has_open_groups()
-            {
+            // Stay on the timed path while any notification work is
+            // outstanding — including open barrier cohorts whose group
+            // timeout must be enforced even with no inbound message.
+            let next = if self.notification_work_outstanding() {
                 tokio::select! {
                     biased;
                     m = mailbox.recv() => m,
@@ -343,17 +340,10 @@ impl AgentActor {
                                 .await;
                         }
                         self.run_subagent_notification().await;
-                        if self
-                            .durable
-                            .session
-                            .state
-                            .pending_background_results
-                            .is_empty()
-                            && !self.has_open_groups()
-                        {
-                            notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
-                        } else {
+                        if self.notification_work_outstanding() {
                             notify_backoff = (notify_backoff * 2).min(NOTIFY_RETRY_MAX_BACKOFF);
+                        } else {
+                            notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
                         }
                         continue;
                     }
@@ -369,6 +359,14 @@ impl AgentActor {
             match msg {
                 AgentMessage::ActorStop => {
                     debug!(session_id = %session_id, "actor stopping");
+                    // Final state write so the durable row matches the actor's
+                    // last in-memory state. Load-bearing for the notification
+                    // ledger: if the post-delivery clear couldn't persist (a
+                    // transient store error), the row still shows the ledger
+                    // open — a rehydrated actor would re-run the turn and send
+                    // a duplicate. This save heals that window.
+                    self.persist_session_state_after_pending_change("actor_stop")
+                        .await;
                     // Session-end memory consolidation. Detached on the
                     // runtime root so it survives the `actor_token.cancel()`
                     // below; gated to user-facing sessions only (subagents,
@@ -1234,30 +1232,61 @@ impl AgentActor {
     }
 
     /// Write the actor's current `durable.session` back to the
-    /// session store so the latest `pending_background_results` survives
-    /// eviction. Called only by the background-subagent paths today.
-    /// Logs a warn on storage error rather than failing the surrounding
-    /// handler — losing the persisted copy degrades to "delivered to
-    /// the live actor only" rather than "delivered nowhere", which is
-    /// strictly worse than the v1 (mailbox-only) baseline. Updates
-    /// `last_active` in passing so the reaper doesn't immediately
+    /// session store so the latest `pending_background_results` /
+    /// notification ledger survives eviction. Called only by the
+    /// background-subagent paths today. Logs a warn on storage error rather
+    /// than failing the surrounding handler — losing the persisted copy
+    /// degrades to "delivered to the live actor only" rather than "delivered
+    /// nowhere", which is strictly worse than the v1 (mailbox-only) baseline.
+    /// Updates `last_active` in passing so the reaper doesn't immediately
     /// re-target the actor after the counter clears.
-    async fn persist_session_state_after_pending_change(&mut self, context: &'static str) {
+    ///
+    /// Returns whether the save landed. Most callers can ignore it (the
+    /// in-memory copy is authoritative for the live actor); the notification
+    /// drain gates on it so a turn never runs ahead of a ledger the store
+    /// doesn't have.
+    async fn persist_session_state_after_pending_change(&mut self, context: &'static str) -> bool {
         self.durable.session.last_active = chrono::Utc::now();
-        if let Err(e) = self
+        match self
             .volatile
             .session_manager
             .store()
             .save(&self.durable.session)
             .await
         {
-            warn!(
-                session_id = %self.durable.session.id,
-                context = %context,
-                error = %e,
-                "failed to persist session.state after pending-subagent change; live actor still has the latest copy in memory"
-            );
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    session_id = %self.durable.session.id,
+                    context = %context,
+                    error = %e,
+                    "failed to persist session.state after pending-subagent change; live actor still has the latest copy in memory"
+                );
+                false
+            }
         }
+    }
+
+    /// Any undelivered notification work: a buffered batch, an open barrier
+    /// cohort (its timeout must be enforced), or an open delivery ledger (a
+    /// persisted prompt row awaiting its reply). One predicate for the run
+    /// loop's stay-on-timed-path decision AND its backoff reset-vs-double
+    /// decision — the two must agree, or a provider outage retries at the
+    /// initial cadence forever instead of settling at the cap.
+    fn notification_work_outstanding(&self) -> bool {
+        !self
+            .durable
+            .session
+            .state
+            .pending_background_results
+            .is_empty()
+            || self.has_open_groups()
+            || self
+                .durable
+                .session
+                .state
+                .pending_notification_turn
+                .is_some()
     }
 
     /// Surface buffered background-subagent results as their own turn —
@@ -1265,6 +1294,11 @@ impl AgentActor {
     /// (UserInput) must run first, and another queued `BackgroundJobFinished`
     /// is folded in first (merge). An empty queue or a lowest-priority
     /// `ActorStop` means "drain now".
+    ///
+    /// An open delivery ledger defers to the run loop's timed backoff arm
+    /// instead: retrying here would fire a proactive re-turn immediately
+    /// behind every inbound message (whose request already carried the
+    /// persisted prompt row).
     async fn maybe_run_subagent_notification(
         &mut self,
         mailbox: &mailbox::MailboxReceiver<AgentMessage>,
@@ -1275,6 +1309,12 @@ impl AgentActor {
             .state
             .pending_background_results
             .is_empty()
+            || self
+                .durable
+                .session
+                .state
+                .pending_notification_turn
+                .is_some()
         {
             return;
         }
@@ -1291,44 +1331,159 @@ impl AgentActor {
     /// main-path turn (same system prompt + toolset → prompt cache
     /// unchanged). The reply is sent proactively; an empty/whitespace
     /// reply is suppressed.
+    ///
+    /// Delivery is ledgered: the prompt row is persisted to the transcript
+    /// up front and recorded on `session.state.pending_notification_turn`,
+    /// then the turn runs with **no rollback of any kind** — a failed
+    /// attempt's partial rows stay (they are real history the prompt row
+    /// explains), and the ledger drives a forward-only retry. Crash stance:
+    /// a crash mid-turn re-runs the turn on rehydration — a duplicate report
+    /// beats a lost one, the same direction the cron delivery ledger chose.
     async fn run_subagent_notification(&mut self) {
-        // Establish the system prompt before the snapshot below. It is
-        // persisted by `ensure_seeded`, so if the snapshot were taken before it
-        // (on a fresh session the prior context is empty), a rollback would drop
-        // the just-persisted system row in-memory and the next retry would
-        // re-seed and re-persist it. Idempotent mid-session, and infallible.
-        self.volatile.agent_loop.ensure_system_prompt_seeded().await;
-        // Take the results but keep them in hand: the turn below is
-        // fallible (provider error, cost rejection, cancellation), and a
-        // delivered completion must not be lost if it fails. The actor is
-        // single-threaded, so nothing else mutates the buffer while the
-        // turn runs.
+        // An open ledger means a prior batch's prompt row is already in the
+        // transcript without a delivered reply. Finish that first; a fresh
+        // batch stays buffered as the next one.
+        if self
+            .durable
+            .session
+            .state
+            .pending_notification_turn
+            .is_some()
+        {
+            self.retry_notification_turn().await;
+            return;
+        }
+        // Take the batch. The actor is single-threaded — nothing else
+        // mutates the buffer while the drain runs.
         let pending = std::mem::take(&mut self.durable.session.state.pending_background_results);
         if pending.is_empty() {
             return;
         }
         let content = baybo_context::prompts::subagent::build_notification_content(&pending);
-        // Commit the drained (now-empty) buffer to the row BEFORE the
-        // fallible turn: a crash mid-turn must not leave the results in the
-        // row to be replayed as a DUPLICATE notification on restart. On an
-        // in-process turn failure we re-buffer below, so a transient error
-        // still retries (the actor is single-threaded — nothing else
-        // mutates the buffer while the turn runs).
-        self.persist_session_state_after_pending_change("subagent_notification_drained")
-            .await;
+        // Persist the prompt row FIRST. From here the results are durable in
+        // the transcript itself — even a crashed actor's next real turn reads
+        // them — so the buffer can empty and no path needs to restore it.
+        let Some(prompt_ordinal) = self
+            .volatile
+            .agent_loop
+            .append_subagent_notification(content.clone())
+            .await
+        else {
+            // Persist failed (the window was popped back in lockstep). Put
+            // the batch back untouched; the backoff retries the whole drain.
+            warn!(
+                session_id = %self.durable.session.id,
+                "notification prompt row failed to persist; re-buffering the batch for retry"
+            );
+            self.durable.session.state.pending_background_results = pending;
+            return;
+        };
+        self.durable.session.state.pending_notification_turn = Some(PendingNotificationTurn {
+            content: content.clone(),
+            prompt_ordinal,
+            attempts: 0,
+        });
+        // One durable commit: buffer emptied + ledger opened. If it fails,
+        // don't run the turn — the in-memory ledger stays set, so the next
+        // timed-arm tick lands in the retry branch, which re-persists before
+        // running. (A crash in this window re-drives from the still-buffered
+        // batch and duplicates one prompt row: duplicate-beats-lost.)
+        if !self
+            .persist_session_state_after_pending_change("subagent_notification_drained")
+            .await
+        {
+            return;
+        }
+        self.drive_notification_turn(content).await;
+    }
+
+    /// Re-drive an open delivery ledger: the prompt row is persisted but no
+    /// reply was delivered. Forward-only — nothing is rolled back; a cue row
+    /// re-anchors the request tail and the same turn re-runs.
+    async fn retry_notification_turn(&mut self) {
+        // The ledger (or its last attempts bump) may never have reached the
+        // store. Re-persist before running so a crash can't lose the
+        // bookkeeping the turn is about to depend on.
+        if !self
+            .persist_session_state_after_pending_change("subagent_notification_retry")
+            .await
+        {
+            return;
+        }
+        let Some(ledger) = self.durable.session.state.pending_notification_turn.clone() else {
+            return;
+        };
+        // Compaction supersedes every active row and re-inserts the kept
+        // slice at fresh ordinals, so the recorded ordinal dangles after any
+        // compaction — even when the prompt's content survived verbatim. The
+        // ledger froze the content, so the repair is a re-append.
+        let prompt_active = match self
+            .volatile
+            .session_manager
+            .load_session_messages_with_supersede(&self.durable.session.id)
+            .await
+        {
+            Ok(rows) => rows
+                .iter()
+                .any(|r| r.ordinal == ledger.prompt_ordinal && r.superseded_by.is_none()),
+            Err(e) => {
+                warn!(
+                    session_id = %self.durable.session.id,
+                    error = %e,
+                    "could not verify the notification prompt row; retrying next tick"
+                );
+                return;
+            }
+        };
+        if prompt_active {
+            // Cue row (persisted): restores a user-side request tail — a
+            // cancelled attempt's salvage leaves an assistant row at the
+            // tail, and a request ending on an assistant message is provider
+            // prefill (Anthropic rejects it outright with extended thinking
+            // on) — un-buries the prompt from behind the failed attempt's
+            // partial rows, and makes a blank reply a genuine judgment.
+            let cue = baybo_context::prompts::subagent::build_retry_cue(
+                ledger.attempts.saturating_add(1),
+            );
+            if self
+                .volatile
+                .agent_loop
+                .append_subagent_notification(cue)
+                .await
+                .is_none()
+            {
+                return;
+            }
+        } else {
+            let Some(new_ordinal) = self
+                .volatile
+                .agent_loop
+                .append_subagent_notification(ledger.content.clone())
+                .await
+            else {
+                return;
+            };
+            if let Some(l) = self
+                .durable
+                .session
+                .state
+                .pending_notification_turn
+                .as_mut()
+            {
+                l.prompt_ordinal = new_ordinal;
+            }
+            self.persist_session_state_after_pending_change("subagent_notification_reanchored")
+                .await;
+        }
+        self.drive_notification_turn(ledger.content).await;
+    }
+
+    /// Run the notification turn against the (already persisted) prompt and
+    /// settle the ledger: clear on success, bump attempts on failure, degrade
+    /// to passive delivery at the cap.
+    async fn drive_notification_turn(&mut self, content: Vec<ContentBlock>) {
         // No delta streaming: the empty-output decision is made on the
         // assembled reply, so nothing may have been streamed already.
-        //
-        // Snapshot the transcript first: the notification's synthetic prompt
-        // is appended in-memory only (not persisted), so a failed turn must
-        // roll back to here before the retry rebuilds it — otherwise the live
-        // context stacks a copy per attempt under the infinite-backoff retry.
-        let context_snapshot = self.volatile.agent_loop.context_snapshot();
-        // Append the synthetic prompt in-memory *after* the snapshot so a
-        // failed turn rolls it back; the durable buffer is the source of truth.
-        self.volatile
-            .agent_loop
-            .append_subagent_notification(content.clone());
         let result = self
             .run_agent_loop(
                 JobInput::SubagentNotification { content },
@@ -1340,32 +1495,75 @@ impl AgentActor {
             .await;
         match result {
             Ok(response) => {
+                let attempts = self
+                    .durable
+                    .session
+                    .state
+                    .pending_notification_turn
+                    .as_ref()
+                    .map(|l| l.attempts)
+                    .unwrap_or(0);
+                self.durable.session.state.pending_notification_turn = None;
+                // If this clear-persist fails, the in-memory ledger is
+                // already None and any later successful save (including the
+                // ActorStop final write) heals the row — so a reaped actor
+                // can't resurrect a delivered ledger into a duplicate send.
+                self.persist_session_state_after_pending_change("subagent_notification_delivered")
+                    .await;
                 if is_blank_reply(&response.content) {
-                    debug!(
-                        session_id = %self.durable.session.id,
-                        "subagent-notification produced no output; suppressing send"
-                    );
+                    if attempts > 0 {
+                        // With the retry cue in the request, a blank reply is
+                        // a real judgment — but after failures it may also be
+                        // a wedge; keep it observable.
+                        warn!(
+                            session_id = %self.durable.session.id,
+                            attempts,
+                            "subagent-notification retry produced no output; suppressing send"
+                        );
+                    } else {
+                        debug!(
+                            session_id = %self.durable.session.id,
+                            "subagent-notification produced no output; suppressing send"
+                        );
+                    }
                     return;
                 }
                 self.send_response(response.into(), "subagent_notification")
                     .await;
             }
             Err(e) => {
-                error!(
-                    session_id = %self.durable.session.id,
-                    error = %e,
-                    "subagent-notification turn failed; restoring pending results for retry"
-                );
-                // Drop the in-memory synthetic row (and any partial turn
-                // state) this attempt appended, so the retry doesn't stack a
-                // second copy in the live context.
-                self.volatile.agent_loop.restore_context(context_snapshot);
-                // Restore the drained results so the next drain retries them —
-                // the child trace alone would never resurface.
-                let mut restored = pending;
-                restored.append(&mut self.durable.session.state.pending_background_results);
-                self.durable.session.state.pending_background_results = restored;
-                self.persist_session_state_after_pending_change("subagent_notification_restore")
+                let attempts = match self
+                    .durable
+                    .session
+                    .state
+                    .pending_notification_turn
+                    .as_mut()
+                {
+                    Some(ledger) => {
+                        ledger.attempts = ledger.attempts.saturating_add(1);
+                        ledger.attempts
+                    }
+                    None => 0,
+                };
+                if attempts >= NOTIFY_TURN_MAX_ATTEMPTS {
+                    warn!(
+                        session_id = %self.durable.session.id,
+                        attempts,
+                        error = %e,
+                        "subagent-notification turn kept failing; ceasing active retries — \
+                         the results are persisted in the transcript, so the next real turn \
+                         reports them (passive delivery)"
+                    );
+                    self.durable.session.state.pending_notification_turn = None;
+                } else {
+                    error!(
+                        session_id = %self.durable.session.id,
+                        attempts,
+                        error = %e,
+                        "subagent-notification turn failed; the delivery ledger will retry"
+                    );
+                }
+                self.persist_session_state_after_pending_change("subagent_notification_failed")
                     .await;
             }
         }
