@@ -485,8 +485,42 @@ impl ToolResultContent {
         match self {
             Self::Empty => String::new(),
             Self::Text(s) => s,
-            Self::Blocks(blocks) => serde_json::to_string(&blocks).unwrap_or_default(),
+            Self::Blocks(blocks) => blocks
+                .iter()
+                .map(describe_block)
+                .collect::<Vec<_>>()
+                .join(""),
         }
+    }
+}
+
+/// Render one claude `tool_result` content block as transcript text.
+///
+/// Text blocks pass through. An image block is reduced to a descriptor: its
+/// `source.data` is inline base64, and JSON-stringifying the block verbatim
+/// wrote the whole encoded image into `session_messages` as one row (the
+/// largest observed was a 294 KB JPEG). Session rows are never rewritten or
+/// deleted, so that cost is permanent — and the base64 is useless to every
+/// reader anyway, since nothing decodes it back out of the transcript.
+fn describe_block(block: &serde_json::Value) -> String {
+    match block.get("type").and_then(serde_json::Value::as_str) {
+        Some("text") => block
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        Some("image") => {
+            let media_type = block
+                .pointer("/source/media_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("image");
+            let bytes = block
+                .pointer("/source/data")
+                .and_then(serde_json::Value::as_str)
+                .map_or(0, str::len);
+            format!("[image: {media_type}, {bytes} base64 bytes elided]")
+        }
+        _ => serde_json::to_string(block).unwrap_or_default(),
     }
 }
 
@@ -543,6 +577,46 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    /// An image `tool_result` used to be JSON-stringified whole, writing the
+    /// inline base64 into `session_messages` — the largest observed row was a
+    /// 294 KB JPEG. Nothing ever decodes it back out of a transcript, so the
+    /// bytes were pure cost on data that is never deleted.
+    #[test]
+    fn image_tool_result_blocks_elide_their_base64() {
+        let payload = "A".repeat(4096);
+        let content = ToolResultContent::Blocks(vec![
+            serde_json::json!({ "type": "text", "text": "here it is:" }),
+            serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/jpeg", "data": payload },
+            }),
+        ]);
+
+        let s = content.into_string();
+        assert!(
+            !s.contains("AAAA"),
+            "no base64 payload may reach the transcript"
+        );
+        assert!(
+            s.starts_with("here it is:"),
+            "text blocks still pass through"
+        );
+        assert!(
+            s.contains("[image: image/jpeg, 4096 base64 bytes elided]"),
+            "the image must be described, not dropped silently: {s}"
+        );
+    }
+
+    /// The plain-string form is the common case and must be untouched.
+    #[test]
+    fn text_tool_result_content_passes_through() {
+        assert_eq!(
+            ToolResultContent::Text("plain".into()).into_string(),
+            "plain"
+        );
+        assert_eq!(ToolResultContent::Empty.into_string(), "");
+    }
 
     fn fake_claude(version: &str) -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();

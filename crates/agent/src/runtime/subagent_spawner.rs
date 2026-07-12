@@ -1293,8 +1293,9 @@ async fn run_external_agent(
 async fn append_subagent_message(
     session_manager: &Arc<baybo_session::SessionManager>,
     session_id: &SessionId,
-    msg: ChatMessage,
+    mut msg: ChatMessage,
 ) {
+    cap_external_agent_blocks(&mut msg);
     if let Err(e) = session_manager
         .append_session_message(session_id, &msg)
         .await
@@ -1306,6 +1307,47 @@ async fn append_subagent_message(
             "failed to persist external-agent turn to session_messages",
         );
     }
+}
+
+/// Bound the text an external agent's turn writes into `session_messages`.
+///
+/// The main agent loop routes every tool result through
+/// `ContextManager::cap_tool_output`, which caps at `MAX_TOOL_OUTPUT_BYTES` and
+/// spills the remainder to a file. The external-agent leg writes straight to
+/// the store and never passes through that path, so a child that read a large
+/// file persisted the whole thing as a single transcript row — the cap had a
+/// hole exactly the width of this function.
+///
+/// It matters more here than in a trace span: session rows are core data, never
+/// rewritten and never deleted, so an unbounded row is permanent. The bound is
+/// prospective only — existing rows stay exactly as they are.
+fn cap_external_agent_blocks(msg: &mut ChatMessage) {
+    use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+
+    for block in msg.content.iter_mut() {
+        match block {
+            ContentBlock::Text(s) => cap_in_place(s, MAX_TOOL_OUTPUT_BYTES),
+            ContentBlock::ToolResult { content, .. } => {
+                cap_in_place(content, MAX_TOOL_OUTPUT_BYTES)
+            }
+            // Media blocks carry a `BlobRef`, not bytes.
+            _ => {}
+        }
+    }
+}
+
+fn cap_in_place(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let total = s.len();
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    use std::fmt::Write as _;
+    let _ = write!(s, "\n\n[... truncated: {cut}/{total} bytes shown]");
 }
 
 async fn persist_resume_key(
@@ -1385,6 +1427,47 @@ async fn deliver_background_result(
             handle_id = %handle_id,
             "background subagent terminal could not be routed — parent actor not registered; result available in trace/child session only"
         );
+    }
+}
+
+#[cfg(test)]
+mod external_agent_cap_tests {
+    use super::*;
+    use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+
+    /// The external-agent leg writes to `session_messages` without passing
+    /// through the agent loop's `cap_tool_output`, so a child that read a big
+    /// file used to persist the whole thing as one permanent transcript row.
+    #[test]
+    fn oversized_tool_result_is_capped_before_persisting() {
+        let mut msg = ChatMessage::tool(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "z".repeat(MAX_TOOL_OUTPUT_BYTES * 4),
+            meta: None,
+        }]);
+        cap_external_agent_blocks(&mut msg);
+
+        let ContentBlock::ToolResult { content, .. } = &msg.content[0] else {
+            panic!("block kind must survive the cap");
+        };
+        assert!(
+            content.len() < MAX_TOOL_OUTPUT_BYTES * 2,
+            "content must be bounded, got {} bytes",
+            content.len()
+        );
+        assert!(
+            content.contains("truncated"),
+            "a capped row must say so, not look complete"
+        );
+    }
+
+    /// A row already within budget must be persisted byte-for-byte.
+    #[test]
+    fn small_message_is_untouched() {
+        let mut msg = ChatMessage::assistant(vec![ContentBlock::Text("all good".into())]);
+        let before = msg.clone();
+        cap_external_agent_blocks(&mut msg);
+        assert_eq!(msg, before);
     }
 }
 
