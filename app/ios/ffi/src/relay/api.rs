@@ -1,16 +1,23 @@
-//! Relay-mode gateway API client over one-shot API tunnel legs.
+//! Relay-mode gateway API client over API tunnel legs.
+
+use std::time::Duration;
 
 use device_proto::noise::StaticKeypair;
 use serde::de::DeserializeOwned;
 
 use super::pairing::load_paired_record;
 use super::tunnel::{
-    REQUEST_ID, collect_response_body, dial_tunnel_leg, expect_response_head, send_request,
+    LegError, LegIo, body_frames, content_length_header, declared_body_len, dial_tunnel_leg,
 };
-use crate::core::{MAX_TUNNEL_CHUNK, TunnelHeader, TunnelRequest};
+use crate::core::{TunnelHeader, TunnelRequest};
 use crate::gateway_api::{GatewayJsonClient, MEDIA_TYPE_JSON};
 
 const HEADER_CONTENT_TYPE: &str = "content-type";
+
+/// Ceiling on one request/response exchange, once the leg is up. There was no
+/// per-request budget at all before: a leg that went quiet mid-response simply
+/// hung, forever, and took its caller with it.
+const TUNNEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct GatewayApi;
 
@@ -55,7 +62,7 @@ impl GatewayJsonClient for GatewayApi {
         body: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
         async move {
-            let _body = request(
+            request(
                 "POST",
                 path,
                 vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
@@ -72,7 +79,7 @@ impl GatewayJsonClient for GatewayApi {
         body: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
         async move {
-            let _body = request(
+            request(
                 "PUT",
                 path,
                 vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
@@ -88,12 +95,77 @@ impl GatewayJsonClient for GatewayApi {
         path: &'a str,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
         async move {
-            let _body = request("DELETE", path, Vec::new(), None).await?;
+            request("DELETE", path, Vec::new(), None).await?;
             Ok(())
         }
     }
 }
 
+/// Drive one request/response over a leg, leaving it DRAINED.
+///
+/// A non-2xx carries a body too, and abandoning it on the wire would hand those
+/// bytes to whoever writes the next head. `chat_lookup_message`'s 404 is the
+/// ordinary result of an outbox rebase, not an edge case — this is the common
+/// path, not the sad one.
+pub(crate) async fn exchange(
+    leg: &mut LegIo,
+    method: &str,
+    path: &str,
+    headers: Vec<TunnelHeader>,
+    body: Option<&[u8]>,
+) -> Result<Vec<u8>, LegError> {
+    match tokio::time::timeout(
+        TUNNEL_REQUEST_TIMEOUT,
+        run_exchange(leg, method, path, headers, body),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        // A leg that went quiet is not one we can reason about: whatever it still
+        // owes us would arrive tagged with an id nobody is expecting.
+        Err(_) => Err(LegError::dead("tunnel request timed out")),
+    }
+}
+
+async fn run_exchange(
+    leg: &mut LegIo,
+    method: &str,
+    path: &str,
+    mut headers: Vec<TunnelHeader>,
+    body: Option<&[u8]>,
+) -> Result<Vec<u8>, LegError> {
+    let request_id = leg.claim_request_id();
+    let body_len = declared_body_len(body);
+    if let Some(len) = body_len {
+        headers.push(content_length_header(len));
+    }
+
+    leg.send(&TunnelRequest::Head {
+        request_id,
+        method: method.into(),
+        path: path.into(),
+        headers,
+        body_len,
+    })
+    .await?;
+    if let Some(body) = body {
+        for frame in body_frames(request_id, body) {
+            leg.send(&frame).await?;
+        }
+    }
+
+    let head = leg.expect_response_head(request_id).await?;
+    // Drain first, judge second.
+    let response_body = leg.collect_response_body(request_id, head.body_len).await?;
+    if !(200..300).contains(&head.status) {
+        return Err(LegError::Http {
+            status: head.status,
+        });
+    }
+    Ok(response_body)
+}
+
+/// One request on its own leg: dial, exchange, hang up.
 async fn request(
     method: &str,
     path: &str,
@@ -102,64 +174,10 @@ async fn request(
 ) -> Result<Vec<u8>, String> {
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
-    let (mut ws, mut session) =
+    let mut leg =
         dial_tunnel_leg(&record, &local, remote_host_protocol::relay::LegClass::Api).await?;
-    let body_len = body.as_ref().map(|body| body.len() as u64);
 
-    send_request(
-        &mut ws,
-        &mut session,
-        &TunnelRequest::Head {
-            request_id: REQUEST_ID,
-            method: method.into(),
-            path: path.into(),
-            headers,
-            body_len,
-        },
-    )
-    .await?;
-
-    if let Some(body) = body.as_deref() {
-        let size = body.len() as u64;
-        if body.is_empty() {
-            send_request(
-                &mut ws,
-                &mut session,
-                &TunnelRequest::Body {
-                    request_id: REQUEST_ID,
-                    offset: 0,
-                    data: Vec::new(),
-                    last: true,
-                },
-            )
-            .await?;
-        } else {
-            let mut offset = 0u64;
-            for chunk in body.chunks(MAX_TUNNEL_CHUNK) {
-                let chunk_len = chunk.len() as u64;
-                let last = offset + chunk_len >= size;
-                send_request(
-                    &mut ws,
-                    &mut session,
-                    &TunnelRequest::Body {
-                        request_id: REQUEST_ID,
-                        offset,
-                        data: chunk.to_vec(),
-                        last,
-                    },
-                )
-                .await?;
-                offset += chunk_len;
-            }
-        }
-    }
-
-    let (status, _headers, body_len) = expect_response_head(&mut ws, &mut session).await?;
-    if !(200..300).contains(&status) {
-        let _ = ws.close(None).await;
-        return Err(format!("api request failed: HTTP {status}"));
-    }
-    let body = collect_response_body(&mut ws, &mut session, body_len).await?;
-    let _ = ws.close(None).await;
-    Ok(body)
+    let outcome = exchange(&mut leg, method, path, headers, body.as_deref()).await;
+    leg.close().await;
+    outcome.map_err(String::from)
 }
