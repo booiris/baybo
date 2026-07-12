@@ -80,7 +80,10 @@ struct SessionRow: Codable, Identifiable, Equatable {
 /// transcript mirrors live next to it (`TranscriptStore`).
 @MainActor
 final class SessionIndex: ObservableObject {
-    static let shared = SessionIndex()
+    static let shared = SessionIndex(
+        supportDirectory: supportDirectory(), defaults: .standard)
+
+    private static let indexFileName = "sessions.json"
 
     /// Mirrors the gateway CHAT-LIST `PREVIEW_MAX_CHARS` (`api/admin/chat.rs`
     /// — 120, NOT push's 200) so a locally-captured preview and a REST-fetched
@@ -115,6 +118,13 @@ final class SessionIndex: ObservableObject {
 
     @Published private(set) var rows: [SessionRow] = []
 
+    /// The Application Support root this registry — and the transcript mirrors
+    /// and outboxes it prunes/wipes — lives under. Injected rather than resolved
+    /// from the static path so a test drives an isolated tree: the suites run in
+    /// PARALLEL, and a shared `sessions.json` turns one suite's writes into
+    /// another's "logic bug".
+    private let supportDirectory: URL
+    private let defaults: UserDefaults
     private let fileURL: URL
     /// The session whose `ChatScreen` is on top. A `SessionActivity` ping for it
     /// is not counted as unread (the user is looking at it); `nil` on the list.
@@ -138,8 +148,10 @@ final class SessionIndex: ObservableObject {
     /// entry is gone — `merge` compares epochs and drops it.
     private(set) var mutationEpoch = 0
 
-    private init() {
-        fileURL = Self.supportDirectory().appendingPathComponent("sessions.json")
+    init(supportDirectory: URL, defaults: UserDefaults) {
+        self.supportDirectory = supportDirectory
+        self.defaults = defaults
+        fileURL = supportDirectory.appendingPathComponent(Self.indexFileName)
         rows = Self.load(from: fileURL)
         migrateLegacySingleSession()
     }
@@ -465,8 +477,8 @@ final class SessionIndex: ObservableObject {
         pinBaselines = [:]
         mutationEpoch += 1
         save()
-        TranscriptStore.deleteAll()
-        OutboxStore.deleteAll()
+        TranscriptStore.deleteAll(in: supportDirectory)
+        OutboxStore.deleteAll(in: supportDirectory)
     }
 
     // MARK: - Persistence
@@ -476,7 +488,7 @@ final class SessionIndex: ObservableObject {
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(rows) else { return }
         try? data.write(to: fileURL, options: .atomic)
-        TranscriptStore.prune(keeping: mirrorWorthyIds())
+        TranscriptStore.prune(keeping: mirrorWorthyIds(), in: supportDirectory)
     }
 
     /// The sessions whose transcript mirrors survive pruning: the most recently
@@ -500,7 +512,6 @@ final class SessionIndex: ObservableObject {
     /// conversation shows up instead of orphaning, then retire the keys (the
     /// per-session mirror file takes over).
     private func migrateLegacySingleSession() {
-        let defaults = UserDefaults.standard
         guard let sessionId = defaults.string(forKey: ChatDefaults.sessionId) else { return }
         if !rows.contains(where: { $0.id == sessionId }) {
             let now = Date()
@@ -510,7 +521,7 @@ final class SessionIndex: ObservableObject {
                     preview: nil, pinned: false))
         }
         if let blob = defaults.string(forKey: ChatDefaults.transcriptState) {
-            TranscriptStore.write(sessionId: sessionId, stateJson: blob)
+            TranscriptStore.write(sessionId: sessionId, stateJson: blob, in: supportDirectory)
         }
         defaults.removeObject(forKey: ChatDefaults.sessionId)
         defaults.removeObject(forKey: ChatDefaults.transcriptState)
@@ -571,9 +582,11 @@ final class SessionActivityHandler: SessionListSink, @unchecked Sendable {
 /// UserDefaults key couldn't survive a multi-session list, and a plist that
 /// holds every transcript loads whole at launch).
 enum TranscriptStore {
-    private static func directory() -> URL {
-        let dir = SessionIndex.supportDirectory()
-            .appendingPathComponent("transcripts", isDirectory: true)
+    /// The support root defaults to the production one; `SessionIndex` passes
+    /// its own so an isolated registry prunes/wipes its own tree (see its
+    /// `supportDirectory`).
+    private static func directory(in supportDirectory: URL) -> URL {
+        let dir = supportDirectory.appendingPathComponent("transcripts", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -585,28 +598,34 @@ enum TranscriptStore {
         sessionId.replacingOccurrences(of: "/", with: "_")
     }
 
-    private static func fileURL(for sessionId: String) -> URL {
-        directory().appendingPathComponent("\(sanitize(sessionId)).json")
+    private static func fileURL(for sessionId: String, in supportDirectory: URL) -> URL {
+        directory(in: supportDirectory).appendingPathComponent("\(sanitize(sessionId)).json")
     }
 
-    static func read(sessionId: String) -> String? {
-        guard let data = try? Data(contentsOf: fileURL(for: sessionId)) else { return nil }
+    static func read(
+        sessionId: String, in supportDirectory: URL = SessionIndex.supportDirectory()
+    ) -> String? {
+        guard let data = try? Data(contentsOf: fileURL(for: sessionId, in: supportDirectory))
+        else { return nil }
         return String(data: data, encoding: .utf8)
     }
 
-    static func write(sessionId: String, stateJson: String) {
+    static func write(
+        sessionId: String, stateJson: String,
+        in supportDirectory: URL = SessionIndex.supportDirectory()
+    ) {
         try? stateJson.data(using: .utf8)?
-            .write(to: fileURL(for: sessionId), options: .atomic)
+            .write(to: fileURL(for: sessionId, in: supportDirectory), options: .atomic)
     }
 
     /// Drop mirrors for sessions outside `keeping` (the registry's most
     /// recently active). A pruned session just re-fetches history on re-entry.
-    static func prune(keeping: Set<String>) {
+    static func prune(keeping: Set<String>, in supportDirectory: URL) {
         let fm = FileManager.default
         let keptNames = Set(keeping.map(sanitize))
         guard
             let files = try? fm.contentsOfDirectory(
-                at: directory(), includingPropertiesForKeys: nil)
+                at: directory(in: supportDirectory), includingPropertiesForKeys: nil)
         else { return }
         for file in files where file.pathExtension == "json" {
             if !keptNames.contains(file.deletingPathExtension().lastPathComponent) {
@@ -615,7 +634,7 @@ enum TranscriptStore {
         }
     }
 
-    static func deleteAll() {
-        try? FileManager.default.removeItem(at: directory())
+    static func deleteAll(in supportDirectory: URL) {
+        try? FileManager.default.removeItem(at: directory(in: supportDirectory))
     }
 }

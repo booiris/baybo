@@ -99,19 +99,29 @@ final class ChatStore: ObservableObject {
     /// offscreen buffer can overflow and drop frames, and the sync loop restores
     /// rows but not pending prompts, so a web-held queue could lose a card for
     /// good. The card is the only way to answer, and an unanswered gate denies
-    /// after 5 minutes.
+    /// after 5 minutes. The rendering mirror of `approvals`, republished only on
+    /// a real edit.
     @Published private(set) var pendingApprovals: [PendingApproval] = []
 
     /// Increments on every successful dial; the webview uses it to retry
     /// attachments that raced ahead of the leg going live, and — the sync-loop
     /// reconnect edge — to run one forward-recovery pull (`handleConnEpoch`).
     private(set) var connEpoch = 0
+    /// The Rust core. Injected (UniFFI generates `BayboClientProtocol` and
+    /// `BayboClient` conforms) so the send/sync/approval machinery can be driven
+    /// without a gateway, a tokio runtime, or a keychain.
+    private let client: any BayboClientProtocol
+    /// The device-local chat-list registry this store records sends/replies into.
+    private let index: SessionIndex
     private var remoteSessionEnsured: Bool
     private var ensureRemoteSessionTask: Task<Void, Error>?
     /// The persisted send outbox (survives relaunch alongside the transcript
     /// mirror). Confirmation is two-stage: the echo proves transport, an
     /// ordinal-stamped row (sync/backfill) proves durability. See sync-v2.
     private let outbox: OutboxStore
+    /// The pending-approval state machine; `pendingApprovals` is its published
+    /// mirror.
+    private var approvals = ApprovalQueue()
 
     /// Accepted floor: sinks below this are muted. Advanced when a dial
     /// actually REPLACES the pump (success) or on deliberate disconnect — NOT
@@ -135,13 +145,26 @@ final class ChatStore: ObservableObject {
     /// arriving meanwhile are dropped, not re-buffered.
     private var needsSyncOnAttach = false
 
-    init(sessionId: String) {
+    convenience init(sessionId: String, client: any BayboClientProtocol = Baybo.client) {
+        self.init(
+            sessionId: sessionId, client: client, index: .shared,
+            outbox: OutboxStore(sessionId: sessionId))
+    }
+
+    init(
+        sessionId: String,
+        client: any BayboClientProtocol,
+        index: SessionIndex,
+        outbox: OutboxStore
+    ) {
         self.sessionId = sessionId
-        let listed = SessionIndex.shared.contains(sessionId: sessionId)
+        self.client = client
+        self.index = index
+        self.outbox = outbox
+        let listed = index.contains(sessionId: sessionId)
         self.listed = listed
         connState = listed ? .connecting : .draft
         remoteSessionEnsured = false
-        outbox = OutboxStore(sessionId: sessionId)
     }
 
     // MARK: - Connection lifecycle
@@ -182,7 +205,7 @@ final class ChatStore: ObservableObject {
                 }
             }
             do {
-                try await Baybo.client.chatConnect(
+                try await client.chatConnect(
                     sessionId: sessionId,
                     sink: Sink(store: self, generation: gen)
                 )
@@ -252,7 +275,7 @@ final class ChatStore: ObservableObject {
         issuedGeneration += 1
         generation = issuedGeneration
         connState = remoteSessionEnsured ? .connecting : .draft
-        await Baybo.client.chatDisconnect()
+        await client.chatDisconnect()
     }
 
     /// LRU eviction: this store is idle and offscreen. Cancel its timers and
@@ -273,7 +296,7 @@ final class ChatStore: ObservableObject {
         connectTask = nil
         issuedGeneration += 1
         generation = issuedGeneration
-        await Baybo.client.chatUnsubscribe(sessionId: sessionId)
+        await client.chatUnsubscribe(sessionId: sessionId)
     }
 
     // MARK: - Bridge lifecycle
@@ -417,7 +440,7 @@ final class ChatStore: ObservableObject {
         Task {
             do {
                 try await ensureRemoteSession()
-                SessionIndex.shared.recordUserSend(sessionId: sessionId, text: text)
+                index.recordUserSend(sessionId: sessionId, text: text)
                 try await sendWhenReady(text: text, msgId: msgId, attachments: attachments)
             } catch {
                 bridge?.sendFailed(msgId)
@@ -431,7 +454,7 @@ final class ChatStore: ObservableObject {
         attachments: [AttachmentRef]
     ) async throws {
         if connState == .connected {
-            try await Baybo.client.chatSend(
+            try await client.chatSend(
                 sessionId: sessionId, text: text, msgId: msgId, attachments: attachments)
             return
         }
@@ -446,7 +469,7 @@ final class ChatStore: ObservableObject {
         issuedGeneration += 1
         let gen = issuedGeneration
         do {
-            try await Baybo.client.chatSendAfterConnect(
+            try await client.chatSendAfterConnect(
                 sessionId: sessionId,
                 sink: Sink(store: self, generation: gen),
                 text: text,
@@ -476,7 +499,7 @@ final class ChatStore: ObservableObject {
 
         let sessionId = sessionId
         let task = Task {
-            _ = try await Baybo.client.chatCreateSession(sessionId: sessionId)
+            _ = try await client.chatCreateSession(sessionId: sessionId)
         }
         ensureRemoteSessionTask = task
         do {
@@ -516,7 +539,7 @@ final class ChatStore: ObservableObject {
         }
         Task {
             do {
-                let frame = try await Baybo.client.chatFetchSync(
+                let frame = try await client.chatFetchSync(
                     sessionId: sessionId, sinceOrdinal: sinceOrdinal, limit: limit)
                 reconcileOutboxAfterSync(frameJson: frame)
                 pushFrame(frame)
@@ -536,7 +559,7 @@ final class ChatStore: ObservableObject {
         guard listed || remoteSessionEnsured else { return }
         Task {
             do {
-                try await Baybo.client.chatMarkRead(sessionId: sessionId, ordinal: ordinal)
+                try await client.chatMarkRead(sessionId: sessionId, ordinal: ordinal)
             } catch {
                 NSLog("baybo: mark read: %@", bayboErrorText(error))
             }
@@ -567,7 +590,7 @@ final class ChatStore: ObservableObject {
         let msgId = UUID().uuidString
         Task {
             do {
-                try await Baybo.client.chatSend(
+                try await client.chatSend(
                     sessionId: sessionId, text: Self.stopCommand, msgId: msgId, attachments: [])
             } catch {
                 NSLog("baybo: stop: %@", bayboErrorText(error))
@@ -578,7 +601,7 @@ final class ChatStore: ObservableObject {
     func fetchHistory(beforeOrdinal: Int64?, limit: UInt32) {
         Task {
             do {
-                let frame = try await Baybo.client.chatFetchHistory(
+                let frame = try await client.chatFetchHistory(
                     sessionId: sessionId, beforeOrdinal: beforeOrdinal, limit: limit)
                 pushFrame(frame)
             } catch {
@@ -615,43 +638,15 @@ final class ChatStore: ObservableObject {
         outbox.markEchoed(platformMsgId: pmid)
     }
 
-    /// Derive the pending-approval queue from the frame stream — the composer's
+    /// Drive the pending-approval queue off the frame stream — the composer's
     /// approval card. Native, not web: it runs BEFORE the frame reaches (or
     /// misses) the webview, so a prompt raised while the user is parked on the
     /// chat list still lands, and an offscreen buffer overflow can't drop the
-    /// only way to answer a gate that denies itself after 5 minutes.
-    ///
-    /// Four inputs, matching the four ways a prompt appears or goes away:
-    /// * `approval_requested` — a new prompt (deduped: the gate's waker re-fires
-    ///   on the newest queue entry, so the same card can arrive twice);
-    /// * `approval_resolved` — someone answered (this device, or another client);
-    /// * `subscribe_state.pending_approvals` — the authoritative set on
-    ///   (re)subscribe, which REPLACES the queue;
-    /// * `tool_completed` — the blocked call finished. A gate that TIMES OUT
-    ///   denies server-side and broadcasts NO `approval_resolved`, so without
-    ///   this the card would linger forever over a call that is long done.
+    /// only way to answer a gate that denies itself after 5 minutes. The four
+    /// inputs and their id semantics live in `ApprovalQueue`.
     private func approvalObserveFrame(_ frame: [String: Any]) {
-        switch frame["kind"] as? String {
-        case "approval_requested":
-            guard let card = PendingApproval.from(frame: frame),
-                !pendingApprovals.contains(where: { $0.callId == card.callId })
-            else { return }
-            pendingApprovals.append(card)
-        case "approval_resolved":
-            guard let callId = frame["call_id"] as? String else { return }
-            dropApproval(callId: callId)
-        case "subscribe_state":
-            let cards = (frame["pending_approvals"] as? [[String: Any]] ?? [])
-                .compactMap(PendingApproval.from(frame:))
-            if cards != pendingApprovals { pendingApprovals = cards }
-        case "tool_completed":
-            guard let toolCallId = frame["call_id"] as? String,
-                pendingApprovals.contains(where: { $0.toolCallId == toolCallId })
-            else { return }
-            pendingApprovals.removeAll { $0.toolCallId == toolCallId }
-        default:
-            break
-        }
+        guard approvals.apply(frame) else { return }
+        pendingApprovals = approvals.cards
     }
 
     /// The user answered. Dismiss optimistically (the server's `approval_resolved`
@@ -667,7 +662,7 @@ final class ChatStore: ObservableObject {
         #endif
         Task {
             do {
-                try await Baybo.client.chatResolveApproval(
+                try await client.chatResolveApproval(
                     callId: approval.callId, decision: decision)
             } catch {
                 notice = Lang.shared.t("chat.approvalFailed", bayboErrorText(error))
@@ -676,8 +671,8 @@ final class ChatStore: ObservableObject {
     }
 
     private func dropApproval(callId: String) {
-        guard pendingApprovals.contains(where: { $0.callId == callId }) else { return }
-        pendingApprovals.removeAll { $0.callId == callId }
+        guard approvals.resolve(callId: callId) else { return }
+        pendingApprovals = approvals.cards
     }
 
     /// The turn's terminal assistant `message` is the authoritative, tool-free
@@ -691,7 +686,7 @@ final class ChatStore: ObservableObject {
             (frame["role"] as? String) == "assistant",
             let content = frame["content"] as? String
         else { return }
-        SessionIndex.shared.recordAgentReply(sessionId: sessionId, text: content)
+        index.recordAgentReply(sessionId: sessionId, text: content)
     }
 
     /// Native holds the `sync_page` it fetched, so it reconciles the outbox
@@ -722,7 +717,7 @@ final class ChatStore: ObservableObject {
         outbox.markUnknown(platformMsgId: platformMsgId)
         Task {
             do {
-                let lookup = try await Baybo.client.chatLookupMessage(
+                let lookup = try await client.chatLookupMessage(
                     sessionId: sessionId, platformMsgId: platformMsgId)
                 if lookup.found {
                     outbox.confirmDurable(platformMsgId: platformMsgId)
@@ -766,7 +761,7 @@ final class ChatStore: ObservableObject {
         let attachments = entry.attachments.map(Self.toAttachmentRef)
         Task {
             do {
-                try await Baybo.client.chatSend(
+                try await client.chatSend(
                     sessionId: sessionId, text: entry.text, msgId: entry.platformMsgId,
                     attachments: attachments)
             } catch {
@@ -850,7 +845,7 @@ final class ChatStore: ObservableObject {
             do {
                 // A thumbnail fetch: nobody is watching the byte count, and the
                 // core skips the tick machinery entirely for a nil observer.
-                let bytes = try await Baybo.client.blobDownloadBytes(
+                let bytes = try await client.blobDownloadBytes(
                     blobId: blobId, progress: nil)
                 // Encode off the main actor: base64 of a large blob (up to
                 // 100 MiB) would stall every tap for seconds.
@@ -951,7 +946,7 @@ final class ChatStore: ObservableObject {
             return
         }
         Task {
-            let cached = await Baybo.client.blobIsCached(blobId: blobId)
+            let cached = await client.blobIsCached(blobId: blobId)
             pushFileState(blobId: blobId, state: cached ? "ready" : "idle")
         }
     }
@@ -962,7 +957,7 @@ final class ChatStore: ObservableObject {
         Task {
             defer { fileDownloads.remove(blobId) }
             do {
-                _ = try await Baybo.client.blobDownloadBytes(
+                _ = try await client.blobDownloadBytes(
                     blobId: blobId,
                     progress: BlobProgressForwarder { [weak self] loaded, total in
                         self?.pushFileState(
@@ -1021,7 +1016,7 @@ final class ChatStore: ObservableObject {
     /// double-tap-to-restore, and the black chat-image field are guaranteed.
     func viewImage(blobId: String, filename: String, mimeType: String) {
         Task {
-            guard let bytes = try? await Baybo.client.blobDownloadBytes(
+            guard let bytes = try? await client.blobDownloadBytes(
                 blobId: blobId, progress: nil),
                 let image = UIImage(data: bytes)
             else { return }
@@ -1200,7 +1195,7 @@ final class ChatStore: ObservableObject {
             return try await inFlight.value
         }
         let task = Task {
-            let bytes = try await Baybo.client.blobDownloadBytes(blobId: blobId, progress: nil)
+            let bytes = try await client.blobDownloadBytes(blobId: blobId, progress: nil)
             try bytes.write(to: url, options: .atomic)
             return url
         }

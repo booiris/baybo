@@ -4,10 +4,12 @@
 // the Rust test `pinned_vector_is_reproduced` guards the producer side, this
 // guards the consumer side, so any AEAD drift fails on one side or the other.
 
+// The NSE sources are compiled straight into this bundle (project.yml): an app
+// EXTENSION cannot host a test bundle, so there is no `@testable import
+// NotificationExtension` to reach for — that shape does not exist.
+
 import CryptoKit
 import XCTest
-
-@testable import NotificationExtension
 
 final class NotificationServiceTests: XCTestCase {
     // device_proto::fixtures::KEY  (0x00..=0x1f)
