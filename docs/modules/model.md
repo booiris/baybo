@@ -6,17 +6,23 @@
 
 Contents:
 
-- **Content models**: `ContentBlock`, `BlobRef`, `ChatMessage` (including the persisted `platform_msg_id` idempotency key for channel-originated user rows), `Role`, `MessageSource`, `ThinkingContent`, `MessageMetadata` (now an empty struct), plus the `TOOL_OUTPUT_OPEN_PREFIX` / `TOOL_OUTPUT_CLOSE_PREFIX` marker constants
-- **Session types**: `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `Lineage`, `LineageKind`, `BackgroundCompressionPayload`
+- **Content models**: `ContentBlock`, `BlobRef`, `ChatMessage` (including the persisted `platform_msg_id` idempotency key for channel-originated user rows), `Role`, `MessageSource`, `ThinkingContent`, `MessageMetadata` (now an empty struct), `ToolResultMeta`, plus the `TOOL_OUTPUT_OPEN_PREFIX` / `TOOL_OUTPUT_CLOSE_PREFIX` marker constants and the `SHA256_PREFIX` blob-id prefix with its `blob_content_digest` helper
+- **Session types**: `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `Lineage`, `LineageKind`, `BackgroundCompressionPayload`, `GroupState`
 - **Memory types**: `MessageSource::RecalledMemory` (the framed recall-injection marker) + the `ChatMessage::recalled_memory` constructor
+- **Task types** (`task`): `Task`, `TaskStatus`, the `TASK_CREATE_TOOL_NAME` / `TASK_GET_TOOL_NAME` / `TASK_LIST_TOOL_NAME` / `TASK_UPDATE_TOOL_NAME` consts, and `TASK_MUTATING_TOOL_NAMES`
+- **Control events**: `ControlEvent`, `ControlEventKind`
+- **Folder types**: `FolderId`, `FolderSummary`, `MAX_FOLDER_NAME_LEN`
+- **Agent-profile types**: `AgentProfileId`, `AgentFramework`, `BUILTIN_AGENT_PROFILE_ID`, `MAX_AGENT_PROFILE_NAME_CHARS`
 - **Governance types**: `TrustLevel`, `ArtifactSource`, `ExtensionManifest`, `ExtensionKind`
-- **Cost & money types**: `CostRecord`, `CostSummary`, `TimeRange`, `MicroUsd` (integer micro-USD; the project never uses floats for money)
+- **Security types**: `PlaceholderId`, `SecretKind`
+- **Cost & money types**: `CostRecord`, `CostSummary`, `CallReason`, `TimeRange`, `MicroUsd` (integer micro-USD; the project never uses floats for money)
 - **Cron types**: `CronJob`, `CronExecution`, `CronSchedule`, `CronStatus`, `ExecutionStatus`
 - **Approval types**: `ApprovalDecision`, `ApprovedResource`, `HostPattern`, `ResourceAccess`
-- **Subagent spawn protocol** (`spawn_protocol`): `SubagentSpawnRequest`, `SubagentResult`, `PendingSubagentResult`, `SubagentReturn`, `SubagentExitStatus`, the `SPAWN_SUBAGENT_TOOL_NAME` const, and related markers
-- **External-agent types**: `ExternalAgentKind`, `SubagentBackend`, `SubagentBackendKind`
+- **Subagent spawn protocol** (`spawn_protocol`): `SubagentSpawnRequest`, `SubagentParentContext`, `SubagentResult`, `SubagentExitStatus`, `PendingBackgroundResult`, `BackgroundJobKind`, `OnTimeout`, the `SPAWN_SUBAGENT_TOOL_NAME` const, and related markers (`SUBAGENT_CHANNEL_TAG`, `BACKGROUND_SUBAGENT_HANDLE_PREFIX`, `BACKGROUND_DISPATCH_ACK_PREFIX`, `new_background_handle`)
+- **External-agent types**: `ExternalAgentKind`, `SubagentBackend`, `SubagentBackendKind`, `SubagentBackendTag`, the `BAYBO_BACKEND_TAG` const
 - **LLM routing types**: `LlmEntryName`, `ModelTier`, `LlmPricingOverride`
-- **ID newtypes**: `SessionId`, `JobId`, `SpanId`, `StepId`, `CostRecordId`, `ParallelGroup`
+- **Fingerprints**: `FileFingerprint` (mtime + size, used by the read-before-write tracker)
+- **ID newtypes**: `SessionId`, `JobId`, `SpanId`, `StepId`, `CostRecordId`, `TaskId`, `ParallelGroup`
 
 ## Design Decisions
 
@@ -30,7 +36,7 @@ Multimedia content (`ContentBlock::Image/Audio/File`) uses `BlobRef` (id) instea
 
 ### Thread safety
 
-All `model` types are `Send + Sync + Serialize + Deserialize + Clone`.
+All `model` types are `Send + Sync + Clone`; persisted and wire-visible types are additionally `Serialize + Deserialize` (the in-process spawn-handoff types `SubagentResult` and `SubagentParentContext` — which carries a `CancellationToken` — are not).
 
 ### Memory types
 

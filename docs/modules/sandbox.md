@@ -17,13 +17,14 @@ What the crate provides:
   paths, extra `writable_paths`, network policy, environment policy,
   stdin source, timeout, `resource_limits` (memory + pids caps), and
   the `FilesystemPolicy` selecting between strict workspace-only writes
-  and the permissive "host RW + denylist" model used by `BashTool`.
+  and the permissive "workspace+$HOME RW + denylist" model used by `BashTool`.
 - `cfg`-free `args.rs` that renders the bwrap argv and the SBPL profile,
   so spec → invocation is unit-testable on any developer host.
-- An `baybo_sandbox::probe()` entry point so callers (the gateway) can detect
-  a missing backend at startup and react cleanly. The `bootstrap` module
-  exports the `SandboxAvailability` struct that `probe()` returns; the
-  function itself sits at the crate root.
+- An `baybo_sandbox::probe()` entry point (returning
+  `bootstrap::SandboxAvailability`) for backend diagnostics; the gateway's
+  boot path itself uses `current_platform_runner()` (see "Bootstrap probe at
+  startup"). The `bootstrap` module exports the `SandboxAvailability` struct
+  that `probe()` returns; the function itself sits at the crate root.
 
 What gets wrapped:
 
@@ -66,9 +67,19 @@ Bash warns before running without the inner OS sandbox.
 
 The three backends have nothing meaningful in common at the syscall
 level — bwrap namespaces vs. SBPL rules vs. dockerd-managed cgroups —
-so the trait surface is intentionally minimal: `run(spec) ->
-Result<SandboxOutput, SandboxError>` and `backend()` for diagnostics.
-There is no shared "policy" type beyond `SandboxSpec` itself.
+so the trait surface is small: `run(spec) ->
+Result<SandboxOutput, SandboxError>`, `spawn_detached(spec) -> Box<dyn
+DetachedChild>` (backs the Bash timeout → background path; the caller owns
+wait/timeout/kill, and the Docker impl must `docker rm -f` the container on
+kill), `warm()`, `default_resource_limits()`, and `backend()` for
+diagnostics. There is no shared "policy" type beyond `SandboxSpec` itself.
+
+`DetachedChild` mirrors `baybo_tools::RunningChild` — it is declared in
+`baybo-sandbox` so the crate stays free of an `baybo-tools` dependency, and
+`SandboxAdapter::spawn_command_detached` (`baybo-agent`) bridges the two.
+All three backends override `spawn_detached`; the default impl returns
+`SandboxError::InvalidSpec`, on which the tool falls back to the blocking
+`run` (kill-on-timeout).
 
 #### Docker fallback specifics
 
@@ -231,8 +242,9 @@ reach. When `allowed_hosts` is non-empty the runners diverge sharply:
 - macOS callers can populate it and get real enforcement.
 - Linux/Docker callers immediately surface the limitation rather
   than learning later that the boundary was advisory.
-- A future netns + nftables enforcer (or a kernel-level Linux
-  alternative) can plug into the same field without an API change.
+- A future pre-provisioned netns + iptables enforcer (or another
+  kernel-level Linux alternative) can plug into the same field without
+  an API change.
 
 ### Filesystem policy: `Workspace` vs. `Permissive`
 
@@ -258,10 +270,11 @@ on minimal containers) downgrades silently instead of failing the
 call. FHS roots (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`,
 `/run/systemd/resolve`) stay RO-bound so installed binaries and
 resolv.conf still work. Anything outside that union is *not* visible
-inside the sandbox — there is **no full host-root bind**. `--proc`,
-`--dev`, and `--tmpfs /tmp` overlay a fresh PID namespace, a minimal
-devtmpfs (no host raw devices like `/dev/sda`), and a per-call temp
-dir. Each entry in `denied_paths` is then masked with an empty
+inside the sandbox — there is **no full host-root bind**. `--proc` and
+`--dev` overlay a fresh PID namespace and a minimal devtmpfs (no host
+raw devices like `/dev/sda`); `/tmp` is the host's real `/tmp`, bound
+RW (`--bind /tmp /tmp`) — see "Tempdir routing" below. Each entry in
+`denied_paths` is then masked with an empty
 per-call `tmpfs`, so credential vaults that physically sit inside
 `extra_root` look empty inside the sandbox regardless of what was on
 the host. The OS user's own permission bits stay in effect on top.
@@ -322,26 +335,21 @@ Trade-offs:
 
 ### Sandbox FS root vs. Baybo state directory
 
-These are **different paths**, on purpose:
+These are **distinct scopes**, on purpose — though not disjoint paths:
+the sandbox FS root is a subdirectory of the Baybo state root.
 
 - `baybo_workspace::WorkspaceManager.root` is `config.workspace.path`
   (defaults to `~/.baybo`). It's where Baybo keeps its libsql storage,
   identity files, lock file, and skill bundles. The agent reads from
   here in-process, not via subprocesses.
-- The sandbox FS root passed to `ToolExecutor::new` is the *project
-  workspace*: where the user expects shell commands to run. The
-  gateway resolves this from `std::env::current_dir().canonicalize()`
-  at startup — the directory baybo was launched from. If
-  `current_dir()` fails, the gateway falls back to the state
-  directory and logs a warning.
+- The sandbox FS root passed to `ToolExecutor::new` is the workspace
+  **work dir** — `<workspace>/work/` (`WorkspacePaths::work_dir()`),
+  created by `WorkspaceManager::ensure_layout`. The gateway
+  canonicalizes it at startup (`crates/baybo/src/runtime.rs`); if
+  canonicalization fails it uses the literal path and logs a warning.
 - `SandboxAdapter` rejects any `cwd` that isn't a subpath of the
   sandbox FS root (after canonicalization on both sides, so macOS's
   `/tmp` → `/private/tmp` symlink doesn't trip false escape errors).
-
-Daemon-launched setups whose `current_dir()` is `/` will fall back to
-the state directory, which is almost certainly not what the operator
-wants — that case will be addressed by the deferred `[sandbox]` config
-section.
 
 ### Tempdir routing
 
@@ -450,7 +458,7 @@ backend binary is absent.
 |--------------|-----------------------------------------------------------------------------------------------|
 | `tools`      | Defines `ExecSandbox` trait + `SandboxedOutput` and adds `sandbox` / `workspace_root` to `ToolContext`. `BashTool` opts in to routing.   |
 | `agent`      | Builds `SandboxAdapter` per call; passes the runner and any sandbox-bypass reason into `ToolExecutor::new`. |
-| `security`   | Hosts the decision-layer primitives (SSRF resolution in `WebFetch::validate_url_with`, leak detection, secret vault). The sandbox is the enforcement layer that makes those decisions real for ExecCommand tools. |
+| `security`   | Hosts the decision-layer primitives (the SSRF floor `is_blocked_ip` consumed by WebFetch's `validate_url_with` in `baybo-tools`, leak detection, secret vault). The sandbox is the enforcement layer that makes those decisions real for ExecCommand tools. |
 | `bootstrap`  | `crates/baybo/src/sandbox_boot.rs` calls `current_platform_runner()` at startup; `runtime.rs` threads the result into `ToolExecutor`.                 |
 
 ## Deferred (post-v1)
@@ -458,12 +466,14 @@ backend binary is absent.
 Tracked in [`docs/todo/sandbox-os-isolation.md`](../todo/sandbox-os-isolation.md):
 
 - **Per-host network allowlist on Linux** (bwrap and Docker). The
-  macOS SBPL path shipped. Linux currently fail-closes; the future
-  enforcement layer is netns + nftables egress filtering on bwrap
-  (CAP_NET_ADMIN inside the user namespace makes this tractable
-  without privileged setup), and a container-reachable filter for
-  Docker (host-gateway routing or in-container sidecar). Until that
-  lands, callers wanting host scopes use macOS or run with empty
+  macOS SBPL path shipped. Linux currently warns and ignores the field
+  (advisory); the future enforcement layer is a pre-provisioned netns +
+  iptables egress filter on bwrap (Path A in
+  `docs/todo/sandbox-os-isolation.md` — privileged setup once at install
+  time, zero-privilege at runtime), and the same Path-A pattern adapted
+  for Docker (a pre-created network with filtered egress via `docker
+  network create` + a `DOCKER-USER` iptables rule). Until that lands,
+  callers wanting host scopes use macOS or run with empty
   `allowed_hosts`.
 - MCP stdio sandboxing.
 - `[sandbox]` config section for timeouts, memory caps, extra

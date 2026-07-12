@@ -9,7 +9,7 @@ The `baybo-cli` crate is the **operator-facing command layer** for Baybo. It doe
 
 `baybo-cli` adds no business logic. Every command is a thin adapter that turns parsed flags into an existing manager call (`SessionManager`, `JobLifecycle`, `ToolRegistry`, `SkillRegistry`, `CronScheduler`, `SecretVault`, `WorkspaceManager`, `BayboConfig`). When a subsystem is not yet implemented, its command family is omitted — the CLI never surfaces a "zombie" command that prints `not implemented`.
 
-The command taxonomy is organized by subsystem: one family per manager exposed in `crates/baybo/src/main.rs`. Subsystems that do not yet exist in Baybo (e.g. service-mode gateway, device pairing, browser control) get no command family at all.
+The command taxonomy is organized by subsystem: one family per manager exposed in `crates/baybo/src/main.rs`. Subsystems that do not yet exist in Baybo (e.g. browser control, node fabric, `mcp serve`) get no command family at all.
 
 ## Design Decisions
 
@@ -25,19 +25,19 @@ Reserved slash tokens (`/quit`, `/exit`, `/clear`) stay local to the adapter and
 
 ### `CommandContext` is the only handle
 
-Every command receives a `CommandContext` carrying `Arc` clones of the managers plus the loaded `BayboConfig` and an `OutputSink`. The same struct is used in both modes; only the sink differs (`StdoutSink` vs `ChannelResponseSink`). Commands never reach for globals, never construct their own `Arc`s, and never take `&mut` to any manager — concurrency safety is the manager's responsibility.
+Every command receives a `CommandContext` carrying `Arc` clones of the managers plus the loaded `BayboConfig`, the requested `OutputFormat`, and the `Invocation` (argv vs slash). The same struct is used in both modes; rendering is the caller's job — argv prints `out.render(format)`, slash wraps it in a `ContentBlock::Text`. Commands never reach for globals, never construct their own `Arc`s, and never take `&mut` to any manager — concurrency safety is the manager's responsibility.
 
 ### Explicit mutation confirmation in slash mode
 
-A command is marked `Mutating` at definition time (read-only commands default to `ReadOnly`). Mutating commands invoked over slash require an explicit `--yes` (or `-y`) flag; without it the dispatcher returns `CliError::ConfirmationRequired` and the response explains what would have happened. Argv mode allows interactive prompts; slash mode does not (there is no TTY guarantee on non-CLI channels). This keeps mis-typed `/job cancel foo` from firing silently while a user is chatting.
+Confirmation is per-subcommand: every mutating subcommand carries a `--yes` (or `-y`) flag in the clap tree, and its handler checks the invocation — over slash, without `--yes` (or a pre-confirmed `ctx.confirmed`), it returns `CliError::ConfirmationRequired` and the response explains what would have happened. Argv mode allows interactive prompts; slash mode does not (there is no TTY guarantee on non-CLI channels). This keeps mis-typed `/job cancel foo` from firing silently while a user is chatting.
 
 ### Output format is structured, not just printed
 
-Commands return `CommandOutput`, not `String`. The sink decides how to render:
+Commands return `CommandOutput`, not `String`. The caller decides how to render:
 
 - `OutputFormat::Human` → pretty text / ANSI tables / sectioned summaries
 - `OutputFormat::Json` → `serde_json::to_string_pretty` for scripts
-- `OutputFormat::Plain` → uncolored single-block text, used by the slash sink when sending back over a channel
+- `OutputFormat::Plain` → uncolored single-block text, what slash renders when sending back over a channel
 
 `--json` and `--plain` are global flags and work identically in both modes — `/job list --json` returns a JSON-formatted text block.
 
@@ -121,7 +121,7 @@ before the subshell runs. The agent gets:
 The substring match is loose; non-baybo processes inherit the
 variables and ignore them, so a false-positive injection is a no-op.
 
-"Status" shows what actually ships today. Rows marked **deferred** are kept here so future contributors can see the target surface; the missing backing APIs land with their subsystems — the original mass-tracker was completed and archived at `docs/todo/archives/cli-write-commands.md`. Handlers for deferred subcommands do not exist — the clap tree in `crates/cli/src/cli.rs` only exposes the shipped rows.
+"Status" shows what actually ships today. Rows marked **deferred** are kept here so future contributors can see the target surface; the missing backing APIs land with their subsystems — the original mass-tracker (the since-removed `cli-write-commands.md` todo) was completed, archived, and then deleted; see git history. Handlers for deferred subcommands do not exist — the clap tree in `crates/cli/src/cli.rs` only exposes the shipped rows.
 
 | Family       | Subcommands                                                                                               | Backing module                                                               | Mutation                                                                                           | Status                                            |
 | ------------ | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
@@ -133,7 +133,7 @@ variables and ignore them, so a false-positive injection is a no-op.
 | `channel`    | `status` · `logs [channel]`                                                                               | `ChannelRegistry` / adapter logs                                             | read-only                                                                                          | deferred — needs per-adapter status + log drain   |
 | `mcp`        | `add <name> <command-or-url> [...]` · `list` · `get <name>` · `remove <name>`                              | `baybo-tools::mcp` (config: `<workspace>/.mcp.json`) + `SecretVault` (tokens) | `add`/`remove` mutate `.mcp.json` + vault; `add` runs the OAuth flow inline when an OAuth flag is passed for an HTTP server. The running gateway's `McpReconciler` picks up changes within ~5s. | shipped                                           |
 | `llm`        | `status`                                                                                                  | `LlmClient`                                                                  | read-only                                                                                          | shipped                                           |
-| `llm`        | `probe [name]` · `live-model [name]`                                                                      | `LlmProviderRegistry::list_models` / `LlmClient::probe`                      | `probe` issues a minimal chat request                                                              | shipped                                           |
+| `llm`        | `probe [name]` · `live-model [name]`                                                                      | `LlmProviderRegistry::list_live_models` / `LlmClient::probe`                 | `probe` issues a minimal chat request                                                              | shipped                                           |
 | `llm`        | `add` · `edit` · `remove` · `default`                                                                     | Interactive editors that write the active config + vault                     | mutates `baybo.json` and per-entry vault keys                                                       | shipped                                           |
 | `memory`     | `status` · `setup` · `test` · `disable`                                                                   | `baybo-memory` backends + `UserSecretManager` (`user_env.<NAME>` shared with `baybo secret`) | `status` / `test` are read-only (test runs the backend's startup health probe); `setup` is interactive (single-select provider picker + endpoint for openviking) and persists to `baybo.json`; the actual API-key value goes through `baybo secret add <NAME>` (defaults: `MEM0_API_KEY` / `OPENVIKING_API_KEY`); `disable` flips `provider = noop` and clears `extra`. Memory config is **not** hot-reload, so each mutating command prints a restart hint. | shipped                                           |
 | `external-agent` | `status` · `setup` · `disable` · `default`                                                            | `baybo-agent::external_agent` CLI backends (Claude Code / Codex / Gemini)     | `status` re-probes each kind offline (read-only); `setup` is an interactive wizard that probes a binary path and writes the resolved **absolute** `external_agents.<kind>.binary_path` to `baybo.json` (empty input = PATH lookup, still recorded as a concrete path); `disable` is a multi-select that flips `external_agents.<kind>.enabled = false` for the checked kinds and re-resolves the default (no-op success when nothing is enabled); `default` sets `external_agents.default_external_agent` to an enabled kind (operator-facing designation — nothing reads it at runtime yet, so no restart) | shipped                                           |
@@ -146,11 +146,12 @@ variables and ignore them, so a false-positive injection is a no-op.
 | `cost`       | `show [--user <u> \| --session <id> \| --job <id>] [--since <YYYY-MM-DD>] [--until <YYYY-MM-DD>]`        | `QueryApi::cost_summary` (`CostScope::{User, Session, Job, TimeRange}`)      | read-only. Scopes are mutually exclusive: `--user` is bounded by `--since`/`--until` (default = current UTC day); `--session`/`--job` ignore the time range. Output reports total micro-USD + token aggregates (input / output / cached input / cache writes). | shipped (requires the full domain graph; returns a `Manager` error in argv-light boots that lack `QueryApi`) |
 | `status`     | `[--live]`                                                                                                | Static: registries + `LlmClient`. Live: `JobLifecycle::list` + `QueryApi::cost_summary` | `--live` adds in-flight job count, failed-jobs-last-24h, and today's spend (USD + token counts). Each live counter degrades to `(unavailable)` when its manager isn't wired in the current invocation. | shipped (live block populated where managers are wired)  |
 | `gateway`    | `start` · `install [--system] [--exec-start <p>]` · `enable` · `disable` · `uninstall` · `status` · `token {show, rotate}` | `baybo-gateway` installer + `AdminToken`                                      | `start` runs the long-lived server; `install`/`enable`/`disable`/`uninstall` and `token rotate` mutate; `status`/`token show` are read-only | shipped (intercepted in `crates/baybo/src/main.rs` before dispatch, runs in `crates/baybo/src/gateway_cmd.rs`) |
-| `pair`       | `list [--pending\|--approved]` · `approve <code>` · `revoke <channel-type> <bot-id> <user-id>`            | `baybo-pair` store via `ChannelPairingStore`                                  | `approve`/`revoke` mutate                                                                          | shipped                                           |
+| `pair`       | `list [--pending\|--approved]` · `approve <code>` · `revoke <channel-type> <bot-id> <user-id>`            | `baybo_store::ChannelPairingStore`                                            | `approve`/`revoke` mutate                                                                          | shipped                                           |
+| `device`     | `pair [--relay-url <host>] [--remote-api-key <key>]` · `list [--approved]` · `revoke <device-id>`         | `baybo_pairing::DevicePairingService` (device store)                         | `pair`/`revoke` mutate; `pair` is an interactive mutual-confirm flow (terminal-only — the whole family is rejected in slash) | shipped                                           |
 | `prompt`     | `[PROMPT] [--session <id>] [-y/--dangerously-allow-all] [--timeout <secs>]`                               | Hybrid: WS into a live gateway, else in-process `runtime::build_managers` + `wire_router` | runs one agent turn — persists the session row + transcript + traces + cost like any conversation | shipped (intercepted before dispatch, runs in `crates/baybo/src/prompt_cmd.rs`) |
 | `tui`        | `[--session <id>]`                                                                                        | WS client into the gateway's channel listener                                | read-only                                                                                          | shipped (intercepted before dispatch, runs in `crates/baybo/src/tui_cmd.rs`) |
 | `setup`      | —                                                                                                         | Interactive first-run wizard (`baybo-setup`)                                  | bootstraps workspace + master key + default `baybo.json`                                            | shipped (intercepted before dispatch, runs in `crates/baybo/src/setup_cmd.rs`) |
-| `doctor`     | —                                                                                                         | Aggregates `BayboConfig::validate`, storage ping, `llm::probe`, env-var audit | read-only                                                                                          | shipped (LLM probe gated on `llm probe` landing)  |
+| `doctor`     | —                                                                                                         | Checks config path presence, `security.encryption_key_file` readability, LLM client wired (no live probe), and ≥1 registered channel | read-only                                                                                          | shipped                                           |
 | `completion` | `<shell>`                                                                                                 | `clap_complete`                                                              | stdout only                                                                                        | shipped                                           |
 
 ### `prompt` — headless one-shot turns
@@ -233,9 +234,9 @@ wait for the turn's reply: on expiry the turn errors out (surfaced as the
 Listed so future contributors see the gap explicitly. Each one waits for its subsystem to land:
 
 - **Service lifecycle**: `daemon` — service installation lives under `baybo gateway`; no separate `daemon` surface.
-- **Device and node fabric**: `nodes`, `devices` — no paired-peer concept in Baybo today. (Per-user pairing approval ships as `baybo pair`.)
+- **Node fabric**: `nodes` — no multi-node peer concept in Baybo today. (Per-user channel pairing ships as `baybo pair`; iOS-companion device pairing ships as `baybo device` — see the table row.)
 - **IDE / external bridges**: `acp`, `mcp serve`, `dashboard` — out of scope until the corresponding subsystems exist. The MCP **client** ships as `baybo mcp {add,list,get,remove}` (see the row above); only the *server-side* `mcp serve` family remains deferred.
-- **Rich media**: `browser`, inference over image/audio/video/tts — no Baybo counterpart.
+- **Rich media**: `browser`, inference over image/audio/video/tts — the browser tool ships as a sidecar (see [`sidecars.md`](../sidecars.md)) configured via `baybo setup`, with no dedicated CLI family; the rest have no Baybo counterpart.
 - **Plugin distribution & installer**: `plugins`, `backup`, `update`, `onboard`, `reset` — release-engineering concerns, not runtime.
 - **Auxiliary directories**: `directory`, `wiki`, `webhooks`, `dns` — deferred until each subsystem lands.
 
@@ -251,7 +252,7 @@ Persistent TUI input history is owned by the gateway, not `baybo-cli`. The TUI l
 
 ### Dashboard shortcut
 
-Bare dashboard commands — `/skills`, `/tools`, `/jobs`, `/sessions`, `/memory` with no further tokens — bypass the clap path and return `SlashOutcome::OpenView(ViewKind::_)`. Interactive adapters swap into a table view backed by `DashboardProvider::snapshot(kind)`; line-mode adapters treat the outcome as a no-op. Commands with arguments (e.g. `/skills info foo`) still go through clap as `SlashOutcome::Handled`.
+Bare dashboard commands — `/skills`, `/jobs`, `/sessions` with no further tokens — bypass the clap path and return `SlashOutcome::OpenView(ViewKind::_)`. Interactive adapters swap into a table view backed by `DashboardProvider::snapshot(kind)`; line-mode adapters treat the outcome as a no-op. Commands with arguments (e.g. `/skills info foo`) still go through clap as `SlashOutcome::Handled`.
 
 ### Skill shortcut
 
@@ -259,27 +260,27 @@ Bare dashboard commands — `/skills`, `/tools`, `/jobs`, `/sessions`, `/memory`
 
 ### Output rendering over channels
 
-`ChannelResponseSink` turns `CommandOutput` into a single `ContentBlock::Text`. Tables are rendered as monospace text; `--json` produces JSON text. Images and files are never produced by CLI commands.
+`CliSlashHandler::handle` renders `CommandOutput` (Plain, or Json when the invocation carried `--json`) into a single `ContentBlock::Text`. Tables are rendered as monospace text. Images and files are never produced by CLI commands.
 
 ### Mutation feedback
 
-When a command with `Mutating = true` runs in slash mode, its response always includes the resulting `JobId` / new row id / trace span id, so the user sees an auditable handle. This aligns with the observability constraint in CLAUDE.md.
+When a mutating command runs in slash mode, its response includes the affected id (job id, server name, config path, …), so the user sees an auditable handle. This aligns with the observability constraint in CLAUDE.md.
 
 ## Constraints
 
 - `baybo-cli` holds no mutable state; all managers are `Arc`. The crate is `Send + Sync + 'static`.
 - Slash input **must not** be forwarded to the agent when it parses as a known CLI command. Unknown `/` input (parse error `UnknownCommand`) falls back to `PassThrough` only if the dispatcher explicitly says so — never by default. The skill shortcut is the one sanctioned `PassThrough` path: a `/<token>` whose first token matches a user-invocable skill is forwarded to the agent as a normal chat message.
 - Commands that mutate must route their effect through the manager (never touching a store directly), so traces fire naturally.
-- The `SecretVault` value of any secret is never rendered; `security` and `config` commands redact to `********`.
+- The `SecretVault` value of any secret is never rendered; `mcp get` renders vault-backed env/headers/credentials as `********`, and `secret list` / `memory status` show only masked previews.
 - No `unwrap` / `expect` in command handlers. Parser-level `expect` on derive macros is acceptable.
-- Every **shipped** command family has at least one parser test and one dispatch test. Deferred families do not appear in the clap tree at all until their subsystem lands, so there is nothing to test yet.
+- Shipped command families are expected to carry at least one parser test and one dispatch test; several (`pair`, `secret`) currently carry neither, and the dispatch smokes cover `mcp` only. Deferred families do not appear in the clap tree at all until their subsystem lands, so there is nothing to test yet.
 
 ## Collaboration
 
 | Module                                                                                                              | Role                                                                                                                                                             |
 | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `bootstrap` — the `baybo` binary in **`crates/baybo`** (`crates/baybo/src/main.rs`, `crates/baybo/src/boot.rs`, `crates/baybo/src/runtime.rs`, `crates/baybo/src/gateway_cmd.rs`, `crates/baybo/src/tui_cmd.rs`, `crates/baybo/src/setup_cmd.rs`), not `crates/cli` (`baybo-cli` is lib-only, no `main.rs`) | Promotes `--config` into `BAYBO_CONFIG_PATH`, then routes to a per-subcommand entry: `gateway_cmd::run` for `gateway`, `setup_cmd::run` for `setup`, `tui_cmd::run` for `tui`, and the lightweight argv path (`baybo_cli::dispatch::run` against a `CommandContext`) for everything else. The TUI side (`tui_cmd`) wires `baybo-tui`'s WS-backed `TuiSlashHandler` / `TuiDashboardProvider`, not the in-crate `CliSlashHandler`. |
-| `config`                                                                                                            | `config` family directly reads/writes `BayboConfig`; `doctor` calls `validate`.                                                                                   |
+| `config`                                                                                                            | `config` family directly reads/writes `BayboConfig`; `doctor` reads the loaded config (path + `security.encryption_key_file`).                                    |
 | `agent`                                                                                                             | Supplies all manager `Arc`s.                                                                                              |
 | `channels`                                                                                                          | Owns `SlashHandler`, `SlashOutcome`, `DashboardProvider`, `ViewKind`; `TuiAdapter` is the first consumer of all four.                                            |
 | `job` / `cron` / `skills` / `tools` / `session` / `security` / `llm` | Each exposes the read/write APIs that a command family calls. CLI contains no business logic — it is a parameter adapter only.                                   |
@@ -300,7 +301,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 - `baybo completion zsh > /tmp/_baybo && zsh -c 'source /tmp/_baybo'` loads without error.
 - `baybo doctor` reports an error when `security.encryption_key_file` is missing or unreadable, and when no LLM client is configured.
 
-**Phase 2b — write-mutating commands** — complete. Tracked in `docs/todo/archives/cli-write-commands.md` (archived). Each shipped family landed with the following:
+**Phase 2b — write-mutating commands** — complete. Tracked in the since-removed `cli-write-commands.md` todo (completed, archived, then deleted — see git history). Each shipped family landed with the following:
 
 - Parser snapshot test in `crates/cli/tests/parser.rs` (aggregated via `crates/cli/tests/all.rs`).
 - Dispatch smoke tests in `crates/cli/tests/mcp_e2e.rs` (also reached via `all.rs`).

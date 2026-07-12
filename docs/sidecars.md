@@ -8,19 +8,19 @@ In-tree sidecars under `sidecars/channel/*` and `sidecars/tool/*` ship inside th
 Every sidecar self-declares an `baybo.domain` in its `package.json` (`channel`, `tool`, …). Domain identifies the family; the per-package name identifies an individual sidecar inside it. Constants live in `baybo_gateway::sidecar::domains`. **Build-time enforcement**: a missing or invalid domain (must match `[a-z0-9_]+`) is a hard `cargo build` error — new sidecars can't silently default into the wrong family.
 
 Adding a new sidecar:
-1. Pick a directory (`sidecars/channel/<name>/` or `sidecars/tool/<name>/`), add it to `pnpm-workspace.yaml`.
+1. Pick a directory (`sidecars/channel/<name>/` or `sidecars/tool/<name>/`) — the `sidecars/*/*` glob in `pnpm-workspace.yaml` picks it up automatically.
 2. `package.json` declares `"baybo": { "domain": "channel" | "tool" | ..., "kind": "mcp_server"? }`.
 3. For a new family, add a `domains::YOUR_DOMAIN` constant in `crates/gateway/src/sidecar/assets.rs` and iterate it from whichever supervisor / route / CLI dispatches that family.
-4. For a new tool-domain MCP server: also add an `*_mcp_profile(...)` builder in `crates/tools/src/mcp/profile/<name>.rs` (primitive args so `baybo-tools` stays free of an `baybo-config` dep) and append an entry in `runtime::build_managers`.
+4. For a new tool-domain MCP server: also add an `*_mcp_profile(...)` builder in `crates/tools/src/mcp/profile/<name>.rs` (primitive args so `baybo-tools` stays free of an `baybo-config` dep) and append an entry to the array literal in `baybo_gateway::collect_profiles` (`crates/gateway/src/sidecar/embedded_mcp.rs`) — `runtime::build_managers` stays unchanged.
 
 Existing dispatch:
 - `baybo channel list/add` filters `runtime.names_in_domain(domains::CHANNEL)`.
 - `SidecarSupervisor` (channel restart loop) iterates `domains::CHANNEL`.
-- `baybo_tools::mcp::embedded_servers(&profiles)` consumes the `EmbeddedMcpProfile` list from `runtime::build_managers` (today: just browser when `browser.enable=true`).
+- `baybo_tools::mcp::embedded_servers(&profiles)` consumes the `EmbeddedMcpProfile` list from `baybo_gateway::collect_profiles` (`crates/gateway/src/sidecar/embedded_mcp.rs`); the resulting servers are handed to `runtime::build_managers` (today: just browser when `browser.enable=true`).
 
 ## Media side-channel (`/v1/blobs/*`)
 
-Non-text media — a file the agent sends, a screenshot a tool produced, an image a user uploads — **never rides the channel WebSocket**. The bytes live in the gateway's content-addressed `BlobStore` (`crates/store/src/blob.rs`); the wire carries only a `WireAttachment` reference (`kind`, `blob_id`, `mime_type`, `size`, `filename`). A 100 MiB file is a tiny frame, and a slow media transfer can't head-of-line-block unrelated traffic on the same multiplexed connection. Bytes move over a separate channel-token-authenticated HTTP route, `POST/GET /v1/blobs/*` (`crates/gateway/src/channel/blobs.rs`), mounted under the same auth middleware as `/channel-ws`.
+Non-text media — a file the agent sends, a screenshot a tool produced, an image a user uploads — **never rides the channel WebSocket**. The bytes live in the gateway's content-addressed `BlobStore` (`crates/store/src/blob.rs`); the wire carries only a `WireAttachment` reference (`kind`, `blob_id`, `mime_type`, `size`, `filename`, `duration_ms`). A 100 MiB file is a tiny frame, and a slow media transfer can't head-of-line-block unrelated traffic on the same multiplexed connection. Bytes move over a separate channel-token-authenticated HTTP route, `POST/GET /v1/blobs/*` (`crates/gateway/src/channel/blobs.rs`), mounted under the same auth middleware as `/channel-ws`.
 
 `BlobStore::put_stream` hashes chunks on the fly, writes a temp file, then renames to `<blobs_root>/<sha256[0..2]>/<sha256>`, so identical content dedups to one physical file. Each `put` still mints a **distinct, unguessable `blob_id`** (`"sha256:<hex>.<read_token>"`, see `SHA256_PREFIX`) — the id *is* the read capability, so "same bytes" ≠ "same id" and sharing an id delegates read access. The 100 MiB ceiling (`MAX_BLOB_BYTES`) is enforced incrementally during upload and mirrored by axum's `DefaultBodyLimit`.
 
@@ -44,9 +44,9 @@ Thin wrapper around Google's [`chrome-devtools-mcp`](https://github.com/ChromeDe
 
 Shape what the agent can be safely told to do — not bugs but load-bearing:
 
-- **No per-Baybo-session isolation**. All sessions in one Baybo process share one Chrome profile (CDDM has no `BrowserContext` primitive). Concurrent sessions see each other's cookies. Docker mode does not restore isolation.
+- **No per-Baybo-session isolation**. All sessions in one Baybo process share the default browser context/profile unless an agent explicitly passes `isolatedContext` to `new_page` (CDDM creates a Puppeteer `BrowserContext` per name); Baybo does not wire a per-session context automatically. Concurrent sessions see each other's cookies. Docker mode does not restore isolation.
 - **No in-sidecar SSRF guard**. CDDM doesn't gate navigation to RFC1918 / loopback / cloud-metadata. With approvals also off, the LLM can navigate to `http://169.254.169.254/...` un-prompted. Treat `browser/navigate_page` to a non-vetted hostname the way you'd treat a `WebFetch` to that host.
-- **No per-call approval gate**. The browser MCP profile declares `capabilities = []` (`crates/tools/src/mcp/profile/browser.rs`) and CDDM emits no `_meta.baybo` annotations, so the agent loop's pre-execute approval prompt never fires for `browser/*`. Add HITL gateway-side, not in the MCP layer.
+- **No per-call approval gate**. The browser MCP profile declares `capabilities = []` (`crates/tools/src/mcp/profile/browser.rs`), so the agent loop's pre-execute approval prompt never fires for `browser/*`. Add HITL gateway-side, not in the MCP layer.
 - **Wide tool surface**. `evaluate_script` runs arbitrary JS in the page and is ungated. (Performance trace, lighthouse audit, and webmcp tools are hidden by the wrapper, but the rest of CDDM's surface — including arbitrary JS eval — is live.)
 - **DNS-rebinding window**. CDDM runs no sidecar-owned resolver — the agent has no checkpoint between resolution and CDP commands.
 

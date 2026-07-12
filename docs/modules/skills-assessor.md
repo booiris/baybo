@@ -10,7 +10,7 @@ Core responsibilities:
 
 - Hash a skill directory in a stable, tamper-evident way (`hash_skill_dir`, `hash_skill_primary`).
 - Prompt an LLM with the skill contents, parse the JSON verdict.
-- Persist verdicts via `SkillRiskStore` (defined in `storage`).
+- Persist verdicts via `SkillRiskStore` (defined in `baybo-store`; libsql implementation in `storage`).
 - Honour the `AssessmentMode` set at construction: `Off` skips the check, `Primary` judges `SKILL.md`, `Full` judges the whole tree (tiering oversized trees to a background worker).
 - Run oversized full-scope jobs on a background worker so chat turns don't block on a large LLM prompt, and recover any persisted job rows left behind by older builds so upgrades don't silently abandon in-flight verdicts.
 
@@ -48,7 +48,7 @@ An LLM call per skill per agent turn is not affordable. Verdicts are cached unde
 
 `hash_skill_dir` produces a stable hex-encoded SHA-256 over the **metadata** of each entry — `(path, kind, size, mtime-ns)` for files, `(path, target)` for symlinks. File bodies are deliberately not read. The properties:
 
-- **Stat-only walk** — the hot path (`cached()`, per-turn gate calls) does no file-content I/O, just `stat`. A 100 MiB skill tree used to mean 100 ms+ of reads per call; now it's a few hundred syscalls.
+- **Stat-only walk** — the hot path (per-turn gate calls that hit the `SkillRiskStore::get` cache) does no file-content I/O, just `stat`. A 100 MiB skill tree used to mean 100 ms+ of reads per call; now it's a few hundred syscalls.
 - **Sorted entries** — directory iteration order is OS-dependent; entries are sorted by relative path before hashing.
 - **Forward-slash paths** — a cache written on Linux matches one written on WSL / Windows.
 - **Length-prefixed fields** — `(len, bytes)` prefix on every variable-length string (rel-path, symlink target) to close aliasing hazards. Without it, file `a` with rel-path "a" could collide with file `ab` with rel-path "ab" across field boundaries.
@@ -63,7 +63,7 @@ An LLM call per skill per agent turn is not affordable. Verdicts are cached unde
 
 `AssessmentMode` is chosen at construction (bootstrapped from `config.skills.risk_check` in `baybo.json`) and controls the entire `check` flow:
 
-- **Off** — the classifier is never called. Every skill returns a synthesised `Safe` verdict with `scope = Disabled`. No hashing, no I/O, no cache reads or writes. The background recovery worker is also idle — we don't want disabling the check to silently drain persisted jobs to the LLM.
+- **Off** — the classifier is never called. Every skill returns a synthesised `Safe` verdict with `scope = Disabled`. No hashing, no I/O, no cache reads or writes. Recovered jobs are the one exception: rows already persisted in `skill_risk_assessment_jobs` are still drained by the background worker at startup — `Off` suppresses new enqueues only (see [Crash-safe recovery worker](#crash-safe-recovery-worker)).
 - **Primary** (default) — classify `SKILL.md` alone. Helper scripts are neither read nor judged. If the skill directory has no `SKILL.md`, the assessor returns a synthesised `Safe` verdict rather than escalating: operators who want helper-script coverage must opt into `Full`.
 - **Full** — classify the whole directory tree. Small trees (≤ `TIER_MAX_FILES` files AND ≤ `TIER_MAX_BYTES` aggregate) are judged synchronously on first use; subsequent calls hit the cache. Oversized trees tier automatically: the assessor classifies `SKILL.md` synchronously (returning `scope = Primary`, `background_pending = true`) and enqueues a full-scope job for the background worker. A later `check_full` call that still finds no full-scope cache entry returns the primary verdict without re-enqueuing, so the worker runs the full-scope LLM call at most once per `(skill, full_hash)`.
 
@@ -82,7 +82,7 @@ The background worker handles two kinds of full-scope jobs: ones enqueued live b
 
 ### Non-blocking error policy
 
-Only `Dangerous` blocks skill injection. Assessor errors (LLM unreachable, unparseable reply, I/O failure), skills without an on-disk `source_path` (test fixtures, inline-constructed skills), and the `Suspicious` tier all pass through with a `warn!` log. Availability is preferred over false-positive blocks; the verdict is still surfaced in `baybo skills check` output so a human can review.
+Only `Dangerous` blocks skill injection. Assessor errors (LLM unreachable, unparseable reply, I/O failure) and the `Suspicious` tier pass through with a `warn!` log; skills without an on-disk `source_path` (test fixtures, inline-constructed skills) pass through silently. Availability is preferred over false-positive blocks; the verdict is still surfaced in `baybo skills check` output so a human can review.
 
 ### Prompt construction
 
@@ -112,6 +112,7 @@ check(skill)
                           └─ miss
                              ├─ !should_tier → LLM(full) sync → put → return Full
                              └─ should_tier → hash_skill_primary
+                                  ├─ None (no SKILL.md) → LLM(full) sync → put → return Full
                                   ├─ primary cache hit → enqueued earlier; return Primary (pending=true)
                                   └─ miss → LLM(primary) sync → put
                                             → upsert_job + tx.send(full) → return Primary (pending=true)
@@ -130,7 +131,7 @@ recv(job)
 
 ## Persistence model
 
-Owned by `storage::risk` (see [storage.md](storage.md)):
+Owned by the `storage` crate's `libsql/skill_risk.rs` (see [storage.md](storage.md)):
 
 - `skill_risk_assessments(skill_name, content_hash, level, rationale, model, assessed_at)` — finalised verdicts. One table for both scopes; scope is encoded in the hash prefix, not a separate column.
 - `skill_risk_assessment_jobs(skill_name, content_hash, source_path, status, attempts, last_error, created_at, updated_at)` — in-flight full-scope work. `status` is `Pending` | `InProgress` | `Failed`. Written live when `Full` mode tiers a large skill; also carries rows left behind by older builds that can be recovered at startup.
@@ -153,7 +154,7 @@ Owned by `storage::risk` (see [storage.md](storage.md)):
 | Module | Role |
 |--------|------|
 | `skills`  | Owns `SkillDefinition`, `source_path`, and the registry the assessor hashes. |
-| `storage` | Defines `SkillRiskStore`, `RiskVerdict`, `AssessmentJob`; owns the libsql backend. |
+| `storage` | Implements `SkillRiskStore` over libsql; the trait plus `RiskVerdict` / `AssessmentJob` live in the `baybo-store` ports crate. |
 | `llm`     | Provides the `BoundBilledLlm` (bound to `Attribution::system("skill-assessor")`) used for the classifier call. |
-| `agent`   | Hosts the `Skill` builtin tool that consults `SkillRiskCheck` per invocation. |
+| `agent`   | Runs the tool loop that executes the registered `Skill` tool; the tool itself lives in `skills::tools` and consults `SkillRiskCheck` per invocation. |
 | `cli`     | `baybo skills check` renders `AssessedSkill` for operator review. |

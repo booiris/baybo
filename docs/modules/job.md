@@ -14,11 +14,13 @@ Job answers **"what step is this operation at"**, not "what exactly did it do." 
 
 ```
 Pending → InProgress → Completed
-                   \→ Stuck { reason } → InProgress
-                                      \→ Failed { reason }
-                                      \→ Cancelled { reason, partial_artifacts }
-                   \→ Failed { reason }
-                   \→ Cancelled { reason, partial_artifacts }
+      |            \→ Stuck { reason } → InProgress
+      |                               \→ Failed { reason }
+      |                               \→ Cancelled { reason, partial_artifacts }
+      |            \→ Failed { reason }
+      |            \→ Cancelled { reason, partial_artifacts }
+      \→ Failed { reason }
+      \→ Cancelled { reason, partial_artifacts }
 ```
 
 - **Pending**: created, waiting to execute
@@ -32,7 +34,7 @@ Every transition is validated strictly. Illegal transitions return errors, never
 
 ### Cancelled is independent of Failed
 
-`Cancelled` carries a `reason: CancelReason` (`UserPreempt`, `SystemCrash`, `SubagentTimeout`, `ParentCancelled`, `ParentDeleted`, `OperatorCancel`, `UserStopped`) and `partial_artifacts: Vec<SpanId>` — the spans that completed (or partially completed) before the cancel. Both fields are nested **inside** the `JobStatus::Cancelled { reason, partial_artifacts }` variant; the top-level `Job` exposes `emitted_span_ids` for general progress indexing. The next job's prompt-assembly step reads `partial_artifacts` and renders a "previously completed steps:" preamble so the LLM has context. Content lives only in the trace; the field is indices.
+`Cancelled` carries a `reason: CancelReason` (`UserPreempt`, `SystemCrash`, `SubagentTimeout`, `ParentCancelled`, `ParentDeleted`, `OperatorCancel`, `UserStopped`) and `partial_artifacts: Vec<SpanId>` — the spans that completed (or partially completed) before the cancel. Both fields are nested **inside** the `JobStatus::Cancelled { reason, partial_artifacts }` variant; the top-level `Job` exposes `emitted_span_ids` for general progress indexing. The field is reserved for a future prompt-assembly preamble that would surface those spans to the next job's LLM; no consumer reads it today, and every production cancel path currently passes an empty list. Content lives only in the trace; the field is indices.
 
 `SystemCrash` is used when Baybo owns the cleanup after execution disappeared:
 the boot recovery sweep rolls jobs left non-terminal by a prior process death to
@@ -58,9 +60,9 @@ pub enum JobInputKind { UserChat, Cron, Compact, Spawned, SubagentNotification }
 
 `Job` is not a passive data struct — it encapsulates the state machine:
 
-- `Job::new(session_id, origin, shape, input, parent_job_id)` — constructor with ULID, `Pending` status, timestamps. `origin` and `shape` are supplied by the caller; `input_kind` is projected from `input`.
+- `Job::new(session_id, origin, input, parent_job_id)` — constructor with ULID, `Pending` status, timestamps. `origin` is supplied by the caller; `input_kind` is projected from `input`.
 - `Job::transition(target, ...)` — validates transition, mutates status/timestamps, returns `JobTransition` record. `transition_at(target, ..., at)` / `cancel_at(reason, artifacts, at)` are explicit-timestamp variants reserved for the boot-recovery sweep, which must backdate `ended_at` to the last observed activity rather than the boot wall-clock; live callers use `transition` / `cancel`.
-- Convenience methods: `start()`, `complete(output)`, `fail(reason)`, `cancel(reason, partial_artifacts)`, `stuck(reason)`, `recover()`
+- Convenience methods: `start()`, `complete(output)`, `fail(reason)`, `cancel(reason, partial_artifacts)`, `stuck(reason)`, `recover(reason)`
 - `Job::is_terminal()` — true for `Completed | Cancelled | Failed`
 - `JobStatus::needs_recovery()` — true for `Pending | InProgress | Stuck` (consumed by admin queries that surface in-flight jobs)
 
@@ -74,7 +76,7 @@ This keeps the state machine invariants co-located with the type and makes them 
 
 `JobLifecycle` does only: load from store → call `job.transition()` → `store.save()` + `store.record_transition()`. No state machine logic in the orchestrator. It additionally owns:
 
-- A `tokio::sync::broadcast` bus that publishes a `JobLifecycleEvent` (id, session, parent, phase) on `Pending → InProgress` and on every `Completed | Failed | Cancelled` transition. Subscribers either wait for terminal phases (subagent runtime) or treat every phase as a recompute trigger (TurnState projection). Lagging subscribers must reconcile via store reads such as `list_by_session` / `active_turn_started_at` — a dropped event is not re-published.
+- A `tokio::sync::broadcast` bus that publishes a `JobLifecycleEvent` (id, session, parent, phase, input kind; the `Completed` phase additionally carries the reply's persisted `session_messages.ordinal`) on `Pending → InProgress` and on every `Completed | Failed | Cancelled` transition. Subscribers: the subagent runtime waits for terminal phases, the TurnState projection treats every phase as a recompute trigger, and the push dispatcher filters `Completed` events to real user turns (`kind == UserChat`). Lagging subscribers must reconcile via store reads such as `list_by_session` / `active_turn_started_at` — a dropped event is not re-published.
 - A `JobCancellationRegistry` mapping `JobId → CancellationToken` for in-flight jobs. `JobLifecycle::cancel` trips the registered token *before* flipping the row, so the running execution observes the cancel before terminal-state observers do. `register_running` returns a RAII `JobCancellationGuard` that unregisters on drop, so an early `?` from the agent loop can't leak entries.
 
 ### Recovery
@@ -99,15 +101,17 @@ Jobs support parent-child relationships via `parent_job_id`. Child success/failu
 
 ### Per-trigger queue / preempt policy
 
-The job state machine itself is trigger-agnostic, but the actor that drives it follows per-trigger policy:
+The job state machine itself is trigger-agnostic, but the actor that drives it follows per-trigger policy. The actor is a serial loop over a priority mailbox, so nothing a *trigger* carries preempts a running turn — only the subagent token tree does:
 
 | Session trigger | New trigger arriving while a job is `InProgress`                |
 | --------------- | --------------------------------------------------------------- |
-| `User`          | Preempt: current job → `Cancelled { UserPreempt, ... }`          |
+| `User`          | Queue / inject: lands in the actor mailbox at `Trigger` priority (see below) |
 | `Cron`          | Queue: actor mailbox holds it until current job is terminal     |
 | Subagent (any)  | Preempt: parent's cancellation token tree propagates downward   |
 
-Distinct from a new trigger arriving, the out-of-band `/stop` control command cancels the in-flight turn (and every in-flight descendant subagent) with `Cancelled { UserStopped, ... }` — that reason lets the subagent wait task suppress the terminal `BackgroundJobFinished` delivery so a stopped result never repopulates `pending_background_results`.
+A running turn drains the leading run of non-slash user inputs at each tool boundary and injects them mid-turn (non-preemptive — never mid-LLM-call); anything still queued when the turn ends is coalesced into the next turn. Preemption is not implemented — `CancelReason::UserPreempt` has no production producer today; the out-of-band `/stop` is the only way to cancel a running turn.
+
+`/stop` cancels the in-flight turn (and every in-flight descendant subagent) with `Cancelled { UserStopped, ... }` — suppression of the terminal `BackgroundJobFinished` delivery comes from `/stop` draining the supervisor's in-flight background-subagent registry (each child's wait task finds its entry gone and drops the delivery), so a stopped result never repopulates `pending_background_results`; `UserStopped` is the audit reason stamped on the cancelled rows.
 
 ### Collaboration with Trace
 
@@ -117,14 +121,14 @@ Distinct from a new trigger arriving, the out-of-band `/stop` control command ca
 | Key fields     | `status`, timestamps, hierarchy, `final_result`      | `step_id`, `span_id`, kind-specific input/output/provenance |
 | Sensitive data | Sanitized JSON only                                  | Sanitized payloads/summaries only                           |
 
-`JobLifecycle` lives in this crate; `SpanRecorder` (still in `agent`, pending its own extraction to `baybo-trace`) is its peer facade. They do not share a transaction; cross-table consistency is reconciled by the recovery scan (per-table transactions, eventually consistent).
+`JobLifecycle` lives in this crate; `SpanRecorder` (in `baybo-trace`) is its peer facade. They do not share a transaction; cross-table consistency is reconciled by the recovery scan (per-table transactions, eventually consistent).
 
 ## Constraints
 
 - `input` / `final_result` / `JobStatus::Cancelled.partial_artifacts` store sanitized JSON / span-id lists only — sensitive values must already be placeholders
-- `save()` and `record_transition()` should run in the same transaction (enforced by `JobLifecycle`)
+- `save()` and `record_transition()` are always invoked as a pair by `JobLifecycle::persist` — two sequential writes, not one DB transaction. A crash between them can leave a terminal row whose transition audit is missing its last entry; only rows left non-terminal are reconciled, by the boot recovery scan
 - `Job.origin` is supplied by the caller at `JobLifecycle::start_job` (via `JobSpec.origin`) and passed straight into `Job::new`; it is not validated against the payload. Only `input_kind` is projected from `input`
-- Does not depend on `trace`, `llm`, `tools`, or `agent`. Depends only on `baybo-model` for IDs.
+- Does not depend on `trace`, `llm`, `tools`, or `agent`. Depends only on `baybo-model` (IDs) and `baybo-store` (the `JobStore` trait + row DTOs).
 - `test_support::MemoryJobStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `baybo-job = { workspace = true, features = ["test-support"] }`.
 
 ## Collaboration

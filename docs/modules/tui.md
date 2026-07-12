@@ -95,7 +95,7 @@ encrypted at rest rather than in a plaintext history file — but the TUI
 process itself never opens the vault. The gateway is the single writer,
 and the TUI exchanges the ring over the channel WS like any other state.
 
-- Wire protocol: two `baybo_channels::wire::Frame` variants carry the history end-to-end. `Frame::HistorySnapshot { session_id, entries }` is pushed from the server once, right after `Frame::RegisterAck { ok: true }`, for session-scoped TUI clients only — sidecars never see it. `Frame::HistoryAppend { session_id, entry }` is sent by the TUI after every accepted submission.
+- Wire protocol: two `baybo_channels::wire::Frame` variants carry the history end-to-end. `Frame::HistorySnapshot { session_id, entries }` is pushed by the server in response to each `Frame::Subscribe` from a TUI-channel connection — so once during the bootstrap handshake (Register → RegisterAck → Subscribe → HistorySnapshot), and again on a `/new` re-subscribe, where the pump drops the redundant resend — sidecars never see it. `Frame::HistoryAppend { session_id, entry }` is sent by the TUI after every accepted submission.
 - Gateway side: `baybo_gateway::channel::TuiHistoryStore` (`crates/gateway/src/channel/history.rs`) wraps `Arc<SecretVault>` behind a `tokio::sync::Mutex`, so concurrent appends from multiple TUIs on the same gateway serialize into the same vault blob. It reads the current ring from the fixed key `baybo.tui.input_history`, pushes the new entry (de-duping consecutive duplicates), caps the ring at 500 newest entries, and writes it back (see [`security.md`](./security.md)). Load failures or write errors are logged `warn!` and are non-fatal.
 - TUI side: `WsTransport` (`crates/tui/src/client/ws.rs`, `transport.rs`) buffers the one-shot snapshot inside `initial_history: Mutex<Option<Vec<String>>>` during `connect_tui`. The main loop calls `ctx.input.take_history_snapshot().await` before the first `terminal.draw`, so the prior ring is populated when the input box first renders. `Action::Submit` calls `ctx.input.append_history(&entry)` in a detached `tokio::spawn` — no vault handle, no lock file, no local `baybo-security` dependency.
 - The TUI crate no longer carries an `InputHistoryStore` trait or any history builder on `TuiAdapter`. The store is implicit in the transport; tests that construct an adapter without a live gateway just get no snapshot and no-op appends.
@@ -134,7 +134,6 @@ These are intercepted by `TuiAdapter` before `SlashHandler::handle` is called.
 | `Ctrl-C` | Clear input if non-empty, otherwise request shutdown                                                                                                                |
 | `Ctrl-D` | Two-press exit (only when input is empty): the first press prints a hint; a second press within 2s exits. Any other key or a longer pause cancels the confirmation. |
 | `Ctrl-L` | Clear chat scrollback                                                                                                                                               |
-| `Alt-M`  | Toggle terminal mouse capture. Off restores native drag-to-select across terminals (wheel-scroll stops working until re-enabled).                                   |
 
 ### Chat
 
@@ -143,7 +142,6 @@ These are intercepted by `TuiAdapter` before `SlashHandler::handle` is called.
 | `Enter`                                          | Submit input (or run slash command)                                          |
 | `Shift-Enter` / `Alt-Enter`                      | Insert newline in the input (see terminal support below)                     |
 | `Up`/`Down`                                      | Move cursor within a multi-line draft; on the first/last line walks history  |
-| `PageUp`/`PageDown`                              | Scroll scrollback                                                            |
 | `Home`/`End`/`Left`/`Right`/`Backspace`/`Delete` | Standard cursor edits                                                        |
 | Any printable character                          | Insert at cursor                                                             |
 
@@ -262,12 +260,17 @@ The loop multiplexes three sources with `tokio::select!`:
 
 `WsTransport` (`crates/tui/src/client/transport.rs`) is the single
 concrete transport used by the TUI. The adapter holds an
-`Arc<WsTransport>` and calls three methods on it:
+`Arc<WsTransport>` and drives it through `submit`, `subscribe`,
+`approval_queue`, plus the session-pin (`current_session_id` /
+`switch_session`) and history (`take_history_snapshot` /
+`append_history`) helpers:
 
 - `submit(msg)` — flatten an `IncomingMessage`'s text blocks and
   send a `Frame::Message` over the WS.
-- `subscribe(session_id) -> TransportEventStream` — decode inbound
-  frames from the same WS and translate them into
+- `subscribe() -> TransportEventStream` — decode inbound frames from
+  the same WS for the currently pinned session (the pump re-reads the
+  pin on every frame, so a `/new`-driven `switch_session(new_id)` rolls
+  over without a stream restart) and translate them into
   `TransportEvent::{StreamDelta, ToolStarted, ToolCompleted, Status, Response, Notice, ApprovalRequested, ApprovalResolved}`. `Frame::Reasoning` is dropped (no variant) — the TUI shows a working indicator instead of the thinking trace.
 - `approval_queue()` — returns the transport's local `ApprovalQueue`.
   On construction, `WsTransport::connect` installs a resolver so
@@ -303,14 +306,14 @@ Single-consumer ordering on the mpsc keeps delta/response ordering correct as WS
 
 ### Logging in chat mode
 
-Writing `tracing` records to stdout while ratatui owns raw mode corrupts the frame. Chat mode therefore uses a two-layer subscriber:
+Writing `tracing` records to stdout while ratatui owns raw mode corrupts the frame. Chat mode (`TracingMode::Tui`, `crates/baybo/src/tracing_init.rs`) therefore uses a two-layer subscriber, and writes **no file on disk** — the TUI is a thin gateway client, and the gateway process owns the authoritative log file:
 
-- **File layer** — `tracing_appender::rolling::daily("<workspace>/logs", "baybo.log")` wrapped in a non-blocking writer. A `WorkerGuard` held on the stack of `main` flushes pending lines on shutdown.
-- **TUI echo layer** — `TuiLogLayer` (`crates/baybo/src/tui_log.rs`) filters **tracing** events to `WARN` and `ERROR` (lower `tracing` levels stay in the file only), extracts `message` + structured fields, and forwards them through `TuiLogSink::emit` as `AppEvent::Log(LogRecord)`. The event loop pushes the record onto the scrollback as a coloured line (`warn` yellow, `error` red, with the event `target` in grey).
+- **Buffer layer** — `LogBufferLayer` keeps recent events in the bounded in-memory `LogBuffer`. There is no file appender (`TracingGuards { _worker: None, .. }`); the `tracing_appender::rolling::daily` writer belongs to `TracingMode::File`, the gateway-server path.
+- **TUI echo layer** — `TuiLogLayer` (`crates/baybo/src/tui_log.rs`) filters **tracing** events to `WARN` and `ERROR` (lower `tracing` levels are kept only in the in-memory `LogBuffer`), extracts `message` + structured fields, and forwards them through `TuiLogSink::emit` as `AppEvent::Log(LogRecord)`. The event loop pushes the record onto the scrollback as a coloured line (`warn` yellow, `error` red, with the event `target` in grey).
 
 The `WARN`/`ERROR` cut applies only to this tracing-echo layer. Agent **notices** take a separate route: the transport maps `Frame::Notice` → `TransportEvent::Notice` → `AppEvent::Log` (see [Output path](#output-path)), preserving all three `NoticeLevel`s — `Info` notices reach the same `LogRecord` surface and render as a cyan `info` line (`LogLevel::Info`), so an agent-emitted info notice is not filtered out the way a `tracing` INFO event is.
 
-The sink is plumbed into the layer via `Arc<OnceLock<TuiLogSink>>`: `init_tracing` allocates the cell, then `main` sets it from `TuiAdapter::log_sink()` after the adapter is constructed. Events emitted before the cell is filled still reach the file layer; they simply don't appear in the TUI.
+The sink is plumbed into the layer via `Arc<OnceLock<TuiLogSink>>`: `init_tracing` allocates the cell, then `main` sets it from `TuiAdapter::log_sink()` after the adapter is constructed. Events emitted before the cell is filled reach only the in-memory `LogBuffer`; they don't appear in the TUI (and TUI-process events are never written to disk — the gateway owns the log file).
 
 Argv mode keeps the old stdout layer — one-shot commands don't own the terminal, so normal formatting works.
 

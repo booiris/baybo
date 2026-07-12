@@ -10,7 +10,7 @@ CronJobs are bound to `user_id + channel` (not `session_id`) so they survive ses
 
 ### Bind to user_id + channel, not session_id
 
-Sessions are ephemeral (30-min default timeout). A cron job is a long-lived intent that must outlive any single session. Binding to `user_id + channel` provides a stable identity; the Router mints a fresh session per fire (UUID id, `TriggerSource::Cron { cron_job_id }` stamped at creation) and runs a one-shot actor that exits after `CronTrigger` + `Shutdown`. Continuity across fires lives in long-term memory, not in a shared mutable transcript — reusing one session would replay every prior fire's messages and `SessionState` into the next run.
+Sessions are ephemeral (30-min default timeout). A cron job is a long-lived intent that must outlive any single session. Binding to `user_id + channel` provides a stable identity; the Router mints a fresh session per fire (a `cron-`-prefixed UUID id, `TriggerSource::Cron { cron_job_id }` stamped at creation) and runs a one-shot actor that exits after `CronTrigger` + `ActorStop`. Continuity across fires lives in long-term memory, not in a shared mutable transcript — reusing one session would replay every prior fire's messages and `SessionState` into the next run.
 
 ### Pre-computed next_trigger_at
 
@@ -22,7 +22,7 @@ Jobs whose `schedule` is `CronSchedule::At { time }` (i.e. `CronSchedule::is_one
 
 ### Cron expressions are timezone-aware
 
-Each `CronJob` carries an IANA `timezone` field (e.g. `"Asia/Shanghai"`, `"UTC"`). Cron expressions are evaluated **in that timezone**: `0 9 * * *` with `timezone = "Asia/Shanghai"` fires at 09:00 Shanghai time daily, not 09:00 UTC. The scheduler uses `chrono-tz` to convert the current UTC instant into the target zone, asks the `cron` crate for the next match in that zone, and converts the result back to `DateTime<Utc>` for persistence and the storage index. `At { time }` carries an absolute UTC instant and ignores `timezone`. Old rows persisted before this field existed deserialize with `"UTC"` — preserving their original behavior. The web admin auto-detects the browser's IANA zone via `Intl.DateTimeFormat()`, so users never need to pre-convert times.
+Each `CronJob` carries an IANA `timezone` field (e.g. `"Asia/Shanghai"`, `"UTC"`). Cron expressions are evaluated **in that timezone**: `0 9 * * *` with `timezone = "Asia/Shanghai"` fires at 09:00 Shanghai time daily, not 09:00 UTC. The scheduler uses `chrono-tz` to convert the current UTC instant into the target zone, asks the `cron` crate for the next match in that zone, and converts the result back to `DateTime<Utc>` for persistence and the storage index. `At { time }` carries an absolute UTC instant and ignores `timezone`. Old rows persisted before this field existed deserialize with `"UTC"` — preserving their original behavior. Jobs are created via the LLM `CronCreate` tool, which requires an explicit IANA `timezone` argument; the web admin cron page only lists, inspects, and deletes jobs — it has no create form.
 
 ### Schedule as a typed enum
 
@@ -59,4 +59,4 @@ The `CronStore` trait lives in the `baybo-store` ports crate (its libsql impl in
 | `storage` | `LibsqlCronStore` implements the `CronStore` trait (from `baybo-store`) against libsql, over `baybo-model` types; no dependency on `baybo-cron` |
 | `tools`   | `baybo-cron::tools` implements the `Tool` trait (`CronCreate` / `CronDelete` / `CronList`), bridging `Arc<CronScheduler>` to the registry; `crates/baybo/src/runtime.rs` registers them |
 | `agent`   | Re-exports `CronScheduler` / `CronTriggerEvent`; `Router` consumes the event stream, resolves sessions, and routes `AgentMessage::CronTrigger` to actors |
-| `job`     | `OperationKind::CronExecution` tracks cron-triggered operations |
+| `job`     | `JobInput::Cron { action_payload }` / `JobInputKind::Cron` mark cron-triggered jobs; the job's `origin` records the session's root trigger (`TriggerKind::Cron`) |

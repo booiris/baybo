@@ -29,7 +29,7 @@ scripts/check-ts-bindings.sh                                    # ts-rs regen CI
 
 **Slow tests are `#[ignore]` or gated.** The tmux render/smoke tests (`crates/tui/tests/chat_render.rs`, the `baybo-term-harness` lib tmux tests) are `#[ignore]` — they're flaky under load and run in CI's non-gating `render-tests` job via `--include-ignored`. Docker- and bwrap-backed sandbox smokes self-skip when their backend is absent. Any test that must sleep on a real timeout (e.g. the OpenViking timeout paths) injects ms-scale budgets — see `OpenVikingMemory::with_timeouts` — rather than sleeping real seconds.
 
-**Python tooling uses `uv` with a persistent project venv — never bare `pip` or the system interpreter.** Project-side Python (currently the `bench/swe` SWE-bench grader + dataset export) declares its deps in a `pyproject.toml`; `uv sync` materialises a reused on-disk `.venv` **and** provisions a pinned CPython, so the env is built once, reproducible, and independent of whatever `python3` the host ships (the system one is often too new for a given stack — e.g. `swebench`). Run through it — `uv run --project <dir> python …`, or point a tool at `<dir>/.venv/bin/python`. Commit `pyproject.toml` / `uv.lock` / `.python-version`; gitignore `.venv/`. Add a new Python tool the same way (its own `pyproject.toml` + `uv sync`), not with a global `pip install`.
+**Python tooling uses `uv` with a persistent project venv — never bare `pip` or the system interpreter.** Project-side Python (currently the `bench/` harnesses — `bench/swe`, `bench/swe-baseline`, `bench/swe-claude`, and the two `bench/terminal-bench-*` dirs) declares its deps in a `pyproject.toml`; `uv sync` materialises a reused on-disk `.venv` **and** provisions a pinned CPython, so the env is built once, reproducible, and independent of whatever `python3` the host ships (the system one is often too new for a given stack — e.g. `swebench`). Run through it — `uv run --project <dir> python …`, or point a tool at `<dir>/.venv/bin/python`. Commit `pyproject.toml` / `uv.lock` / `.python-version`; gitignore `.venv/`. Add a new Python tool the same way (its own `pyproject.toml` + `uv sync`), not with a global `pip install`.
 
 **Zero warnings means zero — including test files.** `--tests` is part of the clippy invocation above on purpose. Don't dismiss a warning as "pre-existing" or "only in a test"; if `cargo clippy` lights it up, fix it as part of the change.
 
@@ -41,7 +41,7 @@ Verbose / scoped logging:
 
 ```bash
 RUST_LOG=baybo=trace cargo run                # verbose
-RUST_LOG=baybo::agent=debug cargo run         # agent module only
+RUST_LOG=baybo_agent=debug cargo run          # agent crate only
 ```
 
 ## Code Style
@@ -88,7 +88,7 @@ Prefer generic/extensible architectures over hardcoding specific integrations. A
 - **Modular**: Each crate is an independent module; traits are defined within their own crate; crates interact via traits — high cohesion, low coupling
 - **Extensible**: Channels, Tools, and Skills all plug in via registries
 - **Domain crates own their tools**: a crate that owns a domain hosts its own `Tool` impls and depends on `baybo-tools` for the trait; `baybo-tools` carries only generic/core tools and never depends back on a domain crate (that would be a cycle)
-- **Dedup at the seam, not the surface**: when two variants share a lifecycle (e.g. the mobile `direct` vs `relay` chat legs in `app/mobile/src-tauri/src/transport.rs`), unify that lifecycle **once** and let each variant plug in through a narrow trait seam (`ChatTransport::establish`, `FrameCodec`, `SessionLeg::registry`). Hoist identical delegation/boilerplate into a generic helper rather than re-declaring it per variant. Do **NOT** collapse genuinely divergent bodies — different protocol/crypto/auth (`establish`, the blob legs, pairing-vs-login) — into one function behind an `if variant` / `match` branch: that's a false dedup that couples things that differ essentially and grows worse with each new case. Share only what is literally identical; keep the divergent parts in their own per-variant files.
+- **Dedup at the seam, not the surface**: when two variants share a lifecycle (e.g. the mobile `direct` vs `relay` chat legs in `app/ios/ffi/src/transport.rs`), unify that lifecycle **once** and let each variant plug in through a narrow trait seam (`ChatTransport::establish`, `FrameCodec`, `SessionLeg::registry`). Hoist identical delegation/boilerplate into a generic helper rather than re-declaring it per variant. Do **NOT** collapse genuinely divergent bodies — different protocol/crypto/auth (`establish`, the blob legs, pairing-vs-login) — into one function behind an `if variant` / `match` branch: that's a false dedup that couples things that differ essentially and grows worse with each new case. Share only what is literally identical; keep the divergent parts in their own per-variant files.
 - **Secure**: Encrypted secret storage, input leak detection, least-privilege networking and credential injection
 - **Governable**: All Skill/Tool/extensions must carry source, version, hash, trust level, and capability declarations; selection and execution are auditable
 - **Observable**: Full call-chain tracing; Job system manages all async operation states; supports session replay, trace forking and rollback; logs/traces record only sanitized placeholders and summaries
@@ -108,7 +108,7 @@ Module index: [`docs/modules/README.md`](docs/modules/README.md)
 
 For non-module-crate topics, read the relevant doc before touching that area:
 
-- [`docs/webui.md`](docs/webui.md) — embedded React dashboard (`web/`), pnpm/Vite workflow, OpenAPI codegen, Tailwind v4 design tokens.
+- [`docs/webui.md`](docs/webui.md) — embedded React dashboard (`app/web/`), pnpm/Vite workflow, OpenAPI codegen, Tailwind v4 design tokens.
 - [`docs/web-chat.md`](docs/web-chat.md) — web chat UI **feature** reference (`app/web/src/pages/ChatPage.tsx` + `app/web/src/pages/chat/`): conversations/folders/pin, composer + attachments + model switch, slash-command completion, input-history ring, the interjection queue, thread/turn rendering, and the WS data-flow backbone.
 - [`docs/sync-protocol.md`](docs/sync-protocol.md) — chat sync protocol v2 (one cursor, one sync call, three data planes): the `sync`/point-lookup REST surface, the `SubscribeState`/`Gap` wire frames, the client sync loop + outbox, and rebase/gap handling. [`docs/CONTEXT.md`](docs/CONTEXT.md) is its terminology glossary (canonical names + retired-alias smells).
 - [`docs/bench-web.md`](docs/bench-web.md) — standalone read-only viewer (`bench/bench-web`) for bench `results/` + agent `trace/` artifacts; spine model + per-bench adapters, ts-rs gate.

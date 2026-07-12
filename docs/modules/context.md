@@ -49,12 +49,20 @@ ContextManager (struct)
 │   ├── Stage 3: truncate fallback      — keep system + last keep_recent
 │   │                                     (only on Stage 2 failure)
 │   └── reseed_system_row               — re-read workspace soul on every apply
+├── background_summary.rs — run_background_summary: detached summary.md
+│                           refresh pass (see background-compression.md)
 └── prompts/          — all model-facing framing text + pure builders
-    ├── soul.rs        — assemble_from_workspace (TOP/TAIL hints + identity)
-    ├── cron.rs        — frame_cron_prompt / original_cron_prompt
-    ├── subagent.rs    — build_notification_content (SubagentNotification XML)
-    ├── tool_output.rs — wrap_tool_output / cap_tool_output / spill (+ MAX cap)
-    └── compression.rs — SUMMARIZE_INSTRUCTION + CONTINUATION_INTRO/FOOTER
+    ├── soul.rs            — assemble_from_workspace (TOP/TAIL hints + identity)
+    ├── cron.rs            — frame_cron_prompt / original_cron_prompt
+    ├── subagent.rs        — build_notification_content (<background_results> XML
+    │                        for the background-jobs notification turn)
+    ├── interjection.rs    — wrap_interjections (mid-turn steering envelope)
+    ├── recalled_memory.rs — wrap_recalled_memories (recall envelope)
+    ├── tasks.rs           — render_task_list (transient checklist reminder)
+    ├── title.rs           — build_title_prompt (conversation-title pass)
+    ├── cancelled_turn.rs  — /stop salvage marker (SUFFIX + strip_marker)
+    ├── tool_output.rs     — wrap_tool_output / cap_tool_output / spill (+ MAX cap)
+    └── compression.rs     — SUMMARIZE_INSTRUCTION + CONTINUATION_INTRO/FOOTER
 ```
 
 `prompts/` is the single home for every piece of text the runtime injects into
@@ -79,7 +87,7 @@ This trade-off — losing the "impossible to forget" property of auto-compressio
 self.context_manager.append(&user_msg).await;
 
 // Single explicit compression site at the top of each iteration.
-self.compress_if_needed(session, span_recorder, job_id, &cancel_token).await?;
+self.compress_if_needed(session, span_recorder, job_id, &cancel_token, delta_tx.as_ref()).await?;
 ```
 
 `maybe_compress` returns `Result<CompressionOutcome>`, a four-variant enum: `Compressed` (the transcript was replaced with a shorter list), `BelowThreshold` (budget under the configured compression threshold; only produced by `maybe_compress`), `StrategyDeclined` (the compressor's pre-flight gate fired — non-system message count already at or below `keep_recent`, so even truncate couldn't shrink), or `NoSavings` (the compressor produced a candidate slice but its post-tokenise total wasn't smaller than the original). The chat closure supplied by the agent loop is what opens the `StepKind::Compression` step + `SpanKind::LlmCall` span and records the call against the cost ledger.
@@ -125,8 +133,8 @@ The context sent to the LLM is organized in descending priority:
 
 - Depends on `baybo-llm` for the `ChatRequest` / `LlmResponse` shape used in the `ChatCallback` signature. The compressor does not construct an LLM client itself; the callback is supplied by the caller. Tokenization stays algorithm-only: `TiktokenTokenizer` depends on `tiktoken-rs` (pure BPE), not on any provider SDK.
 - Depends on `baybo-workspace` for `WorkspacePaths` so per-session paths (`summary.md`, transcript-recovery pointer) resolve through the same source of truth the rest of the runtime uses.
-- Does **not** depend on `memory` (the agent loop has no automatic memory injection; the `memory` crate only powers the admin REST surface).
-- Does **not** depend on `trace` or `storage` directly — the chat callback is what opens the trace span and records cost; `context` only sees its `Result<LlmResponse, ContextError>`. Persistence of the transcript is brokered through the `Arc<SessionManager>` (from `baybo-session`) supplied at construction.
+- Does **not** depend on `memory` — memory recall is injected from the agent layer: `AgentLoop::recall_and_inject` recalls via `baybo-memory` and appends framed `RecalledMemory` rows through `ContextManager::append_recalled_memory`; context only supplies the envelope (`prompts/recalled_memory.rs`).
+- Depends on `baybo-trace` only for the `LlmCallInputs` marker type carried through the `ChatCallback` — the compressor builds a `Persisted`-ordinal/`Inline` input marker for the span, but opening the span and recording cost still happen inside the caller's closure; `context` only sees its `Result<LlmResponse, ContextError>`. No direct `storage` dependency — transcript persistence is brokered through the `Arc<SessionManager>` (from `baybo-session`) supplied at construction.
 
 ## Constraints
 
@@ -136,7 +144,7 @@ The context sent to the LLM is organized in descending priority:
 
 ## Cost recording
 
-`ContextManager::maybe_compress` takes a chat closure from the caller and forwards it to the strategy as a `ChatCallback`. The agent loop's chat closure brackets the real LLM call in a `StepKind::Compression` step + `SpanKind::LlmCall` span (real lifecycle — start/end times, real `input_messages`) and calls `CostManager::record_call` with the span's id while the span is still open. The cost row's `span_id` is therefore a join key into a real trace span. `context` itself takes no `CostManager` or trace dependency.
+`ContextManager::maybe_compress` takes a chat closure from the caller and forwards it to the strategy as a `ChatCallback`. The agent loop's chat closure brackets the real LLM call in a `StepKind::Compression` step + `SpanKind::LlmCall` span (real lifecycle — start/end times, real `input_messages`) and calls `CostManager::record_call` with the span's id while the span is still open. The cost row's `span_id` is therefore a join key into a real trace span. `context` itself takes no `CostManager` dependency and never opens spans.
 
 Failure handling: when `Summarize`'s callback errors or returns empty content, the strategy itself falls back to a Truncate-equivalent slice (still returned as `CompressOutput::Replaced`). A transient summarizer failure logs `warn!` and continues the user's turn rather than killing it.
 
@@ -165,7 +173,7 @@ Wiring contract:
 | Module   | Role                                                                                   |
 | -------- | -------------------------------------------------------------------------------------- |
 | `agent`   | `AgentLoop` owns a `ContextManager` instance and calls `append` / `maybe_compress`     |
-| `session` | Required `Arc<SessionManager>` supplied to `ContextManager::new`; mirrors transcript mutations to `session_messages` |
+| `session` | Required `Arc<SessionManager>` supplied to `ContextManager::from_config` (the `sessions` field of `ContextManagerConfig`); mirrors transcript mutations to `session_messages` |
 
 ## See also
 

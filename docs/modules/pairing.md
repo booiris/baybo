@@ -7,7 +7,7 @@ separate from mobile **device pairing**, which is documented in
 
 ## Problem
 
-Channel sidecars (Telegram today, future Discord / Slack / HTTP bots)
+Channel sidecars (Telegram and Weixin today, future Discord / Slack / HTTP bots)
 forward every inbound user message to baybo over the WS channel. The
 gateway used to run it straight through `ChannelSessionResolver →
 router → agent loop` — no per-user gate, anyone who could reach a
@@ -41,11 +41,12 @@ one bot does not imply approval on the other.
 ### Wire addition
 
 `Frame::Message` grew an optional `bot_id: String` field (defaults
-to `""` on the wire, omitted on serialize when empty). Additive — no
-`PROTOCOL_VERSION` bump. The sidecar fills it in when it knows which
-bot originated the inbound event; the TUI leaves it empty. The
-Telegram sidecar already tracks `botByUser` internally, so surfacing
-`bot_id` on inbound is a one-line change in `pushInbound`.
+to `""` on the wire, omitted on serialize when empty). Additive
+change. The sidecar fills it in when it knows which bot originated
+the inbound event; the TUI leaves it empty. The shared channel SDK
+(`sidecars/sdk/channel-ts/src/bot.ts`) tracks `botByUser` and stamps
+`botId` on every `pushInbound`, so all sidecars surface `bot_id` on
+inbound for free.
 
 Existing `user_id`, `session_id` plumbing is untouched. Outbound
 Notice / Message frames stay keyed on `user_id` only — the sidecar
@@ -196,15 +197,22 @@ dedicated crate. The split here is:
 crates/pairing/                 # business logic only
 ├── Cargo.toml
 └── src/
-    ├── lib.rs      // re-exports
-    ├── service.rs  // PairingService (gate check + approve)
-    ├── code.rs     // generate_code + generate_unique
-    └── error.rs    // PairingError
+    ├── lib.rs            // re-exports
+    ├── service.rs        // PairingService (gate check + approve)
+    ├── code.rs           // generate_code + generate_unique
+    ├── error.rs          // PairingError
+    ├── device_service.rs // DevicePairingService (iOS device pairing —
+    │                     //   see docs/modules/mobile/companion.md)
+    └── device_slot.rs    // in-flight device-pairing slot DTO
 
 crates/store/src/channel_pairing.rs      // ChannelPairingStore trait
                                           // + ChannelPairingRow + PairingStatus
 crates/storage/src/libsql/channel_pairing.rs  // LibsqlChannelPairingStore
 ```
+
+The crate hosts two orthogonal things: the channel-pairing gate this
+doc describes, and the mobile device-pairing business logic
+(`DevicePairingService` / `DevicePairingSlot`). They share no state.
 
 Dependency direction: `baybo-pairing → baybo-store` for the trait +
 row types, matching how `baybo-session` reaches `SessionStore`. The
@@ -216,8 +224,11 @@ baybo-store   ──► model                       (defines ChannelPairingStore
 baybo-storage ──► store, model                (LibsqlChannelPairingStore; implements the trait)
 baybo-pairing ──► model, store                (PairingService + code gen; consumes the trait + row types)
 baybo-gateway ──► pairing, store, storage, …  (holds the Arc<dyn ChannelPairingStore>, wires the libsql impl)
-baybo-cli     ──► store, storage              (CLI talks to the store directly)
+baybo-cli     ──► store, storage, pairing*    (pair commands talk to the store directly)
 ```
+
+\* `baybo-pairing` is pulled in only for the orthogonal `baybo device
+pair` (`DevicePairingService`), not for the channel gate.
 
 The gateway consumes `PairingService` (service) and
 `ChannelPairingStore` (trait — imported from `baybo-store`, to hold the
@@ -228,43 +239,55 @@ dead weight.
 ### Test support
 
 `baybo-pairing` ships no in-memory store fake: gateway tests
-exercise the gate end-to-end through the real libsql adapter (via
-`build_test_deps`), and the adapter has its own per-method unit
-tests. A fake can be added later if service-level tests need one —
-nothing does today.
+exercise the gate through the real libsql adapter (the
+`authorize_upload` tests in `crates/gateway/src/channel/blobs.rs`
+build `LibsqlChannelPairingStore` over an in-memory pool), and the
+adapter has its own per-method unit tests. A fake can be added later
+if service-level tests need one — nothing does today.
 
 ### Integration points
 
 - `crates/gateway/src/channel/state.rs` — `WsChannelState` carries
   `pairing: Arc<PairingService>`.
 - `crates/gateway/src/channel/route.rs` — `enforce_pairing` runs
-  in the empty-`session_id` branch of the `Frame::Message` handler,
-  before `session_resolver.resolve_or_create`. On
+  in the `ChannelKind::Multiplexed` arm of `resolve_inbound_session`,
+  after inbound dedup and before slash handling and
+  `session_resolver.resolve_or_create`. On
   `CheckOutcome::Pending { code }` it sends a `Frame::Notice`
   (`level: "warn"`) and drops the inbound; on `CheckOutcome::Approved`
   it falls through.
-- `crates/gateway/src/server.rs` — `GatewayDeps` carries
-  `channel_pairing_store`, wired from `Store::channel_pairing`.
-  `build_channel_router` constructs the `PairingService`, which owns
-  the hardcoded TTL.
-- `crates/baybo/src/runtime.rs` — `ManagerGraph` carries `channel_pairing_store`;
-  `build_bot_registry_deps` returns it too so the CLI can reach it.
+- `crates/gateway/src/channel/blobs.rs` — `authorize_upload` runs the
+  same `pairing.check(…)` before any attachment bytes land on disk;
+  an unapproved sidecar user gets a `PairingRequiredResponse` refusal.
+- `crates/gateway/src/server.rs` — `GatewayDeps` carries the whole
+  `stores: Store` bundle; `build_channel_router` →
+  `WsChannelState::from_deps` constructs the `PairingService` from
+  `deps.stores.channel_pairing`. The pairing TTL stays a hardcoded
+  const inside `baybo-pairing`.
+- `crates/baybo/src/runtime.rs` — `ManagerGraph` carries the cloneable
+  `stores: Store` bundle; `build_bot_registry_deps` returns
+  `(Arc<SecretVault>, Store)` so the CLI reaches the pairing store as
+  `stores.channel_pairing`.
 - `crates/baybo/src/main.rs` / `crates/baybo/src/gateway_cmd.rs` — plumb the store through
   from `Store::open` to the CLI context / `GatewayDeps`.
+  `gateway_cmd.rs` also wires it into `Janitor::with_pairing_store`
+  for the hourly `purge_expired` sweep (see Expiry).
 - `crates/cli/src/cli.rs`, `dispatch.rs`, `commands/pair.rs` —
   `baybo pair` subcommand family.
-- `crates/channels/src/wire.rs` + `sidecars/sdk/channel-ts/src/generated/`
-  (regen) — `Frame::Message` carries optional `bot_id`.
-- `sidecars/channel/telegram/src/channel.ts` — passes `botId` on the
-  `pushInbound` call site (already tracked in `botByUser`).
+- `crates/wire/src/lib.rs` (re-exported as `baybo_channels::wire`) +
+  `sidecars/sdk/channel-ts/src/generated/` (regen) — `Frame::Message`
+  carries optional `bot_id`.
+- `sidecars/sdk/channel-ts/src/bot.ts` — the shared `ChannelBot` tracks
+  `botByUser` and stamps `botId` on every `pushInbound`, so every
+  sidecar (telegram, weixin) surfaces `bot_id` on inbound.
 
 ### TUI
 
-TUI sends its own `session_id` on the Register frame and never hits
-the empty-`session_id` branch in `route.rs`. The gate only applies
-inside that branch, so TUI bypasses pairing entirely — it is local
-and implicitly trusted. Same reasoning as the slash-account-auth
-doc's `PrincipalSource::Cli` branch.
+The TUI registers as a `Subscribed`-kind channel and attaches to its
+session via `Subscribe` frames; the gate lives only in the
+`ChannelKind::Multiplexed` arm of `route.rs`, so the TUI bypasses
+pairing entirely — it is local and implicitly trusted. Same reasoning
+as the slash-account-auth doc's `PrincipalSource::Cli` branch.
 
 ### Observability
 
@@ -273,7 +296,8 @@ doc's `PrincipalSource::Cli` branch.
   raw identifiers in traces). The hash is a truncated 4-hex digest
   of `DefaultHasher(user_id)` — enough to disambiguate concurrent
   pendings in a log without leaking the raw id.
-- Approvals (via CLI) log at `info` with the same hashed form.
+- Approvals produce no trace log — the CLI prints the approved triple
+  (raw; it's the operator's own terminal) in its command output.
 - The refusal Notice's code is not logged — it is surfaced to the
   end-user verbatim and belongs only in the libsql row.
 
@@ -300,12 +324,13 @@ doc's `PrincipalSource::Cli` branch.
 
 ## Related
 
-- `crates/channels/src/wire.rs` — `Frame::Message` carries optional
-  `bot_id`.
-- `crates/gateway/src/channel/route.rs` — gate lands right before
-  `session_resolver.resolve_or_create` in the empty-session branch.
-- `sidecars/channel/telegram/src/channel.ts` — sends `bot_id` on the
-  inbound path.
+- `crates/wire/src/lib.rs` (re-exported as `baybo_channels::wire`) —
+  `Frame::Message` carries optional `bot_id`.
+- `crates/gateway/src/channel/route.rs` — gate lands in the
+  `ChannelKind::Multiplexed` arm, before slash handling and
+  `session_resolver.resolve_or_create`.
+- `sidecars/sdk/channel-ts/src/bot.ts` — the shared ChannelBot sends
+  `bot_id` on the inbound path for every sidecar.
 - `docs/modules/storage.md` — store convention that dictates where
   the trait + row types live.
 - `docs/todo/slash-account-authorization.md` — parallel

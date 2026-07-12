@@ -2,10 +2,11 @@
 
 ## Context
 
-The web `user_interjection` queue (park / auto-fire / reorder / inline-edit / pause-banner,
-`app/web/src/pages/chat/queueStore.tsx` + `QueuePanel.tsx` + the `sendToSession` / `drainQueueOnFrame`
-wiring in `ChatPage.tsx`) is **frontend-only**. Current automated coverage is **pure-function unit
-tests only** — the repo's `web` tests (`workBlock.test.ts`, `turnSync.test.ts`, `composerSend.test.ts`)
+The web `user_interjection` queue (park / defer / auto-fire / batch coalescing / reorder / inline-edit /
+pause-banner, `app/web/src/pages/chat/queueStore.tsx` + `QueuePanel.tsx` + the `sendToSession` /
+`drainQueueOnFrame` wiring in `ChatPage.tsx`) is **frontend-only**. Current automated coverage is
+**pure-function unit tests only** — the repo's `app/web` tests (`workBlock.test.ts`, `turnSync.test.ts`,
+`composerSend.test.ts`, `slashCompletion.test.ts`, `syncApply.test.ts`, and the `pages/chat/` store tests)
 import pure helpers from `./ChatPage` and assert on them; there is **no React-rendering or browser
 harness**. So the send-vs-park *rule* is pinned (`decideComposerAction`), but the *wiring*, the DOM,
 drag, and localStorage-across-reload are not.
@@ -19,7 +20,7 @@ but only because the rule was extracted into a pure function.
 Auto-fire keys on a **turn completion** (an assistant `message` frame). With a real LLM a completion
 is slow, variable, and costs money → flaky tests. So an "E2E" for this feature should almost never run
 against a real gateway + real LLM; it should **control when the completion frame arrives**. The seam:
-`ChatPage` builds `new ChatWs({ onFrame, onStatus, ... })` (`ChatPage.tsx` ~684) and `ChatWs`
+`ChatPage` builds `new ChatWs({ onFrame, onStatus, ... })` (grep `new ChatWs`) and `ChatWs`
 (`app/web/src/api/chatWs.ts`) exposes `onFrame` / `onStatus` callbacks + a `sendMessage` method. Mocking
 `../api/chatWs` lets a test capture `onFrame`/`onStatus` and spy `sendMessage`, i.e. drive the whole
 client flow deterministically with no backend.
@@ -35,18 +36,39 @@ Same move as `decideComposerAction`. Extract the auto-fire/pause decision out of
 into a pure function, e.g.:
 
 ```ts
-export type QueueFrameAction = 'fire' | 'pause-cancelled' | 'pause-error' | 'none';
+export type QueueFrameAction =
+  | 'fire' // top parked item
+  | 'fire-deferred' // every sendable deferred item, batched or one-by-one
+  | 'restore-deferred' // deferred items move back to the parked queue
+  | 'pause-cancelled'
+  | 'pause-error'
+  | 'none';
 export function classifyQueueFrame(
   frame: Frame,
-  ctx: { armed: boolean; alreadyFired: boolean; paused: boolean; hasItems: boolean },
+  ctx: {
+    armed: boolean;
+    alreadyFired: boolean;
+    paused: boolean;
+    hasItems: boolean;
+    hasDeferred: boolean;
+  },
 ): QueueFrameAction;
 ```
 
-`drainQueueOnFrame` keeps the side effects (call `sendToSession`, `store.removeItem`, `store.setPause`)
-but delegates the decision. Unit-test `classifyQueueFrame` for: armed + completion + items + not-fired
-→ `fire`; unarmed (reload replay) → `none`; paused → `none`; stop-cancel notice → `pause-cancelled`;
-`level:'error'` notice → `pause-error`; already-fired-this-turn → `none`. Deterministic, no new deps.
-**Do this regardless of the other layers.**
+The deferred plane has a second pure decision worth its own helper — the batch-vs-individual choice
+(`sendable.length >= 2 && sendable.every((i) => !isSlashText(i.text))`, after junk-filtering blank items),
+e.g. `canBatchDeferred(items): boolean`.
+
+`drainQueueOnFrame` keeps the side effects (call `sendToSession` / `sendBatchToSession`,
+`store.removeItem` / `store.removeDeferred`, `store.restoreDeferred`, `store.setPause`) but delegates the
+decision. Unit-test `classifyQueueFrame` for: armed + completion + items + not-fired → `fire`; armed +
+completion + deferred → `fire-deferred`; unarmed (reload replay) → `none`; paused → `none`;
+`turn_state{active:false}` with deferred items that never rode the turn → `restore-deferred`; transient
+notice → `none`; notice with an empty parked **and** deferred queue → `none`; stop-cancel notice →
+`pause-cancelled`; `level:'error'` notice → `pause-error` (both pause cases restore the deferred items
+first); already-fired-this-turn → `none`. And `canBatchDeferred` for: 2+ plain items → batch; a slash
+command anywhere in the set → individual; lone item → individual; blank items filtered out before the
+threshold is applied. Deterministic, no new deps. **Do this regardless of the other layers.**
 
 ### Layer 2 — component / integration with React Testing Library
 

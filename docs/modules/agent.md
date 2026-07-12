@@ -25,23 +25,29 @@ agent/src/
 ├── lib.rs
 ├── security.rs               # SecurityGateway (cross-cutting interception facade)
 ├── service.rs                # ShutdownSignal, TaskTracker (process-level)
+├── recovery.rs               # startup + actor-panic recovery
+├── external_agent/           # claude / codex / gemini CLI subagents + version probe
 ├── runtime/                  # per-turn execution core
 │   ├── agent_loop.rs         # AgentLoop, AgentLoopConfig
 │   ├── tool_executor.rs      # ToolExecutor + approval gate; wires virtual-file providers into ToolContext
 │   ├── virtual_read.rs       # SessionTranscriptReader: VirtualReadResolver serving the transcript (ReadTool consults it)
 │   ├── compression.rs        # inline + background compression wiring
-│   ├── soul.rs               # system-prompt + identity assembly
 │   ├── billed_chat.rs        # cost-aware LLM call wrapper
 │   ├── error_recovery.rs     # retry / degrade policy
 │   ├── sandbox.rs            # SandboxAdapter glue for tool exec
 │   ├── scope.rs              # with_job / with_step / with_span guards
-│   └── llm_pool.rs           # per-provider LlmClient pool
+│   ├── llm_pool.rs           # per-provider LlmClient pool
+│   ├── background_jobs.rs    # backgrounded-Bash sink + detached escort
+│   ├── progress_observer.rs  # out-of-band status emitter for long turns
+│   ├── subagent_spawner.rs   # out-of-band subagent-spawn ingress
+│   └── title.rs              # conversation-title pass
 └── actor/                    # per-session actor + orchestration
     ├── mod.rs                # AgentActor + AgentMessage
+    ├── mailbox.rs            # bounded priority mailbox
     ├── runner.rs             # tokio task boundary + actor panic recovery
     ├── supervisor.rs         # AgentSupervisor + idle reaper
     ├── subagent.rs           # subagent wait routine
-    ├── router/               # ingress dispatch (cron / user / output / system_spawn)
+    ├── router/               # ingress dispatch (cron / user / output; subagent-spawn ingress lives in runtime/subagent_spawner.rs)
     └── state/                # DurableActorState + VolatileResources
 ```
 
@@ -63,13 +69,13 @@ One Actor per session: natural serialization within a session (no context races)
 
 ### SpanRecorder lock strategy
 
-`SpanRecorder` exposes short-lived `begin/succeed/fail`. `AgentLoop` and `ToolExecutor` must never hold locks while waiting for LLM calls or tool execution.
+`SpanRecorder` exposes short-lived `begin_step`/`end_step` and `begin_span`/`end_span` (closed with a `LifecycleOutcome`). `AgentLoop` and `ToolExecutor` must never hold locks while waiting for LLM calls or tool execution.
 
 ### ToolExecutor responsibility
 
 ToolExecutor: lookup tool → validate trust/capability → consult approval gate → construct `ToolContext` → create child Job/Trace nodes → reveal placeholders in args → execute → sanitize output → write results. It does **not** decide whether a tool should be called — that's `AgentLoop`.
 
-`ToolExecutor` holds an `Arc<SecurityGateway>`. Tool invocation is the one legitimate plaintext boundary for arguments: the pre-reveal `params` is what flows into `SpanInput::ToolExecution` and the approval preview (placeholder form), while a cloned `params_revealed` — with `reveal_in_value` applied — is what's passed to `tool_registry.execute`. After execution the returned `ToolOutput` is run through `sanitize_tool_output` so any tool-echoed secret is re-minted and vaulted before it enters the trace, the next LLM call, or memory. Errors are passed through `sanitize_error` before `recorder.fail`.
+`ToolExecutor` holds an `Arc<SecurityGateway>`. Tool invocation is the one legitimate plaintext boundary for arguments: the pre-reveal `params` is what flows into `SpanKind::ToolCall`'s `ToolCallBegin.params` and the approval preview (placeholder form), while a cloned `params_revealed` — with `reveal_in_value` applied — is what's passed to `tool_registry.execute`. After execution the returned `ToolOutput` is run through `sanitize_tool_output` so any tool-echoed secret is re-minted and vaulted before it enters the trace, the next LLM call, or memory. Errors are passed through `sanitize_error` before the error bubbles into `with_span`, which closes the span as `Failed { reason }`.
 
 ### LLM-response defensive scrubbing
 
@@ -169,7 +175,7 @@ Consolidated reference for every time bound a turn can hit. Two structural facts
 | `backoff_base` | 1s |
 | `backoff_max` | 30s |
 
-Backoff sequence is `1, 2, 4, 8, 16, 30, 30, 30, 30, 30` s — worst case ≈ 2.7 min of waiting before the call gives up. Only `LlmError::is_retriable()` errors (transient) and raw `io::Error` retry; config / model-shape errors surface immediately.
+Backoff sequence is `1, 2, 4, 8, 16, 30, 30, 30, 30, 30` s — worst case ≈ 3 min of waiting before the call gives up. Only `LlmError::is_retriable()` errors (transient) and raw `io::Error` retry; config / model-shape errors surface immediately.
 
 **Tool execution** (`runtime/tool_executor.rs`) — two nested deadlines:
 
@@ -188,7 +194,7 @@ Per-tool `max_timeout()`:
 | Skill read (risk-assessed) | 60s | `skills/src/tools.rs` |
 | Skill install pipeline | 120s | `skills/src/tools.rs` |
 | MCP tool | 60s | `tools/src/mcp/tool.rs` |
-| OpenViking memory store | 120s | `STORE_MAX_TIMEOUT` in `memory/src/backends/openviking.rs` |
+| OpenViking memory store | 120s | `OpenVikingTimeouts::store_max` (default) in `memory/src/backends/openviking.rs` |
 | Subagent (in-process) | `TOOL_WAIT_BACKSTOP` = 30 days | `subagent/src/tool.rs` — effectively unbounded; the real bound is the caller's cancel / job lineage |
 
 **Approval gate** — `APPROVAL_TIMEOUT` = 300s (`gateway/src/channel/boot.rs`). How long a tool-approval prompt waits for the user before timing out; the executor's `APPROVAL_HEADROOM` tracks it.
@@ -236,7 +242,7 @@ Router-level user rate limiting (`actor/router`) uses a sliding window (default 
 | `tools` | `ToolExecutor` executes tools |
 | `skills` | `AgentLoop` parses and executes skills |
 | `model` | Provides `MessageSource::RecalledMemory` (the framed recall-injection marker); session domain types (`Session`, `User`, `ChannelType`) used by `baybo-session::SessionManager` |
-| `memory` | Owns the pluggable `Memory` trait + `NoopMemory` default. The agent loop drives `recall` / `on_job_complete` for `UserChat` + `Cron` jobs; no real backend ships yet (runtime wires `None`) |
+| `memory` | Owns the pluggable `Memory` trait + `NoopMemory` default. The agent loop drives `recall` / `on_job_complete` for `UserChat` + `Cron` jobs; real backends (`mem0`, `openviking`) are built from `config.memory.provider` via `baybo_memory::boot::build_memory_backend`; the runtime wires `None` only when memory is disabled or `provider = noop` |
 | `workspace` | Identity files for system prompt |
 | `cron` | Owns `CronJob`, `CronExecution`, and `CronScheduler`; agent re-exports `CronScheduler` / `CronTriggerEvent` for assembly-layer wiring |
 | `context` | Conversation window and compression |

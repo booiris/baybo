@@ -4,7 +4,7 @@
 
 The `workspace` crate is the single source of truth for Baybo's workspace layout. It owns:
 
-- **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for every workspace-relative file/dir name (`profile/`, `skills/`, `state/`, `work/`, `logs/`, `baybo.json`, `.mcp.json`, `storage.db`, `baybo.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.uv/`), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `BAYBO_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `baybo_cache_root` resolvers.
+- **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for the workspace-relative file/dir names (`config/`, `profile/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `logs/`, `baybo.json`, `.mcp.json`, `encryption.key`, `storage.db`, `baybo.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.uv/`, …), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `BAYBO_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `baybo_cache_root` resolvers.
 - **Identity I/O** (`io` feature, default-on): `WorkspaceManager`, `IdentityFiles`, `load_identity_files`, `write_identity_file`, `WorkspaceManager::ensure_layout` — the async readers/writers backing the three identity documents and the workspace-skeleton initializer.
 - **Default identity templates** (`prompt` module, always available): the `DEFAULT_SOUL_CONTENT` / `DEFAULT_USER_CONTENT` / `DEFAULT_IDENTITY_CONTENT` seed strings that `IdentityKind::default_content` returns when `seed_default_identity_files` writes a missing `SOUL.md` / `USER.md` / `IDENTITY.md`.
 
@@ -12,21 +12,23 @@ Pure-data consumers (e.g. `baybo-config`, `baybo-tools`) take this crate with `d
 
 ## Layout
 
-The workspace root is the single **project root** for the entire runtime: every subsystem that needs a persistent path derives its location from it. The root is divided into six top-level subdirectories that describe what kind of content lives there.
+The workspace root is the single **project root** for the entire runtime: every subsystem that needs a persistent path derives its location from it. The root is divided into eight top-level subdirectories that describe what kind of content lives there.
 
 ```text
 <workspace_root>/
-  profile/         # standalone git repo: baybo.json, .mcp.json, identity .md files
+  config/          # standalone git repo: baybo.json, .mcp.json
+  profile/         # standalone git repo: SOUL.md / USER.md / IDENTITY.md identity files
   skills/          # standalone git repo: workspace-local skill definitions
   agents/          # standalone git repo: subagent profile definitions
-  state/           # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
-  work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), future scratch
+  .key/            # not version-controlled: encryption.key (mode 0600)
+  state/           # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile, sessions/<id>/summary.md
+  work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), .fonts/, .baybo-tool-spills/, future scratch
   logs/            # not version-controlled: baybo.log.<date>, channel/<type>.log.<date> (sessions/<id>.jsonl is a virtual path, never written)
 ```
 
 | Field            | Default | Role                                        |
 | ---------------- | ------- | ------------------------------------------- |
-| `workspace.path` | `default_workspace_root()` | Project root directory (validated non-empty)|
+| `workspace.path` | `default_workspace_root()` | Project root directory (validated non-empty and absolute)|
 
 Defaults: `~/.baybo` in release builds, `./.baybo` in debug builds. The
 debug default keeps `cargo run` self-contained inside the project
@@ -43,7 +45,10 @@ checkout rather than polluting the real user home.
 | singleton lock   | `<workspace.path>/state/baybo.lock`         |
 | channel port     | `<workspace.path>/state/channel.port`      |
 | browser profile  | `<workspace.path>/state/browser/profile/`  |
+| session summary state | `<workspace.path>/state/sessions/<session_id>/summary.md` (atomic write via `.tmp` sibling) |
 | uv state         | `<workspace.path>/work/.uv/{cache,python,tools,bin}/` |
+| browser fonts    | `<workspace.path>/work/.fonts/`            |
+| tool-output spills | `<workspace.path>/work/.baybo-tool-spills/` |
 | gateway logs     | `<workspace.path>/logs/baybo.log.<date>`    |
 | channel logs     | `<workspace.path>/logs/channel/<channel_type>.log.<date>` |
 | session transcript (virtual) | `<workspace.path>/logs/sessions/<session_id>.jsonl` (no file; the compaction recovery pointer, served from `session_messages` on read) |
@@ -85,7 +90,7 @@ They complement each other without overlapping.
 
 ### Why split state/work/logs from profile/skills
 
-The split exists so the user's git workflow stays clean: `profile/` and `skills/` are declarative, hand-edited content that belongs in source control; `state/` is mutable runtime state (libsql DB, locks, ports, browser profile) that would create churn or conflicts if committed; `work/` holds tool-generated scratch (uv caches, downloaded Python toolchains, ad-hoc shell output) that has no long-term value; `logs/` is ephemeral. Each of the two declarative dirs is its own git repo, so the boundary is enforced by repo scope rather than a top-level ignore list — users can never accidentally commit `state/` because no enclosing repo includes it.
+The split exists so the user's git workflow stays clean: `config/`, `profile/`, `skills/`, and `agents/` are declarative, hand-edited content that belongs in source control; `state/` is mutable runtime state (libsql DB, locks, ports, browser profile) that would create churn or conflicts if committed; `work/` holds tool-generated scratch (uv caches, downloaded Python toolchains, ad-hoc shell output) that has no long-term value; `logs/` is ephemeral. Each of the four declarative dirs is its own git repo, so the boundary is enforced by repo scope rather than a top-level ignore list — users can never accidentally commit `state/` because no enclosing repo includes it.
 
 ## Constraints
 
@@ -100,5 +105,5 @@ The split exists so the user's git workflow stays clean: `profile/` and `skills/
 |--------|------|
 | `agent` | Reads identity files for system prompt |
 | `skills` | Provides trusted local skill directories |
-| `trace` | Identity file version changes are recorded in provenance |
+| `trace` | (planned) identity file version changes recorded in provenance — no version stamp/hash is written today; `workspace` is a leaf crate with no baybo-* deps, so any wiring must run through a consumer (`context` / `agent`), not `workspace` itself |
 | `memory` | Complements without overlapping responsibility |

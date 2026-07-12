@@ -39,7 +39,7 @@ need a trust-level gate so that:
 - Should low-trust tools be hidden from the LLM entirely, or visible but
   gated at execution time? Hiding reduces noise; gating preserves
   discoverability.
-- How does trust level interact with the existing `Capability` declarations in
+- How does trust level interact with the existing `ToolCapability` declarations in
   `ToolManifest`? A high-trust tool with broad capabilities may still warrant
   per-invocation approval.
 - Should users be able to promote a skill's tools to a higher trust level via
@@ -47,7 +47,8 @@ need a trust-level gate so that:
 
 ## Related
 
-- `crates/tools/src/lib.rs` — `ToolManifest`, `TrustLevel`, `Capability`
-- `crates/agent/src/tool_executor.rs` — approval gate
-- `crates/agent/src/agent_loop.rs` — tool definition injection in `call_llm`
+- `crates/tools/src/lib.rs` — `ToolManifest`, `ToolCapability`
+- `crates/model/src/governance.rs` — `TrustLevel`, `ArtifactSource`
+- `crates/agent/src/runtime/tool_executor.rs` — approval gate
+- `crates/agent/src/runtime/agent_loop.rs` — tool definition injection in `call_llm`
 - `docs/modules/tools.md` — tool system design spec

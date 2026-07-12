@@ -12,9 +12,10 @@ user-facing features:
    the gateway encrypts, the operator's remote host forwards ciphertext blind,
    and the phone decrypts locally in a Notification Service Extension (NSE).
 
-The app is a **Tauri 2** shell (`app/mobile`) over a host-tested, FFI-free Rust
-core (`baybo-mobile-core`); the protocol + crypto live in shared crates so the
-phone and the gateway agree by construction.
+The app is a **SwiftUI** app (`app/ios`) whose native screens wrap a host-testable
+Rust core exposed over UniFFI (`baybo-ios-ffi`, `app/ios/ffi` — its own Cargo
+workspace); the protocol + crypto live in shared crates (`crates/wire`,
+`crates/device-proto`) so the phone and the gateway agree by construction.
 
 > The pairing handshake's **security model** (why it is safe against a hostile
 > relay) is its own document: [`pairing-security.md`](pairing-security.md).
@@ -67,11 +68,12 @@ shared blind relay and is **not** bound 1:1.
 - **Operator consent:** `baybo device pair` prints any current binding and asks
   before minting a slot (defaults to **no**).
 - **App (P):** one fixed keychain account (`baybo.paired-gateway`) holds the
-  single `PairedRecord`; the UI offers **Replace** (re-pair, overwrite on success)
-  and **Forget** (`forget_pairing` — drops the record + push key). The app's
+  single `PairedRecord`; the UI offers **Log out** (`BayboClient::logout` →
+  `forget_pairing` — drops the record + push key); re-pairing after logout
+  overwrites on success. The app's
   Noise static identity lives under its own account (`baybo.device-identity`) and
   is **stable** across re-pairings, so the derived `device_id` (`device-<pubkey[..8]>`)
-  is stable; *Forget* deliberately keeps it.
+  is stable; *Log out* deliberately keeps it.
 
 ## Components
 
@@ -102,16 +104,23 @@ shared blind relay and is **not** bound 1:1.
   - `crates/relay` — the blind byte-pipe `RelayBroker` + the WS rendezvous/content
     server; `crates/admission` — the hot-reloaded `remote_api_key` allow-list;
     `crates/push` — APNs (HTTP/2 sender, ES256 `.p8` JWT, `/notify` + `/register`);
-    `crates/server` — the single binary serving relay + push on one listener.
-- `app/mobile/core` (`baybo-mobile-core`) — P-side: `PairingClient`,
-  `ContentSession` (Noise self-pull), and the blob-leg client. No FFI, no
-  platform APIs — host-unit-testable; the Tauri shell owns relay WebSocket and
-  filesystem/keychain integration.
-- `app/mobile/src-tauri` — the Tauri shell: the `pair` / `forget_pairing`
-  commands, push-key keychain persistence (`keychain.rs`), and push registration
-  (`push_register.rs`).
-- `app/mobile/apple/NotificationExtension` — the NSE (`NotificationService.swift`,
-  `PushKeyStore.swift`), plus `verify-crypto.swift` and `verify-nse.sh`.
+    `crates/server` — the single binary serving relay + push on one listener;
+    `crates/edge` — the shared per-request / per-client-IP layer both roles mount
+    (the IP rate limiter + traffic recorder) plus the `TokenBucket` primitive the
+    relay/push throttles all draw on; `crates/dashboard` —
+    `remote-host-dashboard`, the operator read/control plane on its own listener
+    (see Status).
+- `app/ios/ffi` (`baybo-ios-ffi`) — P-side UniFFI core: `PairingClient`,
+  `ContentSession` (Noise self-pull), the relay/direct transport legs, the
+  blob-leg client, and keychain persistence (`keychain.rs`); host-unit-testable
+  (`lib` crate-type). The SwiftUI app (`app/ios/App`) consumes it as `BayboClient`
+  through generated bindings.
+- `app/ios/App` — the SwiftUI shell: screens, `AppStore` / `ChatStore`, the
+  transcript WKWebView host; pairing/forget flows call the FFI
+  (`BayboClient.logout` → `forget_pairing`).
+- `app/ios/NotificationExtension` — the NSE (`NotificationService.swift`,
+  `PushKeyStore.swift`, `PushPayloadKeys.swift`), its Swift-side AEAD vector test
+  (`NotificationServiceTests.swift`), plus `scripts/verify-nse.sh`.
 
 ## Wire & crypto contracts
 
@@ -161,7 +170,6 @@ runs in production over the outbound relay data leg.
 { "aps": { "alert": { "title": "Baybo", "body": "New message" }, "mutable-content": 1 },
   "enc": "<base64 ciphertext||16-byte tag>",   // ChaCha20-Poly1305, empty AAD
   "n":   "<base64 12-byte nonce>",
-  "kid": 0,                                     // key epoch (always 0 today)
   "bid": "<device_id>" }                        // binding id == device_id
 ```
 
@@ -192,7 +200,7 @@ relay admission key, device identity, and `push_key`.
 
 **Direct-mode push (no pairing):** the direct transport has no pairing handshake,
 so it provisions the *same* binding over the admin-token REST surface instead.
-`direct_push_register` (`src-tauri/src/direct/push.rs`) reuses the phone's stable
+`direct::push::register` (`app/ios/ffi/src/direct/push.rs`) reuses the phone's stable
 Ed25519 identity, load-or-creates a stable `push_key` in the shared App Group
 keychain for its NSE (minted once, reused), fetches the gateway push key via `GET /v1/push/params`,
 signs the same delegation, and `POST /v1/push/register`s it (admin Bearer). The
@@ -261,13 +269,14 @@ C's blind relay, which only matches two legs by key and copies opaque frames
 
 ## App lifecycle & persistence
 
-The app stores its `PairedRecord` (auth token, gateway static key, routing
-candidates, relay node id, Noise static secret) in the App Group keychain and
+The app stores its `PairedRecord` (auth token, gateway static key, relay URL +
+admission key, relay node id, Noise static secret) in the App Group keychain and
 shows a "remembered" view on launch. The chat survives a background round-trip,
 and the content session reconnects (then runs the sync loop —
 `docs/sync-protocol.md`) on every iOS foreground. It
-also reconnects on its own when a live leg drops mid-session: the Rust pump emits
-a `content-disconnected` event on any unsolicited exit (socket close, the
+also reconnects on its own when a live leg drops mid-session: the Rust pump fires
+the sink's `onDisconnected` callback (`FrameSink`, `app/ios/ffi/src/transport.rs`)
+on any unsolicited exit (socket close, the
 inbound-liveness lapse, a remote-host restart) — but not on a deliberate
 reconnect/disconnect, which aborts the task first — and the native chat store
 retries on a short backoff, so chat recovers without waiting for the next
@@ -297,9 +306,9 @@ UI are implemented in this branch. Real APNs delivery and App Group keychain
 reads require a provisioned, code-signed build; the simulator can exercise
 `simctl push` and the NSE path but cannot receive live APNs.
 
-`remote-host-dashboard` mounts on its own listener (default `:7778`, plain HTTP,
-not via Cloudflare), token-gated by `DASHBOARD_TOKEN` (any non-empty value; off
-when unset).
+`remote-host-dashboard` mounts on its own listener (default `:7778`, plain HTTP by
+default (HTTPS via the `DASHBOARD_TLS_*` pair), not via Cloudflare), token-gated by
+`DASHBOARD_TOKEN` (any non-empty value; off when unset).
 
 ### The signing boundary (empirical, iOS 26 simulator)
 
@@ -314,70 +323,68 @@ gap:
   manual `codesign` (ad-hoc or Development) cannot register that capability.
 
 The reliable path is **Xcode automatic signing** (set the team on both the app and
-the NSE target — a paid Apple Developer capability). `apple/verify-nse.sh`
+the NSE target — a paid Apple Developer capability). `app/ios/scripts/verify-nse.sh`
 automates build + sign + seed + push and prints this path when the App Group
 isn't provisioned. PASS = a notification reading *"Baybo / The agent finished
 replying."*
 
 ## Build & install on a device
 
-`tauri ios dev` installs a *development* app whose frontend is served live from the
-Vite dev server (`build.devUrl`). Stop that session — or delete the dev app — and the
-phone has nothing to load. For an app that survives with no Mac attached, build a
-**standalone** bundle (`tauri ios build` embeds `build.frontendDist` into the binary)
-and install it over USB:
+The build is one orchestrated pass — transcript web bundle → Rust xcframework +
+UniFFI bindings (`scripts/build-core.sh`) → `xcodegen` → `xcodebuild` — and the
+ordering matters, because the generated `.xcodeproj` references all three products:
 
 ```bash
-cd app/mobile
-pnpm ios:install                 # build (release, signed) + install + launch
-pnpm ios:install --debug         # faster debug build
-pnpm ios:install --skip-build    # install the last-built IPA as-is
-pnpm ios:install --no-launch     # install only
-pnpm ios:install --device <id>   # disambiguate when several devices are attached
+cd app/ios
+scripts/build-app.sh                    # debug, simulator (default)
+scripts/build-app.sh --release --device # release, physical device
+scripts/build-app.sh --skip-web         # reuse App/Resources/transcript/
+scripts/build-app.sh --skip-rust        # reuse the existing xcframework
 ```
 
-`pnpm ios:build` runs just the signed build. The signing team is **hardcoded**
-(`DEVELOPMENT_TEAM` in `src-tauri/gen/apple/project.yml` and the generated
-`.xcodeproj`), so `xcodebuild` picks it up directly while building/archiving. Both
-scripts still go through `scripts/tauri-env.mjs`, whose only remaining job is to set
-`APPLE_DEVELOPMENT_TEAM` in the environment — Tauri reads it to fill `teamID` in the
-`ExportOptions.plist` it generates for the `-exportArchive` step, which does **not**
-consult the Xcode build settings. It exports with method `debugging`
-(development-signed, installable on the team's **registered** devices — not App Store /
-ad-hoc). `scripts/ios-install.mjs` unpacks the IPA's `Payload/*.app` and installs it
-with `xcrun devicectl device install app`.
+`build-app.sh` defaults to **sim-only** (`build-core.sh --sim-only`), so a plain run
+produces a sim-only `BayboCore.xcframework` and a device build then fails with *"no
+library for this platform was found."* Pass `--device` to add the `ios-arm64` slice —
+that path also **codesigns** the xcframework, which Xcode requires for a device build.
 
-To change the team, edit `DEVELOPMENT_TEAM` in `project.yml` (regen the `.xcodeproj`)
-and the `IOS_DEVELOPMENT_TEAM` constant in `tauri-env.mjs` — keep the two in sync.
+For an app that survives with no Mac attached, install a development-signed IPA over
+USB:
 
-Prerequisites: the target iPhone is registered with the signing team (running
-`pnpm tauri ios dev` or Xcode against it once registers it), Developer Mode is on
-(Settings ▸ Privacy & Security ▸ Developer Mode), and the phone is unlocked when it
-launches. App Group + Push (the NSE decrypt path) additionally need a **paid** team —
-see the signing boundary above.
+```bash
+node scripts/install.mjs                 # build (release, signed) + install + launch
+node scripts/install.mjs --prepare       # build the web bundle + xcframework first
+node scripts/install.mjs --debug         # faster debug build
+node scripts/install.mjs --no-launch     # install only
+node scripts/install.mjs --device <udid> # disambiguate when several devices are attached
+```
+
+It archives, exports with method `debugging` (development-signed, installable on the
+team's **registered** devices — not App Store / ad-hoc), and installs with `xcrun
+devicectl device install app`. The signing team is `KLK5BP5YS6` — set in the committed
+xcodegen spec (`DEVELOPMENT_TEAM` in `app/ios/project.yml`, so `xcodebuild` picks it up
+while building/archiving) and mirrored as the export `teamID` in `install.mjs`
+(override with `BAYBO_TEAM_ID`). To change the team, keep the two in sync.
+
+Prerequisites: the target iPhone is registered with the signing team (running Xcode
+against it once registers it), Developer Mode is on (Settings ▸ Privacy & Security ▸
+Developer Mode), and the phone is unlocked when it launches. App Group + Push (the NSE
+decrypt path) additionally need a **paid** team — see the signing boundary above.
 
 ### Troubleshooting
 
-- **`exportArchive: No Account for Team "…"` / `No profiles for 'com.baybo.app…' were
-  found`** — the *export* step didn't get a team. Build/archive reads it from the Xcode
-  build settings, but Tauri's generated `ExportOptions.plist` needs
-  `APPLE_DEVELOPMENT_TEAM` in the environment. `tauri-env.mjs` sets it; if you invoke
-  `tauri ios build` directly (bypassing that script), set `APPLE_DEVELOPMENT_TEAM`
-  yourself.
 - **`CodeSign … errSecInternalComponent` (often with `security: … User interaction is
   not allowed`)** — `codesign` can't reach the signing key's private key. Almost always
   because the build runs in a **non-GUI session** (SSH; `launchctl managername` prints
-  `Background`), so the "allow key access" prompt has nowhere to appear. `scripts/
-  tauri-env.mjs` **handles this automatically** for every `ios build` / `ios dev` — i.e.
-  `pnpm tauri ios dev`, `pnpm ios:build`, and `pnpm ios:install` (all route through it):
-  when it detects a non-GUI session it runs `security unlock-keychain` + `security
-  set-key-partition-list -S apple-tool:,apple: -s` before building, so `codesign` gets
-  non-interactive key access. `security` prompts for your login/keychain password on the
-  terminal itself (hidden — never on the command line); it may ask twice (unlock, then
-  grant). Set `BAYBO_SKIP_KEYCHAIN_PREP=1` to skip (e.g. you manage signing access
-  yourself). If you invoke `tauri ios build` **without** `pnpm` (bypassing `tauri-env.mjs`),
-  run those two `security` commands yourself first, or build from a Terminal **on the
-  Mac itself** (GUI session).
+  `Background`), so the "allow key access" prompt has nowhere to appear.
+  `scripts/install.mjs` **handles this automatically**: when it detects a non-GUI session
+  it runs `security unlock-keychain` + `security set-key-partition-list -S
+  apple-tool:,apple:` before building, so `codesign` gets non-interactive key access.
+  `security` prompts for your login/keychain password on the terminal itself (hidden —
+  never on the command line); it may ask twice (unlock, then grant). Set
+  `BAYBO_SKIP_KEYCHAIN_PREP=1` to skip (e.g. you manage signing access yourself).
+  `build-app.sh` / `build-core.sh` do **no** such prep — run a signing build (anything
+  with `--device`) from a Terminal **on the Mac itself** (GUI session), or run those two
+  `security` commands yourself first.
 
 ## Testing
 
@@ -389,7 +396,8 @@ real `remote-host` relay in-process to drive both paths through it:
 `real_relay_splices_gateway_responder_and_mock_app` (the real Noise IK content
 responder + a mock app) and `real_relay_pairs_gateway_and_mock_app` (the real
 XXpsk0 pairing entry + a mock app landing an approved row). The AEAD interop is
-pinned by `device_proto::fixtures` + `apple/verify-crypto.swift`.
+pinned by `device_proto::fixtures` +
+`app/ios/NotificationExtension/NotificationServiceTests.swift`.
 
 ## Deploying C
 

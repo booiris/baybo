@@ -48,7 +48,7 @@ Helpers used only by the same crate's tests stay `#[cfg(test)]`.
 | Crate              | Helper                                                                  | Purpose                                                                                       |
 | ------------------ | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | `baybo-security`    | `MemorySecretStore`                                                     | In-memory `SecretStore` impl with `len()` / `is_empty()` for vault-state assertions.          |
-| domain crates      | `MemoryJobStore` (`baybo-job`), `MemoryTraceStore` (`baybo-trace`), `MemoryCostStore` (`baybo-cost`), `RecordingMemory` (`baybo-memory` — records `recall` / `on_job_complete` / `on_session_end` calls), `MemorySessionStore` + `MemorySessionSummaryStore` (`baybo-session`) | In-memory backends for the `*Store` traits (the trait contracts live in `baybo-store`; each fake sits in its domain crate's `test_support.rs`). Each exposes a typed `Arc` handle so e2e tests can assert on what the agent persisted. `MemorySessionStore` stubs out lineage / maintenance lookups (returning empty); tests that need that surface should use the real libsql store via `Store::open` against a tempfile. `MemorySessionSummaryStore` mirrors the libsql backend's per-row semantics (`upsert_success` resets `error_count`, `bump_error_count` inserts a zero row when missing) so unit tests assert against the same invariants production exercises. |
+| domain crates      | `MemoryJobStore` (`baybo-job`), `MemoryTraceStore` (`baybo-trace`), `MemoryCostStore` (`baybo-cost`), `RecordingMemory` (`baybo-memory` — records `recall` / `on_job_complete` / `on_session_end` calls), `MemorySessionStore` + `MemorySessionSummaryStore` (`baybo-session`) | In-memory backends for the `*Store` traits (the trait contracts live in `baybo-store`; each fake sits in its domain crate's `test_support.rs`). Each exposes a typed `Arc` handle so e2e tests can assert on what the agent persisted. `MemorySessionStore` stubs out lineage lookups (`list_lineage_children` returns empty); tests that need that surface should use the real libsql store via `Store::open` against a tempfile. `MemorySessionSummaryStore` mirrors the libsql backend's per-row semantics (`upsert_success` resets `error_count`, `bump_error_count` inserts a zero row when missing) so unit tests assert against the same invariants production exercises. |
 | `baybo-tools`       | `EchoTool`, `RecordingTool`                                             | `Tool` impls — `EchoTool` echoes params; `RecordingTool` captures invocation params.          |
 | `baybo-llm`         | `StubLlm`                                                               | Scriptable `LlmCompletion` impl. `with_text_chunk_size(n)` forces sub-chunked stream events. |
 
@@ -112,8 +112,8 @@ Current drift tests:
 | ----------------------------------------------- | ----------------------- | -------------------------------------------------------------------------- |
 | `crates/gateway/tests/openapi_spec_sync.rs`     | `docs/openapi.json`     | `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test all openapi_json_is_in_sync` |
 
-The OpenAPI snapshot is the contract that `web/`'s
-`openapi-typescript` codegen reads to produce `app/web/src/api/schema.d.ts`;
+The OpenAPI snapshot is the contract that `app/web`'s
+`openapi-typescript` codegen (`pnpm gen:api`) reads to produce `app/web/src/api/schema.d.ts`;
 keeping it in lockstep with the Rust router is what lets the frontend
 `tsc` step catch API drift.
 
@@ -133,10 +133,28 @@ keeping it in lockstep with the Rust router is what lets the frontend
   `AgentTestHarness`. Pins clean-stream deltas, secret minting at the
   router seam, the tool-call round trip, and inbound injection
   warnings.
+- `background_compression_e2e.rs` — the in-actor background-summary pass
+  plus the FS orphan reaper.
+- `channel_registration.rs` — drives the real Telegram sidecar bundle
+  through the production registration driver.
+- `context_compression_e2e.rs` — the LLM context-compression path under a
+  tight token budget.
+- `summary_aware_wrapper_e2e.rs` — the compressor's fast-path stage as
+  wired into the live agent loop.
+- `token_calibration_e2e.rs` — the token-count calibration feedback loop.
+- `tool_concurrency.rs` — tool-call concurrency scheduling in
+  `run_iteration`.
+
+(`all.rs` is the aggregator, not a suite.)
 
 Each file pins one cross-cutting contract. New e2e tests should follow
 the pattern: name the file after the contract, group scenarios as
-`#[tokio::test]` functions whose names read as the assertion.
+`#[tokio::test]` functions whose names read as the assertion. The crate
+sets `autotests = false` and links every e2e file into one `all` test
+binary — a new file must also be mounted in `tests/all.rs`
+(`#[path = "my_contract.rs"] mod my_contract;`) or it silently never
+builds or runs. The same aggregator convention applies to the
+crate-level suites in `crates/{security,memory,sandbox,cli,gateway,config}`.
 
 ## Real-terminal rendering tests
 
@@ -155,7 +173,11 @@ height, env })`, then `send_keys`/`send_text`, `resize`, `capture`, and
 the settle-aware `wait_until` / `wait_stable` / `wait_for_exit` pollers
 (no fixed sleeps). `tmux_available()` lets a test self-skip when tmux is
 absent, so CI without tmux stays green — the same self-skip contract as
-the docker/bwrap-backed tests. CI installs tmux so these actually run.
+the docker/bwrap-backed tests. The suites are also `#[ignore]` (they're
+flaky under load), so the gating `test` job never runs them: tmux is
+installed only in the separate non-gating `render-tests` job, which is
+`continue-on-error` and fires only when a PR touches `crates/tui` or
+`crates/term-harness`, via `-- --include-ignored`.
 
 The probe pattern (used by both suites below):
 
@@ -186,7 +208,7 @@ Current real-terminal suites:
     compared after `normalize()` masks the version string (`vX.Y.Z`) and
     drops the volatile working-indicator timer line. Regenerate after an
     intentional UI change with `UPDATE_CHAT_SNAPSHOT=1 cargo test -p
-    baybo-tui --test chat_render`. These catch *unanticipated* visual
+    baybo-tui --test chat_render -- --include-ignored`. These catch *unanticipated* visual
     drift the structural asserts would miss.
   - **Structural assertions** for the dynamic scenarios: a tool-call line
     (`Read(src/lib.rs)` + `⎿` result), a subagent surfacing as a `Task`
@@ -210,11 +232,12 @@ Current real-terminal suites:
 ## Running tests
 
 ```bash
-cargo test                                              # full workspace
+cargo nextest run --workspace                           # canonical runner (CI's gating job; config in .config/nextest.toml)
+cargo test                                              # full workspace (fallback)
 cargo test -p baybo-security                             # one crate
-cargo test -p baybo-integration-tests --test security_pipeline   # one file
-cargo test -p baybo-integration-tests --test tool_boundary -- --nocapture
-cargo test -p baybo-tui   --test chat_render             # real-terminal (needs tmux)
+cargo test -p baybo-integration-tests --test all security_pipeline::   # one file (module filter)
+cargo test -p baybo-integration-tests --test all tool_boundary:: -- --nocapture
+cargo test -p baybo-tui   --test chat_render -- --include-ignored   # real-terminal (needs tmux; suites are #[ignore])
 ```
 
 The real-terminal suites need `tmux` on `PATH`; without it they self-skip
