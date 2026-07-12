@@ -185,7 +185,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     }
 
     func chatUnsubscribe(sessionId: String) async {
-        lock.withLock { sinks.removeValue(forKey: sessionId) }
+        lock.withLock { _ = sinks.removeValue(forKey: sessionId) }
     }
 
     func chatDisconnect() async {

@@ -110,8 +110,10 @@ struct ChatStoreApprovalTests {
         deliver(Self.requestedFrame)
         #expect(await waitUntil { store.pendingApprovals.count == 1 })
 
-        let card = try? #require(store.pendingApprovals.first)
-        guard let card else { return }
+        guard let card = store.pendingApprovals.first else {
+            Issue.record("a prompt must be pending")
+            return
+        }
         store.resolveApproval(card, decision: .approve)
         #expect(store.pendingApprovals.isEmpty, "the dismiss is optimistic, not awaited")
 
@@ -130,8 +132,10 @@ struct ChatStoreApprovalTests {
         deliver(Self.requestedFrame)
         #expect(await waitUntil { store.pendingApprovals.count == 1 })
 
-        let card = try? #require(store.pendingApprovals.first)
-        guard let card else { return }
+        guard let card = store.pendingApprovals.first else {
+            Issue.record("a prompt must be pending")
+            return
+        }
         store.resolveApproval(card, decision: .deny)
 
         #expect(await waitUntil { store.notice != nil })

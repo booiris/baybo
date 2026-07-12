@@ -29,6 +29,20 @@ class BayboUITestCase: XCTestCase {
         continueAfterFailure = false
     }
 
+    /// Terminate the app we launched, rather than leaving it for the NEXT test's
+    /// `launch()` to kill implicitly. A hosted CI runner is several times slower
+    /// than a dev Mac, and there the implicit kill raced its own launch:
+    /// `Failed to terminate com.baybo.app`, surfaced as a failure of whichever
+    /// test happened to run next. Terminating on the way out gives the shutdown
+    /// its own window.
+    override func tearDown() {
+        launched?.terminate()
+        launched = nil
+        super.tearDown()
+    }
+
+    private var launched: XCUIApplication?
+
     /// Launch with the fixture flags, language pinned — BOTH languages.
     ///
     /// `-baybo.lang` only pins OUR strings (it is the app's own UserDefaults
@@ -55,13 +69,19 @@ class BayboUITestCase: XCTestCase {
                 "-AppleLocale", "en_US",
             ]
         app.launch()
+        launched = app
         return app
     }
 
     /// Block until `-baybo-demo-download` has walked both cards to `ready`.
-    /// Replaces a hard sleep: the drive takes ~5.7s, but a loaded CI runner can
-    /// take longer, and a sleep that is long enough there is pure waste here.
-    func waitForDemoDownload(_ app: XCUIApplication, timeout: TimeInterval = 20) {
+    ///
+    /// Replaces a hard sleep, and the generous ceiling is the point: the drive
+    /// itself is ~6s, but it only starts once the app has launched and the
+    /// transcript webview has booted, and a hosted runner does that several
+    /// times slower than a dev Mac (the same four cases take ~60s locally and
+    /// ~270s there). A wait costs nothing when the signal arrives early — a
+    /// ceiling tuned to a fast machine is just a scheduled flake.
+    func waitForDemoDownload(_ app: XCUIApplication, timeout: TimeInterval = 90) {
         let ready = app.buttons[Self.videoReadyLabel]
         XCTAssertTrue(
             ready.waitForExistence(timeout: timeout),
