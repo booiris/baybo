@@ -3,31 +3,35 @@ import XCTest
 /// Headless drive of the attachment long-press → system share sheet path
 /// (web gesture → `shareFile` bridge msg → `ChatStore.fileShare` →
 /// `ShareSheet`). Runs against the `-baybo-demo-attachments -baybo-demo-download`
-/// turn: the download drive walks the PDF card to `ready` (~8s in) and
+/// turn: the download drive walks the PDF card to `ready` and
 /// `demoMaterializeBytes` serves stand-in bytes, so the sheet genuinely
 /// presents with no gateway. The transcript is a webview, but its cards
 /// surface as accessibility Buttons (the file card's label is its
 /// name + meta line), so the press targets the element itself.
-final class AttachmentShareUITests: XCTestCase {
-    private func launchAndPressPdfCard(_ app: XCUIApplication) {
-        app.launchArguments = [
-            "-baybo-open-chat", "-baybo-demo-attachments", "-baybo-demo-download",
-        ]
-        app.launch()
+final class AttachmentShareUITests: BayboUITestCase {
+    private static let demoArguments = [
+        "-baybo-open-chat", "-baybo-demo-attachments", "-baybo-demo-download",
+    ]
 
-        let card = app.buttons.matching(
-            NSPredicate(format: "label CONTAINS 'final.pdf'")
-        ).firstMatch
+    private func pdfCard(_ app: XCUIApplication) -> XCUIElement {
+        app.buttons.matching(NSPredicate(format: "label CONTAINS 'final.pdf'")).firstMatch
+    }
+
+    /// Launch, wait out the download drive, then long-press the ready PDF card.
+    /// Idle and ready render the same meta line, so the card's own existence
+    /// cannot prove readiness — the video tile's label flip can, and one drive
+    /// walks both cards.
+    private func launchAndPressPdfCard() -> XCUIApplication {
+        let app = launch(Self.demoArguments)
+        let card = pdfCard(app)
         XCTAssertTrue(card.waitForExistence(timeout: 10), "demo PDF card must render")
-        // Idle and ready share the same meta line, so existence can't prove
-        // ready — wait out the demo download drive (ready at ~7.2s).
-        sleep(10)
+        waitForDemoDownload(app)
         card.press(forDuration: 0.7)
+        return app
     }
 
     func testLongPressOnReadyFileCardPresentsShareSheet() {
-        let app = XCUIApplication()
-        launchAndPressPdfCard(app)
+        let app = launchAndPressPdfCard()
 
         // The system sheet's stable container identifier — the filename header
         // lives in a remote process and is not reliably addressable.
@@ -40,8 +44,7 @@ final class AttachmentShareUITests: XCTestCase {
     /// synthetic click after the lift is swallowed web-side. If suppression
     /// broke, QuickLook would present over (or instead of) the share sheet.
     func testLongPressDoesNotAlsoOpenPreview() {
-        let app = XCUIApplication()
-        launchAndPressPdfCard(app)
+        let app = launchAndPressPdfCard()
         XCTAssertTrue(app.otherElements["ActivityListView"].waitForExistence(timeout: 5))
 
         // QuickLook's chrome (its Done button) must not be anywhere.
@@ -56,15 +59,11 @@ final class AttachmentShareUITests: XCTestCase {
     /// demo video materialises as a real 2s clip, so the genuine player chrome
     /// renders. Our share disc marks the player being on screen.
     func testVideoPlayerAVKitCloseDismissesAndReopens() {
-        let app = XCUIApplication()
-        app.launchArguments = [
-            "-baybo-open-chat", "-baybo-demo-attachments", "-baybo-demo-download",
-        ]
-        app.launch()
+        let app = launch(Self.demoArguments)
 
-        let tile = app.buttons["播放视频"]
-        XCTAssertTrue(tile.waitForExistence(timeout: 10))
-        sleep(10)
+        // The tile's ready label IS the drive's completion signal.
+        waitForDemoDownload(app)
+        let tile = app.buttons[Self.videoReadyLabel]
         tile.tap()
 
         let share = app.buttons["viewer.square.and.arrow.up"]
@@ -72,11 +71,13 @@ final class AttachmentShareUITests: XCTestCase {
 
         // AVKit auto-hides its chrome; a tap on the surface summons it.
         app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
-        // AVKit's fullscreen chrome close control. The identifier is AVKit's;
-        // fall back to localized labels if it ever changes.
-        let close = [app.buttons["Done"], app.buttons["关闭"], app.buttons["完成"]]
-            .first { $0.waitForExistence(timeout: 2) }
-        guard let close else {
+        // Match AVKit's own IDENTIFIER, not a label: the label is localized
+        // ("Close" / "关闭"), and an EMBEDDED AVPlayerViewController shows a
+        // "Close Button" where the fullscreen presentation shows "Done" — so a
+        // label match is wrong twice over, and passed here only by matching the
+        // Chinese label on a Chinese simulator.
+        let close = app.buttons["Close Button"]
+        guard close.waitForExistence(timeout: 3) else {
             XCTFail("AVKit must supply its close button")
             return
         }
@@ -93,17 +94,10 @@ final class AttachmentShareUITests: XCTestCase {
     /// share (top-right) and close (top-left). Drives share → sheet → dismiss
     /// → ✕ → preview gone.
     func testPreviewChromeSharesAndCloses() {
-        let app = XCUIApplication()
-        app.launchArguments = [
-            "-baybo-open-chat", "-baybo-demo-attachments", "-baybo-demo-download",
-        ]
-        app.launch()
-
-        let card = app.buttons.matching(
-            NSPredicate(format: "label CONTAINS 'final.pdf'")
-        ).firstMatch
+        let app = launch(Self.demoArguments)
+        let card = pdfCard(app)
         XCTAssertTrue(card.waitForExistence(timeout: 10))
-        sleep(10)
+        waitForDemoDownload(app)
         card.tap()
 
         let close = app.buttons["viewer.xmark"]

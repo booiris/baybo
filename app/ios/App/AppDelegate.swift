@@ -10,10 +10,33 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     /// launch and iOS never retries on its own).
     private(set) static var hasToken = false
 
+    #if DEBUG
+    /// Wipe the device-local stores (`Application Support/baybo`: the session
+    /// registry, the transcript mirrors, the outboxes) before anything reads
+    /// them, so a `-baybo-demo-*` launch is IDEMPOTENT.
+    ///
+    /// Without it the demo fixtures are not hermetic: their session ids are
+    /// fixed, so every launch APPENDS its canned turn to the same persisted
+    /// mirror. A UI suite shares one simulator across its cases, so by the
+    /// fourth launch the attachment demo renders four video tiles and a
+    /// by-label query that is unambiguous on a fresh install matches six
+    /// elements and dies. That is a test-harness bug, not a product one — it
+    /// just fails as if the product broke.
+    static let resetStoreArg = "-baybo-reset-store"
+    #endif
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        #if DEBUG
+        // Earliest hook that still precedes `AppStore()` (a `@StateObject`,
+        // built on the first body evaluation) and therefore every reader of the
+        // support directory.
+        if ProcessInfo.processInfo.arguments.contains(Self.resetStoreArg) {
+            try? FileManager.default.removeItem(at: SessionIndex.supportDirectory())
+        }
+        #endif
         // Tap routing (didReceive below); foreground presentation stays silent.
         UNUserNotificationCenter.current().delegate = self
         Self.registerForPush()
