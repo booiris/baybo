@@ -43,6 +43,7 @@ import {
   type UserSentPayload,
 } from "./bridge";
 import { MarkdownBody } from "./Markdown";
+import { advanceFromLive, advanceFromSync, type CursorState } from "./transcript/cursor";
 import { WorkBlockView } from "./WorkBlock";
 import {
   blobContentDigest,
@@ -63,7 +64,7 @@ import {
 // WorkStep. A `tool` step keeps its `call_id` so a later live `ToolCompleted`
 // still pairs by id; `status` defaults to "running" until the call finished
 // within the buffered turn.
-function wireStepToWork(s: WireWorkStepFrame): WorkStep {
+export function wireStepToWork(s: WireWorkStepFrame): WorkStep {
   if (s.kind === "tool") {
     return {
       kind: "tool",
@@ -81,7 +82,7 @@ function wireStepToWork(s: WireWorkStepFrame): WorkStep {
 /// `tool_label` / `tool_status` / `tool_summary`, no `call_id`) onto a rendered
 /// WorkStep. A reconstructed step's tool call is already closed, so `status`
 /// falls back to "ok" when the persisted result didn't carry one.
-function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number]): WorkStep {
+export function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number]): WorkStep {
   if (s.kind === "tool") {
     return {
       kind: "tool",
@@ -100,7 +101,7 @@ function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number]): Wor
 /// keyed by the server's stable `id` (`m<ordinal>` / `w<ordinal>` / `n<seq>`)
 /// — the render key AND redelivery dedup key. `null` for a shape we don't
 /// render (an empty/unknown row).
-function transcriptItemToRow(item: TranscriptRowItem): Row | null {
+export function transcriptItemToRow(item: TranscriptRowItem): Row | null {
   if (item.kind === "work") {
     const steps = (item.steps ?? []).map(restStepToWork);
     return {
@@ -211,7 +212,7 @@ function scrollEl(): HTMLElement | null {
 /// the command's user echo — the native stop button issues `/stop` as an
 /// ordinary send and it must never render as a message bubble. Mirrors
 /// app/web's `isStopCommand`.
-function isStopCommand(text: string): boolean {
+export function isStopCommand(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed.startsWith("/")) return false;
   const cmd = trimmed.slice(1).split(/[\s@]/, 1)[0]?.toLowerCase();
@@ -223,12 +224,12 @@ function isStopCommand(text: string): boolean {
 /// or the no-op `"Nothing in progress to stop."`. These are text-channel chatter
 /// that read oddly as a chat bubble (worst when a thinking-only turn is stopped
 /// before any work block exists), so the transcript drops them entirely.
-function isStopAckNotice(text: string): boolean {
+export function isStopAckNotice(text: string): boolean {
   const t = text.trim();
   return t.startsWith("Stopped.") || t === "Nothing in progress to stop.";
 }
 
-function ordinalFromMessageId(id: string): number | null {
+export function ordinalFromMessageId(id: string): number | null {
   const match = /^m(\d+)$/.exec(id);
   if (!match) return null;
   const n = Number(match[1]);
@@ -239,7 +240,7 @@ function ordinalFromMessageId(id: string): number | null {
 /// `w<ordinal>` work block. `null` for a client-minted `uid()` (a live block)
 /// or an `n<seq>` notice, neither of which carries an ordinal. Used to place a
 /// re-delivered work block into its own turn during a sync-difference merge.
-function rowOrdinal(id: string): number | null {
+export function rowOrdinal(id: string): number | null {
   const match = /^[mw](\d+)$/.exec(id);
   if (!match) return null;
   const n = Number(match[1]);
@@ -249,7 +250,7 @@ function rowOrdinal(id: string): number | null {
 /// Identity of a work step for dedup when folding two representations of the
 /// same turn's block: a tool step is keyed by its call id (stable across the
 /// live vs reconstructed shapes); text steps by kind + text.
-function workStepKey(s: WorkStep): string {
+export function workStepKey(s: WorkStep): string {
   return s.kind === "tool" ? `tool:${s.callId}` : `${s.kind}:${s.text}`;
 }
 
@@ -257,7 +258,7 @@ function workStepKey(s: WorkStep): string {
 /// folding a torn turn's disjoint halves appends cleanly, while folding two
 /// overlapping representations of one turn (live + reconstructed) collapses to
 /// a single copy instead of doubling every step.
-function mergeWorkSteps(a: WorkStep[], b: WorkStep[]): WorkStep[] {
+export function mergeWorkSteps(a: WorkStep[], b: WorkStep[]): WorkStep[] {
   const seen = new Set(a.map(workStepKey));
   const out = [...a];
   for (const s of b) {
@@ -274,7 +275,7 @@ function mergeWorkSteps(a: WorkStep[], b: WorkStep[]): WorkStep[] {
 /// whole thread, not just the tail. Called before appending/adopting a fresh
 /// live block so the transcript never holds two open "Working" cards at once:
 /// there is only ever one in-flight turn, hence one active block.
-function freezeActiveWork(rows: Row[]): Row[] {
+export function freezeActiveWork(rows: Row[]): Row[] {
   return rows.map((r) =>
     r.role === "work" && r.active
       ? { ...r, active: false, elapsedMs: r.elapsedMs ?? (r.startedAt !== undefined ? Date.now() - r.startedAt : undefined) }
@@ -289,7 +290,7 @@ function freezeActiveWork(rows: Row[]): Row[] {
 /// the server's duration for the frozen label (while still active the live
 /// ticker rules, so `elapsedMs` stays unset). Keeps `base`'s id/active so a live
 /// block isn't remounted mid-stream.
-function reconcileWork(base: WorkRow, recon: WorkRow): WorkRow {
+export function reconcileWork(base: WorkRow, recon: WorkRow): WorkRow {
   return {
     ...base,
     steps: mergeWorkSteps(base.steps, recon.steps),
@@ -308,7 +309,7 @@ function reconcileWork(base: WorkRow, recon: WorkRow): WorkRow {
 /// genuinely later turn's block (its answer not yet on screen) is never
 /// mis-folded. `-1` when there is no such block. Used to re-home a durable
 /// progress `status` block the reopen path can strand below the reply.
-function sameTurnWorkIndex(rows: Row[], ord: number): number {
+export function sameTurnWorkIndex(rows: Row[], ord: number): number {
   let j = rows.length - 1;
   let sawTurnAnswer = false;
   while (j >= 0) {
@@ -331,13 +332,13 @@ function sameTurnWorkIndex(rows: Row[], ord: number): number {
 /// / sync re-anchors it to the server's true turn start. A block that persisted
 /// already-closed stays closed. Empty blocks have nothing to show; unknown
 /// future roles are dropped. Also folds back a turn a mirror split in two.
-function clearAwaitingApproval(step: WorkStep): WorkStep {
+export function clearAwaitingApproval(step: WorkStep): WorkStep {
   return step.kind === "tool" && step.awaitingApproval
     ? { ...step, awaitingApproval: undefined }
     : step;
 }
 
-function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
+export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
   const out: Row[] = [];
   for (let r of rows ?? []) {
     if (r.role === "work") {
@@ -416,7 +417,7 @@ const ImageDimsContext = createContext<ImageDimsStore | null>(null);
 /// Rebuild the map from a restored mirror, dropping anything that isn't a usable
 /// size — a zero or garbage dimension would poison the reserved box's ratio (CSS
 /// divides by it), and the mirror is on-disk JSON, not a trusted type.
-function restoreImageDims(
+export function restoreImageDims(
   raw: Record<string, [number, number]> | undefined,
 ): Map<string, [number, number]> {
   const out = new Map<string, [number, number]>();
@@ -662,13 +663,13 @@ function AttachmentBubble({
 
 /// Video has no wire kind of its own — it rides `file` (the gateway buckets
 /// only image/audio specially) — so the tile is elected by mime here.
-function isVideoAttachment(attachment: WireAttachment): boolean {
+export function isVideoAttachment(attachment: WireAttachment): boolean {
   return attachment.kind === "file" && attachment.mime_type.startsWith("video/");
 }
 
 /// Binary units, and only as much precision as disambiguates: `812 B`,
 /// `24 KB`, `2.3 MB`, `140 MB`.
-function formatBytes(bytes: number): string {
+export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const kb = bytes / 1024;
   if (kb < 1024) return `${Math.round(kb)} KB`;
@@ -680,7 +681,7 @@ function formatBytes(bytes: number): string {
 /// honest source (`.docx` beats the mime's
 /// `vnd.openxmlformats-officedocument.wordprocessingml.document`); fall back to
 /// the mime subtype with its `+xml` suffix and `vnd.…` vendor path stripped.
-function typeLabel(attachment: WireAttachment): string {
+export function typeLabel(attachment: WireAttachment): string {
   const dot = attachment.filename?.lastIndexOf(".") ?? -1;
   const ext = dot > 0 ? attachment.filename?.slice(dot + 1) : undefined;
   if (ext && ext.length <= 4) return ext.toUpperCase();
@@ -696,7 +697,7 @@ const FILENAME_TAIL_CHARS = 10;
 
 /// Split a name so CSS can ellipsize the head while the tail stays pinned.
 /// Short names take the whole width and get no tail.
-function splitForMiddleEllipsis(name: string): [string, string] {
+export function splitForMiddleEllipsis(name: string): [string, string] {
   if (name.length <= FILENAME_TAIL_CHARS * 2) return [name, ""];
   return [name.slice(0, -FILENAME_TAIL_CHARS), name.slice(-FILENAME_TAIL_CHARS)];
 }
@@ -755,7 +756,7 @@ const GLYPH_PAUSE = (
 );
 
 /// `m:ss` (`h:mm:ss` past an hour) — playback positions and video durations.
-function formatTime(totalSeconds: number): string {
+export function formatTime(totalSeconds: number): string {
   const s = Math.max(0, Math.floor(totalSeconds));
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
@@ -1043,7 +1044,7 @@ function AttachmentAudio({ attachment }: { attachment: WireAttachment }) {
 const VIDEO_RATIO_DEFAULT = 16 / 9;
 const VIDEO_RATIO_MIN = 3 / 4;
 
-function clampVideoRatio(ratio: number): number {
+export function clampVideoRatio(ratio: number): number {
   return Math.min(VIDEO_RATIO_DEFAULT, Math.max(VIDEO_RATIO_MIN, ratio));
 }
 
@@ -1491,18 +1492,13 @@ export function Transcript({
         .filter((n): n is number => n !== null),
     ),
   );
-  // The sync cursor: the highest coverage watermark this client holds for the
-  // session (docs/sync-protocol.md). `null` = no baseline yet — the next sync
-  // omits `since_ordinal` and REPLACEs on the newest page. Advanced max-wins
-  // from a sync `next_cursor` and from ordinal-stamped live final replies —
-  // except while `rebaseDirty`, when only a sync `next_cursor` advances it.
-  const lastOrdinal = useRef<number | null>(restored?.lastOrdinal ?? null);
-  // True after applying a rebased page, until one non-rebased sync completes:
-  // live ordinals render but do not advance the cursor (a row persisted after
-  // the page was built but before the turn's final reply would otherwise be
-  // leapfrogged forever by the strictly-`>` select). The follow-up sync fires
-  // on turn end and on the safety tick.
-  const rebaseDirty = useRef(false);
+  // The sync cursor + its rebase-dirty flag (see transcript/cursor.ts, which
+  // owns the advance rule). `cursor: null` = no baseline yet — the next sync
+  // omits `since_ordinal` and REPLACEs on the newest page.
+  const cursorRef = useRef<CursorState>({
+    cursor: restored?.lastOrdinal ?? null,
+    rebaseDirty: false,
+  });
   // Started-at epoch-ms of turns this client has already seen END — the
   // turn-identity staleness test for a `subscribe_state` bundle's turn/work
   // halves (never cursor-vs-`as_of_ordinal` arithmetic). Bounded FIFO.
@@ -1608,7 +1604,7 @@ export function Transcript({
     persistLatest.current = () =>
       persistState({
         messages,
-        lastOrdinal: lastOrdinal.current,
+        lastOrdinal: cursorRef.current.cursor,
         oldestOrdinal: oldestOrdinal.current,
         hasMoreOlder,
         imageDims: Object.fromEntries(imageDims),
@@ -2093,7 +2089,7 @@ export function Transcript({
   // burst of triggers to one pull (cleared by the reply).
   const runSync = useCallback(() => {
     if (syncInFlight.current) return;
-    const cursor = lastOrdinal.current;
+    const cursor = cursorRef.current.cursor;
     const limit = cursor === null ? SYNC_BASELINE_LIMIT : SYNC_MERGE_LIMIT;
     syncInFlight.current = true;
     try {
@@ -2104,23 +2100,12 @@ export function Transcript({
     }
   }, []);
 
-  // Advance the cursor from a completed sync (docs/sync-protocol.md): the
-  // coverage watermark `next_cursor` feeds the max even on a rebased page (it
-  // is a sync watermark), and `rebased` sets the dirty flag — cleared by any
-  // non-rebased sync — so a live ordinal can't leapfrog the rebase window.
   const advanceCursorFromSync = useCallback((nextCursor: number | null, rebased: boolean) => {
-    if (nextCursor !== null && (lastOrdinal.current === null || nextCursor > lastOrdinal.current)) {
-      lastOrdinal.current = nextCursor;
-    }
-    rebaseDirty.current = rebased;
+    cursorRef.current = advanceFromSync(cursorRef.current, nextCursor, rebased);
   }, []);
 
-  // Advance from an ordinal-stamped live final reply — max-wins, but a
-  // rebase-dirty cursor is frozen against live advances until one non-rebased
-  // sync completes.
   const advanceCursorFromLive = useCallback((ordinal: number) => {
-    if (rebaseDirty.current) return;
-    if (lastOrdinal.current === null || ordinal > lastOrdinal.current) lastOrdinal.current = ordinal;
+    cursorRef.current = advanceFromLive(cursorRef.current, ordinal);
   }, []);
 
   // The transcript is on screen (native attaches the webview only for the open
@@ -2128,7 +2113,7 @@ export function Transcript({
   // native to advance the server read cursor, deduped so it fires only when the
   // cursor actually moved forward.
   const markReadIfAdvanced = useCallback(() => {
-    const cursor = lastOrdinal.current;
+    const cursor = cursorRef.current.cursor;
     if (cursor === null || cursor <= lastMarkedRead.current) return;
     lastMarkedRead.current = cursor;
     postMarkRead(cursor);
@@ -2325,7 +2310,7 @@ export function Transcript({
           setAwaitingReply(false);
           recordEndedTurn(activeTurnStart.current);
           activeTurnStart.current = null;
-          if (rebaseDirty.current) runSync();
+          if (cursorRef.current.rebaseDirty) runSync();
         }
         if (ordinal !== null) renderedOrdinals.current.add(ordinal);
         setMessages((m) => [
@@ -2425,7 +2410,7 @@ export function Transcript({
           activeTurnStart.current = null;
           // A turn ending on a rebase-dirty cursor triggers the follow-up sync
           // that closes the dirty window (mirrors the final-Message path).
-          if (rebaseDirty.current) runSync();
+          if (cursorRef.current.rebaseDirty) runSync();
         }
         break;
       case "subscribe_state":

@@ -6,7 +6,7 @@ import type { WorkRow, WorkStep } from "./types";
 
 /// Humanized duration: seconds under a minute, "Xm Ys" under an hour,
 /// "Xh Ym" beyond (seconds dropped at hour scale).
-function formatDuration(t: TFunction, ms: number): string {
+export function formatDuration(t: TFunction, ms: number): string {
   const total = Math.round(ms / 1000);
   if (total < 60) return t("chat.durS", { s: total });
   if (total < 3600) {
@@ -38,7 +38,7 @@ function LiveElapsed({ startedAt }: { startedAt?: number }) {
   return <span className="work-elapsed">{formatDuration(t, ms)}</span>;
 }
 
-function workedLabel(t: TFunction, elapsedMs?: number): string {
+export function workedLabel(t: TFunction, elapsedMs?: number): string {
   if (elapsedMs !== undefined && elapsedMs >= 1000) {
     return t("chat.workedFor", { dur: formatDuration(t, elapsedMs) });
   }
@@ -49,7 +49,7 @@ function workedLabel(t: TFunction, elapsedMs?: number): string {
 /// call, then the user's verdict — which persists (`ToolResultMeta::approval`),
 /// so it is still there after a reload. `null` for a call that never prompted,
 /// which is the overwhelming majority.
-function approvalLabel(t: TFunction, step: WorkStep): string | null {
+export function approvalLabel(t: TFunction, step: WorkStep): string | null {
   if (step.kind !== "tool") return null;
   if (step.awaitingApproval) return t("chat.approvalWaiting");
   switch (step.approval) {
