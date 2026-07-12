@@ -42,6 +42,19 @@ xcodegen generate
 # Pin products inside the repo (build/DerivedData) — the default DerivedData
 # lives outside it, and "install the .app xcodebuild just wrote" then grabs a
 # stale bundle from whichever path happened to exist.
+#
+# The filter must not eat the exit status: `| grep … || true` forced a 0 even
+# when xcodebuild failed (the `||` discards pipefail's status), so a broken
+# build reported success. Take xcodebuild's own status out of PIPESTATUS, and
+# keep the unfiltered log for the failure case.
+mkdir -p build
+set +e
 xcodebuild -project Baybo.xcodeproj -scheme Baybo -configuration "$CONFIGURATION" \
   -sdk "$SDK" -destination "$DEST" -derivedDataPath build/DerivedData build \
-  | grep -E 'error|warning: |BUILD' || true
+  | tee build/xcodebuild.log | grep -E 'error|warning: |BUILD'
+status=${PIPESTATUS[0]}
+set -e
+if (( status != 0 )); then
+  echo "xcodebuild failed (exit $status) — full log: app/ios/build/xcodebuild.log" >&2
+  exit "$status"
+fi
