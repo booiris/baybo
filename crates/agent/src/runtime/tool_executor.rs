@@ -42,13 +42,16 @@ const APPROVAL_HEADROOM: Duration = Duration::from_secs(300);
 /// `MAX_TOOL_OUTPUT_BYTES` (see [`cap_trace_output`]).
 const FAILURE_REASON_MAX_BYTES: usize = 512;
 
-/// Hard cap on the total byte size of text fields carried inside the
-/// drained payloads of a single tool call. Tools are expected to
-/// truncate their own snippets/inputs/outputs before emitting, but
-/// this cap protects `span_events` from a tool that emits one very
-/// large payload (or many medium ones). Entries that would push the
-/// running total past this cap are dropped silently — the trace is
-/// best-effort, not load-bearing.
+/// Hard cap on the *aggregate* byte size of the drained payloads of a single
+/// tool call — a backstop against a tool that emits a very large number of
+/// events. Individual fields are already bounded by
+/// `SPAN_EVENT_TEXT_MAX_BYTES` in the sink, so no single event can approach
+/// this on its own.
+///
+/// Entries past the cap are dropped whole and silently (the trace is
+/// best-effort, not load-bearing), which is exactly why the per-field bound
+/// has to come first: a fat field here would evict later events, including the
+/// `ParseFailure` audit record.
 ///
 /// There is no separate cap on entry count: tools that emit a steady
 /// trickle of small `Phase` events are bounded by this same byte
@@ -105,7 +108,14 @@ fn payload_text_bytes(payload: &ToolEventPayload) -> usize {
 }
 
 impl baybo_tools::ToolEventSink for SpanEventRecorder {
-    fn emit(&self, action: &str, payload: ToolEventPayload) {
+    fn emit(&self, action: &str, mut payload: ToolEventPayload) {
+        // Bound each text field here, at the one sink every emitter passes
+        // through, rather than trusting five producers to remember. Note this
+        // must happen *before* the running-total check below: that check drops
+        // the whole entry, so an unbounded field would not merely bloat the
+        // trace, it would make later events (including `ParseFailure`, which is
+        // an audit record) vanish depending on arrival order.
+        payload.truncate_text_fields();
         let mut guard = self.entries.lock();
         let cost = action.len() + payload_text_bytes(&payload);
         if guard.text_bytes.saturating_add(cost) > TOOL_EVENTS_MAX_PAYLOAD_BYTES {
@@ -826,7 +836,59 @@ impl ToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baybo_tools::ToolEventSink;
+    use baybo_trace::SPAN_EVENT_TEXT_MAX_BYTES;
     use serde_json::json;
+
+    /// The sink is the enforcement point: emitters used to be trusted to
+    /// truncate their own payloads (WebFetch shipped a whole 96 KiB page), and
+    /// the only backstop dropped the *entire* entry, so an oversized field
+    /// could silently swallow later audit events. Bound it here instead.
+    #[test]
+    fn event_sink_truncates_oversized_payload_fields() {
+        let sink = SpanEventRecorder::new();
+        sink.emit(
+            "llm_summary",
+            ToolEventPayload::LlmCall {
+                model: "m".into(),
+                input: "p".repeat(SPAN_EVENT_TEXT_MAX_BYTES * 4),
+                output: "o".repeat(SPAN_EVENT_TEXT_MAX_BYTES * 4),
+            },
+        );
+        // A later event must still land — the old whole-entry drop made this
+        // order-dependent.
+        sink.emit(
+            "parse_failure",
+            ToolEventPayload::ParseFailure {
+                command: "rm -rf /".into(),
+            },
+        );
+
+        let items = sink.drain();
+        assert_eq!(
+            items.len(),
+            2,
+            "the oversized event must not evict later ones"
+        );
+        let ToolEventPayload::LlmCall { input, output, .. } = &items[0].1 else {
+            panic!("expected the LlmCall payload first");
+        };
+        for (name, field) in [("input", input), ("output", output)] {
+            assert!(
+                field.len() < SPAN_EVENT_TEXT_MAX_BYTES * 2,
+                "{name} must be bounded, got {} bytes",
+                field.len()
+            );
+            assert!(
+                field.contains("truncated"),
+                "{name} must say it was truncated rather than look complete"
+            );
+        }
+        assert!(
+            matches!(&items[1].1, ToolEventPayload::ParseFailure { command } if command == "rm -rf /"),
+            "the audit event must survive intact"
+        );
+    }
 
     use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
 

@@ -24,7 +24,7 @@ pub mod test_support;
 
 pub use baybo_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
 pub use error::TraceError;
-pub use event::{SpanEvent, SpanEventKind, ToolEventPayload};
+pub use event::{SPAN_EVENT_TEXT_MAX_BYTES, SpanEvent, SpanEventKind, ToolEventPayload};
 pub use outcome::{LifecycleOutcome, LifecycleState};
 pub use recorder::{SpanRecorder, TraceEvent, TraceEventStream};
 pub use span::{
