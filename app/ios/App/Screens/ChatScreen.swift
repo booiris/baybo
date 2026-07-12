@@ -95,6 +95,7 @@ struct ChatScreen: View {
                 store.startDemoFramesIfRequested()
                 store.startDemoAttachmentsIfRequested()
                 store.startDemoImagesIfRequested()
+                store.startDemoApprovalIfRequested()
                 store.startDemoSwitchIfRequested()
                 bridge.startDemoJumpIfRequested()
                 startDemoBackIfRequested()

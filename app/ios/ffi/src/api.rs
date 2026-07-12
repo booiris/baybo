@@ -184,6 +184,31 @@ pub enum AttachmentKind {
     File,
 }
 
+/// A user's answer to a pending tool-approval prompt, echoed back to the
+/// gateway as `Frame::ResolveApproval`.
+///
+/// Deliberately NARROWER than `baybo_model::ApprovalDecision`, which also has
+/// an `ApproveAlways` (a standing, session-wide grant for every resource the
+/// call touches). Other clients offer it; the phone does not — a mis-tap is
+/// likeliest here, and a standing grant is the one decision you can't undo by
+/// paying more attention next time. Leaving the variant out of the FFI means
+/// the app cannot send it even by accident. Decisions made ELSEWHERE still
+/// arrive and render — this type is the send side only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ApprovalDecision {
+    Approve,
+    Deny,
+}
+
+impl From<ApprovalDecision> for crate::core::WireApprovalDecision {
+    fn from(d: ApprovalDecision) -> Self {
+        match d {
+            ApprovalDecision::Approve => Self::Approve,
+            ApprovalDecision::Deny => Self::Deny,
+        }
+    }
+}
+
 impl From<AttachmentRef> for crate::core::WireAttachment {
     fn from(a: AttachmentRef) -> Self {
         let kind = match a.kind {

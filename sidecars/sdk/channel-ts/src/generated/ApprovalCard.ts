@@ -8,4 +8,9 @@ import type { ResourceAccess } from "./ResourceAccess";
  * [`Frame::ApprovalRequested`] (minus `session_id`, which the bundle
  * carries once) so clients render both through the same card.
  */
-export type ApprovalCard = { call_id: string, user_id?: string, tool: string, accesses: Array<ResourceAccess>, params_preview: string, description?: string, };
+export type ApprovalCard = { call_id: string, 
+/**
+ * `call_id` of the TOOL call the prompt blocks — see
+ * [`Frame::ApprovalRequested::tool_call_id`].
+ */
+tool_call_id?: string, user_id?: string, tool: string, accesses: Array<ResourceAccess>, params_preview: string, description?: string, };

@@ -45,7 +45,27 @@ function workedLabel(t: TFunction, elapsedMs?: number): string {
   return t("chat.worked");
 }
 
+/// The step's approval label: "waiting for approval" while the gate holds the
+/// call, then the user's verdict — which persists (`ToolResultMeta::approval`),
+/// so it is still there after a reload. `null` for a call that never prompted,
+/// which is the overwhelming majority.
+function approvalLabel(t: TFunction, step: WorkStep): string | null {
+  if (step.kind !== "tool") return null;
+  if (step.awaitingApproval) return t("chat.approvalWaiting");
+  switch (step.approval) {
+    case "approve":
+      return t("chat.approvalApproved");
+    case "approve_always":
+      return t("chat.approvalApprovedAlways");
+    case "deny":
+      return t("chat.approvalDenied");
+    default:
+      return null;
+  }
+}
+
 function WorkStepView({ step }: { step: WorkStep }) {
+  const { t } = useTranslation();
   switch (step.kind) {
     case "reasoning":
       return (
@@ -74,14 +94,21 @@ function WorkStepView({ step }: { step: WorkStep }) {
       );
     case "tool": {
       const failed = step.status === "error" || step.status === "denied";
-      const running = step.status === "running";
+      // A call waiting on the user is NOT "running" — the pulse would read as
+      // work in progress when nothing is happening until the card is answered.
+      const awaiting = Boolean(step.awaitingApproval);
+      const running = step.status === "running" && !awaiting;
+      const approval = approvalLabel(t, step);
       return (
-        <div className={`step tool${failed ? " failed" : ""}${running ? " running" : ""}`}>
+        <div
+          className={`step tool${failed ? " failed" : ""}${running ? " running" : ""}${awaiting ? " awaiting" : ""}`}
+        >
           {/* U+25CF, not U+23FA — the latter takes iOS's blue emoji presentation. */}
           <span className="step-glyph">●</span>
           <span className="step-text">
             {step.label}
             {step.summary ? ` — ${step.summary}` : ""}
+            {approval ? <span className="step-approval">{approval}</span> : null}
           </span>
         </div>
       );

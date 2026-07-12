@@ -29,9 +29,9 @@ use std::sync::Arc;
 use crate::core::WireAttachment;
 
 pub use api::{
-    ApnsEnvironment, AttachmentKind, AttachmentRef, BayboError, BlobProgress, ChatSessionSummary,
-    ClientConfig, FrameSink, MessageLookup, PairAbortListener, PairChallenge, PairTarget,
-    PairedSummary, SessionListSink,
+    ApnsEnvironment, ApprovalDecision, AttachmentKind, AttachmentRef, BayboError, BlobProgress,
+    ChatSessionSummary, ClientConfig, FrameSink, MessageLookup, PairAbortListener, PairChallenge,
+    PairTarget, PairedSummary, SessionListSink,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -388,6 +388,33 @@ impl BayboClient {
                 }
                 ActiveLeg::Direct => {
                     transport::send(&this.direct, session_id, text, msg_id, attachments).await
+                }
+            }
+        })
+        .await
+    }
+
+    /// Answer a pending tool-approval prompt (`call_id` from the
+    /// `approval_requested` frame, or a `subscribe_state` bundle's
+    /// `pending_approvals` card). Fire-and-forget on the active binding's chat
+    /// leg: the gateway resolves the gate — releasing the blocked tool call —
+    /// and broadcasts `approval_resolved`, which arrives back on the frame
+    /// sink. A decision the leg can't deliver errors here; the server-side gate
+    /// then times out and denies (fail-closed).
+    pub async fn chat_resolve_approval(
+        self: Arc<Self>,
+        call_id: String,
+        decision: ApprovalDecision,
+    ) -> Result<(), BayboError> {
+        let this = self;
+        runtime::run(async move {
+            let decision = decision.into();
+            match active_leg()? {
+                ActiveLeg::Relay => {
+                    transport::resolve_approval(&this.relay, call_id, decision).await
+                }
+                ActiveLeg::Direct => {
+                    transport::resolve_approval(&this.direct, call_id, decision).await
                 }
             }
         })

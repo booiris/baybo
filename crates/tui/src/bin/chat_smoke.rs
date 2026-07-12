@@ -172,6 +172,7 @@ async fn tool_call(
             call_id: call_id.to_string(),
             status: "ok".to_string(),
             summary: summary.to_string(),
+            approval: None,
         },
     )
     .await;
@@ -180,6 +181,7 @@ async fn tool_call(
 fn approval_request(sid: &SessionId) -> Frame {
     Frame::ApprovalRequested {
         call_id: "c-appr".to_string(),
+        tool_call_id: None,
         session_id: sid.clone(),
         user_id: String::new(),
         tool: APPROVAL_TOOL.to_string(),

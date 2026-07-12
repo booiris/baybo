@@ -348,6 +348,12 @@ pub struct WireWorkStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub summary: Option<String>,
+    /// Decision the call's approval prompt returned, once it completed
+    /// within the buffered turn; `None` when it never prompted (or is
+    /// still running / still waiting on the prompt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+    pub approval: Option<ApprovalDecision>,
 }
 
 impl WireWorkStep {
@@ -361,6 +367,7 @@ impl WireWorkStep {
             label: None,
             status: None,
             summary: None,
+            approval: None,
         }
     }
 
@@ -374,6 +381,7 @@ impl WireWorkStep {
             label: None,
             status: None,
             summary: None,
+            approval: None,
         }
     }
 
@@ -387,6 +395,7 @@ impl WireWorkStep {
             label: None,
             status: None,
             summary: None,
+            approval: None,
         }
     }
 
@@ -403,6 +412,7 @@ impl WireWorkStep {
             label,
             status: None,
             summary: None,
+            approval: None,
         }
     }
 }
@@ -442,6 +452,11 @@ pub struct TurnSnapshot {
 )]
 pub struct ApprovalCard {
     pub call_id: String,
+    /// `call_id` of the TOOL call the prompt blocks — see
+    /// [`Frame::ApprovalRequested::tool_call_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub user_id: String,
     pub tool: String,
@@ -607,6 +622,8 @@ pub enum Frame {
     /// string (`"ok"` / `"error"` / `"denied"`) like `Notice.level`, so
     /// third-party clients don't need a typed enum; `summary` is a short
     /// result rendering. Pairs with `ToolStarted` by `call_id`.
+    /// `approval` is the decision the call's approval prompt returned
+    /// (absent when it never prompted) so clients can label the step.
     ToolCompleted {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
@@ -615,6 +632,9 @@ pub enum Frame {
         call_id: String,
         status: String,
         summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+        approval: Option<ApprovalDecision>,
     },
     /// Server → client: a coarse turn-phase transition for a transient
     /// status line. `phase` is a lower-case string (today `"compacting"` /
@@ -687,6 +707,13 @@ pub enum Frame {
     /// one can ignore, and the gate will time out server-side.
     ApprovalRequested {
         call_id: String,
+        /// `call_id` of the TOOL call this prompt blocks (the id
+        /// `ToolStarted`/`ToolCompleted` carry — NOT this frame's own
+        /// `call_id`, which is minted per prompt). Lets clients badge
+        /// the exact work step that is waiting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        tool_call_id: Option<String>,
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1094,6 +1121,7 @@ mod tests {
             ],
             pending_approvals: vec![ApprovalCard {
                 call_id: "c1".into(),
+                tool_call_id: Some("t-use-1".into()),
                 user_id: "u1".into(),
                 tool: "fs.read".into(),
                 accesses: vec![ResourceAccess::ReadFile {
@@ -1245,6 +1273,7 @@ mod tests {
         use std::path::PathBuf;
         let frame = Frame::ApprovalRequested {
             call_id: "c1".into(),
+            tool_call_id: Some("t-use-1".into()),
             session_id: "s1".into(),
             user_id: "u1".into(),
             tool: "fs.read".into(),

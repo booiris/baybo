@@ -41,6 +41,21 @@ struct ComposerView: View {
                 .padding(.horizontal, 18)
             }
 
+            // A blocked tool call outranks everything else in the dock: it is
+            // the only thing the user can act on, and an unanswered gate denies
+            // itself after 5 minutes.
+            if let approval = store.pendingApprovals.first {
+                ApprovalCardView(
+                    approval: approval,
+                    queued: store.pendingApprovals.count - 1
+                ) { decision in
+                    store.resolveApproval(approval, decision: decision)
+                }
+                // Re-key on the prompt so answering the head SWAPS in the next
+                // card (fresh one-shot latch) instead of reusing this view.
+                .id(approval.callId)
+            }
+
             if !staged.isEmpty {
                 stagedStrip
             }
@@ -121,6 +136,7 @@ struct ComposerView: View {
         }
         .padding(.top, 0)
         .padding(.bottom, dockBottomPadding)
+        .animation(.easeOut(duration: 0.2), value: store.pendingApprovals.first?.callId)
         .background { composerVeil }
         .onChange(of: pickerItem) { _, item in
             guard let item else { return }

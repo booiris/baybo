@@ -15,9 +15,11 @@ pub use api_tunnel::{
     blob_id_sha256_hex,
 };
 pub use content::{
-    ContentHandshake, ContentSession, register_device_frame, subscribe_frame, user_message_frame,
+    ContentHandshake, ContentSession, register_device_frame, resolve_approval_frame,
+    subscribe_frame, user_message_frame,
 };
 pub use error::MobileError;
 pub use pairing::{PairChallenge, PairedSummary, PairingClient, PairingRequest};
 
+pub use baybo_model::ApprovalDecision as WireApprovalDecision;
 pub use wire::{AttachmentKind, Frame, WireAttachment, decode, encode};

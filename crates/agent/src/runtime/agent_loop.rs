@@ -17,7 +17,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use baybo_model::{ControlEventKind, LineageKind, Session, TriggerSource};
-use baybo_tools::{ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
+use baybo_tools::{ApprovalDecision, ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
 use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
 };
@@ -31,7 +31,7 @@ use crate::runtime::progress_observer::{
 };
 use crate::runtime::scope::JobSpec;
 
-use crate::runtime::tool_executor::ToolExecutor;
+use crate::runtime::tool_executor::{ExecutedTool, ToolExecutor};
 use crate::security::SecurityGateway;
 use tokio_util::sync::CancellationToken;
 
@@ -140,8 +140,15 @@ fn summarize_attachments(blocks: &[ContentBlock]) -> String {
 /// content-light; the summary still passes the leak boundary before it is
 /// emitted. Mirrors the result match the loop runs for the LLM-facing
 /// `tool_result` text.
-fn tool_completion_summary(result: &anyhow::Result<ToolOutput>) -> (ToolStatus, String) {
-    match result {
+fn tool_completion_summary(executed: &ExecutedTool) -> (ToolStatus, String) {
+    // A recorded `Deny` is the authoritative denial signal, whatever shape the
+    // refusal took: the pre-execute gate raises a typed `ToolError::Denied`,
+    // but a tool that prompts MID-CALL folds the refusal into its own (untyped)
+    // error — and both must read as "denied", not "the tool crashed".
+    if executed.approval == Some(ApprovalDecision::Deny) {
+        return (ToolStatus::Denied, "denied".to_string());
+    }
+    match &executed.output {
         Ok(ToolOutput::Text(s)) => (ToolStatus::Ok, summarize_text(s)),
         Ok(ToolOutput::Json(_)) => (ToolStatus::Ok, "ok".to_string()),
         Ok(ToolOutput::WithAttachments { attachments, .. }) => {
@@ -151,15 +158,7 @@ fn tool_completion_summary(result: &anyhow::Result<ToolOutput>) -> (ToolStatus, 
             (ToolStatus::Ok, format!("{} image(s)", llm_images.len()))
         }
         Ok(ToolOutput::Error(msg)) => (ToolStatus::Error, truncate_summary(msg)),
-        Err(e) => {
-            if let Some(baybo_tools::ToolError::Denied { .. }) =
-                e.downcast_ref::<baybo_tools::ToolError>()
-            {
-                (ToolStatus::Denied, "denied".to_string())
-            } else {
-                (ToolStatus::Error, truncate_summary(&e.to_string()))
-            }
-        }
+        Err(e) => (ToolStatus::Error, truncate_summary(&e.to_string())),
     }
 }
 
@@ -1304,10 +1303,18 @@ impl AgentLoop {
 
         // Sequential post-processing: append results in `tool_calls`
         // order so context state stays byte-stable across calls.
-        for (tool_call, tool_result) in response.tool_calls.iter().zip(tool_results) {
-            let (status, raw_summary) = tool_completion_summary(&tool_result);
-            self.emit_tool_completed(delta_tx, session, tool_call.id.clone(), status, raw_summary)
-                .await;
+        for (tool_call, executed) in response.tool_calls.iter().zip(tool_results) {
+            let (status, raw_summary) = tool_completion_summary(&executed);
+            let call_approval = executed.approval;
+            self.emit_tool_completed(
+                delta_tx,
+                session,
+                tool_call.id.clone(),
+                status,
+                raw_summary,
+                call_approval,
+            )
+            .await;
 
             // Count a grouped subagent spawn into its barrier cohort so the
             // turn-end seal knows the member total. Only a *successful
@@ -1317,8 +1324,9 @@ impl AgentLoop {
             // broad: counting it would stall the cohort until its group
             // timeout. A real dispatch returns the ack with its `bg-…` handle.
             let dispatched = matches!(
-                &tool_result,
-                Ok(ToolOutput::Text(t)) if t.starts_with(baybo_model::BACKGROUND_DISPATCH_ACK_PREFIX)
+                &executed.output,
+                Ok(ToolOutput::Text(t))
+                    if t.starts_with(baybo_model::BACKGROUND_DISPATCH_ACK_PREFIX)
             );
             if tool_call.name == baybo_model::SPAWN_SUBAGENT_TOOL_NAME
                 && dispatched
@@ -1342,7 +1350,7 @@ impl AgentLoop {
                     .expected += 1;
             }
 
-            let raw_result_text = match &tool_result {
+            let raw_result_text = match &executed.output {
                 Ok(ToolOutput::Text(s)) => s.clone(),
                 Ok(ToolOutput::Json(v)) => {
                     serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
@@ -1388,25 +1396,30 @@ impl AgentLoop {
             );
 
             // Append tool result to context with the tool_use_id so the
-            // LLM can correlate results with their originating calls. For a
-            // `Read`, stamp the fingerprint it recorded onto the row so the
-            // read-before-write tracker can be rebuilt on hydration (the
-            // fingerprint persists with the transcript but is never sent to
-            // the LLM). `get` returns `None` for a failed/virtual read, which
-            // collapses to a plain `tool_result`.
-            let tool_msg = if tool_call.name == baybo_tools::READ_TOOL_NAME {
-                let meta = tool_call
-                    .arguments
-                    .get("file_path")
-                    .and_then(|v| v.as_str())
-                    .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
-                    .map(|fp| baybo_model::ToolResultMeta {
-                        read_fingerprint: Some(fp),
-                    });
-                ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, meta)
-            } else {
-                ChatMessage::tool_result(tool_call.id.clone(), wrapped)
-            };
+            // LLM can correlate results with their originating calls. The
+            // meta rides the persisted row but is never sent to the LLM: a
+            // `Read` stamps the fingerprint it recorded (so the
+            // read-before-write tracker can be rebuilt on hydration; `get`
+            // returns `None` for a failed/virtual read), and any call that
+            // raised an approval prompt stamps the decision (so reloads can
+            // label the work step). Both `None` collapses to a plain
+            // `tool_result`.
+            let read_fingerprint = (tool_call.name == baybo_tools::READ_TOOL_NAME)
+                .then(|| {
+                    tool_call
+                        .arguments
+                        .get("file_path")
+                        .and_then(|v| v.as_str())
+                        .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
+                })
+                .flatten();
+            let meta = (read_fingerprint.is_some() || call_approval.is_some()).then_some(
+                baybo_model::ToolResultMeta {
+                    read_fingerprint,
+                    approval: call_approval,
+                },
+            );
+            let tool_msg = ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, meta);
             self.context_manager.append(&tool_msg).await;
         }
 
@@ -2302,6 +2315,7 @@ impl AgentLoop {
         call_id: String,
         status: ToolStatus,
         raw_summary: String,
+        approval: Option<ApprovalDecision>,
     ) {
         let Some(tx) = delta_tx else { return };
         let summary = self
@@ -2318,6 +2332,7 @@ impl AgentLoop {
                     call_id,
                     status,
                     summary,
+                    approval,
                 },
             })
             .await;
@@ -3459,5 +3474,49 @@ mod bg_compression_at_most_one_tests {
             may_spawn(&handle),
             "a finished pass must not block the next spawn"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_completion_summary_tests {
+    use super::*;
+
+    fn executed(
+        output: anyhow::Result<ToolOutput>,
+        approval: Option<ApprovalDecision>,
+    ) -> ExecutedTool {
+        ExecutedTool { output, approval }
+    }
+
+    #[test]
+    fn a_recorded_denial_reads_denied_even_though_the_error_is_untyped() {
+        // The regression this pins: a tool that prompts MID-CALL folds the
+        // refusal into its own error, which reaches us as a plain `anyhow`
+        // (the executor sanitizes and re-wraps it, losing the type). Keying
+        // off the error type alone reported that as a crash — an "error" step
+        // with no verdict — while the user had explicitly denied it.
+        let (status, summary) = tool_completion_summary(&executed(
+            Err(anyhow::anyhow!("skill 'x' requires env-var approval")),
+            Some(ApprovalDecision::Deny),
+        ));
+        assert_eq!(status, ToolStatus::Denied);
+        assert_eq!(summary, "denied");
+    }
+
+    #[test]
+    fn an_approved_call_that_then_fails_still_reads_as_an_error() {
+        let (status, _) = tool_completion_summary(&executed(
+            Err(anyhow::anyhow!("boom")),
+            Some(ApprovalDecision::ApproveAlways),
+        ));
+        assert_eq!(status, ToolStatus::Error, "the approval isn't the outcome");
+    }
+
+    #[test]
+    fn an_ungated_call_is_unaffected() {
+        let (status, summary) =
+            tool_completion_summary(&executed(Ok(ToolOutput::Text("3 files".into())), None));
+        assert_eq!(status, ToolStatus::Ok);
+        assert_eq!(summary, "3 files");
     }
 }

@@ -454,6 +454,24 @@ button {
 .step.tool.failed { color: var(--color-err); }
 .work.active .step.tool.running .step-glyph { animation: glyph-pulse 1s ease-in-out infinite; }
 @keyframes glyph-pulse { 50% { opacity: 0.25; } }
+/* A call blocked on the user: the glyph BREATHES (slower, shallower than the
+   running pulse) rather than pulsing — nothing is executing, the turn is simply
+   parked on the composer's approval card. */
+.work.active .step.tool.awaiting .step-glyph { animation: glyph-breathe 2s ease-in-out infinite; }
+@keyframes glyph-breathe { 50% { opacity: 0.5; } }
+/* The verdict rides the step's own line, quiet and monochrome: a boxed label,
+   never a colored badge (a denied call already reads red via `.failed`). */
+.step.tool .step-approval {
+  margin-left: 0.4rem;
+  padding: 0 0.3rem;
+  border: 1px solid var(--color-line);
+  border-radius: 0.35rem;
+  font-size: 0.62rem;
+  line-height: 1.5;
+  color: var(--color-ink-soft);
+  white-space: nowrap;
+}
+.step.tool.awaiting .step-approval { border-color: var(--color-ink); color: var(--color-ink); }
 .step.prose { display: block; font-family: var(--font-sans); font-size: 0.85rem; color: var(--color-ink); }
 .step.status { white-space: pre-wrap; }
 /* Mid-turn notice folded into the block: a severity ramp on the monochrome

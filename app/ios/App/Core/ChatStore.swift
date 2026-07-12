@@ -93,6 +93,14 @@ final class ChatStore: ObservableObject {
     /// the composer's send↔stop button. Native never re-derives turn state; it
     /// only reflects what the webview reports.
     @Published private(set) var agentRunning = false
+    /// Tool calls blocked on this user's decision, oldest first — the composer's
+    /// approval card renders the head and counts the rest. Derived NATIVELY from
+    /// the frame stream (`pushFrame`), not mirrored from the webview: the
+    /// offscreen buffer can overflow and drop frames, and the sync loop restores
+    /// rows but not pending prompts, so a web-held queue could lose a card for
+    /// good. The card is the only way to answer, and an unanswered gate denies
+    /// after 5 minutes.
+    @Published private(set) var pendingApprovals: [PendingApproval] = []
 
     /// Increments on every successful dial; the webview uses it to retry
     /// attachments that raced ahead of the leg going live, and — the sync-loop
@@ -293,20 +301,30 @@ final class ChatStore: ObservableObject {
     }
 
     private func pushFrame(_ frameJson: String) {
-        // Already overflowed while offscreen: the webview re-syncs on the next
-        // attach, so don't buffer past the hole the dropped frames left.
-        if bridge == nil && needsSyncOnAttach { return }
         // Passive observers on the same frame stream, parsed once: a user Echo
         // (ordinal-less, matching platform_msg_id) advances the outbox; the
         // turn's terminal assistant `message` updates the chat-list preview in
-        // place. Both run even while offscreen (bridge nil, buffered) so a reply
-        // that lands after the user backs out still updates the list live.
+        // place; approval frames drive the composer's card. They run even while
+        // offscreen (bridge nil, buffered) so a reply that lands after the user
+        // backs out still updates the list live.
+        //
+        // They also run AHEAD of the overflow bail below — deliberately. The
+        // buffer is the WEBVIEW's replay queue, and dropping it only costs the
+        // webview a re-sync; the observers own native state the sync can't
+        // rebuild. An approval in particular: `sync_page` carries rows, not
+        // pending prompts, and a re-attach doesn't re-Subscribe, so a card
+        // dropped here would never come back — the gate would just deny itself
+        // five minutes later with the user never asked.
         if let data = frameJson.data(using: .utf8),
             let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         {
             outboxObserveFrame(frame)
             noteChatListPreview(frame)
+            approvalObserveFrame(frame)
         }
+        // Already overflowed while offscreen: the webview re-syncs on the next
+        // attach, so don't buffer past the hole the dropped frames left.
+        if bridge == nil && needsSyncOnAttach { return }
         if let bridge {
             bridge.pushFrame(frameJson)
         } else {
@@ -595,6 +613,71 @@ final class ChatStore: ObservableObject {
             frame["ordinal"] == nil || frame["ordinal"] is NSNull
         else { return }
         outbox.markEchoed(platformMsgId: pmid)
+    }
+
+    /// Derive the pending-approval queue from the frame stream — the composer's
+    /// approval card. Native, not web: it runs BEFORE the frame reaches (or
+    /// misses) the webview, so a prompt raised while the user is parked on the
+    /// chat list still lands, and an offscreen buffer overflow can't drop the
+    /// only way to answer a gate that denies itself after 5 minutes.
+    ///
+    /// Four inputs, matching the four ways a prompt appears or goes away:
+    /// * `approval_requested` — a new prompt (deduped: the gate's waker re-fires
+    ///   on the newest queue entry, so the same card can arrive twice);
+    /// * `approval_resolved` — someone answered (this device, or another client);
+    /// * `subscribe_state.pending_approvals` — the authoritative set on
+    ///   (re)subscribe, which REPLACES the queue;
+    /// * `tool_completed` — the blocked call finished. A gate that TIMES OUT
+    ///   denies server-side and broadcasts NO `approval_resolved`, so without
+    ///   this the card would linger forever over a call that is long done.
+    private func approvalObserveFrame(_ frame: [String: Any]) {
+        switch frame["kind"] as? String {
+        case "approval_requested":
+            guard let card = PendingApproval.from(frame: frame),
+                !pendingApprovals.contains(where: { $0.callId == card.callId })
+            else { return }
+            pendingApprovals.append(card)
+        case "approval_resolved":
+            guard let callId = frame["call_id"] as? String else { return }
+            dropApproval(callId: callId)
+        case "subscribe_state":
+            let cards = (frame["pending_approvals"] as? [[String: Any]] ?? [])
+                .compactMap(PendingApproval.from(frame:))
+            if cards != pendingApprovals { pendingApprovals = cards }
+        case "tool_completed":
+            guard let toolCallId = frame["call_id"] as? String,
+                pendingApprovals.contains(where: { $0.toolCallId == toolCallId })
+            else { return }
+            pendingApprovals.removeAll { $0.toolCallId == toolCallId }
+        default:
+            break
+        }
+    }
+
+    /// The user answered. Dismiss optimistically (the server's `approval_resolved`
+    /// fan-out confirms it, and re-adding the card on the frame's return would
+    /// flash a prompt they just answered), then echo the decision on the live
+    /// leg. A leg that can't carry it surfaces a notice: the decision is lost and
+    /// the gate will deny on its own timeout, so the user has to know.
+    func resolveApproval(_ approval: PendingApproval, decision: ApprovalDecision) {
+        dropApproval(callId: approval.callId)
+        Haptics.tap()
+        #if DEBUG
+            if resolveDemoApprovalIfRequested(approval, decision: decision) { return }
+        #endif
+        Task {
+            do {
+                try await Baybo.client.chatResolveApproval(
+                    callId: approval.callId, decision: decision)
+            } catch {
+                notice = Lang.shared.t("chat.approvalFailed", bayboErrorText(error))
+            }
+        }
+    }
+
+    private func dropApproval(callId: String) {
+        guard pendingApprovals.contains(where: { $0.callId == callId }) else { return }
+        pendingApprovals.removeAll { $0.callId == callId }
     }
 
     /// The turn's terminal assistant `message` is the authoritative, tool-free

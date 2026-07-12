@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::approval::ApprovalDecision;
 use crate::fingerprint::FileFingerprint;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -88,6 +89,14 @@ pub struct ToolResultMeta {
     /// non-`Read` tool result. See [`FileFingerprint`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_fingerprint: Option<FileFingerprint>,
+    /// Decision the user's approval gate returned for this call — the durable
+    /// record behind the transcript's "approved / always / denied" step label.
+    /// `None` for calls that never raised a prompt (covered by prior grants or
+    /// an ungated tool) and for rows persisted before the field existed. When
+    /// a call prompts more than once (mid-call `ApprovalHandle` asks), the
+    /// last decision wins, which matches the call's final status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalDecision>,
 }
 
 /// Open-tag prefix of the `<tool_output name="...">` envelope the agent wraps
@@ -498,6 +507,7 @@ mod tests {
             content: "body".into(),
             meta: Some(ToolResultMeta {
                 read_fingerprint: Some(fp),
+                approval: Some(ApprovalDecision::ApproveAlways),
             }),
         };
         let json = serde_json::to_string(&block).unwrap();

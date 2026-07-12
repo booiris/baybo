@@ -364,6 +364,7 @@ async fn session_event_to_frame(
         }
         SessionEvent::ApprovalRequested {
             call_id,
+            tool_call_id,
             session_id,
             user_id,
             tool,
@@ -372,6 +373,7 @@ async fn session_event_to_frame(
             description,
         } => Frame::ApprovalRequested {
             call_id,
+            tool_call_id,
             session_id,
             user_id,
             tool,
@@ -422,6 +424,7 @@ async fn agent_output_to_frame(
             call_id,
             status,
             summary,
+            approval,
         } => {
             let status = match status {
                 ToolStatus::Ok => "ok",
@@ -434,6 +437,7 @@ async fn agent_output_to_frame(
                 call_id,
                 status: status.to_owned(),
                 summary,
+                approval,
             }
         }
         AgentEvent::Status(status) => {

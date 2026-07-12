@@ -48,9 +48,9 @@ use baybo_channels::wire::{
 };
 use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent};
 use baybo_model::{
-    ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind, FolderId,
-    FolderSummary, LlmEntryName, MessageSource, Role, Session, SessionId, ThinkingContent,
-    TriggerSource, User,
+    ApprovalDecision, ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind,
+    FolderId, FolderSummary, LlmEntryName, MessageSource, Role, Session, SessionId,
+    ThinkingContent, TriggerSource, User,
 };
 use baybo_session::SessionError;
 use chrono::{DateTime, Utc};
@@ -453,6 +453,12 @@ pub struct ChatWorkStep {
     /// the live UI withheld — acceptable for the operator's own view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_summary: Option<String>,
+    /// Decision the call's approval prompt returned (`"approve"` /
+    /// `"approve_always"` / `"deny"`), read from the persisted
+    /// `ToolResultMeta`; `None` when the call never prompted (or the row
+    /// predates the field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
 }
 
 impl ChatWorkStep {
@@ -464,6 +470,7 @@ impl ChatWorkStep {
             tool_label: None,
             tool_status: None,
             tool_summary: None,
+            approval: None,
         }
     }
 
@@ -475,6 +482,7 @@ impl ChatWorkStep {
             tool_label: None,
             tool_status: None,
             tool_summary: None,
+            approval: None,
         }
     }
 
@@ -486,6 +494,7 @@ impl ChatWorkStep {
             tool_label: None,
             tool_status: None,
             tool_summary: None,
+            approval: None,
         }
     }
 
@@ -497,6 +506,7 @@ impl ChatWorkStep {
             tool_label,
             tool_status: None,
             tool_summary: None,
+            approval: None,
         }
     }
 }
@@ -518,6 +528,7 @@ impl From<WireWorkStep> for ChatWorkStep {
                 tool_label: step.label,
                 tool_status: step.status,
                 tool_summary: step.summary,
+                approval: step.approval.map(|d| d.as_str().to_owned()),
             },
         }
     }
@@ -2570,13 +2581,24 @@ fn reconstruct_transcript_with_attachments(
                     if let ContentBlock::ToolResult {
                         tool_use_id,
                         content,
-                        ..
+                        meta,
                     } = block
                         && let Some(&idx) = work.pending_tools.get(tool_use_id)
                         && let Some(step) = work.steps.get_mut(idx)
                     {
-                        step.tool_status = Some(tool_result_status(content));
+                        let approval = meta.as_ref().and_then(|m| m.approval);
+                        // A recorded `Deny` outranks the text sniff: a tool that
+                        // prompted MID-CALL folds the refusal into its own error
+                        // message, which carries none of the sentinel wording, so
+                        // sniffing alone would reconstruct it as a plain failure
+                        // while the live view showed it denied. Rows persisted
+                        // before the field existed still fall through to the sniff.
+                        step.tool_status = Some(match approval {
+                            Some(ApprovalDecision::Deny) => "denied".to_owned(),
+                            _ => tool_result_status(content),
+                        });
                         step.tool_summary = Some(summarize_tool_result(content));
+                        step.approval = approval.map(|d| d.as_str().to_owned());
                     }
                 }
             }
@@ -3512,6 +3534,83 @@ mod tests {
         assert_eq!(work.steps.len(), 1);
         assert_eq!(work.steps[0].tool_status.as_deref(), Some("ok"));
         assert_eq!(work.steps[0].tool_summary.as_deref(), Some("ok output"));
+        assert_eq!(work.steps[0].approval, None, "no prompt, no label");
+    }
+
+    #[test]
+    fn reconstruct_reads_approval_off_tool_result_meta() {
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![
+                    tool_use("c1", "Bash", serde_json::json!({"command": "ls"})),
+                    tool_use("c2", "Bash", serde_json::json!({"command": "rm x"})),
+                ]),
+            ),
+            (
+                4,
+                ts(4),
+                ChatMessage::tool_result_with_meta(
+                    "c1".to_owned(),
+                    "ok output".to_owned(),
+                    Some(baybo_model::ToolResultMeta {
+                        read_fingerprint: None,
+                        approval: Some(baybo_tools::ApprovalDecision::ApproveAlways),
+                    }),
+                ),
+            ),
+            // A denied row persisted BEFORE the meta field existed: the
+            // status sniff still fires, the approval label stays absent.
+            (
+                5,
+                ts(5),
+                ChatMessage::tool_result(
+                    "c2".to_owned(),
+                    "The user explicitly denied permission for tool 'Bash'.".to_owned(),
+                ),
+            ),
+        ];
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
+        let work = &items[1];
+        assert_eq!(work.steps.len(), 2);
+        assert_eq!(work.steps[0].tool_status.as_deref(), Some("ok"));
+        assert_eq!(work.steps[0].approval.as_deref(), Some("approve_always"));
+        assert_eq!(work.steps[1].tool_status.as_deref(), Some("denied"));
+        assert_eq!(work.steps[1].approval, None);
+    }
+
+    #[test]
+    fn a_recorded_denial_outranks_the_text_sniff() {
+        // A tool that prompted MID-CALL folds the refusal into its own error
+        // message, which carries none of the sentinel wording — so the sniff
+        // alone reconstructs it as a plain failure while the live view showed
+        // it denied. The recorded decision settles it.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![tool_use("c1", "Skill", serde_json::json!({}))]),
+            ),
+            (
+                4,
+                ts(4),
+                ChatMessage::tool_result_with_meta(
+                    "c1".to_owned(),
+                    "Error: skill 'x' requires env-var approval".to_owned(),
+                    Some(baybo_model::ToolResultMeta {
+                        read_fingerprint: None,
+                        approval: Some(ApprovalDecision::Deny),
+                    }),
+                ),
+            ),
+        ];
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
+        let work = &items[1];
+        assert_eq!(work.steps[0].tool_status.as_deref(), Some("denied"));
+        assert_eq!(work.steps[0].approval.as_deref(), Some("deny"));
     }
 
     #[test]

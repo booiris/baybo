@@ -312,6 +312,7 @@ fn map_frame(
         }
         Frame::ApprovalRequested {
             call_id,
+            tool_call_id,
             session_id,
             user_id,
             tool,
@@ -331,6 +332,7 @@ fn map_frame(
             debug!(call_id, tool, "approval added from gateway");
             queue.enqueue_mirror(ApprovalRequest {
                 call_id,
+                tool_call_id,
                 session_id,
                 user_id,
                 tool,
@@ -380,6 +382,7 @@ fn map_frame(
                 queue.drop_call(&card.call_id);
                 queue.enqueue_mirror(ApprovalRequest {
                     call_id: card.call_id,
+                    tool_call_id: card.tool_call_id,
                     session_id: session_id.clone(),
                     user_id: card.user_id,
                     tool: card.tool,
@@ -569,6 +572,7 @@ mod tests {
                 call_id: "c1".into(),
                 status: "ok".into(),
                 summary: "200 lines".into(),
+                approval: None,
             },
             &target,
             &queue,

@@ -619,7 +619,7 @@ async fn tool_call_emits_started_and_completed_progress() {
     assert!(
         outs.iter().any(|o| matches!(
             &o.event,
-            AgentEvent::ToolCompleted { call_id, status, summary }
+            AgentEvent::ToolCompleted { call_id, status, summary, .. }
                 if call_id == "call-1" && *status == ToolStatus::Ok && summary == "3 lines"
         )),
         "expected a ToolCompleted(Ok, \"3 lines\") for the echo_tool call, got {outs:?}"

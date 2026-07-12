@@ -51,6 +51,7 @@ import {
   type PersistedState,
   type Row,
   type TranscriptRowItem,
+  type WireApprovalCard,
   type WireAttachment,
   type WireFrame,
   type WireWorkStepFrame,
@@ -70,6 +71,7 @@ function wireStepToWork(s: WireWorkStepFrame): WorkStep {
       label: s.label || s.tool || "",
       status: s.status ?? "running",
       summary: s.summary || undefined,
+      approval: s.approval || undefined,
     };
   }
   return { kind: s.kind, text: s.text ?? "" };
@@ -87,6 +89,7 @@ function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number]): Wor
       label: s.tool_label || s.tool || "",
       status: s.tool_status ?? "ok",
       summary: s.tool_summary || undefined,
+      approval: s.approval || undefined,
     };
   }
   return { kind: s.kind, text: s.text ?? "" };
@@ -328,11 +331,26 @@ function sameTurnWorkIndex(rows: Row[], ord: number): number {
 /// / sync re-anchors it to the server's true turn start. A block that persisted
 /// already-closed stays closed. Empty blocks have nothing to show; unknown
 /// future roles are dropped. Also folds back a turn a mirror split in two.
+function clearAwaitingApproval(step: WorkStep): WorkStep {
+  return step.kind === "tool" && step.awaitingApproval
+    ? { ...step, awaitingApproval: undefined }
+    : step;
+}
+
 function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
   const out: Row[] = [];
-  for (const r of rows ?? []) {
+  for (let r of rows ?? []) {
     if (r.role === "work") {
       if (!Array.isArray(r.steps) || r.steps.length === 0) continue;
+      // A prompt that was still up when we persisted is NOT still up now: it
+      // was answered, cancelled, or (after 5 minutes) denied by the gate itself
+      // while the app was closed — and none of those signals is redeliverable
+      // (`approval_resolved` isn't even broadcast for a timeout, and the
+      // clearing `tool_completed` is a live-only frame). The pending set is
+      // re-derived from the authoritative `subscribe_state.pending_approvals` on
+      // the next subscribe, so drop the badge rather than let it strand as a
+      // permanent "waiting for approval" on a step nothing can ever clear.
+      r = { ...r, steps: r.steps.map(clearAwaitingApproval) };
       // Heal a mirror split by the (now-fixed) re-entry bug: two work blocks
       // directly adjacent (NO message row between) are ONE turn torn apart — a
       // healthy turn always has a message between its block and the next, so
@@ -1833,6 +1851,49 @@ export function Transcript({
     [withOpenWork],
   );
 
+  // Rewrite the tail work block's tool steps IN PLACE. Unlike `withOpenWork`
+  // this never OPENS a block: an approval frame is not a work frame, and
+  // `approval_resolved` is broadcast connection-wide (it carries no session), so
+  // a session with no block open would otherwise sprout an empty "Working" card
+  // every time some other conversation answered a prompt.
+  const rewriteToolSteps = useCallback((mutate: (step: WorkStep) => WorkStep) => {
+    setMessages((rows) => {
+      const last = rows[rows.length - 1];
+      if (!last || last.role !== "work") return rows;
+      const steps = last.steps.map((s) => (s.kind === "tool" ? mutate(s) : s));
+      return [...rows.slice(0, -1), { ...last, steps }];
+    });
+  }, []);
+
+  // A prompt opened on `toolCallId`: badge that step as waiting. Keyed by the
+  // TOOL call's id (`tool_call_id`), which is what the step carries — the
+  // prompt's own `call_id` is a fresh id per prompt and is only stashed so the
+  // matching `approval_resolved` can find the step again.
+  const markStepAwaitingApproval = useCallback(
+    (toolCallId: string, promptId: string) => {
+      rewriteToolSteps((s) =>
+        s.kind === "tool" && s.callId === toolCallId ? { ...s, awaitingApproval: promptId } : s,
+      );
+    },
+    [rewriteToolSteps],
+  );
+
+  // A prompt was answered: clear the waiting badge and label the step with the
+  // decision. Matched by PROMPT id, because that is all `approval_resolved`
+  // carries. The label is provisional until the call completes and the server's
+  // own `approval` lands on it — identical value, but that one is the persisted
+  // twin that survives a reload.
+  const resolveStepApproval = useCallback(
+    (promptId: string, decision: string) => {
+      rewriteToolSteps((s) =>
+        s.kind === "tool" && s.awaitingApproval === promptId
+          ? { ...s, awaitingApproval: undefined, approval: decision }
+          : s,
+      );
+    },
+    [rewriteToolSteps],
+  );
+
   // Answer text followed by more work was intermediate: settle it into the
   // block as a prose step so reasoning and answer interleave cleanly (the web
   // chat's flush-and-fold on any non-delta work frame).
@@ -1879,7 +1940,11 @@ export function Transcript({
   // judged by turn identity (`startedMs` already seen END), never by cursor
   // arithmetic; a stale bundle leaves the transcript untouched.
   const applySubscribeState = useCallback(
-    (turn: { active: boolean; started_at?: string }, wireSteps: WireWorkStepFrame[]) => {
+    (
+      turn: { active: boolean; started_at?: string },
+      wireSteps: WireWorkStepFrame[],
+      pendingApprovals: WireApprovalCard[],
+    ) => {
       const startedMs = turn.started_at ? Date.parse(turn.started_at) : null;
       if (startedMs !== null && endedTurnStarts.current.includes(startedMs)) return;
       if (!turn.active) {
@@ -1890,7 +1955,20 @@ export function Transcript({
         return;
       }
       setTurnActive(true);
-      const steps = wireSteps.map(wireStepToWork);
+      // The bundle REPLACES the block's steps, so the awaiting badge has to be
+      // re-derived here too — the `approval_requested` frame that set it may
+      // predate this connection (the prompt outlived a reconnect), and the
+      // rebuilt steps carry no memory of it.
+      const awaitingByCall = new Map(
+        pendingApprovals
+          .filter((c) => c.tool_call_id)
+          .map((c) => [c.tool_call_id as string, c.call_id]),
+      );
+      const steps = wireSteps.map(wireStepToWork).map((s) =>
+        s.kind === "tool" && awaitingByCall.has(s.callId)
+          ? { ...s, awaitingApproval: awaitingByCall.get(s.callId) }
+          : s,
+      );
       const tail = steps[steps.length - 1];
       const tailProse = tail?.kind === "prose";
       const workSteps = tailProse ? steps.slice(0, -1) : steps;
@@ -2296,7 +2374,16 @@ export function Transcript({
           for (let i = steps.length - 1; i >= 0; i -= 1) {
             const s = steps[i];
             if (s.kind === "tool" && s.callId === frame.call_id && s.status === "running") {
-              steps[i] = { ...s, status: frame.status, summary: frame.summary || undefined };
+              steps[i] = {
+                ...s,
+                status: frame.status,
+                summary: frame.summary || undefined,
+                // The call is done, so nothing is waiting on the user any more —
+                // even when the gate TIMED OUT (no `approval_resolved` is
+                // broadcast for that; the completion is the only signal).
+                awaitingApproval: undefined,
+                approval: frame.approval || s.approval,
+              };
               return { ...w, steps };
             }
           }
@@ -2307,9 +2394,22 @@ export function Transcript({
             callId: frame.call_id,
             label: frame.summary || frame.call_id,
             status: frame.status,
+            approval: frame.approval || undefined,
           });
           return { ...w, steps };
         });
+        break;
+      case "approval_requested":
+        // A tool call is blocked on the user. The prompt itself is NATIVE (the
+        // composer's card); the transcript only badges the step that is waiting,
+        // so the user can see WHICH call the card is asking about.
+        if (frame.tool_call_id) markStepAwaitingApproval(frame.tool_call_id, frame.call_id);
+        break;
+      case "approval_resolved":
+        // Answered (here, or on another client). The decision lands on the step
+        // right away rather than waiting for the call to finish — an approved
+        // call keeps running, sometimes for minutes.
+        resolveStepApproval(frame.call_id, frame.decision);
         break;
       case "turn_state":
         setTurnActive(frame.active);
@@ -2329,8 +2429,11 @@ export function Transcript({
         }
         break;
       case "subscribe_state":
-        // The one atomic state-plane bundle. iOS surfaces only the turn/work
-        // halves (no approvals/tasks UI); staleness is judged by turn identity.
+        // The one atomic state-plane bundle. iOS renders the turn/work halves
+        // here and the approval half natively (the composer card); the
+        // transcript takes only each pending prompt's `tool_call_id`, to restore
+        // the awaiting badge on the step it blocks. Staleness is judged by turn
+        // identity.
         if (frame.turn.active && frame.turn.started_at) {
           activeTurnStart.current = Date.parse(frame.turn.started_at);
         }
@@ -2342,7 +2445,7 @@ export function Transcript({
         // real turn is reflected by applySubscribeState rebuilding the work block
         // / streaming reply; a genuinely idle window self-expires (see the
         // `awaitingReply` timeout) and is cleared by the turn's terminal frame.
-        applySubscribeState(frame.turn, frame.work_steps ?? []);
+        applySubscribeState(frame.turn, frame.work_steps ?? [], frame.pending_approvals ?? []);
         break;
       case "gap":
         // Server-declared loss on this connection — run the one forward-recovery
@@ -2409,7 +2512,7 @@ export function Transcript({
         break;
       }
       default:
-        break; // task_list / approvals / ping etc. not surfaced in the transcript
+        break; // task_list / ping etc. not surfaced in the transcript
     }
   };
 

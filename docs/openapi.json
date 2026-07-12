@@ -4085,6 +4085,13 @@
           "kind"
         ],
         "properties": {
+          "approval": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Decision the call's approval prompt returned (`\"approve\"` /\n`\"approve_always\"` / `\"deny\"`), read from the persisted\n`ToolResultMeta`; `None` when the call never prompted (or the row\npredates the field)."
+          },
           "kind": {
             "$ref": "#/components/schemas/WorkStepKind"
           },

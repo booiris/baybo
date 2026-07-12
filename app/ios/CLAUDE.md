@@ -208,7 +208,10 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   `ready/sync/persist/fetchHistory/requestBlob/queryFileState/downloadFile/previewFile/shareFile/viewImage/audioToggle/audioSeek/queryAudioState/playVideo/requestVideoPoster/openUrl/copy/log/jumpVisible/runState`.
   (`copy` is a user-bubble long-press: native writes `UIPasteboard` + fires a
   haptic, because a `file://` WKWebView rejects `navigator.clipboard` outside a
-  live gesture.) `runState` mirrors whether a
+  live gesture.) Tool approvals deliberately add NO bridge message in either
+  direction: the card is native and reads the frame stream directly, and the
+  transcript's own badges come off frames it already receives (see "Tool
+  approvals" below). `runState` mirrors whether a
   turn is in flight to `ChatStore.agentRunning`, which flips the composer's send
   button to a stop control; a tap sends `/stop` as an ordinary `chatSend` (the
   agent Router cancels the turn out-of-band; the channel-echoed `/stop` user
@@ -480,7 +483,15 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   `-baybo-demo-keyboard` raises the keyboard 2s in and drops
   it at 5s (record with `simctl io recordVideo`, extract frames with ffmpeg);
   the software keyboard only appears with Simulator.app running and hardware
-  keyboard disconnected. `-baybo-demo-switch` (DEBUG) opens session `demo-a`
+  keyboard disconnected. `-baybo-demo-approval` (DEBUG, with `-baybo-open-chat`) runs a turn that blocks
+  on the approval gate — two parallel `Bash` calls, so the card's queue counter
+  renders — through the REAL frame path (`pushFrame`), so the native observer and
+  the web reducer under test are the production ones; only the leg is faked
+  (`resolveDemoApprovalIfRequested` answers in-process by pushing exactly the
+  frames the gateway would, since there is no binding to call
+  `chatResolveApproval` on). Screenshot at ~4s for the card + both steps'
+  "waiting for approval", then tap Approve/Deny for the verdict labels.
+  `-baybo-demo-switch` (DEBUG) opens session `demo-a`
   with a session-tagged turn, then switches `chatPath` to `demo-b` at 5s —
   exercising the single reused webview's cross-session remount so a content
   leak is screenshot-verifiable (each thread must show ONLY its own tag; the
@@ -493,6 +504,47 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
 - **Send path**: native mints the msgId, seeds the webview's optimistic bubble
   + echo-dedup FIRST, enrols the persisted outbox entry, then enqueues on the
   leg (see "Send outbox" below).
+- **Tool approvals** (`App/Core/ChatApprovals.swift` + `ChatStore.approvalObserveFrame`
+  / `Screens/ApprovalCardView.swift`): a tool call whose declared resources
+  aren't already granted blocks on the gateway's approval gate, which fans out
+  `approval_requested` and **denies itself after 5 minutes** if nobody answers.
+  The card is **NATIVE**, mounted inside the composer dock above the pill (so it
+  rides the keyboard and inflates the web bottom inset), and the pending set is
+  derived **natively in `pushFrame`** — NOT mirrored from the webview: frames
+  buffered offscreen can overflow and be dropped, and the sync loop restores
+  rows but not pending prompts, so a web-held queue could lose the only way to
+  answer a gate that is about to deny. Four inputs, one per way a prompt
+  appears or goes away: `approval_requested` (deduped — the gate's waker
+  re-fires on the newest queue entry), `approval_resolved` (broadcast to EVERY
+  session's sink, so it is matched by prompt id, never by session),
+  `subscribe_state.pending_approvals` (the authoritative set, REPLACES the
+  queue), and `tool_completed` (a **timed-out** gate broadcasts NO resolution —
+  the completion is the only signal that retires the card). Answering dismisses
+  optimistically and echoes `Frame::ResolveApproval` over the new FFI
+  `chat_resolve_approval` (leg-generic; both legs share the outbound pump); a
+  leg that can't carry it raises a notice, because the decision is then lost and
+  the gate will deny on its own.
+  **Two ids, don't confuse them**: a prompt's `call_id` is minted per prompt
+  (one call can prompt more than once via the mid-call `ApprovalHandle`) and is
+  what a resolve answers with; `tool_call_id` is the BLOCKED TOOL CALL — the id
+  `tool_started`/`tool_completed` carry — and is what the work block badges.
+  **The card offers exactly two answers — approve and deny.** The gate also
+  accepts an `approve_always` (a standing, session-wide grant covering every
+  resource the call touches) and the web chat / TUI both offer it, but the
+  phone deliberately does not: a mis-tap is likeliest here, and a standing
+  grant is the one decision the user can't walk back by paying more attention
+  next time. The FFI enum (`api::ApprovalDecision`) omits the variant outright,
+  so the app cannot send it even by accident — but a verdict given on ANOTHER
+  client still arrives and renders (see the label below). Don't "restore" the
+  third button without re-deciding this.
+  The transcript shows the process, never the prompt: the blocked step reads
+  "waiting for approval" (glyph BREATHES rather than pulses — nothing is
+  executing), and after the decision it carries a permanent
+  approved / always-approved / denied label. That label is **durable**:
+  `ToolResultMeta::approval` persists it on the tool result, so a reload
+  re-labels the same step (`ChatWorkStep.approval` on REST rows,
+  `WireWorkStep.approval` in the `subscribe_state` snapshot). A `deny` also
+  still reads red via the existing `denied` tool status.
 - **Liquid Glass (iOS 26)**: the bottom tab bar is the NATIVE `TabView` Liquid
   Glass bar — its selection-capsule morph (the glass that slides + stretches
   between tabs) is the SYSTEM's, and getting that authentic morph is exactly why

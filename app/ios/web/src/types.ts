@@ -56,6 +56,9 @@ export type WireWorkStepFrame = {
   label?: string;
   status?: string;
   summary?: string;
+  /// The decision the call's approval prompt returned, once it completed within
+  /// the buffered turn — the durable twin of the live `tool_completed.approval`.
+  approval?: string;
 };
 
 /// One reconstructed step inside a REST `work` transcript row — the gateway's
@@ -70,6 +73,10 @@ export type RestWorkStep = {
   tool_label?: string;
   tool_status?: string;
   tool_summary?: string;
+  /// `"approve"` / `"approve_always"` / `"deny"` — persisted on the tool result
+  /// (`ToolResultMeta::approval`), so a reload still labels the step the user
+  /// judged. Absent when the call never prompted.
+  approval?: string;
 };
 
 /// One full-fidelity transcript row — the gateway's `ChatTranscriptItem` DTO,
@@ -94,6 +101,17 @@ export type TranscriptRowItem = {
   notice_level?: string;
 };
 
+/// One pending approval prompt inside a `subscribe_state` bundle — the wire
+/// mirror of the Rust `wire::ApprovalCard`. The transcript uses only
+/// `tool_call_id` (which work step is waiting); the rest drives the native card.
+export type WireApprovalCard = {
+  call_id: string;
+  tool_call_id?: string;
+  tool: string;
+  params_preview: string;
+  description?: string;
+};
+
 /// A decrypted wire `Frame`, arriving as JSON text via `window.baybo.pushFrame`.
 /// MessagePack field names round-trip as snake_case JSON; we only model the few
 /// variants the transcript renders and tolerate the rest.
@@ -104,7 +122,28 @@ export type WireFrame =
   // turn's work block instead of the reply body.
   | { kind: "reasoning"; text: string }
   | { kind: "tool_started"; call_id: string; tool: string; label?: string | null }
-  | { kind: "tool_completed"; call_id: string; status: string; summary: string }
+  | {
+      kind: "tool_completed";
+      call_id: string;
+      status: string;
+      summary: string;
+      // The decision the call's approval prompt returned; absent when it never
+      // prompted. Persisted server-side, so a reload re-labels the same step.
+      approval?: string;
+    }
+  // A tool call is blocked on this user's decision. `call_id` is the PROMPT's id
+  // (what a resolve answers with); `tool_call_id` is the blocked TOOL call — the
+  // work step to badge. The card itself is NATIVE (see ChatStore.pendingApprovals);
+  // the transcript only marks the step as waiting.
+  | {
+      kind: "approval_requested";
+      call_id: string;
+      tool_call_id?: string;
+      tool: string;
+    }
+  // Someone answered (this device, or another client). Broadcast to every
+  // session's sink, so it is matched by prompt id, never by session.
+  | { kind: "approval_resolved"; call_id: string; decision: string }
   // `started_at` is present iff `active` — it is the turn's identity for the
   // SubscribeState staleness test and for re-opening a restored work block.
   | { kind: "turn_state"; active: boolean; started_at?: string }
@@ -121,7 +160,10 @@ export type WireFrame =
       as_of_ordinal?: number;
       turn: { active: boolean; started_at?: string };
       work_steps?: WireWorkStepFrame[];
-      pending_approvals?: unknown[];
+      // The authoritative pending set on (re)subscribe. The native card renders
+      // them; the transcript reads only `tool_call_id`, to restore the awaiting
+      // badge on a work step whose prompt outlived a reconnect.
+      pending_approvals?: WireApprovalCard[];
       tasks?: unknown[];
     }
   // The server dropped frames it owed this connection — run sync. (`session_id`
@@ -191,7 +233,20 @@ export type WorkStep =
   // `level`) instead of severing the block into two cards. A notice with no open
   // block still renders as its own centered `role:"notice"` row.
   | { kind: "notice"; level: string; text: string }
-  | { kind: "tool"; callId: string; label: string; status: string; summary?: string };
+  | {
+      kind: "tool";
+      callId: string;
+      label: string;
+      status: string;
+      summary?: string;
+      /// Prompt id, set while this call is blocked on the user's decision — the
+      /// step renders "waiting for approval" and clears when the matching
+      /// `approval_resolved` (or the call's completion) lands.
+      awaitingApproval?: string;
+      /// `"approve"` / `"approve_always"` / `"deny"` once the user judged it.
+      /// Survives reload (persisted on the tool result).
+      approval?: string;
+    };
 
 /// A turn's collapsible work block, kept as its own transcript row (the web
 /// chat's model: the final answer renders BELOW the block, never inside it).

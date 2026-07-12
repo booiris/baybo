@@ -62,12 +62,14 @@ pub(crate) fn in_flight_wire_steps(events: Vec<SessionEvent>) -> Vec<WireWorkSte
                 call_id,
                 status,
                 summary,
+                approval,
             } => {
                 if let Some(&idx) = pending_tools.get(&call_id)
                     && let Some(step) = steps.get_mut(idx)
                 {
                     step.status = Some(tool_status_str(status).to_owned());
                     step.summary = Some(summary);
+                    step.approval = approval;
                 }
             }
             _ => {}
@@ -105,6 +107,7 @@ mod tests {
                 call_id: "c1".into(),
                 status: ToolStatus::Ok,
                 summary: "exit 0".into(),
+                approval: Some(baybo_tools::ApprovalDecision::Approve),
             }),
             ev(AgentEvent::AnswerDelta("the answer".into())),
         ]);
@@ -122,6 +125,11 @@ mod tests {
         assert_eq!(steps[1].label.as_deref(), Some("ls"));
         assert_eq!(steps[1].status.as_deref(), Some("ok"));
         assert_eq!(steps[1].summary.as_deref(), Some("exit 0"));
+        assert_eq!(
+            steps[1].approval,
+            Some(baybo_tools::ApprovalDecision::Approve),
+            "prompted decision rides the snapshot step"
+        );
         assert_eq!(steps[2].kind, WireWorkStepKind::Prose);
         assert_eq!(steps[2].text, "the answer");
     }
@@ -154,6 +162,7 @@ mod tests {
                 call_id: "ghost".into(),
                 status: ToolStatus::Error,
                 summary: "boom".into(),
+                approval: None,
             }),
             // Blank reasoning is skipped.
             ev(AgentEvent::Reasoning("   ".into())),

@@ -256,6 +256,7 @@ impl Channel {
     pub fn dispatch_approval_requested(
         &self,
         call_id: String,
+        tool_call_id: Option<String>,
         session_id: SessionId,
         user_id: String,
         tool: String,
@@ -265,6 +266,7 @@ impl Channel {
     ) {
         self.dispatch_event(SessionEvent::ApprovalRequested {
             call_id,
+            tool_call_id,
             session_id,
             user_id,
             tool,

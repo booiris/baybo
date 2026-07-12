@@ -1220,6 +1220,13 @@ export interface components {
          *     carries the call's name + a re-derived result summary.
          */
         ChatWorkStep: {
+            /**
+             * @description Decision the call's approval prompt returned (`"approve"` /
+             *     `"approve_always"` / `"deny"`), read from the persisted
+             *     `ToolResultMeta`; `None` when the call never prompted (or the row
+             *     predates the field).
+             */
+            approval?: string | null;
             kind: components["schemas"]["WorkStepKind"];
             /** @description Reasoning trace or mid-turn narration body. Empty for `tool` steps. */
             text?: string;

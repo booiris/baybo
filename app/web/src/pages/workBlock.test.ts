@@ -9,6 +9,10 @@ import {
   isStopCommand,
   isStopCancellationNotice,
   markLastWorkCancelled,
+  pushToolStartedStep,
+  applyToolCompletedStep,
+  markStepAwaitingApproval,
+  resolveStepApproval,
   type TranscriptRow,
   type WorkStep,
 } from './ChatPage';
@@ -247,5 +251,70 @@ describe('finalizeTrailingAnswer — keep the /stop reply as a bubble', () => {
     expect(out[1].role).toBe('assistant');
     expect(out[1].streaming).toBe(false);
     expect(out[1].text).toBe('a b-tree is');
+  });
+});
+
+// Pins the approval labelling of a tool step: the badge tracks the PROMPT
+// (`approval_requested` → `approval_resolved`), the verdict rides the step,
+// and a call that finishes always retires the badge — including the gate
+// timing out, which broadcasts no resolution at all.
+
+describe('work-step approval labelling', () => {
+  const withCall = (): TranscriptRow[] =>
+    pushToolStartedStep([], 'call-1', 'Bash', 'rm -rf build', true);
+
+  it('badges the step of the tool call the prompt blocks', () => {
+    const out = markStepAwaitingApproval(withCall(), 'call-1', 'prompt-9');
+    expect(out[0].steps?.[0].awaitingApproval).toBe('prompt-9');
+    expect(out[0].steps?.[0].toolStatus).toBe('running');
+  });
+
+  it('a resolution clears the badge and labels the step by PROMPT id', () => {
+    const asked = markStepAwaitingApproval(withCall(), 'call-1', 'prompt-9');
+    const out = resolveStepApproval(asked, 'prompt-9', 'approve_always');
+    expect(out[0].steps?.[0].awaitingApproval).toBeUndefined();
+    expect(out[0].steps?.[0].approval).toBe('approve_always');
+  });
+
+  it('leaves a thread untouched when the resolved prompt is another session\'s', () => {
+    // `approval_resolved` is broadcast connection-wide, so every open thread
+    // sees every decision. An unrelated one must not mint a new transcript.
+    const asked = markStepAwaitingApproval(withCall(), 'call-1', 'prompt-9');
+    expect(resolveStepApproval(asked, 'prompt-other', 'deny')).toBe(asked);
+  });
+
+  it('an unknown decision string is dropped, not rendered raw', () => {
+    const asked = markStepAwaitingApproval(withCall(), 'call-1', 'prompt-9');
+    const out = resolveStepApproval(asked, 'prompt-9', 'maybe');
+    expect(out[0].steps?.[0].approval).toBeUndefined();
+  });
+
+  it('completion carries the persisted decision and retires the badge', () => {
+    const asked = markStepAwaitingApproval(withCall(), 'call-1', 'prompt-9');
+    const out = applyToolCompletedStep(asked, 'call-1', 'ok', 'removed 1.2 GB', 'approve', true);
+    expect(out[0].steps?.[0].awaitingApproval).toBeUndefined();
+    expect(out[0].steps?.[0].approval).toBe('approve');
+    expect(out[0].steps?.[0].toolStatus).toBe('ok');
+  });
+
+  it('a timed-out gate retires the badge on the denial alone (no resolution frame)', () => {
+    const asked = markStepAwaitingApproval(withCall(), 'call-1', 'prompt-9');
+    const out = applyToolCompletedStep(asked, 'call-1', 'denied', 'denied', 'deny', true);
+    expect(out[0].steps?.[0].awaitingApproval).toBeUndefined();
+    expect(out[0].steps?.[0].toolStatus).toBe('denied');
+    expect(out[0].steps?.[0].approval).toBe('deny');
+  });
+
+  it('a completion without a decision keeps the one the resolution already set', () => {
+    const asked = markStepAwaitingApproval(withCall(), 'call-1', 'prompt-9');
+    const resolved = resolveStepApproval(asked, 'prompt-9', 'approve');
+    const out = applyToolCompletedStep(resolved, 'call-1', 'ok', 'ok', undefined, true);
+    expect(out[0].steps?.[0].approval).toBe('approve');
+  });
+
+  it('an ungated call carries no label at all', () => {
+    const out = applyToolCompletedStep(withCall(), 'call-1', 'ok', '3 files', undefined, true);
+    expect(out[0].steps?.[0].approval).toBeUndefined();
+    expect(out[0].steps?.[0].awaitingApproval).toBeUndefined();
   });
 });

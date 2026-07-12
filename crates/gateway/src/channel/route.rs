@@ -625,6 +625,7 @@ async fn send_subscribe_state(state: &WsChannelState, sidecar: &Sidecar, session
         .into_iter()
         .map(|req| ApprovalCard {
             call_id: req.call_id,
+            tool_call_id: req.tool_call_id,
             user_id: req.user_id,
             tool: req.tool,
             accesses: req.accesses,

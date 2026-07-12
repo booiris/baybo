@@ -21,7 +21,7 @@ export type Frame = { "kind": "register", token: string, channel_type: string, }
  * Newest persisted `session_messages.ordinal` at snapshot
  * time; `None` for a session with no rows yet.
  */
-as_of_ordinal?: bigint, turn: TurnSnapshot, work_steps?: Array<WireWorkStep>, pending_approvals?: Array<ApprovalCard>, tasks?: Array<TaskView>, } | { "kind": "gap", session_id?: string, } | { "kind": "message" } & Message | { "kind": "messages", messages: Array<Message>, } | { "kind": "answer_delta", session_id: string, user_id?: string, text: string, } | { "kind": "reasoning", session_id: string, user_id?: string, text: string, } | { "kind": "tool_started", session_id: string, user_id?: string, call_id: string, tool: string, label?: string, } | { "kind": "tool_completed", session_id: string, user_id?: string, call_id: string, status: string, summary: string, } | { "kind": "status", session_id: string, user_id?: string, phase: string, } | { "kind": "notice", session_id: string, user_id?: string, level: string, text: string, 
+as_of_ordinal?: bigint, turn: TurnSnapshot, work_steps?: Array<WireWorkStep>, pending_approvals?: Array<ApprovalCard>, tasks?: Array<TaskView>, } | { "kind": "gap", session_id?: string, } | { "kind": "message" } & Message | { "kind": "messages", messages: Array<Message>, } | { "kind": "answer_delta", session_id: string, user_id?: string, text: string, } | { "kind": "reasoning", session_id: string, user_id?: string, text: string, } | { "kind": "tool_started", session_id: string, user_id?: string, call_id: string, tool: string, label?: string, } | { "kind": "tool_completed", session_id: string, user_id?: string, call_id: string, status: string, summary: string, approval?: string, } | { "kind": "status", session_id: string, user_id?: string, phase: string, } | { "kind": "notice", session_id: string, user_id?: string, level: string, text: string, 
 /**
  * `true` for a *transient* mid-turn progress update (the progress
  * observer) rather than a terminal notice. Clients that render a
@@ -34,7 +34,14 @@ transient?: boolean, } | { "kind": "task_list", session_id: string, user_id?: st
 /**
  * `Some` iff `active`.
  */
-started_at?: string, } | { "kind": "approval_requested", call_id: string, session_id: string, user_id?: string, tool: string, accesses: Array<ResourceAccess>, params_preview: string, 
+started_at?: string, } | { "kind": "approval_requested", call_id: string, 
+/**
+ * `call_id` of the TOOL call this prompt blocks (the id
+ * `ToolStarted`/`ToolCompleted` carry — NOT this frame's own
+ * `call_id`, which is minted per prompt). Lets clients badge
+ * the exact work step that is waiting.
+ */
+tool_call_id?: string, session_id: string, user_id?: string, tool: string, accesses: Array<ResourceAccess>, params_preview: string, 
 /**
  * Optional human-readable label the tool produced via
  * `Tool::call_label` (e.g. Bash's `description` parameter).

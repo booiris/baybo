@@ -461,6 +461,83 @@
             }
         }
 
+        /// `-baybo-demo-approval`: a turn that blocks on the approval gate, so the
+        /// native card AND the work block's awaiting/result labels are verifiable
+        /// with no gateway. Frames ride the real `pushFrame` path, so the native
+        /// observer and the web reducer are the production ones; only the leg is
+        /// fake — `resolveDemoApprovalIfRequested` answers the card in-process
+        /// (there is no `chatResolveApproval` to call without a binding) by
+        /// pushing exactly the frames the gateway would: `approval_resolved`, then
+        /// the tool's completion carrying the decision.
+        ///
+        /// Two prompts open at once (a parallel tool pair) so the queue counter
+        /// renders; the second is left for the tester to answer.
+        func startDemoApprovalIfRequested() {
+            guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-approval") else { return }
+            NSLog("baybo: demo approval starting")
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(500))
+                pushDemoUserSent(msgId: "demo-appr-u1", text: "Clean up the build artifacts")
+                pushDemo(["kind": "turn_state", "active": true])
+                try? await Task.sleep(for: .milliseconds(600))
+                pushDemo(["kind": "reasoning", "text": "That deletes files — I'll ask first."])
+                try? await Task.sleep(for: .milliseconds(400))
+
+                for (call, label, command) in [
+                    ("demo-call-1", "rm -rf target/debug", "rm -rf target/debug"),
+                    ("demo-call-2", "rm -rf build/", "rm -rf build/"),
+                ] {
+                    pushDemo([
+                        "kind": "tool_started", "call_id": call, "tool": "Bash", "label": label,
+                    ])
+                    pushDemo([
+                        "kind": "approval_requested",
+                        "call_id": "demo-prompt-\(call)",
+                        "tool_call_id": call,
+                        "session_id": sessionId,
+                        "tool": "Bash",
+                        "accesses": [["kind": "exec_command", "command": command]],
+                        "params_preview": "{\"command\": \"\(command)\"}",
+                        "description": "Delete stale build output",
+                    ])
+                    try? await Task.sleep(for: .milliseconds(300))
+                }
+            }
+        }
+
+        /// Answer a demo approval locally: no binding exists, so the FFI call
+        /// would fail. Pushes the frames the gateway would have — the resolution
+        /// broadcast, then the blocked call's completion carrying the decision
+        /// (a deny surfaces as `status: denied`, exactly as the executor's
+        /// `ToolError::Denied` does).
+        func resolveDemoApprovalIfRequested(
+            _ approval: PendingApproval, decision: ApprovalDecision
+        ) -> Bool {
+            guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-approval"),
+                approval.callId.hasPrefix("demo-prompt-"),
+                let toolCallId = approval.toolCallId
+            else { return false }
+            let decisionText =
+                switch decision {
+                case .approve: "approve"
+                case .deny: "deny"
+                }
+            Task { @MainActor in
+                pushDemo([
+                    "kind": "approval_resolved", "call_id": approval.callId,
+                    "decision": decisionText,
+                ])
+                try? await Task.sleep(for: .milliseconds(decision == .deny ? 300 : 1400))
+                pushDemo([
+                    "kind": "tool_completed", "call_id": toolCallId,
+                    "status": decision == .deny ? "denied" : "ok",
+                    "summary": decision == .deny ? "denied" : "removed 1.2 GB",
+                    "approval": decisionText,
+                ])
+            }
+            return true
+        }
+
         func startDemoSwitchIfRequested() {
             guard ProcessInfo.processInfo.arguments.contains("-baybo-demo-switch") else { return }
             guard Self.demoSwitchSeeded.insert(sessionId).inserted else { return }

@@ -114,10 +114,14 @@ pub enum AgentEvent {
     },
     /// A tool call finished. `summary` is a short, presentation-only
     /// rendering of the result ("Read 200 lines", "exit 0", "Error: …").
+    /// `approval` is the decision the call's approval prompt returned
+    /// (`None` when it never prompted) so clients can label the step —
+    /// the same value persisted in `ToolResultMeta::approval`.
     ToolCompleted {
         call_id: String,
         status: ToolStatus,
         summary: String,
+        approval: Option<ApprovalDecision>,
     },
     /// Coarse turn-phase transition for a transient status line (today:
     /// context compaction start/end). Channels show a spinner/banner and
@@ -240,6 +244,10 @@ pub enum SessionEvent {
     /// prompt elsewhere.
     ApprovalRequested {
         call_id: String,
+        /// `call_id` of the TOOL call the prompt blocks (the id
+        /// `ToolStarted`/`ToolCompleted` carry) — see
+        /// [`baybo_tools::ApprovalRequest::tool_call_id`].
+        tool_call_id: Option<String>,
         session_id: SessionId,
         user_id: String,
         tool: String,

@@ -35,6 +35,8 @@ type MirroredKind =
   | "tool_completed"
   | "turn_state"
   | "subscribe_state"
+  | "approval_requested"
+  | "approval_resolved"
   | "gap"
   | "notice";
 
