@@ -21,6 +21,13 @@ struct ApprovalCardView: View {
     /// Answering is one-shot: the card is dismissed optimistically, but a
     /// double-tap inside the same frame would fire twice.
     @State private var decided = false
+    /// Natural height of the detail body, measured to decide whether it needs to
+    /// become a scroller.
+    @State private var detailHeight: CGFloat = 0
+
+    /// Ceiling on the detail box (~9 lines of the 12pt mono). Past this the body
+    /// scrolls: the card must stay a prompt over the composer, not a page.
+    private static let maxDetailHeight: CGFloat = 140
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -42,25 +49,7 @@ struct ApprovalCardView: View {
                     .foregroundStyle(Theme.inkSoft)
             }
 
-            if !approval.accesses.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(approval.accesses, id: \.self) { access in
-                        Text(verbatim: access)
-                            .font(Theme.mono(12))
-                            .foregroundStyle(Theme.ink)
-                            .lineLimit(3)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-            } else if !approval.paramsPreview.isEmpty {
-                // No declared resource (a tool whose accesses didn't map) — the
-                // parameter preview is then the only thing the user can judge on.
-                Text(verbatim: approval.paramsPreview)
-                    .font(Theme.mono(12))
-                    .foregroundStyle(Theme.inkSoft)
-                    .lineLimit(3)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            detail
 
             // Two answers only. The gate also accepts an "approve always" —
             // a session-wide grant for every resource the call touches — and
@@ -93,6 +82,64 @@ struct ApprovalCardView: View {
         )
         .padding(.horizontal, 18)
         .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
+    /// What the call actually wants to do — the ONE thing the user judges on.
+    ///
+    /// Never truncated. `ResourceAccess::ExecCommand` carries the raw command in
+    /// full, and a shell line's tail is exactly where the teeth are
+    /// (`… && docker system prune -af --volumes`): a clipped view reads as a
+    /// harmless cleanup while the destructive half sits past the ellipsis. So a
+    /// long body SCROLLS inside a bounded box instead — every character
+    /// reachable, and the card still can't grow tall enough to push the
+    /// transcript off the screen. Short bodies size naturally; only an
+    /// overflowing one turns into a scroller (and wears the fade that says so).
+    @ViewBuilder private var detail: some View {
+        let overflows = detailHeight > Self.maxDetailHeight
+        Group {
+            if overflows {
+                ScrollView { detailBody }
+                    .frame(height: Self.maxDetailHeight)
+                    // Bottom fade — the same "there is more past this edge" cue
+                    // the header and composer veils use. The scroll indicator
+                    // only shows up mid-gesture, which is too late to be told
+                    // there was more to read.
+                    .overlay(alignment: .bottom) {
+                        LinearGradient(
+                            colors: [Theme.paper.opacity(0), Theme.paper],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                        .frame(height: 20)
+                        .allowsHitTesting(false)
+                    }
+            } else {
+                detailBody
+            }
+        }
+    }
+
+    private var detailBody: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(approval.accesses, id: \.self) { access in
+                Text(verbatim: access)
+                    .font(Theme.mono(12))
+                    .foregroundStyle(Theme.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // Shown ALONGSIDE the accesses, not only when they're missing: a
+            // tool's declared resources can be coarser than its parameters (a
+            // fetch declares a host, but the URL and body live here), and the
+            // user would be judging the coarse version.
+            if !approval.paramsPreview.isEmpty {
+                Text(verbatim: approval.paramsPreview)
+                    .font(Theme.mono(11))
+                    .foregroundStyle(Theme.inkSoft)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { detailHeight = $0 }
     }
 
     private func decide(_ decision: ApprovalDecision) {
