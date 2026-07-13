@@ -251,6 +251,11 @@ impl LibsqlPool {
                     -- reconnect/history replay to reconcile optimistic user
                     -- bubbles; empty for rows without a client-supplied id.
                     platform_msg_id TEXT NOT NULL DEFAULT '',
+                    -- Durable idempotency key for a source event that may be
+                    -- replayed after a crash (for example a cron execution or
+                    -- a background-notification batch operation). NULL for
+                    -- ordinary transcript rows.
+                    source_event_id TEXT,
                     PRIMARY KEY (session_id, ordinal)
                 );
                 CREATE INDEX IF NOT EXISTS idx_session_messages_active
@@ -618,6 +623,7 @@ impl LibsqlPool {
             "ALTER TABLE sessions ADD COLUMN read_cursor INTEGER",
             "ALTER TABLE cron_executions ADD COLUMN completed_at INTEGER",
             "ALTER TABLE cron_executions ADD COLUMN notified_at INTEGER",
+            "ALTER TABLE session_messages ADD COLUMN source_event_id TEXT",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {
@@ -652,6 +658,18 @@ impl LibsqlPool {
             .await
             .map_err(|e| {
                 anyhow::anyhow!("failed to create idx_cron_executions_awaiting_delivery: {e}")
+            })?;
+
+        self.conn
+            .execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_session_messages_source_event \
+                 ON session_messages(session_id, source_event_id) \
+                 WHERE source_event_id IS NOT NULL",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("failed to create idx_session_messages_source_event: {e}")
             })?;
 
         Ok(())

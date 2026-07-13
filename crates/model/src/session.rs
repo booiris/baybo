@@ -320,52 +320,15 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approved_resources: Vec<ApprovedResource>,
 
-    /// Background-job results (detached subagents and detached `Bash`
-    /// commands) that reached a terminal state while the parent actor
-    /// was between turns. Drained into a notification turn once no
-    /// higher-priority work is queued. Persisted with the session so an
-    /// actor evicted by the idle reaper still surfaces the deliveries on
-    /// hydration. See `baybo_model::spawn_protocol::PendingBackgroundResult`.
+    /// Durable state for the complete background-notification pipeline:
+    /// collecting terminal job results, waiting on grouped barriers, and
+    /// actively delivering one transcript-backed notification turn.
     ///
-    /// No `serde(alias)` for the old `pending_subagent_results`: that field
-    /// held the *old* element shape, which can't deserialize as the new type
-    /// — aliasing it would make a whole `Session` row fail to load. Without
-    /// the alias serde just ignores the old field (no `deny_unknown_fields`)
-    /// and this defaults empty, so an upgrade drops only the transient
-    /// in-flight buffer (the results also live in the child trace) rather
-    /// than breaking hydration.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_background_results: Vec<crate::spawn_protocol::PendingBackgroundResult>,
-
-    /// Barrier cohorts for grouped subagents (`spawn_subagent(group=…)`),
-    /// keyed by group name. A member's result is held in its group until
-    /// the group is complete (sealed + every member terminal) or its
-    /// timeout dissolves it, then released into `pending_background_results`
-    /// for one merged notification.
-    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub background_groups: std::collections::HashMap<String, GroupState>,
-
-    /// The delivery ledger for a subagent-notification turn whose prompt row
-    /// is already persisted in the transcript but whose proactive reply has
-    /// not been delivered yet. Opened when a drained batch's prompt row lands
-    /// in `session_messages`; cleared when the turn produces a reply (or the
-    /// attempt cap degrades delivery to passive — the prompt row is durable,
-    /// so the next real turn's model still reads it). Persisted with the
-    /// session so a reaped actor re-drives the turn on hydration, exactly
-    /// like `pending_background_results`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_notification_turn: Option<PendingNotificationTurn>,
-
-    /// `CronExecution` ids whose one-shot result this session has already
-    /// appended (see the actor's `CronResultReady` handler). The delivery
-    /// ledger's `notified_at` stamp is written *after* the append, so a crash
-    /// in that window makes the boot re-drive re-route a result that already
-    /// landed; this set is what keeps the transcript append exactly-once.
-    /// Capped (drop-oldest) — a replayed id that has aged out would at worst
-    /// duplicate one row, which is the direction this design deliberately
-    /// errs in (a duplicate beats a lost notification).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub delivered_cron_executions: Vec<String>,
+    /// Flattening deliberately preserves the existing session JSON keys so
+    /// stored rows remain readable in both directions while callers get one
+    /// cohesive state object.
+    #[serde(default, flatten)]
+    pub background_notifications: BackgroundNotificationState,
 
     /// Which backend created this subagent session, plus (for
     /// External) the agent's `workspace_dir` and `resume_key`.
@@ -400,12 +363,96 @@ pub struct SessionState {
     pub extra: HashMap<String, Value>,
 }
 
-/// Delivery ledger for one outstanding subagent-notification turn. The
-/// ledger is self-sufficient: `content` is the built prompt frozen at drain
-/// time, so a retry never point-reads the transcript — after a compaction
-/// reshuffles ordinals, the prompt is simply re-appended from here.
+/// The complete durable state of background-result notification delivery.
+///
+/// `buffered_results` and `active_delivery` are different pipeline stages,
+/// not alternatives: while one batch is waiting for a proactive delivery
+/// retry, newly finished jobs continue accumulating in the buffer for the
+/// next batch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackgroundNotificationState {
+    /// Terminal background-job results not yet committed to the transcript as
+    /// a notification prompt. The actor merges this buffer into one turn once
+    /// higher-priority mailbox work has drained.
+    ///
+    /// No alias for the older `pending_subagent_results` key: it used an
+    /// incompatible element shape. Ignoring that retired key keeps the rest of
+    /// a legacy session row hydratable.
+    #[serde(
+        default,
+        rename = "pending_background_results",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub buffered_results: Vec<crate::spawn_protocol::PendingBackgroundResult>,
+
+    /// Barrier cohorts for grouped subagents, keyed by the turn-namespaced
+    /// group key. Ready or timed-out groups release their results into
+    /// `buffered_results`.
+    #[serde(
+        default,
+        rename = "background_groups",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub groups: HashMap<String, BackgroundNotificationGroup>,
+
+    /// The one batch whose prompt is already durable in the transcript but
+    /// whose proactive reply has not yet settled. A fresh batch may remain in
+    /// `buffered_results` until this delivery succeeds or degrades to passive.
+    #[serde(
+        default,
+        rename = "pending_notification_turn",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub active_delivery: Option<BackgroundNotificationDelivery>,
+}
+
+impl BackgroundNotificationState {
+    /// Whether the actor must stay on its notification timer path.
+    pub fn has_work(&self) -> bool {
+        !self.buffered_results.is_empty()
+            || !self.groups.is_empty()
+            || self.active_delivery.is_some()
+    }
+
+    /// Whether a terminal result is already owned by any pipeline stage.
+    pub fn knows_handle(&self, handle_id: &str) -> bool {
+        self.buffered_results
+            .iter()
+            .any(|result| result.handle_id == handle_id)
+            || self.groups.values().any(|group| {
+                group
+                    .results
+                    .iter()
+                    .any(|result| result.handle_id == handle_id)
+            })
+            || self
+                .active_delivery
+                .as_ref()
+                .is_some_and(|delivery| delivery.handle_ids.iter().any(|id| id == handle_id))
+    }
+
+    /// Count one successfully dispatched member in a turn-namespaced barrier
+    /// cohort. The completion path uses the same key constructor when routing
+    /// the member back into this aggregate.
+    pub fn register_group_member(&mut self, job_id: JobId, group: &str) {
+        self.groups
+            .entry(BackgroundNotificationGroup::cohort_key(job_id, group))
+            .or_default()
+            .expected += 1;
+    }
+}
+
+/// Retry ledger for the one background-notification batch whose prompt is
+/// already in the transcript. It is self-sufficient: `content` freezes the
+/// prompt so a compaction-invalidated ordinal can be repaired without reading
+/// and reconstructing the original result batch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingNotificationTurn {
+pub struct BackgroundNotificationDelivery {
+    /// Handles owned by this delivery. Besides making the batch auditable,
+    /// they keep a re-published terminal event from entering the next buffer
+    /// while this batch is awaiting retry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handle_ids: Vec<String>,
     /// The framed notification prompt, exactly as persisted.
     pub content: Vec<crate::ContentBlock>,
     /// `session_messages` ordinal of the persisted prompt row. Dangles after
@@ -415,16 +462,16 @@ pub struct PendingNotificationTurn {
     pub prompt_ordinal: i64,
     /// Failed delivery attempts so far. At the actor's attempt cap the
     /// ledger clears and delivery degrades to passive.
-    #[serde(default)]
-    pub attempts: u32,
+    #[serde(default, rename = "attempts")]
+    pub failed_attempts: u32,
 }
 
 /// A barrier cohort of grouped subagents. Members' results accumulate in
 /// `results` until the group is complete (`sealed` and `results.len() ==
-/// expected`) or its timeout elapses, then release into
-/// `pending_background_results` as one merged notification.
+/// expected`) or its timeout elapses, then release into the notification
+/// buffer as one merged notification.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GroupState {
+pub struct BackgroundNotificationGroup {
     /// Member count the dispatching turn issued. The agent loop bumps it
     /// per grouped `spawn_subagent` call; the barrier fires when
     /// `results.len()` reaches it (and the group is sealed).
@@ -441,7 +488,7 @@ pub struct GroupState {
     pub results: Vec<crate::spawn_protocol::PendingBackgroundResult>,
 }
 
-impl GroupState {
+impl BackgroundNotificationGroup {
     /// Whether the cohort may fire: sealed, and either every member has a
     /// result (complete) or the group timeout has elapsed since sealing.
     pub fn is_ready(&self, now: chrono::DateTime<chrono::Utc>, timeout: chrono::Duration) -> bool {
@@ -456,12 +503,9 @@ impl GroupState {
         self.results.len() < self.expected
     }
 
-    /// Cohort key for [`SessionState::background_groups`]. The dispatching
-    /// turn's `job_id` namespaces the LLM-chosen group name so that reusing
-    /// the same name in a later turn starts a fresh cohort instead of
-    /// extending the prior (still-draining) one. Both the agent loop (when
-    /// counting a grouped spawn) and the spawner (when stamping the escorted
-    /// member's `group`) derive the key through here, so the two always agree.
+    /// The dispatching turn's `job_id` namespaces the LLM-chosen group name so
+    /// reuse in a later turn starts a fresh cohort instead of extending the
+    /// earlier one. Both the dispatch and completion paths derive the key here.
     pub fn cohort_key(job_id: JobId, group: &str) -> String {
         format!("{job_id}::{group}")
     }
@@ -471,8 +515,8 @@ impl GroupState {
 mod tests {
     use super::*;
 
-    fn group(expected: usize, sealed: bool, results: usize) -> GroupState {
-        GroupState {
+    fn group(expected: usize, sealed: bool, results: usize) -> BackgroundNotificationGroup {
+        BackgroundNotificationGroup {
             expected,
             sealed,
             sealed_at: sealed.then(chrono::Utc::now),
@@ -513,19 +557,41 @@ mod tests {
         let j2 = JobId::new();
         // Deterministic per (job, name): same inputs → same key.
         assert_eq!(
-            GroupState::cohort_key(j1, "g"),
-            GroupState::cohort_key(j1, "g")
+            BackgroundNotificationGroup::cohort_key(j1, "g"),
+            BackgroundNotificationGroup::cohort_key(j1, "g")
         );
         // Reusing a name in a different turn (job) yields a distinct cohort —
         // the property that stops a later turn from extending a prior cohort.
         assert_ne!(
-            GroupState::cohort_key(j1, "g"),
-            GroupState::cohort_key(j2, "g")
+            BackgroundNotificationGroup::cohort_key(j1, "g"),
+            BackgroundNotificationGroup::cohort_key(j2, "g")
         );
         // Distinct names within one turn stay distinct.
         assert_ne!(
-            GroupState::cohort_key(j1, "a"),
-            GroupState::cohort_key(j1, "b")
+            BackgroundNotificationGroup::cohort_key(j1, "a"),
+            BackgroundNotificationGroup::cohort_key(j1, "b")
+        );
+    }
+
+    #[test]
+    fn group_registration_counts_members_per_turn() {
+        let first_job = JobId::new();
+        let second_job = JobId::new();
+        let mut notifications = BackgroundNotificationState::default();
+
+        notifications.register_group_member(first_job, "research");
+        notifications.register_group_member(first_job, "research");
+        notifications.register_group_member(second_job, "research");
+
+        assert_eq!(notifications.groups.len(), 2);
+        assert_eq!(
+            notifications
+                .groups
+                .get(&BackgroundNotificationGroup::cohort_key(
+                    first_job, "research"
+                ))
+                .map(|group| group.expected),
+            Some(2)
         );
     }
 
@@ -544,9 +610,124 @@ mod tests {
         let state: SessionState =
             serde_json::from_str(old).expect("an old-shape row must still deserialize");
         assert!(
-            state.pending_background_results.is_empty(),
+            state.background_notifications.buffered_results.is_empty(),
             "the old buffer is dropped, not mis-migrated"
         );
+    }
+
+    /// The old cron delivery cache is dropped, not bridged. On the first boot
+    /// of the new binary, an execution that was delivered under the old cache
+    /// but whose ledger stamp was lost to a crash can re-deliver once (its
+    /// historical transcript row predates the `source_event_id` column, so the
+    /// idempotent append can't recognise it). That one-time upgrade duplicate
+    /// is accepted — steady state is exactly-once via the unique key. Hydration
+    /// itself must never break on the retired key.
+    #[test]
+    fn legacy_delivered_cron_executions_field_is_ignored() {
+        let state: SessionState = serde_json::from_str(
+            r#"{
+                "delivered_cron_executions": ["execution-1"]
+            }"#,
+        )
+        .expect("legacy cron delivery cache must not break session hydration");
+
+        let current = serde_json::to_value(state).expect("serialize current session state");
+        assert!(current.get("delivered_cron_executions").is_none());
+    }
+
+    #[test]
+    fn background_notification_aggregate_preserves_flat_session_json() {
+        let result = crate::spawn_protocol::PendingBackgroundResult::subagent(
+            "bg-1",
+            "explorer",
+            "inspect",
+            SessionId::from("child-1"),
+            "done",
+            crate::SubagentExitStatus::Completed,
+        );
+        let mut state = SessionState::default();
+        state.background_notifications.buffered_results.push(result);
+        state.background_notifications.groups.insert(
+            "turn::research".into(),
+            BackgroundNotificationGroup {
+                expected: 2,
+                ..BackgroundNotificationGroup::default()
+            },
+        );
+        state.background_notifications.active_delivery = Some(BackgroundNotificationDelivery {
+            handle_ids: vec!["bg-active".into()],
+            content: vec![crate::ContentBlock::Text("report".into())],
+            prompt_ordinal: 7,
+            failed_attempts: 2,
+        });
+
+        let json = serde_json::to_value(&state).expect("serialize session state");
+        assert!(json.get("background_notifications").is_none());
+        assert!(json.get("pending_background_results").is_some());
+        assert!(json.get("background_groups").is_some());
+        assert!(json.get("pending_notification_turn").is_some());
+
+        let mut legacy_json = json.clone();
+        legacy_json
+            .get_mut("pending_notification_turn")
+            .and_then(Value::as_object_mut)
+            .expect("serialized delivery object")
+            .remove("handle_ids");
+
+        let restored: SessionState =
+            serde_json::from_value(legacy_json).expect("deserialize flat legacy-compatible state");
+        assert_eq!(
+            restored
+                .background_notifications
+                .buffered_results
+                .first()
+                .map(|result| result.handle_id.as_str()),
+            Some("bg-1")
+        );
+        assert_eq!(
+            restored
+                .background_notifications
+                .groups
+                .get("turn::research")
+                .map(|group| group.expected),
+            Some(2)
+        );
+        let delivery = restored
+            .background_notifications
+            .active_delivery
+            .expect("active delivery");
+        assert_eq!(delivery.failed_attempts, 2);
+        assert!(
+            delivery.handle_ids.is_empty(),
+            "legacy ledgers predate cross-stage handle dedup"
+        );
+
+        let current: SessionState =
+            serde_json::from_value(json).expect("deserialize current flat state");
+        assert_eq!(
+            current
+                .background_notifications
+                .active_delivery
+                .expect("current active delivery")
+                .handle_ids,
+            ["bg-active"]
+        );
+    }
+
+    #[test]
+    fn active_delivery_participates_in_handle_dedup() {
+        let notifications = BackgroundNotificationState {
+            active_delivery: Some(BackgroundNotificationDelivery {
+                handle_ids: vec!["bg-active".into()],
+                content: vec![],
+                prompt_ordinal: 1,
+                failed_attempts: 0,
+            }),
+            ..BackgroundNotificationState::default()
+        };
+
+        assert!(notifications.knows_handle("bg-active"));
+        assert!(!notifications.knows_handle("bg-other"));
     }
 
     #[test]

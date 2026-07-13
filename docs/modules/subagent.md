@@ -51,7 +51,7 @@ The tool is registered by the runtime wiring code (`crates/baybo/src/runtime.rs`
 - `model_tier` — `fast` / `balanced` / `deep`; precedence is explicit > profile `default_tier` > pool default. Only applies to `backend="baybo"`.
 - `background` — when `true`, returns a dispatch ack immediately and surfaces the child's final result as an out-of-band notification on the parent's next turn.
 - `on_timeout` — `"background"` (default) or `"kill"`: what to do when a foreground spawn from a user-facing session is still running after the fixed 2-minute foreground wait (`SUBAGENT_FOREGROUND_WAIT`). `background` detaches it (handle now, notification on terminal); `kill` cancels it. Ignored when `background=true`. Parsed via `OnTimeout`.
-- `group` — barrier cohort name. Subagents sharing a `group` (spawned together in one turn) are forced background-from-start and deliver a single merged notification only once they all finish; the spawner namespaces the cohort by the dispatching turn's job id (`GroupState::cohort_key`).
+- `group` — barrier cohort name. Subagents sharing a `group` (spawned together in one turn) are forced background-from-start and deliver a single merged notification only once they all finish; the spawner namespaces the cohort by the dispatching turn's job id (`BackgroundNotificationGroup::cohort_key`).
 - `resume_session_id` — continue a prior child's conversation (foreground results carry a `[subagent_session_id: …]` tail the parent can pass back).
 
 ### Fan-out limiter is a per-root capacity gate

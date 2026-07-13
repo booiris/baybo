@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
 use baybo_store::StorageError;
-use baybo_store::session::{Result, SessionStore, StoredMessage};
+use baybo_store::session::{Result, SessionMessageAppendOutcome, SessionStore, StoredMessage};
 use baybo_store::session_folder::{SessionFolderRow, SessionFolderStore};
 use baybo_store::session_summary::{SessionSummaryRow, SessionSummaryStore};
 
@@ -29,6 +29,7 @@ struct StoredMessageRow {
     message: ChatMessage,
     superseded_by: Option<u64>,
     created_at: DateTime<Utc>,
+    source_event_id: Option<String>,
 }
 
 /// In-memory `SessionStore` for tests across the workspace. Lineage
@@ -234,10 +235,81 @@ impl SessionStore for MemorySessionStore {
             message: message.clone(),
             superseded_by: None,
             created_at: Utc::now(),
+            source_event_id: None,
         });
         i64::try_from(ordinal).map_err(|_| {
             StorageError::Internal(anyhow::anyhow!("ordinal {ordinal} exceeds i64::MAX"))
         })
+    }
+
+    async fn append_session_message_idempotent(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+        message: &ChatMessage,
+    ) -> Result<SessionMessageAppendOutcome> {
+        if source_event_id.is_empty() {
+            return Err(StorageError::Storage(
+                "source_event_id must not be empty".to_string(),
+            ));
+        }
+        if self.fail_appends.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(StorageError::Internal(anyhow::anyhow!(
+                "injected transcript append failure"
+            )));
+        }
+
+        let mut guard = self.transcripts.lock();
+        let log = guard.entry(session_id.clone()).or_default();
+        if let Some(existing) = log
+            .iter()
+            .find(|row| row.source_event_id.as_deref() == Some(source_event_id))
+        {
+            let ordinal = i64::try_from(existing.ordinal).map_err(|_| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "ordinal {} exceeds i64::MAX",
+                    existing.ordinal
+                ))
+            })?;
+            return Ok(SessionMessageAppendOutcome::Existing { ordinal });
+        }
+
+        let ordinal = log.last().map(|row| row.ordinal + 1).unwrap_or(0);
+        let stored_ordinal = i64::try_from(ordinal).map_err(|_| {
+            StorageError::Internal(anyhow::anyhow!("ordinal {ordinal} exceeds i64::MAX"))
+        })?;
+        log.push(StoredMessageRow {
+            ordinal,
+            message: message.clone(),
+            superseded_by: None,
+            created_at: Utc::now(),
+            source_event_id: Some(source_event_id.to_string()),
+        });
+        Ok(SessionMessageAppendOutcome::Inserted {
+            ordinal: stored_ordinal,
+        })
+    }
+
+    async fn find_message_ordinal_by_source_event_id(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+    ) -> Result<Option<i64>> {
+        self.transcripts
+            .lock()
+            .get(session_id)
+            .and_then(|log| {
+                log.iter()
+                    .find(|row| row.source_event_id.as_deref() == Some(source_event_id))
+                    .map(|row| row.ordinal)
+            })
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|error| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "source-event ordinal exceeds i64::MAX: {error}"
+                ))
+            })
     }
 
     async fn append_control_event(
@@ -290,6 +362,7 @@ impl SessionStore for MemorySessionStore {
                 message: msg.clone(),
                 superseded_by: None,
                 created_at: stamp,
+                source_event_id: None,
             });
         }
         Ok(())

@@ -160,13 +160,16 @@ impl ActorSubagentSpawner {
         // tool reserved a slot before sending the envelope.
         let fan_out_root = request.fan_out_root.clone();
         // Namespace a grouped spawn's cohort tag by the dispatching turn's
-        // `job_id` (see `GroupState::cohort_key`). The agent loop counts the
-        // member into the same job-scoped cohort, so reusing a group name in a
-        // later turn opens a fresh cohort instead of extending a prior turn's
-        // still-draining one. No-op for ungrouped spawns.
+        // `job_id` (see `BackgroundNotificationGroup::cohort_key`). The agent
+        // loop counts the member into the same job-scoped cohort, so reusing a
+        // group name in a later turn opens a fresh cohort instead of extending
+        // a prior turn's still-draining one. No-op for ungrouped spawns.
         let mut request = request;
         if let Some(group) = request.group.take() {
-            request.group = Some(baybo_model::GroupState::cohort_key(parent_job_id, &group));
+            request.group = Some(baybo_model::BackgroundNotificationGroup::cohort_key(
+                parent_job_id,
+                &group,
+            ));
         }
         let parent = match self.session_manager.get(&parent_session_id).await {
             Ok(Some(p)) => p,
@@ -749,8 +752,8 @@ async fn escort_background_terminal(
     // Peek (don't clear) so the in-flight marker is still set across the
     // delivery — the reaper must not tear the parent down mid-escort. An
     // absent marker means `/stop` already drained this subagent, so suppress
-    // the terminal delivery: a user-stopped result must not repopulate
-    // `pending_background_results`.
+    // the terminal delivery: a user-stopped result must not repopulate the
+    // parent's background-notification buffer.
     if supervisor.is_background_subagent_in_flight(parent_id, &child_session_id) {
         deliver_background_result(
             supervisor,

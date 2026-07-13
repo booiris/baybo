@@ -36,7 +36,7 @@ pub use device::{DeviceRow, DeviceStatus, DeviceStore};
 pub use error::StorageError;
 pub use job::{JobRow, JobStore, JobTransitionRow};
 pub use secret::SecretStore;
-pub use session::{SessionStore, StoredMessage};
+pub use session::{SessionMessageAppendOutcome, SessionStore, StoredMessage};
 pub use session_folder::{SessionFolderRow, SessionFolderStore};
 pub use session_summary::{SessionSummaryRow, SessionSummaryStore};
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};

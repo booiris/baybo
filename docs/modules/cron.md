@@ -61,9 +61,17 @@ The header is **English**, like every other prompt in the tree — the model rea
 
 The ledger fields on `CronExecution` (`completed_at` … `notified_at`) make delivery recoverable. `notified_at` records a **resolution**, not merely a success: it is stamped both when the result lands and when it is terminally dropped (no usable origin), so the boot re-drive's scan (`completed_at IS NOT NULL AND notified_at IS NULL`, both projected into indexed columns) converges instead of re-attempting a hopeless delivery on every boot.
 
-At boot, `Router::run` re-drives that scan before any live traffic. A replayed delivery is a no-op because the origin actor records what it has already appended in `session.state.delivered_cron_executions` (capped, drop-oldest) — written **inside** the notification job's scope, immediately after the row lands, so everything that can still fail afterwards (the job's own `complete()`, the channel send, the ledger stamp) leaves a replay that dedups instead of duplicating.
+At boot, `Router::run` re-drives that scan before any live traffic. The origin actor appends with the source-event key `cron-execution:<execution_id>`; a unique partial index on `(session_id, source_event_id)` claims the key in the same statement as the transcript row. A replay therefore returns the original ordinal without opening another notification job, appending another row, or dispatching another live message, then stamps `notified_at` so the scan converges.
 
-The residual window is an unclean crash *between* those two store writes (the transcript row, then the dedup key): the re-drive then appends a second copy. That direction is deliberate. Committing the key first would close it by risking the opposite — a crash after the key but before the row would make the re-drive skip a notification that never existed. A duplicate reminder is a nuisance; a lost one is the failure this whole design exists to prevent.
+The former session-row cache (`delivered_cron_executions`) and its append→cache crash window no longer exist. Transcript insertion is exactly-once for a source execution even after compaction because the unique key remains on the historical superseded row. The execution ledger stamp is still a separate write; its replay is safe because it now meets the database constraint rather than a bounded in-memory/session-state cache.
+
+This is a transcript guarantee, not a distributed exactly-once claim. The
+notification job and external channel/push dispatch are not in the same
+database transaction as `session_messages`: a crash after the row lands can
+leave the durable conversation/unread state intact without completing every
+proactive transport. Replaying that execution deliberately converges on the
+existing row instead of risking a duplicate push. A transactional outbox would
+be required to close that transport-level gap.
 
 Accepted gap: if the process dies after the fire's job reaches a terminal state but before the waiter stamps `completed_at`, the execution is not re-driven. It neighbours the interrupted-execution gap tracked in [`../todo/stuck-cron-job-auto-retry.md`](../todo/stuck-cron-job-auto-retry.md).
 

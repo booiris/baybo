@@ -3,6 +3,7 @@
 //! routed to by [`Router`](crate::actor::router::Router), and
 //! checkpointed via [`DurableActorState`](crate::actor::state::DurableActorState).
 
+mod background_notification;
 pub mod mailbox;
 pub mod router;
 pub mod runner;
@@ -19,25 +20,14 @@ use baybo_channels::{
 use baybo_job::JobInput;
 use baybo_model::{
     ContentBlock, ControlEventKind, ExecutionOutcome, LlmEntryName, PendingBackgroundResult,
-    PendingCronResult, PendingNotificationTurn,
+    PendingCronResult,
 };
+use baybo_session::SessionMessageAppendOutcome;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Hard cap on `session.state.pending_background_results`. A parent
-/// that stays idle while many background subagents finish would
-/// otherwise grow this vec without bound — both in memory and on
-/// the persisted row. Once the cap is reached the oldest entry is
-/// dropped (its content still lives in the child session's trace).
-const MAX_PENDING_BACKGROUND_RESULTS: usize = 64;
-
-/// Hard cap on `session.state.delivered_cron_executions` — the dedup keys of
-/// one-shot results already appended here. Only a crash inside the
-/// append→stamp window can replay a delivery, so a handful of recent keys is
-/// all that is ever consulted; the cap keeps a long-lived conversation's row
-/// from growing without bound.
-const MAX_DELIVERED_CRON_EXECUTIONS: usize = 64;
+const CRON_NOTIFICATION_SOURCE_EVENT_PREFIX: &str = "cron-execution:";
 
 /// How many rows to pull around a cron fire's reply ordinal when reading it out
 /// of the fire's session. The reply sits exactly at the recorded ordinal; the
@@ -45,31 +35,9 @@ const MAX_DELIVERED_CRON_EXECUTIONS: usize = 64;
 /// Mirrors the push dispatcher's preview read.
 const FIRE_REPLY_READ_LIMIT: usize = 4;
 
-/// How long after sealing a subagent group the barrier waits for all
-/// members before firing partial + dissolving the cohort (still-running
-/// members then deliver individually). Generous — group members are real
-/// background subagents.
-const GROUP_TIMEOUT_MINUTES: i64 = 30;
-
-/// Exponential-backoff retry schedule for a FAILED `SubagentNotification`
-/// turn. When the turn errors (provider / cost / cancel) and the session is
-/// idle, the actor retries on this backoff so a fire-and-forget completion is
-/// still reported during the idle window. Each step doubles, capped at
-/// `NOTIFY_RETRY_MAX_BACKOFF`; an inbound message resets the schedule.
-const NOTIFY_RETRY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
-const NOTIFY_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Delivery attempts for one notification ledger before the actor stops
-/// retrying. The results are NOT lost at the cap: the prompt row is durable
-/// in the transcript, so delivery degrades to *passive* — the next real
-/// turn's model reads the results and reports then. The cap exists because
-/// each retry's state persist bumps `last_active`, so a perpetually failing
-/// turn would otherwise pin the actor resident forever.
-const NOTIFY_TURN_MAX_ATTEMPTS: u32 = 5;
-
 /// Surfaced (as a `Notice`) when a *user* turn yields a blank reply — the
 /// user is waiting, so acknowledge rather than push an empty bubble. Non-user
-/// turns (cron, subagent notification) silently suppress a blank reply.
+/// turns (cron, background notification) silently suppress a blank reply.
 const EMPTY_USER_REPLY_NOTICE: &str =
     "The assistant did not produce a response to your message. Please try again or rephrase.";
 
@@ -114,12 +82,10 @@ pub enum AgentMessage {
         initial_message: Box<IncomingMessage>,
         parent_job_id: baybo_model::JobId,
     },
-    /// A `background: true` subagent dispatched from this session
-    /// reached a terminal state. The wait task posts this to the parent
-    /// actor's mailbox; it is buffered on
-    /// `session.state.pending_background_results` and, once no
-    /// higher-priority work is queued, drained into one autonomous
-    /// `SubagentNotification` turn.
+    /// A detached subagent or `Bash` command reached a terminal state. The
+    /// completion enters `session.state.background_notifications`, where it
+    /// is grouped/buffered and later delivered by one autonomous notification
+    /// turn after higher-priority work drains.
     BackgroundJobFinished(Box<PendingBackgroundResult>),
     /// Re-pin the session's LLM (chat per-session model switch). `llm`
     /// is the `baybo.json` entry name to resolve against, or `None` to
@@ -170,14 +136,17 @@ impl mailbox::Prioritized for AgentMessage {
     }
 }
 
-/// A `SubagentNotification` reply is suppressed (not sent to the channel)
-/// when it carries no non-whitespace text — the model's only, implicit,
-/// way to stay quiet (there is no `<no_output/>` sentinel).
+/// A background-notification reply is suppressed when it carries no
+/// non-whitespace text — the model's implicit way to stay quiet.
 fn is_blank_reply(content: &[ContentBlock]) -> bool {
     content.iter().all(|b| match b {
         ContentBlock::Text(t) => t.trim().is_empty(),
         _ => false,
     })
+}
+
+fn cron_notification_source_event_id(execution_id: &str) -> String {
+    format!("{CRON_NOTIFICATION_SOURCE_EVENT_PREFIX}{execution_id}")
 }
 
 /// Mirrors the gateway slash dispatcher's tolerance for casing and
@@ -311,40 +280,21 @@ impl AgentActor {
             .restore_transcript_from_store()
             .await;
 
-        // An undelivered notification (a buffered batch, an open barrier
-        // cohort, or an open delivery ledger) is worked off on an exponential
-        // backoff (capped at `NOTIFY_RETRY_MAX_BACKOFF`) rather than waiting
-        // for the next inbound message, so a fire-and-forget completion is
-        // still reported during the idle window. A real inbound message wins
-        // the race (biased) and resets the backoff. Retries are capped at
-        // `NOTIFY_TURN_MAX_ATTEMPTS`, after which delivery degrades to
-        // passive (the prompt row is durable in the transcript).
-        let mut notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
+        // Notification work uses a timer so a fire-and-forget result can be
+        // reported while the session is otherwise idle. Inbound messages win
+        // the biased race and reset the retry schedule.
+        let mut notification_retry =
+            background_notification::BackgroundNotificationRetrySchedule::new();
         loop {
-            // Stay on the timed path while any notification work is
-            // outstanding — including open barrier cohorts whose group
-            // timeout must be enforced even with no inbound message.
-            let next = if self.notification_work_outstanding() {
+            let next = if self.has_background_notification_work() {
                 tokio::select! {
                     biased;
                     m = mailbox.recv() => m,
-                    _ = tokio::time::sleep(notify_backoff) => {
-                        // Release any cohort that completed or hit its timeout
-                        // into the buffer, then drain. A cohort that times out
-                        // with zero results buffers nothing, so the
-                        // notification's own persist won't fire — persist the
-                        // group-map change here so the sweep survives a later
-                        // rehydration.
-                        if self.check_groups() {
-                            self.persist_session_state_after_pending_change("group_swept")
-                                .await;
-                        }
-                        self.run_subagent_notification().await;
-                        if self.notification_work_outstanding() {
-                            notify_backoff = (notify_backoff * 2).min(NOTIFY_RETRY_MAX_BACKOFF);
-                        } else {
-                            notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
-                        }
+                    _ = tokio::time::sleep(notification_retry.delay()) => {
+                        self.handle_background_notification_timer().await;
+                        notification_retry.after_timer_attempt(
+                            self.has_background_notification_work(),
+                        );
                         continue;
                     }
                 }
@@ -354,8 +304,7 @@ impl AgentActor {
             let Some(msg) = next else {
                 break;
             };
-            // A real message resets the notification backoff (fresh schedule).
-            notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
+            notification_retry.reset();
             match msg {
                 AgentMessage::ActorStop => {
                     debug!(session_id = %session_id, "actor stopping");
@@ -443,10 +392,10 @@ impl AgentActor {
             // The turn that just ran finished dispatching its grouped spawns,
             // so seal their cohorts: membership is now final and the barrier
             // (and its timeout) can fire.
-            self.seal_open_groups().await;
-            // Surface any buffered background-subagent results as their
-            // own turn once nothing higher-priority remains queued.
-            self.maybe_run_subagent_notification(&mailbox).await;
+            self.seal_background_notification_groups().await;
+            // Surface buffered background-job results as their own turn once
+            // nothing higher-priority remains queued.
+            self.maybe_start_background_notification(&mailbox).await;
         }
         info!(session_id = %session_id, "agent actor stopped");
     }
@@ -531,8 +480,8 @@ impl AgentActor {
     /// Run the loop on the session's *current* context. The triggering
     /// message must already be appended (the callers do this via
     /// `AgentLoop::append_user_message` / `append_cron_fire` /
-    /// `append_subagent_notification`) so framing lives in `baybo-context`
-    /// and the loop just iterates.
+    /// `append_background_notification_prompt_once`) so framing lives in
+    /// `baybo-context` and the loop just iterates.
     async fn run_agent_loop(
         &mut self,
         job_input: JobInput,
@@ -576,7 +525,7 @@ impl AgentActor {
         // a terminal notice, not silence (the log line alone leaves the chat
         // dangling on its last progress frame). Cancellation stays quiet:
         // `/stop` already acknowledged with its own notice. Non-user turns
-        // keep their own policies (cron logs, subagent-notification retries).
+        // keep their own policies (cron logs, background-notification retries).
         if is_user_turn
             && !turn_token.is_cancelled()
             && let Err(e) = &result
@@ -680,10 +629,9 @@ impl AgentActor {
     /// push off the durable row, and dispatch it to the channel. Returns the
     /// persisted ordinal.
     ///
-    /// `remember` is the execution to record as delivered once the row is
-    /// durable — the one-shot origin delivery's dedup key. `None` for a fire
-    /// reporting in its own conversation, which has no cross-session ledger to
-    /// keep.
+    /// `source_event_id` makes a one-shot origin append idempotent. `None` is
+    /// used by a recurring fire reporting in its own conversation, where each
+    /// fire has a fresh session.
     ///
     /// An append that does not reach the store fails the whole publish: the row
     /// would live only in this actor's memory, the push would have no durable
@@ -693,14 +641,24 @@ impl AgentActor {
     async fn publish_cron_notification(
         &mut self,
         content: Vec<ContentBlock>,
-        remember: Option<String>,
-    ) -> anyhow::Result<i64> {
+        source_event_id: Option<String>,
+    ) -> anyhow::Result<SessionMessageAppendOutcome> {
         let session_id = self.durable.session.id.clone();
+        if let Some(source_event_id) = source_event_id.as_deref()
+            && let Some(ordinal) = self
+                .volatile
+                .session_manager
+                .find_message_ordinal_by_source_event_id(&session_id, source_event_id)
+                .await?
+        {
+            return Ok(SessionMessageAppendOutcome::Existing { ordinal });
+        }
+
         let job_lifecycle = Arc::clone(&self.volatile.job_lifecycle);
         let origin = self.durable.session.trigger.kind();
-        let ordinal = crate::runtime::scope::with_job(
+        let append_outcome = crate::runtime::scope::with_job(
             &job_lifecycle,
-            // Not a cancellable turn: the append is a single store write with
+            // Not a cancellable turn: the append is one store write with
             // nothing to interrupt. The token is never tripped.
             CancellationToken::new(),
             crate::runtime::scope::JobSpec {
@@ -712,32 +670,30 @@ impl AgentActor {
                 parent_job_id: None,
             },
             |_job_id| async {
-                let ordinal = self
+                let append_outcome = self
                     .volatile
                     .agent_loop
-                    .append_cron_notification(content.clone())
+                    .append_cron_notification(content.clone(), source_event_id.as_deref())
                     .await
                     .ok_or_else(|| {
                         anyhow::anyhow!("cron notification was not persisted to the transcript")
                     })?;
-                // Record the dedup key as soon as the row IS durable, still
-                // inside the job scope: everything after this point can fail
-                // (the job's own `complete()` writes to the same store), and a
-                // failure there must not leave an appended row whose execution
-                // the re-drive would replay into a second copy.
-                if let Some(execution_id) = remember.clone() {
-                    self.remember_cron_delivery(execution_id).await;
-                }
+                let SessionMessageAppendOutcome::Inserted { ordinal } = append_outcome else {
+                    return Err(anyhow::anyhow!(
+                        "cron notification source event was inserted concurrently"
+                    ));
+                };
                 Ok((
                     baybo_job::JobOutput::Message {
                         content: content.clone(),
                         ordinal: Some(ordinal),
                     },
-                    ordinal,
+                    append_outcome,
                 ))
             },
         )
         .await?;
+        let ordinal = append_outcome.ordinal();
 
         let out = AgentOutput {
             session_id: session_id.clone(),
@@ -754,7 +710,7 @@ impl AgentActor {
             }),
         };
         self.send_response(out, "cron_notification").await;
-        Ok(ordinal)
+        Ok(append_outcome)
     }
 
     /// Deliver a finished one-shot cron fire's result into **this**
@@ -769,23 +725,40 @@ impl AgentActor {
     /// silently evaporates is the one behaviour this feature must never have.
     async fn handle_cron_result_ready(&mut self, pending: PendingCronResult) {
         let session_id = self.durable.session.id.clone();
-        if self
-            .durable
-            .session
-            .state
-            .delivered_cron_executions
-            .contains(&pending.execution_id)
+        let source_event_id = cron_notification_source_event_id(&pending.execution_id);
+
+        // Replay guard, BEFORE any side effect. The append below is idempotent
+        // on `source_event_id`, but the work leading up to it is not: a boot
+        // re-drive of an already-delivered result (its transcript row landed
+        // but the ledger stamp didn't) would otherwise re-read the fire's reply
+        // and — worse, user-visibly — un-hide a conversation the user has since
+        // removed. Detect the existing row first and just re-resolve the ledger.
+        match self
+            .volatile
+            .session_manager
+            .find_message_ordinal_by_source_event_id(&session_id, &source_event_id)
+            .await
         {
-            debug!(
-                session_id = %session_id,
-                execution_id = %pending.execution_id,
-                "cron result already delivered to this session; ignoring replay"
-            );
-            // The append survived but the ledger stamp did not (that is the
-            // only way a delivered result gets replayed). Stamp it now so the
-            // boot re-drive stops re-routing it.
-            self.resolve_cron_delivery(&pending.execution_id).await;
-            return;
+            Ok(Some(_)) => {
+                debug!(
+                    session_id = %session_id,
+                    execution_id = %pending.execution_id,
+                    "cron result transcript row already exists; resolving replay without re-delivery"
+                );
+                self.resolve_cron_delivery(&pending.execution_id).await;
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // Couldn't check — fall through to the append, which is itself
+                // idempotent, rather than risk dropping a genuine first delivery.
+                warn!(
+                    session_id = %session_id,
+                    execution_id = %pending.execution_id,
+                    error = %error,
+                    "could not check for an existing cron result row; proceeding to idempotent append"
+                );
+            }
         }
 
         let content = self.build_cron_notification(&pending).await;
@@ -794,24 +767,33 @@ impl AgentActor {
         // must be in the user's list when they tap it.
         self.unhide_for_cron_notification().await;
 
-        if let Err(e) = self
-            .publish_cron_notification(content, Some(pending.execution_id.clone()))
+        let outcome = match self
+            .publish_cron_notification(content, Some(source_event_id))
             .await
         {
-            // Leave the ledger unresolved: the boot re-drive replays this
-            // delivery rather than losing the user's reminder. If the row did
-            // land before the failure, the dedup key landed with it, so the
-            // replay is a no-op.
-            error!(
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Leave the ledger unresolved: the boot re-drive retries the
+                // same source-event key rather than losing the reminder.
+                error!(
+                    session_id = %session_id,
+                    execution_id = %pending.execution_id,
+                    error = %error,
+                    "cron result delivery failed; leaving it for re-drive"
+                );
+                return;
+            }
+        };
+
+        self.resolve_cron_delivery(&pending.execution_id).await;
+        if matches!(outcome, SessionMessageAppendOutcome::Existing { .. }) {
+            debug!(
                 session_id = %session_id,
                 execution_id = %pending.execution_id,
-                error = %e,
-                "cron result delivery failed; leaving it for re-drive"
+                "cron result transcript row already exists; resolved replay"
             );
             return;
         }
-
-        self.resolve_cron_delivery(&pending.execution_id).await;
         info!(
             session_id = %session_id,
             execution_id = %pending.execution_id,
@@ -926,19 +908,6 @@ impl AgentActor {
         self.durable.session.hidden = false;
     }
 
-    /// Record that this execution's result has landed in the transcript, and
-    /// persist it — the session row is the only thing that survives an actor
-    /// eviction, and it is what makes a replayed delivery a no-op.
-    async fn remember_cron_delivery(&mut self, execution_id: String) {
-        let delivered = &mut self.durable.session.state.delivered_cron_executions;
-        if delivered.len() >= MAX_DELIVERED_CRON_EXECUTIONS {
-            delivered.remove(0);
-        }
-        delivered.push(execution_id);
-        self.persist_session_state_after_pending_change("cron_result_delivered")
-            .await;
-    }
-
     /// Stamp the execution's delivery as resolved. Failure is logged, not
     /// propagated: the result is already in the transcript, and an unresolved
     /// ledger only costs a replayed delivery at the next boot, which the dedup
@@ -968,10 +937,9 @@ impl AgentActor {
                 .handle_compact(slash_command_text(&content), sent_at)
                 .await;
         }
-        // Background `spawn_subagent` results are NOT folded into the
-        // user's turn — they run as their own `SubagentNotification` turn
-        // (scheduled by `maybe_run_subagent_notification`) so the user's
-        // turn keeps a clean leading `/command` for slash detection.
+        // Background results are not folded into slash turns. Their own
+        // notification turn runs after this one, keeping the leading
+        // `/command` intact for slash detection.
         //
         // Pass a clone of the response channel so the loop can stream
         // text deltas as `AgentEvent::AnswerDelta` while the final assembled
@@ -1064,177 +1032,10 @@ impl AgentActor {
             interjections.discard_pending();
         }
         let response = result?;
-        // A completed user turn's request already carried any open
-        // notification ledger's persisted prompt row (the actor is
-        // single-threaded, and the ledger only opens between turns), so the
-        // model saw the results with a real chance to fold them into this
-        // reply. Settle the ledger — passive delivery, the attempt cap's
-        // stance — rather than letting the timed retry force a duplicate
-        // proactive report behind a cue claiming nothing reached the user.
-        // Settling happens HERE, on the turn the actor knows completed:
-        // transcript rows can't carry that fact (a failed turn's salvage row
-        // is indistinguishable from a delivered final reply). Stopped and
-        // blank turns don't settle — their reply never reached the user.
-        if !stopped
-            && !is_blank_reply(&response.content)
-            && self
-                .durable
-                .session
-                .state
-                .pending_notification_turn
-                .is_some()
-        {
-            debug!(
-                session_id = %self.durable.session.id,
-                "a user turn completed over the open notification ledger; settling \
-                 (passive delivery)"
-            );
-            self.durable.session.state.pending_notification_turn = None;
-            self.persist_session_state_after_pending_change("subagent_notification_settled")
-                .await;
-        }
+        self.settle_background_notification_after_user_turn(stopped, &response.content)
+            .await;
         self.send_user_reply(response).await;
         Ok(())
-    }
-
-    /// Idempotent on `handle_id` — the wait task can in principle
-    /// publish twice (mailbox retry, manual recovery) and we don't
-    /// want the notification to list it twice. Capped at
-    /// `MAX_PENDING_BACKGROUND_RESULTS` with drop-oldest semantics so a
-    /// parent that stays idle while many backgrounds finish can't
-    /// grow the persisted row without bound.
-    async fn handle_background_finished(&mut self, pending: PendingBackgroundResult) {
-        if self.background_result_known(&pending.handle_id) {
-            debug!(
-                session_id = %self.durable.session.id,
-                handle_id = %pending.handle_id,
-                "duplicate BackgroundJobFinished for handle; ignoring"
-            );
-            return;
-        }
-        debug!(
-            session_id = %self.durable.session.id,
-            handle_id = %pending.handle_id,
-            label = %pending.label,
-            "buffered background job result"
-        );
-        // Route a grouped member into its still-open cohort; everything else
-        // — non-grouped jobs, and grouped members whose cohort already
-        // released or dissolved — goes straight to the notification buffer.
-        let grouped = pending.group.as_ref().and_then(|g| {
-            self.durable
-                .session
-                .state
-                .background_groups
-                .contains_key(g)
-                .then(|| g.clone())
-        });
-        match grouped {
-            Some(g) => {
-                if let Some(state) = self.durable.session.state.background_groups.get_mut(&g) {
-                    state.results.push(pending);
-                }
-            }
-            None => self.buffer_pending_result(pending),
-        }
-        self.check_groups();
-        self.persist_session_state_after_pending_change("background_finished")
-            .await;
-    }
-
-    /// Whether a result with this handle is already buffered (in the
-    /// notification queue or any group cohort) — dedup across re-delivery.
-    fn background_result_known(&self, handle_id: &str) -> bool {
-        let state = &self.durable.session.state;
-        state
-            .pending_background_results
-            .iter()
-            .any(|p| p.handle_id == handle_id)
-            || state
-                .background_groups
-                .values()
-                .any(|g| g.results.iter().any(|p| p.handle_id == handle_id))
-    }
-
-    /// Push a result into the notification buffer, capped drop-oldest.
-    fn buffer_pending_result(&mut self, pending: PendingBackgroundResult) {
-        let buffer = &mut self.durable.session.state.pending_background_results;
-        if buffer.len() >= MAX_PENDING_BACKGROUND_RESULTS {
-            let dropped = buffer.remove(0);
-            warn!(
-                session_id = %self.durable.session.id,
-                dropped_handle_id = %dropped.handle_id,
-                cap = MAX_PENDING_BACKGROUND_RESULTS,
-                "pending background buffer full; dropping oldest entry"
-            );
-        }
-        buffer.push(pending);
-    }
-
-    /// Seal every still-open barrier cohort at a turn boundary: membership is
-    /// final once the dispatching turn ends, so the barrier may fire. Starts
-    /// each group's timeout clock. Persists if anything changed.
-    async fn seal_open_groups(&mut self) {
-        let now = chrono::Utc::now();
-        let mut changed = false;
-        for g in self.durable.session.state.background_groups.values_mut() {
-            if !g.sealed {
-                g.sealed = true;
-                g.sealed_at = Some(now);
-                changed = true;
-            }
-        }
-        if changed {
-            // A cohort whose members all finished mid-turn is complete the
-            // moment it seals — release it before the next drain.
-            self.check_groups();
-            self.persist_session_state_after_pending_change("group_sealed")
-                .await;
-        }
-    }
-
-    /// Whether any barrier cohort is still open — keeps the idle loop awake so
-    /// the group timeout is enforced even with no inbound messages.
-    fn has_open_groups(&self) -> bool {
-        !self.durable.session.state.background_groups.is_empty()
-    }
-
-    /// Release every complete (`results.len() >= expected`) or timed-out
-    /// cohort into the notification buffer. A timed-out cohort fires partial
-    /// (its finished members) and dissolves — still-running members revert to
-    /// individual delivery, since their later result finds no cohort and
-    /// buffers directly. No-op while a cohort is still filling.
-    fn check_groups(&mut self) -> bool {
-        let now = chrono::Utc::now();
-        let timeout = chrono::Duration::minutes(GROUP_TIMEOUT_MINUTES);
-        let ready: Vec<String> = self
-            .durable
-            .session
-            .state
-            .background_groups
-            .iter()
-            .filter(|(_, g)| g.is_ready(now, timeout))
-            .map(|(name, _)| name.clone())
-            .collect();
-        let removed = !ready.is_empty();
-        for name in ready {
-            let Some(g) = self.durable.session.state.background_groups.remove(&name) else {
-                continue;
-            };
-            if g.is_partial() {
-                debug!(
-                    session_id = %self.durable.session.id,
-                    group = %name,
-                    have = g.results.len(),
-                    expected = g.expected,
-                    "group timed out; partial-firing and dissolving"
-                );
-            }
-            for r in g.results {
-                self.buffer_pending_result(r);
-            }
-        }
-        removed
     }
 
     /// Re-pin this session's LLM in place (chat per-session model switch)
@@ -1262,27 +1063,14 @@ impl AgentActor {
         self.volatile.agent_loop.set_initial_llm(llm);
     }
 
-    /// Write the actor's current `durable.session` back to the
-    /// session store so the latest `pending_background_results` /
-    /// notification ledger survives eviction. Called only by the
-    /// background-subagent paths today. Logs a warn on storage error rather
-    /// than failing the surrounding handler — losing the persisted copy
-    /// degrades to "delivered to the live actor only" rather than "delivered
-    /// nowhere", which is strictly worse than the v1 (mailbox-only) baseline.
-    /// Updates `last_active` in passing so the reaper doesn't immediately
-    /// re-target the actor after the counter clears.
-    ///
-    /// Returns whether the save landed. Most callers can ignore it (the
-    /// in-memory copy is authoritative for the live actor); the notification
-    /// drain gates on it so a turn never runs ahead of a ledger the store
-    /// doesn't have.
-    async fn persist_session_state_after_pending_change(&mut self, context: &'static str) -> bool {
+    /// Persist actor-owned session state and refresh activity so the reaper
+    /// does not immediately target an actor that just completed durable work.
+    async fn persist_session_state_with_activity(&mut self, context: &'static str) -> bool {
         self.durable.session.last_active = chrono::Utc::now();
         self.save_session_row(context).await
     }
 
-    /// Like [`Self::persist_session_state_after_pending_change`] but WITHOUT
-    /// stamping `last_active = now`. For the ActorStop final write: the chat
+    /// Final actor-state write without stamping `last_active = now`. The chat
     /// list is ordered by `last_active`, and the reaper stops actors
     /// *because* they are idle — stamping "now" there would hoist every
     /// reaped stale conversation above genuinely recent ones (and a gateway
@@ -1332,329 +1120,9 @@ impl AgentActor {
                     session_id = %self.durable.session.id,
                     context = %context,
                     error = %e,
-                    "failed to persist session.state after pending-subagent change; live actor still has the latest copy in memory"
+                    "failed to persist actor-owned session state; live actor still has the latest copy in memory"
                 );
                 false
-            }
-        }
-    }
-
-    /// Any undelivered notification work: a buffered batch, an open barrier
-    /// cohort (its timeout must be enforced), or an open delivery ledger (a
-    /// persisted prompt row awaiting its reply). One predicate for the run
-    /// loop's stay-on-timed-path decision AND its backoff reset-vs-double
-    /// decision — the two must agree, or a provider outage retries at the
-    /// initial cadence forever instead of settling at the cap.
-    fn notification_work_outstanding(&self) -> bool {
-        !self
-            .durable
-            .session
-            .state
-            .pending_background_results
-            .is_empty()
-            || self.has_open_groups()
-            || self
-                .durable
-                .session
-                .state
-                .pending_notification_turn
-                .is_some()
-    }
-
-    /// Surface buffered background-subagent results as their own turn —
-    /// but only when no higher-priority work is queued: a `Trigger`
-    /// (UserInput) must run first, and another queued `BackgroundJobFinished`
-    /// is folded in first (merge). An empty queue or a lowest-priority
-    /// `ActorStop` means "drain now".
-    ///
-    /// An open delivery ledger defers to the run loop's timed backoff arm
-    /// instead: retrying here would fire a proactive re-turn immediately
-    /// behind every inbound message (whose request already carried the
-    /// persisted prompt row).
-    async fn maybe_run_subagent_notification(
-        &mut self,
-        mailbox: &mailbox::MailboxReceiver<AgentMessage>,
-    ) {
-        if self
-            .durable
-            .session
-            .state
-            .pending_background_results
-            .is_empty()
-            || self
-                .durable
-                .session
-                .state
-                .pending_notification_turn
-                .is_some()
-        {
-            return;
-        }
-        if matches!(
-            mailbox.peek_priority(),
-            Some(p) if p >= mailbox::MessagePriority::BackgroundJobFinished
-        ) {
-            return;
-        }
-        self.run_subagent_notification().await;
-    }
-
-    /// Run the merged background-subagent notification as its own
-    /// main-path turn (same system prompt + toolset → prompt cache
-    /// unchanged). The reply is sent proactively; an empty/whitespace
-    /// reply is suppressed.
-    ///
-    /// Delivery is ledgered: the prompt row is persisted to the transcript
-    /// up front and recorded on `session.state.pending_notification_turn`,
-    /// then the turn runs with **no rollback of any kind** — a failed
-    /// attempt's partial rows stay (they are real history the prompt row
-    /// explains), and the ledger drives a forward-only retry. Crash stance:
-    /// a crash mid-turn re-runs the turn on rehydration — a duplicate report
-    /// beats a lost one, the same direction the cron delivery ledger chose.
-    async fn run_subagent_notification(&mut self) {
-        // An open ledger means a prior batch's prompt row is already in the
-        // transcript without a delivered reply. Finish that first; a fresh
-        // batch stays buffered as the next one.
-        if self
-            .durable
-            .session
-            .state
-            .pending_notification_turn
-            .is_some()
-        {
-            self.retry_notification_turn().await;
-            return;
-        }
-        // Take the batch. The actor is single-threaded — nothing else
-        // mutates the buffer while the drain runs.
-        let pending = std::mem::take(&mut self.durable.session.state.pending_background_results);
-        if pending.is_empty() {
-            return;
-        }
-        let content = baybo_context::prompts::subagent::build_notification_content(&pending);
-        // Persist the prompt row FIRST. From here the results are durable in
-        // the transcript itself — even a crashed actor's next real turn reads
-        // them — so the buffer can empty and no path needs to restore it.
-        let Some(prompt_ordinal) = self
-            .volatile
-            .agent_loop
-            .append_subagent_notification(content.clone())
-            .await
-        else {
-            // Persist failed (the window was popped back in lockstep). Put
-            // the batch back untouched; the backoff retries the whole drain.
-            warn!(
-                session_id = %self.durable.session.id,
-                "notification prompt row failed to persist; re-buffering the batch for retry"
-            );
-            self.durable.session.state.pending_background_results = pending;
-            return;
-        };
-        self.durable.session.state.pending_notification_turn = Some(PendingNotificationTurn {
-            content: content.clone(),
-            prompt_ordinal,
-            attempts: 0,
-        });
-        // One durable commit: buffer emptied + ledger opened. If it fails,
-        // don't run the turn — the in-memory ledger stays set, so the next
-        // timed-arm tick lands in the retry branch, which re-persists before
-        // running. (A crash in this window re-drives from the still-buffered
-        // batch and duplicates one prompt row: duplicate-beats-lost.)
-        if !self
-            .persist_session_state_after_pending_change("subagent_notification_drained")
-            .await
-        {
-            return;
-        }
-        self.drive_notification_turn(content).await;
-    }
-
-    /// Re-drive an open delivery ledger: the prompt row is persisted but no
-    /// reply was delivered. Forward-only — nothing is rolled back; a cue row
-    /// re-anchors the request tail and the same turn re-runs.
-    async fn retry_notification_turn(&mut self) {
-        // The ledger (or its last attempts bump) may never have reached the
-        // store. Re-persist before running so a crash can't lose the
-        // bookkeeping the turn is about to depend on.
-        if !self
-            .persist_session_state_after_pending_change("subagent_notification_retry")
-            .await
-        {
-            return;
-        }
-        let Some(ledger) = self.durable.session.state.pending_notification_turn.clone() else {
-            return;
-        };
-        // Compaction supersedes every active row and re-inserts the kept
-        // slice at fresh ordinals, so the recorded ordinal dangles after any
-        // compaction — even when the prompt's content survived verbatim; the
-        // ledger froze the content, so the repair is a re-append. Index-only
-        // check: no content is read.
-        let prompt_active = match self
-            .volatile
-            .session_manager
-            .active_index_of_ordinal(&self.durable.session.id, ledger.prompt_ordinal)
-            .await
-        {
-            Ok(idx) => idx.is_some(),
-            Err(e) => {
-                warn!(
-                    session_id = %self.durable.session.id,
-                    error = %e,
-                    "could not verify the notification prompt row"
-                );
-                // Counts as a failed attempt: a store that saves session rows
-                // but can't load messages would otherwise loop here forever,
-                // each tick bumping `last_active` — the perpetual-residency
-                // mode the attempt cap exists to prevent.
-                self.record_notification_attempt_failure("prompt row verification failed")
-                    .await;
-                return;
-            }
-        };
-        if prompt_active {
-            // Cue row (persisted): restores a user-side request tail — a
-            // cancelled attempt's salvage leaves an assistant row at the
-            // tail, and a request ending on an assistant message is provider
-            // prefill (Anthropic rejects it outright with extended thinking
-            // on) — un-buries the prompt from behind the failed attempt's
-            // partial rows, and makes a blank reply a genuine judgment.
-            let cue = baybo_context::prompts::subagent::build_retry_cue(
-                ledger.attempts.saturating_add(1),
-            );
-            if self
-                .volatile
-                .agent_loop
-                .append_subagent_notification(cue)
-                .await
-                .is_none()
-            {
-                self.record_notification_attempt_failure("cue row failed to persist")
-                    .await;
-                return;
-            }
-        } else {
-            let Some(new_ordinal) = self
-                .volatile
-                .agent_loop
-                .append_subagent_notification(ledger.content.clone())
-                .await
-            else {
-                self.record_notification_attempt_failure(
-                    "re-anchored prompt row failed to persist",
-                )
-                .await;
-                return;
-            };
-            if let Some(l) = self
-                .durable
-                .session
-                .state
-                .pending_notification_turn
-                .as_mut()
-            {
-                l.prompt_ordinal = new_ordinal;
-            }
-            self.persist_session_state_after_pending_change("subagent_notification_reanchored")
-                .await;
-        }
-        self.drive_notification_turn(ledger.content).await;
-    }
-
-    /// Count a delivery attempt that could not even reach the LLM (a store
-    /// error while preparing the retry) against the same cap as a failed
-    /// turn, so a partially-broken store degrades to passive delivery
-    /// instead of pinning the actor on an endless verify-retry loop.
-    async fn record_notification_attempt_failure(&mut self, reason: &'static str) {
-        let attempts = match self
-            .durable
-            .session
-            .state
-            .pending_notification_turn
-            .as_mut()
-        {
-            Some(ledger) => {
-                ledger.attempts = ledger.attempts.saturating_add(1);
-                ledger.attempts
-            }
-            None => return,
-        };
-        if attempts >= NOTIFY_TURN_MAX_ATTEMPTS {
-            warn!(
-                session_id = %self.durable.session.id,
-                attempts,
-                reason,
-                "subagent-notification delivery kept failing; ceasing active retries — \
-                 the results are persisted in the transcript, so the next real turn \
-                 reports them (passive delivery)"
-            );
-            self.durable.session.state.pending_notification_turn = None;
-        }
-        self.persist_session_state_after_pending_change("subagent_notification_failed")
-            .await;
-    }
-
-    /// Run the notification turn against the (already persisted) prompt and
-    /// settle the ledger: clear on success, bump attempts on failure, degrade
-    /// to passive delivery at the cap.
-    async fn drive_notification_turn(&mut self, content: Vec<ContentBlock>) {
-        // No delta streaming: the empty-output decision is made on the
-        // assembled reply, so nothing may have been streamed already.
-        let result = self
-            .run_agent_loop(
-                JobInput::SubagentNotification { content },
-                None,
-                None,
-                None,
-                None,
-            )
-            .await;
-        match result {
-            Ok(response) => {
-                let attempts = self
-                    .durable
-                    .session
-                    .state
-                    .pending_notification_turn
-                    .as_ref()
-                    .map(|l| l.attempts)
-                    .unwrap_or(0);
-                self.durable.session.state.pending_notification_turn = None;
-                // If this clear-persist fails, the in-memory ledger is
-                // already None and any later successful save (including the
-                // ActorStop final write) heals the row — so a reaped actor
-                // can't resurrect a delivered ledger into a duplicate send.
-                self.persist_session_state_after_pending_change("subagent_notification_delivered")
-                    .await;
-                if is_blank_reply(&response.content) {
-                    if attempts > 0 {
-                        // With the retry cue in the request, a blank reply is
-                        // a real judgment — but after failures it may also be
-                        // a wedge; keep it observable.
-                        warn!(
-                            session_id = %self.durable.session.id,
-                            attempts,
-                            "subagent-notification retry produced no output; suppressing send"
-                        );
-                    } else {
-                        debug!(
-                            session_id = %self.durable.session.id,
-                            "subagent-notification produced no output; suppressing send"
-                        );
-                    }
-                    return;
-                }
-                self.send_response(response.into(), "subagent_notification")
-                    .await;
-            }
-            Err(e) => {
-                error!(
-                    session_id = %self.durable.session.id,
-                    error = %e,
-                    "subagent-notification turn failed"
-                );
-                self.record_notification_attempt_failure("notification turn failed")
-                    .await;
             }
         }
     }
@@ -1662,7 +1130,7 @@ impl AgentActor {
     /// Send a user-turn reply. A blank reply (no non-whitespace text) is
     /// anomalous for a user turn — the user is waiting — so surface a
     /// fallback `Notice` rather than push an empty bubble. (Non-user turns —
-    /// cron, subagent notification — silently suppress a blank reply.)
+    /// cron, background notification — silently suppress a blank reply.)
     async fn send_user_reply(&self, response: OutgoingMessage) {
         if is_blank_reply(&response.content) {
             warn!(

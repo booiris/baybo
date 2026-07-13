@@ -7,7 +7,7 @@
 Contents:
 
 - **Content models**: `ContentBlock`, `BlobRef`, `ChatMessage` (including the persisted `platform_msg_id` idempotency key for channel-originated user rows), `Role`, `MessageSource`, `ThinkingContent`, `MessageMetadata` (now an empty struct), `ToolResultMeta`, plus the `TOOL_OUTPUT_OPEN_PREFIX` / `TOOL_OUTPUT_CLOSE_PREFIX` marker constants and the `SHA256_PREFIX` blob-id prefix with its `blob_content_digest` helper
-- **Session types**: `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `Lineage`, `LineageKind`, `BackgroundCompressionPayload`, `GroupState`
+- **Session types**: `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `Lineage`, `LineageKind`, `BackgroundCompressionPayload`, `BackgroundNotificationState`, `BackgroundNotificationGroup`, `BackgroundNotificationDelivery`
 - **Memory types**: `MessageSource::RecalledMemory` (the framed recall-injection marker) + the `ChatMessage::recalled_memory` constructor
 - **Task types** (`task`): `Task`, `TaskStatus`, the `TASK_CREATE_TOOL_NAME` / `TASK_GET_TOOL_NAME` / `TASK_LIST_TOOL_NAME` / `TASK_UPDATE_TOOL_NAME` consts, and `TASK_MUTATING_TOOL_NAMES`
 - **Control events**: `ControlEvent`, `ControlEventKind`

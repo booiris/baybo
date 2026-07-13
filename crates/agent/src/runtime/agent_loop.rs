@@ -651,8 +651,8 @@ impl AgentLoop {
     // kicked it off — User / Cron / Spawned), used for the JobSpec.
     // The turn's triggering message is appended to the transcript by the
     // actor *before* this runs (via `append_user_message` / `append_cron_fire`
-    // / `append_subagent_notification`), so the loop iterates the current
-    // context rather than appending here.
+    // / `append_background_notification_prompt_once`), so the loop iterates
+    // the current context rather than appending here.
     /// Re-resolve the active client from the (possibly hot-swapped)
     /// pool at the start of a turn. When the resolved model changed
     /// since the last turn, swap the client, rebuild the billed-chat
@@ -1161,7 +1161,7 @@ impl AgentLoop {
         self.context_manager.append(&assistant_msg).await;
 
         // Surface each tool call as a live progress line before dispatch
-        // (streaming turns only; cron / subagent pass `delta_tx = None`).
+        // (streaming turns only; cron passes `delta_tx = None`).
         // Emitted ahead of `join_all` so the user sees "starting" before
         // any approval prompt the executor raises mid-call.
         for tc in &response.tool_calls {
@@ -1321,10 +1321,8 @@ impl AgentLoop {
                 // same helper, so routing back into the cohort agrees.
                 session
                     .state
-                    .background_groups
-                    .entry(baybo_model::GroupState::cohort_key(job_id, group))
-                    .or_default()
-                    .expected += 1;
+                    .background_notifications
+                    .register_group_member(job_id, group);
             }
 
             let raw_result_text = match &executed.output {
@@ -1964,8 +1962,10 @@ impl AgentLoop {
     }
 
     /// Append a one-shot cron fire's result to **this** (the scheduling)
-    /// conversation as a persisted `Role::Assistant` row, and return its
-    /// ordinal.
+    /// conversation as a persisted `Role::Assistant` row. A one-shot origin
+    /// delivery supplies `source_event_id` so a crash replay returns the
+    /// existing row instead of appending another copy; recurring fires pass
+    /// `None` because each fire owns a fresh conversation.
     ///
     /// No inference runs: `content` is the fire's own reply, already framed
     /// with a scheduled-task header ([`baybo_context::prompts::cron`]). The
@@ -1976,11 +1976,25 @@ impl AgentLoop {
     ///
     /// `None` when the session runs with no durable store (tests); the caller
     /// then has no ordinal to push or to record on the job.
-    pub async fn append_cron_notification(&mut self, content: Vec<ContentBlock>) -> Option<i64> {
+    pub async fn append_cron_notification(
+        &mut self,
+        content: Vec<ContentBlock>,
+        source_event_id: Option<&str>,
+    ) -> Option<baybo_session::SessionMessageAppendOutcome> {
         self.context_manager.ensure_seeded().await;
-        self.context_manager
-            .append(&ChatMessage::cron_notification(content))
-            .await
+        let message = ChatMessage::cron_notification(content);
+        match source_event_id {
+            Some(source_event_id) => {
+                self.context_manager
+                    .append_idempotent(source_event_id, &message)
+                    .await
+            }
+            None => self
+                .context_manager
+                .append(&message)
+                .await
+                .map(|ordinal| baybo_session::SessionMessageAppendOutcome::Inserted { ordinal }),
+        }
     }
 
     /// Append a subagent-spawned session's initial prompt as a persisted
@@ -1995,28 +2009,39 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Append the `SubagentNotification` prompt as a persisted agent-context
-    /// row (hidden from chat surfaces, like [`Self::append_spawned_prompt`])
-    /// and return its ordinal. Seeds the system prompt first — the
-    /// notification can be the first thing an otherwise-cold session appends.
-    ///
-    /// `None` means the persist failed; the just-pushed row has been popped
-    /// back off the window so the transcript and the log stay in lockstep.
-    /// The caller leaves the batch buffered and retries the whole drain on
-    /// its backoff.
-    pub async fn append_subagent_notification(
+    /// Append the public, non-LLM completion reply for a background batch.
+    /// The stable source-event id keeps crash replay from creating a second
+    /// assistant bubble.
+    pub async fn append_background_completion_reply_once(
         &mut self,
         content: Vec<ContentBlock>,
-    ) -> Option<i64> {
+        source_event_id: &str,
+    ) -> Option<baybo_session::SessionMessageAppendOutcome> {
         self.context_manager.ensure_seeded().await;
-        let msg = ChatMessage::agent_context(content);
-        match self.context_manager.append(&msg).await {
-            Some(ordinal) => Some(ordinal),
-            None => {
-                self.context_manager.pop_unpersisted_tail();
-                None
-            }
-        }
+        self.context_manager
+            .append_idempotent(source_event_id, &ChatMessage::assistant(content))
+            .await
+    }
+
+    /// Append the crash-replayable hidden prompt that carries a background
+    /// batch into its analysis turn. Existing rows are returned without
+    /// duplicating the live context window.
+    pub async fn append_background_notification_prompt_once(
+        &mut self,
+        content: Vec<ContentBlock>,
+        source_event_id: &str,
+    ) -> Option<baybo_session::SessionMessageAppendOutcome> {
+        self.context_manager.ensure_seeded().await;
+        self.context_manager
+            .append_idempotent(source_event_id, &ChatMessage::agent_context(content))
+            .await
+    }
+
+    /// Arm or clear the request-time background-notification retry cue. Applied
+    /// only while the transcript tail is an assistant row; never persisted. See
+    /// [`baybo_context::ContextManager::set_notification_cue`].
+    pub fn set_notification_cue(&mut self, armed: bool) {
+        self.context_manager.set_notification_cue(armed);
     }
 
     /// Run a streaming chat request, forwarding each text chunk through
@@ -2256,7 +2281,7 @@ impl AgentLoop {
     /// Emit a `ToolStarted` progress event before a tool call runs. The
     /// `label` (from `Tool::progress_label`, derived from LLM-written
     /// arguments) passes the leak boundary first. No-op when the turn
-    /// isn't streaming (`delta_tx` is `None`: cron / subagent).
+    /// isn't streaming (`delta_tx` is `None`: cron).
     async fn emit_tool_started(
         &self,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
@@ -2325,7 +2350,7 @@ impl AgentLoop {
     /// Emit a transient turn-[`AgentEvent::Status`] event (today:
     /// compaction start/end). No sanitization — the variant carries no
     /// free text. No-op when the turn isn't streaming (`delta_tx` is
-    /// `None`: cron / subagent).
+    /// `None`: cron).
     async fn emit_status(
         &self,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,

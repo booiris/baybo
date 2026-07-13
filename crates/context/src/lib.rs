@@ -72,7 +72,7 @@ use std::time::Instant;
 
 use baybo_llm::{ChatRequest, LlmResponse};
 use baybo_model::{BackgroundCompressionPayload, ChatMessage, ContentBlock, Role, SessionId};
-use baybo_session::SessionManager;
+use baybo_session::{SessionManager, SessionMessageAppendOutcome};
 use baybo_skills::render::{render_skill_block, render_skill_reminder};
 use baybo_skills::{
     SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry, SkillSummary,
@@ -225,6 +225,17 @@ pub struct ContextManager {
     /// reminder to the compression decision) and [`Self::record_call_actual`]
     /// subtracts it so the provider-anchored baseline stays messages-only.
     task_reminder_raw: usize,
+    /// Request-time retry cue for a background-notification turn (see
+    /// [`crate::prompts::background_notification`]). Set for the duration of a
+    /// notification delivery and cleared after; like [`Self::task_reminder`] it
+    /// is never persisted and never enters `self.messages`. It rides a request
+    /// **only when the transcript tail is an assistant row** — that is the sole
+    /// case a notification turn needs a synthetic user-role tail (a cancelled
+    /// prior attempt's salvage), so the mount is recomputed per request rather
+    /// than tracked. Both the request (`messages_for_llm`) and the trace marker
+    /// (`build_call_input_marker`) apply the same condition, so replay matches
+    /// what the model saw.
+    notification_cue: Option<ChatMessage>,
 }
 
 /// Required dependencies for [`ContextManager::from_config`]. Plain
@@ -281,6 +292,7 @@ impl ContextManager {
             last_synced_cursor: None,
             task_reminder: None,
             task_reminder_raw: 0,
+            notification_cue: None,
         }
     }
 
@@ -319,7 +331,7 @@ impl ContextManager {
         // row. The no-framing / no-reminder path stays clone-free.
         let mut base = if needs_framing {
             frame_recalled_memories(&frame_interjections(&self.messages))
-        } else if self.task_reminder.is_some() {
+        } else if self.task_reminder.is_some() || self.active_notification_cue().is_some() {
             self.messages.clone()
         } else {
             return merge_for_llm(&self.messages);
@@ -327,7 +339,37 @@ impl ContextManager {
         if let Some(reminder) = &self.task_reminder {
             base.push(reminder.clone());
         }
+        if let Some(cue) = self.active_notification_cue() {
+            base.push(cue.clone());
+        }
         merge_for_llm(&base)
+    }
+
+    /// The notification cue, but only when it should actually ride this
+    /// request: it exists AND the persisted transcript tail is an assistant
+    /// row (the sole case a notification turn lacks a user-role tail). The
+    /// condition is on `self.messages`, not the framed/reminder-appended view,
+    /// so the request and the trace marker agree. Recomputed per request, which
+    /// is what makes it correct across a mid-turn iteration (once a tool result
+    /// or the model's reply lands, the tail is user-role and the cue drops out)
+    /// and across a crash-replay (no attempt counter to desync).
+    fn active_notification_cue(&self) -> Option<&ChatMessage> {
+        let cue = self.notification_cue.as_ref()?;
+        let tail_is_assistant = self
+            .messages
+            .last()
+            .is_some_and(|m| m.role == baybo_model::Role::Assistant);
+        tail_is_assistant.then_some(cue)
+    }
+
+    /// Arm (or clear) the request-time background-notification retry cue. The
+    /// actor sets it around a notification delivery turn; it is applied only
+    /// when [`Self::active_notification_cue`]'s tail condition holds. Never
+    /// persisted, never added to `self.messages`.
+    pub fn set_notification_cue(&mut self, armed: bool) {
+        self.notification_cue = armed.then(|| {
+            ChatMessage::agent_context(crate::prompts::background_notification::build_retry_cue())
+        });
     }
 
     /// Set (or clear) the transient planning-checklist reminder injected at the
@@ -686,12 +728,46 @@ impl ContextManager {
     /// `append` calls is resolved before the next LLM request is
     /// built.
     pub async fn append(&mut self, msg: &ChatMessage) -> Option<i64> {
+        self.push_message(msg);
+        self.persist_appended(msg).await
+    }
+
+    /// Persist a source-event-backed row atomically and mirror it into the
+    /// live window only when the store inserted a new row. A replay returns
+    /// the original ordinal without duplicating the in-memory transcript.
+    pub async fn append_idempotent(
+        &mut self,
+        source_event_id: &str,
+        msg: &ChatMessage,
+    ) -> Option<SessionMessageAppendOutcome> {
+        match self
+            .sessions
+            .append_session_message_idempotent(&self.session_id, source_event_id, msg)
+            .await
+        {
+            Ok(outcome) => {
+                if outcome.was_inserted() {
+                    self.push_message(msg);
+                }
+                Some(outcome)
+            }
+            Err(error) => {
+                warn!(
+                    session_id = %self.session_id,
+                    error = %error,
+                    "failed to append idempotent message to session_messages log"
+                );
+                None
+            }
+        }
+    }
+
+    fn push_message(&mut self, msg: &ChatMessage) {
         let count = self.message_budget_tokens(msg);
         record_skill_calls(&mut self.called_skills, msg);
         self.messages.push(msg.clone());
         self.per_message_tokens.push(count);
         self.budget.update(self.count_tokens());
-        self.persist_appended(msg).await
     }
 
     /// Append a mid-turn user interjection as a faithful user-bubble row. The
@@ -752,19 +828,6 @@ impl ContextManager {
                 .cloned(),
         );
         self.tokenizer.count_message(&ChatMessage::user(framed))
-    }
-
-    /// Remove the tail row after [`Self::append`] reported its persist failed
-    /// (`None`). `append` pushes onto the in-memory window *before* writing
-    /// the store, so a failed persist leaves a row the log doesn't have —
-    /// wedging the window/log lockstep that the trace input markers and the
-    /// compression fast-path rely on. Sound only for the just-appended tail;
-    /// callers must invoke it immediately, before any further append.
-    pub fn pop_unpersisted_tail(&mut self) {
-        self.messages.pop();
-        self.per_message_tokens.pop();
-        self.called_skills = self.called_skills_in(&self.messages);
-        self.budget.update(self.count_tokens());
     }
 
     /// Cap untrusted tool output to the per-result byte budget, spilling the
@@ -1250,7 +1313,14 @@ impl ContextManager {
     /// every turn. Falls back to `Inline(messages)` when the store
     /// has no rows yet (fresh session) or the lookup errors.
     pub async fn build_call_input_marker(&self) -> LlmCallInputs {
-        self.input_marker_with_suffix(Vec::new()).await
+        // The notification cue rides the request as a suffix (not a log row),
+        // so the marker must carry it too or replay would omit it. Same tail
+        // condition as `messages_for_llm`.
+        let suffix = self
+            .active_notification_cue()
+            .map(|cue| vec![cue.clone()])
+            .unwrap_or_default();
+        self.input_marker_with_suffix(suffix).await
     }
 
     /// Like [`build_call_input_marker`](Self::build_call_input_marker) but
@@ -1266,12 +1336,10 @@ impl ContextManager {
         // Emit a `Persisted` reference only when the anchor ordinal and the
         // prefix count are both known AND the persisted active set mirrors the
         // in-memory window (`count == messages.len()` — the same invariant
-        // `synced_last_ordinal` guards). Every append persists its row in
-        // lockstep (a failed persist is popped back off via
-        // `pop_unpersisted_tail`), so a divergence here means a store error
-        // slipped through; the tripwire can't catch an under-counted prefix
-        // (the reconstructed count would match it), so any miss falls back to
-        // a self-contained inline copy instead.
+        // `synced_last_ordinal` guards). A divergence means a regular append
+        // failed after entering the live window; the tripwire can't catch an
+        // under-counted prefix (the reconstructed count would match it), so
+        // any miss falls back to a self-contained inline copy instead.
         if let (Ok(Some(last_ordinal)), Ok(prefix_len)) = (
             self.sessions.latest_session_ordinal(&self.session_id).await,
             self.sessions.count_active_messages(&self.session_id).await,
@@ -2072,7 +2140,12 @@ mod tests {
         ))
     }
 
-    fn make_ctx(keep_recent: usize, max_tokens: usize, threshold: f64) -> ContextManager {
+    fn make_ctx_with_sessions(
+        sessions: Arc<baybo_session::SessionManager>,
+        keep_recent: usize,
+        max_tokens: usize,
+        threshold: f64,
+    ) -> ContextManager {
         let mut ctx = ContextManager::from_config(ContextManagerConfig {
             tokenizer: Arc::new(SimpleTokenizer),
             workspace: test_workspace(),
@@ -2081,11 +2154,15 @@ mod tests {
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             session_id: test_session_id(),
-            sessions: test_sessions(),
+            sessions,
             subagent_profile: None,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
+    }
+
+    fn make_ctx(keep_recent: usize, max_tokens: usize, threshold: f64) -> ContextManager {
+        make_ctx_with_sessions(test_sessions(), keep_recent, max_tokens, threshold)
     }
 
     #[test]
@@ -2115,6 +2192,40 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn idempotent_append_mirrors_only_new_source_events() {
+        let sessions = test_sessions();
+        let mut ctx = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        let original = make_msg(Role::User, "original");
+        let replay = make_msg(Role::User, "replay");
+        let source_event_id = "background-notification:batch:prompt";
+
+        assert_eq!(
+            ctx.append_idempotent(source_event_id, &original).await,
+            Some(SessionMessageAppendOutcome::Inserted { ordinal: 0 })
+        );
+        assert_eq!(
+            ctx.append_idempotent(source_event_id, &replay).await,
+            Some(SessionMessageAppendOutcome::Existing { ordinal: 0 })
+        );
+        assert_eq!(ctx.messages(), std::slice::from_ref(&original));
+
+        let mut restored = make_ctx_with_sessions(Arc::clone(&sessions), 5, 100_000, 0.75);
+        restored.restore_from_store().await;
+        assert_eq!(
+            restored.append_idempotent(source_event_id, &replay).await,
+            Some(SessionMessageAppendOutcome::Existing { ordinal: 0 })
+        );
+        assert_eq!(restored.messages(), std::slice::from_ref(&original));
+        assert_eq!(
+            sessions
+                .load_active_session_messages(&test_session_id())
+                .await
+                .expect("load transcript"),
+            restored.messages()
+        );
+    }
+
     /// Steady state — every in-memory row is also persisted — so the marker
     /// references the transcript by ordinal: `prefix_len` equals the window
     /// size.
@@ -2135,6 +2246,78 @@ mod tests {
                 assert!(suffix.is_empty());
             }
             other => panic!("expected Persisted, got {other:?}"),
+        }
+    }
+
+    /// The armed notification cue rides a request ONLY when the transcript
+    /// tail is an assistant row (the case a notification retry lacks a
+    /// user-role tail), and it never enters `self.messages`.
+    #[tokio::test]
+    async fn notification_cue_mounts_only_on_an_assistant_tail() {
+        let cue_text = "no complete report";
+        let has_cue = |msgs: &[ChatMessage]| {
+            msgs.iter().any(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text(t) if t.contains(cue_text)))
+            })
+        };
+
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, "prompt row")).await; // tail is user-role
+        ctx.set_notification_cue(true);
+
+        // User-role tail: armed, but the cue must NOT mount.
+        let req = ctx.messages_for_llm();
+        assert!(!has_cue(&req), "cue must not mount on a user-role tail");
+        assert!(
+            !has_cue(ctx.messages()),
+            "cue must never enter the persisted window"
+        );
+
+        // Assistant tail (a prior attempt's cancelled salvage): the cue mounts.
+        ctx.append(&make_msg(Role::Assistant, "partial… [cut short]"))
+            .await;
+        let req = ctx.messages_for_llm();
+        assert!(has_cue(&req), "cue must mount on an assistant tail");
+        assert_eq!(
+            req.last().map(|m| m.role),
+            Some(Role::User),
+            "the cue must give the request a user-role tail"
+        );
+        assert!(
+            !has_cue(ctx.messages()),
+            "the mounted cue still must not be persisted"
+        );
+
+        // Disarmed: no cue regardless of tail.
+        ctx.set_notification_cue(false);
+        assert!(!has_cue(&ctx.messages_for_llm()), "disarmed → no cue");
+    }
+
+    /// The cue rides the request as a marker suffix too, so trace replay
+    /// reconstructs exactly what the model saw (unlike `task_reminder`, whose
+    /// omission from the marker is a known gap). On an assistant tail the
+    /// marker must be `Persisted` with the cue as its sole suffix.
+    #[tokio::test]
+    async fn notification_cue_rides_the_trace_marker_suffix() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, "prompt row")).await;
+        ctx.append(&make_msg(Role::Assistant, "partial… [cut short]"))
+            .await;
+        ctx.set_notification_cue(true);
+
+        match ctx.build_call_input_marker().await {
+            LlmCallInputs::Persisted {
+                prefix_len, suffix, ..
+            } => {
+                assert_eq!(prefix_len, 3, "the three persisted rows");
+                assert_eq!(suffix.len(), 1, "the cue is the sole marker suffix");
+                assert_eq!(suffix[0].role, Role::User);
+            }
+            other => panic!("expected Persisted with a cue suffix, got {other:?}"),
         }
     }
 
@@ -2166,28 +2349,6 @@ mod tests {
             }
             other => panic!("expected Inline fallback, got {other:?}"),
         }
-    }
-
-    /// `pop_unpersisted_tail` is the failed-persist compensator: `append`
-    /// pushes in-memory before writing the store, so on `None` the caller
-    /// pops the tail to keep window == log. Everything derived from the
-    /// window (budget, per-message cache) must roll back with it.
-    #[tokio::test]
-    async fn pop_unpersisted_tail_restores_window_and_budget() {
-        let mut ctx = make_ctx(5, 100_000, 0.75);
-        ctx.append(&make_msg(Role::System, "sys")).await;
-        ctx.append(&make_msg(Role::User, "hi")).await;
-        let before_len = ctx.messages().len();
-        let before_budget = ctx.budget().current();
-
-        ctx.append(&make_msg(Role::User, "doomed row")).await;
-        ctx.pop_unpersisted_tail();
-
-        assert_eq!(ctx.messages().len(), before_len);
-        assert_eq!(ctx.budget().current(), before_budget);
-        // The window mirrors the log again... except the store kept the
-        // "doomed" row (this test's store never fails); the marker fallback
-        // covers that divergence. What matters here is the in-memory rollback.
     }
 
     #[tokio::test]
