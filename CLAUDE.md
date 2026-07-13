@@ -44,6 +44,34 @@ RUST_LOG=baybo=trace cargo run                # verbose
 RUST_LOG=baybo_agent=debug cargo run          # agent crate only
 ```
 
+## Pull Requests
+
+**Open every PR as a draft (`gh pr create --draft`), and never mark it ready
+yourself.** The owner reviews it first and says when it may go ready. Marking it
+ready is what starts CI and what puts it in front of reviewers — that is the
+owner's call, not the author's.
+
+```bash
+gh pr create --draft --base master --head <branch> --title "…" --body "…"
+# … owner reviews, and only then:
+gh pr ready <number>
+```
+
+**A draft PR runs NO CI, and a skipped run looks exactly like a passing one.**
+Every job in `.github/workflows/ci.yml` carries
+`if: ${{ github.event.pull_request.draft == false }}` — deliberately, because a
+skipped job spins up no runner and bills no minutes. The trap is on the reading
+side: `gh pr checks --watch` on a draft reports every job as `skipping` and
+**exits 0**, which is indistinguishable from green at a glance. Before merging,
+confirm the gating jobs actually say `pass`. If they say `skipping`, CI has never
+seen the code.
+
+The macOS jobs cost 10× Linux minutes, which is why the iOS jobs are currently
+`if: false` (see `61eb9246`). While that holds, **nothing under `app/ios` is
+covered by CI** — the Rust core, the transcript bundle, and the Swift suite are
+all local-only. Run them by hand and say so in the PR body; do not let a green
+check imply coverage it does not have.
+
 ## Code Style
 
 - Prefer `crate::` for cross-module imports; `super::` is fine in tests and intra-module refs

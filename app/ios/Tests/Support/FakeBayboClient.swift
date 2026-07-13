@@ -44,6 +44,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var approvals: [ApprovalCall] = []
     private var marksRead: [Int64] = []
 
+    private var apiLegInvalidations = 0
+
     private var connectError: Error?
     private var sendError: Error?
     private var createSessionError: Error?
@@ -68,6 +70,10 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var lookupCalls: [LookupCall] { lock.withLock { lookups } }
     var approvalCalls: [ApprovalCall] { lock.withLock { approvals } }
     var readOrdinals: [Int64] { lock.withLock { marksRead } }
+    /// How many times the app dropped its warm relay API legs — the `.background`
+    /// barrier. iOS suspends without warning and takes the sockets with it, so a
+    /// leg that outlives a suspend is a zombie.
+    var apiLegInvalidationCount: Int { lock.withLock { apiLegInvalidations } }
 
     /// Every transmission of a message, however it reached the wire — the
     /// initial `chatSendAfterConnect` on a cold leg and every later `chatSend`.
@@ -231,6 +237,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     func pairedDevice() -> String? { nil }
     func registerPush() async throws -> String? { throw Self.unsupported }
+    func relayInvalidateApiLegs() { lock.withLock { apiLegInvalidations += 1 } }
     func relayPreconnect() async throws { throw Self.unsupported }
     func setApnsToken(tokenHex: String) {}
     func setSessionListSink(sink: SessionListSink) {}

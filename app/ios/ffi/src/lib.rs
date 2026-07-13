@@ -92,6 +92,22 @@ impl BayboClient {
         self.apns.set_token(token_hex);
     }
 
+    /// Drop every warm relay API leg, and orphan the ones currently checked out.
+    ///
+    /// Called on the app's `.background` edge. iOS suspends the process without
+    /// warning and takes the sockets with it, so a pooled leg that outlives a
+    /// suspend is a zombie: it looks alive, accepts a write, and then goes silent
+    /// until the first-byte timeout.
+    ///
+    /// Deliberately NOT async, and deliberately not hung off `relay_preconnect`.
+    /// It must run synchronously on the scene-phase edge, BEFORE anything a later
+    /// Task might do with a leg — `preconnect` is guarded by an in-flight latch
+    /// that would skip it in exactly the weak-network case that needs it, and it
+    /// races the chat list's own foreground refresh besides.
+    pub fn relay_invalidate_api_legs(&self) {
+        relay::leg_pool::pool().invalidate();
+    }
+
     /// Install the chat list's session-activity sink: the connection-global
     /// `Frame::SessionActivity` pings (for ANY session, subscribed or not) land
     /// here so the list can bump unread + recency without subscribing every
@@ -317,8 +333,21 @@ impl BayboClient {
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => {
-                    refresh_relay_apns_best_effort(&this.apns).await;
-                    transport::preconnect(&this.relay).await
+                    // Snapshot the pool generation BEFORE the first await. If the app
+                    // backgrounds while the chat leg is dialing, the barrier's epoch
+                    // bump lands in that window — and a `warm()` that read the epoch
+                    // afterwards would stamp its leg as CURRENT and park it, handing
+                    // the pool the very zombie the barrier exists to keep out (the
+                    // suspend takes that socket with it).
+                    let epoch = relay::leg_pool::pool().epoch();
+                    // The chat leg first: it is what a chat actually needs, and it
+                    // should not race a warm-up for a relay connection slot.
+                    transport::preconnect(&this.relay).await?;
+                    // Then park one API leg, so the list refresh the user is about
+                    // to trigger does not pay a dial.
+                    relay::leg_pool::warm(epoch).await;
+                    refresh_relay_apns_best_effort(this.apns.clone());
+                    Ok(())
                 }
                 ActiveLeg::Direct => Ok(()),
             }
@@ -357,7 +386,7 @@ impl BayboClient {
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => {
-                    refresh_relay_apns_best_effort(&this.apns).await;
+                    refresh_relay_apns_best_effort(this.apns.clone());
                     transport::connect(&this.relay, session_id, sink).await
                 }
                 ActiveLeg::Direct => transport::connect(&this.direct, session_id, sink).await,
@@ -437,7 +466,7 @@ impl BayboClient {
                 attachments.into_iter().map(Into::into).collect();
             match active_leg()? {
                 ActiveLeg::Relay => {
-                    refresh_relay_apns_best_effort(&this.apns).await;
+                    refresh_relay_apns_best_effort(this.apns.clone());
                     transport::connect_and_send(
                         &this.relay,
                         session_id,
@@ -704,16 +733,47 @@ fn debug_seed_push_key() {
     log::debug!("keychain self-check: {result}");
 }
 
-async fn refresh_relay_apns_best_effort(apns: &ApnsState) {
-    let Some(token) = apns.token() else {
-        log::info!("connecting without an APNs token; relay push binding not refreshed");
+/// Tell the gateway this device's APNs token, if it does not already know it.
+///
+/// Detached from every caller's critical path on purpose. It used to be `.await`ed
+/// BEFORE `transport::connect`, so every chat-leg subscribe queued behind it — and
+/// with the API leg pool underneath, a foreground (which reconnects up to a dozen
+/// resident stores at once) would have put a dozen identical POSTs in front of the
+/// chat leg the user is waiting on. The steady-state answer is to send nothing at
+/// all; when there IS something to send, it does not need to be first.
+fn refresh_relay_apns_best_effort(apns: Arc<ApnsState>) {
+    let Some(token) = apns.claim_post() else {
         return;
     };
-    if let Err(e) =
-        gateway_api::update_apns_token(&relay::GatewayApi, &token, apns.env().as_str()).await
-    {
-        log::warn!("relay APNs token refresh failed: {e}");
-    }
+    tokio::spawn(async move {
+        let mut token = token;
+        loop {
+            let delivered = match gateway_api::update_apns_token(
+                &relay::GatewayApi,
+                &token,
+                apns.env().as_str(),
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("relay APNs token refresh failed: {e}");
+                    false
+                }
+            };
+            apns.finish_post(token, delivered);
+            if !delivered {
+                return;
+            }
+            // iOS rotated the token while that POST was on the wire. Chase it here
+            // rather than leave the gateway bound to the one it just retired and
+            // hope some later connect notices.
+            match apns.claim_post() {
+                Some(next) => token = next,
+                None => return,
+            }
+        }
+    });
 }
 
 /// Select the rustls crypto provider for the process. `tokio-tungstenite` pulls
