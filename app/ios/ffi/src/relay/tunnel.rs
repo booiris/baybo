@@ -328,17 +328,26 @@ async fn recv_binary_with_timeout(ws: &mut WsStream, timeout: Duration) -> Resul
 
 /// Body chunks for `request_id`, sized to the tunnel's chunk ceiling.
 ///
+/// LAZY, and it has to be: an attachment runs to 100 MiB, and it is already held
+/// twice (Swift's `Data`, then the `Vec<u8>` that crossed the FFI). Materialising
+/// every frame up front would own a third copy of the whole thing before the first
+/// byte left the device — enough to have iOS kill an upload that would otherwise
+/// have gone through. Only one chunk is alive at a time.
+///
 /// An EMPTY body is no body at all: the head declares `body_len: None` and not a
 /// single `Body` frame goes out. The gateway folds a declared length of zero into
 /// its no-body branch and NEVER reads that frame — on a one-shot leg the close
 /// reclaimed it, but on a reused one it surfaces as the next request's first
 /// frame. (The gateway drops such a straggler by id, but that seatbelt exists for
 /// clients already in the field; this one must not need it.)
-pub(crate) fn body_frames(request_id: u64, body: &[u8]) -> Vec<TunnelRequest> {
+pub(crate) fn body_frames(
+    request_id: u64,
+    body: &[u8],
+) -> impl Iterator<Item = TunnelRequest> + '_ {
     let size = body.len() as u64;
     let mut offset = 0u64;
     body.chunks(crate::core::MAX_TUNNEL_CHUNK)
-        .map(|chunk| {
+        .map(move |chunk| {
             let chunk_len = chunk.len() as u64;
             let frame = TunnelRequest::Body {
                 request_id,
@@ -349,7 +358,6 @@ pub(crate) fn body_frames(request_id: u64, body: &[u8]) -> Vec<TunnelRequest> {
             offset += chunk_len;
             frame
         })
-        .collect()
 }
 
 /// The `Content-Length`-shaped declaration for a request body: `None` for an
@@ -562,16 +570,37 @@ mod tests {
 
     #[test]
     fn an_empty_body_produces_no_frames_and_no_declared_length() {
-        assert!(body_frames(1, &[]).is_empty());
+        assert_eq!(body_frames(1, &[]).count(), 0);
         assert_eq!(declared_body_len(Some(&[])), None);
         assert_eq!(declared_body_len(None), None);
         assert_eq!(declared_body_len(Some(&[1, 2, 3])), Some(3));
     }
 
+    /// An attachment runs to 100 MiB and is already held twice before it gets here.
+    /// Materialising every frame up front would own a third copy of the whole thing
+    /// before the first byte left the device — enough for iOS to kill an upload that
+    /// would otherwise have gone through. Taking one frame must not build the rest.
+    #[test]
+    fn body_frames_are_built_one_at_a_time() {
+        let body = vec![7u8; crate::core::MAX_TUNNEL_CHUNK * 4];
+        let mut frames = body_frames(1, &body);
+
+        let first = frames.next().expect("a frame");
+        let TunnelRequest::Body { data, .. } = &first else {
+            panic!("expected a body frame, got {first:?}");
+        };
+        assert_eq!(data.len(), crate::core::MAX_TUNNEL_CHUNK);
+        assert_eq!(
+            frames.size_hint(),
+            (3, Some(3)),
+            "the other three are still unbuilt"
+        );
+    }
+
     #[test]
     fn a_body_is_chunked_contiguously_with_last_only_at_the_end() {
         let body = vec![7u8; crate::core::MAX_TUNNEL_CHUNK + 1];
-        let frames = body_frames(9, &body);
+        let frames: Vec<_> = body_frames(9, &body).collect();
 
         assert_eq!(frames.len(), 2);
         let mut expected_offset = 0u64;
