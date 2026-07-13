@@ -75,7 +75,7 @@ use reqwest::redirect;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use baybo_trace::ToolEventPayload;
+use baybo_trace::{SPAN_EVENT_TEXT_MAX_BYTES, ToolEventPayload};
 
 use crate::{
     ResourceAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, start_timer,
@@ -97,12 +97,6 @@ const MAX_SUMMARY_INPUT_BYTES: usize = 96 * 1024;
 /// scripts.
 const SUMMARY_MIN_CHARS: usize = 2048;
 const ERROR_BODY_PREVIEW_BYTES: usize = 8 * 1024;
-/// Cap on the rendered-body preview persisted into the trace's
-/// `HttpFetch` event payload. The full rendered text still flows back
-/// to the agent via `ToolOutput::Text`; this only governs what shows
-/// up in the audit trail. Bytes (not chars) — `truncate_utf8` cuts on
-/// a UTF-8 boundary.
-const HTTP_BODY_PREVIEW_BYTES: usize = 32 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIRECT_LIMIT: usize = 5;
 const CALL_LABEL_MAX: usize = 120;
@@ -476,9 +470,12 @@ Usage notes:
                 status: status.as_u16(),
                 bytes: body_bytes_read as u64,
                 content_type: empty_to_none(&content_type),
+                // A preview, not a second copy of the page — the full rendering
+                // is archived in the blob store just below and reachable via
+                // `raw_content_file`.
                 body_preview: empty_to_none(&truncate_utf8(
                     rendered.as_bytes(),
-                    HTTP_BODY_PREVIEW_BYTES,
+                    SPAN_EVENT_TEXT_MAX_BYTES,
                 )),
             },
         );
@@ -542,7 +539,14 @@ Usage notes:
                         "llm_summary",
                         ToolEventPayload::LlmCall {
                             model: llm.model_info().id.clone(),
-                            input: summary_user_text.clone(),
+                            // The prompt embeds the whole (96 KiB-capped) page;
+                            // cloning it here persisted a second copy of the
+                            // page per fetch. The event only needs enough to
+                            // recognise the call.
+                            input: truncate_utf8(
+                                summary_user_text.as_bytes(),
+                                SPAN_EVENT_TEXT_MAX_BYTES,
+                            ),
                             output: body.clone(),
                         },
                     );

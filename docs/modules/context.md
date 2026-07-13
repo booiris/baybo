@@ -14,7 +14,7 @@ the same constructor — no separate "in-memory mode" exists.
 
 Core responsibilities:
 
-- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `baybo-model`) carries only metadata (id, user, channel, lineage, soul binding, …). Every `append` calls `persist_appended` (→ `SessionManager::append_session_message`) and every successful compression calls `persist_compaction` (→ `SessionManager::apply_session_compaction`). Cold-start hydration via `restore_from_store` seeds the manager so an actor restart preserves the conversation.
+- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `baybo-model`) carries only metadata (id, user, channel, lineage, soul binding, …). Ordinary `append` calls `persist_appended` (→ `SessionManager::append_session_message`); `append_idempotent` asks the store to atomically claim a `source_event_id` and mirrors the message into the live window only for `Inserted`, never `Existing`. Every successful compression calls `persist_compaction` (→ `SessionManager::apply_session_compaction`). Cold-start hydration via `restore_from_store` seeds the manager so an actor restart preserves the conversation.
 - **Caller-driven compression**: `append()` is pure (push + budget update); the agent loop calls `maybe_compress()` at well-defined points so compression LLM cost can be recorded against the cost ledger
 - **Token budget tracking**: track current token usage and remaining capacity via `TokenBudget`, anchored to the provider's authoritative `usage.input_tokens` between calls
 - **Hardcoded compression flow**: a single `Compressor` impl block on `ContextManager` runs three stages in sequence — summary.md fast-path → live LLM summary → truncate fallback. No trait, no dispatch — every production session takes the same path.
@@ -54,8 +54,9 @@ ContextManager (struct)
 └── prompts/          — all model-facing framing text + pure builders
     ├── soul.rs            — assemble_from_workspace (TOP/TAIL hints + identity)
     ├── cron.rs            — frame_cron_prompt / original_cron_prompt
-    ├── subagent.rs        — build_notification_content (<background_results> XML
-    │                        for the background-jobs notification turn)
+    ├── background_notification.rs — build_completion_reply +
+    │                              build_notification_content
+    │                              (<background_results> notification XML)
     ├── interjection.rs    — wrap_interjections (mid-turn steering envelope)
     ├── recalled_memory.rs — wrap_recalled_memories (recall envelope)
     ├── tasks.rs           — render_task_list (transient checklist reminder)
@@ -69,7 +70,8 @@ ContextManager (struct)
 the LLM transcript. The pure builders are unit-testable on their own; both
 `ContextManager` (`resolve_system_prompt` via `ensure_seeded`,
 `cap_tool_output`, `reseed_system_row`) and the agent-loop seam
-(`append_cron_fire`, `append_subagent_notification`) call into them. The
+(`append_cron_fire`, `append_background_completion_reply_once`,
+`append_background_notification_prompt_once`) call into them. The
 injection *detection* for tool output stays in `baybo-security`; only the
 `<tool_output>` envelope formatting lives here (the shared delimiter is
 `baybo_model::TOOL_OUTPUT_{OPEN,CLOSE}_PREFIX`).

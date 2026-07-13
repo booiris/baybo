@@ -111,7 +111,7 @@ The job state machine itself is trigger-agnostic, but the actor that drives it f
 
 A running turn drains the leading run of non-slash user inputs at each tool boundary and injects them mid-turn (non-preemptive — never mid-LLM-call); anything still queued when the turn ends is coalesced into the next turn. Preemption is not implemented — `CancelReason::UserPreempt` has no production producer today; the out-of-band `/stop` is the only way to cancel a running turn.
 
-`/stop` cancels the in-flight turn (and every in-flight descendant subagent) with `Cancelled { UserStopped, ... }` — suppression of the terminal `BackgroundJobFinished` delivery comes from `/stop` draining the supervisor's in-flight background-subagent registry (each child's wait task finds its entry gone and drops the delivery), so a stopped result never repopulates `pending_background_results`; `UserStopped` is the audit reason stamped on the cancelled rows.
+`/stop` cancels the in-flight turn (and every in-flight descendant subagent) with `Cancelled { UserStopped, ... }` — suppression of the terminal `BackgroundJobFinished` delivery comes from `/stop` draining the supervisor's in-flight background-subagent registry (each child's wait task finds its entry gone and drops the delivery), so a stopped result never repopulates the parent notification buffer; `UserStopped` is the audit reason stamped on the cancelled rows.
 
 ### Collaboration with Trace
 

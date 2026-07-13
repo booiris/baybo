@@ -46,8 +46,9 @@ pub use money::{MicroUsd, usd_decimal_option};
 pub use pricing::LlmPricingOverride;
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
-    BackgroundCompressionPayload, ChannelType, GroupState, Lineage, LineageKind, Session,
-    SessionState, TriggerKind, TriggerSource, User,
+    BackgroundCompressionPayload, BackgroundNotificationDelivery, BackgroundNotificationGroup,
+    BackgroundNotificationState, ChannelType, Lineage, LineageKind, Session, SessionState,
+    TriggerKind, TriggerSource, User,
 };
 pub use spawn_protocol::{
     BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_SUBAGENT_HANDLE_PREFIX, BackgroundJobKind,

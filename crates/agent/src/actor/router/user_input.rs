@@ -330,8 +330,8 @@ impl Router {
     /// subagents that already *completed* but haven't been reported yet are
     /// left untouched — `/stop` only stops what's still running, so those
     /// notify normally once the cancelled turn returns and the actor drains
-    /// `pending_background_results`. Idempotent and safe on an idle session
-    /// (everything degrades to a no-op).
+    /// its background-notification buffer. Idempotent and safe on an idle
+    /// session (everything degrades to a no-op).
     async fn handle_stop(
         &self,
         session_id: &SessionId,
@@ -343,7 +343,7 @@ impl Router {
         // Drain the in-flight background subagents first: the removal both
         // gives us the cancel targets + ack summaries AND suppresses each
         // child's terminal delivery (its wait task sees the entry gone), so a
-        // stopped result can't repopulate `pending_background_results`.
+        // stopped result can't repopulate the notification buffer.
         let background = self
             .supervisor
             .take_in_flight_background_subagents(session_id);
@@ -402,11 +402,9 @@ impl Router {
             info.cancel_token.cancel();
         }
 
-        // Note: we deliberately do NOT touch `pending_background_results` or
-        // drain queued `BackgroundJobFinished`. Those hold results from subagents
-        // that already finished; `/stop` stops running work, it doesn't discard
-        // completed work — so once the cancelled turn returns, the actor reports
-        // them via the normal notification path.
+        // Note: we deliberately do not touch durable background-notification
+        // state or drain queued `BackgroundJobFinished` messages. Those hold
+        // already-completed work, which reports after the cancelled turn returns.
         let text = build_stop_notice(cancelled_turn, &background);
 
         // Fire the live notice first so the user sees the stop immediately,

@@ -1,16 +1,21 @@
-//! Framing for the autonomous notification turn — the synthetic prompt the
+//! Framing for the autonomous background-notification turn — the synthetic prompt the
 //! parent session runs when one or more background jobs (detached subagents
 //! and detached `Bash` commands) finish. Built here (pure) so the framing
-//! lives with the rest of the prompt-injection text; the agent actor appends
-//! the result **in-memory only** (rebuilt from the durable
-//! `pending_background_results` buffer on every retry) and never persists it.
+//! lives with the rest of the prompt-injection text; the agent actor persists
+//! the result as a hidden agent-context row and records it on the session's
+//! notification ledger, which drives delivery retries.
 
 use baybo_model::{BackgroundJobKind, ContentBlock, PendingBackgroundResult, SubagentExitStatus};
 
+/// Deterministic assistant-reply lead sent before the parent starts analysing
+/// a finished background batch.
+const BACKGROUND_COMPLETION_REPLY_LEAD: &str =
+    "Background work has finished. I'm reviewing the result now.";
+
 /// Opening framing for a notification turn's content. Lives in per-turn
 /// content (never the system prompt) so the prompt-cache prefix is identical
-/// to a normal main-path turn. Cron-style: report proactively.
-const BACKGROUND_NOTIFICATION_FRAMING: &str = "[background task(s) finished since your last turn — report the outcome to the user as a fresh, proactive message.]";
+/// to a normal main-path turn.
+const BACKGROUND_NOTIFICATION_FRAMING: &str = "[background task(s) finished since your last turn. A brief completion acknowledgement has already been sent to the user. Analyze the results now and report the useful outcome as the next fresh, proactive message; do not repeat the acknowledgement.]";
 
 /// Per-result element of the nested `<background_results>` block. Metadata
 /// rides as attributes; `task` / `output` (and the kind-specific `detail`)
@@ -22,11 +27,55 @@ const BACKGROUND_RESULT_TEMPLATE: &str = r#"  <result handle="{{handle}}" type="
 {{detail}}  </result>
 "#;
 
+/// Request-time cue that gives a notification-turn request a user-role tail.
+/// It is load-bearing, not decoration: a cancelled attempt's salvage leaves an
+/// assistant row at the transcript tail, and a request ending on an assistant
+/// message is provider *prefill* — rejected outright by Anthropic with
+/// extended thinking on — so the retry needs a user-side tail; it also
+/// un-buries the prompt from behind the failed attempt's partial rows, and it
+/// makes a blank retry reply a genuine "nothing to add" judgment instead of
+/// an "I already answered above" artifact.
+///
+/// Never persisted: it is applied as a request-time suffix
+/// ([`ContextManager::set_notification_cue`]) only while the transcript tail is
+/// an assistant row, so it is recomputed per request rather than carrying an
+/// attempt number — a persisted, attempt-keyed cue was a no-op on the exact
+/// crash-replay it had to survive (the counter only advances on an observed
+/// failure) and left permanent rows in the append-only log.
+const RETRY_CUE: &str = "[the user has received only the completion acknowledgement; no complete report for the background results above has reached them yet — produce the complete report now.]";
+
+/// Build the persisted, non-LLM completion reply that precedes the streamed
+/// analysis turn. It includes each result's bounded `summary_text` so the user
+/// immediately sees what finished while the parent prepares its full report.
+pub fn build_completion_reply(pending: &[PendingBackgroundResult]) -> Vec<ContentBlock> {
+    let mut reply = String::from(BACKGROUND_COMPLETION_REPLY_LEAD);
+    if pending.len() == 1 {
+        reply.push_str("\n\nSummary:\n");
+        reply.push_str(&truncate_for_notice(&pending[0].summary_text));
+    } else if !pending.is_empty() {
+        reply.push_str("\n\nSummaries:");
+        for result in pending {
+            reply.push_str("\n\n");
+            reply.push_str(&result.label);
+            reply.push_str(":\n");
+            reply.push_str(&truncate_for_notice(&result.summary_text));
+        }
+    }
+    vec![ContentBlock::Text(reply)]
+}
+
+/// The request-time retry cue (see [`RETRY_CUE`]). Stateless — the same for
+/// every attempt, because the decision to apply it is made per request from
+/// the transcript tail, not from an attempt counter.
+pub fn build_retry_cue() -> Vec<ContentBlock> {
+    vec![ContentBlock::Text(RETRY_CUE.to_string())]
+}
+
 /// Render pending background-job results into nested-XML content for one
-/// notification turn. Pure — the caller owns the buffer so it can restore the
-/// results if the turn fails. The framing rides in this per-turn content
-/// (never the system prompt) so the prompt-cache prefix stays identical to a
-/// normal main-path turn.
+/// notification turn. Pure — the actor freezes the rendered content on the
+/// notification ledger, so a retry re-runs against exactly this prompt. The
+/// framing rides in this per-turn content (never the system prompt) so the
+/// prompt-cache prefix stays identical to a normal main-path turn.
 pub fn build_notification_content(pending: &[PendingBackgroundResult]) -> Vec<ContentBlock> {
     let mut xml = String::from(BACKGROUND_NOTIFICATION_FRAMING);
     xml.push_str("\n\n<background_results>\n");
@@ -171,5 +220,51 @@ mod tests {
         assert!(xml.contains("<exit_code>0</exit_code>"));
         assert!(xml.contains("<output_file>logs/background/bg-cmd-1.log</output_file>"));
         assert!(xml.contains("cargo build --release"));
+    }
+
+    #[test]
+    fn completion_reply_is_deterministic_assistant_copy() {
+        let pending = vec![PendingBackgroundResult::subagent(
+            "h1",
+            "explorer",
+            "find the file",
+            baybo_model::SessionId::from("child-1"),
+            "found it at src/lib.rs",
+            SubagentExitStatus::Completed,
+        )];
+        assert_eq!(
+            build_completion_reply(&pending),
+            vec![ContentBlock::Text(
+                "Background work has finished. I'm reviewing the result now.\n\nSummary:\nfound it at src/lib.rs".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn completion_reply_labels_batched_summaries() {
+        let pending = vec![
+            PendingBackgroundResult::subagent(
+                "h1",
+                "explorer",
+                "first task",
+                baybo_model::SessionId::from("child-1"),
+                "first summary",
+                SubagentExitStatus::Completed,
+            ),
+            PendingBackgroundResult::subagent(
+                "h2",
+                "explorer",
+                "second task",
+                baybo_model::SessionId::from("child-2"),
+                "second summary",
+                SubagentExitStatus::Completed,
+            ),
+        ];
+        let ContentBlock::Text(reply) = &build_completion_reply(&pending)[0] else {
+            panic!("completion reply must be text");
+        };
+        assert!(reply.contains("Summaries:"));
+        assert!(reply.contains("first task:\nfirst summary"));
+        assert!(reply.contains("second task:\nsecond summary"));
     }
 }

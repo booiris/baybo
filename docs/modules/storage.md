@@ -45,7 +45,7 @@ Each file above holds its store's queries, but the table DDL is not colocated: e
 
 `Session`, `User`, `ChannelType`, and `SessionState` live in `baybo-model` so that both `baybo-session` (the `SessionManager` facade) and `baybo-storage` (libsql impl) can type against them without either crate dragging the other along. The `SessionStore` / `SessionSummaryStore` traits and their `StoredMessage` / `SessionSummaryRow` row types live in `baybo-store`; `baybo-storage` implements them and `baybo-session` calls them.
 
-The conversation transcript itself is **not** stored on `Session` — it's owned by `baybo_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for new turns, `apply_session_compaction` for `/compact`, `load_active_session_messages` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions).
+The conversation transcript itself is **not** stored on `Session` — it's owned by `baybo_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for ordinary turns, `append_session_message_idempotent` for replayable source events, `apply_session_compaction` for `/compact`, and `load_active_session_messages` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions).
 
 Read/unread state is **server-side at session granularity**: a `read_cursor` flat column on `sessions` holds the highest `session_messages.ordinal` a viewer has read. It is advanced max-wins (a lower ordinal is a no-op) by `PUT /v1/chat/sessions/:id/read` via `SessionStore::set_read_cursor` — the same targeted-UPDATE anti-clobber discipline as `hidden` / `last_llm` — and the chat list endpoint derives each row's `unread_count` from it. The web sidebar seeds its badge from that server-computed `unread_count` and bumps it live on `Frame::SessionActivity` pulses (see [channels.md](channels.md)). Cron fires need nothing extra: a recurring fire's conversation and a one-shot's notification are both ordinary rows in an ordinary session, so they accrue unread counts like any other reply.
 
@@ -66,8 +66,15 @@ or rewritten — this is user-facing core data (see the never-delete rule in the
 repo `CLAUDE.md`). Columns: `role`, `content` (serialized `ContentBlock`s),
 `created_at`, `source` (`MessageSource`: `user` / `cron` / `agent` — tells a
 genuine prompt and a cron fire apart from the agent's own injected `user`-role
-rows), `platform_msg_id` (client send idempotency key — sync-redelivery dedup, optimistic-row reconciliation, and the outbox durability point lookup),
-and `superseded_by`.
+rows), `platform_msg_id` (client send idempotency key — sync-redelivery dedup, optimistic-row reconciliation, and the outbox durability point lookup), `source_event_id` (nullable durable idempotency key for internal replayable events), and `superseded_by`.
+
+`source_event_id` is unique per session across the **full** transcript, including
+superseded rows. `append_session_message_idempotent` performs the row insert and
+key claim in one statement, returning `Inserted { ordinal }` or the original
+`Existing { ordinal }`. Cron origin delivery uses a `cron-execution:` key;
+background notification prompts, retry cues, and compaction re-anchors use
+operation-scoped `background-notification:` keys. Ordinary rows leave the
+column `NULL` and are unaffected by the unique partial index.
 
 **The ordinal is the load-bearing primitive.** Because it is stable, dense, and
 durable, other subsystems reference a transcript position *by value* (one `i64`)

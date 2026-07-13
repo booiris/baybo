@@ -232,10 +232,21 @@ pub struct ToolCallBegin {
 /// End-time result for a `ToolCall` span.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallResult {
+    /// The tool's result, capped at the same byte budget the LLM transcript
+    /// uses (`baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES`).
+    /// The model never saw more than this either — the transcript copy is
+    /// capped and spilled to a file — so storing the raw payload here just
+    /// bought a third copy nobody reads.
     #[serde(default)]
     pub output: Value,
     #[serde(default)]
     pub success: bool,
+    /// Serialized byte length of the untruncated output, set only when
+    /// `output` was capped. `None` means the span holds it verbatim. Lets the
+    /// trace viewer say the output is partial instead of silently implying
+    /// the tool returned this much.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_truncated_from: Option<usize>,
 }
 
 /// One tool_use block emitted by an LLM. Recorded inside the LLM

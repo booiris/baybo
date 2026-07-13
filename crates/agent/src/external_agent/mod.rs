@@ -87,6 +87,11 @@ pub enum ExternalAgentEvent {
     /// agents bypass baybo's sandbox + approval gate, so these
     /// records describe what the external agent did, not what baybo
     /// authorised.
+    ///
+    /// Text and tool-result blocks are capped at `MAX_TOOL_OUTPUT_BYTES` before
+    /// they are persisted (`cap_external_agent_blocks` in the spawner) — this
+    /// leg does not pass through the agent loop's `cap_tool_output`, and a
+    /// session row, once written, is never rewritten or deleted.
     Intermediate(ChatMessage),
     /// Terminal event — the agent has finished. Emitted exactly once,
     /// as the last item before the stream closes. The same content

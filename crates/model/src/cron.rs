@@ -351,7 +351,7 @@ impl CronExecution {
 /// Built by the cron waiter from the fire's terminal lifecycle event, and
 /// rebuilt verbatim by the boot re-drive from the persisted [`CronExecution`]
 /// — so both paths deliver identical content. `execution_id` is the
-/// idempotency key (see `SessionState::delivered_cron_executions`).
+/// source of the transcript row's durable idempotency key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingCronResult {
     pub execution_id: String,

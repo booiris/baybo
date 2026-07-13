@@ -28,6 +28,29 @@ pub struct StoredMessage {
     pub message: ChatMessage,
 }
 
+/// Result of appending a transcript row under a durable source-event key.
+/// `Existing` means the same source event already owns a row in this session,
+/// so callers must not mirror another copy into their in-memory transcript.
+/// The caller still decides whether the surrounding workflow is complete or
+/// must resume from that durable row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMessageAppendOutcome {
+    Inserted { ordinal: i64 },
+    Existing { ordinal: i64 },
+}
+
+impl SessionMessageAppendOutcome {
+    pub fn ordinal(self) -> i64 {
+        match self {
+            Self::Inserted { ordinal } | Self::Existing { ordinal } => ordinal,
+        }
+    }
+
+    pub fn was_inserted(self) -> bool {
+        matches!(self, Self::Inserted { .. })
+    }
+}
+
 /// Persistence interface for sessions.
 ///
 /// `SessionId` is the caller-supplied opaque string (see
@@ -177,6 +200,24 @@ pub trait SessionStore: Send + Sync {
         session_id: &SessionId,
         message: &ChatMessage,
     ) -> Result<i64>;
+
+    /// Append one message under a non-empty source-event id. The
+    /// `(session_id, source_event_id)` pair is unique across the complete
+    /// transcript, including superseded rows. Implementations atomically
+    /// return the existing ordinal instead of inserting a duplicate.
+    async fn append_session_message_idempotent(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+        message: &ChatMessage,
+    ) -> Result<SessionMessageAppendOutcome>;
+
+    /// Look up the transcript row already claimed by a source-event id.
+    async fn find_message_ordinal_by_source_event_id(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+    ) -> Result<Option<i64>>;
 
     /// Append an out-of-band control/display event ([`ControlEvent`]) to the
     /// session — a slash-command echo or a notice. Stored separately from the

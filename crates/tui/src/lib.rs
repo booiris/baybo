@@ -1041,12 +1041,11 @@ fn flush_stream_partial(state: &mut AppState, terminal: &mut Term) -> io::Result
 /// When the body streamed, its text is already in the scrollback, so we
 /// append only the trailing partial plus any non-text extras the stream
 /// didn't carry (e.g. the CronCreate recurring-trigger hint). When
-/// nothing streamed — the non-streaming delivery path where `delta_tx`
-/// was `None`: cron fires and subagent-notification turns (see
-/// `AgentActor::run_agent_loop` callers) deliver only a final Message,
-/// no deltas — the body never reached the scrollback, so the full
-/// message is rendered from `blocks`. The `cooked for` footer is committed
-/// separately by [`finalize_stream`] (with its own separator), not here.
+/// nothing streamed — a cron turn with `delta_tx = None`, or a direct
+/// synthetic Message such as the background-completion reply — the body never
+/// reached the scrollback, so the full message is rendered from `blocks`. The
+/// `cooked for` footer is committed separately by [`finalize_stream`] (with its
+/// own separator), not here.
 fn finalize_lines(
     blocks: &[ContentBlock],
     started: bool,
@@ -1727,9 +1726,9 @@ mod tests {
 
     #[test]
     fn finalize_renders_body_when_nothing_streamed() {
-        // Non-streaming delivery (cron / subagent-notification): the
-        // Message arrives with no preceding deltas, so its text must
-        // render from the blocks rather than be dropped.
+        // Direct/non-streaming delivery (cron or a synthetic completion
+        // reply): the Message arrives with no preceding deltas, so its text
+        // must render from the blocks rather than be dropped.
         let blocks = vec![ContentBlock::Text("cron result".into())];
         let lines = finalize_lines(&blocks, false, None);
         let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");

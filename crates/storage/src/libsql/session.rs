@@ -7,7 +7,7 @@ use baybo_model::{
     SessionId,
 };
 use baybo_store::StorageError;
-use baybo_store::session::{Result, SessionStore, StoredMessage};
+use baybo_store::session::{Result, SessionMessageAppendOutcome, SessionStore, StoredMessage};
 
 pub struct LibsqlSessionStore {
     pool: LibsqlPool,
@@ -636,6 +636,121 @@ impl SessionStore for LibsqlSessionStore {
             .get(0)
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ordinal: {e}")))?;
         Ok(ordinal)
+    }
+
+    async fn append_session_message_idempotent(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+        message: &ChatMessage,
+    ) -> Result<SessionMessageAppendOutcome> {
+        if source_event_id.is_empty() {
+            return Err(StorageError::Storage(
+                "source_event_id must not be empty".to_string(),
+            ));
+        }
+
+        let conn = self.pool.conn();
+        let role = message.role.as_str();
+        let content = serde_json::to_string(&message.content)
+            .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
+        let now_us = super::time::to_us(chrono::Utc::now());
+        let session_id = session_id.as_str().to_string();
+        let source_event_id = source_event_id.to_string();
+        let mut rows = conn
+            .query(
+                "INSERT INTO session_messages \
+                 (session_id, ordinal, role, content, created_at, source, \
+                  platform_msg_id, source_event_id) \
+                 SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4, ?5, ?6, ?7 \
+                 FROM session_messages WHERE session_id = ?1 \
+                 ON CONFLICT DO NOTHING \
+                 RETURNING ordinal",
+                libsql::params![
+                    session_id.clone(),
+                    role.to_string(),
+                    content,
+                    now_us,
+                    message.source().as_str().to_string(),
+                    message.platform_msg_id().to_string(),
+                    source_event_id.clone(),
+                ],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "libsql idempotent append session_message: {e}"
+                ))
+            })?;
+
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let ordinal = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ordinal: {e}")))?;
+            return Ok(SessionMessageAppendOutcome::Inserted { ordinal });
+        }
+        drop(rows);
+
+        let mut rows = conn
+            .query(
+                "SELECT ordinal FROM session_messages \
+                 WHERE session_id = ?1 AND source_event_id = ?2",
+                libsql::params![session_id, source_event_id],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "libsql find idempotent session_message: {e}"
+                ))
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .ok_or_else(|| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "idempotent session_message insert returned no row and no existing key"
+                ))
+            })?;
+        let ordinal = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ordinal: {e}")))?;
+        Ok(SessionMessageAppendOutcome::Existing { ordinal })
+    }
+
+    async fn find_message_ordinal_by_source_event_id(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+    ) -> Result<Option<i64>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT ordinal FROM session_messages \
+                 WHERE session_id = ?1 AND source_event_id = ?2",
+                libsql::params![session_id.as_str().to_string(), source_event_id.to_string()],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "libsql find session_message by source event: {e}"
+                ))
+            })?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let ordinal = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ordinal: {e}")))?;
+        Ok(Some(ordinal))
     }
 
     async fn append_control_event(
@@ -1702,6 +1817,104 @@ mod tests {
             .unwrap();
         assert_eq!(loaded[0].platform_msg_id(), "");
         assert_eq!(loaded[1].platform_msg_id(), "");
+    }
+
+    #[tokio::test]
+    async fn source_event_append_is_idempotent_across_compaction() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+        let session = make_root_session("source-event");
+        store.save(&session).await.unwrap();
+
+        let original =
+            baybo_model::ChatMessage::cron_notification(vec![baybo_model::ContentBlock::Text(
+                "original".into(),
+            )]);
+        let replay =
+            baybo_model::ChatMessage::cron_notification(vec![baybo_model::ContentBlock::Text(
+                "must not replace original".into(),
+            )]);
+        assert_eq!(
+            store
+                .append_session_message_idempotent(&session.id, "cron:execution-1", &original)
+                .await
+                .unwrap(),
+            SessionMessageAppendOutcome::Inserted { ordinal: 0 }
+        );
+        assert_eq!(
+            store
+                .append_session_message_idempotent(&session.id, "cron:execution-1", &replay)
+                .await
+                .unwrap(),
+            SessionMessageAppendOutcome::Existing { ordinal: 0 }
+        );
+
+        store
+            .apply_session_compaction(
+                &session.id,
+                &[baybo_model::ChatMessage::system(vec![
+                    baybo_model::ContentBlock::Text("summary".into()),
+                ])],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .append_session_message_idempotent(&session.id, "cron:execution-1", &replay)
+                .await
+                .unwrap(),
+            SessionMessageAppendOutcome::Existing { ordinal: 0 },
+            "superseding a row must not release its source-event key"
+        );
+
+        let rows = store
+            .load_session_messages_with_supersede(&session.id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "one source row plus one compacted row");
+        assert_eq!(rows[0].message.content, original.content);
+    }
+
+    #[tokio::test]
+    async fn legacy_session_messages_table_gains_source_event_id() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        pool.conn()
+            .execute(
+                "DROP INDEX idx_session_messages_source_event",
+                libsql::params![],
+            )
+            .await
+            .unwrap();
+        pool.conn()
+            .execute(
+                "ALTER TABLE session_messages DROP COLUMN source_event_id",
+                libsql::params![],
+            )
+            .await
+            .unwrap();
+
+        pool.init_db().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+        let session = make_root_session("source-event-migrated");
+        store.save(&session).await.unwrap();
+        let message =
+            baybo_model::ChatMessage::cron_notification(vec![baybo_model::ContentBlock::Text(
+                "migrated".into(),
+            )]);
+        assert_eq!(
+            store
+                .append_session_message_idempotent(&session.id, "cron:legacy", &message)
+                .await
+                .unwrap(),
+            SessionMessageAppendOutcome::Inserted { ordinal: 0 }
+        );
+        assert_eq!(
+            store
+                .append_session_message_idempotent(&session.id, "cron:legacy", &message)
+                .await
+                .unwrap(),
+            SessionMessageAppendOutcome::Existing { ordinal: 0 }
+        );
     }
 
     #[tokio::test]

@@ -144,6 +144,12 @@ export interface ToolCallBegin {
 export interface ToolCallResult {
   output: unknown;
   success: boolean;
+  /**
+   * Serialized byte length of the untruncated output, present only when the
+   * span's copy was capped (at the same budget the LLM transcript uses). The
+   * model never saw more than the cap either. Absent = stored verbatim.
+   */
+  output_truncated_from?: number;
 }
 
 export type SpanKind =

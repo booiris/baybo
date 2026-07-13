@@ -99,8 +99,8 @@ pub struct VolatileResources {
     /// Session-row writer used by handlers whose state mutations must
     /// survive actor eviction. Today only the background-subagent
     /// path reaches for this — `AgentMessage::BackgroundJobFinished`
-    /// persists `session.state.pending_background_results`, and the
-    /// next-turn drain re-persists the cleared list, so a parent that
+    /// persists `session.state.background_notifications`, and the next-turn
+    /// drain re-persists the cleared buffer, so a parent that
     /// the idle reaper eventually reclaims still hands the pending
     /// notifications to the fresh actor on hydration.
     pub session_manager: Arc<SessionManager>,

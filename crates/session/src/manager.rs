@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use crate::SessionError;
 use baybo_store::{SessionFolderRow, SessionFolderStore};
-use baybo_store::{SessionStore, StoredMessage};
+use baybo_store::{SessionMessageAppendOutcome, SessionStore, StoredMessage};
 use baybo_store::{SessionSummaryRow, SessionSummaryStore};
 
 type Result<T> = std::result::Result<T, SessionError>;
@@ -419,6 +419,31 @@ impl SessionManager {
     ) -> Result<i64> {
         self.store
             .append_session_message(session_id, message)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    /// Atomically append a transcript row once for a durable source event.
+    /// Replays return the original ordinal without creating another row.
+    pub async fn append_session_message_idempotent(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+        message: &ChatMessage,
+    ) -> Result<SessionMessageAppendOutcome> {
+        self.store
+            .append_session_message_idempotent(session_id, source_event_id, message)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    pub async fn find_message_ordinal_by_source_event_id(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+    ) -> Result<Option<i64>> {
+        self.store
+            .find_message_ordinal_by_source_event_id(session_id, source_event_id)
             .await
             .map_err(SessionError::from)
     }
