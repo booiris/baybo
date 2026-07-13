@@ -148,6 +148,13 @@ pub(crate) struct LegIo<F: TunnelFrames = NoiseFrames> {
     pending: VecDeque<TunnelResponse>,
     /// Ids must strictly increase on a leg; the gateway closes it otherwise.
     next_request_id: u64,
+    /// Whether ANY response frame has arrived for the request in flight.
+    ///
+    /// Not "a valid head arrived" — *any* frame. An `Error`, a frame for the wrong
+    /// id, a body before its head: every one of those is still the gateway TALKING,
+    /// and past the first word we can no longer claim it did not run the request.
+    /// Only silence licenses a replay.
+    saw_response: bool,
 }
 
 impl<F: TunnelFrames> LegIo<F> {
@@ -156,14 +163,22 @@ impl<F: TunnelFrames> LegIo<F> {
             frames,
             pending: VecDeque::new(),
             next_request_id: 1,
+            saw_response: false,
         }
     }
 
-    /// Claim the next request id on this leg.
+    /// Claim the next request id on this leg. This is the per-request boundary, so
+    /// it is also where `saw_response` resets.
     pub(crate) fn claim_request_id(&mut self) -> u64 {
         let id = self.next_request_id;
         self.next_request_id += 1;
+        self.saw_response = false;
         id
+    }
+
+    /// Whether the gateway said anything at all about the request in flight.
+    pub(crate) fn saw_response(&self) -> bool {
+        self.saw_response
     }
 
     pub(crate) async fn send(&mut self, request: &TunnelRequest) -> Result<(), LegError> {
@@ -174,6 +189,10 @@ impl<F: TunnelFrames> LegIo<F> {
     pub(crate) async fn next_response(&mut self) -> Result<TunnelResponse, LegError> {
         loop {
             if let Some(response) = self.pending.pop_front() {
+                // Whatever it turns out to be — an Error, a stray id, a body out of
+                // order — the gateway has spoken. Record that BEFORE anyone judges
+                // the frame's shape.
+                self.saw_response = true;
                 return Ok(response);
             }
             self.pending.extend(self.frames.recv().await?);

@@ -333,12 +333,19 @@ impl BayboClient {
         runtime::run(async move {
             match active_leg()? {
                 ActiveLeg::Relay => {
+                    // Snapshot the pool generation BEFORE the first await. If the app
+                    // backgrounds while the chat leg is dialing, the barrier's epoch
+                    // bump lands in that window — and a `warm()` that read the epoch
+                    // afterwards would stamp its leg as CURRENT and park it, handing
+                    // the pool the very zombie the barrier exists to keep out (the
+                    // suspend takes that socket with it).
+                    let epoch = relay::leg_pool::pool().epoch();
                     // The chat leg first: it is what a chat actually needs, and it
                     // should not race a warm-up for a relay connection slot.
                     transport::preconnect(&this.relay).await?;
                     // Then park one API leg, so the list refresh the user is about
                     // to trigger does not pay a dial.
-                    relay::leg_pool::warm().await;
+                    relay::leg_pool::warm(epoch).await;
                     refresh_relay_apns_best_effort(this.apns.clone());
                     Ok(())
                 }
@@ -735,14 +742,36 @@ fn debug_seed_push_key() {
 /// chat leg the user is waiting on. The steady-state answer is to send nothing at
 /// all; when there IS something to send, it does not need to be first.
 fn refresh_relay_apns_best_effort(apns: Arc<ApnsState>) {
-    let Some(token) = apns.token_needing_post() else {
+    let Some(token) = apns.claim_post() else {
         return;
     };
     tokio::spawn(async move {
-        match gateway_api::update_apns_token(&relay::GatewayApi, &token, apns.env().as_str()).await
-        {
-            Ok(()) => apns.mark_posted(token),
-            Err(e) => log::warn!("relay APNs token refresh failed: {e}"),
+        let mut token = token;
+        loop {
+            let delivered = match gateway_api::update_apns_token(
+                &relay::GatewayApi,
+                &token,
+                apns.env().as_str(),
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("relay APNs token refresh failed: {e}");
+                    false
+                }
+            };
+            apns.finish_post(token, delivered);
+            if !delivered {
+                return;
+            }
+            // iOS rotated the token while that POST was on the wire. Chase it here
+            // rather than leave the gateway bound to the one it just retired and
+            // hope some later connect notices.
+            match apns.claim_post() {
+                Some(next) => token = next,
+                None => return,
+            }
         }
     });
 }

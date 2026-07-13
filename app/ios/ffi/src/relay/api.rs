@@ -167,20 +167,15 @@ pub(crate) async fn exchange<F: TunnelFrames>(
     body: Option<&[u8]>,
     first_byte_timeout: Duration,
 ) -> Exchange {
-    let mut response_seen = false;
     let outcome = tokio::time::timeout(
         TUNNEL_REQUEST_TIMEOUT,
-        run_exchange(
-            leg,
-            method,
-            path,
-            headers,
-            body,
-            first_byte_timeout,
-            &mut response_seen,
-        ),
+        run_exchange(leg, method, path, headers, body, first_byte_timeout),
     )
     .await;
+    // Asked of the leg, not tracked alongside it: an `Error` frame and a desync are
+    // both failures that produce no head, yet both mean the gateway ANSWERED. Only
+    // silence — a timeout, or a socket that died before a word — licenses a replay.
+    let response_seen = leg.saw_response();
 
     match outcome {
         Ok(Ok((body, reuse))) => Exchange {
@@ -212,7 +207,6 @@ pub(crate) async fn exchange<F: TunnelFrames>(
 
 type ExchangeResult = Result<(Vec<u8>, Option<TunnelReuse>), (LegError, Option<TunnelReuse>)>;
 
-#[allow(clippy::too_many_arguments)]
 async fn run_exchange<F: TunnelFrames>(
     leg: &mut LegIo<F>,
     method: &str,
@@ -220,7 +214,6 @@ async fn run_exchange<F: TunnelFrames>(
     mut headers: Vec<TunnelHeader>,
     body: Option<&[u8]>,
     first_byte_timeout: Duration,
-    response_seen: &mut bool,
 ) -> ExchangeResult {
     let request_id = leg.claim_request_id();
     let body_len = declared_body_len(body);
@@ -246,7 +239,6 @@ async fn run_exchange<F: TunnelFrames>(
         .await
         .map_err(|_| (LegError::dead("tunnel leg went silent"), None))?
         .map_err(|e| (e, None))?;
-    *response_seen = true;
 
     // Drain first, judge second.
     let response_body = leg
@@ -362,6 +354,7 @@ fn should_retry(outcome: &Exchange, was_pooled: bool, replay: Replayable) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::TunnelResponse;
     use crate::relay::tunnel::testing::{ScriptedFrames, body, head, reusable_head};
 
     fn exchange_result(result: Result<Vec<u8>, LegError>, response_seen: bool) -> Exchange {
@@ -497,6 +490,77 @@ mod tests {
             Some(reuse),
             "the leg is drained and still good"
         );
+    }
+
+    /// An `Error` frame is a failure with no head — but it is still the gateway
+    /// TALKING. Treating it as "no response" would license a replay of a request the
+    /// gateway may well have run, against the design's own no-retry rule for errors.
+    #[tokio::test]
+    async fn an_error_frame_counts_as_a_response() {
+        let mut leg = LegIo::new(ScriptedFrames::new(vec![vec![TunnelResponse::Error {
+            request_id: 1,
+            status: 400,
+            reason: "forbidden tunnel header".into(),
+        }]]));
+
+        let outcome = exchange(
+            &mut leg,
+            "GET",
+            "/v1/chat/sessions",
+            vec![],
+            None,
+            TUNNEL_REQUEST_TIMEOUT,
+        )
+        .await;
+
+        assert!(matches!(outcome.result, Err(LegError::Dead(_))));
+        assert!(outcome.response_seen, "the gateway answered");
+        assert!(
+            !should_retry(&outcome, true, Replayable::Yes),
+            "and a deterministic rejection must not be replayed"
+        );
+    }
+
+    /// Same for a desync. A frame for the wrong request is the gateway's voice too —
+    /// and one we can no longer interpret, which is the worst possible moment to
+    /// re-run the request.
+    #[tokio::test]
+    async fn a_desynced_frame_counts_as_a_response() {
+        let mut leg = LegIo::new(ScriptedFrames::new(vec![vec![head(7, 200, 0)]]));
+
+        let outcome = exchange(
+            &mut leg,
+            "GET",
+            "/v1/chat/sessions",
+            vec![],
+            None,
+            TUNNEL_REQUEST_TIMEOUT,
+        )
+        .await;
+
+        assert!(matches!(outcome.result, Err(LegError::Dead(_))));
+        assert!(outcome.response_seen);
+        assert!(!should_retry(&outcome, true, Replayable::Yes));
+    }
+
+    /// The one thing that DOES license a replay: silence. A leg the gateway never
+    /// answered on is the reclaimed-while-parked case the pool exists to absorb.
+    #[tokio::test(start_paused = true)]
+    async fn only_silence_licenses_a_replay() {
+        let mut leg = LegIo::new(ScriptedFrames::silent());
+
+        let outcome = exchange(
+            &mut leg,
+            "GET",
+            "/v1/chat/sessions",
+            vec![],
+            None,
+            POOLED_LEG_FIRST_BYTE_TIMEOUT,
+        )
+        .await;
+
+        assert!(!outcome.response_seen, "not a word came back");
+        assert!(should_retry(&outcome, true, Replayable::Yes));
     }
 
     /// A parked leg can be a zombie: the write lands, and then nothing comes back.

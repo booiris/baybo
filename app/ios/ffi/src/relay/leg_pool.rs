@@ -280,7 +280,14 @@ pub(crate) fn pool() -> &'static ApiLegPool {
 ///
 /// Best-effort. A user who foregrounds and does nothing costs one relay connection
 /// slot for twelve seconds.
-pub(crate) async fn warm() {
+///
+/// `epoch` is the pool generation as of BEFORE the caller's first await — not one
+/// read here. `relay_preconnect` dials the chat leg first, and the `.background`
+/// barrier can land inside that await; a leg stamped with the epoch the barrier
+/// just bumped TO would park as current and be handed out after the suspend that
+/// killed its socket. The caller owns that snapshot because the caller owns the
+/// await.
+pub(crate) async fn warm(epoch: u64) {
     let Ok(Some(record)) = super::pairing::load_paired_record() else {
         return;
     };
@@ -292,11 +299,6 @@ pub(crate) async fn warm() {
 
     let local =
         device_proto::noise::StaticKeypair::from_parts(record.noise_public, record.noise_secret);
-    // Snapshot the epoch BEFORE the dial: one that straddles the app's
-    // `.background` edge must not be stamped with the epoch the barrier just
-    // bumped TO, or it would be parked as exactly the zombie the barrier exists
-    // to prevent.
-    let epoch = pool().epoch();
     match super::tunnel::dial_tunnel_leg(
         &record,
         &local,
