@@ -6,7 +6,7 @@ use crate::StorageError;
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Persistence interface for cron jobs and executions. Implemented by
-/// `baybo_storage::libsql::LibsqlCronStore`. The trait talks in the domain
+/// `baybo_storage::sqlite::SqliteCronStore`. The trait talks in the domain
 /// types (`CronJob`, `CronExecution`, `ExecutionStatus`) from
 /// `baybo-model`; the libsql impl handles JSON round-tripping internally.
 #[async_trait]

@@ -16,36 +16,62 @@ mod task;
 mod time;
 mod trace;
 
-pub use agent_profile::LibsqlAgentProfileStore;
-pub use blob::LibsqlBlobStore;
-pub use channel_bot::LibsqlChannelBotStore;
-pub use channel_pairing::LibsqlChannelPairingStore;
-pub use channel_session::LibsqlChannelSessionStore;
-pub use cost::LibsqlCostStore;
-pub use cron::LibsqlCronStore;
-pub use device::LibsqlDeviceStore;
-pub use job::LibsqlJobStore;
-pub use secret::LibsqlSecretStore;
-pub use session::LibsqlSessionStore;
-pub use session_folder::LibsqlSessionFolderStore;
-pub use session_summary::LibsqlSessionSummaryStore;
-pub use skill_risk::LibsqlSkillRiskStore;
-pub use task::LibsqlTaskStore;
-pub use trace::LibsqlTraceStore;
+pub use agent_profile::SqliteAgentProfileStore;
+pub use blob::SqliteBlobStore;
+pub use channel_bot::SqliteChannelBotStore;
+pub use channel_pairing::SqliteChannelPairingStore;
+pub use channel_session::SqliteChannelSessionStore;
+pub use cost::SqliteCostStore;
+pub use cron::SqliteCronStore;
+pub use device::SqliteDeviceStore;
+pub use job::SqliteJobStore;
+pub use secret::SqliteSecretStore;
+pub use session::SqliteSessionStore;
+pub use session_folder::SqliteSessionFolderStore;
+pub use session_summary::SqliteSessionSummaryStore;
+pub use skill_risk::SqliteSkillRiskStore;
+pub use task::SqliteTaskStore;
+pub use trace::SqliteTraceStore;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Shared handle to a libsql database connection.
+use baybo_store::StorageError;
+use deadpool_sqlite::{Config, Runtime};
+
+/// Connections kept open by the pool. Readers never block each other under
+/// WAL; writers serialise on the write lock regardless of how many handles
+/// exist, so a bigger pool buys read parallelism and nothing else.
+const POOL_SIZE: usize = 8;
+
+/// A second writer waits for the current one rather than failing. Concurrent
+/// writers are routine here — the agent loop and the trace sink write while the
+/// gateway serves reads — and sqlite's default of 0 would turn that normal
+/// overlap into spurious `SQLITE_BUSY`. Contention that outlives this timeout is
+/// a different animal (a *cross-process* writer, i.e. the CLI holding the file
+/// against a running gateway) and is handled by [`crate::retry`].
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Pool of sqlite connections.
 ///
-/// Wraps a single `libsql::Connection` behind an `Arc` so it can be
-/// cheaply cloned and shared across async tasks.
+/// Cheap to clone (the inner `deadpool` pool is an `Arc`) and shared by every
+/// store. Callers reach the database only through [`SqlitePool::interact`],
+/// which checks a connection out *exclusively* for the whole closure.
+///
+/// That exclusivity is a memory-safety contract, not a throughput knob. A
+/// sqlite connection owns an unsynchronised private heap — its lookaside
+/// allocator — and the C API's own accessors mutate it: `sqlite3_value_text()`
+/// on a TEXT column allocates in order to NUL-terminate. The decode is
+/// therefore as much a critical section as the query, and two threads inside
+/// one handle corrupt the free list; the process dies later, in an unrelated
+/// allocation. `rusqlite::Connection` is `Send` but *not* `Sync`, so the
+/// compiler — not a convention — is what keeps them out.
 #[derive(Clone)]
-pub struct LibsqlPool {
-    conn: Arc<libsql::Connection>,
+pub struct SqlitePool {
+    pool: deadpool_sqlite::Pool,
 }
 
-impl LibsqlPool {
-    /// Open (or create) a local libsql database at the given path.
+impl SqlitePool {
+    /// Open (or create) a local sqlite database at the given path.
     pub async fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent()
@@ -55,77 +81,100 @@ impl LibsqlPool {
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
         }
-        let db = libsql::Builder::new_local(path)
-            .build()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("failed to open libsql database at {}: {e}", path.display())
-            })?;
-        let conn = db
-            .connect()
-            .map_err(|e| anyhow::anyhow!("failed to get libsql connection: {e}"))?;
-        let pool = Self {
-            conn: Arc::new(conn),
-        };
-        pool.set_wal_mode().await?;
-        pool.init_db().await?;
-        Ok(pool)
+        Self::build(Config::new(path), path.display().to_string()).await
     }
 
-    /// Open an in-memory libsql database.
+    /// Open a private in-memory database (tests).
+    ///
+    /// A bare `:memory:` would hand every pooled connection its own empty
+    /// database. The shared-cache URI makes the pool's connections address one
+    /// database, and the unique name keeps concurrent tests isolated from each
+    /// other. Such a database lives only while a connection to it is open, so
+    /// the pool must never reap idle connections — deadpool doesn't by default.
     pub async fn open_in_memory() -> anyhow::Result<Self> {
-        let db = libsql::Builder::new_local(":memory:")
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let uri = format!("file:baybo-test-{id}?mode=memory&cache=shared");
+        Self::build(Config::new(&uri), uri.clone()).await
+    }
+
+    async fn build(cfg: Config, what: String) -> anyhow::Result<Self> {
+        let pool = cfg
+            .builder(Runtime::Tokio1)
+            .map_err(|e| anyhow::anyhow!("failed to configure sqlite pool for {what}: {e}"))?
+            .max_size(POOL_SIZE)
+            // Per-connection state, so it belongs on the hook that fires for
+            // every connection the pool ever creates — including ones opened
+            // lazily under load, or replaced after a recycle. `journal_mode` is
+            // persisted in the file header and only needs saying once, but
+            // `synchronous` and `busy_timeout` are per-handle and would
+            // otherwise silently revert to sqlite's defaults on a fresh handle.
+            .post_create(deadpool_sqlite::Hook::async_fn(|conn, _| {
+                Box::pin(async move {
+                    conn.interact(|conn| {
+                        conn.busy_timeout(BUSY_TIMEOUT)?;
+                        conn.pragma_update(None, "journal_mode", "WAL")?;
+                        conn.pragma_update(None, "synchronous", "NORMAL")
+                    })
+                    .await
+                    .map_err(|e| deadpool_sqlite::HookError::message(e.to_string()))?
+                    .map_err(deadpool_sqlite::HookError::Backend)
+                })
+            }))
             .build()
+            .map_err(|e| anyhow::anyhow!("failed to build sqlite pool for {what}: {e}"))?;
+        let pool = Self { pool };
+        pool.interact("sqlite.init_db", init_db)
             .await
-            .map_err(|e| anyhow::anyhow!("failed to open in-memory libsql database: {e}"))?;
-        let conn = db
-            .connect()
-            .map_err(|e| anyhow::anyhow!("failed to get in-memory libsql connection: {e}"))?;
-        let pool = Self {
-            conn: Arc::new(conn),
-        };
-        pool.init_db().await?;
+            .map_err(|e| anyhow::anyhow!("failed to initialize schema for {what}: {e}"))?;
         Ok(pool)
     }
 
-    /// Get a reference to the underlying connection.
-    pub(crate) fn conn(&self) -> &libsql::Connection {
-        &self.conn
-    }
-
-    /// Enable WAL journaling so writers no longer churn a `-journal` sidecar
-    /// on every transaction. `synchronous=NORMAL` is the recommended pairing
-    /// for WAL (crash-safe, faster than FULL).
-    async fn set_wal_mode(&self) -> anyhow::Result<()> {
-        self.conn
-            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+    /// Run `f` against a connection held exclusively for the whole closure.
+    ///
+    /// `f` runs on a blocking thread (rusqlite is synchronous), so it must own
+    /// its inputs — bind every parameter as an owned value. `op` names the
+    /// call-site and prefixes any error.
+    pub(crate) async fn interact<F, T>(&self, op: &'static str, f: F) -> Result<T, StorageError>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = self
+            .pool
+            .get()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to enable WAL mode: {e}"))?;
-        Ok(())
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: pool checkout: {e}")))?;
+        conn.interact(f)
+            .await
+            // The closure panicked, or a previous one did and poisoned the
+            // connection. Either way it never produced a result.
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("{op}: {e}")))
     }
+}
 
-    /// Create all required tables if they do not already exist.
-    ///
-    /// Timestamp columns (`created_at`, `started_at` on `jobs`, etc.) are Unix
-    /// microseconds — round-trip via `libsql::time::{to_us, from_us}`. µs is
-    /// finer than the millisecond granularity of typical web tooling so sub-ms
-    /// ordering survives (useful for fast local tool spans), and
-    /// `chrono::timestamp_micros` is infallible. API surfaces (HTTP /
-    /// OpenAPI / web) re-encode as RFC3339 and don't expose raw µs.
-    ///
-    /// **Exception — trace tables (`steps`, `spans`).** The `started_at`
-    /// / `ended_at` columns are TEXT generated columns extracted from
-    /// the JSON `data` blob via `json_extract`. `baybo-trace` serialises
-    /// `chrono::DateTime<Utc>` as RFC3339 strings, so these columns
-    /// hold RFC3339 — sortable lexicographically because the leading
-    /// `YYYY-MM-DDTHH:MM:SS` prefix is fixed-width and any
-    /// fractional-second suffix shares a common prefix length within
-    /// a single insertion path. They don't follow the µs invariant
-    /// the rest of the schema uses; querying these columns means
-    /// string comparison, not integer comparison.
-    async fn init_db(&self) -> anyhow::Result<()> {
-        self.conn
-            .execute_batch(
+/// Create all required tables if they do not already exist.
+///
+/// Timestamp columns (`created_at`, `started_at` on `jobs`, etc.) are Unix
+/// microseconds — round-trip via `sqlite::time::{to_us, from_us}`. µs is
+/// finer than the millisecond granularity of typical web tooling so sub-ms
+/// ordering survives (useful for fast local tool spans), and
+/// `chrono::timestamp_micros` is infallible. API surfaces (HTTP /
+/// OpenAPI / web) re-encode as RFC3339 and don't expose raw µs.
+///
+/// **Exception — trace tables (`steps`, `spans`).** The `started_at`
+/// / `ended_at` columns are TEXT generated columns extracted from
+/// the JSON `data` blob via `json_extract`. `baybo-trace` serialises
+/// `chrono::DateTime<Utc>` as RFC3339 strings, so these columns
+/// hold RFC3339 — sortable lexicographically because the leading
+/// `YYYY-MM-DDTHH:MM:SS` prefix is fixed-width and any
+/// fractional-second suffix shares a common prefix length within
+/// a single insertion path. They don't follow the µs invariant
+/// the rest of the schema uses; querying these columns means
+/// string comparison, not integer comparison.
+fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS sessions (
                     id                    TEXT PRIMARY KEY,
                     root_session_id       TEXT NOT NULL,
@@ -599,79 +648,181 @@ impl LibsqlPool {
                 -- and drops out of this partial index.
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_one_approved
                     ON devices(status) WHERE status = 'approved';",
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;
+    )
+    .map_err(|e| anyhow::anyhow!("failed to initialize sqlite schema: {e}"))?;
 
-        // Migrations for DBs created before a column was added. libsql
-        // / SQLite has no `ADD COLUMN IF NOT EXISTS`, so we attempt the
-        // ALTER and swallow the "duplicate column" error. Add new
-        // migrations to this list rather than mutating the CREATE
-        // TABLE — fresh DBs pick the column up from CREATE, existing
-        // DBs from the ALTER.
-        let migrations: &[&str] = &[
-            "ALTER TABLE sessions ADD COLUMN parent_span_id TEXT",
-            "ALTER TABLE sessions ADD COLUMN last_llm TEXT",
-            "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE cost_records ADD COLUMN reason TEXT",
-            "ALTER TABLE sessions ADD COLUMN folder_id TEXT",
-            "ALTER TABLE sessions ADD COLUMN title TEXT",
-            "ALTER TABLE devices ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE devices ADD COLUMN remote_api_key TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE session_messages ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE sessions ADD COLUMN read_cursor INTEGER",
-            "ALTER TABLE cron_executions ADD COLUMN completed_at INTEGER",
-            "ALTER TABLE cron_executions ADD COLUMN notified_at INTEGER",
-            "ALTER TABLE session_messages ADD COLUMN source_event_id TEXT",
-        ];
-        for stmt in migrations {
-            if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {
-                let msg = e.to_string();
-                if !msg.contains("duplicate column name") {
-                    return Err(anyhow::anyhow!("migration `{stmt}` failed: {msg}"));
-                }
+    // Migrations for DBs created before a column was added. SQLite has no
+    // `ADD COLUMN IF NOT EXISTS`, so we attempt the ALTER and swallow the
+    // "duplicate column" error. Add new migrations to this list rather
+    // than mutating the CREATE TABLE — fresh DBs pick the column up from
+    // CREATE, existing DBs from the ALTER.
+    let migrations: &[&str] = &[
+        "ALTER TABLE sessions ADD COLUMN parent_span_id TEXT",
+        "ALTER TABLE sessions ADD COLUMN last_llm TEXT",
+        "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE cost_records ADD COLUMN reason TEXT",
+        "ALTER TABLE sessions ADD COLUMN folder_id TEXT",
+        "ALTER TABLE sessions ADD COLUMN title TEXT",
+        "ALTER TABLE devices ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE devices ADD COLUMN remote_api_key TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE session_messages ADD COLUMN platform_msg_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN read_cursor INTEGER",
+        "ALTER TABLE cron_executions ADD COLUMN completed_at INTEGER",
+        "ALTER TABLE cron_executions ADD COLUMN notified_at INTEGER",
+        "ALTER TABLE session_messages ADD COLUMN source_event_id TEXT",
+    ];
+    for stmt in migrations {
+        if let Err(e) = conn.execute(stmt, []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(anyhow::anyhow!("migration `{stmt}` failed: {msg}"));
             }
         }
+    }
 
-        // Indexes on migration-added columns. Created AFTER the ALTER loop,
-        // not in the schema batch above: on a legacy DB the column doesn't
-        // exist until the ALTER runs, so a batch-time CREATE INDEX referencing
-        // it would fail. `IF NOT EXISTS` keeps them idempotent on every
-        // subsequent boot.
-        self.conn
-            .execute(
-                "CREATE INDEX IF NOT EXISTS idx_sessions_folder \
-                 ON sessions(folder_id) WHERE folder_id IS NOT NULL",
-                libsql::params![],
-            )
+    // Indexes on migration-added columns. Created AFTER the ALTER loop,
+    // not in the schema batch above: on a legacy DB the column doesn't
+    // exist until the ALTER runs, so a batch-time CREATE INDEX referencing
+    // it would fail. `IF NOT EXISTS` keeps them idempotent on every
+    // subsequent boot.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_folder
+             ON sessions(folder_id) WHERE folder_id IS NOT NULL;
+         -- Serves the boot re-drive's 'completed but not yet delivered' scan.
+         CREATE INDEX IF NOT EXISTS idx_cron_executions_awaiting_delivery
+             ON cron_executions(completed_at) WHERE notified_at IS NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_session_messages_source_event
+             ON session_messages(session_id, source_event_id)
+             WHERE source_event_id IS NOT NULL;",
+    )
+    .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes: {e}"))?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `post_create` hook is the only thing standing between the pool and
+    /// sqlite's defaults, and a PRAGMA that silently fails to apply looks
+    /// exactly like one that applied — the query still runs, just with the old
+    /// setting. Assert the connection's actual state rather than trusting that
+    /// the hook ran.
+    #[tokio::test]
+    async fn every_connection_gets_the_pragmas() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = SqlitePool::open(dir.path().join("t.db"))
             .await
-            .map_err(|e| anyhow::anyhow!("failed to create idx_sessions_folder: {e}"))?;
+            .expect("open");
 
-        // Serves the boot re-drive's "completed but not yet delivered" scan.
-        self.conn
-            .execute(
-                "CREATE INDEX IF NOT EXISTS idx_cron_executions_awaiting_delivery \
-                 ON cron_executions(completed_at) WHERE notified_at IS NULL",
-                libsql::params![],
-            )
+        // Ask enough connections to cover the pool: a hook that fires only for
+        // the first one would pass a single-connection check.
+        for _ in 0..POOL_SIZE * 2 {
+            let (journal_mode, busy_timeout, synchronous) = pool
+                .interact("test.pragmas", |conn| {
+                    Ok((
+                        conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?,
+                        conn.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, i64>(0))?,
+                        conn.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?,
+                    ))
+                })
+                .await
+                .expect("read pragmas");
+            assert_eq!(journal_mode, "wal");
+            assert_eq!(busy_timeout, BUSY_TIMEOUT.as_millis() as i64);
+            assert_eq!(synchronous, 1, "NORMAL");
+        }
+    }
+
+    /// A shared-cache in-memory database exists only while some connection to
+    /// it is open. The pool must therefore keep one alive between calls —
+    /// otherwise the schema would silently vanish and the next call would open
+    /// a fresh, empty database.
+    #[tokio::test]
+    async fn in_memory_database_survives_between_checkouts() {
+        let pool = SqlitePool::open_in_memory().await.expect("open");
+        pool.interact("test.write", |conn| {
+            conn.execute(
+                "INSERT INTO secrets (name, encrypted_value) VALUES ('k', x'01')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("write");
+
+        let n: i64 = pool
+            .interact("test.read", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM secrets", [], |r| r.get(0))?)
+            })
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("failed to create idx_cron_executions_awaiting_delivery: {e}")
-            })?;
+            .expect("read");
+        assert_eq!(n, 1, "the in-memory database outlived the first checkout");
+    }
 
-        self.conn
-            .execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_session_messages_source_event \
-                 ON session_messages(session_id, source_event_id) \
-                 WHERE source_event_id IS NOT NULL",
-                libsql::params![],
-            )
+    /// The shared cache the in-memory pool relies on locks at *table* level and
+    /// signals contention with `SQLITE_LOCKED`, which `busy_timeout` does not
+    /// wait out. Every unit test in the crate runs on this pool, so if
+    /// concurrent writers could trip that, the whole suite would flake. Prove
+    /// they don't.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn in_memory_pool_tolerates_concurrent_writers() {
+        let pool = SqlitePool::open_in_memory().await.expect("open");
+        let mut tasks = Vec::new();
+        for w in 0..8 {
+            let pool = pool.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..25 {
+                    let name = format!("k{w}-{i}");
+                    pool.interact("test.concurrent_write", move |conn| {
+                        conn.execute(
+                            "INSERT INTO secrets (name, encrypted_value) VALUES (?1, x'01')",
+                            rusqlite::params![name],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .expect("concurrent insert");
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.expect("writer panicked");
+        }
+
+        let n: i64 = pool
+            .interact("test.count", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM secrets", [], |r| r.get(0))?)
+            })
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("failed to create idx_session_messages_source_event: {e}")
-            })?;
+            .expect("count");
+        assert_eq!(n, 200, "no writer was silently dropped");
+    }
 
-        Ok(())
+    /// Two pools must not see each other's data, or tests running in parallel
+    /// would interfere through the shared cache.
+    #[tokio::test]
+    async fn in_memory_databases_are_isolated_from_each_other() {
+        let a = SqlitePool::open_in_memory().await.expect("open a");
+        let b = SqlitePool::open_in_memory().await.expect("open b");
+        a.interact("test.write", |conn| {
+            conn.execute(
+                "INSERT INTO secrets (name, encrypted_value) VALUES ('k', x'01')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("write");
+
+        let n: i64 = b
+            .interact("test.read", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM secrets", [], |r| r.get(0))?)
+            })
+            .await
+            .expect("read");
+        assert_eq!(n, 0, "pools must not share an in-memory database");
     }
 }

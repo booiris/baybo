@@ -6,7 +6,7 @@ The `baybo-memory` crate defines a **single pluggable [`Memory`] trait**. The
 system knows memory only through one `Arc<dyn Memory>` slot (not a many-registry
 like tools/channels): at most one implementation is registered at startup. The
 trait is intentionally thin and **storage-opaque** — an implementation owns its
-own persistence (libsql, a vector DB, an external service) and receives its LLM
+own persistence (sqlite, a vector DB, an external service) and receives its LLM
 handle and config in its own constructor.
 
 The core ships the trait, its value types (`MemoryContext`, `RecalledMemory`,
@@ -18,7 +18,7 @@ The core ships the trait, its value types (`MemoryContext`, `RecalledMemory`,
 deployment recalls, writes, and bills nothing.
 
 This supersedes the previous CRUD `MemoryManager` facade (now removed, along with
-`MemoryStore`/`MemoryEntry`/`MemoryCategory`, the libsql impl, the `/v1/memory`
+`MemoryStore`/`MemoryEntry`/`MemoryCategory`, the sqlite impl, the `/v1/memory`
 admin REST, and the `memories` table — no longer created; the cleanup migration
 was itself removed, so old databases keep it as an inert orphan). The earlier
 heuristic `recall` + `maybe_store` pipeline was retired because it (1) recalled

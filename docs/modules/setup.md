@@ -3,7 +3,7 @@
 ## Problem
 
 A fresh Baybo install has *nothing* on disk: no workspace dir, no
-master encryption key, no `baybo.json`, no libsql storage, no
+master encryption key, no `baybo.json`, no sqlite storage, no
 configured LLM. The existing argv commands (`baybo llm add`,
 `baybo channel add`, …) all assume the encryption key + vault are
 already up; the gateway boot path assumes a valid `baybo.json`. Without
@@ -24,7 +24,7 @@ a wizard, an operator's first run goes:
 - mints the master encryption key at `<root>/.key/encryption.key`
   with mode 0600,
 - writes a default `baybo.json` pinned to that key,
-- opens libsql storage and the secret vault,
+- opens sqlite storage and the secret vault,
 - walks an LLM-provider step (Quick + Full both run it), an optional
   channel-bot step, (Full only) an interactive browser-tool step —
   Quick instead auto-enables the browser tool with docker mode on,
@@ -51,7 +51,7 @@ baybo-cli (top)            baybo-cli::commands::{llm,channel}::add — thin wrap
             ├─ baybo-config / baybo-security (vault + encryption key)
             ├─ baybo-llm (provider catalog + OAuth)
             ├─ baybo-channels (sidecar registration protocol)
-            ├─ baybo-storage (libsql open + SecretStore + ChannelBotStore)
+            ├─ baybo-storage (sqlite open + SecretStore + ChannelBotStore)
             ├─ baybo-workspace (paths, ensure_layout)
             ├─ baybo-agent (external-agent PATH probes)
             ├─ baybo-model (ChannelType, ExternalAgentKind)
@@ -88,7 +88,7 @@ Before showing any picker, `bootstrap_workspace_if_needed`:
    patch in the key file pointer only if the existing config
    left `encryption_key_file` unset.
 4. Validates the in-memory config.
-5. Opens libsql at `<root>/state/storage.db` and builds the
+5. Opens sqlite at `<root>/state/storage.db` and builds the
    `SecretVault`.
 
 The result is a `SetupContext { config_path, config, vault, stores }`
@@ -102,7 +102,7 @@ memory; the runner commits exactly once at the end.
 Each step performs its own external side effects as it runs:
 
 - vault writes (api keys, OAuth bundles, channel tokens),
-- libsql rows (channel bot metadata),
+- sqlite rows (channel bot metadata),
 - platform-side sidecar registrations (Telegram BotFather, etc.).
 
 The **only** deferred write is `baybo.json`. The wizard accumulates
@@ -110,7 +110,7 @@ the desired config in memory, validates the whole thing once at the
 very end, and atomic-writes via `BayboConfig::write_to_file`.
 
 A Ctrl-C before the final write leaves `baybo.json` untouched. Vault
-and libsql side effects persist; a re-run picks them up via the
+and sqlite side effects persist; a re-run picks them up via the
 "Add another / Skip" pickers and the new `baybo.json` write at the
 end becomes authoritative.
 

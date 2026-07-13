@@ -4,7 +4,7 @@
 
 The `job` crate is the home for the Job concept: domain types (`Job`, `JobStatus`, `JobInputKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `JobError`), the row conversions that persist them, and the `JobLifecycle` persistence orchestrator. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself; `JobLifecycle` wraps the `JobStore` with the cancel state machine, lifecycle-event bus, and `JobId → CancellationToken` registry the in-flight execution path subscribes to.
 
-The `JobStore` trait itself lives in the `baybo-store` ports crate and trades in row DTOs — `JobRow` (the queryable columns plus the serialized `Job` in `data`) and `JobTransitionRow`. This crate owns the `Job::to_row` / `Job::from_row` conversions, so the state machine stays here while the trait sits in a leaf crate every store consumer can reach. `baybo-storage` provides the libsql implementation, shuttling rows without depending on `baybo-job` (it converts in its tests only). `impl From<baybo_store::StorageError> for JobError` bridges errors at the call sites.
+The `JobStore` trait itself lives in the `baybo-store` ports crate and trades in row DTOs — `JobRow` (the queryable columns plus the serialized `Job` in `data`) and `JobTransitionRow`. This crate owns the `Job::to_row` / `Job::from_row` conversions, so the state machine stays here while the trait sits in a leaf crate every store consumer can reach. `baybo-storage` provides the sqlite implementation, shuttling rows without depending on `baybo-job` (it converts in its tests only). `impl From<baybo_store::StorageError> for JobError` bridges errors at the call sites.
 
 Job answers **"what step is this operation at"**, not "what exactly did it do." Detailed input/output is recorded by `trace`. Each job carries its own `final_result` for the final contractual value, but progress messages emitted mid-job live in the trace tree — `Job.emitted_span_ids` is an index, not a copy. Spans completed before a cancel are tracked separately on `JobStatus::Cancelled { reason, partial_artifacts }`, not as a top-level `Job` field.
 
@@ -138,5 +138,5 @@ A running turn drains the leading run of non-slash user inputs at each tool boun
 | `agent`   | Consumes `JobLifecycle` to drive jobs through the agent loop; supplies the cancellation tokens that `register_running` tracks |
 | `trace`   | Provides `SpanId`; `JobStatus::Cancelled.partial_artifacts` references trace spans; recovery coordinates with the trace scan    |
 | `store`   | Owns the `JobStore` trait + its `JobRow` / `JobTransitionRow` DTOs and `StorageError`; this crate converts `Job` ↔ rows |
-| `storage` | Provides the libsql implementation of `JobStore` (from `baybo-store`), shuttling rows; depends on `baybo-job` only as a dev-dependency |
+| `storage` | Provides the sqlite implementation of `JobStore` (from `baybo-store`), shuttling rows; depends on `baybo-job` only as a dev-dependency |
 | `session` | `Session.trigger.kind()` is recorded as `Job.origin`; `Lineage` consumes `parent_job_id`                       |

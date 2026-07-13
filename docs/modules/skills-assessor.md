@@ -10,7 +10,7 @@ Core responsibilities:
 
 - Hash a skill directory in a stable, tamper-evident way (`hash_skill_dir`, `hash_skill_primary`).
 - Prompt an LLM with the skill contents, parse the JSON verdict.
-- Persist verdicts via `SkillRiskStore` (defined in `baybo-store`; libsql implementation in `storage`).
+- Persist verdicts via `SkillRiskStore` (defined in `baybo-store`; sqlite implementation in `storage`).
 - Honour the `AssessmentMode` set at construction: `Off` skips the check, `Primary` judges `SKILL.md`, `Full` judges the whole tree (tiering oversized trees to a background worker).
 - Run oversized full-scope jobs on a background worker so chat turns don't block on a large LLM prompt, and recover any persisted job rows left behind by older builds so upgrades don't silently abandon in-flight verdicts.
 
@@ -131,7 +131,7 @@ recv(job)
 
 ## Persistence model
 
-Owned by the `storage` crate's `libsql/skill_risk.rs` (see [storage.md](storage.md)):
+Owned by the `storage` crate's `sqlite/skill_risk.rs` (see [storage.md](storage.md)):
 
 - `skill_risk_assessments(skill_name, content_hash, level, rationale, model, assessed_at)` — finalised verdicts. One table for both scopes; scope is encoded in the hash prefix, not a separate column.
 - `skill_risk_assessment_jobs(skill_name, content_hash, source_path, status, attempts, last_error, created_at, updated_at)` — in-flight full-scope work. `status` is `Pending` | `InProgress` | `Failed`. Written live when `Full` mode tiers a large skill; also carries rows left behind by older builds that can be recovered at startup.
@@ -146,7 +146,7 @@ Owned by the `storage` crate's `libsql/skill_risk.rs` (see [storage.md](storage.
 ## Constraints
 
 - Depends on `baybo-skills` (for `SkillDefinition`), `baybo-store` (for `SkillRiskStore` + types), `baybo-llm`, and `baybo-model` — not on `baybo-storage`. Nothing else in the assistant depends on this crate's internals — callers see `AssessedSkill` and trait-object re-exports only.
-- Does not define its own `RiskVerdict` / `RiskLevel` / `AssessmentJob` — those live in `baybo-store` (the ports crate), alongside the `SkillRiskStore` trait; the libsql persistence that operates on them lives in `baybo-storage`. This crate re-exports the types so downstream callers only need one dependency.
+- Does not define its own `RiskVerdict` / `RiskLevel` / `AssessmentJob` — those live in `baybo-store` (the ports crate), alongside the `SkillRiskStore` trait; the sqlite persistence that operates on them lives in `baybo-storage`. This crate re-exports the types so downstream callers only need one dependency.
 - Production code has no `.unwrap()` / `.expect()`; all I/O and LLM errors map to `AssessError` variants.
 
 ## Collaboration
@@ -154,7 +154,7 @@ Owned by the `storage` crate's `libsql/skill_risk.rs` (see [storage.md](storage.
 | Module | Role |
 |--------|------|
 | `skills`  | Owns `SkillDefinition`, `source_path`, and the registry the assessor hashes. |
-| `storage` | Implements `SkillRiskStore` over libsql; the trait plus `RiskVerdict` / `AssessmentJob` live in the `baybo-store` ports crate. |
+| `storage` | Implements `SkillRiskStore` over sqlite; the trait plus `RiskVerdict` / `AssessmentJob` live in the `baybo-store` ports crate. |
 | `llm`     | Provides the `BoundBilledLlm` (bound to `Attribution::system("skill-assessor")`) used for the classifier call. |
 | `agent`   | Runs the tool loop that executes the registered `Skill` tool; the tool itself lives in `skills::tools` and consults `SkillRiskCheck` per invocation. |
 | `cli`     | `baybo skills check` renders `AssessedSkill` for operator review. |

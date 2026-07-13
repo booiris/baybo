@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `storage` crate is the **libsql adapter**: it implements every `*Store` trait over a single libsql backend. The trait *contracts* live in the `baybo-store` ports crate (see [`README.md`](README.md)), not here, and consumers import them from `baybo_store` directly — `baybo-storage` does **not** re-export them. What it exposes is the concrete surface: the `Store` DI bundle, the `libsql` module, and the `retry` helper. **libsql** is the sole backend.
+The `storage` crate is the **sqlite adapter**: it implements every `*Store` trait over a single sqlite backend. The trait *contracts* live in the `baybo-store` ports crate (see [`README.md`](README.md)), not here, and consumers import them from `baybo_store` directly — `baybo-storage` does **not** re-export them. What it exposes is the concrete surface: the `Store` DI bundle, the `sqlite` module, and the `retry` helper. **sqlite** is the sole backend.
 
 Its job is:
 
@@ -10,40 +10,61 @@ Its job is:
   `SessionSummaryStore`, `SessionFolderStore`, `TaskStore`, `JobStore`,
   `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`,
   `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`,
-  `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`) via libsql
+  `DeviceStore`, `SkillRiskStore`, `AgentProfileStore`) via sqlite
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
-Because the trait contracts and their row/DTO types live in `baybo-store` (a leaf over `baybo-model`), `baybo-storage` no longer depends on any of the domain crates whose stores it implements — its only normal dependencies are `baybo-store` + `baybo-model`. `baybo-job` and `baybo-trace` stay on as `dev-dependencies` alone, so the libsql round-trip tests can build the rich `Job` / `Step` / `Span` types and call their `to_row` / `from_row` helpers. Domain crates depend on `baybo-store` to *call* a store; the assembly layer wires in `baybo-storage`.
+Because the trait contracts and their row/DTO types live in `baybo-store` (a leaf over `baybo-model`), `baybo-storage` no longer depends on any of the domain crates whose stores it implements — its only normal dependencies are `baybo-store` + `baybo-model`. `baybo-job` and `baybo-trace` stay on as `dev-dependencies` alone, so the sqlite round-trip tests can build the rich `Job` / `Step` / `Span` types and call their `to_row` / `from_row` helpers. Domain crates depend on `baybo-store` to *call* a store; the assembly layer wires in `baybo-storage`.
 
 ## Design Decisions
+
+### One connection per in-flight operation — a memory-safety rule, not a tuning knob
+
+`SqlitePool` (`sqlite/mod.rs`) is a real pool of `rusqlite::Connection`s (`deadpool-sqlite`, `POOL_SIZE = 8`). Stores never hold a connection; they reach the database only through:
+
+```rust
+pool.interact("sessions.load_last_user_message", move |conn| { … }).await
+```
+
+which checks a connection out **exclusively for the whole closure** — prepare, step, *and every `row.get()`*.
+
+The exclusivity is load-bearing, and the reason is not throughput. A sqlite connection owns an unsynchronised private heap — its lookaside allocator — and the C API's own accessors mutate it: `sqlite3_value_text()` allocates in order to NUL-terminate a TEXT column. **The decode is as much a critical section as the query is**, so a lock around only the statement is a non-fix. Two threads inside one connection corrupt the lookaside free list, and the process dies later in `sqlite3DbMallocRawNN` when something pops the dangling head — far from the code that broke it.
+
+What makes the rule hold is the type system, not vigilance: `rusqlite::Connection` is `Send` but deliberately **not** `Sync`, so `Arc<Connection>` shared across tasks does not compile. `crates/storage/tests/concurrency.rs` is the regression guard; a driver that permits the aliasing fails it with a signal, not an assertion.
+
+Consequences worth knowing:
+
+- **The closure is `'static`.** Bind every parameter as an owned value (`session_id.as_str().to_string()`), and do fallible decoding (serde, chrono) in the outer `anyhow` closure rather than inside a `query_map` row closure, which may only yield `rusqlite::Result`.
+- **No `.await` inside a closure.** A method that must await something non-SQL between statements (`sqlite/blob.rs` does, for path locks and filesystem writes) splits into several `interact` calls. That is behaviour-preserving only where the statements were not already one transaction — check before splitting.
+- **`busy_timeout` is 5s, not 0.** With a single shared connection, intra-process write contention was impossible: everything queued behind one handle. A pool makes concurrent writers real, so without a timeout the agent loop and the trace sink would trade spurious `SQLITE_BUSY`. [`retry`](../../crates/storage/src/retry.rs) is now the *second* line of defence, for cross-process contention (the CLI writing the same file as a running gateway) that outlives the timeout.
+- **Transactions get exclusivity for free.** A `BEGIN IMMEDIATE` block runs inside one closure on one connection, so another task's statements can no longer land inside it — which they could when every task shared the one handle.
 
 ### All store traits live in the ports crate
 
 Every `*Store` trait contract lives in `baybo-store`; `baybo-storage` only *implements* them. Most traits trade in plain value types (`baybo-model` domain types, or row/DTO types defined alongside the trait in `baybo-store`). Two of them — `JobStore` and `TraceStore` — trade in **row DTOs** (`JobRow` / `JobTransitionRow`, `StepRow` / `SpanRow` / `SpanEventRow`: a queryable key plus the serialized entity in a `data` column) so the trait can sit in the leaf ports crate while the rich `Job` / `Step` / `Span` types — which carry the state-machine and recorder logic — stay in `baybo-job` / `baybo-trace`. Those two crates own the `to_row` / `from_row` conversions and convert at the call boundary. `TraceStore::list_unfinished_steps` is the recovery-oriented indexed query: it returns steps that are themselves open or have an open child span, including detached steps under terminal jobs.
 
 ```
-libsql/session.rs         → impl SessionStore                         (trait + StoredMessage from baybo-store)
-libsql/session_summary.rs → impl SessionSummaryStore                  (trait + SessionSummaryRow from baybo-store)
-libsql/trace.rs           → impl TraceStore                           (trait from baybo-store; rows ↔ Step/Span/SpanEvent via baybo-trace)
-libsql/secret.rs          → impl SecretStore                          (trait from baybo-store; one secrets table shared by minted placeholders, mcp.* creds, and user_env.* user secrets)
-libsql/job.rs             → impl JobStore                             (trait from baybo-store; rows ↔ Job via baybo-job)
-libsql/cost.rs            → impl CostStore                            (trait from baybo-store)
-libsql/cron.rs            → impl CronStore                            (trait from baybo-store; libsql adapter handles JSON serialization)
-libsql/skill_risk.rs      → impl SkillRiskStore                       (trait + RiskVerdict / RiskLevel from baybo-store)
-libsql/channel_session.rs → impl ChannelSessionStore                  (trait from baybo-store)
-libsql/channel_bot.rs     → impl ChannelBotStore                      (trait + ChannelBotRow from baybo-store)
-libsql/channel_pairing.rs → impl ChannelPairingStore                  (trait + ChannelPairingRow / PairingStatus from baybo-store)
-libsql/blob.rs            → impl BlobStore                            (trait + BlobMeta from baybo-store)
-libsql/session_folder.rs  → impl SessionFolderStore                   (trait + SessionFolderRow from baybo-store)
-libsql/task.rs            → impl TaskStore                            (trait + TaskPatch from baybo-store)
-libsql/device.rs          → impl DeviceStore                          (trait + DeviceRow / DeviceStatus from baybo-store)
-libsql/agent_profile.rs   → impl AgentProfileStore                    (trait + AgentProfileRow / AgentProfileUpdate from baybo-store)
+sqlite/session.rs         → impl SessionStore                         (trait + StoredMessage from baybo-store)
+sqlite/session_summary.rs → impl SessionSummaryStore                  (trait + SessionSummaryRow from baybo-store)
+sqlite/trace.rs           → impl TraceStore                           (trait from baybo-store; rows ↔ Step/Span/SpanEvent via baybo-trace)
+sqlite/secret.rs          → impl SecretStore                          (trait from baybo-store; one secrets table shared by minted placeholders, mcp.* creds, and user_env.* user secrets)
+sqlite/job.rs             → impl JobStore                             (trait from baybo-store; rows ↔ Job via baybo-job)
+sqlite/cost.rs            → impl CostStore                            (trait from baybo-store)
+sqlite/cron.rs            → impl CronStore                            (trait from baybo-store; sqlite adapter handles JSON serialization)
+sqlite/skill_risk.rs      → impl SkillRiskStore                       (trait + RiskVerdict / RiskLevel from baybo-store)
+sqlite/channel_session.rs → impl ChannelSessionStore                  (trait from baybo-store)
+sqlite/channel_bot.rs     → impl ChannelBotStore                      (trait + ChannelBotRow from baybo-store)
+sqlite/channel_pairing.rs → impl ChannelPairingStore                  (trait + ChannelPairingRow / PairingStatus from baybo-store)
+sqlite/blob.rs            → impl BlobStore                            (trait + BlobMeta from baybo-store)
+sqlite/session_folder.rs  → impl SessionFolderStore                   (trait + SessionFolderRow from baybo-store)
+sqlite/task.rs            → impl TaskStore                            (trait + TaskPatch from baybo-store)
+sqlite/device.rs          → impl DeviceStore                          (trait + DeviceRow / DeviceStatus from baybo-store)
+sqlite/agent_profile.rs   → impl AgentProfileStore                    (trait + AgentProfileRow / AgentProfileUpdate from baybo-store)
 ```
 
-Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `libsql/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one.
+Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `sqlite/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one.
 
-`Session`, `User`, `ChannelType`, and `SessionState` live in `baybo-model` so that both `baybo-session` (the `SessionManager` facade) and `baybo-storage` (libsql impl) can type against them without either crate dragging the other along. The `SessionStore` / `SessionSummaryStore` traits and their `StoredMessage` / `SessionSummaryRow` row types live in `baybo-store`; `baybo-storage` implements them and `baybo-session` calls them.
+`Session`, `User`, `ChannelType`, and `SessionState` live in `baybo-model` so that both `baybo-session` (the `SessionManager` facade) and `baybo-storage` (sqlite impl) can type against them without either crate dragging the other along. The `SessionStore` / `SessionSummaryStore` traits and their `StoredMessage` / `SessionSummaryRow` row types live in `baybo-store`; `baybo-storage` implements them and `baybo-session` calls them.
 
 The conversation transcript itself is **not** stored on `Session` — it's owned by `baybo_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for ordinary turns, `append_session_message_idempotent` for replayable source events, `apply_session_compaction` for `/compact`, and `load_active_session_messages` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions).
 
@@ -147,15 +168,15 @@ loading `end = offset + limit` rows always covers an `end`-line window, so
 `LIMIT` a high `offset` still loads O(offset) rows (line offsets don't map to row
 offsets) and sequential full pagination stays O(N²) without a per-session render
 cache — disproportionate for a rare path until real sessions grow large. A true
-libsql row-cursor (`rows.next()` is lazy, stop early) is avoided because the
+sqlite row-cursor (`rows.next()` is lazy, stop early) is avoided because the
 `dyn SessionStore` boundary would force `Pin<Box<dyn Stream>>` and the single
-shared `Arc<libsql::Connection>` would be held open across the render.
+shared `Arc<sqlite::Connection>` would be held open across the render.
 
 ### Session planning checklist: the `session_tasks` table
 
 The `Task*` planning checklist (see [`task.md`](task.md)) lives in its own
 `session_tasks` table — one row per task, keyed `(session_id, task_id)` with
-`REFERENCES sessions(id) ON DELETE CASCADE`, served by `LibsqlTaskStore` over the
+`REFERENCES sessions(id) ON DELETE CASCADE`, served by `SqliteTaskStore` over the
 `TaskStore` trait. It is **not** a `SessionState` field: a live checklist is
 mutated on every `TaskUpdate`, concurrently with the full-blob writers on the
 `sessions` row (`touch`, the actor's `save`), so a blob `Vec` would lose updates
@@ -171,23 +192,23 @@ a row whose stored `status` is unrecognized (written by a future variant) rather
 than failing the whole call, mirroring the session-blob skip discipline. Task
 rows themselves carry no unread/acknowledged state.
 
-### Single backend: libsql
+### Single backend: sqlite
 
-All store implementations use libsql (async-native, SQLite-compatible). There is no rusqlite or separate in-memory backend. `Store::open(path)` opens (or creates) a file-backed libsql database (creating parent directories if missing); `LibsqlPool::open_in_memory()` is still available for tests. `LibsqlPool` wraps a shared `libsql::Connection` behind `Arc` for cheap cloning across async tasks.
+All store implementations use sqlite (async-native, SQLite-compatible). There is no rusqlite or separate in-memory backend. `Store::open(path)` opens (or creates) a file-backed sqlite database (creating parent directories if missing); `SqlitePool::open_in_memory()` is still available for tests. `SqlitePool` wraps a shared `sqlite::Connection` behind `Arc` for cheap cloning across async tasks.
 
 The database file path is not a user-facing config knob. Bootstrap composes it from the project root via `boot::storage_db_path()` — storage always lives at `<workspace.path>/state/storage.db`. Operators pick the project root; the storage layout underneath it is fixed by convention.
 
 ### One struct per trait
 
-Each domain has an independent Store implementation (`LibsqlSessionStore`, `LibsqlCostStore`, etc.). All share one `LibsqlPool` while preserving domain isolation. No giant struct implementing every interface.
+Each domain has an independent Store implementation (`SqliteSessionStore`, `SqliteCostStore`, etc.). All share one `SqlitePool` while preserving domain isolation. No giant struct implementing every interface.
 
 ### Store solves initialization, not abstraction
 
-At startup: `Store::open(path)` creates a `LibsqlPool` and wires all store implementations. The `agent` layer injects individual stores into corresponding managers.
+At startup: `Store::open(path)` creates a `SqlitePool` and wires all store implementations. The `agent` layer injects individual stores into corresponding managers.
 
 ### Each Store manages its own queries
 
-Table schemas are created centrally in `LibsqlPool::init_db()`, but each Store struct owns its own query logic. No cross-domain aggregate tables.
+Table schemas are created centrally in `SqlitePool::init_db()`, but each Store struct owns its own query logic. No cross-domain aggregate tables.
 
 ### JSON field strategy
 
@@ -203,7 +224,7 @@ initiated by the user.
 
 ### Hard delete
 
-All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tombstone column, no soft-delete protocol, and no revival semantics — once a row is gone it is gone. The one cadence-driven retention sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow rows), which issues the same `DELETE FROM` against rows past their retention horizon. Blobs are **not** swept on a TTL; there is no `BlobStore::purge_older_than` API, so a blob row lives until an explicit `BlobStore::delete` removes it (which unlinks the content-addressed payload once no live row still references it).
+All sqlite-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tombstone column, no soft-delete protocol, and no revival semantics — once a row is gone it is gone. The one cadence-driven retention sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow rows), which issues the same `DELETE FROM` against rows past their retention horizon. Blobs are **not** swept on a TTL; there is no `BlobStore::purge_older_than` API, so a blob row lives until an explicit `BlobStore::delete` removes it (which unlinks the content-addressed payload once no live row still references it).
 
 ## Constraints
 
@@ -215,9 +236,9 @@ All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tomb
 
 | Module                                   | Role                                                                                      |
 | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
-| `storage` (self)                         | Provides libsql implementations for every Store trait from `baybo-store`; owns queries and schema initialization |
+| `storage` (self)                         | Provides sqlite implementations for every Store trait from `baybo-store`; owns queries and schema initialization |
 | `store`                                  | Owns every `*Store` trait contract + its row/DTO types; `storage` implements them and depends only on this crate (+ `model`) |
-| `model` / `trace` / `job`                | Provide domain types the libsql impls round-trip (`trace` / `job` are `dev-dependencies` only, for the round-trip tests) |
+| `model` / `trace` / `job`                | Provide domain types the sqlite impls round-trip (`trace` / `job` are `dev-dependencies` only, for the round-trip tests) |
 | `context`                                | Owns `ContextManager`; pure in-memory                                                     |
 | `session`                                | Owns the `SessionManager` facade and calls `SessionStore` / `SessionSummaryStore` (whose traits live in `baybo-store`); `storage` does **not** depend on `session` |
 | `agent`                                  | Injects stores into managers (JobLifecycle, etc.); re-exports SessionManager |

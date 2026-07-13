@@ -1,48 +1,41 @@
-//! libsql implementation of [`SessionSummaryStore`].
+//! sqlite implementation of [`SessionSummaryStore`].
 
 use async_trait::async_trait;
 use baybo_model::SessionId;
 use chrono::{DateTime, Utc};
+use rusqlite::OptionalExtension;
 
-use super::LibsqlPool;
+use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::session_summary::{Result, SessionSummaryRow, SessionSummaryStore};
 
-pub struct LibsqlSessionSummaryStore {
-    pool: LibsqlPool,
+pub struct SqliteSessionSummaryStore {
+    pool: SqlitePool,
 }
 
-impl LibsqlSessionSummaryStore {
-    pub fn new(pool: LibsqlPool) -> Self {
+impl SqliteSessionSummaryStore {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 }
 
-fn row_from_libsql(row: &libsql::Row) -> Result<SessionSummaryRow> {
-    let session_id: String = row.get(0).map_err(|e| {
-        StorageError::Internal(anyhow::anyhow!("session_summaries.session_id: {e}"))
-    })?;
-    let cursor: i64 = row
-        .get(1)
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("session_summaries.cursor: {e}")))?;
-    let pass_count: i64 = row.get(2).map_err(|e| {
-        StorageError::Internal(anyhow::anyhow!("session_summaries.pass_count: {e}"))
-    })?;
-    let updated_at_us: i64 = row.get(3).map_err(|e| {
-        StorageError::Internal(anyhow::anyhow!("session_summaries.updated_at: {e}"))
-    })?;
-    let cost_micros: i64 = row.get(4).map_err(|e| {
-        StorageError::Internal(anyhow::anyhow!("session_summaries.cost_micros: {e}"))
-    })?;
-    let model_id: String = row
-        .get(5)
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("session_summaries.model_id: {e}")))?;
-    let span_id: String = row
-        .get(6)
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("session_summaries.span_id: {e}")))?;
-    let error_count: i64 = row.get(7).map_err(|e| {
-        StorageError::Internal(anyhow::anyhow!("session_summaries.error_count: {e}"))
-    })?;
+/// Raw column tuple: (session_id, cursor, pass_count, updated_at µs,
+/// cost_micros, model_id, span_id, error_count). Decoded into a
+/// [`SessionSummaryRow`] outside the pool closure so the out-of-range
+/// timestamp keeps its `StorageError::Storage` variant.
+type RawSummaryRow = (String, i64, i64, i64, i64, String, String, i64);
+
+fn row_from_raw(raw: RawSummaryRow) -> Result<SessionSummaryRow> {
+    let (
+        session_id,
+        cursor,
+        pass_count,
+        updated_at_us,
+        cost_micros,
+        model_id,
+        span_id,
+        error_count,
+    ) = raw;
     let updated_at = super::time::from_us(updated_at_us).ok_or_else(|| {
         StorageError::Storage(format!(
             "session_summaries.updated_at out of range: {updated_at_us}"
@@ -61,25 +54,36 @@ fn row_from_libsql(row: &libsql::Row) -> Result<SessionSummaryRow> {
 }
 
 #[async_trait]
-impl SessionSummaryStore for LibsqlSessionSummaryStore {
+impl SessionSummaryStore for SqliteSessionSummaryStore {
     async fn get(&self, session_id: &SessionId) -> Result<Option<SessionSummaryRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT session_id, cursor, pass_count, updated_at, \
-                        cost_micros, model_id, span_id, error_count \
-                 FROM session_summaries WHERE session_id = ?1",
-                libsql::params![session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql query session_summaries: {e}"))
-            })?;
-        let row = rows.next().await.map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!("libsql session_summaries row: {e}"))
-        })?;
-        match row {
-            Some(r) => Ok(Some(row_from_libsql(&r)?)),
+        let sid = session_id.as_str().to_string();
+        let raw = self
+            .pool
+            .interact("session_summaries.get", move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT session_id, cursor, pass_count, updated_at, \
+                                cost_micros, model_id, span_id, error_count \
+                         FROM session_summaries WHERE session_id = ?1",
+                        rusqlite::params![sid],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                            ))
+                        },
+                    )
+                    .optional()?)
+            })
+            .await?;
+        match raw {
+            Some(raw) => Ok(Some(row_from_raw(raw)?)),
             None => Ok(None),
         }
     }
@@ -93,36 +97,39 @@ impl SessionSummaryStore for LibsqlSessionSummaryStore {
         span_id: &str,
         updated_at: DateTime<Utc>,
     ) -> Result<()> {
-        let conn = self.pool.conn();
-        // Single-statement upsert: INSERT … ON CONFLICT DO UPDATE so
-        // pass_count and cost_micros increment atomically and
-        // error_count resets to zero on success.
-        conn.execute(
-            "INSERT INTO session_summaries \
-                 (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count) \
-             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, 0) \
-             ON CONFLICT(session_id) DO UPDATE SET \
-                 cursor          = excluded.cursor, \
-                 pass_count      = session_summaries.pass_count + 1, \
-                 updated_at      = excluded.updated_at, \
-                 cost_micros     = session_summaries.cost_micros + excluded.cost_micros, \
-                 model_id        = excluded.model_id, \
-                 span_id         = excluded.span_id, \
-                 error_count     = 0",
-            libsql::params![
-                session_id.as_str().to_string(),
-                cursor,
-                super::time::to_us(updated_at),
-                cost_micros_delta,
-                model_id.to_string(),
-                span_id.to_string(),
-            ],
-        )
-        .await
-        .map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!("libsql upsert session_summaries: {e}"))
-        })?;
-        Ok(())
+        let sid = session_id.as_str().to_string();
+        let model_id = model_id.to_string();
+        let span_id = span_id.to_string();
+        let updated_at_us = super::time::to_us(updated_at);
+        self.pool
+            .interact("session_summaries.upsert_success", move |conn| {
+                // Single-statement upsert: INSERT … ON CONFLICT DO UPDATE so
+                // pass_count and cost_micros increment atomically and
+                // error_count resets to zero on success.
+                conn.execute(
+                    "INSERT INTO session_summaries \
+                         (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count) \
+                     VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, 0) \
+                     ON CONFLICT(session_id) DO UPDATE SET \
+                         cursor          = excluded.cursor, \
+                         pass_count      = session_summaries.pass_count + 1, \
+                         updated_at      = excluded.updated_at, \
+                         cost_micros     = session_summaries.cost_micros + excluded.cost_micros, \
+                         model_id        = excluded.model_id, \
+                         span_id         = excluded.span_id, \
+                         error_count     = 0",
+                    rusqlite::params![
+                        sid,
+                        cursor,
+                        updated_at_us,
+                        cost_micros_delta,
+                        model_id,
+                        span_id,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
     }
 
     async fn bump_error_count(
@@ -132,76 +139,64 @@ impl SessionSummaryStore for LibsqlSessionSummaryStore {
         span_id: &str,
         updated_at: DateTime<Utc>,
     ) -> Result<()> {
-        let conn = self.pool.conn();
-        // Inserts a row with cursor=0 / pass_count=0 if absent so even
-        // sessions that have never produced a successful summary can
-        // surface failure telemetry. On conflict, increments error_count
-        // and refreshes the model_id / span_id / updated_at trio.
-        conn.execute(
-            "INSERT INTO session_summaries \
-                 (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count) \
-             VALUES (?1, 0, 0, ?2, 0, ?3, ?4, 1) \
-             ON CONFLICT(session_id) DO UPDATE SET \
-                 error_count     = session_summaries.error_count + 1, \
-                 model_id        = excluded.model_id, \
-                 span_id         = excluded.span_id, \
-                 updated_at      = excluded.updated_at",
-            libsql::params![
-                session_id.as_str().to_string(),
-                super::time::to_us(updated_at),
-                model_id.to_string(),
-                span_id.to_string(),
-            ],
-        )
-        .await
-        .map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!("libsql bump session_summaries error: {e}"))
-        })?;
-        Ok(())
+        let sid = session_id.as_str().to_string();
+        let model_id = model_id.to_string();
+        let span_id = span_id.to_string();
+        let updated_at_us = super::time::to_us(updated_at);
+        self.pool
+            .interact("session_summaries.bump_error_count", move |conn| {
+                // Inserts a row with cursor=0 / pass_count=0 if absent so even
+                // sessions that have never produced a successful summary can
+                // surface failure telemetry. On conflict, increments error_count
+                // and refreshes the model_id / span_id / updated_at trio.
+                conn.execute(
+                    "INSERT INTO session_summaries \
+                         (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count) \
+                     VALUES (?1, 0, 0, ?2, 0, ?3, ?4, 1) \
+                     ON CONFLICT(session_id) DO UPDATE SET \
+                         error_count     = session_summaries.error_count + 1, \
+                         model_id        = excluded.model_id, \
+                         span_id         = excluded.span_id, \
+                         updated_at      = excluded.updated_at",
+                    rusqlite::params![sid, updated_at_us, model_id, span_id],
+                )?;
+                Ok(())
+            })
+            .await
     }
 
     async fn delete(&self, session_id: &SessionId) -> Result<bool> {
-        let conn = self.pool.conn();
-        let affected = conn
-            .execute(
-                "DELETE FROM session_summaries WHERE session_id = ?1",
-                libsql::params![session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql delete session_summaries: {e}"))
-            })?;
+        let sid = session_id.as_str().to_string();
+        let affected = self
+            .pool
+            .interact("session_summaries.delete", move |conn| {
+                Ok(conn.execute(
+                    "DELETE FROM session_summaries WHERE session_id = ?1",
+                    rusqlite::params![sid],
+                )?)
+            })
+            .await?;
         Ok(affected > 0)
     }
 
     async fn list_session_ids(&self) -> Result<Vec<SessionId>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT session_id FROM session_summaries ORDER BY session_id",
-                libsql::params![],
-            )
+        self.pool
+            .interact("session_summaries.list_session_ids", move |conn| {
+                let mut stmt =
+                    conn.prepare("SELECT session_id FROM session_summaries ORDER BY session_id")?;
+                let ids = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(ids.into_iter().map(SessionId::from).collect())
+            })
             .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql list session_summaries: {e}"))
-            })?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!("libsql session_summaries row: {e}"))
-        })? {
-            let id: String = row.get(0).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("session_summaries.session_id: {e}"))
-            })?;
-            out.push(SessionId::from(id));
-        }
-        Ok(out)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::libsql::session::LibsqlSessionStore;
+    use crate::sqlite::session::SqliteSessionStore;
     use baybo_model::{ChannelType, Session, SessionState, TriggerSource, User};
     use baybo_store::SessionStore;
 
@@ -230,16 +225,16 @@ mod tests {
         }
     }
 
-    async fn fresh_pool() -> LibsqlPool {
-        LibsqlPool::open_in_memory().await.unwrap()
+    async fn fresh_pool() -> SqlitePool {
+        SqlitePool::open_in_memory().await.unwrap()
     }
 
     #[tokio::test]
     async fn upsert_then_get_round_trips() {
         let pool = fresh_pool().await;
-        let sessions = LibsqlSessionStore::new(pool.clone());
+        let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session("s1")).await.unwrap();
-        let store = LibsqlSessionSummaryStore::new(pool);
+        let store = SqliteSessionSummaryStore::new(pool);
 
         let id = SessionId::from("s1");
         let now = Utc::now();
@@ -261,9 +256,9 @@ mod tests {
     #[tokio::test]
     async fn upsert_increments_pass_count_and_accumulates_cost() {
         let pool = fresh_pool().await;
-        let sessions = LibsqlSessionStore::new(pool.clone());
+        let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session("s2")).await.unwrap();
-        let store = LibsqlSessionSummaryStore::new(pool);
+        let store = SqliteSessionSummaryStore::new(pool);
         let id = SessionId::from("s2");
 
         store
@@ -289,9 +284,9 @@ mod tests {
     #[tokio::test]
     async fn bump_error_count_creates_row_when_missing_and_increments_on_conflict() {
         let pool = fresh_pool().await;
-        let sessions = LibsqlSessionStore::new(pool.clone());
+        let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session("s3")).await.unwrap();
-        let store = LibsqlSessionSummaryStore::new(pool);
+        let store = SqliteSessionSummaryStore::new(pool);
         let id = SessionId::from("s3");
 
         // No prior row → bump creates one with error_count = 1.
@@ -317,9 +312,9 @@ mod tests {
     #[tokio::test]
     async fn upsert_after_error_resets_error_count() {
         let pool = fresh_pool().await;
-        let sessions = LibsqlSessionStore::new(pool.clone());
+        let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session("s4")).await.unwrap();
-        let store = LibsqlSessionSummaryStore::new(pool);
+        let store = SqliteSessionSummaryStore::new(pool);
         let id = SessionId::from("s4");
 
         store
@@ -345,9 +340,9 @@ mod tests {
     #[tokio::test]
     async fn delete_is_idempotent() {
         let pool = fresh_pool().await;
-        let sessions = LibsqlSessionStore::new(pool.clone());
+        let sessions = SqliteSessionStore::new(pool.clone());
         sessions.save(&make_session("s5")).await.unwrap();
-        let store = LibsqlSessionSummaryStore::new(pool);
+        let store = SqliteSessionSummaryStore::new(pool);
         let id = SessionId::from("s5");
 
         store
@@ -362,11 +357,11 @@ mod tests {
     #[tokio::test]
     async fn list_session_ids_returns_sorted_set() {
         let pool = fresh_pool().await;
-        let sessions = LibsqlSessionStore::new(pool.clone());
+        let sessions = SqliteSessionStore::new(pool.clone());
         for id in ["b", "a", "c"] {
             sessions.save(&make_session(id)).await.unwrap();
         }
-        let store = LibsqlSessionSummaryStore::new(pool);
+        let store = SqliteSessionSummaryStore::new(pool);
         for id in ["b", "a", "c"] {
             store
                 .upsert_success(&SessionId::from(id), 1, 1, "m", "span", Utc::now())
@@ -388,11 +383,11 @@ mod tests {
     #[tokio::test]
     async fn cascade_delete_when_parent_session_removed() {
         let pool = fresh_pool().await;
-        let sessions = LibsqlSessionStore::new(pool.clone());
+        let sessions = SqliteSessionStore::new(pool.clone());
         let s = make_session("s-cascade");
         sessions.save(&s).await.unwrap();
 
-        let store = LibsqlSessionSummaryStore::new(pool);
+        let store = SqliteSessionSummaryStore::new(pool);
         store
             .upsert_success(&s.id, 1, 1, "m", "span", Utc::now())
             .await

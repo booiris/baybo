@@ -1,15 +1,16 @@
 use async_trait::async_trait;
+use rusqlite::OptionalExtension;
 
-use super::LibsqlPool;
+use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result};
 
-pub struct LibsqlDeviceStore {
-    pool: LibsqlPool,
+pub struct SqliteDeviceStore {
+    pool: SqlitePool,
 }
 
-impl LibsqlDeviceStore {
-    pub fn new(pool: LibsqlPool) -> Self {
+impl SqliteDeviceStore {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 }
@@ -25,7 +26,7 @@ const INSERT_DEVICE: &str = "INSERT INTO devices
  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
 
 /// Re-pair tail appended to [`INSERT_DEVICE`], used only by
-/// [`LibsqlDeviceStore::create_replacing_approved`]. `device_id` is a stable,
+/// [`SqliteDeviceStore::create_replacing_approved`]. `device_id` is a stable,
 /// client-persisted identity (the app keys it off a keychain-pinned Noise
 /// static), so re-pairing the **same** physical device collides on the
 /// `device_id` primary key. Upsert refreshes that row in place — new token /
@@ -42,28 +43,24 @@ const REPAIR_UPSERT_TAIL: &str = " ON CONFLICT(device_id) DO UPDATE SET \
      relay_url = excluded.relay_url, \
      remote_api_key = excluded.remote_api_key";
 
-fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
-    StorageError::Internal(anyhow::anyhow!("libsql {ctx}: {e}"))
-}
-
-/// Map a libsql INSERT error to a [`StorageError::Conflict`] when it tripped a
+/// Map an INSERT error to a [`StorageError::Conflict`] when it tripped a
 /// uniqueness constraint (duplicate `device_id` or `auth_token`), else a generic
-/// internal error.
-fn insert_conflict_err(row: &DeviceRow, e: impl std::fmt::Display) -> StorageError {
-    let msg = e.to_string();
+/// internal error. `StorageError::Conflict` cannot be built inside the pool's
+/// `anyhow` closure, so the failing statement's message is carried out and
+/// classified here.
+fn insert_conflict_err(op: &str, device_id: &str, msg: &str) -> StorageError {
     if msg.contains("constraint") || msg.contains("UNIQUE") {
         StorageError::Conflict(format!(
-            "device {} or its auth_token already exists",
-            row.device_id
+            "device {device_id} or its auth_token already exists"
         ))
     } else {
-        col_err("insert device", e)
+        StorageError::Internal(anyhow::anyhow!("{op}: insert device: {msg}"))
     }
 }
 
-/// The eight positional params for [`INSERT_DEVICE`], in column order.
-fn insert_params(row: &DeviceRow) -> Vec<libsql::Value> {
-    use libsql::Value;
+/// The ten positional params for [`INSERT_DEVICE`], in column order.
+fn insert_params(row: &DeviceRow) -> Vec<rusqlite::types::Value> {
+    use rusqlite::types::Value;
     let opt_int = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
     vec![
         Value::Text(row.device_id.clone()),
@@ -79,261 +76,304 @@ fn insert_params(row: &DeviceRow) -> Vec<libsql::Value> {
     ]
 }
 
-async fn fetch_row(rows: &mut libsql::Rows) -> Result<Option<DeviceRow>> {
-    let Some(row) = rows.next().await.map_err(|e| col_err("row", e))? else {
-        return Ok(None);
-    };
-    let status_s: String = row.get(3).map_err(|e| col_err("get status", e))?;
-    let status = DeviceStatus::parse(&status_s)
-        .ok_or_else(|| col_err("status", format!("unknown device status: {status_s}")))?;
-    Ok(Some(DeviceRow {
-        device_id: row.get(0).map_err(|e| col_err("get device_id", e))?,
-        device_pubkey: row.get(1).map_err(|e| col_err("get device_pubkey", e))?,
-        auth_token: row.get(2).map_err(|e| col_err("get auth_token", e))?,
-        status,
-        rendezvous_id: row.get(4).map_err(|e| col_err("get rendezvous_id", e))?,
-        created_at: row.get(5).map_err(|e| col_err("get created_at", e))?,
-        approved_at: row.get(6).map_err(|e| col_err("get approved_at", e))?,
-        last_seen_at: row.get(7).map_err(|e| col_err("get last_seen_at", e))?,
-        relay_url: row.get(8).map_err(|e| col_err("get relay_url", e))?,
-        remote_api_key: row.get(9).map_err(|e| col_err("get remote_api_key", e))?,
-    }))
+/// The raw column tuple for [`COLS`], decoded inside a `rusqlite` row closure.
+/// `status` stays a `String` here: parsing it can fail with a non-rusqlite
+/// error, so it happens after the rows are collected.
+struct RawDevice {
+    device_id: String,
+    device_pubkey: Vec<u8>,
+    auth_token: String,
+    status: String,
+    rendezvous_id: Option<String>,
+    created_at: i64,
+    approved_at: Option<i64>,
+    last_seen_at: Option<i64>,
+    relay_url: String,
+    remote_api_key: String,
 }
 
-async fn collect(rows: &mut libsql::Rows) -> Result<Vec<DeviceRow>> {
-    let mut out = Vec::new();
-    while let Some(row) = fetch_row(rows).await? {
-        out.push(row);
-    }
-    Ok(out)
+fn raw_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawDevice> {
+    Ok(RawDevice {
+        device_id: row.get(0)?,
+        device_pubkey: row.get(1)?,
+        auth_token: row.get(2)?,
+        status: row.get(3)?,
+        rendezvous_id: row.get(4)?,
+        created_at: row.get(5)?,
+        approved_at: row.get(6)?,
+        last_seen_at: row.get(7)?,
+        relay_url: row.get(8)?,
+        remote_api_key: row.get(9)?,
+    })
+}
+
+fn into_device_row(raw: RawDevice) -> anyhow::Result<DeviceRow> {
+    let status = DeviceStatus::parse(&raw.status)
+        .ok_or_else(|| anyhow::anyhow!("unknown device status: {}", raw.status))?;
+    Ok(DeviceRow {
+        device_id: raw.device_id,
+        device_pubkey: raw.device_pubkey,
+        auth_token: raw.auth_token,
+        status,
+        rendezvous_id: raw.rendezvous_id,
+        created_at: raw.created_at,
+        approved_at: raw.approved_at,
+        last_seen_at: raw.last_seen_at,
+        relay_url: raw.relay_url,
+        remote_api_key: raw.remote_api_key,
+    })
 }
 
 #[async_trait]
-impl DeviceStore for LibsqlDeviceStore {
+impl DeviceStore for SqliteDeviceStore {
     async fn create(&self, row: &DeviceRow) -> Result<()> {
-        let conn = self.pool.conn();
-        conn.execute(INSERT_DEVICE, insert_params(row))
-            .await
-            .map_err(|e| insert_conflict_err(row, e))?;
-        Ok(())
+        let device_id = row.device_id.clone();
+        let params = insert_params(row);
+        let failed = self
+            .pool
+            .interact("devices.create", move |conn| {
+                match conn.execute(INSERT_DEVICE, rusqlite::params_from_iter(params)) {
+                    Ok(_) => Ok(None),
+                    Err(e) => Ok(Some(e.to_string())),
+                }
+            })
+            .await?;
+        match failed {
+            Some(msg) => Err(insert_conflict_err("devices.create", &device_id, &msg)),
+            None => Ok(()),
+        }
     }
 
     async fn create_provisioning(&self, row: &DeviceRow) -> Result<()> {
-        let conn = self.pool.conn();
-        conn.execute(
-            &format!("{INSERT_DEVICE}{REPAIR_UPSERT_TAIL}"),
-            insert_params(row),
-        )
-        .await
-        .map_err(|e| insert_conflict_err(row, e))?;
-        Ok(())
+        let device_id = row.device_id.clone();
+        let params = insert_params(row);
+        let failed = self
+            .pool
+            .interact("devices.create_provisioning", move |conn| {
+                let sql = format!("{INSERT_DEVICE}{REPAIR_UPSERT_TAIL}");
+                match conn.execute(&sql, rusqlite::params_from_iter(params)) {
+                    Ok(_) => Ok(None),
+                    Err(e) => Ok(Some(e.to_string())),
+                }
+            })
+            .await?;
+        match failed {
+            Some(msg) => Err(insert_conflict_err(
+                "devices.create_provisioning",
+                &device_id,
+                &msg,
+            )),
+            None => Ok(()),
+        }
     }
 
     async fn approve_replacing(&self, device_id: &str, approved_at: i64) -> Result<Vec<String>> {
-        let conn = self.pool.conn();
-        let tx = conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await
-            .map_err(|e| col_err("begin approve tx", e))?;
+        let id = device_id.to_string();
+        let replaced = self
+            .pool
+            .interact("devices.approve_replacing", move |conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        let mut current = tx
-            .query(
-                "SELECT device_id FROM devices WHERE device_id = ?1",
-                libsql::params![device_id.to_string()],
-            )
-            .await
-            .map_err(|e| col_err("query staged device", e))?;
-        let exists = current
-            .next()
-            .await
-            .map_err(|e| col_err("staged device row", e))?
-            .is_some();
-        drop(current);
-        if !exists {
-            return Err(StorageError::NotFound(format!("device {device_id}")));
-        }
+                let exists = tx
+                    .query_row(
+                        "SELECT device_id FROM devices WHERE device_id = ?1",
+                        rusqlite::params![id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    // Nothing to approve — drop the tx (rollback) and let the
+                    // caller raise NotFound.
+                    return Ok(None);
+                }
 
-        let mut rows = tx
-            .query(
-                "SELECT device_id FROM devices WHERE status = 'approved' AND device_id != ?1",
-                libsql::params![device_id.to_string()],
-            )
-            .await
-            .map_err(|e| col_err("query approved", e))?;
-        let mut replaced = Vec::new();
-        while let Some(r) = rows.next().await.map_err(|e| col_err("row", e))? {
-            replaced.push(
-                r.get::<String>(0)
-                    .map_err(|e| col_err("get device_id", e))?,
-            );
-        }
-        drop(rows);
+                let replaced = {
+                    let mut stmt = tx.prepare(
+                        "SELECT device_id FROM devices WHERE status = 'approved' AND device_id != ?1",
+                    )?;
+                    stmt.query_map(rusqlite::params![id], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
 
-        tx.execute(
-            "UPDATE devices SET status = 'revoked'
+                tx.execute(
+                    "UPDATE devices SET status = 'revoked'
              WHERE status = 'approved' AND device_id != ?1",
-            libsql::params![device_id.to_string()],
-        )
-        .await
-        .map_err(|e| col_err("revoke prior approved", e))?;
+                    rusqlite::params![id],
+                )?;
 
-        tx.execute(
-            "UPDATE devices SET status = 'approved', approved_at = ?2
+                tx.execute(
+                    "UPDATE devices SET status = 'approved', approved_at = ?2
              WHERE device_id = ?1",
-            libsql::params![device_id.to_string(), approved_at],
-        )
-        .await
-        .map_err(|e| col_err("approve staged device", e))?;
+                    rusqlite::params![id, approved_at],
+                )?;
 
-        tx.commit()
-            .await
-            .map_err(|e| col_err("commit approve tx", e))?;
-        Ok(replaced)
+                tx.commit()?;
+                Ok(Some(replaced))
+            })
+            .await?;
+        replaced.ok_or_else(|| StorageError::NotFound(format!("device {device_id}")))
     }
 
     async fn create_replacing_approved(&self, row: &DeviceRow) -> Result<Vec<String>> {
-        let conn = self.pool.conn();
-        // BEGIN IMMEDIATE takes the write lock up front so the revoke + upsert
-        // commit as a unit — no window where there are zero or two approved
-        // devices, and the partial unique index can never trip.
-        let tx = conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await
-            .map_err(|e| col_err("begin replace tx", e))?;
+        let device_id = row.device_id.clone();
+        let params = insert_params(row);
+        let inserted_id = device_id.clone();
+        let outcome = self
+            .pool
+            .interact("devices.create_replacing_approved", move |conn| {
+                // BEGIN IMMEDIATE takes the write lock up front so the revoke + upsert
+                // commit as a unit — no window where there are zero or two approved
+                // devices, and the partial unique index can never trip.
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        // The devices we're about to supersede, captured for the operator's
-        // "replaced X" report before they're flipped to revoked.
-        let mut rows = tx
-            .query(
-                "SELECT device_id FROM devices WHERE status = 'approved'",
-                libsql::params![],
-            )
-            .await
-            .map_err(|e| col_err("query approved", e))?;
-        let mut replaced = Vec::new();
-        while let Some(r) = rows.next().await.map_err(|e| col_err("row", e))? {
-            let id = r
-                .get::<String>(0)
-                .map_err(|e| col_err("get device_id", e))?;
-            // A same-device re-pair (stable device_id) refreshes its own row in
-            // place below; it didn't supersede a *different* binding, so don't
-            // report it as replaced.
-            if id != row.device_id {
-                replaced.push(id);
-            }
-        }
-        drop(rows);
+                // The devices we're about to supersede, captured for the operator's
+                // "replaced X" report before they're flipped to revoked.
+                let approved = {
+                    let mut stmt =
+                        tx.prepare("SELECT device_id FROM devices WHERE status = 'approved'")?;
+                    stmt.query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                let mut replaced = Vec::new();
+                for id in approved {
+                    // A same-device re-pair (stable device_id) refreshes its own row in
+                    // place below; it didn't supersede a *different* binding, so don't
+                    // report it as replaced.
+                    if id != inserted_id {
+                        replaced.push(id);
+                    }
+                }
 
-        tx.execute(
-            "UPDATE devices SET status = 'revoked' WHERE status = 'approved'",
-            libsql::params![],
-        )
-        .await
-        .map_err(|e| col_err("revoke prior approved", e))?;
+                tx.execute(
+                    "UPDATE devices SET status = 'revoked' WHERE status = 'approved'",
+                    [],
+                )?;
 
-        tx.execute(
-            &format!("{INSERT_DEVICE}{REPAIR_UPSERT_TAIL}"),
-            insert_params(row),
-        )
-        .await
-        .map_err(|e| insert_conflict_err(row, e))?;
+                let sql = format!("{INSERT_DEVICE}{REPAIR_UPSERT_TAIL}");
+                if let Err(e) = tx.execute(&sql, rusqlite::params_from_iter(params)) {
+                    // Drop the tx without committing: the revoke rolls back with it.
+                    return Ok(Err(e.to_string()));
+                }
 
-        tx.commit()
-            .await
-            .map_err(|e| col_err("commit replace tx", e))?;
-        Ok(replaced)
+                tx.commit()?;
+                Ok(Ok(replaced))
+            })
+            .await?;
+        outcome.map_err(|msg| {
+            insert_conflict_err("devices.create_replacing_approved", &device_id, &msg)
+        })
     }
 
     async fn get(&self, device_id: &str) -> Result<Option<DeviceRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                &format!("SELECT {COLS} FROM devices WHERE device_id = ?1"),
-                libsql::params![device_id.to_string()],
-            )
+        let id = device_id.to_string();
+        self.pool
+            .interact("devices.get", move |conn| {
+                let raw = conn
+                    .query_row(
+                        &format!("SELECT {COLS} FROM devices WHERE device_id = ?1"),
+                        rusqlite::params![id],
+                        raw_from_row,
+                    )
+                    .optional()?;
+                raw.map(into_device_row).transpose()
+            })
             .await
-            .map_err(|e| col_err("query", e))?;
-        fetch_row(&mut rows).await
     }
 
     async fn lookup_approved_by_auth_token(&self, auth_token: &str) -> Result<Option<DeviceRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                &format!(
-                    "SELECT {COLS} FROM devices WHERE auth_token = ?1 AND status = 'approved'"
-                ),
-                libsql::params![auth_token.to_string()],
-            )
+        let token = auth_token.to_string();
+        self.pool
+            .interact("devices.lookup_approved_by_auth_token", move |conn| {
+                let raw = conn
+                    .query_row(
+                        &format!(
+                            "SELECT {COLS} FROM devices WHERE auth_token = ?1 AND status = 'approved'"
+                        ),
+                        rusqlite::params![token],
+                        raw_from_row,
+                    )
+                    .optional()?;
+                raw.map(into_device_row).transpose()
+            })
             .await
-            .map_err(|e| col_err("query by token", e))?;
-        fetch_row(&mut rows).await
     }
 
     async fn lookup_approved_by_pubkey(&self, device_pubkey: &[u8]) -> Result<Option<DeviceRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                // `ORDER BY ... LIMIT 1` keeps the result deterministic even in
-                // the (cryptographically impossible) event two approved rows
-                // shared a static key, so device resolution never flaps.
-                &format!(
-                    "SELECT {COLS} FROM devices WHERE device_pubkey = ?1 AND status = 'approved' \
-                     ORDER BY created_at ASC LIMIT 1"
-                ),
-                libsql::params![device_pubkey.to_vec()],
-            )
+        let pubkey = device_pubkey.to_vec();
+        self.pool
+            .interact("devices.lookup_approved_by_pubkey", move |conn| {
+                let raw = conn
+                    .query_row(
+                        // `ORDER BY ... LIMIT 1` keeps the result deterministic even in
+                        // the (cryptographically impossible) event two approved rows
+                        // shared a static key, so device resolution never flaps.
+                        &format!(
+                            "SELECT {COLS} FROM devices WHERE device_pubkey = ?1 AND status = 'approved' \
+                             ORDER BY created_at ASC LIMIT 1"
+                        ),
+                        rusqlite::params![pubkey],
+                        raw_from_row,
+                    )
+                    .optional()?;
+                raw.map(into_device_row).transpose()
+            })
             .await
-            .map_err(|e| col_err("query by pubkey", e))?;
-        fetch_row(&mut rows).await
     }
 
     async fn list(&self, status: Option<DeviceStatus>) -> Result<Vec<DeviceRow>> {
-        let conn = self.pool.conn();
-        let mut rows = match status {
-            Some(s) => {
-                conn.query(
-                    &format!(
-                        "SELECT {COLS} FROM devices WHERE status = ?1 ORDER BY created_at DESC"
-                    ),
-                    libsql::params![s.as_str().to_string()],
-                )
-                .await
-            }
-            None => {
-                conn.query(
-                    &format!("SELECT {COLS} FROM devices ORDER BY created_at DESC"),
-                    libsql::params![],
-                )
-                .await
-            }
-        }
-        .map_err(|e| col_err("query list", e))?;
-        collect(&mut rows).await
+        self.pool
+            .interact("devices.list", move |conn| {
+                let raws = match status {
+                    Some(s) => {
+                        let mut stmt = conn.prepare(&format!(
+                            "SELECT {COLS} FROM devices WHERE status = ?1 ORDER BY created_at DESC"
+                        ))?;
+
+                        stmt.query_map(rusqlite::params![s.as_str().to_string()], raw_from_row)?
+                            .collect::<rusqlite::Result<Vec<_>>>()?
+                    }
+                    None => {
+                        let mut stmt = conn.prepare(&format!(
+                            "SELECT {COLS} FROM devices ORDER BY created_at DESC"
+                        ))?;
+
+                        stmt.query_map([], raw_from_row)?
+                            .collect::<rusqlite::Result<Vec<_>>>()?
+                    }
+                };
+                raws.into_iter().map(into_device_row).collect()
+            })
+            .await
     }
 
     async fn revoke(&self, device_id: &str) -> Result<bool> {
-        let conn = self.pool.conn();
-        let affected = conn
-            .execute(
-                "UPDATE devices SET status = 'revoked'
+        let id = device_id.to_string();
+        self.pool
+            .interact("devices.revoke", move |conn| {
+                let affected = conn.execute(
+                    "UPDATE devices SET status = 'revoked'
                  WHERE device_id = ?1 AND status != 'revoked'",
-                libsql::params![device_id.to_string()],
-            )
+                    rusqlite::params![id],
+                )?;
+                Ok(affected > 0)
+            })
             .await
-            .map_err(|e| col_err("revoke", e))?;
-        Ok(affected > 0)
     }
 
     async fn touch_last_seen(&self, device_id: &str, now: i64) -> Result<()> {
-        let conn = self.pool.conn();
-        conn.execute(
-            "UPDATE devices SET last_seen_at = ?2 WHERE device_id = ?1",
-            libsql::params![device_id.to_string(), now],
-        )
-        .await
-        .map_err(|e| col_err("touch", e))?;
-        Ok(())
+        let id = device_id.to_string();
+        self.pool
+            .interact("devices.touch_last_seen", move |conn| {
+                conn.execute(
+                    "UPDATE devices SET last_seen_at = ?2 WHERE device_id = ?1",
+                    rusqlite::params![id, now],
+                )?;
+                Ok(())
+            })
+            .await
     }
 }
 
@@ -356,8 +396,8 @@ mod tests {
         }
     }
 
-    async fn store() -> LibsqlDeviceStore {
-        LibsqlDeviceStore::new(LibsqlPool::open_in_memory().await.unwrap())
+    async fn store() -> SqliteDeviceStore {
+        SqliteDeviceStore::new(SqlitePool::open_in_memory().await.unwrap())
     }
 
     #[tokio::test]

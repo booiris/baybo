@@ -12,7 +12,7 @@ pub enum JobError {
     Storage(String),
 
     /// Generic wrapper for unexpected lower-layer errors that don't
-    /// map onto a richer variant (typically libsql driver failures).
+    /// map onto a richer variant (typically sqlite driver failures).
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }

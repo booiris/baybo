@@ -141,10 +141,14 @@ chacha20poly1305 = "0.10"
 # Zeroize the 32-byte pairing secret (the Noise PSK) on drop so it never
 # lingers in freed memory; cross-compiles to aarch64-apple-ios.
 zeroize = { version = "1", features = ["derive"] }
-# Local-only — never connects to a remote turso/libsql server, so we
-# drop default features (`replication`, `remote`, `sync`, `tls`) that
-# would pull in hyper-rustls + an old rustls/webpki tree.
-libsql = { version = "0.9", default-features = false, features = ["core"] }
+# `Connection` is `Send` but deliberately NOT `Sync`, so the compiler
+# forbids two threads from entering one sqlite handle — the invariant the
+# C API requires and that a driver cannot uphold with a comment alone.
+# `bundled` pins the SQLite build to the crate rather than the host's.
+# deadpool-sqlite pins rusqlite ^0.38, and libsqlite3-sys carries
+# `links = "sqlite3"`, so exactly one version may exist in the graph.
+rusqlite = { version = "0.38", features = ["bundled"] }
+deadpool-sqlite = { version = "0.13", features = ["rt_tokio_1"] }
 axum = "0.8"
 hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = [

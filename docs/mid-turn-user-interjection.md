@@ -96,6 +96,6 @@ has_pending_input`) is the ready-made fix if this proves undesirable.
 - `crates/agent/src/runtime/agent_loop.rs` — `run_inner` loop, `InterjectionSource`, `drain_user_interjections`
 - `crates/model/src/message.rs` — `MessageSource`, `from_user()`, `ChatMessage::user_interjection`
 - `crates/context/src/lib.rs` + `crates/context/src/prompts/interjection.rs` — `frame_interjections`, `message_budget_tokens`, `wrap_interjections`
-- `crates/storage/src/libsql/session.rs` — `rehydrate_message` source round-trip
+- `crates/storage/src/sqlite/session.rs` — `rehydrate_message` source round-trip
 - `app/web/src/components/trace/MessageList.tsx`, `app/web/src/pages/TraceSessionPage.tsx` — trace-UI markers
 - `docs/modules/agent.md` — canonical scheduling invariants

@@ -72,7 +72,7 @@ impl ChannelSessionResolver {
 
         // Persist mapping. `put` survives a race where a second
         // concurrent inbound already inserted a mapping — the existing
-        // one wins (see `LibsqlChannelSessionStore::put`), so a re-read
+        // one wins (see `SqliteChannelSessionStore::put`), so a re-read
         // here is what the caller should trust.
         self.store
             .put(channel_type, user_id, &session.id)
@@ -135,17 +135,17 @@ impl ChannelSessionResolver {
 
 #[cfg(test)]
 mod tests {
-    use baybo_storage::libsql::{LibsqlChannelSessionStore, LibsqlPool, LibsqlSessionStore};
+    use baybo_storage::sqlite::{SqliteChannelSessionStore, SqlitePool, SqliteSessionStore};
 
     use super::*;
 
     async fn build() -> ChannelSessionResolver {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let session_store = Arc::new(LibsqlSessionStore::new(pool.clone()));
-        let summary_store = Arc::new(baybo_storage::libsql::LibsqlSessionSummaryStore::new(
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let session_store = Arc::new(SqliteSessionStore::new(pool.clone()));
+        let summary_store = Arc::new(baybo_storage::sqlite::SqliteSessionSummaryStore::new(
             pool.clone(),
         ));
-        let folder_store = Arc::new(baybo_storage::libsql::LibsqlSessionFolderStore::new(
+        let folder_store = Arc::new(baybo_storage::sqlite::SqliteSessionFolderStore::new(
             pool.clone(),
         ));
         let session_mgr = Arc::new(SessionManager::new(
@@ -153,7 +153,7 @@ mod tests {
             summary_store,
             folder_store,
         ));
-        let channel_store = Arc::new(LibsqlChannelSessionStore::new(pool));
+        let channel_store = Arc::new(SqliteChannelSessionStore::new(pool));
         ChannelSessionResolver::new(session_mgr, channel_store)
     }
 

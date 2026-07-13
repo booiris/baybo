@@ -9,7 +9,7 @@ use baybo_model::{SessionId, Task, TaskId};
 use baybo_store::task::{Result, TaskPatch, TaskStore};
 use parking_lot::Mutex;
 
-/// Maps each session to its checklist. Mirrors `LibsqlTaskStore` semantics:
+/// Maps each session to its checklist. Mirrors `SqliteTaskStore` semantics:
 /// per-row updates, idempotent `create` on id.
 #[derive(Default)]
 pub struct MemoryTaskStore {

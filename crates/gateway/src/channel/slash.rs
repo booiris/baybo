@@ -165,17 +165,17 @@ mod tests {
     use std::sync::Arc;
 
     use baybo_agent::SessionManager;
-    use baybo_storage::libsql::{LibsqlChannelSessionStore, LibsqlPool, LibsqlSessionStore};
+    use baybo_storage::sqlite::{SqliteChannelSessionStore, SqlitePool, SqliteSessionStore};
 
     use super::*;
 
     async fn build() -> ChannelSessionResolver {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let session_store = Arc::new(LibsqlSessionStore::new(pool.clone()));
-        let summary_store = Arc::new(baybo_storage::libsql::LibsqlSessionSummaryStore::new(
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let session_store = Arc::new(SqliteSessionStore::new(pool.clone()));
+        let summary_store = Arc::new(baybo_storage::sqlite::SqliteSessionSummaryStore::new(
             pool.clone(),
         ));
-        let folder_store = Arc::new(baybo_storage::libsql::LibsqlSessionFolderStore::new(
+        let folder_store = Arc::new(baybo_storage::sqlite::SqliteSessionFolderStore::new(
             pool.clone(),
         ));
         let session_mgr = Arc::new(SessionManager::new(
@@ -183,7 +183,7 @@ mod tests {
             summary_store,
             folder_store,
         ));
-        let channel_store = Arc::new(LibsqlChannelSessionStore::new(pool));
+        let channel_store = Arc::new(SqliteChannelSessionStore::new(pool));
         ChannelSessionResolver::new(session_mgr, channel_store)
     }
 

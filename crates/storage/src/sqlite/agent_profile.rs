@@ -1,9 +1,10 @@
-//! libsql implementation of [`AgentProfileStore`].
+//! sqlite implementation of [`AgentProfileStore`].
 
 use async_trait::async_trait;
 use baybo_model::{AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, LlmEntryName};
+use rusqlite::OptionalExtension;
 
-use super::LibsqlPool;
+use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::agent_profile::{AgentProfileRow, AgentProfileStore, AgentProfileUpdate, Result};
 
@@ -16,32 +17,34 @@ const BUILTIN_AGENT_PROFILE_DESCRIPTION: &str =
 const SELECT_COLS: &str = "id, name, description, avatar_blob_id, system_prompt, framework, \
                            llm, builtin, created_at, updated_at";
 
-pub struct LibsqlAgentProfileStore {
-    pool: LibsqlPool,
+pub struct SqliteAgentProfileStore {
+    pool: SqlitePool,
 }
 
-impl LibsqlAgentProfileStore {
+impl SqliteAgentProfileStore {
     /// Open the store and seed the built-in `baybo` row. `INSERT OR IGNORE`
     /// gives a fresh DB the row and leaves an existing one untouched
     /// (including a user-set avatar). This seed is the only statement in
     /// the process that writes `builtin = 1`.
-    pub async fn open(pool: LibsqlPool) -> anyhow::Result<Self> {
+    pub async fn open(pool: SqlitePool) -> anyhow::Result<Self> {
         let store = Self { pool };
         let now = super::time::now_us();
         store
             .pool
-            .conn()
-            .execute(
-                "INSERT OR IGNORE INTO agent_profiles \
-                 (id, name, description, framework, builtin, created_at, updated_at) \
-                 VALUES (?1, ?1, ?2, ?3, 1, ?4, ?4)",
-                libsql::params![
-                    BUILTIN_AGENT_PROFILE_ID,
-                    BUILTIN_AGENT_PROFILE_DESCRIPTION,
-                    AgentFramework::Baybo.as_str(),
-                    now,
-                ],
-            )
+            .interact("agent_profiles.seed_builtin", move |conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO agent_profiles \
+                     (id, name, description, framework, builtin, created_at, updated_at) \
+                     VALUES (?1, ?1, ?2, ?3, 1, ?4, ?4)",
+                    rusqlite::params![
+                        BUILTIN_AGENT_PROFILE_ID,
+                        BUILTIN_AGENT_PROFILE_DESCRIPTION,
+                        AgentFramework::Baybo.as_str(),
+                        now,
+                    ],
+                )?;
+                Ok(())
+            })
             .await
             .map_err(|e| anyhow::anyhow!("failed to seed builtin agent profile: {e}"))?;
         Ok(store)
@@ -49,10 +52,10 @@ impl LibsqlAgentProfileStore {
 }
 
 fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
-    StorageError::Internal(anyhow::anyhow!("libsql {ctx}: {e}"))
+    StorageError::Internal(anyhow::anyhow!("sqlite {ctx}: {e}"))
 }
 
-/// Map a libsql write error to [`StorageError::Conflict`] when it tripped
+/// Map a sqlite write error to [`StorageError::Conflict`] when it tripped
 /// the case-insensitive `UNIQUE` on `agent_profiles.name`, else a generic
 /// internal error. Same message-sniff as the device store.
 ///
@@ -68,41 +71,61 @@ fn name_conflict_err(ctx: &str, name: &str, e: impl std::fmt::Display) -> Storag
     }
 }
 
-fn row_from_libsql(row: &libsql::Row) -> Result<AgentProfileRow> {
-    let id: String = row.get(0).map_err(|e| col_err("agent_profiles.id", e))?;
-    let name: String = row.get(1).map_err(|e| col_err("agent_profiles.name", e))?;
-    let description: String = row
-        .get(2)
-        .map_err(|e| col_err("agent_profiles.description", e))?;
-    let avatar_blob_id: Option<String> = row
-        .get(3)
-        .map_err(|e| col_err("agent_profiles.avatar_blob_id", e))?;
-    let system_prompt: Option<String> = row
-        .get(4)
-        .map_err(|e| col_err("agent_profiles.system_prompt", e))?;
-    let framework_raw: String = row
-        .get(5)
-        .map_err(|e| col_err("agent_profiles.framework", e))?;
+/// The `SELECT_COLS` columns exactly as sqlite hands them over. Decoding into
+/// an [`AgentProfileRow`] can fail with a non-`Internal` [`StorageError`], which
+/// cannot be built inside the `interact` closure — so the raw columns come out
+/// first and are decoded afterwards.
+type RawProfileRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+);
+
+fn read_raw_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProfileRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn row_from_raw(raw: RawProfileRow) -> Result<AgentProfileRow> {
+    let (
+        id,
+        name,
+        description,
+        avatar_blob_id,
+        system_prompt,
+        framework_raw,
+        llm,
+        builtin_col,
+        created_at_us,
+        updated_at_us,
+    ) = raw;
     let framework = AgentFramework::parse(&framework_raw).ok_or_else(|| {
         StorageError::Storage(format!(
             "agent_profiles.framework: unknown value {framework_raw:?}"
         ))
     })?;
-    let llm: Option<String> = row.get(6).map_err(|e| col_err("agent_profiles.llm", e))?;
-    let builtin_col: i64 = row
-        .get(7)
-        .map_err(|e| col_err("agent_profiles.builtin", e))?;
-    let created_at_us: i64 = row
-        .get(8)
-        .map_err(|e| col_err("agent_profiles.created_at", e))?;
     let created_at = super::time::from_us(created_at_us).ok_or_else(|| {
         StorageError::Storage(format!(
             "agent_profiles.created_at out of range: {created_at_us}"
         ))
     })?;
-    let updated_at_us: i64 = row
-        .get(9)
-        .map_err(|e| col_err("agent_profiles.updated_at", e))?;
     let updated_at = super::time::from_us(updated_at_us).ok_or_else(|| {
         StorageError::Storage(format!(
             "agent_profiles.updated_at out of range: {updated_at_us}"
@@ -123,123 +146,152 @@ fn row_from_libsql(row: &libsql::Row) -> Result<AgentProfileRow> {
 }
 
 #[async_trait]
-impl AgentProfileStore for LibsqlAgentProfileStore {
+impl AgentProfileStore for SqliteAgentProfileStore {
     async fn list(&self) -> Result<Vec<AgentProfileRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                &format!(
+        let raws = self
+            .pool
+            .interact("agent_profiles.list", move |conn| {
+                let mut stmt = conn.prepare(&format!(
                     "SELECT {SELECT_COLS} FROM agent_profiles \
                      ORDER BY builtin DESC, name COLLATE NOCASE, id"
-                ),
-                (),
-            )
-            .await
-            .map_err(|e| col_err("list agent profiles", e))?;
-        let mut profiles = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| col_err("agent profile row", e))?
-        {
-            profiles.push(row_from_libsql(&row)?);
-        }
-        Ok(profiles)
+                ))?;
+                let raws = stmt
+                    .query_map([], read_raw_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(raws)
+            })
+            .await?;
+        raws.into_iter().map(row_from_raw).collect()
     }
 
     async fn get(&self, id: &AgentProfileId) -> Result<Option<AgentProfileRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                &format!("SELECT {SELECT_COLS} FROM agent_profiles WHERE id = ?1"),
-                libsql::params![id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| col_err("get agent profile", e))?;
-        match rows
-            .next()
-            .await
-            .map_err(|e| col_err("agent profile row", e))?
-        {
-            Some(row) => Ok(Some(row_from_libsql(&row)?)),
-            None => Ok(None),
-        }
+        let id = id.as_str().to_string();
+        let raw = self
+            .pool
+            .interact("agent_profiles.get", move |conn| {
+                Ok(conn
+                    .query_row(
+                        &format!("SELECT {SELECT_COLS} FROM agent_profiles WHERE id = ?1"),
+                        rusqlite::params![id],
+                        read_raw_row,
+                    )
+                    .optional()?)
+            })
+            .await?;
+        raw.map(row_from_raw).transpose()
     }
 
     async fn create(&self, row: &AgentProfileRow) -> Result<()> {
-        let conn = self.pool.conn();
-        // `builtin` is deliberately not in the column list: the schema
-        // DEFAULT 0 fills it, so the seed stays the only writer of 1.
-        conn.execute(
-            "INSERT INTO agent_profiles \
-             (id, name, description, avatar_blob_id, system_prompt, framework, \
-              llm, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            libsql::params![
-                row.id.as_str().to_string(),
-                row.name.clone(),
-                row.description.clone(),
-                row.avatar_blob_id.clone(),
-                row.system_prompt.clone(),
-                row.framework.as_str(),
-                row.llm.as_ref().map(|l| l.as_str().to_string()),
-                super::time::to_us(row.created_at),
-                super::time::to_us(row.updated_at),
-            ],
-        )
-        .await
-        .map_err(|e| name_conflict_err("create agent profile", &row.name, e))?;
-        Ok(())
+        let name = row.name.clone();
+        let id = row.id.as_str().to_string();
+        let description = row.description.clone();
+        let avatar_blob_id = row.avatar_blob_id.clone();
+        let system_prompt = row.system_prompt.clone();
+        let framework = row.framework.as_str();
+        let llm = row.llm.as_ref().map(|l| l.as_str().to_string());
+        let created_at = super::time::to_us(row.created_at);
+        let updated_at = super::time::to_us(row.updated_at);
+        let insert_name = name.clone();
+        // The write error has to survive the closure as data: `Conflict` is a
+        // non-`Internal` variant and can't be built inside it.
+        let outcome = self
+            .pool
+            .interact("agent_profiles.create", move |conn| {
+                // `builtin` is deliberately not in the column list: the schema
+                // DEFAULT 0 fills it, so the seed stays the only writer of 1.
+                match conn.execute(
+                    "INSERT INTO agent_profiles \
+                     (id, name, description, avatar_blob_id, system_prompt, framework, \
+                      llm, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        id,
+                        insert_name,
+                        description,
+                        avatar_blob_id,
+                        system_prompt,
+                        framework,
+                        llm,
+                        created_at,
+                        updated_at,
+                    ],
+                ) {
+                    Ok(_) => Ok(None),
+                    Err(e) => Ok(Some(e.to_string())),
+                }
+            })
+            .await?;
+        match outcome {
+            None => Ok(()),
+            Some(e) => Err(name_conflict_err("create agent profile", &name, e)),
+        }
     }
 
     async fn update(&self, id: &AgentProfileId, update: &AgentProfileUpdate) -> Result<bool> {
-        let conn = self.pool.conn();
-        let affected = conn
-            .execute(
-                "UPDATE agent_profiles SET \
-                 name = ?2, description = ?3, system_prompt = ?4, framework = ?5, \
-                 llm = ?6, updated_at = ?7 \
-                 WHERE id = ?1 AND builtin = 0",
-                libsql::params![
-                    id.as_str().to_string(),
-                    update.name.clone(),
-                    update.description.clone(),
-                    update.system_prompt.clone(),
-                    update.framework.as_str(),
-                    update.llm.as_ref().map(|l| l.as_str().to_string()),
-                    super::time::now_us(),
-                ],
-            )
-            .await
-            .map_err(|e| name_conflict_err("update agent profile", &update.name, e))?;
-        Ok(affected > 0)
+        let id = id.as_str().to_string();
+        let name = update.name.clone();
+        let update_name = name.clone();
+        let description = update.description.clone();
+        let system_prompt = update.system_prompt.clone();
+        let framework = update.framework.as_str();
+        let llm = update.llm.as_ref().map(|l| l.as_str().to_string());
+        let now = super::time::now_us();
+        let outcome = self
+            .pool
+            .interact("agent_profiles.update", move |conn| {
+                match conn.execute(
+                    "UPDATE agent_profiles SET \
+                     name = ?2, description = ?3, system_prompt = ?4, framework = ?5, \
+                     llm = ?6, updated_at = ?7 \
+                     WHERE id = ?1 AND builtin = 0",
+                    rusqlite::params![
+                        id,
+                        update_name,
+                        description,
+                        system_prompt,
+                        framework,
+                        llm,
+                        now,
+                    ],
+                ) {
+                    Ok(affected) => Ok(Ok(affected)),
+                    Err(e) => Ok(Err(e.to_string())),
+                }
+            })
+            .await?;
+        match outcome {
+            Ok(affected) => Ok(affected > 0),
+            Err(e) => Err(name_conflict_err("update agent profile", &name, e)),
+        }
     }
 
     async fn set_avatar(&self, id: &AgentProfileId, blob_id: Option<&str>) -> Result<bool> {
-        let conn = self.pool.conn();
-        let affected = conn
-            .execute(
-                "UPDATE agent_profiles SET avatar_blob_id = ?2, updated_at = ?3 WHERE id = ?1",
-                libsql::params![
-                    id.as_str().to_string(),
-                    blob_id.map(str::to_string),
-                    super::time::now_us(),
-                ],
-            )
-            .await
-            .map_err(|e| col_err("set agent profile avatar", e))?;
+        let id = id.as_str().to_string();
+        let blob_id = blob_id.map(str::to_string);
+        let now = super::time::now_us();
+        let affected = self
+            .pool
+            .interact("agent_profiles.set_avatar", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE agent_profiles SET avatar_blob_id = ?2, updated_at = ?3 WHERE id = ?1",
+                    rusqlite::params![id, blob_id, now],
+                )?)
+            })
+            .await?;
         Ok(affected > 0)
     }
 
     async fn delete(&self, id: &AgentProfileId) -> Result<bool> {
-        let conn = self.pool.conn();
-        let affected = conn
-            .execute(
-                "DELETE FROM agent_profiles WHERE id = ?1 AND builtin = 0",
-                libsql::params![id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| col_err("delete agent profile", e))?;
+        let id = id.as_str().to_string();
+        let affected = self
+            .pool
+            .interact("agent_profiles.delete", move |conn| {
+                Ok(conn.execute(
+                    "DELETE FROM agent_profiles WHERE id = ?1 AND builtin = 0",
+                    rusqlite::params![id],
+                )?)
+            })
+            .await?;
         Ok(affected > 0)
     }
 }
@@ -249,13 +301,13 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
 
-    async fn open_store() -> LibsqlAgentProfileStore {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        LibsqlAgentProfileStore::open(pool).await.unwrap()
+    async fn open_store() -> SqliteAgentProfileStore {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        SqliteAgentProfileStore::open(pool).await.unwrap()
     }
 
     fn now_us_precision() -> DateTime<Utc> {
-        crate::libsql::time::from_us(crate::libsql::time::now_us()).unwrap()
+        crate::sqlite::time::from_us(crate::sqlite::time::now_us()).unwrap()
     }
 
     fn custom_row(name: &str) -> AgentProfileRow {
@@ -302,8 +354,8 @@ mod tests {
 
     #[tokio::test]
     async fn reseed_preserves_builtin_avatar() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlAgentProfileStore::open(pool.clone()).await.unwrap();
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteAgentProfileStore::open(pool.clone()).await.unwrap();
         let builtin = AgentProfileId::builtin();
         assert!(
             store
@@ -312,7 +364,7 @@ mod tests {
                 .unwrap()
         );
 
-        let store = LibsqlAgentProfileStore::open(pool).await.unwrap();
+        let store = SqliteAgentProfileStore::open(pool).await.unwrap();
         let row = store.get(&builtin).await.unwrap().unwrap();
         assert_eq!(row.avatar_blob_id.as_deref(), Some("sha256:aa.bb"));
     }

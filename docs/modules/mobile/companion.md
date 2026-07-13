@@ -56,10 +56,10 @@ shared blind relay and is **not** bound 1:1.
 
 - **Gateway (A):** a partial unique index
   `idx_devices_one_approved ON devices(status) WHERE status='approved'`
-  (`crates/storage/src/libsql/mod.rs`) admits exactly one approved row at a time —
+  (`crates/storage/src/sqlite/mod.rs`) admits exactly one approved row at a time —
   the device domain has **no `user_id`**, so this is a single global approved row.
-  `DeviceStore::create_replacing_approved` (`crates/store/src/device.rs`, libsql
-  impl in `.../libsql/device.rs`) revokes every approved row and inserts the new
+  `DeviceStore::create_replacing_approved` (`crates/store/src/device.rs`, sqlite
+  impl in `.../sqlite/device.rs`) revokes every approved row and inserts the new
   one in one `BEGIN IMMEDIATE` transaction; re-pairing the **same** device id
   upserts in place, a **different** device supersedes the prior binding (revoked,
   kept for audit). `DevicePairingService::complete` calls it, so the swap happens

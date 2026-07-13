@@ -1,7 +1,7 @@
 //! Centralised filesystem addresses.
 //!
 //! Every baybo-managed path — workspace root, identity files, log dir,
-//! libsql database, MCP config, sidecar cache — is resolved through one of
+//! sqlite database, MCP config, sidecar cache — is resolved through one of
 //! the constants or helpers in this module. Keeping the strings in a single
 //! leaf-level crate prevents the same filename from drifting across
 //! `gateway`, `tools`, the binary entrypoints, etc.
@@ -93,7 +93,7 @@ pub const ENCRYPTION_KEY_FILE: &str = "encryption.key";
 // Files inside `state/` (not version-controlled)
 // ---------------------------------------------------------------------------
 
-/// libsql database file.
+/// sqlite database file.
 pub const STORAGE_DB_FILE: &str = "storage.db";
 
 /// Per-workspace singleton lock (advisory `flock`).
@@ -119,7 +119,7 @@ pub const STATE_SESSIONS_SUBDIR: &str = "sessions";
 /// Per-session summary file (markdown). Authoritative content for the
 /// async-refresh fast-path lives at
 /// `<STATE_DIR>/<STATE_SESSIONS_SUBDIR>/<session_id>/<SUMMARY_FILE>`;
-/// the durable metadata index is the `session_summaries` libsql table.
+/// the durable metadata index is the `session_summaries` sqlite table.
 pub const SUMMARY_FILE: &str = "summary.md";
 
 /// Sibling of [`SUMMARY_FILE`] used by the atomic write path

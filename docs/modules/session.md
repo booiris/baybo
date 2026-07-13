@@ -2,13 +2,13 @@
 
 ## Overview
 
-The `session` crate owns the session lifecycle vertical: `SessionError` and the `SessionManager` business-logic facade. The `SessionStore` / `SessionSummaryStore` traits and their per-row `StoredMessage` / `SessionSummaryRow` value types live in the `baybo-store` ports crate; domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`, `LineageKind`) live in `baybo-model`. The libsql implementations of both store traits live in `baybo-storage`, which implements the `baybo-store` contracts; `baybo-session` calls them.
+The `session` crate owns the session lifecycle vertical: `SessionError` and the `SessionManager` business-logic facade. The `SessionStore` / `SessionSummaryStore` traits and their per-row `StoredMessage` / `SessionSummaryRow` value types live in the `baybo-store` ports crate; domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`, `LineageKind`) live in `baybo-model`. The sqlite implementations of both store traits live in `baybo-storage`, which implements the `baybo-store` contracts; `baybo-session` calls them.
 
 A `Session` is the top of one trace tree. There is exactly one trace per session — subagent spawn creates new sessions with `Lineage` pointers, never new trees rooted in the same session.
 
 The conversation transcript itself is **not** carried on `Session`. It lives in `baybo_context::ContextManager` while the actor is alive; the agent loop persists each appended message and each `/compact` apply through `SessionManager::append_session_message` / `apply_session_compaction`, and the actor's run loop seeds it on cold start via `ContextManager::restore_from_store`, which calls `load_active_session_messages`.
 
-**Design principle**: each domain crate owns its business-logic vertical (manager + error + test-support fake) while the `*Store` trait contract lives in the `baybo-store` ports crate. Downstream callers depend on the manager crate for logic and on `baybo-store` for the trait. `baybo-storage` keeps only the libsql implementations and exposes a `Store` bundle for assembly-layer wiring. Higher-level orchestration (Router, Actor) lives in `agent`, which re-exports `SessionManager` for convenience.
+**Design principle**: each domain crate owns its business-logic vertical (manager + error + test-support fake) while the `*Store` trait contract lives in the `baybo-store` ports crate. Downstream callers depend on the manager crate for logic and on `baybo-store` for the trait. `baybo-storage` keeps only the sqlite implementations and exposes a `Store` bundle for assembly-layer wiring. Higher-level orchestration (Router, Actor) lives in `agent`, which re-exports `SessionManager` for convenience.
 
 ## Manager surface
 
@@ -81,7 +81,7 @@ Session rows and their transcripts are core user data and are **never** dropped 
 | Module    | Role                                                                                                |
 | --------- | --------------------------------------------------------------------------------------------------- |
 | `model`   | Defines `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`               |
-| `storage` | Implements `SessionStore` / `SessionSummaryStore` / `SessionFolderStore` against libsql; pulls the traits from `baybo-store` (no `baybo-session` dependency) |
+| `storage` | Implements `SessionStore` / `SessionSummaryStore` / `SessionFolderStore` against sqlite; pulls the traits from `baybo-store` (no `baybo-session` dependency) |
 | `context` | Owns the in-memory transcript via `ContextManager`; agent loop brokers persistence via this crate  |
 | `agent`   | Re-exports `SessionManager`; Router calls it; `AgentActor` holds the `Session` instance            |
 | `cli` / `gateway` | Operator-facing surfaces consume `baybo_agent::SessionManager`                              |

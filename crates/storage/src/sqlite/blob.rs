@@ -11,10 +11,11 @@ use baybo_model::BlobRef;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use super::LibsqlPool;
+use super::SqlitePool;
 use baybo_store::StorageError;
 use baybo_store::blob::{BlobMeta, BlobReader, BlobStore, ByteStream, Result, SHA256_PREFIX};
 
@@ -25,18 +26,18 @@ use baybo_store::blob::{BlobMeta, BlobReader, BlobStore, ByteStream, Result, SHA
 // `CLAUDE.md`) so neither needs a cfg gate.
 const BLOB_PATH_LOCK_STRIPES: usize = 64;
 
-pub struct LibsqlBlobStore {
-    pool: LibsqlPool,
+pub struct SqliteBlobStore {
+    pool: SqlitePool,
     root: PathBuf,
     path_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
 }
 
-impl LibsqlBlobStore {
+impl SqliteBlobStore {
     /// Construct a blob store backed by `pool` for metadata and `root`
     /// on the filesystem for byte payloads. The caller is responsible
     /// for creating `root` (or using [`Self::open`] which does it for
     /// you).
-    pub fn new(pool: LibsqlPool, root: impl Into<PathBuf>) -> Self {
+    pub fn new(pool: SqlitePool, root: impl Into<PathBuf>) -> Self {
         Self {
             pool,
             root: root.into(),
@@ -45,7 +46,7 @@ impl LibsqlBlobStore {
     }
 
     /// Construct a blob store and ensure `root` exists on disk.
-    pub async fn open(pool: LibsqlPool, root: impl Into<PathBuf>) -> anyhow::Result<Self> {
+    pub async fn open(pool: SqlitePool, root: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let root = root.into();
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -99,25 +100,31 @@ impl LibsqlBlobStore {
         read_token: &str,
     ) -> Result<BlobRef> {
         let blob_id = format!("{SHA256_PREFIX}{hex}.{read_token}");
-        let conn = self.pool.conn();
         let now = now_unix();
-        conn.execute(
-            "INSERT INTO blobs (blob_id, mime_type, size, uploader_identity, read_token, created_at, last_accessed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
-             ON CONFLICT(blob_id) DO UPDATE SET \
-                mime_type = excluded.mime_type, \
-                last_accessed_at = excluded.last_accessed_at",
-            libsql::params![
-                blob_id.clone(),
-                mime_type.to_string(),
-                size as i64,
-                uploader_identity.map(|s| s.to_string()),
-                read_token.to_string(),
-                now,
-            ],
-        )
-        .await
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob upsert: {e}")))?;
+        let row_id = blob_id.clone();
+        let mime_type = mime_type.to_string();
+        let uploader_identity = uploader_identity.map(|s| s.to_string());
+        let read_token = read_token.to_string();
+        self.pool
+            .interact("blobs.record_metadata", move |conn| {
+                conn.execute(
+                    "INSERT INTO blobs (blob_id, mime_type, size, uploader_identity, read_token, created_at, last_accessed_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
+                     ON CONFLICT(blob_id) DO UPDATE SET \
+                        mime_type = excluded.mime_type, \
+                        last_accessed_at = excluded.last_accessed_at",
+                    rusqlite::params![
+                        row_id,
+                        mime_type,
+                        size as i64,
+                        uploader_identity,
+                        read_token,
+                        now,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await?;
         Ok(BlobRef { blob_id })
     }
 
@@ -125,13 +132,18 @@ impl LibsqlBlobStore {
     /// must never bubble up to the caller — the read path needs to keep
     /// returning bytes even when the DB is briefly unwritable.
     async fn touch(&self, blob_id: &str) {
-        let conn = self.pool.conn();
-        if let Err(e) = conn
-            .execute(
-                "UPDATE blobs SET last_accessed_at = ?2 \
-                 WHERE blob_id = ?1",
-                libsql::params![blob_id.to_string(), now_unix()],
-            )
+        let id = blob_id.to_string();
+        let now = now_unix();
+        if let Err(e) = self
+            .pool
+            .interact("blobs.touch", move |conn| {
+                conn.execute(
+                    "UPDATE blobs SET last_accessed_at = ?2 \
+                     WHERE blob_id = ?1",
+                    rusqlite::params![id, now],
+                )?;
+                Ok(())
+            })
             .await
         {
             tracing::warn!(
@@ -157,7 +169,7 @@ fn now_unix() -> i64 {
 
 /// Cosmetic file extension to append to a blob's on-disk filename so a
 /// human poking around `<state>/blobs/` can recognise an image vs a
-/// PDF without consulting the libsql metadata. Returns `""` when the
+/// PDF without consulting the sqlite metadata. Returns `""` when the
 /// MIME type isn't in the table — anything we don't recognise lands
 /// without a suffix rather than guessing wrong.
 fn mime_extension(mime: &str) -> &'static str {
@@ -202,7 +214,7 @@ fn mime_extension(mime: &str) -> &'static str {
 }
 
 #[async_trait]
-impl BlobStore for LibsqlBlobStore {
+impl BlobStore for SqliteBlobStore {
     async fn put(
         &self,
         bytes: &[u8],
@@ -394,37 +406,31 @@ impl BlobStore for LibsqlBlobStore {
 
     async fn stat(&self, blob_id: &str) -> Result<BlobMeta> {
         let (_hex, token) = split_id(blob_id)?;
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT blob_id, mime_type, size, created_at, read_token \
-                 FROM blobs WHERE blob_id = ?1",
-                libsql::params![blob_id.to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob query: {e}")))?;
+        let id_param = blob_id.to_string();
+        let row = self
+            .pool
+            .interact("blobs.stat", move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT blob_id, mime_type, size, created_at, read_token \
+                         FROM blobs WHERE blob_id = ?1",
+                        rusqlite::params![id_param],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?)
+            })
+            .await?;
 
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob row: {e}")))?
+        let (id, mime_type, size, created_at, read_token) = row
             .ok_or_else(|| StorageError::NotFound(format!("blob {}", redacted_blob_id(blob_id))))?;
-
-        let id: String = row
-            .get(0)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get blob_id: {e}")))?;
-        let mime_type: String = row
-            .get(1)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get mime: {e}")))?;
-        let size: i64 = row
-            .get(2)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get size: {e}")))?;
-        let created_at: i64 = row
-            .get(3)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}")))?;
-        let read_token: Option<String> = row
-            .get(4)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get read_token: {e}")))?;
 
         // Enforce the unguessable token match. Legacy blobs without a
         // token are open (backward compatibility).
@@ -454,42 +460,38 @@ impl BlobStore for LibsqlBlobStore {
 
     async fn delete(&self, blob_id: &str) -> Result<()> {
         let (hex, _token) = split_id(blob_id)?;
-        let conn = self.pool.conn();
 
         // Capture mime so we can locate the on-disk file before the
         // metadata row is gone, then check whether any other live row
         // still points at the same content path.
-        let mut rows = conn
-            .query(
-                "SELECT mime_type FROM blobs WHERE blob_id = ?1",
-                libsql::params![blob_id.to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob query: {e}")))?;
-        let mime_type: Option<String> = match rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob row: {e}")))?
-        {
-            Some(row) => Some(
-                row.get(0)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get mime: {e}")))?,
-            ),
-            None => None,
-        };
-        drop(rows);
+        let id_param = blob_id.to_string();
+        let mime_type: Option<String> = self
+            .pool
+            .interact("blobs.delete_lookup", move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT mime_type FROM blobs WHERE blob_id = ?1",
+                        rusqlite::params![id_param],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?)
+            })
+            .await?;
 
         if let Some(mime) = mime_type {
             let ext = mime_extension(&mime);
             let path = self.blob_path(hex, ext);
             let _path_guard = self.content_path_guard(hex, ext).await;
-            let affected = conn
-                .execute(
-                    "DELETE FROM blobs WHERE blob_id = ?1",
-                    libsql::params![blob_id.to_string()],
-                )
-                .await
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob delete: {e}")))?;
+            let id_param = blob_id.to_string();
+            let affected = self
+                .pool
+                .interact("blobs.delete", move |conn| {
+                    Ok(conn.execute(
+                        "DELETE FROM blobs WHERE blob_id = ?1",
+                        rusqlite::params![id_param],
+                    )?)
+                })
+                .await?;
             // Two puts of the same content (and same mime) share one
             // on-disk file by content addressing; deleting one
             // capability must not yank the file out from under the
@@ -512,37 +514,31 @@ impl BlobStore for LibsqlBlobStore {
     }
 }
 
-impl LibsqlBlobStore {
+impl SqliteBlobStore {
     /// Return `true` if some other live blob row resolves to the same
     /// on-disk path (i.e. shares this `(hex, mime_extension)` pair).
     /// Used by [`BlobStore::delete`] before unlinking a payload so a
     /// concurrent capability for the same content doesn't lose its
     /// bytes.
     async fn any_live_for_path(&self, hex: &str, ext: &'static str) -> Result<bool> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query("SELECT blob_id, mime_type FROM blobs", libsql::params![])
+        let hex = hex.to_string();
+        self.pool
+            .interact("blobs.any_live_for_path", move |conn| {
+                let mut stmt = conn.prepare("SELECT blob_id, mime_type FROM blobs")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let other_id: String = row.get(0)?;
+                    let other_mime: String = row.get(1)?;
+                    if let Ok((other_hex, _token)) = split_id(&other_id)
+                        && other_hex == hex
+                        && mime_extension(&other_mime) == ext
+                    {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
             .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob live scan: {e}")))?;
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql blob live row: {e}")))?
-        {
-            let other_id: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get blob_id: {e}")))?;
-            let other_mime: String = row
-                .get(1)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get mime: {e}")))?;
-            if let Ok((other_hex, _token)) = split_id(&other_id)
-                && other_hex == hex
-                && mime_extension(&other_mime) == ext
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 }
 
@@ -613,10 +609,10 @@ fn split_id(blob_id: &str) -> Result<(&str, &str)> {
 mod tests {
     use super::*;
 
-    async fn build() -> (LibsqlBlobStore, tempfile::TempDir) {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
+    async fn build() -> (SqliteBlobStore, tempfile::TempDir) {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let store = LibsqlBlobStore::open(pool, dir.path().join("blobs"))
+        let store = SqliteBlobStore::open(pool, dir.path().join("blobs"))
             .await
             .unwrap();
         (store, dir)
@@ -783,10 +779,10 @@ mod tests {
         // explicitly rather than relying on umask.
         unsafe { libc::umask(0o022) };
 
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let pool = SqlitePool::open_in_memory().await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let blob_root = dir.path().join("blobs");
-        let store = LibsqlBlobStore::open(pool, &blob_root).await.unwrap();
+        let store = SqliteBlobStore::open(pool, &blob_root).await.unwrap();
 
         let blob = store.put(b"perm check", "text/plain", None).await.unwrap();
 

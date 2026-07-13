@@ -1,6 +1,6 @@
 //! Unix-microsecond <-> `DateTime<Utc>` conversion helpers.
 //!
-//! Every timestamp column in the libsql schema stores an `INTEGER`
+//! Every timestamp column in the sqlite schema stores an `INTEGER`
 //! count of microseconds since the Unix epoch. Going through these
 //! helpers keeps the unit explicit at every site.
 //!

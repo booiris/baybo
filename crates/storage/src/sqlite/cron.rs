@@ -1,4 +1,4 @@
-//! libsql implementation of [`CronStore`].
+//! sqlite implementation of [`CronStore`].
 //!
 //! Cron rows persist as the same `(id, user_id, status, next_trigger_at,
 //! data)` shape they always have — `data` carries the full
@@ -11,51 +11,49 @@ use baybo_model::{CronExecution, CronJob, ExecutionStatus};
 use baybo_store::StorageError;
 use baybo_store::cron::{CronStore, ExecutionCompletion, Result};
 use chrono::{DateTime, Utc};
+use rusqlite::OptionalExtension;
 
-use super::LibsqlPool;
+use super::SqlitePool;
 
-pub struct LibsqlCronStore {
-    pool: LibsqlPool,
+pub struct SqliteCronStore {
+    pool: SqlitePool,
 }
 
-impl LibsqlCronStore {
-    pub fn new(pool: LibsqlPool) -> Self {
+impl SqliteCronStore {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 }
 
 // ── Row helpers ───────────────────────────────────────────────────────
+//
+// Decoding runs *outside* the connection closure: a `query_map` row
+// callback may only fail with a rusqlite error, so the queries below pull
+// the raw columns out and hand them here.
 
-fn col_string(row: &libsql::Row, i: i32) -> Result<String> {
-    row.get::<String>(i)
-        .map_err(|e| StorageError::Storage(format!("libsql get column {i}: {e}")))
-}
-
-fn job_from_row(row: &libsql::Row) -> Result<CronJob> {
-    // Cols: (id, user_id, status, next_trigger_at, data)
-    let data = col_string(row, 4)?;
-    serde_json::from_str(&data)
+fn job_from_data(data: &str) -> Result<CronJob> {
+    serde_json::from_str(data)
         .map_err(|e| StorageError::Storage(format!("failed to deserialize cron job: {e}")))
 }
 
-fn execution_from_row(row: &libsql::Row) -> Result<CronExecution> {
-    // Cols: (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data)
-    let data = col_string(row, 6)?;
-    let mut exec: CronExecution = serde_json::from_str(&data)
+fn execution_from_row(status_col: &str, data: &str) -> Result<CronExecution> {
+    let mut exec: CronExecution = serde_json::from_str(data)
         .map_err(|e| StorageError::Storage(format!("failed to deserialize execution: {e}")))?;
     // The row-level `status` column is the source of truth — `update_execution_status`
     // touches the column without rewriting `data`.
-    let status_col = col_string(row, 5)?;
-    exec.status = match status_col.as_str() {
+    exec.status = match status_col {
         "dispatched" => ExecutionStatus::Dispatched,
         _ => ExecutionStatus::Pending,
     };
     Ok(exec)
 }
 
-/// Columns every execution query selects, in the order
-/// [`execution_from_row`] indexes them.
+/// Columns every execution query selects; [`execution_from_row`] takes the
+/// `status` (index 5) and `data` (index 6) columns out of that list.
 const EXECUTION_COLS: &str = "id, job_id, user_id, scheduled_fire_time, triggered_at, status, data";
+
+/// The `(status, data)` pair each execution query lifts out of a row.
+type ExecutionRow = (String, String);
 
 fn execution_status_str(status: ExecutionStatus) -> &'static str {
     match status {
@@ -74,49 +72,56 @@ fn serialize_execution(exec: &CronExecution) -> Result<String> {
         .map_err(|e| StorageError::Storage(format!("failed to serialize execution: {e}")))
 }
 
+fn decode_jobs(rows: Vec<String>) -> Result<Vec<CronJob>> {
+    rows.iter().map(|data| job_from_data(data)).collect()
+}
+
+fn decode_executions(rows: Vec<ExecutionRow>) -> Result<Vec<CronExecution>> {
+    rows.iter()
+        .map(|(status, data)| execution_from_row(status, data))
+        .collect()
+}
+
 #[async_trait]
-impl CronStore for LibsqlCronStore {
+impl CronStore for SqliteCronStore {
     async fn create(&self, job: &CronJob) -> Result<()> {
         let data = serialize_job(job)?;
         let next_trigger_us = job
             .next_trigger_at
             .map(|t| t.timestamp_micros())
             .unwrap_or(0);
+        let id = job.id.clone();
+        let user_id = job.user_id.clone();
+        let status = job.status.as_str().to_string();
         self.pool
-            .conn()
-            .execute(
-                "INSERT INTO cron_jobs (id, user_id, status, next_trigger_at, data) VALUES (?1, ?2, ?3, ?4, ?5)",
-                libsql::params![
-                    job.id.clone(),
-                    job.user_id.clone(),
-                    job.status.as_str().to_string(),
-                    next_trigger_us,
-                    data,
-                ],
-            )
+            .interact("cron.create", move |conn| {
+                conn.execute(
+                    "INSERT INTO cron_jobs (id, user_id, status, next_trigger_at, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![id, user_id, status, next_trigger_us, data],
+                )?;
+                Ok(())
+            })
             .await
-            .map_err(|e| StorageError::Storage(format!("libsql insert: {e}")))?;
-        Ok(())
     }
 
     async fn get(&self, job_id: &str) -> Result<Option<CronJob>> {
-        let mut rows = self
+        let job_id = job_id.to_string();
+        let data: Option<String> = self
             .pool
-            .conn()
-            .query(
-                "SELECT id, user_id, status, next_trigger_at, data \
-                 FROM cron_jobs WHERE id = ?1",
-                libsql::params![job_id.to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
+            .interact("cron.get", move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT id, user_id, status, next_trigger_at, data \
+                         FROM cron_jobs WHERE id = ?1",
+                        rusqlite::params![job_id],
+                        |row| row.get::<_, String>(4),
+                    )
+                    .optional()?)
+            })
+            .await?;
 
-        match rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
-        {
-            Some(row) => Ok(Some(job_from_row(&row)?)),
+        match data {
+            Some(data) => Ok(Some(job_from_data(&data)?)),
             None => Ok(None),
         }
     }
@@ -127,22 +132,19 @@ impl CronStore for LibsqlCronStore {
             .next_trigger_at
             .map(|t| t.timestamp_micros())
             .unwrap_or(0);
+        let id = job.id.clone();
+        let user_id = job.user_id.clone();
+        let status = job.status.as_str().to_string();
         let affected = self
             .pool
-            .conn()
-            .execute(
-                "UPDATE cron_jobs SET user_id = ?1, status = ?2, next_trigger_at = ?3, data = ?4 \
-                 WHERE id = ?5",
-                libsql::params![
-                    job.user_id.clone(),
-                    job.status.as_str().to_string(),
-                    next_trigger_us,
-                    data,
-                    job.id.clone(),
-                ],
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql update: {e}")))?;
+            .interact("cron.save", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE cron_jobs SET user_id = ?1, status = ?2, next_trigger_at = ?3, data = ?4 \
+                     WHERE id = ?5",
+                    rusqlite::params![user_id, status, next_trigger_us, data, id],
+                )?)
+            })
+            .await?;
 
         if affected == 0 {
             return Err(StorageError::NotFound(job.id.clone()));
@@ -151,15 +153,13 @@ impl CronStore for LibsqlCronStore {
     }
 
     async fn delete(&self, job_id: &str) -> Result<()> {
+        let id = job_id.to_string();
         let affected = self
             .pool
-            .conn()
-            .execute(
-                "DELETE FROM cron_jobs WHERE id = ?1",
-                libsql::params![job_id.to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql delete: {e}")))?;
+            .interact("cron.delete", move |conn| {
+                Ok(conn.execute("DELETE FROM cron_jobs WHERE id = ?1", rusqlite::params![id])?)
+            })
+            .await?;
 
         if affected == 0 {
             return Err(StorageError::NotFound(job_id.to_string()));
@@ -168,95 +168,72 @@ impl CronStore for LibsqlCronStore {
     }
 
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<CronJob>> {
-        let mut rows = self
+        let user_id = user_id.to_string();
+        let rows = self
             .pool
-            .conn()
-            .query(
-                "SELECT id, user_id, status, next_trigger_at, data \
-                 FROM cron_jobs WHERE user_id = ?1",
-                libsql::params![user_id.to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
-        {
-            out.push(job_from_row(&row)?);
-        }
-        Ok(out)
+            .interact("cron.list_by_user", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, user_id, status, next_trigger_at, data \
+                     FROM cron_jobs WHERE user_id = ?1",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![user_id], |row| row.get::<_, String>(4))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        decode_jobs(rows)
     }
 
     async fn list_all(&self) -> Result<Vec<CronJob>> {
-        let mut rows = self
+        let rows = self
             .pool
-            .conn()
-            .query(
-                "SELECT id, user_id, status, next_trigger_at, data \
-                 FROM cron_jobs",
-                (),
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
-        {
-            out.push(job_from_row(&row)?);
-        }
-        Ok(out)
+            .interact("cron.list_all", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, user_id, status, next_trigger_at, data \
+                     FROM cron_jobs",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(4))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        decode_jobs(rows)
     }
 
     async fn list_enabled(&self) -> Result<Vec<CronJob>> {
-        let mut rows = self
+        let rows = self
             .pool
-            .conn()
-            .query(
-                "SELECT id, user_id, status, next_trigger_at, data \
-                 FROM cron_jobs WHERE status = 'enabled'",
-                (),
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
-        {
-            out.push(job_from_row(&row)?);
-        }
-        Ok(out)
+            .interact("cron.list_enabled", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, user_id, status, next_trigger_at, data \
+                     FROM cron_jobs WHERE status = 'enabled'",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(4))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        decode_jobs(rows)
     }
 
     async fn list_due(&self, now_us: i64) -> Result<Vec<CronJob>> {
-        let mut rows = self
+        let rows = self
             .pool
-            .conn()
-            .query(
-                "SELECT id, user_id, status, next_trigger_at, data FROM cron_jobs \
-                 WHERE status = 'enabled' AND next_trigger_at != 0 AND next_trigger_at <= ?1",
-                libsql::params![now_us],
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
-        {
-            out.push(job_from_row(&row)?);
-        }
-        Ok(out)
+            .interact("cron.list_due", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, user_id, status, next_trigger_at, data FROM cron_jobs \
+                     WHERE status = 'enabled' AND next_trigger_at != 0 AND next_trigger_at <= ?1",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![now_us], |row| row.get::<_, String>(4))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        decode_jobs(rows)
     }
 
     // ── Execution records ──
@@ -265,27 +242,31 @@ impl CronStore for LibsqlCronStore {
         let data = serialize_execution(exec)?;
         let scheduled_us = exec.scheduled_fire_time.timestamp_micros();
         let triggered_us = exec.triggered_at.timestamp_micros();
+        let id = exec.id.clone();
+        let job_id = exec.job_id.clone();
+        let user_id = exec.user_id.clone();
+        let status = execution_status_str(exec.status).to_string();
         // INSERT OR IGNORE so the (job_id, scheduled_fire_time) unique
         // index distinguishes "lost the dedup race" from "DB is broken".
         // 0 affected rows means another scheduler beat us to this slot;
         // the caller treats that as benign and skips the dispatch.
         let affected = self
             .pool
-            .conn()
-            .execute(
-                "INSERT OR IGNORE INTO cron_executions (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                libsql::params![
-                    exec.id.clone(),
-                    exec.job_id.clone(),
-                    exec.user_id.clone(),
-                    scheduled_us,
-                    triggered_us,
-                    execution_status_str(exec.status).to_string(),
-                    data,
-                ],
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql insert: {e}")))?;
+            .interact("cron.record_execution", move |conn| {
+                Ok(conn.execute(
+                    "INSERT OR IGNORE INTO cron_executions (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        id,
+                        job_id,
+                        user_id,
+                        scheduled_us,
+                        triggered_us,
+                        status,
+                        data,
+                    ],
+                )?)
+            })
+            .await?;
         if affected == 0 {
             return Err(StorageError::Conflict(format!(
                 "{}@{}",
@@ -296,47 +277,41 @@ impl CronStore for LibsqlCronStore {
     }
 
     async fn list_executions_by_job(&self, job_id: &str) -> Result<Vec<CronExecution>> {
-        let mut rows = self
+        let job_id = job_id.to_string();
+        let rows = self
             .pool
-            .conn()
-            .query(
-                "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE job_id = ?1 ORDER BY triggered_at DESC",
-                libsql::params![job_id.to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
-        {
-            out.push(execution_from_row(&row)?);
-        }
-        Ok(out)
+            .interact("cron.list_executions_by_job", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE job_id = ?1 ORDER BY triggered_at DESC",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![job_id], |row| {
+                        Ok((row.get::<_, String>(5)?, row.get::<_, String>(6)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<ExecutionRow>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        decode_executions(rows)
     }
 
     async fn list_executions_by_user(&self, user_id: &str) -> Result<Vec<CronExecution>> {
-        let mut rows = self
+        let user_id = user_id.to_string();
+        let rows = self
             .pool
-            .conn()
-            .query(
-                "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE user_id = ?1 ORDER BY triggered_at DESC",
-                libsql::params![user_id.to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
-        {
-            out.push(execution_from_row(&row)?);
-        }
-        Ok(out)
+            .interact("cron.list_executions_by_user", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, job_id, user_id, scheduled_fire_time, triggered_at, status, data FROM cron_executions WHERE user_id = ?1 ORDER BY triggered_at DESC",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![user_id], |row| {
+                        Ok((row.get::<_, String>(5)?, row.get::<_, String>(6)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<ExecutionRow>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        decode_executions(rows)
     }
 
     async fn has_execution_for_schedule(
@@ -344,22 +319,19 @@ impl CronStore for LibsqlCronStore {
         job_id: &str,
         scheduled_fire_time_us: i64,
     ) -> Result<bool> {
-        let mut rows = self
-            .pool
-            .conn()
-            .query(
-                "SELECT 1 FROM cron_executions WHERE job_id = ?1 AND scheduled_fire_time = ?2 LIMIT 1",
-                libsql::params![job_id.to_string(), scheduled_fire_time_us],
-            )
+        let job_id = job_id.to_string();
+        self.pool
+            .interact("cron.has_execution_for_schedule", move |conn| {
+                let found: Option<i64> = conn
+                    .query_row(
+                        "SELECT 1 FROM cron_executions WHERE job_id = ?1 AND scheduled_fire_time = ?2 LIMIT 1",
+                        rusqlite::params![job_id, scheduled_fire_time_us],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                Ok(found.is_some())
+            })
             .await
-            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
-
-        let exists = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
-            .is_some();
-        Ok(exists)
     }
 
     async fn update_execution_status(
@@ -367,18 +339,17 @@ impl CronStore for LibsqlCronStore {
         execution_id: &str,
         status: ExecutionStatus,
     ) -> Result<()> {
+        let status = execution_status_str(status).to_string();
+        let id = execution_id.to_string();
         let affected = self
             .pool
-            .conn()
-            .execute(
-                "UPDATE cron_executions SET status = ?1 WHERE id = ?2",
-                libsql::params![
-                    execution_status_str(status).to_string(),
-                    execution_id.to_string(),
-                ],
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql update: {e}")))?;
+            .interact("cron.update_execution_status", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE cron_executions SET status = ?1 WHERE id = ?2",
+                    rusqlite::params![status, id],
+                )?)
+            })
+            .await?;
 
         if affected == 0 {
             return Err(StorageError::NotFound(execution_id.to_string()));
@@ -390,25 +361,22 @@ impl CronStore for LibsqlCronStore {
         &self,
         status: ExecutionStatus,
     ) -> Result<Vec<CronExecution>> {
-        let mut rows = self
+        let status = execution_status_str(status).to_string();
+        let rows = self
             .pool
-            .conn()
-            .query(
-                &format!("SELECT {EXECUTION_COLS} FROM cron_executions WHERE status = ?1"),
-                libsql::params![execution_status_str(status).to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
-        {
-            out.push(execution_from_row(&row)?);
-        }
-        Ok(out)
+            .interact("cron.list_executions_by_status", move |conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {EXECUTION_COLS} FROM cron_executions WHERE status = ?1"
+                ))?;
+                let rows = stmt
+                    .query_map(rusqlite::params![status], |row| {
+                        Ok((row.get::<_, String>(5)?, row.get::<_, String>(6)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<ExecutionRow>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        decode_executions(rows)
     }
 
     // ── Delivery ledger ──
@@ -430,86 +398,80 @@ impl CronStore for LibsqlCronStore {
         exec.reply_ordinal = completion.reply_ordinal;
         exec.completed_at = Some(completion.completed_at);
         let data = serialize_execution(&exec)?;
+        let completed_us = completion.completed_at.timestamp_micros();
+        let id = execution_id.to_string();
 
         self.pool
-            .conn()
-            .execute(
-                "UPDATE cron_executions SET completed_at = ?1, data = ?2 WHERE id = ?3",
-                libsql::params![
-                    completion.completed_at.timestamp_micros(),
-                    data,
-                    execution_id.to_string(),
-                ],
-            )
+            .interact("cron.record_execution_completion", move |conn| {
+                conn.execute(
+                    "UPDATE cron_executions SET completed_at = ?1, data = ?2 WHERE id = ?3",
+                    rusqlite::params![completed_us, data, id],
+                )?;
+                Ok(())
+            })
             .await
-            .map_err(|e| StorageError::Storage(format!("libsql update: {e}")))?;
-        Ok(())
     }
 
     async fn mark_execution_notified(&self, execution_id: &str, at: DateTime<Utc>) -> Result<()> {
         let mut exec = self.load_execution(execution_id).await?;
         exec.notified_at = Some(at);
         let data = serialize_execution(&exec)?;
+        let at_us = at.timestamp_micros();
+        let id = execution_id.to_string();
 
         self.pool
-            .conn()
-            .execute(
-                "UPDATE cron_executions SET notified_at = ?1, data = ?2 WHERE id = ?3",
-                libsql::params![at.timestamp_micros(), data, execution_id.to_string()],
-            )
+            .interact("cron.mark_execution_notified", move |conn| {
+                conn.execute(
+                    "UPDATE cron_executions SET notified_at = ?1, data = ?2 WHERE id = ?3",
+                    rusqlite::params![at_us, data, id],
+                )?;
+                Ok(())
+            })
             .await
-            .map_err(|e| StorageError::Storage(format!("libsql update: {e}")))?;
-        Ok(())
     }
 
     async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>> {
-        let mut rows = self
+        let rows = self
             .pool
-            .conn()
-            .query(
-                &format!(
+            .interact("cron.list_executions_awaiting_delivery", move |conn| {
+                let mut stmt = conn.prepare(&format!(
                     "SELECT {EXECUTION_COLS} FROM cron_executions \
                      WHERE completed_at IS NOT NULL AND notified_at IS NULL \
                      ORDER BY completed_at ASC"
-                ),
-                (),
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
-        {
-            out.push(execution_from_row(&row)?);
-        }
-        Ok(out)
+                ))?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(5)?, row.get::<_, String>(6)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<ExecutionRow>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        decode_executions(rows)
     }
 }
 
-impl LibsqlCronStore {
+impl SqliteCronStore {
     /// Load one execution for a read-modify-write of its ledger. The row's
     /// `data` blob carries every ledger field; the `status` column overrides
     /// the blob's copy (see [`execution_from_row`]).
     async fn load_execution(&self, execution_id: &str) -> Result<CronExecution> {
-        let mut rows = self
+        let id = execution_id.to_string();
+        let row: Option<ExecutionRow> = self
             .pool
-            .conn()
-            .query(
-                &format!("SELECT {EXECUTION_COLS} FROM cron_executions WHERE id = ?1"),
-                libsql::params![execution_id.to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
+            .interact("cron.load_execution", move |conn| {
+                Ok(conn
+                    .query_row(
+                        &format!("SELECT {EXECUTION_COLS} FROM cron_executions WHERE id = ?1"),
+                        rusqlite::params![id],
+                        |row| Ok((row.get::<_, String>(5)?, row.get::<_, String>(6)?)),
+                    )
+                    .optional()?)
+            })
+            .await?;
 
-        match rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
-        {
-            Some(row) => execution_from_row(&row),
+        match row {
+            Some((status, data)) => execution_from_row(&status, &data),
             None => Err(StorageError::NotFound(execution_id.to_string())),
         }
     }
@@ -580,8 +542,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_get() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
         store
             .create(&test_job("cj-1", "u1", CronStatus::Enabled))
             .await
@@ -593,8 +555,8 @@ mod tests {
 
     #[tokio::test]
     async fn save_updates_row() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
         let mut job = test_job("cj-2", "u1", CronStatus::Enabled);
         store.create(&job).await.unwrap();
 
@@ -607,8 +569,8 @@ mod tests {
 
     #[tokio::test]
     async fn save_nonexistent_returns_not_found() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
         let err = store
             .save(&test_job("nonexistent", "u1", CronStatus::Enabled))
             .await
@@ -618,8 +580,8 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_row() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
         store
             .create(&test_job("cj-3", "u1", CronStatus::Enabled))
             .await
@@ -630,16 +592,16 @@ mod tests {
 
     #[tokio::test]
     async fn delete_nonexistent_returns_not_found() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
         let err = store.delete("nonexistent").await.unwrap_err();
         assert!(matches!(err, StorageError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn list_by_user_filters_correctly() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
         store
             .create(&test_job("cj-4", "u1", CronStatus::Enabled))
             .await
@@ -659,8 +621,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_enabled_filters_disabled() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
         store
             .create(&test_job("cj-7", "u1", CronStatus::Enabled))
             .await
@@ -677,8 +639,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_due_returns_only_past_due() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
 
         // 2000-01-01 / 2025-01-01.
         let past = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
@@ -709,8 +671,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_execution_dedup_returns_already_dispatched() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
 
         let mut exec = test_execution("ce-dup-a", "cj-dup", "u1");
         store.record_execution(&exec).await.unwrap();
@@ -734,8 +696,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_and_list_executions_by_job() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
 
         store
             .record_execution(&test_execution("ce-1", "cj-1", "u1"))
@@ -756,8 +718,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_executions_by_user() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
 
         store
             .record_execution(&test_execution("ce-4", "cj-1", "u1"))
@@ -778,8 +740,8 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_ledger_round_trips_and_drives_the_awaiting_scan() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
 
         store
             .record_execution(&test_execution("ce-led", "cj-led", "u1"))
@@ -855,10 +817,10 @@ mod tests {
         let db_path = dir.path().join("legacy.db");
 
         // The schema exactly as it shipped before this change.
-        let legacy = libsql::Builder::new_local(&db_path).build().await.unwrap();
-        let conn = legacy.connect().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE cron_executions (
+        let legacy = rusqlite::Connection::open(&db_path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE cron_executions (
                  id                  TEXT    PRIMARY KEY,
                  job_id              TEXT    NOT NULL,
                  user_id             TEXT    NOT NULL,
@@ -867,35 +829,33 @@ mod tests {
                  status              TEXT    NOT NULL DEFAULT 'pending',
                  data                TEXT    NOT NULL
              );",
-        )
-        .await
-        .expect("create the pre-redesign table");
-        conn.execute(
-            "INSERT INTO cron_executions \
-             (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            libsql::params![
-                "01a1c0d1-9819-4174-8122-60a49b28f1a4",
-                "9d0e5af1-f4dc-457b-8192-2ac72b5aef5f",
-                "device-7b26",
-                0_i64,
-                0_i64,
-                "dispatched",
-                LEGACY_EXECUTION_JSON,
-            ],
-        )
-        .await
-        .expect("insert a row the old code would have written");
-        drop(conn);
+            )
+            .expect("create the pre-redesign table");
+        legacy
+            .execute(
+                "INSERT INTO cron_executions \
+                 (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "01a1c0d1-9819-4174-8122-60a49b28f1a4",
+                    "9d0e5af1-f4dc-457b-8192-2ac72b5aef5f",
+                    "device-7b26",
+                    0_i64,
+                    0_i64,
+                    "dispatched",
+                    LEGACY_EXECUTION_JSON,
+                ],
+            )
+            .expect("insert a row the old code would have written");
         drop(legacy);
 
         // Boot the new code against that file: `open` runs the schema init,
         // which must ALTER the existing table rather than fail on it.
-        let pool = LibsqlPool::open(&db_path)
+        let pool = SqlitePool::open(&db_path)
             .await
             .expect("a pre-redesign database must open");
 
-        let store = LibsqlCronStore::new(pool);
+        let store = SqliteCronStore::new(pool);
         let loaded = store
             .list_executions_by_job("9d0e5af1-f4dc-457b-8192-2ac72b5aef5f")
             .await
@@ -949,8 +909,8 @@ mod tests {
 
     #[tokio::test]
     async fn ledger_writes_reject_unknown_execution() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
         let err = store
             .mark_execution_notified("ghost", future_dt())
             .await
@@ -960,8 +920,8 @@ mod tests {
 
     #[tokio::test]
     async fn execution_records_survive_job_deletion() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlCronStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
 
         store
             .create(&test_job("cj-evict", "u1", CronStatus::Enabled))

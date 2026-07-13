@@ -1,22 +1,27 @@
-//! Bounded retry wrapper for cross-process libsql contention.
+//! Bounded retry wrapper for cross-process sqlite contention.
 //!
-//! SQLite's `busy_timeout` pragma would absorb transient `database is
-//! locked` errors inside the driver, but it does so silently — any
-//! real lock contention is hidden from logs and telemetry. We instead
-//! keep `busy_timeout` at its default (0) so anything serious surfaces
-//! immediately, and offer this helper for call-sites that are known
-//! to compete with another process (today just the CLI's `baybo
-//! channels bot add/remove`, which writes the same libsql file a
-//! running gateway may read/write).
+//! Second line of defence, behind the connection's `busy_timeout` (see
+//! `sqlite::BUSY_TIMEOUT`). The timeout absorbs *intra-process* write
+//! contention, which a connection pool makes routine: two pooled
+//! connections writing at once is normal, and failing the second one
+//! would be a bug, not a signal.
+//!
+//! What the timeout cannot cover is a *cross-process* writer holding the
+//! lock for longer than the timeout — today just the CLI's `baybo
+//! channels bot add/remove`, which writes the same database file a
+//! running gateway may read/write. This helper exists for those
+//! call-sites: contention that survives `busy_timeout` is genuinely
+//! anomalous and worth a bounded retry plus a loud log.
 //!
 //! Every retry logs at `warn!` so operators and telemetry can see
 //! contention when it matters; after the last attempt the original
 //! error propagates for loud failure.
 //!
 //! Gateway hot paths (`ChannelBotReconciler`, `ChannelSessionResolver`,
-//! agent-loop DB writes) deliberately do NOT use this helper — they
-//! should fail fast on `BUSY` so any new contention shows up as a
-//! debuggable error rather than a silently-tolerated latency bump.
+//! agent-loop DB writes) deliberately do NOT use this helper — having
+//! already waited out `busy_timeout`, a `BUSY` there is a real problem
+//! and should surface as a debuggable error rather than a silently
+//! tolerated latency bump.
 
 use std::fmt::Display;
 use std::future::Future;
@@ -30,7 +35,7 @@ const MAX_ATTEMPTS: u32 = 4;
 const INITIAL_BACKOFF_MS: u64 = 15;
 
 /// Run `f` up to [`MAX_ATTEMPTS`] times, re-invoking it with
-/// exponential backoff only when the error reads as a libsql BUSY
+/// exponential backoff only when the error reads as a sqlite BUSY
 /// condition (heuristic string match). Any other error
 /// short-circuits.
 ///
@@ -59,7 +64,7 @@ where
                     attempt,
                     wait_ms,
                     error = %e,
-                    "libsql contention; retrying",
+                    "sqlite contention; retrying",
                 );
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;
             }
@@ -68,11 +73,11 @@ where
     }
 }
 
-/// Heuristic — libsql surfaces BUSY with a message containing
+/// Heuristic — sqlite surfaces BUSY with a message containing
 /// `"database is locked"` or `"database is busy"`. There's no typed
-/// error code to match against short of depending on `libsql::Error`
+/// error code to match against short of depending on `rusqlite::Error`
 /// directly (which would leak the storage backend into every
-/// consumer), so we match on the string. Stable across libsql
+/// consumer), so we match on the string. Stable across driver
 /// versions because the phrasing comes straight from upstream sqlite.
 fn is_busy_string(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
@@ -87,7 +92,7 @@ mod tests {
     use baybo_store::StorageError;
 
     fn busy_err() -> StorageError {
-        StorageError::Internal(anyhow::anyhow!("libsql upsert: database is locked"))
+        StorageError::Internal(anyhow::anyhow!("sqlite upsert: database is locked"))
     }
 
     fn non_retryable_err() -> StorageError {
@@ -163,7 +168,7 @@ mod tests {
         let calls = Mutex::new(0u32);
         let result: Result<(), _> = retry_on_busy("test.security", || async {
             *calls.lock().unwrap() += 1;
-            Err::<(), _>(SecErr("Storage(libsql insert: database is locked)".into()))
+            Err::<(), _>(SecErr("Storage(sqlite insert: database is locked)".into()))
         })
         .await;
         assert!(result.is_err());
@@ -172,7 +177,7 @@ mod tests {
 
     #[test]
     fn is_busy_string_matches_common_sqlite_phrasings() {
-        assert!(is_busy_string("libsql upsert: database is locked"));
+        assert!(is_busy_string("sqlite upsert: database is locked"));
         assert!(is_busy_string("database is busy"));
         assert!(is_busy_string("DATABASE IS LOCKED"));
         assert!(!is_busy_string("not found: nothing"));
