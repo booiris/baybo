@@ -240,14 +240,28 @@ fn cap_trace_output(value: Value) -> (Value, Option<usize>) {
         serde_json::to_string(&value).unwrap_or_default()
     });
 
+    // The budget is on the row as PERSISTED, i.e. the serialized JSON —
+    // escaping (`\n` → `\\n`, `"` → `\\"`, control chars → `\uXXXX`) inflates
+    // a raw-byte cut by up to ~6x, so trim against the serialized candidate
+    // until it fits. The proportional shrink converges in a couple of rounds;
+    // `min(cut - 1, …)` makes every round strictly smaller, so it terminates.
     let mut cut = MAX_TOOL_OUTPUT_BYTES.min(body.len());
-    while cut > 0 && !body.is_char_boundary(cut) {
-        cut -= 1;
+    loop {
+        while cut > 0 && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut out = serde_json::Map::new();
+        out.insert("type".into(), Value::String(tag.clone()));
+        out.insert(field.into(), Value::String(body[..cut].to_string()));
+        let candidate = Value::Object(out);
+        let serialized = serde_json::to_string(&candidate)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        if serialized <= MAX_TOOL_OUTPUT_BYTES || cut == 0 {
+            return (candidate, Some(full_len));
+        }
+        cut = (cut.saturating_mul(MAX_TOOL_OUTPUT_BYTES) / serialized).min(cut - 1);
     }
-    let mut out = serde_json::Map::new();
-    out.insert("type".into(), Value::String(tag));
-    out.insert(field.into(), Value::String(body[..cut].to_string()));
-    (Value::Object(out), Some(full_len))
 }
 
 /// A finished tool call: whatever the call produced, plus the approval decision
@@ -982,5 +996,21 @@ mod tests {
         let (v, _) = tool_output_to_trace_value(&ToolOutput::Text(big));
         let text = v["text"].as_str().expect("still valid UTF-8 text");
         assert!(text.chars().all(|c| c == '★'), "no mangled char at the cut");
+    }
+
+    /// The budget is on the row as persisted — the serialized JSON. Escaping
+    /// doubles a newline (`\n` → `\\n`), so a raw-byte cut of escape-heavy
+    /// content used to overshoot the stated bound by ~2x (and up to ~6x for
+    /// control characters).
+    #[test]
+    fn trace_value_cap_bounds_the_serialized_size() {
+        let big = "line with \"quotes\" and \\slashes\\\n".repeat(MAX_TOOL_OUTPUT_BYTES / 16);
+        let (v, truncated) = tool_output_to_trace_value(&ToolOutput::Text(big));
+        let serialized = serde_json::to_string(&v).unwrap().len();
+        assert!(
+            serialized <= MAX_TOOL_OUTPUT_BYTES,
+            "the persisted row must fit the budget after escaping, got {serialized}"
+        );
+        assert!(truncated.is_some());
     }
 }

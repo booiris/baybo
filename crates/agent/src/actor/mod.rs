@@ -180,34 +180,6 @@ fn is_blank_reply(content: &[ContentBlock]) -> bool {
     })
 }
 
-/// Whether a genuine user turn ran to completion after the notification
-/// prompt row landed: an active `from_user` row past `prompt_ordinal`,
-/// answered by a later active assistant row that carries inference (a
-/// `CronNotification` assistant row is a zero-inference append and proves
-/// nothing about the model having seen the prompt). A failed notification
-/// attempt's own salvage rows never match — they are assistant/agent rows
-/// with no user row ahead of them. Ordinal comparisons are only coherent
-/// while the prompt row itself is still active (compaction re-inserts kept
-/// rows at fresh ordinals), so the caller gates on that first.
-fn user_turn_completed_after(rows: &[baybo_store::StoredMessage], prompt_ordinal: i64) -> bool {
-    let first_user_after = rows
-        .iter()
-        .filter(|r| {
-            r.superseded_by.is_none() && r.ordinal > prompt_ordinal && r.message.from_user()
-        })
-        .map(|r| r.ordinal)
-        .min();
-    let Some(user_ordinal) = first_user_after else {
-        return false;
-    };
-    rows.iter().any(|r| {
-        r.superseded_by.is_none()
-            && r.ordinal > user_ordinal
-            && r.message.role == baybo_model::Role::Assistant
-            && r.message.source() != baybo_model::MessageSource::CronNotification
-    })
-}
-
 /// Mirrors the gateway slash dispatcher's tolerance for casing and
 /// trailing arguments so a user typing `/Compact extra` from any
 /// channel hits the same control path.
@@ -1092,6 +1064,35 @@ impl AgentActor {
             interjections.discard_pending();
         }
         let response = result?;
+        // A completed user turn's request already carried any open
+        // notification ledger's persisted prompt row (the actor is
+        // single-threaded, and the ledger only opens between turns), so the
+        // model saw the results with a real chance to fold them into this
+        // reply. Settle the ledger — passive delivery, the attempt cap's
+        // stance — rather than letting the timed retry force a duplicate
+        // proactive report behind a cue claiming nothing reached the user.
+        // Settling happens HERE, on the turn the actor knows completed:
+        // transcript rows can't carry that fact (a failed turn's salvage row
+        // is indistinguishable from a delivered final reply). Stopped and
+        // blank turns don't settle — their reply never reached the user.
+        if !stopped
+            && !is_blank_reply(&response.content)
+            && self
+                .durable
+                .session
+                .state
+                .pending_notification_turn
+                .is_some()
+        {
+            debug!(
+                session_id = %self.durable.session.id,
+                "a user turn completed over the open notification ledger; settling \
+                 (passive delivery)"
+            );
+            self.durable.session.state.pending_notification_turn = None;
+            self.persist_session_state_after_pending_change("subagent_notification_settled")
+                .await;
+        }
         self.send_user_reply(response).await;
         Ok(())
     }
@@ -1281,13 +1282,39 @@ impl AgentActor {
     }
 
     /// Like [`Self::persist_session_state_after_pending_change`] but WITHOUT
-    /// touching `last_active`. For the ActorStop final write: the chat list
-    /// is ordered by `last_active`, and the reaper stops actors *because*
-    /// they are idle — stamping "now" there would hoist every reaped stale
-    /// conversation above genuinely recent ones (and a gateway shutdown would
-    /// flatten the whole list onto one timestamp). The keep-alive rationale
-    /// for the bump doesn't apply to an exiting actor.
+    /// stamping `last_active = now`. For the ActorStop final write: the chat
+    /// list is ordered by `last_active`, and the reaper stops actors
+    /// *because* they are idle — stamping "now" there would hoist every
+    /// reaped stale conversation above genuinely recent ones (and a gateway
+    /// shutdown would flatten the whole list onto one timestamp). The
+    /// keep-alive rationale for the bump doesn't apply to an exiting actor.
+    ///
+    /// The in-memory copy can't just be written back either: the router
+    /// touches `last_active` straight in the store on every inbound message
+    /// (`SessionManager::touch`), so the actor's copy is typically *older*
+    /// than the row and a full save would regress recency. Merge the
+    /// authoritative value first.
     async fn persist_session_state_preserving_activity(&mut self, context: &'static str) -> bool {
+        match self
+            .volatile
+            .session_manager
+            .get(&self.durable.session.id)
+            .await
+        {
+            Ok(Some(stored)) if stored.last_active > self.durable.session.last_active => {
+                self.durable.session.last_active = stored.last_active;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    session_id = %self.durable.session.id,
+                    context = %context,
+                    error = %e,
+                    "could not read the stored session before the final save; \
+                     using the in-memory activity timestamp"
+                );
+            }
+        }
         self.save_session_row(context).await
     }
 
@@ -1458,20 +1485,18 @@ impl AgentActor {
         let Some(ledger) = self.durable.session.state.pending_notification_turn.clone() else {
             return;
         };
-        // One full read serves the whole (rare) retry path: whether the
-        // prompt row is still active, and whether a genuine user turn
-        // completed after it landed. Compaction supersedes every active row
-        // and re-inserts the kept slice at fresh ordinals, so the recorded
-        // ordinal dangles after any compaction — even when the prompt's
-        // content survived verbatim; the ledger froze the content, so the
-        // repair is a re-append.
-        let rows = match self
+        // Compaction supersedes every active row and re-inserts the kept
+        // slice at fresh ordinals, so the recorded ordinal dangles after any
+        // compaction — even when the prompt's content survived verbatim; the
+        // ledger froze the content, so the repair is a re-append. Index-only
+        // check: no content is read.
+        let prompt_active = match self
             .volatile
             .session_manager
-            .load_session_messages_with_supersede(&self.durable.session.id)
+            .active_index_of_ordinal(&self.durable.session.id, ledger.prompt_ordinal)
             .await
         {
-            Ok(rows) => rows,
+            Ok(idx) => idx.is_some(),
             Err(e) => {
                 warn!(
                     session_id = %self.durable.session.id,
@@ -1487,28 +1512,7 @@ impl AgentActor {
                 return;
             }
         };
-        let prompt_active = rows
-            .iter()
-            .any(|r| r.ordinal == ledger.prompt_ordinal && r.superseded_by.is_none());
         if prompt_active {
-            // A completed user turn after the prompt row means the model
-            // already saw the results with a chance to report them — the
-            // proactive re-turn would duplicate the report (and the cue's
-            // "no reply reached the user" would be false). Settle to passive
-            // delivery, the same stance the attempt cap takes. Only coherent
-            // while the prompt row is active: post-compaction ordinals are a
-            // fresh sequence, so this comparison lives inside this branch.
-            if user_turn_completed_after(&rows, ledger.prompt_ordinal) {
-                debug!(
-                    session_id = %self.durable.session.id,
-                    "a user turn completed after the notification prompt; settling the ledger \
-                     (passive delivery)"
-                );
-                self.durable.session.state.pending_notification_turn = None;
-                self.persist_session_state_after_pending_change("subagent_notification_settled")
-                    .await;
-                return;
-            }
             // Cue row (persisted): restores a user-side request tail — a
             // cancelled attempt's salvage leaves an assistant row at the
             // tail, and a request ending on an assistant message is provider
