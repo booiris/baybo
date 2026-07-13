@@ -1,21 +1,23 @@
-//! The admission allow-list, sourced from a SQLite (libsql) table and
-//! hot-reloaded by polling — the table may be updated out of band (another
-//! process writes it), so the runtime re-reads it on an interval rather than
-//! reacting to in-process writes.
+//! The admission allow-list, sourced from a SQLite table and hot-reloaded by
+//! polling — the table may be updated out of band (another process writes it), so
+//! the runtime re-reads it on an interval rather than reacting to in-process
+//! writes.
 //!
 //! [`AdmissionDb`] also owns the in-process **write path** the operator dashboard
 //! drives (admit / edit / revoke / reveal / list). Writes go through the same
-//! `write_conn` whose subsequent [`AdmissionDb::force_reload`] reloads the
-//! in-memory view read-after-write on that one connection, firing the shared
-//! `on_revoke` hook for any key that just lost admission.
+//! [`SqlitePool`], and the [`AdmissionDb::force_reload`] that follows each one
+//! reloads the in-memory view read-after-write, firing the shared `on_revoke`
+//! hook for any key that just lost admission.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use libsql::{Builder, params};
 use remote_host_admission::{AdmissionEntry, InMemoryAdmission};
 use remote_host_protocol::key_tag;
+use rusqlite::{OptionalExtension, params};
+
+use crate::sqlite::{SqliteError, SqlitePool};
 
 /// Source-of-truth table: one row per admitted `remote_api_key`. `label` +
 /// `created_at` are for whoever administers it. `max_conns` + `max_bps` are
@@ -44,13 +46,13 @@ const NOT_EXPIRED: &str = "NOT (expires_at IS NOT NULL AND expires_at < datetime
 const GENERATED_KEY_BYTES: usize = 32;
 const GENERATED_KEY_PREFIX: &str = "rh_";
 
-/// Errors raised by the admission write/read path. Reads/writes flow through one
-/// libsql connection; a PK collision on admit surfaces here as [`Self::Db`] and is
+/// Errors raised by the admission write/read path. Reads/writes flow through the
+/// shared sqlite pool; a PK collision on admit surfaces here as [`Self::Db`] and is
 /// mapped to a 409 by the dashboard backend.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AdmissionDbError {
     #[error("admission db: {0}")]
-    Db(#[from] libsql::Error),
+    Db(#[from] SqliteError),
     #[error("remote_api_key not found")]
     NotFound,
     #[error("a key requires both max_conns and max_bps")]
@@ -64,41 +66,31 @@ pub(crate) enum AdmissionDbError {
 /// be dropped. Shared by the poller task and the write path's reload, hence `Arc`.
 pub(crate) type RevokeHook = Arc<dyn Fn(HashSet<String>) + Send + Sync>;
 
-/// The admission allow-list handle: the live in-memory view plus the write
-/// connection the dashboard mutates. The poller task (spawned by [`open`]) holds the
-/// owning [`libsql::Database`] alive, which is what keeps `write_conn` valid.
+/// The admission allow-list handle: the live in-memory view plus the pool the
+/// dashboard's mutations run on. The poller task (spawned by [`open`]) holds its own
+/// clone of the pool, so it reads on a different connection than a concurrent write.
 pub(crate) struct AdmissionDb {
     admission: Arc<InMemoryAdmission>,
-    write_conn: libsql::Connection,
+    pool: SqlitePool,
     on_revoke: RevokeHook,
 }
 
-/// Open the libsql DB at `path` in WAL mode, ensure the table, load the allow-list,
-/// and spawn a task that re-reads it every `poll` to pick up external edits (via a
-/// **separate** reader connection — the WAL win). On each reload, `on_revoke` is
-/// called with the keys that just lost admission so their live connections can be
-/// dropped. Returns a handle owning the write connection + shared admission view.
+/// Open the DB at `path`, ensure the table, load the allow-list, and spawn a task
+/// that re-reads it every `poll` to pick up external edits (on its own pooled
+/// connection — the WAL win). On each reload, `on_revoke` is called with the keys
+/// that just lost admission so their live connections can be dropped. Returns a
+/// handle owning the pool + shared admission view.
 pub(crate) async fn open(
     path: &str,
     poll: Duration,
     on_revoke: RevokeHook,
 ) -> Result<AdmissionDb, AdmissionDbError> {
-    let db = Builder::new_local(path).build().await?;
-    let write_conn = db.connect()?;
-    // `PRAGMA journal_mode=WAL` returns a row → run it via `query` + drain, not
-    // `execute`. WAL lets the poller's reader connection read concurrently with
-    // dashboard writes on `write_conn`.
-    let mut r = write_conn.query("PRAGMA journal_mode=WAL", ()).await?;
-    let _ = r.next().await?;
-    // `PRAGMA busy_timeout=N` echoes the new value as a row in this libsql build —
-    // drain it via `query`, same as `journal_mode`, or `execute` errors.
-    let mut r = write_conn.query("PRAGMA busy_timeout=5000", ()).await?;
-    let _ = r.next().await?;
-    write_conn.execute(SCHEMA, ()).await?;
+    let pool = SqlitePool::open(path)?;
+    pool.interact(|conn| conn.execute_batch(SCHEMA)).await?;
 
     let admission = Arc::new(InMemoryAdmission::new());
     // Initial load: nothing was admitted before, so nothing to revoke.
-    let initial = load(&write_conn).await?;
+    let initial = load(&pool).await?;
     let keys_admitted = initial.len();
     let _ = admission.replace_all(initial);
     tracing::info!(
@@ -114,22 +106,17 @@ pub(crate) async fn open(
         );
     }
 
-    let read_conn = db.connect()?;
+    let poll_pool = pool.clone();
     let admission_poll = admission.clone();
     let on_revoke_poll = on_revoke.clone();
     let poll_path = path.to_owned();
     tokio::spawn(async move {
-        // Hold `_db` for the task's life: it keeps BOTH the moved `read_conn` here
-        // AND the `write_conn` returned to the caller valid (a libsql `Connection`
-        // outliving its `Database` is unsound). The poller never exits, so the
-        // write connection stays usable for the dashboard's whole runtime.
-        let _db = db;
         let mut tick = tokio::time::interval(poll);
         tick.tick().await; // the first tick is immediate; we already loaded once
         let mut consecutive_failures: u32 = 0;
         loop {
             tick.tick().await;
-            match load(&read_conn).await {
+            match load(&poll_pool).await {
                 Ok(keys) => {
                     if consecutive_failures > 0 {
                         tracing::info!(
@@ -162,7 +149,7 @@ pub(crate) async fn open(
 
     Ok(AdmissionDb {
         admission,
-        write_conn,
+        pool,
         on_revoke,
     })
 }
@@ -173,11 +160,11 @@ impl AdmissionDb {
         self.admission.clone()
     }
 
-    /// Reload the in-memory view from the write connection (read-after-write on one
-    /// connection, no poll-interval wait), firing `on_revoke` for any key the reload
-    /// dropped — used right after a dashboard mutation so revokes take effect at once.
+    /// Reload the in-memory view from the DB (read-after-write, no poll-interval
+    /// wait), firing `on_revoke` for any key the reload dropped — used right after a
+    /// dashboard mutation so revokes take effect at once.
     pub(crate) async fn force_reload(&self) -> Result<(), AdmissionDbError> {
-        let keys = load(&self.write_conn).await?;
+        let keys = load(&self.pool).await?;
         let loaded = keys.len();
         let before = self.admission.len();
         let revoked = self.admission.replace_all(keys);
@@ -193,20 +180,28 @@ impl AdmissionDb {
     /// that would relax an existing key's limits. `expires_at` is honored.
     pub(crate) async fn admit_key(&self, new: &NewKey) -> Result<(), AdmissionDbError> {
         require_limits(new.max_conns, new.max_bps)?;
-        self.write_conn
-            .execute(
-                "INSERT INTO remote_api_keys \
-                 (remote_api_key, label, max_conns, max_bps, per_server_max_bps, expires_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    new.remote_api_key.clone(),
-                    new.label.clone(),
-                    to_i64(new.max_conns, "max_conns")?,
-                    to_i64(new.max_bps, "max_bps")?,
-                    to_i64(new.per_server_max_bps, "per_server_max_bps")?,
-                    new.expires_at.clone(),
-                ],
-            )
+        let remote_api_key = new.remote_api_key.clone();
+        let label = new.label.clone();
+        let max_conns = to_i64(new.max_conns, "max_conns")?;
+        let max_bps = to_i64(new.max_bps, "max_bps")?;
+        let per_server_max_bps = to_i64(new.per_server_max_bps, "per_server_max_bps")?;
+        let expires_at = new.expires_at.clone();
+        self.pool
+            .interact(move |conn| {
+                conn.execute(
+                    "INSERT INTO remote_api_keys \
+                     (remote_api_key, label, max_conns, max_bps, per_server_max_bps, expires_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        remote_api_key,
+                        label,
+                        max_conns,
+                        max_bps,
+                        per_server_max_bps,
+                        expires_at,
+                    ],
+                )
+            })
             .await?;
         Ok(())
     }
@@ -221,22 +216,30 @@ impl AdmissionDb {
         limits: &KeyLimits,
     ) -> Result<(), AdmissionDbError> {
         require_limits(limits.max_conns, limits.max_bps)?;
+        let remote_api_key = remote_api_key.to_owned();
+        let label = limits.label.clone();
+        let max_conns = to_i64(limits.max_conns, "max_conns")?;
+        let max_bps = to_i64(limits.max_bps, "max_bps")?;
+        let per_server_max_bps = to_i64(limits.per_server_max_bps, "per_server_max_bps")?;
+        let expires_at = limits.expires_at.clone();
         let changed = self
-            .write_conn
-            .execute(
-                "UPDATE remote_api_keys \
-                 SET label = ?2, max_conns = ?3, max_bps = ?4, \
-                     per_server_max_bps = ?5, expires_at = ?6 \
-                 WHERE remote_api_key = ?1",
-                params![
-                    remote_api_key,
-                    limits.label.clone(),
-                    to_i64(limits.max_conns, "max_conns")?,
-                    to_i64(limits.max_bps, "max_bps")?,
-                    to_i64(limits.per_server_max_bps, "per_server_max_bps")?,
-                    limits.expires_at.clone(),
-                ],
-            )
+            .pool
+            .interact(move |conn| {
+                conn.execute(
+                    "UPDATE remote_api_keys \
+                     SET label = ?2, max_conns = ?3, max_bps = ?4, \
+                         per_server_max_bps = ?5, expires_at = ?6 \
+                     WHERE remote_api_key = ?1",
+                    params![
+                        remote_api_key,
+                        label,
+                        max_conns,
+                        max_bps,
+                        per_server_max_bps,
+                        expires_at,
+                    ],
+                )
+            })
             .await?;
         if changed == 0 {
             return Err(AdmissionDbError::NotFound);
@@ -248,12 +251,15 @@ impl AdmissionDb {
     /// allow-list is infra, not session data, so this row-level delete is exempt
     /// from the never-delete-sessions rule.
     pub(crate) async fn revoke_key(&self, remote_api_key: &str) -> Result<bool, AdmissionDbError> {
+        let remote_api_key = remote_api_key.to_owned();
         let deleted = self
-            .write_conn
-            .execute(
-                "DELETE FROM remote_api_keys WHERE remote_api_key = ?1",
-                params![remote_api_key],
-            )
+            .pool
+            .interact(move |conn| {
+                conn.execute(
+                    "DELETE FROM remote_api_keys WHERE remote_api_key = ?1",
+                    params![remote_api_key],
+                )
+            })
             .await?;
         Ok(deleted > 0)
     }
@@ -262,51 +268,53 @@ impl AdmissionDb {
     /// the operator must see expired rows. Carries the full secret; the API layer
     /// masks it to `key_last4` before serializing.
     pub(crate) async fn list_keys(&self) -> Result<Vec<KeyRecord>, AdmissionDbError> {
-        let mut rows = self
-            .write_conn
-            .query(
-                "SELECT rowid, remote_api_key, label, max_conns, max_bps, \
-                        per_server_max_bps, expires_at, created_at \
-                 FROM remote_api_keys ORDER BY created_at DESC",
-                (),
-            )
+        let out = self
+            .pool
+            .interact(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT rowid, remote_api_key, label, max_conns, max_bps, \
+                            per_server_max_bps, expires_at, created_at \
+                     FROM remote_api_keys ORDER BY created_at DESC",
+                )?;
+                stmt.query_map([], |row| {
+                    Ok(KeyRecord {
+                        rowid: row.get::<_, i64>(0)?,
+                        remote_api_key: row.get::<_, String>(1)?,
+                        label: row.get::<_, Option<String>>(2)?,
+                        max_conns: row
+                            .get::<_, Option<i64>>(3)?
+                            .and_then(|v| u32::try_from(v).ok()),
+                        max_bps: row
+                            .get::<_, Option<i64>>(4)?
+                            .and_then(|v| u64::try_from(v).ok()),
+                        per_server_max_bps: row
+                            .get::<_, Option<i64>>(5)?
+                            .and_then(|v| u64::try_from(v).ok()),
+                        expires_at: row.get::<_, Option<String>>(6)?,
+                        created_at: row.get::<_, String>(7)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            })
             .await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(KeyRecord {
-                rowid: row.get::<i64>(0)?,
-                remote_api_key: row.get::<String>(1)?,
-                label: row.get::<Option<String>>(2)?,
-                max_conns: row
-                    .get::<Option<i64>>(3)?
-                    .and_then(|v| u32::try_from(v).ok()),
-                max_bps: row
-                    .get::<Option<i64>>(4)?
-                    .and_then(|v| u64::try_from(v).ok()),
-                per_server_max_bps: row
-                    .get::<Option<i64>>(5)?
-                    .and_then(|v| u64::try_from(v).ok()),
-                expires_at: row.get::<Option<String>>(6)?,
-                created_at: row.get::<String>(7)?,
-            });
-        }
         Ok(out)
     }
 
     /// The full secret for one row, addressed by its stable SQLite `rowid`. `None`
     /// when the row is gone. Masking is the API layer's job — this returns the key.
     pub(crate) async fn reveal_key(&self, rowid: i64) -> Result<Option<String>, AdmissionDbError> {
-        let mut rows = self
-            .write_conn
-            .query(
-                "SELECT remote_api_key FROM remote_api_keys WHERE rowid = ?1",
-                params![rowid],
-            )
+        let key = self
+            .pool
+            .interact(move |conn| {
+                conn.query_row(
+                    "SELECT remote_api_key FROM remote_api_keys WHERE rowid = ?1",
+                    params![rowid],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
             .await?;
-        match rows.next().await? {
-            Some(row) => Ok(Some(row.get::<String>(0)?)),
-            None => Ok(None),
-        }
+        Ok(key)
     }
 }
 
@@ -339,7 +347,7 @@ fn require_limits(max_conns: Option<u32>, max_bps: Option<u64>) -> Result<(), Ad
     Ok(())
 }
 
-/// Checked conversion of a limit column to libsql's `i64` storage type — never an
+/// Checked conversion of a limit column to sqlite's `i64` storage type — never an
 /// `as` cast. `None` stays `None` (binds SQL NULL).
 fn to_i64<T: TryInto<i64>>(
     v: Option<T>,
@@ -400,92 +408,48 @@ fn log_reload_diff(trigger: &str, keys_admitted: usize, before: usize, revoked: 
     }
 }
 
-async fn load(conn: &libsql::Connection) -> Result<HashMap<String, AdmissionEntry>, libsql::Error> {
-    let mut rows = conn
-        .query(
-            &format!(
-                "SELECT remote_api_key, max_conns, max_bps, per_server_max_bps, expires_at \
-                 FROM remote_api_keys WHERE {NOT_EXPIRED}"
-            ),
-            (),
-        )
-        .await?;
-    let mut keys = HashMap::new();
-    while let Some(row) = rows.next().await? {
-        let key = row.get::<String>(0)?;
-        // Nullable INTEGERs -> per-key overrides; NULL or out-of-range -> None
-        // (the caller's role floor applies).
-        let max_conns = row
-            .get::<Option<i64>>(1)?
-            .and_then(|v| u32::try_from(v).ok());
-        let max_bps = row
-            .get::<Option<i64>>(2)?
-            .and_then(|v| u64::try_from(v).ok());
-        let per_server_max_bps = row
-            .get::<Option<i64>>(3)?
-            .and_then(|v| u64::try_from(v).ok());
-        let expires_at = row.get::<Option<String>>(4)?;
-        keys.insert(
-            key,
-            AdmissionEntry {
-                max_conns,
-                max_bps,
-                per_server_max_bps,
-                expires_at,
-            },
-        );
-    }
-    Ok(keys)
+async fn load(pool: &SqlitePool) -> Result<HashMap<String, AdmissionEntry>, SqliteError> {
+    pool.interact(|conn| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT remote_api_key, max_conns, max_bps, per_server_max_bps, expires_at \
+             FROM remote_api_keys WHERE {NOT_EXPIRED}"
+        ))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let key = row.get::<_, String>(0)?;
+                // Nullable INTEGERs -> per-key overrides; NULL or out-of-range -> None
+                // (the caller's role floor applies).
+                let max_conns = row
+                    .get::<_, Option<i64>>(1)?
+                    .and_then(|v| u32::try_from(v).ok());
+                let max_bps = row
+                    .get::<_, Option<i64>>(2)?
+                    .and_then(|v| u64::try_from(v).ok());
+                let per_server_max_bps = row
+                    .get::<_, Option<i64>>(3)?
+                    .and_then(|v| u64::try_from(v).ok());
+                let expires_at = row.get::<_, Option<String>>(4)?;
+                Ok((
+                    key,
+                    AdmissionEntry {
+                        max_conns,
+                        max_bps,
+                        per_server_max_bps,
+                        expires_at,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+        Ok(rows)
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use parking_lot::Mutex;
-
-    async fn mem_conn() -> libsql::Connection {
-        let db = Builder::new_local(":memory:").build().await.unwrap();
-        let conn = db.connect().unwrap();
-        conn.execute(SCHEMA, ()).await.unwrap();
-        conn
-    }
-
-    /// A no-op revoke hook for tests that don't assert on revocation.
-    fn noop_hook() -> RevokeHook {
-        Arc::new(|_revoked| {})
-    }
-
-    /// A recording revoke hook + the shared sink it pushes revoked keys into.
-    fn recording_hook() -> (RevokeHook, Arc<Mutex<Vec<String>>>) {
-        let sink = Arc::new(Mutex::new(Vec::new()));
-        let sink_for_hook = sink.clone();
-        let hook: RevokeHook = Arc::new(move |revoked: HashSet<String>| {
-            let mut got: Vec<String> = revoked.into_iter().collect();
-            got.sort();
-            sink_for_hook.lock().extend(got);
-        });
-        (hook, sink)
-    }
-
-    /// Build an `AdmissionDb` over an in-memory libsql DB with the given revoke
-    /// hook. The poller is not spawned (no `path`/`Database` to keep alive) — these
-    /// tests drive `force_reload` explicitly, which is the read-after-write path.
-    async fn mem_db(on_revoke: RevokeHook) -> AdmissionDb {
-        let db = Builder::new_local(":memory:").build().await.unwrap();
-        let write_conn = db.connect().unwrap();
-        write_conn.execute(SCHEMA, ()).await.unwrap();
-        let admission = Arc::new(InMemoryAdmission::new());
-        let _ = admission.replace_all(load(&write_conn).await.unwrap());
-        // Keep the in-memory `Database` alive for the test's duration by leaking it
-        // (test-only): an in-memory libsql connection is invalid once its `Database`
-        // drops, and there is no poller task here to hold it.
-        Box::leak(Box::new(db));
-        AdmissionDb {
-            admission,
-            write_conn,
-            on_revoke,
-        }
-    }
+    use std::ops::Deref;
 
     /// A temp on-disk DB path that removes the `.db`/`-wal`/`-shm` sidecars on drop.
     struct TempDbPath(String);
@@ -506,6 +470,80 @@ mod tests {
         }
     }
 
+    /// A pool over a throwaway on-disk DB, kept alive (and cleaned up) by the path
+    /// guard it carries. Every pooled connection must see the same DB, so the tests
+    /// use a real file rather than `:memory:` (which is private per connection).
+    struct TempPool {
+        pool: SqlitePool,
+        _path: TempDbPath,
+    }
+    impl Deref for TempPool {
+        type Target = SqlitePool;
+        fn deref(&self) -> &SqlitePool {
+            &self.pool
+        }
+    }
+
+    /// An `AdmissionDb` over a throwaway on-disk DB, plus the path guard that cleans
+    /// it up. The poller is not spawned — these tests drive `force_reload` explicitly,
+    /// which is the read-after-write path.
+    struct TempDb {
+        db: AdmissionDb,
+        _path: TempDbPath,
+    }
+    impl Deref for TempDb {
+        type Target = AdmissionDb;
+        fn deref(&self) -> &AdmissionDb {
+            &self.db
+        }
+    }
+
+    async fn temp_pool() -> TempPool {
+        let path = TempDbPath::new();
+        let pool = SqlitePool::open(&path.0).unwrap();
+        pool.interact(|conn| conn.execute_batch(SCHEMA))
+            .await
+            .unwrap();
+        TempPool { pool, _path: path }
+    }
+
+    /// Run one statement with no parameters, so a test can seed (or fail to seed) a
+    /// row straight through the pool.
+    async fn exec(pool: &SqlitePool, sql: &'static str) -> Result<usize, SqliteError> {
+        pool.interact(move |conn| conn.execute(sql, [])).await
+    }
+
+    /// A no-op revoke hook for tests that don't assert on revocation.
+    fn noop_hook() -> RevokeHook {
+        Arc::new(|_revoked| {})
+    }
+
+    /// A recording revoke hook + the shared sink it pushes revoked keys into.
+    fn recording_hook() -> (RevokeHook, Arc<Mutex<Vec<String>>>) {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let sink_for_hook = sink.clone();
+        let hook: RevokeHook = Arc::new(move |revoked: HashSet<String>| {
+            let mut got: Vec<String> = revoked.into_iter().collect();
+            got.sort();
+            sink_for_hook.lock().extend(got);
+        });
+        (hook, sink)
+    }
+
+    async fn temp_db(on_revoke: RevokeHook) -> TempDb {
+        let TempPool { pool, _path } = temp_pool().await;
+        let admission = Arc::new(InMemoryAdmission::new());
+        let _ = admission.replace_all(load(&pool).await.unwrap());
+        TempDb {
+            db: AdmissionDb {
+                admission,
+                pool,
+                on_revoke,
+            },
+            _path,
+        }
+    }
+
     fn new_key(key: &str, max_conns: Option<u32>, max_bps: Option<u64>) -> NewKey {
         NewKey {
             remote_api_key: key.to_string(),
@@ -520,16 +558,16 @@ mod tests {
     /// `load` reads every limit column and `expires_at`.
     #[tokio::test]
     async fn load_reads_every_limit_column() {
-        let conn = mem_conn().await;
-        conn.execute(
+        let pool = temp_pool().await;
+        exec(
+            &pool,
             "INSERT INTO remote_api_keys(remote_api_key, max_conns, max_bps, per_server_max_bps) \
              VALUES('tuned', 8, 4194304, 1048576)",
-            (),
         )
         .await
         .unwrap();
 
-        let loaded = load(&conn).await.unwrap();
+        let loaded = load(&pool).await.unwrap();
 
         let tuned = loaded.get("tuned").expect("row admitted");
         assert_eq!(tuned.max_conns, Some(8));
@@ -542,30 +580,30 @@ mod tests {
     /// and a far-future one both survive.
     #[tokio::test]
     async fn load_filters_expired() {
-        let conn = mem_conn().await;
-        conn.execute(
+        let pool = temp_pool().await;
+        exec(
+            &pool,
             "INSERT INTO remote_api_keys(remote_api_key, max_conns, max_bps, expires_at) \
              VALUES('stale', 8, 4194304, '2000-01-01 00:00:00')",
-            (),
         )
         .await
         .unwrap();
-        conn.execute(
+        exec(
+            &pool,
             "INSERT INTO remote_api_keys(remote_api_key, max_conns, max_bps, expires_at) \
              VALUES('fresh', 8, 4194304, '2999-01-01 00:00:00')",
-            (),
         )
         .await
         .unwrap();
-        conn.execute(
+        exec(
+            &pool,
             "INSERT INTO remote_api_keys(remote_api_key, max_conns, max_bps) \
              VALUES('never', 8, 4194304)",
-            (),
         )
         .await
         .unwrap();
 
-        let loaded = load(&conn).await.unwrap();
+        let loaded = load(&pool).await.unwrap();
         assert!(!loaded.contains_key("stale"), "expired row is filtered");
         assert!(loaded.contains_key("fresh"), "future expiry kept");
         assert!(loaded.contains_key("never"), "no-expiry row kept");
@@ -575,40 +613,38 @@ mod tests {
     /// `per_server_max_bps` is never required.
     #[tokio::test]
     async fn row_requires_max_conns_and_max_bps() {
-        let conn = mem_conn().await;
+        let pool = temp_pool().await;
 
         // Both limits set + per_server NULL → accepted.
-        conn.execute(
+        exec(
+            &pool,
             "INSERT INTO remote_api_keys(remote_api_key, max_conns, max_bps) \
              VALUES('ok', 8, 4194304)",
-            (),
         )
         .await
         .unwrap();
 
         // Missing max_bps → rejected.
-        let missing_bps = conn
-            .execute(
-                "INSERT INTO remote_api_keys(remote_api_key, max_conns) VALUES('no-bps', 8)",
-                (),
-            )
-            .await;
+        let missing_bps = exec(
+            &pool,
+            "INSERT INTO remote_api_keys(remote_api_key, max_conns) VALUES('no-bps', 8)",
+        )
+        .await;
         assert!(missing_bps.is_err(), "a row must set max_bps");
 
         // Missing both (the old bare admit) → rejected.
-        let bare = conn
-            .execute(
-                "INSERT INTO remote_api_keys(remote_api_key, label) VALUES('bare', 'gw')",
-                (),
-            )
-            .await;
+        let bare = exec(
+            &pool,
+            "INSERT INTO remote_api_keys(remote_api_key, label) VALUES('bare', 'gw')",
+        )
+        .await;
         assert!(bare.is_err(), "a row can't omit both limits");
     }
 
     /// An admit with both limits lands and surfaces in `list_keys`.
     #[tokio::test]
     async fn admit_with_both_limits_ok() {
-        let db = mem_db(noop_hook()).await;
+        let db = temp_db(noop_hook()).await;
         db.admit_key(&new_key("reg", Some(8), Some(4_194_304)))
             .await
             .unwrap();
@@ -621,7 +657,7 @@ mod tests {
     /// An admit with a NULL limit is rejected before the INSERT.
     #[tokio::test]
     async fn admit_missing_limit_is_rejected() {
-        let db = mem_db(noop_hook()).await;
+        let db = temp_db(noop_hook()).await;
         let err = db
             .admit_key(&new_key("reg", Some(8), None))
             .await
@@ -633,7 +669,7 @@ mod tests {
     /// An admit with a label + expiry round-trips through `list_keys`.
     #[tokio::test]
     async fn admit_with_label_and_expiry_ok() {
-        let db = mem_db(noop_hook()).await;
+        let db = temp_db(noop_hook()).await;
         db.admit_key(&NewKey {
             remote_api_key: "g".into(),
             label: Some("trial".into()),
@@ -653,7 +689,7 @@ mod tests {
     /// A duplicate admit fails (no silent upsert that would relax limits).
     #[tokio::test]
     async fn duplicate_admit_is_a_db_error() {
-        let db = mem_db(noop_hook()).await;
+        let db = temp_db(noop_hook()).await;
         db.admit_key(&new_key("dup", Some(4), Some(1024)))
             .await
             .unwrap();
@@ -677,7 +713,7 @@ mod tests {
     /// reflected by `list_keys`.
     #[tokio::test]
     async fn edit_key_missing_and_existing() {
-        let db = mem_db(noop_hook()).await;
+        let db = temp_db(noop_hook()).await;
         let missing = db
             .edit_key(
                 "nope",
@@ -724,7 +760,7 @@ mod tests {
     /// `revoke_key` is idempotent: first delete returns `true`, the second `false`.
     #[tokio::test]
     async fn revoke_key_is_idempotent() {
-        let db = mem_db(noop_hook()).await;
+        let db = temp_db(noop_hook()).await;
         db.admit_key(&new_key("r", Some(1), Some(1))).await.unwrap();
         assert!(db.revoke_key("r").await.unwrap(), "first delete removes it");
         assert!(!db.revoke_key("r").await.unwrap(), "second is a no-op");
@@ -735,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn force_reload_after_revoke_fires_hook() {
         let (hook, sink) = recording_hook();
-        let db = mem_db(hook).await;
+        let db = temp_db(hook).await;
         db.admit_key(&new_key("k1", Some(1), Some(1)))
             .await
             .unwrap();
@@ -771,7 +807,7 @@ mod tests {
             })
         };
 
-        let db = mem_db(hook).await;
+        let db = temp_db(hook).await;
         db.admit_key(&new_key("k1", Some(1), Some(1)))
             .await
             .unwrap();
@@ -795,7 +831,7 @@ mod tests {
     /// `reveal_key` round-trips by `rowid`; an unknown rowid is `Ok(None)`.
     #[tokio::test]
     async fn reveal_key_round_trips() {
-        let db = mem_db(noop_hook()).await;
+        let db = temp_db(noop_hook()).await;
         db.admit_key(&new_key("secret-key", Some(1), Some(1)))
             .await
             .unwrap();
@@ -817,7 +853,7 @@ mod tests {
     /// `list_keys` carries `label` + `created_at` (non-empty `datetime` default).
     #[tokio::test]
     async fn list_keys_includes_label_and_created_at() {
-        let db = mem_db(noop_hook()).await;
+        let db = temp_db(noop_hook()).await;
         db.admit_key(&NewKey {
             remote_api_key: "labeled".into(),
             label: Some("gw-1".into()),
@@ -857,8 +893,8 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// WAL coexistence on a real on-disk file: two `Database`s on the same path, both
-    /// WAL; a write on one is visible to the other's `load` after commit.
+    /// WAL coexistence on a real on-disk file: two independent pools on the same
+    /// path, both WAL; a write on one is visible to the other's `load` after commit.
     #[tokio::test]
     async fn wal_writer_and_reader_coexist() {
         let path = TempDbPath::new();
@@ -866,11 +902,8 @@ mod tests {
             .await
             .unwrap();
 
-        // A second, independent reader connection on the same on-disk file.
-        let reader_db = Builder::new_local(&path.0).build().await.unwrap();
-        let reader = reader_db.connect().unwrap();
-        let mut r = reader.query("PRAGMA journal_mode=WAL", ()).await.unwrap();
-        let _ = r.next().await.unwrap();
+        // A second, independent reader pool on the same on-disk file.
+        let reader = SqlitePool::open(&path.0).unwrap();
 
         db.admit_key(&new_key("wal-key", Some(2), Some(2048)))
             .await

@@ -598,7 +598,7 @@ fn admit_err(e: AdmissionDbError) -> DashboardError {
 }
 
 /// Map an [`AdmissionDbError`] from a non-admit call: a row miss is 404, a bad
-/// limit is 400, and a libsql failure is a 500.
+/// limit is 400, and a sqlite failure is a 500.
 fn db_err(e: AdmissionDbError) -> DashboardError {
     match e {
         AdmissionDbError::NotFound => DashboardError::NotFound,
