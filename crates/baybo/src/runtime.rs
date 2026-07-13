@@ -87,7 +87,7 @@ pub fn build_leak_detector(
     Arc::new(detector)
 }
 
-/// Open the project's libsql store just far enough to build a
+/// Open the project's sqlite store just far enough to build a
 /// [`SecretVault`]. Used by the gateway's vault-only subcommands so
 /// they don't have to pay the cost of a full [`build_managers`] call
 /// (job recovery, cron scheduler, tool registry, etc.) to read or
@@ -98,11 +98,11 @@ pub async fn build_secret_vault(config: &BayboConfig) -> anyhow::Result<Arc<Secr
     Ok(Arc::new(SecretVault::new(master_key, storage.secret)))
 }
 
-/// Open the libsql store and return the vault + full [`Store`] handle
+/// Open the sqlite store and return the vault + full [`Store`] handle
 /// for CLI subcommands that manage per-channel credentials
 /// (`baybo channel list/add/remove`) or per-user pairings
 /// (`baybo pair list/approve/revoke`). The returned [`Store`] is cloneable
-/// and its fields share a single libsql connection, so CLI writes land
+/// and its fields share a single sqlite connection, so CLI writes land
 /// atomically in the same file the gateway reads from.
 pub async fn build_bot_registry_deps(
     config: &BayboConfig,
@@ -166,7 +166,7 @@ pub struct ManagerGraph {
     pub workspace: Arc<WorkspaceManager>,
     pub channels_registry: Arc<ChannelRegistry>,
     pub secret_vault: Arc<SecretVault>,
-    /// Cloneable bundle of every libsql-backed store handle. Keeping the
+    /// Cloneable bundle of every sqlite-backed store handle. Keeping the
     /// whole [`Store`] in one field means adding a new store only
     /// touches [`Store`] itself — the graph and its downstream consumers
     /// pick it up via `stores.xxx` without a new field here.
@@ -301,7 +301,7 @@ pub async fn build_managers(
     // Vault is constructed up here (before `build_llm_client`) so the
     // openai-subscription provider can read its OAuth bundle straight away.
     // Other providers ignore the vault. Can't route through
-    // `build_secret_vault` here — it would re-open libsql; load the key
+    // `build_secret_vault` here — it would re-open sqlite; load the key
     // directly and share `stores.secret` across both call sites.
     let master_key = boot::load_encryption_key(&config.security)?;
     let secret_vault = Arc::new(SecretVault::new(master_key, stores.secret.clone()));

@@ -48,7 +48,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 baybo-cost = { workspace = true, features = ["test-support"] }
-# `InMemoryCronStore` — the router tests drive cron delivery without libsql.
+# `InMemoryCronStore` — the router tests drive cron delivery without sqlite.
 baybo-cron = { workspace = true, features = ["test-support"] }
 baybo-job = { workspace = true, features = ["test-support"] }
 baybo-llm = { workspace = true, features = ["test-support"] }

@@ -3,7 +3,7 @@
 //! Gated behind the `test-support` cargo feature so it never ships in
 //! release builds. Lives in `baybo-trace` (next to the row conversions)
 //! so crates that depend on `baybo-trace` can spin up a fake store
-//! without pulling the libsql adapter.
+//! without pulling the sqlite adapter.
 
 use std::collections::HashMap;
 
@@ -17,7 +17,7 @@ use crate::{LifecycleState, Span, Step};
 
 /// In-memory `TraceStore` for tests. Stores rows verbatim; the
 /// `list_*_by_*` filters deserialize to read the parent id out of the
-/// `data` blob (the libsql backend uses generated columns instead).
+/// `data` blob (the sqlite backend uses generated columns instead).
 #[derive(Debug, Default)]
 pub struct MemoryTraceStore {
     steps: Mutex<HashMap<StepId, StepRow>>,

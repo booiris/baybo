@@ -18,7 +18,7 @@ const CODE_MINT_RETRIES: u32 = 8;
 /// the service overwrites it with a new one on the next inbound.
 /// 15 minutes — long enough for a human operator to notice a Telegram
 /// buzz and run `baybo pair approve`, short enough that a curious
-/// one-time user's code doesn't linger in libsql for days.
+/// one-time user's code doesn't linger in sqlite for days.
 const PENDING_TTL_SECONDS: i64 = 900;
 
 /// Outcome of [`PairingService::check`].

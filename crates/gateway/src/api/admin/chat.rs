@@ -711,7 +711,7 @@ async fn list_sessions(
     let channel_type = chat_list_channel(authed.as_ref().map(|ext| &ext.0));
     // Push the channel filter into SQL so a long-running gateway
     // with thousands of bot sessions (telegram / weixin / …) doesn't
-    // pay an O(all-sessions) libsql round-trip on every chat-list
+    // pay an O(all-sessions) sqlite round-trip on every chat-list
     // refresh — see `SessionStore::list_by_channel`. We still walk
     // the result to apply the hidden filter; that's a userland-only
     // pass over the (now scoped) result.
@@ -733,11 +733,12 @@ async fn list_sessions(
     // Fan out the per-session preview fetch — each row is a single
     // back-of-the-index lookup (`load_last_user_message`,
     // `ORDER BY ordinal DESC LIMIT 1`) but they add up serially when a tab
-    // has dozens of conversations open. `join_all` runs the libsql queries
-    // concurrently against the shared connection pool. A preview that
-    // fails to load is dropped to `None` rather than failing the whole
-    // list — the sidebar still renders the row, just without a
-    // preview, and the next list refresh will retry.
+    // has dozens of conversations open. `join_all` overlaps them; the real
+    // parallelism is whatever the store's connection pool can hand out, and
+    // the rest queue behind it, so a wide fan-out costs latency rather than
+    // connections. A preview that fails to load is dropped to `None` rather
+    // than failing the whole list — the sidebar still renders the row, just
+    // without a preview, and the next list refresh will retry.
     let previews = futures::future::join_all(visible.iter().map(|s| {
         let manager = state.session_manager.clone();
         let sid = s.id.clone();

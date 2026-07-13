@@ -51,11 +51,11 @@ fn validate_folder_name(name: String) -> Result<String> {
 pub struct SessionManager {
     store: Arc<dyn SessionStore>,
     /// Per-session summary-metadata store. Required at construction —
-    /// production wires the libsql backend; tests pass
+    /// production wires the sqlite backend; tests pass
     /// `crate::test_support::MemorySessionSummaryStore`.
     summary_store: Arc<dyn SessionSummaryStore>,
     /// Chat-list folder store. Required at construction — production wires
-    /// the libsql backend; tests pass `MemorySessionFolderStore`.
+    /// the sqlite backend; tests pass `MemorySessionFolderStore`.
     folder_store: Arc<dyn SessionFolderStore>,
 }
 
@@ -281,7 +281,7 @@ impl SessionManager {
 
     /// Live sessions whose `channel` matches `channel`, newest-active
     /// first. Delegates to the store's `list_by_channel`, which
-    /// pushes the predicate into SQL on the libsql backend so a
+    /// pushes the predicate into SQL on the sqlite backend so a
     /// long-running gateway with thousands of bot sessions doesn't
     /// pay an O(all) round-trip when the caller only wants the
     /// http channel.

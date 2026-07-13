@@ -1,6 +1,6 @@
 //! In-memory [`TaskStore`] for tests — the tool unit tests here and
 //! downstream integration tests (via `features = ["test-support"]`) use it so
-//! they don't drag in the libsql adapter. Gated so it never ships in release.
+//! they don't drag in the sqlite adapter. Gated so it never ships in release.
 
 use std::collections::HashMap;
 

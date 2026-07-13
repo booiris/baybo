@@ -28,9 +28,9 @@ pub use baybo_model::SHA256_PREFIX;
 
 /// Metadata for a stored blob. Returned by [`BlobStore::stat`].
 ///
-/// `size` and `created_at` come from the libsql metadata row; the actual
+/// `size` and `created_at` come from the sqlite metadata row; the actual
 /// bytes live on disk under `<blobs_root>/<sha256[0..2]>/<sha256>` so a
-/// libsql query never has to read the file content.
+/// sqlite query never has to read the file content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobMeta {
     pub blob_id: String,

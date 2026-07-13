@@ -71,7 +71,7 @@ pub async fn bootstrap_workspace_if_needed(workspace_root: PathBuf) -> Result<Se
 
     let stores = Store::open(paths.storage_db())
         .await
-        .map_err(|e| SetupError::Storage(format!("open libsql: {e}")))?;
+        .map_err(|e| SetupError::Storage(format!("open sqlite: {e}")))?;
 
     let vault = Arc::new(SecretVault::new(key, stores.secret.clone()));
 

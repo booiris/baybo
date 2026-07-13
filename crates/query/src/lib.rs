@@ -1240,7 +1240,7 @@ mod tests {
     /// Minimal in-memory `SessionStore` for query-API tests. The
     /// `session_messages` log is a real append-only vector so the
     /// hydration test can drive the same supersede semantics the
-    /// libsql backend implements.
+    /// sqlite backend implements.
     #[derive(Default)]
     struct MemSessionStore {
         sessions: parking_lot::Mutex<HashMap<SessionId, Session>>,

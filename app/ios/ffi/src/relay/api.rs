@@ -41,7 +41,7 @@ const TUNNEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// cancellation, so its task is blocked in `oneshot` and only discovers the dead
 /// leg when it tries to write.)
 ///
-/// 15s sits above the p99 of every pooled route (they are all bounded libsql
+/// 15s sits above the p99 of every pooled route (they are all bounded sqlite
 /// reads and writes) while still capping a zombie well under the 30s request
 /// budget. The dual-clock staleness check and the `.background` barrier are what
 /// actually keep zombies rare; this is only the backstop.

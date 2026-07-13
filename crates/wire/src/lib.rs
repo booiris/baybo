@@ -5,7 +5,7 @@
 //! the attachment / folder / task projections — plus the MessagePack codec.
 //! They were extracted from `baybo-channels` into their own crate so the device
 //! companion core can speak the exact same protocol without
-//! pulling `baybo-channels → baybo-tools → { libsql, axum, reqwest, … }`, a
+//! pulling `baybo-channels → baybo-tools → { sqlite, axum, reqwest, … }`, a
 //! chain that cannot cross-compile to iOS. `baybo-channels` re-exports this
 //! crate as its `wire` module, so server-side consumers are unchanged.
 //!

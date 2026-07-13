@@ -173,7 +173,7 @@ pub trait SessionStore: Send + Sync {
     /// userland.
     ///
     /// Default impl is the naive `list_all() → filter` fallback so
-    /// mock / in-memory stores work without overriding; the libsql
+    /// mock / in-memory stores work without overriding; the sqlite
     /// impl pushes the predicate into SQL.
     async fn list_by_channel(&self, channel: &ChannelType) -> Result<Vec<Session>> {
         let all = self.list_all().await?;

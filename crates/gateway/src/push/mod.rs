@@ -1159,7 +1159,7 @@ mod tests {
         }
     }
 
-    /// A dispatcher backed by a tempdir libsql store, with the durable pairing
+    /// A dispatcher backed by a tempdir sqlite store, with the durable pairing
     /// material `ensure_registered` reads already seeded in the vault.
     async fn test_dispatcher(
         sink: Arc<dyn NotifySink>,

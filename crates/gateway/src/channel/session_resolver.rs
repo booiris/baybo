@@ -7,11 +7,11 @@
 //! way to generate stable UUIDs per end-user, so they send
 //! `Frame::Message { session_id: "", user_id: "<platform_user>" }`
 //! and let the gateway resolve / allocate on their behalf. The mapping
-//! is persisted in the `channel_sessions` libsql table so:
+//! is persisted in the `channel_sessions` sqlite table so:
 //!
 //! * Same Telegram user → same baybo session across sidecar restarts.
 //! * Same Telegram user → same baybo session across gateway restarts
-//!   (libsql is the source of truth, not in-memory state).
+//!   (sqlite is the source of truth, not in-memory state).
 //! * Different users on the same bot always land on distinct sessions.
 
 use std::sync::Arc;

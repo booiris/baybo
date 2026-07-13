@@ -5,7 +5,7 @@
 //! (`install`, `disable`, `uninstall`, `status`, `enable`, `token`) run
 //! here with a lightweight boot: they need only the config for path
 //! resolution, plus — for the auth-token branch — a `SecretVault`
-//! opened against the project's libsql store.
+//! opened against the project's sqlite store.
 //!
 //! `start` is a long-running server: it acquires the per-workspace
 //! singleton, builds the full manager graph via [`crate::runtime`]
@@ -220,7 +220,7 @@ async fn token_rotate(config: &BayboConfig) -> anyhow::Result<()> {
 // ---- start (long-running) ----
 
 async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
-    // Per-workspace singleton. The gateway owns the same libsql store as
+    // Per-workspace singleton. The gateway owns the same sqlite store as
     // the TUI, runs job recovery, and drives cron ticks — two instances
     // against the same workspace would race.
     let workspace_paths =
@@ -295,7 +295,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     );
 
     // Resolve the runtime gateway config up front so a bad `bind_address`
-    // fails fast before we open libsql a second time.
+    // fails fast before we open sqlite a second time.
     let runtime_cfg = RuntimeGatewayConfig::from_config(&config.gateway)
         .map_err(|e| anyhow::anyhow!("invalid gateway config: {e}"))?;
 
@@ -426,7 +426,7 @@ async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
 
     let channel_control = Arc::new(baybo_gateway::ChannelControlRegistry::new());
 
-    // CLI-driven bot add/remove writes straight to libsql + vault. The
+    // CLI-driven bot add/remove writes straight to sqlite + vault. The
     // reconciler polls those stores on a short tick and pushes
     // `StartBot` / `StopBot` frames to whichever sidecars are
     // connected. Spawning here so it rides the shared shutdown signal

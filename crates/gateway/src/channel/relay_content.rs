@@ -55,7 +55,7 @@ fn reconnect_delay() -> Duration {
 
 /// Poll cadence for the approved device row — both while idle (waiting for a
 /// pairing) and while a control connection is live (watching for a revoke).
-/// Cheap: one tiny libsql read per tick against a ≤1-row table.
+/// Cheap: one tiny sqlite read per tick against a ≤1-row table.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A control connection that stayed up at least this long before failing counts

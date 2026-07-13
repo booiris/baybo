@@ -3,7 +3,7 @@
 //! an optional LLM pin.
 //!
 //! This module carries only the value types shared across layers; the row
-//! shape and store port live in `baybo-store`, the libsql impl in
+//! shape and store port live in `baybo-store`, the sqlite impl in
 //! `baybo-storage`. Distinct from the subagent profile registry
 //! (`baybo-subagent`), which is filesystem-authoritative and types spawned
 //! subagents. See `docs/modules/agent-profiles.md`.
@@ -18,7 +18,7 @@ use crate::{BAYBO_BACKEND_TAG, ExternalAgentKind, SubagentBackendKind};
 /// Fixed id of the seeded built-in profile representing default behavior
 /// (workspace Soul prompt, default model, full skill and tool set). The row
 /// is read-only except its avatar and cannot be deleted; the seed's
-/// `INSERT OR IGNORE` in the libsql store is the only writer of
+/// `INSERT OR IGNORE` in the sqlite store is the only writer of
 /// `builtin = 1`.
 pub const BUILTIN_AGENT_PROFILE_ID: &str = "baybo";
 

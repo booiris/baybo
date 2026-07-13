@@ -4,7 +4,7 @@
 //! `CostSummary`, `TimeRange`) live in `baybo-model` and the `CostStore`
 //! trait lives in `baybo-store` (the ports crate).
 //!
-//! `baybo-storage` provides the libsql implementation of `CostStore`.
+//! `baybo-storage` provides the sqlite implementation of `CostStore`.
 
 mod error;
 mod manager;

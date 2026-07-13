@@ -703,7 +703,7 @@ fn extract_article(raw_html: &str, host: &str) -> String {
 }
 
 /// Mirror of `SqliteBlobStore::blob_path` + its private `mime_extension`
-/// table for the two MIME types this tool uses. The libsql backend
+/// table for the two MIME types this tool uses. The sqlite backend
 /// stores `text/markdown` as `<hex>.md` and `text/plain` as `<hex>.txt`
 /// under `<root>/<hex[..2]>/`; if that mapping ever changes upstream
 /// this helper must move with it. In-memory test backends keep no files
