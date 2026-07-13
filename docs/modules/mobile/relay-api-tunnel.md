@@ -8,8 +8,8 @@
 - **Stage 1** — the client's framing hygiene: `LegIo`, request-id checking, the
   frame queue, non-2xx draining, empty-body normalization, and the first
   per-request timeout (`app/ios/ffi/src/relay/{tunnel,api,blob}.rs`).
-- **Stage 2** — the leg pool, the `.background` barrier, and `Replayable`
-  (`app/ios/ffi/src/relay/leg_pool.rs`, `gateway_api.rs`, `App/BayboApp.swift`).
+- **Stage 2** — the leg pool and the `.background` barrier
+  (`app/ios/ffi/src/relay/leg_pool.rs`, `App/BayboApp.swift`).
 - **Stage 3** — the pre-dialed warm leg and the decoupled APNs POST
   (`leg_pool::warm`, `apns.rs`).
 
@@ -411,49 +411,44 @@ the only clean way to ever interrupt a long blob upload.
 
 #### Retry: honestly at-least-once
 
-```rust
-pub(crate) struct LegFailure { pub sent_any: bool, pub response_seen: bool, pub was_pooled: bool }
-```
+**Retry iff `was_pooled && !response_seen`. At most once, always on a freshly
+dialled leg.** A failure on a fresh leg is never retried — otherwise one real
+outage becomes a dial storm. And `response_seen` means *any* frame, not *a valid
+head*: an `Error` frame and a desync are both the gateway TALKING, and past its
+first word we cannot claim it did not run the request. **Only silence licenses a
+replay.**
 
-**Retry iff `was_pooled && !response_seen && route.replayable == Replayable::Yes`.
-At most once, always on a freshly dialled leg. A failure on a fresh leg is never
-retried** (otherwise one real outage becomes a dial storm).
-
-The tempting lemma — *"no Head received ⇒ the gateway did not execute"* — is
+The tempting lemma — *"no head received ⇒ the gateway did not execute"* — is
 **false**. The gateway runs `router.oneshot(req)` first and `send_http_response`
 second; dying between them (gateway restart, relay drop, iOS network path flip) is
-exactly "pre-Head failure, side effect already committed". Therefore:
+exactly "pre-head failure, side effect already committed". Therefore:
 
-> **A pooled request is at-least-once. It is safe only because every route on this
-> surface is idempotent.**
+> **A pooled request is at-least-once. It is safe only because of a property of
+> this surface: every route the pool can carry keys its effect on data the CLIENT
+> supplied.**
 
-Make that a compile-time obligation rather than folklore, in
-`app/ios/ffi/src/gateway_api.rs`:
-
-```rust
-/// A write that may be replayed after a transport failure: the server keys the
-/// effect on CLIENT-SUPPLIED data (session_id / APNs token / blob digest), so a
-/// replay converges to the same state. Replay is at-least-once — the gateway MAY
-/// have already executed it.
-pub(crate) enum Replayable { Yes, No }
-```
-
-| Route | Idempotent? | Why |
+| Route | Safe to replay? | Why |
 |---|---|---|
 | `GET /v1/chat/sessions`, `…/{id}`, `…/sync`, `…/messages?platform_msg_id=` | ✔ | reads |
-| `POST /v1/chat/sessions {session_id}` | ✔ `Yes` | `get_or_create`, keyed on the **client-minted** `session_id` |
+| `POST /v1/chat/sessions {session_id}` | ✔ | `get_or_create`, keyed on the **client-minted** `session_id` |
 | `PUT …/archive`, `…/pin` | ✔ | absolute assignment, not a toggle |
 | `PUT …/read {ordinal}` | ✔ | server-side max-wins, monotonic |
 | `DELETE …/{id}` | ✔ | soft `set_hidden(true)` (session rows are never deleted) |
-| `POST /v1/mobile/apns-token` | ✔ `Yes` | upsert per device |
-| **`POST /v1/blobs`** | ✘ `No` | **every put mints a fresh `blob_id`** (which is exactly why attachment dedup keys on the sha256 digest). Uploads go through `GatewayBlobClient` on a one-shot blob leg, never through `GatewayJsonClient`, so they cannot reach the pool at all — `Replayable::No` is the marker that makes wiring them in later **fail to compile** rather than double-run in the field. It is deliberately unconstructed today. |
+| `POST /v1/mobile/apns-token` | ✔ | upsert per device |
+| **`POST /v1/blobs`** | ✘ | **every put mints a fresh `blob_id`** — which is exactly why attachment dedup keys on the sha256 digest instead. It **cannot reach the pool**: uploads ride `GatewayBlobClient` on a one-shot blob leg, never `GatewayJsonClient`. That structural separation is the guarantee. |
 
-Chat message sends never go through `GatewayJsonClient` — they ride the chat leg
-as `Frame`s (`transport.rs`). There is no "duplicate user message" hazard on this
-surface.
+Chat message sends never go through `GatewayJsonClient` either — they ride the chat
+leg as `Frame`s (`transport.rs`). There is no "duplicate user message" hazard here.
 
-`direct/mod.rs` ignores the parameter (reqwest never retries); only the signature
-changes.
+> An earlier draft carried a per-route `Replayable::{Yes, No}` flag through
+> `GatewayJsonClient`, on the theory that it would force the question at the call
+> site. It was **removed**: every route on this surface answers `Yes`, `No` was
+> never constructible (blob uploads do not use this client), and the flag therefore
+> did nothing at runtime and forced nothing at compile time. What actually keeps
+> this safe is the table above plus the structural exclusion of blobs — so that is
+> where the reasoning lives now, on `should_retry`. **A new route without the
+> client-keyed property must not be added to `GatewayJsonClient` without revisiting
+> it.**
 
 ### iOS backgrounding
 
@@ -562,11 +557,11 @@ non-negotiable prerequisites.
 
 | # | Scenario | Detection | Behaviour | User cost |
 |---|---|---|---|---|
-| 1 | Parked leg reclaimed between requests (gateway idle / relay drop / restart / NAT) | send error or EOF before first byte ⇒ `!response_seen && was_pooled` | discard, dial fresh, retry once (`Replayable::Yes`) | an RST round trip (usually <1 ms) + one normal dial |
+| 1 | Parked leg reclaimed between requests (gateway idle / relay drop / restart / NAT) | send error or EOF before ANY frame ⇒ `!response_seen && was_pooled` | discard, dial fresh, retry once | an RST round trip (usually <1 ms) + one normal dial |
 | 2 | Parked leg becomes a blackhole | `POOLED_LEG_FIRST_BYTE_TIMEOUT = 4s` | discard, dial fresh, retry once | ≤4s + a dial. **The only new tail-latency mode**; the three backgrounding layers push its rate toward zero |
 | 3 | App backgrounds → suspends | synchronous epoch bump on `.background`; dual-clock stamp | pool emptied; an in-flight request's leg is discarded on completion (stale epoch) | first call after foreground dials cold (= today) |
 | 4 | Suspended mid-request | socket usually dead on resume → 4s/30s timeout | discard; no retry if any response byte was seen | ≤30s; the caller (list refresh / sync) already has a retry path |
-| 5 | Leg dies mid-upload (JSON body, single chunk) | `sent_any && !response_seen` | retry per `Replayable` (all bodied routes are `Yes`) | one re-dial |
+| 5 | Leg dies mid-upload (JSON body, single chunk) | `!response_seen` | retried once — every bodied route on this client is replay-safe (see the table above) | one re-dial |
 | 6 | Router hangs up on the request body (401/404 before any extractor reads it) | gateway `BodyDrain::Abandoned` | response still sent, **leg MustClose** | client gets its correct 401/404. **This is the live detonator**, masked today by the leg always dying |
 | 7 | Non-2xx (`chat_lookup_message`'s 404 — the normal outbox-rebase result) | status check | **drain the body first**, then `Err`; leg poolable per `reuse` | none. Today it would poison the next request on a reused leg |
 | 8 | Gateway sends `TunnelResponse::Error` | blanket rule | leg is dead ⇒ discard, no pool, no retry | one re-dial |
@@ -604,7 +599,7 @@ all). A `TunnelFrames` seam went in underneath so the framing rules could be
 tested against a scripted gateway — no relay, no socket, no crypto — which is
 also what Stage 2's pool tests use.
 
-**Stage 2 — the pool, the barrier, `Replayable`.** Where the win starts, and the
+**Stage 2 — the pool and the barrier.** Where the win starts, and the
 only stage that needs both of the others.
 
 **Stage 3 — the pre-dialed leg and the decoupled APNs POST.** Takes the cold list
@@ -662,8 +657,10 @@ here that no test in the repo can reach.
   reconnects — which is exactly why `MAX_POOLED_LEGS` is 3 and the idle is 60s, not
   90s.
 - **At-least-once semantics.** Today it is exactly-once-or-fail. Safety rests
-  entirely on the *current fact* that every route here is idempotent; `Replayable`
-  turns that into a compile-time obligation, but that is a guard rail, not a theorem.
+  entirely on the *current fact* that every route here is idempotent, plus the
+  structural exclusion of blob uploads from this client. That is an argument, not a
+  theorem — a new non-idempotent route on `GatewayJsonClient` would break it
+  silently.
 - **`request_id` becomes load-bearing.** Today it is a constant, ignored, harmless.
 
 ## What this does not fix

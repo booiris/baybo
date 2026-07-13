@@ -16,7 +16,7 @@ use super::tunnel::{
     declared_body_len, dial_tunnel_leg,
 };
 use crate::core::{TunnelHeader, TunnelRequest};
-use crate::gateway_api::{GatewayJsonClient, MEDIA_TYPE_JSON, Replayable};
+use crate::gateway_api::{GatewayJsonClient, MEDIA_TYPE_JSON};
 
 const HEADER_CONTENT_TYPE: &str = "content-type";
 
@@ -59,8 +59,7 @@ impl GatewayJsonClient for GatewayApi {
         T: DeserializeOwned + Send + 'static,
     {
         async move {
-            // A read: replaying it changes nothing.
-            let body = request("GET", path, Vec::new(), None, Replayable::Yes).await?;
+            let body = request("GET", path, Vec::new(), None).await?;
             serde_json::from_slice(&body).map_err(|e| format!("decode response: {e}"))
         }
     }
@@ -69,7 +68,6 @@ impl GatewayJsonClient for GatewayApi {
         &'a self,
         path: &'a str,
         body: Vec<u8>,
-        replay: Replayable,
     ) -> impl std::future::Future<Output = Result<T, String>> + Send + 'a
     where
         T: DeserializeOwned + Send + 'static,
@@ -80,7 +78,6 @@ impl GatewayJsonClient for GatewayApi {
                 path,
                 vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
                 Some(body),
-                replay,
             )
             .await?;
             serde_json::from_slice(&body).map_err(|e| format!("decode response: {e}"))
@@ -91,7 +88,6 @@ impl GatewayJsonClient for GatewayApi {
         &'a self,
         path: &'a str,
         body: Vec<u8>,
-        replay: Replayable,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
         async move {
             request(
@@ -99,7 +95,6 @@ impl GatewayJsonClient for GatewayApi {
                 path,
                 vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
                 Some(body),
-                replay,
             )
             .await?;
             Ok(())
@@ -112,14 +107,11 @@ impl GatewayJsonClient for GatewayApi {
         body: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
         async move {
-            // Absolute assignment (archive / pin) or a monotonic max-wins cursor
-            // (read): idempotent by HTTP contract, and each one checked against it.
             request(
                 "PUT",
                 path,
                 vec![TunnelHeader::new(HEADER_CONTENT_TYPE, MEDIA_TYPE_JSON)],
                 Some(body),
-                Replayable::Yes,
             )
             .await?;
             Ok(())
@@ -131,8 +123,7 @@ impl GatewayJsonClient for GatewayApi {
         path: &'a str,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'a {
         async move {
-            // A soft hide: session rows are never deleted, so this converges.
-            request("DELETE", path, Vec::new(), None, Replayable::Yes).await?;
+            request("DELETE", path, Vec::new(), None).await?;
             Ok(())
         }
     }
@@ -148,8 +139,7 @@ pub(crate) struct Exchange {
     ///
     /// This is the ONLY thing a retry may be reasoned about, and it is weaker than
     /// it looks: the gateway runs the router FIRST and answers second, so a failure
-    /// before the head does NOT mean the request had no effect. A replay is
-    /// at-least-once. See `Replayable`.
+    /// before the head does NOT mean the request had no effect. See `should_retry`.
     pub(crate) response_seen: bool,
 }
 
@@ -262,7 +252,6 @@ async fn request(
     path: &str,
     headers: Vec<TunnelHeader>,
     body: Option<Vec<u8>>,
-    replay: Replayable,
 ) -> Result<Vec<u8>, String> {
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let key = BindingKey::from(&record);
@@ -282,7 +271,7 @@ async fn request(
         // gateway reclaimed it, the relay flapped, a NAT dropped the flow. That is
         // the ONE failure worth retrying, and only when the route can survive being
         // run twice.
-        let retry = should_retry(&outcome, leg.was_pooled, replay);
+        let retry = should_retry(&outcome, leg.was_pooled);
         settle(leg, parkable(outcome.reuse, &outcome.result)).await;
         if !retry {
             return outcome.result.map_err(String::from);
@@ -338,17 +327,35 @@ fn parkable(reuse: Option<TunnelReuse>, result: &Result<Vec<u8>, LegError>) -> O
 
 /// The rule that decides whether a failed call gets a second try.
 ///
-/// Pulled out as a pure function because the reasoning is the fragile part, not
-/// the plumbing: it is the ONE place where the at-least-once bargain is struck.
-fn should_retry(outcome: &Exchange, was_pooled: bool, replay: Replayable) -> bool {
+/// A pure function because the reasoning is the fragile part, not the plumbing:
+/// this is the ONE place the at-least-once bargain is struck.
+///
+/// **The replay is at-least-once, not exactly-once.** The gateway runs the router
+/// FIRST and answers second, so a failure before the response head does NOT prove
+/// the request had no effect — it may well have created the session and then died
+/// on the way to saying so.
+///
+/// It is safe anyway, and only because of a property of THIS surface: every route
+/// the pool can carry keys its effect on data the CLIENT supplied — the session id
+/// we minted (`get_or_create`), the APNs token we hold (an upsert per device), an
+/// absolute archive/pin flag, a max-wins read cursor, a soft hide. A replay
+/// converges on the same state.
+///
+/// The one route that does NOT have that property is `POST /v1/blobs`: every put
+/// mints a fresh `blob_id`, which is exactly why attachment dedup keys on the
+/// sha256 digest instead. It cannot reach this code — uploads ride
+/// `GatewayBlobClient` on a one-shot blob leg, never `GatewayJsonClient` — and
+/// that structural separation is what keeps it safe. **A new route without the
+/// client-keyed property must not be added to `GatewayJsonClient` without
+/// revisiting this.**
+fn should_retry(outcome: &Exchange, was_pooled: bool) -> bool {
     outcome.result.is_err()
         // A leg WE just dialed that fails means the network is down. Retrying there
         // turns one outage into a dial storm.
         && was_pooled
-        // Past the response head we know the gateway ran the request. Replaying it
-        // would be a second execution we can see coming.
+        // The gateway answered — an Error, a desync, anything. Past its first word
+        // we cannot claim it did not run the request. Only silence licenses a replay.
         && !outcome.response_seen
-        && matches!(replay, Replayable::Yes)
 }
 
 #[cfg(test)]
@@ -371,14 +378,14 @@ mod tests {
     #[test]
     fn a_pooled_leg_that_dies_before_any_response_is_retried() {
         let dead = exchange_result(Err(LegError::dead("connection reset")), false);
-        assert!(should_retry(&dead, true, Replayable::Yes));
+        assert!(should_retry(&dead, true));
     }
 
     #[test]
     fn a_freshly_dialed_leg_is_never_retried() {
         let dead = exchange_result(Err(LegError::dead("connection reset")), false);
         assert!(
-            !should_retry(&dead, false, Replayable::Yes),
+            !should_retry(&dead, false),
             "one outage must not become a dial storm"
         );
     }
@@ -389,13 +396,7 @@ mod tests {
     #[test]
     fn a_failure_after_the_response_head_is_never_retried() {
         let dead = exchange_result(Err(LegError::dead("connection reset")), true);
-        assert!(!should_retry(&dead, true, Replayable::Yes));
-    }
-
-    #[test]
-    fn a_non_replayable_route_is_never_retried() {
-        let dead = exchange_result(Err(LegError::dead("connection reset")), false);
-        assert!(!should_retry(&dead, true, Replayable::No));
+        assert!(!should_retry(&dead, true));
     }
 
     /// A gateway that answered "no" is not a transport failure. The leg is drained
@@ -403,13 +404,13 @@ mod tests {
     #[test]
     fn a_gateway_that_answered_is_never_retried() {
         let not_found = exchange_result(Err(LegError::Http { status: 404 }), true);
-        assert!(!should_retry(&not_found, true, Replayable::Yes));
+        assert!(!should_retry(&not_found, true));
     }
 
     #[test]
     fn success_is_never_retried() {
         let ok = exchange_result(Ok(b"[]".to_vec()), true);
-        assert!(!should_retry(&ok, true, Replayable::Yes));
+        assert!(!should_retry(&ok, true));
     }
 
     /// The gateway's offer rides back out of the exchange, because it is what
@@ -516,7 +517,7 @@ mod tests {
         assert!(matches!(outcome.result, Err(LegError::Dead(_))));
         assert!(outcome.response_seen, "the gateway answered");
         assert!(
-            !should_retry(&outcome, true, Replayable::Yes),
+            !should_retry(&outcome, true),
             "and a deterministic rejection must not be replayed"
         );
     }
@@ -540,7 +541,7 @@ mod tests {
 
         assert!(matches!(outcome.result, Err(LegError::Dead(_))));
         assert!(outcome.response_seen);
-        assert!(!should_retry(&outcome, true, Replayable::Yes));
+        assert!(!should_retry(&outcome, true));
     }
 
     /// The one thing that DOES license a replay: silence. A leg the gateway never
@@ -560,7 +561,7 @@ mod tests {
         .await;
 
         assert!(!outcome.response_seen, "not a word came back");
-        assert!(should_retry(&outcome, true, Replayable::Yes));
+        assert!(should_retry(&outcome, true));
     }
 
     /// A parked leg can be a zombie: the write lands, and then nothing comes back.
