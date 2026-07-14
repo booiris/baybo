@@ -45,7 +45,6 @@ import {
 } from '../api/chatWs';
 import type { components } from '../api/schema';
 import { useBlobUrl } from '../api/useBlobUrl';
-import { CronInbox } from '../components/CronInbox';
 import { TaskChecklist } from '../components/chat/TaskChecklist';
 import { AttachmentImage } from './chat/AttachmentImage';
 import { type AgentOption } from './chat/AgentPicker';
@@ -87,6 +86,13 @@ export interface WorkStep {
   toolLabel?: string | null;
   toolStatus?: 'running' | 'ok' | 'error' | 'denied';
   toolSummary?: string;
+  /** Prompt id, set while this call is blocked on the user's approval — the
+   *  step reads "waiting for approval" until the matching `approval_resolved`
+   *  (or the call's own completion) lands. */
+  awaitingApproval?: string;
+  /** The decision the user gave. Persisted with the tool result, so a reload
+   *  still shows what was judged. */
+  approval?: 'approve' | 'approve_always' | 'deny';
 }
 
 export interface TranscriptRow {
@@ -430,15 +436,6 @@ export function ChatPage() {
   // Late-bound `markRead` so the sync loop (defined earlier) can advance the
   // server read cursor without a declaration-order cycle.
   const markReadRef = useRef<(sid: string) => void>(() => {});
-
-  // Bumped whenever the WS reports activity for a session_id we don't
-  // track in the main `sessions` list — cron creates fresh sessions
-  // server-side that the chat-list endpoint filters out, so the only
-  // hint a tab has that a cron fire just happened is a
-  // SessionActivity ping for an unknown id. Cascaded into the
-  // CronInbox panel so it can refetch right when something new lands
-  // instead of waiting on the next 30s poll.
-  const [cronInboxRefresh, setCronInboxRefresh] = useState(0);
 
   const [status, setStatus] = useState<ConnectionStatus>({ state: 'connecting' });
   // Mirrors `status` in a ref so the captured-once `onFrame` closure and the
@@ -1145,13 +1142,12 @@ export function ChatPage() {
             return applySessionActivity(prev, frame.session_id, frame.at, isForeground);
           });
           if (!known) {
-            // Probably a cron-spawned session — those are filtered out
-            // of the main chat list server-side, so the only signal
-            // the tab has is activity for an id it doesn't know.
-            // Nudging the CronInbox panel triggers an immediate
-            // refetch so the fire shows up without waiting on the
-            // polling interval.
-            setCronInboxRefresh((n) => n + 1);
+            // A conversation this tab has never seen just spoke — a recurring
+            // cron fire opening its own conversation, or one started in
+            // another tab. Activity carries no session metadata, so pull the
+            // list to learn what it is; the row then renders with its title
+            // and unread badge like any other.
+            void refetchSessionsAndFolders();
           }
           return;
         }
@@ -1178,7 +1174,6 @@ export function ChatPage() {
           case 'tool_completed':
           case 'status':
           case 'message':
-          case 'attachment':
           case 'notice':
           case 'approval_requested':
           case 'task_list':
@@ -2651,7 +2646,6 @@ export function ChatPage() {
 
       {/* Main column */}
       <main className="flex-1 flex flex-col overflow-hidden relative">
-        <CronInbox refreshSignal={cronInboxRefresh} />
         <header className="h-12 px-4 border-b-2 border-black flex items-center justify-between gap-3 bg-canvas">
           <div className="flex items-center gap-2 min-w-0 flex-1">
             {sessionId ? (
@@ -3167,6 +3161,7 @@ export function routeInboundFrame(
               frame.call_id,
               frame.status,
               frame.summary,
+              approvalFromWire(frame.approval),
               view.turn?.active ?? null,
             ),
           },
@@ -3392,35 +3387,6 @@ export function routeInboundFrame(
       });
       return;
     }
-    case 'attachment': {
-      // Media a tool produced mid-turn (a sent file, a screenshot).
-      // Render it as its OWN standalone bubble — deliberately NOT folded
-      // into the open work block and NOT closing the turn, so the
-      // in-flight reply keeps streaming afterwards.
-      if (frame.attachments.length === 0) return;
-      const sid = frame.session_id;
-      setViews((prev) => {
-        const view = prev[sid] ?? EMPTY_VIEW;
-        return {
-          ...prev,
-          [sid]: {
-            ...view,
-            transcript: [
-              ...view.transcript,
-              {
-                key: `attachment-${view.transcript.length}-${Date.now()}`,
-                role: 'assistant',
-                text: '',
-                hasAttachments: true,
-                attachments: frame.attachments,
-                createdAt: new Date().toISOString(),
-              },
-            ],
-          },
-        };
-      });
-      return;
-    }
     case 'notice': {
       const sid = frame.session_id;
       // A transient notice is the progress observer's mid-turn narration,
@@ -3503,6 +3469,9 @@ export function routeInboundFrame(
           ...prev,
           [sid]: {
             ...view,
+            transcript: frame.tool_call_id
+              ? markStepAwaitingApproval(view.transcript, frame.tool_call_id, frame.call_id)
+              : view.transcript,
             pendingApproval: {
               callId: frame.call_id,
               sessionId: sid,
@@ -3530,10 +3499,15 @@ export function routeInboundFrame(
         // a fresh object would force every SessionRow to re-render.
         let next: Record<string, SessionView> | null = null;
         for (const [sid, view] of Object.entries(prev)) {
-          if (view.pendingApproval?.callId === frame.call_id) {
-            next ??= { ...prev };
-            next[sid] = { ...view, pendingApproval: null };
-          }
+          const transcript = resolveStepApproval(view.transcript, frame.call_id, frame.decision);
+          const card = view.pendingApproval?.callId === frame.call_id;
+          if (!card && transcript === view.transcript) continue;
+          next ??= { ...prev };
+          next[sid] = {
+            ...view,
+            transcript,
+            pendingApproval: card ? null : view.pendingApproval,
+          };
         }
         return next ?? prev;
       });
@@ -3738,7 +3712,7 @@ function appendReasoningStep(
 
 /** Push a running tool step, keyed by `callId`. Idempotent on a
  *  re-delivered start within the open block. */
-function pushToolStartedStep(
+export function pushToolStartedStep(
   prev: TranscriptRow[],
   callId: string,
   tool: string,
@@ -3763,11 +3737,12 @@ function pushToolStartedStep(
 /** Resolve a tool step by `callId` with its final status + summary. If
  *  the start was never seen (dropped), synthesize a completed step so the
  *  result still shows. */
-function applyToolCompletedStep(
+export function applyToolCompletedStep(
   prev: TranscriptRow[],
   callId: string,
   status: string,
   summary: string,
+  approval: WorkStep['approval'],
   turnActive: boolean | null,
 ): TranscriptRow[] {
   const toolStatus: WorkStep['toolStatus'] =
@@ -3779,7 +3754,16 @@ function applyToolCompletedStep(
     const sIdx = steps.findIndex((s) => s.kind === 'tool' && s.toolCallId === callId);
     if (sIdx < 0) continue;
     const nextSteps = steps.slice();
-    nextSteps[sIdx] = { ...nextSteps[sIdx], toolStatus, toolSummary: summary };
+    nextSteps[sIdx] = {
+      ...nextSteps[sIdx],
+      toolStatus,
+      toolSummary: summary,
+      // The call is done, so nothing waits on the user any more — including
+      // when the gate TIMED OUT, which broadcasts no `approval_resolved` and
+      // would otherwise strand the badge.
+      awaitingApproval: undefined,
+      approval: approval ?? nextSteps[sIdx].approval,
+    };
     const next = prev.slice();
     next[i] = { ...row, steps: nextSteps };
     return next;
@@ -3793,9 +3777,66 @@ function applyToolCompletedStep(
       tool: 'tool',
       toolStatus,
       toolSummary: summary,
+      approval,
     },
     turnActive,
   );
+}
+
+/** Narrow a wire decision string onto the step model. Anything unknown (a
+ *  newer server) is dropped rather than rendered raw. */
+function approvalFromWire(decision: string | undefined): WorkStep['approval'] {
+  return decision === 'approve' || decision === 'approve_always' || decision === 'deny'
+    ? decision
+    : undefined;
+}
+
+/** Badge the work step of the TOOL call a prompt just blocked. Never opens a
+ *  block: an approval frame is not work, and a prompt always follows its
+ *  call's `tool_started`. */
+export function markStepAwaitingApproval(
+  prev: TranscriptRow[],
+  toolCallId: string,
+  promptId: string,
+): TranscriptRow[] {
+  return rewriteToolStep(prev, (s) => (s.toolCallId === toolCallId ? { ...s, awaitingApproval: promptId } : s));
+}
+
+/** A prompt was answered (here or on another client): clear the badge and
+ *  label the step. Matched by PROMPT id — that is all `approval_resolved`
+ *  carries. The label is provisional until the call's own completion brings
+ *  the persisted twin. */
+export function resolveStepApproval(
+  prev: TranscriptRow[],
+  promptId: string,
+  decision: string,
+): TranscriptRow[] {
+  return rewriteToolStep(prev, (s) =>
+    s.awaitingApproval === promptId
+      ? { ...s, awaitingApproval: undefined, approval: approvalFromWire(decision) }
+      : s,
+  );
+}
+
+/** Rewrite every tool step of the newest work block in place. Returns `prev`
+ *  UNCHANGED when nothing matched — `approval_resolved` is broadcast to every
+ *  session bucket, and minting a fresh array per bucket would re-render every
+ *  open thread on a decision that belongs to exactly one of them. */
+function rewriteToolStep(
+  prev: TranscriptRow[],
+  mutate: (step: WorkStep) => WorkStep,
+): TranscriptRow[] {
+  for (let i = prev.length - 1; i >= 0; i--) {
+    const row = prev[i];
+    if (row.kind !== 'work') continue;
+    const steps = row.steps ?? [];
+    const nextSteps = steps.map((s) => (s.kind === 'tool' ? mutate(s) : s));
+    if (nextSteps.every((s, idx) => s === steps[idx])) return prev;
+    const next = prev.slice();
+    next[i] = { ...row, steps: nextSteps };
+    return next;
+  }
+  return prev;
 }
 
 /** Push a status step (compaction, …) into the turn's open work block. */
@@ -4095,6 +4136,9 @@ export function transcriptItemToRow(sessionId: string, item: ApiTranscriptItem):
         // didn't land); `undefined` renders neutral, matching live.
         toolStatus: (s.tool_status ?? undefined) as WorkStep['toolStatus'],
         toolSummary: s.tool_summary ?? undefined,
+        // Persisted on the tool result (`ToolResultMeta::approval`), so a
+        // reloaded thread still shows what the user judged.
+        approval: approvalFromWire(s.approval ?? undefined),
       })),
     };
   }
@@ -4272,6 +4316,7 @@ function workStepFromWire(step: WireWorkStep, i: number): WorkStep {
               ? 'ok'
               : 'running',
       toolSummary: step.summary,
+      approval: approvalFromWire(step.approval),
     };
   }
   return { key: `snap-${i}-${step.kind}`, kind: step.kind, text: step.text };
@@ -4315,8 +4360,21 @@ export function applySubscribeState(
   if (turnEnded) return next;
   const startedAt = parseEpochMs(frame.turn.started_at);
   if (frame.turn.active && startedAt !== null) {
+    // The bundle REPLACES the block's steps, so the awaiting badges have to be
+    // re-derived from the authoritative pending set: the `approval_requested`
+    // frame that first set them may predate this connection.
+    const awaitingByCall = new Map(
+      cards.filter((c) => c.tool_call_id).map((c) => [c.tool_call_id as string, c.call_id]),
+    );
     let transcript = applyTurnState(view.transcript, true, startedAt);
-    transcript = replaceOpenWorkSteps(transcript, (frame.work_steps ?? []).map(workStepFromWire));
+    transcript = replaceOpenWorkSteps(
+      transcript,
+      (frame.work_steps ?? []).map(workStepFromWire).map((step) =>
+        step.kind === 'tool' && step.toolCallId && awaitingByCall.has(step.toolCallId)
+          ? { ...step, awaitingApproval: awaitingByCall.get(step.toolCallId) }
+          : step,
+      ),
+    );
     next = {
       ...next,
       transcript,
@@ -4862,14 +4920,34 @@ function WorkStepView({ step }: { step: WorkStep }) {
       : step.toolStatus === 'denied'
         ? 'text-warn'
         : 'text-ink-soft';
+  const approvalLabel = step.awaitingApproval
+    ? 'waiting for approval'
+    : step.approval === 'approve'
+      ? 'approved'
+      : step.approval === 'approve_always'
+        ? 'always approved'
+        : step.approval === 'deny'
+          ? 'denied'
+          : null;
   return (
     <div className="flex flex-col gap-0.5 font-mono text-xs">
       <div className="flex items-center gap-1.5">
         <span className="text-info">⏺</span>
         <span className="font-bold text-ink">{step.tool}</span>
         {step.toolLabel ? <span className="text-ink-soft">({step.toolLabel})</span> : null}
-        {step.toolStatus === 'running' ? (
+        {/* A call parked on the approval card is NOT running — no spinner, or it
+            would read as work in progress while nothing executes. */}
+        {step.toolStatus === 'running' && !step.awaitingApproval ? (
           <RiLoader4Line className="text-ink-soft animate-spin" title="Running…" />
+        ) : null}
+        {approvalLabel ? (
+          <span
+            className={`rounded border px-1 ${
+              step.awaitingApproval ? 'border-ink text-ink' : 'border-line text-ink-soft'
+            }`}
+          >
+            {approvalLabel}
+          </span>
         ) : null}
       </div>
       {step.toolSummary ? (

@@ -119,13 +119,17 @@ export interface TaskView {
  *  within the buffered turn; `reasoning` / `prose` bodies live in
  *  `text`. */
 export interface WireWorkStep {
-  kind: 'reasoning' | 'prose' | 'tool';
+  kind: 'reasoning' | 'prose' | 'tool' | 'status';
   text?: string;
   call_id?: string;
   tool?: string;
   label?: string;
   status?: string;
   summary?: string;
+  /** `'approve'` / `'approve_always'` / `'deny'` — the decision this call's
+   *  approval prompt returned, once it completed within the buffered turn.
+   *  Absent when the call never prompted. */
+  approval?: string;
 }
 
 /** One pending tool-approval prompt in the `subscribe_state` bundle —
@@ -134,6 +138,10 @@ export interface WireWorkStep {
  *  once). */
 export interface WireApprovalCard {
   call_id: string;
+  /** `call_id` of the TOOL call this prompt blocks (what `tool_started` /
+   *  `tool_completed` carry) — NOT the prompt's own `call_id`, which is minted
+   *  per prompt. Lets the work block badge the step that is waiting. */
+  tool_call_id?: string;
   user_id?: string;
   tool: string;
   accesses: ResourceAccess[];
@@ -173,12 +181,6 @@ export type Frame =
    *  message at once" path). Delivered to the actor atomically so its
    *  coalescing can't lose stragglers to per-message intake latency. */
   | { kind: 'messages'; messages: WireMessage[] }
-  | {
-      kind: 'attachment';
-      session_id: string;
-      user_id?: string;
-      attachments: WireAttachment[];
-    }
   | { kind: 'answer_delta'; session_id: string; user_id?: string; text: string }
   | { kind: 'reasoning'; session_id: string; user_id?: string; text: string }
   | {
@@ -196,6 +198,9 @@ export type Frame =
       call_id: string;
       status: string;
       summary: string;
+      /** The decision this call's approval prompt returned; absent when it
+       *  never prompted. Persisted server-side, so a reload re-labels it. */
+      approval?: string;
     }
   | { kind: 'status'; session_id: string; user_id?: string; phase: string }
   | { kind: 'task_list'; session_id: string; user_id?: string; tasks: TaskView[] }
@@ -227,6 +232,8 @@ export type Frame =
   | {
       kind: 'approval_requested';
       call_id: string;
+      /** The blocked TOOL call — see `WireApprovalCard.tool_call_id`. */
+      tool_call_id?: string;
       session_id: string;
       user_id?: string;
       tool: string;

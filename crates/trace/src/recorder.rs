@@ -482,6 +482,7 @@ mod tests {
                 SpanFinalize::ToolCall(crate::ToolCallResult {
                     output: serde_json::Value::Null,
                     success: false,
+                    output_truncated_from: None,
                 }),
                 LifecycleOutcome::Ok,
             )

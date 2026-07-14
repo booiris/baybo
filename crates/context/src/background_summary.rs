@@ -354,6 +354,7 @@ fn tool_def_from(tool: &dyn Tool) -> ToolDefinitionForLlm {
 fn make_tool_context(workspace_paths: &WorkspacePaths, cancel: CancellationToken) -> ToolContext {
     ToolContext {
         session_id: "background-summary".into(),
+        session_trigger: baybo_model::TriggerSource::User,
         job_id: baybo_model::JobId::default(),
         span_id: baybo_model::SpanId::default(),
         user: User {

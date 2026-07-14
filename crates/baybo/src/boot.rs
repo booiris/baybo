@@ -202,7 +202,7 @@ pub fn load_encryption_key(cfg: &SecurityConfig) -> anyhow::Result<EncryptionKey
 // Pure mappings (no I/O, no Arc, no allocation beyond the returned value)
 // ---------------------------------------------------------------------------
 
-/// Path to the libsql database file, derived from the project root
+/// Path to the sqlite database file, derived from the project root
 /// (`workspace.path`). Storage always lives at `<root>/state/storage.db`;
 /// the workspace root is itself the baybo data directory (defaults to
 /// `~/.baybo` in release, `./.baybo` in debug).

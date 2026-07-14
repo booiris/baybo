@@ -1,7 +1,7 @@
 //! End-to-end exercise of the in-actor background-summary pass +
 //! the FS orphan reaper.
 //!
-//! These tests stand up a libsql-backed `Store` and a real
+//! These tests stand up a sqlite-backed `Store` and a real
 //! `SessionManager` with the `SessionSummaryStore` wired in, then
 //! drive:
 //!
@@ -64,6 +64,7 @@ fn root_session(id: &str) -> Session {
         lineage: None,
         hidden: false,
         pinned: false,
+        archived: false,
         folder_id: None,
         title: None,
     }

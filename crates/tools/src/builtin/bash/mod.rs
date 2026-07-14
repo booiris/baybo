@@ -2928,7 +2928,7 @@ mod tests {
     ) -> ToolContext {
         let mut ctx = ctx_with(sandbox);
         let cache: Arc<Mutex<Vec<ApprovedResource>>> = Arc::new(Mutex::new(Vec::new()));
-        ctx.approval = Some(ApprovalHandle::new(gate, cache));
+        ctx.approval = Some(ApprovalHandle::new(gate, cache, None));
         ctx
     }
 

@@ -891,9 +891,9 @@ impl LlmClient {
     async fn user_content_for_block(&self, block: &baybo_model::ContentBlock) -> UserContent {
         match block {
             baybo_model::ContentBlock::Text(t) => UserContent::Text(Text { text: t.clone() }),
-            baybo_model::ContentBlock::Image { blob, mime_type }
-                if self.model_info.supports_vision =>
-            {
+            baybo_model::ContentBlock::Image {
+                blob, mime_type, ..
+            } if self.model_info.supports_vision => {
                 if let (Some(fetcher), Some(media_type)) = (
                     self.blob_fetcher.as_ref(),
                     parse_image_media_type(mime_type),
@@ -929,9 +929,9 @@ impl LlmClient {
                     })
                 }
             }
-            baybo_model::ContentBlock::Audio { blob, mime_type }
-                if self.model_info.supports_vision =>
-            {
+            baybo_model::ContentBlock::Audio {
+                blob, mime_type, ..
+            } if self.model_info.supports_vision => {
                 if let (Some(fetcher), Some(media_type)) = (
                     self.blob_fetcher.as_ref(),
                     parse_audio_media_type(mime_type),
@@ -1252,6 +1252,7 @@ mod multimodal_dispatch_tests {
                 blob_id: "sha256:deadbeef.tok".into(),
             },
             mime_type: "image/jpeg".into(),
+            filename: None,
         };
         let out = client.user_content_for_block(&block).await;
         match out {
@@ -1287,6 +1288,7 @@ mod multimodal_dispatch_tests {
                 blob_id: "sha256:abc.tok".into(),
             },
             mime_type: "image/jpeg".into(),
+            filename: None,
         };
         let out = client.user_content_for_block(&block).await;
         match out {
@@ -1310,6 +1312,7 @@ mod multimodal_dispatch_tests {
                 blob_id: "sha256:gone.tok".into(),
             },
             mime_type: "image/png".into(),
+            filename: None,
         };
         let out = client.user_content_for_block(&block).await;
         assert!(matches!(out, UserContent::Text(_)));
@@ -1346,6 +1349,7 @@ mod multimodal_dispatch_tests {
                 blob_id: "sha256:never-fetched.tok".into(),
             },
             mime_type: "image/jpeg".into(),
+            filename: None,
         };
         let out = client.user_content_for_block(&block).await;
         assert!(matches!(out, UserContent::Text(_)));

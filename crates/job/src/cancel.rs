@@ -40,7 +40,7 @@ pub enum CancelReason {
     /// and every in-flight subagent it spawned. Distinct from
     /// `ParentCancelled` so the subagent wait task can suppress the
     /// terminal `BackgroundJobFinished` delivery (a stopped result must not
-    /// repopulate `pending_background_results`).
+    /// repopulate the parent session's background-notification buffer).
     UserStopped,
 }
 

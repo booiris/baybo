@@ -21,14 +21,18 @@ Selected via `baybo.json`:
 
 ```json
 {
-  "llm": {
-    "provider": "openai-subscription",
-    "model": "gpt-5"
-  }
+  "llm": [
+    {
+      "name": "codex",
+      "provider": "openai-subscription",
+      "model": "gpt-5"
+    }
+  ],
+  "default-llm": "codex"
 }
 ```
 
-Naming rationale: this is the explicit "use your OpenAI subscription" path, distinct from `openai` (API-key, pay-per-token billing). The leading `openai-` keeps it grouped with `openai`/`openai-codex`-style ids in `baybo llm models` listings and avoids putting a vendor product brand (`chatgpt`) directly in operator-facing config. Open question — could equally be `chatgpt`, `openai-oauth`, or `openai-codex`; final decision deferred to review.
+Naming rationale: this is the explicit "use your OpenAI subscription" path, distinct from `openai` (API-key, pay-per-token billing). The leading `openai-` keeps it grouped with `openai`/`openai-codex`-style ids in the `baybo llm add` provider picker and `baybo llm status` listings and avoids putting a vendor product brand (`chatgpt`) directly in operator-facing config. Open question — could equally be `chatgpt`, `openai-oauth`, or `openai-codex`; final decision deferred to review.
 
 No `api_key_env` is consulted; tokens come from the vault. `base_url` defaults to `https://chatgpt.com/backend-api`. **Default-deny on the bearer destination**: an override is accepted only if the parsed host suffix is on the allowlist (`chatgpt.com` and its subdomains, `auth.openai.com`). Anything else fails at provider construction with `LlmError::Config` so the misconfiguration surfaces at boot rather than leaking the bearer at first request. To deliberately override (operator owns the TOS and credential-leak risk), set the env var `BAYBO_OPENAI_SUBSCRIPTION_UNSAFE_BASE_URL=1` — env rather than `baybo.json` field on purpose, so flipping a bypass requires an explicit shell action.
 
@@ -69,14 +73,14 @@ OAuth login is not a separate `auth` subcommand; it's wired into the existing en
 |---|---|
 | `baybo llm add` (pick `openai-subscription` provider) | Prompts the operator to choose between two login methods: **PKCE** (default on a TTY) opens `https://auth.openai.com/oauth/authorize?...` and runs a one-shot HTTP listener on `127.0.0.1:1455` for the callback; **Device code** (auto-selected on non-TTY stdin, also offered on TTY for headless boxes) hits `/api/accounts/deviceauth/usercode` + polled `/deviceauth/token`. The exchanged bundle is persisted in the vault under a single shared key (one profile per workspace). After the login the flow continues with model + reasoning-effort selection. |
 | `baybo llm edit` → `OAuth login (re-authenticate)` | Re-runs the same PKCE / device-code dialog and overwrites the vault bundle. Used to recover from a stale refresh token without removing the entry. |
-| `baybo llm remove` (entry whose provider is `openai-subscription`) | Deletes the config entry; if no other `openai-subscription` entries remain, also calls `/oauth/revoke` (RFC 7009, best-effort — logs but does not fail the command) and clears the vault entry. **Vault clear failure is logged but not fatal**: the config entry is gone, so the runtime no longer routes through this provider; the next process won't see the token. Server-side revoke success is reflected in the JSON output (`subscription_revoked: true|false`). |
+| `baybo llm remove` (entry whose provider is `openai-subscription`) | Deletes the config entry; if no other `openai-subscription` entries remain, also calls `/oauth/revoke` (RFC 7009, best-effort — logs but does not fail the command) and clears the vault entry. **Vault clear failure is logged but not fatal**: the config entry is gone, so the runtime no longer routes through this provider; the next process won't see the token. Server-side revoke success is reflected in the JSON output (`subscription_revoked: true\|false`). |
 | `baybo llm status` | Lists every registered entry (name / provider / model / api_key_env). It does **not** surface OAuth token state (expiry, account email, plan type, override state) today — that data is printed once at login time and is otherwise only visible in tracing events. A richer status view is future work. |
 
-All of the above lives in `crates/cli/src/commands/llm.rs`. The OAuth surface itself (`pkce_login`, `device_code_login`, `revoke`, `VaultTokenStore`) is exposed by `baybo_llm::providers::openai_subscription` for the CLI to consume.
+Edit/remove/status live in `crates/cli/src/commands/llm.rs`; the `add` flow (shared with the setup wizard) lives in `crates/setup/src/flow/llm.rs`. The OAuth surface itself (`pkce_login`, `device_code_login`, `revoke`, `VaultTokenStore`) is exposed by `baybo_llm::providers::openai_subscription` for the CLI to consume.
 
 ## Architecture
 
-### New crate-private module: `crates/llm/src/providers/openai_subscription/`
+### Module: `crates/llm/src/providers/openai_subscription/`
 
 ```
 openai_subscription/
@@ -86,7 +90,7 @@ openai_subscription/
 ├── oauth.rs            — pkce_login(), device_code_login(), refresh(), revoke()
 ├── reasoning.rs        — allowed_efforts_for() (reasoning-effort allow-list)
 ├── factory.rs          — OpenAiSubscriptionProviderFactory + base-url validator
-└── completion_model.rs — OpenAiSubscriptionCompletionModel: rig::CompletionModel impl
+└── completion_model.rs — OpenAiSubscriptionCompletionModel: Codex Responses completion + streaming
 ```
 
 Module directory and inner struct both use `openai_subscription` / `OpenAiSubscriptionCompletionModel` to match the user-facing provider id; the wire format (Codex Responses API) and impersonation surface (`originator: codex_cli_rs`) are documented in the module's header comment but don't leak into struct names.
@@ -95,23 +99,13 @@ Why split: `oauth.rs` and the CLI both need `token_bundle` + `token_store`, but 
 
 ### `AnyCompletionModel` change
 
-`crates/llm/src/lib.rs:262` is currently:
-
-```rust
-pub(crate) enum AnyCompletionModel {
-    OpenAI(openai::completion::CompletionModel),
-    Anthropic(anthropic::completion::CompletionModel),
-    Gemini(gemini::completion::CompletionModel),
-}
-```
-
-Add a fourth variant:
+The enum-dispatched `AnyCompletionModel` in `crates/llm/src/lib.rs` (one variant per provider) carries a dedicated variant for this provider:
 
 ```rust
 OpenAiSubscription(crate::providers::openai_subscription::OpenAiSubscriptionCompletionModel),
 ```
 
-`OpenAiSubscriptionCompletionModel` implements rig's `CompletionModel` trait directly (using its public type signatures) so the existing match arms in `completion()` and `stream()` get a uniform 4th arm. We do **not** route through `rig::providers::openai` because:
+`OpenAiSubscriptionCompletionModel` exposes inherent `completion()` / `stream()` methods over rig's public request/error types (`CompletionRequest`, `CompletionError`), so it slots into `AnyCompletionModel`'s `completion()` and `stream()` as a uniform match arm alongside the rig-backed providers. We do **not** route through `rig::providers::openai` because:
 
 1. The wire format is the Responses API (`input` / `instructions` / `tools` / `reasoning` / `store=false`), not Chat Completions (`messages`).
 2. `Authorization: Bearer <ChatGPT JWT>` plus `ChatGPT-Account-Id: <id>` is required; rig's openai client only knows API-key bearers.
@@ -125,7 +119,7 @@ Concrete consequences:
 
 - `LlmProviderConfig` grows an `Option<Arc<SecretVault>>` field. For the openai-subscription factory it MUST be `Some` (returns `LlmError::Config` otherwise); for every other provider it's ignored.
 - `with_default_providers()` registers the openai-subscription factory like all the others — boot doesn't have to do anything special.
-- `boot::build_llm_client` gains a `vault: Arc<SecretVault>` parameter (touches every test fixture that builds an `LlmClient` — accepted cost per user).
+- `boot::build_llm_client` gains a `vault: Option<Arc<SecretVault>>` parameter (touches every test fixture that builds an `LlmClient` — accepted cost per user).
 - The factory's `create()` does **not** read the vault — it just constructs the `VaultTokenStore` and the completion model (sync, no `block_on`). The bundle load is deferred to the async hot path: `ensure_fresh_bundle()` lazily reads the vault on the first request (and re-validates periodically), so a configured-but-not-yet-signed-in provider only errors when a call is actually attempted.
 
 `baybo-llm` already depends on `tokio` for its streams, so the extra `baybo-security` edge doesn't pull in a new ecosystem.
@@ -136,13 +130,13 @@ Three layers, in order of how often they fire:
 
 - **Background (proactive)**: a tokio task spawned at provider construction wakes every `BACKGROUND_REFRESH_INTERVAL_SECS = 3600` (1 hour). If the cached bundle is within `BACKGROUND_REFRESH_MARGIN_SECS = 300` (5 min) of expiry, refresh proactively. This keeps a long-idle process from making the next user-facing call pay the refresh latency. Loop exits gracefully when the vault is empty (user logged out) or a permanent refresh error fires (token revoked); the next sign-in re-spawns it.
 - **Pre-flight (just-in-time)**: if `expires_at < now() + REFRESH_SKEW_SECS (60)` when a request is about to go out, refresh before sending. Safety net for the ~1 hr window the background task could be late on (process just started, system clock skew, background loop hasn't ticked yet).
-- **Reactive (401)**: 401 from `/codex/responses` → refresh once, retry once. Second 401 surfaces as `LlmError::Auth("openai-subscription: unauthorized after refresh")` — the user must re-login.
+- **Reactive (401)**: 401 from `/codex/responses` → refresh once, retry once. Second 401 surfaces as a rig `CompletionError::ProviderError("openai-subscription: unauthorized after refresh — ...")` (classified `LlmError::Transient` by `rig_completion_to_error`) — the user must re-login via `baybo llm edit`.
 - **Refresh failure**: `refresh_token_expired` / `refresh_token_reused` / `refresh_token_invalidated` → return a typed error and clear the vault entry (so a stale bundle doesn't keep failing). Other 4xx from refresh → transient error, don't clear, surface to caller (or just log + retry-next-tick if the background task hit it).
 - **Concurrency**: a `tokio::sync::Mutex` around the cached token bundle; only one in-flight refresh per process. The background task takes the same lock as the request path, so a request hitting 401 while the background refresh is in progress simply awaits the same lock release.
 
 Why 1 hour and not "every minute"? Each refresh can trigger server-side `refresh_token` rotation; spinning the rotation counter for no reason wastes one of the few server-side guarantees we have. 1 hr is well below typical access-token TTL and well above the cost of a single refresh, so the background task always finds a bundle either fresh enough to skip or just barely inside the margin.
 
-Test isolation: `OpenAiSubscriptionCompletionModel::new` takes an `enable_background_refresh: bool`. The factory passes `true`; unit tests pass `false` so the suite doesn't leak spawned tasks across tests.
+Test isolation: `OpenAiSubscriptionCompletionModel::new` takes a `background: BackgroundRefresh` (`Enabled` / `Disabled`) parameter. The factory passes `Enabled` (and `Disabled` for one-shot live-model probes); unit tests pass `Disabled` so the suite doesn't leak spawned tasks across tests.
 
 ### Request shape (Responses API)
 
@@ -152,8 +146,9 @@ Authorization: Bearer <access_token>
 ChatGPT-Account-Id: <account_id>     // when present
 OpenAI-Beta: responses=experimental
 originator: codex_cli_rs              // anti-bot allowlist; required
-User-Agent: baybo/<version> (...)
 Content-Type: application/json
+// no User-Agent header is set on the Responses call; only the
+// auth.openai.com OAuth endpoints send `User-Agent: baybo/<version>`
 
 {
   "model": "gpt-5",
@@ -164,13 +159,13 @@ Content-Type: application/json
   "parallel_tool_calls": true,
   "stream": true,
   "store": false,
-  "include": ["reasoning.encrypted_content"]
+  "include": ["reasoning.encrypted_content"]  // only when reasoning effort is set (with "reasoning": {effort, summary: "auto"})
 }
 ```
 
-Response is SSE; we parse `response.output_text.delta`, `response.function_call.*`, `response.completed`, `response.error` events into `StreamEvent`s.
+Response is SSE; we parse `response.output_text.delta`, `response.reasoning*.delta`, `response.output_item.added` / `response.output_item.done`, `response.function_call_arguments.*`, `response.completed`, `response.error` events into `StreamEvent`s.
 
-`originator: codex_cli_rs` is mandatory — Codex's edge rejects requests without it. Yes we're impersonating Codex CLI; the OpenClaw docs note this is the "explicitly supported" external-tool path. We do **not** spoof `User-Agent: codex_cli_rs/...`; baybo sends its own UA. This is the minimum needed for the route, no more.
+`originator: codex_cli_rs` is mandatory — Codex's edge rejects requests without it. Yes we're impersonating Codex CLI; the OpenClaw docs note this is the "explicitly supported" external-tool path. We do **not** spoof `User-Agent: codex_cli_rs/...` — the Responses call sends no User-Agent at all, and only the OAuth endpoints carry baybo's own UA. This is the minimum needed for the route, no more.
 
 ### Conversion: rig `CompletionRequest` → Codex `ResponsesApiRequest`
 
@@ -180,18 +175,18 @@ Response is SSE; we parse `response.output_text.delta`, `response.function_call.
 |---|---|---|
 | `preamble` | `instructions` | system prompt |
 | `chat_history` (Vec<Message>) | `input` (Vec<ResponseItem>) | each rig `Message` → one or more `ResponseItem`s |
-| `tools` | `tools` | translate tool schema to Responses-API shape (`type: "function"`, `function: {name, description, parameters}`) |
-| `temperature` / `max_tokens` | passed through | gpt-5 ignores most of these; harmless |
+| `tools` | `tools` | translate tool schema to the flat Responses-API shape (`{type: "function", name, description, parameters}` — no nested `function` object) |
+| `temperature` / `max_tokens` | dropped | Codex Responses rejects `temperature` with 400 "Unsupported parameter: temperature" (regression-tested: `body_drops_temperature_for_codex_responses`); `max_tokens` is likewise not forwarded |
 | (none) | `parallel_tool_calls: true`, `stream: true`, `store: false` | hard-coded |
 
-Tool-call return path: Responses API emits `response.function_call_arguments.delta` events; we accumulate per `id`, finalise on `response.function_call.completed`, surface as `StreamEvent::ToolCall`. Same shape the OpenAI variant already produces.
+Tool-call return path: Responses API emits `response.function_call_arguments.delta` events; we accumulate per `call_id` (registered from `response.output_item.added`), finalise on `response.function_call_arguments.done` or `response.output_item.done` (item type `function_call`), surface as `StreamEvent::ToolCall`. Same shape the OpenAI variant already produces.
 
 ## Error mapping
 
 | Source | baybo `LlmError` |
 |---|---|
 | Vault returns None | `Config("openai-subscription: not signed in — add an entry via `baybo llm add` (pick the openai-subscription provider) or re-authenticate an existing entry via `baybo llm edit`")` |
-| Bundle JSON parse error | `Config("openai-subscription: corrupt token bundle")` (then auto-clear vault entry) |
+| Bundle JSON parse error | `Config("openai-subscription: vault read failed: ...")` — the entry is **not** auto-cleared; recover via `baybo llm edit` → OAuth login, or `baybo llm remove` |
 | Refresh permanent failure | `Config("openai-subscription: refresh token expired/revoked — re-login required")` (auto-clear bundle) |
 | Refresh transient failure | surfaced as a rig `CompletionError::ProviderError`, classified to `LlmError::Transient` by `rig_completion_to_error` |
 | Responses API 401 after refresh | rig `CompletionError::ProviderError("openai-subscription: unauthorized after refresh — ...")` (completion_model.rs), classified to `LlmError::Transient` by `rig_completion_to_error` |
@@ -209,18 +204,18 @@ Tool-call return path: Responses API emits `response.function_call_arguments.del
 - **HTTPS-only on the bearer transport** *(Codex R2-F2)*: the `base_url` validator rejects any non-HTTPS scheme **before** the host suffix check, so even an allowlisted host on `http://` is refused. Protects the bearer from on-path observers and TLS-decrypting proxies that the host allowlist alone wouldn't catch. The unsafe override env var doesn't relax this — it can only widen the host allowlist, never weaken the scheme requirement. Regression tested (`validate_base_url_rejects_http_with_allowlisted_host` + 3 sibling tests).
 - **Durable refresh persistence** *(Codex R2-F3)*: after a successful OAuth refresh, `save_with_retries()` writes the rotated bundle to vault with up to 3 attempts (100ms / 500ms / 2s backoff). If all attempts fail, the bundle is kept in memory but flagged `persisted: false` ("dirty"). The next refresh-path entry retries the save before doing anything else (self-heal); if it STILL can't persist, it refuses to rotate again — better to wait than chain unsaved bundles that all evaporate on process restart. Without this, a transient FS glitch during refresh would silently lose the rotated `refresh_token` and the next process to start would hit `refresh_token_reused` → forced re-login. Regression tested (`save_with_retries_recovers_within_budget`, `save_with_retries_gives_up_after_budget`, `single_flight_refresh_self_heals_dirty_save`, `single_flight_refresh_refuses_to_rotate_when_dirty_save_keeps_failing`).
 - **Cross-process logout invalidation** *(Codex R2-F1)*: every cache hit re-validates against the vault on a periodic interval (`CACHE_VAULT_REVALIDATE_INTERVAL_SECS = 60`). Within the window, repeat calls skip the vault read entirely (hot path stays cheap). Past the window, a missing vault entry drops the in-memory cached bundle so a `baybo llm remove` run by another process (which clears the vault entry as part of removal) is honoured within ~60s. Without this, a CLI removal would only delete the on-disk vault entry while a running gateway / TUI keeps using its cached bundle (and 401 reactive refresh would even write a new bundle back into vault, partially undoing the logout). Regression tested (`ensure_fresh_bundle_invalidates_cache_when_vault_is_emptied`, `ensure_fresh_bundle_skips_vault_within_revalidate_interval`).
-- **Anti-impersonation**: baybo sets `User-Agent: baybo/...`. Only `originator: codex_cli_rs` mimics Codex (mandatory header for the route). Rationale documented inline.
+- **Anti-impersonation**: baybo never spoofs a Codex User-Agent — the Responses call sets no UA at all, and the `auth.openai.com` OAuth endpoints send baybo's own `User-Agent: baybo/<version>`. Only `originator: codex_cli_rs` mimics Codex (mandatory header for the route). Rationale documented inline.
 - **Token at rest**: encrypted with the same AES-256-GCM master key as every other vault entry — same blast radius as a stored API key.
 - **Token in memory**: cached in an `Arc<tokio::sync::Mutex<Option<CachedBundle>>>` for the process lifetime (`CachedBundle` wraps the bundle plus `persisted` / `last_vault_check` bookkeeping); on logout we drop it and delete the vault entry.
-- **Audit log**: every refresh emits a tracing event with `event=openai_subscription_token_refresh`, `outcome=success|transient|permanent`, `account_id` (hashed), no token material in logs ever.
+- **Audit log**: every refresh emits a tracing event with `event=openai_subscription_token_refresh`, `outcome=success|transient|permanent`, no token material in logs ever.
 
 ## Testing
 
-- Unit: PKCE codes well-formed; JWT exp parsing handles short/missing claims; refresh-on-401 path issues exactly one retry.
+- Unit: PKCE codes well-formed; JWT exp parsing handles short/missing claims. The refresh-on-401 retry path is not yet covered by a test (it needs an HTTP mock).
 - Unit: `OAuthTokenBundle` round-trips through `SecretVault::store_typed` / `get_typed` (uses existing `MemorySecretStore` test_support).
 - Unit: rig→Codex request conversion produces the expected JSON for representative messages (text, tool call, tool result, image stub).
-- Unit: with `base_url` unset, the constructed request URL is exactly `https://chatgpt.com/backend-api/codex/responses`. With `base_url = Some("https://example.test/foo")`, the constructed URL is exactly `https://example.test/foo/codex/responses` — the module concatenates only `/codex/responses`, never silently rewrites the host.
-- Integration (gated by `OPENAI_SUBSCRIPTION_LIVE_TEST=1`): a manual smoke test that runs a real PKCE login and a single chat. Not part of CI.
+- Behaviour (not asserted by a test): `send()` concatenates only `/codex/responses` onto `base_url` and never silently rewrites the host — with `base_url` unset the request URL is exactly `https://chatgpt.com/backend-api/codex/responses`.
+- Integration: a manual live smoke test (real PKCE login + a single chat, env-gated, out of CI) is planned, not yet implemented.
 - No mock for the OpenAI auth endpoints in CI — too fragile, the official endpoints are stable enough that contract tests are low-value here.
 
 ## Out-of-scope follow-ups (filed for later, not part of B)

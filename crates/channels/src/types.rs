@@ -114,10 +114,14 @@ pub enum AgentEvent {
     },
     /// A tool call finished. `summary` is a short, presentation-only
     /// rendering of the result ("Read 200 lines", "exit 0", "Error: …").
+    /// `approval` is the decision the call's approval prompt returned
+    /// (`None` when it never prompted) so clients can label the step —
+    /// the same value persisted in `ToolResultMeta::approval`.
     ToolCompleted {
         call_id: String,
         status: ToolStatus,
         summary: String,
+        approval: Option<ApprovalDecision>,
     },
     /// Coarse turn-phase transition for a transient status line (today:
     /// context compaction start/end). Channels show a spinner/banner and
@@ -167,15 +171,6 @@ pub enum AgentEvent {
         /// restarting at zero.
         started_at: Option<DateTime<Utc>>,
     },
-    /// Media a tool produced mid-turn (a sent file, a screenshot), to be
-    /// delivered to the user as its **own** message the moment the tool
-    /// returns — distinct from `Message` (the turn's terminal reply) so it
-    /// carries no turn-completion semantics and clients render it as a
-    /// standalone bubble rather than folding it into the in-flight turn.
-    /// Only the media blocks (`Image` / `Audio` / `File`); never echoed
-    /// back to the LLM. Dropped on non-streaming turns (cron / subagent)
-    /// where there is no live channel.
-    Attachment(Vec<ContentBlock>),
 }
 
 /// Outcome of a finished tool call, carried by
@@ -249,6 +244,10 @@ pub enum SessionEvent {
     /// prompt elsewhere.
     ApprovalRequested {
         call_id: String,
+        /// `call_id` of the TOOL call the prompt blocks (the id
+        /// `ToolStarted`/`ToolCompleted` carry) — see
+        /// [`baybo_tools::ApprovalRequest::tool_call_id`].
+        tool_call_id: Option<String>,
         session_id: SessionId,
         user_id: String,
         tool: String,

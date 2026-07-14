@@ -36,4 +36,10 @@ status?: string,
 /**
  * Short result summary, set alongside `status` on completion.
  */
-summary?: string, };
+summary?: string, 
+/**
+ * Decision the call's approval prompt returned, once it completed
+ * within the buffered turn; `None` when it never prompted (or is
+ * still running / still waiting on the prompt).
+ */
+approval?: string, };

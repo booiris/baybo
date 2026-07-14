@@ -9,23 +9,32 @@ task containers) provide or skip each one.
 
 | Command | Status | Invoked by | Purpose |
 |---------|--------|-----------|---------|
-| `git` | **Required at startup** | `baybo-workspace` (`manager.rs`) | `git init` of the workspace identity repos (`skills/`, `agents/`). Baybo surfaces a startup error if it's genuinely missing. |
+| `git` | **Required at startup** | `baybo-workspace` (`manager.rs`) | `git init` of the workspace identity repos (`config/`, `profile/`, `skills/`, `agents/`). Baybo surfaces a startup error if it's genuinely missing. Also used best-effort by the Edit tool to auto-commit `profile/` identity-file edits (failure degrades to a `commit_warning` in the tool output). |
 | `sh` | **Required** | `baybo-tools` Bash (`bash/mod.rs`) | Every Bash-tool command runs as `sh -c "…"`. |
-| `rg` (ripgrep) | Required **for the `Grep` tool** | `baybo-tools` Grep (`grep.rs`) | The agent's regex content-search tool. Absent → the tool returns *"ripgrep not found; install it"* and the agent must fall back to Bash `grep`/`python`. Baybo itself still runs. |
+| `rg` (ripgrep) | Required **for the `Grep` and `Glob` tools** | `baybo-tools` (`builtin/rg.rs`, shared by `grep.rs` / `glob_tool.rs`) | The agent's regex content-search and file-glob tools both shell out to `rg`. Absent → each returns *"ripgrep (`rg`) not found on PATH; install it"* and the agent must fall back to Bash `grep`/`find`/`python`. Baybo itself still runs. |
 | one of `bwrap` / `sandbox-exec` / `docker` | Optional but recommended for `permission = auto` / `manual` | `baybo-sandbox` | The inner OS sandbox backend: `bwrap` (Linux), `sandbox-exec` (macOS, ships with the OS), or `docker`. With none present on a non-container host, Bash emits a notice and runs without the inner OS sandbox under the configured approval policy; inside a detected outer container/sandbox, it skips the inner sandbox silently. |
 | `systemd-run` | Optional | `baybo-sandbox` (`bwrap.rs`) | cgroup resource limits for `bwrap` when available. |
+| `systemctl` / `launchctl` | Optional (only for `baybo gateway install`-family subcommands) | `baybo-gateway` (`installer/systemd.rs`, `installer/launchd.rs`) | Install/manage the gateway as a systemd unit (Linux) or launchd service (macOS). |
 | `uv` | Optional | `baybo-tools` (`bash/mod.rs` prewarm) | Python tool prewarm / the uv shim. Non-fatal if absent (a startup `WARN`). |
-| `bun` | Required **for channel sidecars** | `baybo-setup` | Runs the bundled JS channel sidecars (Telegram/Discord/…). Only when those channels are configured. |
-| `claude` / `codex` | Optional | `baybo-agent` external-agent delegation | Only when an external agent is configured. |
+| `bun` | Required **for channel sidecars** | `baybo-gateway` (sidecar supervisor; override via `BAYBO_BUN_BIN`) + `baybo-setup` (channel registration flow) | Runs the bundled JS channel sidecars (Telegram/Discord/…). Only when those channels are configured. |
+| `node` | Required **for embedded MCP / tool sidecars** (e.g. the browser sidecar) | `baybo-gateway` (`sidecar/embedded_mcp.rs`) | Runs embedded MCP-server sidecar bundles (`node <bundle.mjs>`); resolved from `PATH`, overridable via `BAYBO_NODE_BIN`. Only when a tool-sidecar domain (e.g. `browser.enable`) is configured. |
+| `claude` / `codex` / `gemini` | Optional | `baybo-agent` external-agent delegation | Only when an external agent is configured. |
 | *(per-skill binaries)* | Per-skill | `baybo-skills` (`registry.rs`) | A skill manifest may declare any required binary; checked at load. |
 
 Build/test-only (not runtime): `cargo`, `pnpm` (web build), `musl-gcc` (bench
 musl build), `tmux` (`baybo-term-harness` tests).
 
+`pnpm` is **required to build `baybo-gateway`**: the dashboard is compiled into
+the binary, and `build.rs` hard-fails when it can't be built. Set
+`BAYBO_SKIP_WEBUI=1` to embed the placeholder page and build the backend without
+it. The sidecar half of that build script stays lenient (empty assets +
+`cargo:warning`) unless `BAYBO_REQUIRE_SIDECARS=1`.
+
 ## Bench environment (`bench-bash` + `permission = free`)
 
-The in-container benches (`bench/swe`, `bench/terminal-bench-1.0`) run the real agent
-*inside* each task's disposable container. Two mechanisms adapt baybo to that:
+The in-container benches (`bench/swe`, `bench/terminal-bench-1.0`,
+`bench/terminal-bench-2.0`) run the real agent *inside* each task's disposable
+container. Two mechanisms adapt baybo to that:
 
 - **Build with `--features bench-bash`** — compiles the bench-only agent prompt
   framing (raw host exec, no work-dir jail, no uv shim, no approval gate). The

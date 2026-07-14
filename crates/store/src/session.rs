@@ -28,6 +28,29 @@ pub struct StoredMessage {
     pub message: ChatMessage,
 }
 
+/// Result of appending a transcript row under a durable source-event key.
+/// `Existing` means the same source event already owns a row in this session,
+/// so callers must not mirror another copy into their in-memory transcript.
+/// The caller still decides whether the surrounding workflow is complete or
+/// must resume from that durable row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMessageAppendOutcome {
+    Inserted { ordinal: i64 },
+    Existing { ordinal: i64 },
+}
+
+impl SessionMessageAppendOutcome {
+    pub fn ordinal(self) -> i64 {
+        match self {
+            Self::Inserted { ordinal } | Self::Existing { ordinal } => ordinal,
+        }
+    }
+
+    pub fn was_inserted(self) -> bool {
+        matches!(self, Self::Inserted { .. })
+    }
+}
+
 /// Persistence interface for sessions.
 ///
 /// `SessionId` is the caller-supplied opaque string (see
@@ -78,6 +101,19 @@ pub trait SessionStore: Send + Sync {
     /// in-memory `Session`) can't clobber the flag. `get` patches
     /// `Session.pinned` from the column at read time.
     async fn set_pinned(&self, session_id: &SessionId, pinned: bool) -> Result<bool>;
+
+    /// Set (or clear, with `false`) the session's chat-list archive flag
+    /// (`PUT /v1/chat/sessions/:id/archive`). Presentation only — the
+    /// list surfaces keep returning archived rows and clients group them;
+    /// new activity never clears the flag. Returns `Ok(true)` when the
+    /// row existed and was updated, `Ok(false)` if no row matched.
+    ///
+    /// Same flat-column discipline as [`Self::set_hidden`]: implementations
+    /// write only the `archived` column and leave the JSON `data` blob
+    /// alone, so a concurrent `save`/`touch` (full-blob rewrite from a
+    /// stale in-memory `Session`) can't clobber the flag. `get` patches
+    /// `Session.archived` from the column at read time.
+    async fn set_archived(&self, session_id: &SessionId, archived: bool) -> Result<bool>;
 
     /// Set (or clear, with `None`) the session's chat-list folder
     /// assignment — the sidebar "move to folder" affordance
@@ -137,7 +173,7 @@ pub trait SessionStore: Send + Sync {
     /// userland.
     ///
     /// Default impl is the naive `list_all() → filter` fallback so
-    /// mock / in-memory stores work without overriding; the libsql
+    /// mock / in-memory stores work without overriding; the sqlite
     /// impl pushes the predicate into SQL.
     async fn list_by_channel(&self, channel: &ChannelType) -> Result<Vec<Session>> {
         let all = self.list_all().await?;
@@ -164,6 +200,24 @@ pub trait SessionStore: Send + Sync {
         session_id: &SessionId,
         message: &ChatMessage,
     ) -> Result<i64>;
+
+    /// Append one message under a non-empty source-event id. The
+    /// `(session_id, source_event_id)` pair is unique across the complete
+    /// transcript, including superseded rows. Implementations atomically
+    /// return the existing ordinal instead of inserting a duplicate.
+    async fn append_session_message_idempotent(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+        message: &ChatMessage,
+    ) -> Result<SessionMessageAppendOutcome>;
+
+    /// Look up the transcript row already claimed by a source-event id.
+    async fn find_message_ordinal_by_source_event_id(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+    ) -> Result<Option<i64>>;
 
     /// Append an out-of-band control/display event ([`ControlEvent`]) to the
     /// session — a slash-command echo or a notice. Stored separately from the

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 #[cfg(any(test, feature = "test-support"))]
 use baybo_model::ChannelType;
-use baybo_model::{JobId, SessionId, SpanId, User};
+use baybo_model::{JobId, SessionId, SpanId, TriggerSource, User};
 use baybo_trace::ToolEventPayload;
 use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
@@ -141,6 +141,13 @@ pub trait Tool: Send + Sync {
 /// Context injected into tool execution by the agent layer.
 pub struct ToolContext {
     pub session_id: SessionId,
+    /// What started the session this call runs in. A tool that records the
+    /// calling conversation for later use needs it: `CronCreate` running
+    /// inside a cron fire (fire sessions get the full tool registry) must
+    /// record the fire's *own* origin as the new job's origin, not the
+    /// transient fire session — otherwise a one-shot's result would be
+    /// delivered into a session nobody can see.
+    pub session_trigger: TriggerSource,
     /// Job this tool call belongs to. Tools that emit downstream work
     /// (e.g. spawn a subagent) carry it so the spawned work can be
     /// lineaged back to the originating job. Production wiring sources
@@ -254,6 +261,7 @@ impl ToolContext {
     pub fn for_test() -> Self {
         Self {
             session_id: "test".into(),
+            session_trigger: TriggerSource::User,
             job_id: JobId::default(),
             span_id: SpanId::default(),
             user: User {
@@ -296,16 +304,6 @@ pub enum NoticeLevel {
 /// tools should not `await` notice delivery.
 pub trait SessionNotifier: Send + Sync {
     fn emit(&self, level: NoticeLevel, summary: &str, detail: &str);
-
-    /// Deliver media a tool produced (a sent file, …) to the session's
-    /// channel as its own standalone, out-of-band message — distinct from
-    /// the turn's final reply, so it does not complete the turn. `blocks`
-    /// are media only (`Image` / `Audio` / `File`). Default no-op for
-    /// notifiers with no live channel (cron, tests); the live notifier
-    /// routes it to the channel. Sync, fire-and-forget.
-    fn emit_attachment(&self, blocks: &[baybo_model::ContentBlock]) {
-        let _ = blocks;
-    }
 }
 
 /// No-op notifier for tests and for call sites that don't have a
@@ -412,17 +410,35 @@ pub struct ApprovalHandle {
     /// for pre-execute approvals, so mid-execution prompts and
     /// pre-execute prompts use a single source of truth.
     approved_cache: Arc<parking_lot::Mutex<Vec<ApprovedResource>>>,
+    /// `tool_use_id` of the call this handle serves, stamped onto every
+    /// [`ApprovalRequest`] so clients can badge the right work step. `None`
+    /// for handles built outside a tool-call context (tests).
+    tool_call_id: Option<String>,
+    /// Last decision an ACTUAL prompt returned (cache short-circuits never
+    /// record). Shared across clones so the executor reads back what
+    /// mid-execution prompts decided after the tool returns.
+    last_decision: Arc<parking_lot::Mutex<Option<ApprovalDecision>>>,
 }
 
 impl ApprovalHandle {
     pub fn new(
         gate: Arc<dyn ApprovalGate>,
         approved_cache: Arc<parking_lot::Mutex<Vec<ApprovedResource>>>,
+        tool_call_id: Option<String>,
     ) -> Self {
         Self {
             gate,
             approved_cache,
+            tool_call_id,
+            last_decision: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// Decision of the most recent prompt this handle (or any clone) actually
+    /// raised — `None` when everything was covered by cache. The executor
+    /// stamps this into the persisted [`baybo_model::ToolResultMeta`].
+    pub fn last_decision(&self) -> Option<ApprovalDecision> {
+        *self.last_decision.lock()
     }
 
     /// Forward a request to the gate WITHOUT consulting the session
@@ -442,6 +458,7 @@ impl ApprovalHandle {
     ) -> ApprovalDecision {
         let req = ApprovalRequest {
             call_id: Uuid::new_v4().to_string(),
+            tool_call_id: self.tool_call_id.clone(),
             session_id: session_id.clone(),
             user_id: user.id.clone(),
             tool: tool.to_string(),
@@ -449,7 +466,9 @@ impl ApprovalHandle {
             params_preview,
             description: None,
         };
-        self.gate.request(req).await
+        let decision = self.gate.request(req).await;
+        *self.last_decision.lock() = Some(decision);
+        decision
     }
 
     /// Forward a request to the gate, filtered by the session approval
@@ -488,6 +507,7 @@ impl ApprovalHandle {
 
         let req = ApprovalRequest {
             call_id: Uuid::new_v4().to_string(),
+            tool_call_id: self.tool_call_id.clone(),
             session_id: session_id.clone(),
             user_id: user.id.clone(),
             tool: tool.to_string(),
@@ -496,6 +516,7 @@ impl ApprovalHandle {
             description: None,
         };
         let decision = self.gate.request(req).await;
+        *self.last_decision.lock() = Some(decision);
         if decision == ApprovalDecision::ApproveAlways {
             let mut cache = self.approved_cache.lock();
             for access in &uncovered {
@@ -707,8 +728,11 @@ pub enum ToolOutput {
     Error(String),
     /// Tool result that also delivers attachments to the user channel.
     /// `text` is what the LLM sees as the tool result; `attachments`
-    /// are hoisted into the assistant's `OutgoingMessage` by the agent
-    /// loop and the channel sidecar then sends them out-of-band.
+    /// (media only — `Image` / `Audio` / `File`) are accumulated across the
+    /// turn by the agent loop and folded into the final assistant message,
+    /// so they persist with the transcript and survive a reload. They reach
+    /// clients on `Frame::Message.attachments`; a turn that never reaches a
+    /// clean final response drops them.
     WithAttachments {
         text: String,
         attachments: Vec<baybo_model::ContentBlock>,
@@ -718,11 +742,12 @@ pub enum ToolOutput {
     /// appends `text` as the normal text-only `ToolResult`, then emits
     /// a follow-up `Role::User` message carrying `llm_images` so a
     /// vision-capable provider receives them through the standard
-    /// multimodal user-content path. The same images are also mirrored
-    /// into the final `OutgoingMessage` so the user channel sees them.
+    /// multimodal user-content path. These images are for the model, not
+    /// the user: they never reach a channel. Use [`ToolOutput::WithAttachments`]
+    /// to show media to the user.
     ///
-    /// Invariant (asserted by [`MultiModalText::new`]): every entry of
-    /// `llm_images` is `ContentBlock::Image`. Other variants are
+    /// Invariant (asserted by [`ToolOutput::multi_modal_text`]): every entry
+    /// of `llm_images` is `ContentBlock::Image`. Other variants are
     /// silently dropped at construction.
     MultiModalText {
         text: String,
@@ -800,6 +825,7 @@ mod multi_modal_text_tests {
                 blob_id: format!("sha256:{}", "ab".repeat(32)),
             },
             mime_type: "image/png".into(),
+            filename: None,
         }
     }
 
@@ -832,6 +858,8 @@ mod multi_modal_text_tests {
                     blob_id: "sha256:0".into(),
                 },
                 mime_type: "audio/wav".into(),
+                filename: None,
+                duration_ms: None,
             },
             ContentBlock::File {
                 blob: BlobRef {
@@ -839,6 +867,7 @@ mod multi_modal_text_tests {
                 },
                 filename: "x".into(),
                 mime_type: "application/pdf".into(),
+                duration_ms: None,
             },
             img(),
         ];
@@ -866,5 +895,101 @@ mod multi_modal_text_tests {
             }
             _ => panic!("expected MultiModalText variant"),
         }
+    }
+}
+
+#[cfg(test)]
+mod approval_handle_tests {
+    use super::*;
+    use crate::approval::{ApprovalGate, ApprovalRequest};
+    use async_trait::async_trait;
+
+    struct FixedGate(ApprovalDecision);
+
+    #[async_trait]
+    impl ApprovalGate for FixedGate {
+        async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
+            assert_eq!(
+                req.tool_call_id.as_deref(),
+                Some("use-1"),
+                "prompt carries the tool call id"
+            );
+            self.0
+        }
+    }
+
+    fn handle(decision: ApprovalDecision) -> ApprovalHandle {
+        ApprovalHandle::new(
+            Arc::new(FixedGate(decision)),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            Some("use-1".into()),
+        )
+    }
+
+    fn user() -> User {
+        User {
+            id: "u".into(),
+            name: None,
+            channel: baybo_model::ChannelType::tui(),
+        }
+    }
+
+    #[tokio::test]
+    async fn records_last_decision_shared_across_clones() {
+        let h = handle(ApprovalDecision::Deny);
+        let probe = h.clone();
+        assert_eq!(probe.last_decision(), None);
+        let d = h
+            .request(
+                "Bash",
+                &"s".into(),
+                &user(),
+                vec![ResourceAccess::ExecCommand {
+                    command: "x".into(),
+                }],
+                "{}".into(),
+            )
+            .await;
+        assert_eq!(d, ApprovalDecision::Deny);
+        assert_eq!(probe.last_decision(), Some(ApprovalDecision::Deny));
+    }
+
+    #[tokio::test]
+    async fn cache_short_circuit_records_nothing() {
+        let h = handle(ApprovalDecision::Approve);
+        let probe = h.clone();
+        // ReadFile accesses are exempt from prompting, so the gate is never
+        // consulted and the short-circuit Approve must NOT be recorded as a
+        // prompted decision.
+        let d = h
+            .request(
+                "Read",
+                &"s".into(),
+                &user(),
+                vec![ResourceAccess::ReadFile {
+                    path: std::path::PathBuf::from("/tmp/x"),
+                }],
+                "{}".into(),
+            )
+            .await;
+        assert_eq!(d, ApprovalDecision::Approve);
+        assert_eq!(probe.last_decision(), None, "no prompt raised, no record");
+    }
+
+    #[tokio::test]
+    async fn request_uncached_records_too() {
+        let h = handle(ApprovalDecision::ApproveAlways);
+        let _ = h
+            .request_uncached(
+                "Bash",
+                &"s".into(),
+                &user(),
+                vec![ResourceAccess::ExecCommand {
+                    command: "x".into(),
+                }],
+                "{}".into(),
+            )
+            .await;
+        assert_eq!(h.last_decision(), Some(ApprovalDecision::ApproveAlways));
     }
 }

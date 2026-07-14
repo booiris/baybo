@@ -1,9 +1,9 @@
 # Mid-Turn User Interjection (Steering)
 
 **Status:** ✅ Shipped (branch `user_msg_insert`, 2026-05-25), later extended by
-the web interjection queue + atomic batching (#126/#127). The runtime mechanism
-is documented in [`docs/modules/agent.md`](modules/agent.md) (scheduling
-section); this doc keeps the **design rationale** — why the forks below were
+the web interjection queue + atomic batching (#126). The runtime mechanism
+is documented in [`docs/modules/agent.md`](modules/agent.md) (the "Long-running
+model" section); this doc keeps the **design rationale** — why the forks below were
 settled the way they are — plus the known limitation. Blow-by-blow
 review/hardening history lives in PR #35 and the git log.
 
@@ -60,13 +60,13 @@ turn ends once the user stops sending and the model returns a no-tool `Final`.
 | **Batching** | Drain the whole leading non-slash run; each stays its own faithful row; wrapped together under one wire envelope. |
 | **Turn scope** | `UserChat` turns only, gated structurally by which handlers pass the source. Only `handle_merged_user_turn` drains — every non-slash user message routes there (a single message is a batch of one); `handle_user_input` (slash `/skill` turns) and cron/spawned/notification pass `None`. A message during a `SubagentNotification` turn stays queued (avoids that turn's in-memory rollback desyncing already-persisted rows). |
 | **Budget** | `max_iterations` is **not** extended by an injection. The `UserInterjection` row is charged its **framed** wire size via `ContextManager::message_budget_tokens` — used by the live append **and** the `restore_messages` / compaction rebuild paths — so the compression gate never under-counts the envelope the request actually carries. |
-| **Provenance / observability** | No new/mutated job and **no `SpanEventKind` variant** (that enum is ts-rs-exported + rendered in the web trace UI — disproportionate for a greppability marker). Durable record = the persisted rows + their capture in the next `LlmCall` span input; the drain also logs `tracing::info!(interjections = N, …)`. |
+| **Provenance / observability** | No new/mutated job and **no `SpanEventKind` variant** (that enum is hand-mirrored in `app/web/src/types/trace.ts` + rendered in the web trace UI — disproportionate for a greppability marker). Durable record = the persisted rows + their capture in the next `LlmCall` span input; the drain also logs `tracing::info!(interjections = N, …)`. |
 | **Rollout / ack** | Always on, no config knob (safe fallback: unhit messages defer to the next turn). Silent ack — the eventual reply acknowledges it per the framing; the user already sees their sent message echoed in the channel. |
 
 ## Key correctness properties
 - `from_user()` is the **render-as-bubble** predicate (broadened to include `UserInterjection`); exact `source == User` is the **slash-detection** predicate (left exact — interjections are never slashes). The web `TraceSessionPage` mirrors this: its `source === 'user'` genuine-prompt check stays exact.
 - Drained-and-persisted interjections survive turn cancel/error: once popped from the mailbox **and** appended to the transcript they live in context regardless of the turn outcome and surface next turn — never re-drained, never duplicated.
-- On a user session the `Trigger`-priority mailbox messages the drain faces are `UserInput` and `UserInputBatch` (#126) — the latter the web's "send all queued at once" atomic batch coalesced into one message (cron mints a fresh one-shot session; subagent-spawn / background-compression go to child sessions). The pop predicate is shared (`is_coalescable_user_input`, which accepts both kinds) between the coalescer and the drain so the barrier invariant can't drift; the slash/non-slash distinction is the only branch within it.
+- On a user session the `Trigger`-priority mailbox messages the drain faces are `UserInput`, `UserInputBatch` (#126) — the latter the web's "send all queued at once" atomic batch coalesced into one message — and `SetModel` (a mid-turn model switch; non-injectable, so it parks at the barrier like a queued slash). Cron mints a fresh one-shot session; subagent-spawn / background-compression go to child sessions. The pop predicate is shared (`is_coalescable_user_input`) between the coalescer and the drain so the barrier invariant can't drift; it accepts only single non-slash `UserInput`s — a queued `UserInputBatch` is deliberately **not** injected mid-turn (it stays queued and runs as its own next turn) and is only swept together with the leading run by `discard_pending` after a `/stop`.
 - Mailbox messages were already run through `SecurityGateway::sanitize_input` at Router ingress — no re-sanitization at drain time.
 - `try_recv_if`'s predicate runs under the queue lock — it must be a pure inspection and must not re-enter the mailbox.
 
@@ -96,6 +96,6 @@ has_pending_input`) is the ready-made fix if this proves undesirable.
 - `crates/agent/src/runtime/agent_loop.rs` — `run_inner` loop, `InterjectionSource`, `drain_user_interjections`
 - `crates/model/src/message.rs` — `MessageSource`, `from_user()`, `ChatMessage::user_interjection`
 - `crates/context/src/lib.rs` + `crates/context/src/prompts/interjection.rs` — `frame_interjections`, `message_budget_tokens`, `wrap_interjections`
-- `crates/storage/src/libsql/session.rs` — `rehydrate_message` source round-trip
+- `crates/storage/src/sqlite/session.rs` — `rehydrate_message` source round-trip
 - `app/web/src/components/trace/MessageList.tsx`, `app/web/src/pages/TraceSessionPage.tsx` — trace-UI markers
 - `docs/modules/agent.md` — canonical scheduling invariants

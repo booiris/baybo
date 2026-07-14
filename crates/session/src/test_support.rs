@@ -16,12 +16,12 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
 use baybo_store::StorageError;
-use baybo_store::session::{Result, SessionStore, StoredMessage};
+use baybo_store::session::{Result, SessionMessageAppendOutcome, SessionStore, StoredMessage};
 use baybo_store::session_folder::{SessionFolderRow, SessionFolderStore};
 use baybo_store::session_summary::{SessionSummaryRow, SessionSummaryStore};
 
 /// One stored row in the in-memory session transcript log — mirrors
-/// the libsql layout closely enough that `apply_session_compaction`
+/// the sqlite layout closely enough that `apply_session_compaction`
 /// can supersede rows the same way the real backend does.
 #[derive(Clone)]
 struct StoredMessageRow {
@@ -29,11 +29,12 @@ struct StoredMessageRow {
     message: ChatMessage,
     superseded_by: Option<u64>,
     created_at: DateTime<Utc>,
+    source_event_id: Option<String>,
 }
 
 /// In-memory `SessionStore` for tests across the workspace. Lineage
 /// columns are stubbed (`list_lineage_children` returns empty) — tests
-/// that need that surface should use the real libsql store via
+/// that need that surface should use the real sqlite store via
 /// `baybo_storage::Store::open` against a tempfile.
 #[derive(Default)]
 pub struct MemorySessionStore {
@@ -41,11 +42,22 @@ pub struct MemorySessionStore {
     transcripts: Mutex<HashMap<SessionId, Vec<StoredMessageRow>>>,
     control_events: Mutex<HashMap<SessionId, Vec<ControlEvent>>>,
     read_cursors: Mutex<HashMap<SessionId, i64>>,
+    /// Fault injection: when set, every `append_session_message` fails. Lets a
+    /// test drive the paths that must treat an unpersisted row as a failed
+    /// write rather than a silent success — a transcript append is the one
+    /// store call several delivery guarantees rest on.
+    fail_appends: std::sync::atomic::AtomicBool,
 }
 
 impl MemorySessionStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Make every subsequent transcript append fail.
+    pub fn fail_appends(&self, fail: bool) {
+        self.fail_appends
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Synchronously seed a session row so consumers (`SessionStore::get`,
@@ -74,6 +86,7 @@ impl SessionStore for MemorySessionStore {
         if let Some(existing) = data.get(&session.id) {
             to_store.hidden = existing.hidden;
             to_store.pinned = existing.pinned;
+            to_store.archived = existing.archived;
             to_store.folder_id = existing.folder_id.clone();
             to_store.title = existing.title.clone();
             to_store.state.agent_id = existing.state.agent_id.clone();
@@ -99,6 +112,17 @@ impl SessionStore for MemorySessionStore {
         match data.get_mut(session_id) {
             Some(s) => {
                 s.pinned = pinned;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn set_archived(&self, session_id: &SessionId, archived: bool) -> Result<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) => {
+                s.archived = archived;
                 Ok(true)
             }
             None => Ok(false),
@@ -203,6 +227,11 @@ impl SessionStore for MemorySessionStore {
         session_id: &SessionId,
         message: &ChatMessage,
     ) -> Result<i64> {
+        if self.fail_appends.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(StorageError::Internal(anyhow::anyhow!(
+                "injected transcript append failure"
+            )));
+        }
         let mut guard = self.transcripts.lock();
         let log = guard.entry(session_id.clone()).or_default();
         let ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
@@ -211,10 +240,81 @@ impl SessionStore for MemorySessionStore {
             message: message.clone(),
             superseded_by: None,
             created_at: Utc::now(),
+            source_event_id: None,
         });
         i64::try_from(ordinal).map_err(|_| {
             StorageError::Internal(anyhow::anyhow!("ordinal {ordinal} exceeds i64::MAX"))
         })
+    }
+
+    async fn append_session_message_idempotent(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+        message: &ChatMessage,
+    ) -> Result<SessionMessageAppendOutcome> {
+        if source_event_id.is_empty() {
+            return Err(StorageError::Storage(
+                "source_event_id must not be empty".to_string(),
+            ));
+        }
+        if self.fail_appends.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(StorageError::Internal(anyhow::anyhow!(
+                "injected transcript append failure"
+            )));
+        }
+
+        let mut guard = self.transcripts.lock();
+        let log = guard.entry(session_id.clone()).or_default();
+        if let Some(existing) = log
+            .iter()
+            .find(|row| row.source_event_id.as_deref() == Some(source_event_id))
+        {
+            let ordinal = i64::try_from(existing.ordinal).map_err(|_| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "ordinal {} exceeds i64::MAX",
+                    existing.ordinal
+                ))
+            })?;
+            return Ok(SessionMessageAppendOutcome::Existing { ordinal });
+        }
+
+        let ordinal = log.last().map(|row| row.ordinal + 1).unwrap_or(0);
+        let stored_ordinal = i64::try_from(ordinal).map_err(|_| {
+            StorageError::Internal(anyhow::anyhow!("ordinal {ordinal} exceeds i64::MAX"))
+        })?;
+        log.push(StoredMessageRow {
+            ordinal,
+            message: message.clone(),
+            superseded_by: None,
+            created_at: Utc::now(),
+            source_event_id: Some(source_event_id.to_string()),
+        });
+        Ok(SessionMessageAppendOutcome::Inserted {
+            ordinal: stored_ordinal,
+        })
+    }
+
+    async fn find_message_ordinal_by_source_event_id(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+    ) -> Result<Option<i64>> {
+        self.transcripts
+            .lock()
+            .get(session_id)
+            .and_then(|log| {
+                log.iter()
+                    .find(|row| row.source_event_id.as_deref() == Some(source_event_id))
+                    .map(|row| row.ordinal)
+            })
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|error| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "source-event ordinal exceeds i64::MAX: {error}"
+                ))
+            })
     }
 
     async fn append_control_event(
@@ -267,6 +367,7 @@ impl SessionStore for MemorySessionStore {
                 message: msg.clone(),
                 superseded_by: None,
                 created_at: stamp,
+                source_event_id: None,
             });
         }
         Ok(())
@@ -453,7 +554,7 @@ impl SessionStore for MemorySessionStore {
 }
 
 /// In-memory `SessionSummaryStore` for tests across the workspace.
-/// Mirrors the libsql backend's behaviour for the trait surface
+/// Mirrors the sqlite backend's behaviour for the trait surface
 /// (`upsert_success` resets `error_count`, `bump_error_count` inserts
 /// a zero row when missing) so unit tests can assert against the same
 /// invariants production exercises.
@@ -546,7 +647,7 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
 /// `delete` promotes sub-folders and removes the row but cannot reach a
 /// sibling `SessionStore` to null member sessions (it returns an empty
 /// affected list). Tests asserting the session-nulling side of dissolve
-/// should use the real libsql store via a tempfile.
+/// should use the real sqlite store via a tempfile.
 #[derive(Default)]
 pub struct MemorySessionFolderStore {
     rows: Mutex<HashMap<FolderId, SessionFolderRow>>,
@@ -636,5 +737,56 @@ impl SessionFolderStore for MemorySessionFolderStore {
         }
         rows.remove(id);
         Ok(Some(Vec::new()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use baybo_model::{SessionState, TriggerSource, User};
+
+    fn make_session(id: &str) -> Session {
+        let id = SessionId::from(id);
+        Session {
+            id: id.clone(),
+            user: User {
+                id: "u1".to_string(),
+                name: None,
+                channel: ChannelType::tui(),
+            },
+            channel: ChannelType::tui(),
+            created_at: Utc::now(),
+            last_active: Utc::now(),
+            state: SessionState::default(),
+            root_session_id: id,
+            trigger: TriggerSource::User,
+            lineage: None,
+            hidden: false,
+            pinned: false,
+            archived: false,
+            folder_id: None,
+            title: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn save_preserves_flat_columns_like_sqlite() {
+        // The fake must mirror the sqlite upsert, whose DO UPDATE omits
+        // the flat columns owned by the targeted setters — a stale
+        // in-memory re-save must not un-hide, un-pin, or un-archive.
+        let store = MemorySessionStore::new();
+        let s = make_session("preserve-me");
+        store.save(&s).await.unwrap();
+        assert!(store.set_hidden(&s.id, true).await.unwrap());
+        assert!(store.set_pinned(&s.id, true).await.unwrap());
+        assert!(store.set_archived(&s.id, true).await.unwrap());
+
+        // Re-save the stale copy (all flags still false).
+        store.save(&s).await.unwrap();
+
+        let loaded = store.get(&s.id).await.unwrap().expect("row present");
+        assert!(loaded.hidden, "save must preserve hidden");
+        assert!(loaded.pinned, "save must preserve pinned");
+        assert!(loaded.archived, "save must preserve archived");
     }
 }

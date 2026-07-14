@@ -39,7 +39,7 @@ Every sweep swallows its own errors (`tracing::warn!` then continue) so one bad 
 
 ## Constraints
 
-- Internal deps: `baybo-store` (the `ChannelPairingStore` trait for the pairing purge), `baybo-workspace` (path resolution), `baybo-model`. It depends on the `baybo-store` **ports** crate, not `baybo-storage`.
+- Internal deps: `baybo-store` (the `ChannelPairingStore` trait for the pairing purge) and `baybo-workspace` (path resolution). It depends on the `baybo-store` **ports** crate, not `baybo-storage`.
 - Both DB-touching and sidecar sweeps are opt-in: without `with_pairing_store` the pairing sweep is skipped; without `with_sidecar_cache` the sidecar sweep is a no-op.
 
 ## Collaboration
@@ -47,6 +47,6 @@ Every sweep swallows its own errors (`tracing::warn!` then continue) so one bad 
 | Module | Role |
 |--------|------|
 | `gateway` | `crates/baybo/src/gateway_cmd.rs` constructs the `Janitor`, wires `with_pairing_store(graph.stores.channel_pairing)` and (when sidecars are active) `with_sidecar_cache`, and spawns `run` against the gateway shutdown signal. |
-| `storage` | `LibsqlChannelPairingStore::purge_expired` issues the `DELETE FROM channel_pairings` the pairing sweep drives |
+| `storage` | `SqliteChannelPairingStore::purge_expired` issues the `DELETE FROM channel_pairings` the pairing sweep drives |
 | `pairing` | Owns the `channel_pairings` rows the sweep reaps; `baybo-janitor` is the cadence that enforces their retention |
-| `workspace` | `WorkspacePaths` resolves `sessions_log_dir` / `logs_dir` / `channel_logs_dir` and the sidecar cache root |
+| `workspace` | `WorkspacePaths` resolves `logs_dir` / `channel_logs_dir`; the sidecar cache root descends from `baybo_workspace::paths::baybo_cache_root()` and reaches the janitor via the gateway's `SidecarRuntime::sidecars_cache_root()` / `live_dir_names()` |

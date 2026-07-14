@@ -75,12 +75,27 @@ struct ChatScreen: View {
             .animation(.easeOut(duration: 0.16), value: bridge.jumpVisible)
         }
         .background(Theme.paper)
+        .sheet(item: $store.filePreview) { preview in
+            FilePreviewSheet(url: preview.url) { store.filePreview = nil }
+        }
+        .sheet(item: $store.fileShare) { share in
+            ShareSheet(url: share.url)
+        }
+        .fullScreenCover(item: $store.viewedImage) { viewed in
+            ImageViewer(image: viewed.image, url: viewed.url) { store.viewedImage = nil }
+        }
+        .fullScreenCover(item: $store.videoPlayback) { playback in
+            VideoPlayerScreen(url: playback.url)
+        }
         .onAppear {
             host.bridge.retarget(to: store)
             store.connectIfNeeded()
             SessionIndex.shared.enterSession(store.sessionId)
             #if DEBUG
                 store.startDemoFramesIfRequested()
+                store.startDemoAttachmentsIfRequested()
+                store.startDemoImagesIfRequested()
+                store.startDemoApprovalIfRequested()
                 store.startDemoSwitchIfRequested()
                 bridge.startDemoJumpIfRequested()
                 startDemoBackIfRequested()
@@ -116,7 +131,8 @@ struct ChatHeaderView: View {
     let onBack: () -> Void
 
     private static let veilPeakAlpha = 0.8
-    private static let barHeight: CGFloat = 46
+    /// Shared with `ArchivedScreen`, which reuses this header grammar.
+    static let barHeight: CGFloat = 46
     /// Solid → clear smoothstep the veil fades through, below its solid
     /// status-bar zone (the composer veil's grammar, mirrored to the top).
     private static let rampAlphas: [Double] = [1.0, 0.9, 0.65, 0.35, 0.1, 0.0]

@@ -35,6 +35,11 @@ log = { workspace = true }
 parking_lot = { workspace = true }
 uniffi = { workspace = true }
 
+[dev-dependencies]
+# `start_paused` — the pooled leg's first-byte budget is 4s of wall clock, and a
+# test has no business sleeping through it.
+tokio = { workspace = true, features = ["test-util"] }
+
 [target.'cfg(target_os = "ios")'.dependencies]
 core-foundation = { workspace = true }
 core-foundation-sys = { workspace = true }

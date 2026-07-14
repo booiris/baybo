@@ -5,7 +5,10 @@ import SwiftUI
 /// in-field send. Interaction contract preserved from the web composer:
 /// * staged picks count as a draft, so an attachment-only send works with an
 ///   empty field;
-/// * send is gated while any staged item is uploading (`waitingUpload` notice);
+/// * send is gated while any staged item is uploading (`waitingUpload` notice),
+///   and blocked outright while one FAILED to upload (`removeFailedAttachment`)
+///   — it carries no blob, and shipping the message without it would drop the
+///   user's image in silence;
 /// * picks over 100 MiB are rejected up front (`tooLarge`), matching the
 ///   gateway's blob cap.
 struct ComposerView: View {
@@ -41,6 +44,21 @@ struct ComposerView: View {
                 .padding(.horizontal, 18)
             }
 
+            // A blocked tool call outranks everything else in the dock: it is
+            // the only thing the user can act on, and an unanswered gate denies
+            // itself after 5 minutes.
+            if let approval = store.pendingApprovals.first {
+                ApprovalCardView(
+                    approval: approval,
+                    queued: store.pendingApprovals.count - 1
+                ) { decision in
+                    store.resolveApproval(approval, decision: decision)
+                }
+                // Re-key on the prompt so answering the head SWAPS in the next
+                // card (fresh one-shot latch) instead of reusing this view.
+                .id(approval.callId)
+            }
+
             if !staged.isEmpty {
                 stagedStrip
             }
@@ -74,20 +92,34 @@ struct ComposerView: View {
                             }
                     }
 
+                // While a turn runs the button is a stop control (cancel via
+                // `/stop`), independent of the field: typing can't turn it back
+                // into a send button mid-turn (interjection is future work). Idle,
+                // it's the send button, enabled only with a draft.
                 Button {
-                    send()
+                    if store.agentRunning {
+                        store.stopAgent()
+                    } else {
+                        send()
+                    }
                 } label: {
                     Circle()
-                        .fill(hasDraft ? Theme.ink : Theme.line)
+                        .fill(store.agentRunning || hasDraft ? Theme.ink : Theme.line)
                         .frame(width: 36, height: 36)
                         .overlay(
-                            Image(systemName: "arrow.up")
-                                .font(.system(size: 15, weight: .semibold))
+                            // A filled square is the "stop generating" affordance
+                            // (ChatGPT-style); the up arrow is send. One Image so
+                            // the glyph morphs between the two states.
+                            Image(systemName: store.agentRunning ? "stop.fill" : "arrow.up")
+                                .font(.system(size: store.agentRunning ? 13 : 15, weight: .semibold))
                                 .foregroundStyle(Theme.paper)
+                                .contentTransition(.symbolEffect(.replace))
                         )
+                        .animation(.easeInOut(duration: 0.2), value: store.agentRunning)
                 }
-                .disabled(!hasDraft)
-                .accessibilityLabel(Text(verbatim: Lang.shared.t("chat.send")))
+                .disabled(!store.agentRunning && !hasDraft)
+                .accessibilityLabel(
+                    Text(verbatim: Lang.shared.t(store.agentRunning ? "chat.stop" : "chat.send")))
                 .padding(.trailing, 6)
                 .padding(.bottom, 6)
             }
@@ -107,6 +139,7 @@ struct ComposerView: View {
         }
         .padding(.top, 0)
         .padding(.bottom, dockBottomPadding)
+        .animation(.easeOut(duration: 0.2), value: store.pendingApprovals.first?.callId)
         .background { composerVeil }
         .onChange(of: pickerItem) { _, item in
             guard let item else { return }
@@ -255,6 +288,14 @@ struct ComposerView: View {
             store.notice = Lang.shared.t("chat.waitingUpload")
             return
         }
+        // A pick whose upload failed has no blob to reference, so it can't ride
+        // the send — and dropping it silently ships the message MINUS the image
+        // the user attached, with nothing to say so. Block on it instead: the
+        // thumbnail's ✕ is right there.
+        if staged.contains(where: { $0.state.isError }) {
+            store.notice = Lang.shared.t("chat.removeFailedAttachment")
+            return
+        }
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let refs: [AttachmentRef] = staged.compactMap { item in
             guard case .ready(let blobId, let mime) = item.state else { return nil }
@@ -264,23 +305,49 @@ struct ComposerView: View {
         }
         guard !body.isEmpty || !refs.isEmpty else { return }
         // Guard the write: an unconditional `store.notice = nil` publishes an
-        // objectWillChange every send even when already nil, forcing a
-        // ComposerView recompute in the same beat as the field reset — extra
-        // transaction churn in exactly the window the deferred clear dodges.
+        // objectWillChange every send even when already nil, forcing a needless
+        // ComposerView recompute in the same beat as the field reset.
         if store.notice != nil {
             store.notice = nil
         }
         store.send(text: body, attachments: refs)
         staged.removeAll()
-        // The multiline TextField(axis:) stays first responder through send, so
-        // a synchronous `text = ""` here can land inside the field's own
-        // in-flight edit transaction and be dropped — leftover glyphs, widened
-        // by a CJK IME's extra commit/predictive churn. Defer to the next
-        // runloop so the reset lands in a clean transaction after the edit
-        // commits.
-        DispatchQueue.main.async {
-            text = ""
+        clearField()
+    }
+
+    /// Clear the field deterministically, INCLUDING a live CJK IME composition.
+    /// The composing syllables (underlined marked text / inline candidates) live
+    /// in the focused text view's marked range — the UIKit input session — NOT
+    /// in the `text` binding, so a plain `text = ""` (sync or deferred) leaves
+    /// them to re-commit on the next input turn and re-materialize after send
+    /// (the intermittent "字没消失", worst under pinyin). Reach the focused input
+    /// over the responder chain, `unmarkText()` to finalize+drop the composition
+    /// FIRST (it commits, so ordering matters), then empty the document
+    /// imperatively so the reset can't lose a race with the field's own edit
+    /// up-sync; mirror `text` so `hasDraft`/send-gating stay in lockstep. No
+    /// responder is resigned — the keyboard stays up.
+    private func clearField() {
+        if let input = Self.focusedTextInput() {
+            input.unmarkText()
+            if let range = input.textRange(
+                from: input.beginningOfDocument, to: input.endOfDocument)
+            {
+                input.replace(range, withText: "")
+            }
         }
+        text = ""
+    }
+
+    /// The current first responder if it is a text input, found via the
+    /// responder chain (`sendAction(to: nil)` targets the first responder).
+    /// Keyed on the `UITextInput` PROTOCOL, never a concrete UITextView class,
+    /// so it survives SwiftUI's private multiline-field backing across iOS
+    /// versions.
+    private static func focusedTextInput() -> UITextInput? {
+        FirstResponderCapture.found = nil
+        UIApplication.shared.sendAction(
+            #selector(UIResponder.baybo_captureFirstResponder), to: nil, from: nil, for: nil)
+        return FirstResponderCapture.found as? UITextInput
     }
 
     private static func sniffMime(_ data: Data) -> String {
@@ -316,4 +383,17 @@ struct StagedAttachment: Identifiable {
     let thumbnail: UIImage
     let byteCount: Int
     var state: State = .uploading
+}
+
+/// One-shot sink for the responder-chain first-responder probe below.
+private enum FirstResponderCapture {
+    static weak var found: UIResponder?
+}
+
+extension UIResponder {
+    /// Action target for `sendAction(to: nil)`: only the current first
+    /// responder receives it, so it records itself for `focusedTextInput()`.
+    @objc fileprivate func baybo_captureFirstResponder() {
+        FirstResponderCapture.found = self
+    }
 }

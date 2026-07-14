@@ -22,7 +22,7 @@ use baybo_channels::{
 };
 use baybo_config::ChannelsConfig;
 use baybo_model::{ChannelType, SessionId};
-use baybo_tools::{ApprovalGate, ApprovalQueue, ChannelApprovalGate};
+use baybo_tools::{ApprovalGate, ApprovalQueue, ApprovalRequest, ChannelApprovalGate};
 
 use super::session_pulse::SessionPulse;
 
@@ -112,22 +112,25 @@ pub(crate) fn install_channel(
 /// an `Arc<Channel>` ready to install.
 pub(crate) fn build_channel(channel_type: ChannelType, kind: ChannelKind) -> Arc<Channel> {
     let queue = ApprovalQueue::new();
-    let queue_for_waker = queue.clone();
     // The gate's waker needs access to the channel for fan-out, but
     // the channel hasn't been constructed yet. Hand the closure a
     // `Weak<Channel>` slot we patch in once the Arc exists.
     let weak_slot: Arc<parking_lot::Mutex<std::sync::Weak<Channel>>> =
         Arc::new(parking_lot::Mutex::new(std::sync::Weak::new()));
     let weak_for_waker = Arc::clone(&weak_slot);
-    let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+    // Broadcast the entry the gate woke us FOR. Reading it back off the queue
+    // instead (say, the tail) is a lost-prompt race: the queue is per-CHANNEL,
+    // so two sessions blocking at once interleave push/wake and one of them
+    // would be announced twice while the other was never announced at all —
+    // and nothing re-announces it, so that turn silently denies itself when the
+    // gate times out.
+    let waker: Arc<dyn Fn(ApprovalRequest) + Send + Sync> = Arc::new(move |entry| {
         let Some(channel) = weak_for_waker.lock().upgrade() else {
-            return;
-        };
-        let Some(entry) = queue_for_waker.list().into_iter().next_back() else {
             return;
         };
         channel.dispatch_approval_requested(
             entry.call_id,
+            entry.tool_call_id,
             entry.session_id,
             entry.user_id,
             entry.tool,

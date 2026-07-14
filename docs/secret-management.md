@@ -22,7 +22,7 @@ plaintext**. The agent only ever passes secret **names**.
 Surfaces:
 
 - **CLI** (human, local terminal): `baybo secret add | list | delete`.
-- **Agent tools**: `secret_add`, `secret_list`, `secret_check` (no `secret_delete`).
+- **Agent tools**: `SecretAdd`, `SecretList`, `SecretCheck` (no `SecretDelete`).
 - **Bash tool**: a new `secret_env: string[]` parameter — the named secrets are
   resolved from the vault and injected into the child process env for that one
   command, then scrubbed back out of stdout/stderr.
@@ -65,7 +65,7 @@ call-site to keep consistent with the vault, for no real isolation win).
 | Piece | Home | Why |
 |---|---|---|
 | `UserSecretManager`, `USER_SECRET_PREFIX` | `baybo-security` | next to `SecretVault`; reachable by `baybo-tools` (dep already exists) |
-| `secret_add` / `secret_list` / `secret_check` | `baybo-tools/builtin/secret.rs` | alongside `BashTool`; `Tool` impls cannot live in `baybo-security` (would close an `baybo-tools ↔ baybo-security` cycle) |
+| `SecretAdd` / `SecretList` / `SecretCheck` | `baybo-tools/builtin/secret.rs` | alongside `BashTool`; `Tool` impls cannot live in `baybo-security` (would close an `baybo-tools ↔ baybo-security` cycle) |
 | Bash change | `baybo-tools/builtin/bash/mod.rs` | — |
 | CLI `secret` family | `crates/cli/src/commands/secret.rs` | — |
 | `SecretAccess` impl | `crates/agent` | only crate that sees both the trait (`baybo-tools`) and the manager (`baybo-security`) |
@@ -116,13 +116,13 @@ spawn_command(&self, program: &Path, args: &[String], opts: SpawnOpts) -> Result
 // SpawnOpts { cwd: Option<PathBuf>, stdin: Option<Vec<u8>>, extra_env: Vec<(String,String)>, timeout: Duration }
 ```
 
-`SandboxAdapter` merges `extra_env` into `SandboxSpec` **after** the
-baseline/allowlist resolution (orthogonal to `EnvPolicy`, which stays
-`Baseline`/`Allowlist`) → `bwrap --setenv K V`, macOS env args; the unsandboxed
-paths use `Command::env(k, v)`. Inject on **all** spawn paths (sandboxed,
-baybo-CLI bypass, bwrap-failed retry) — each is the user's authorized command.
-Secrets never enter the command string (kept separate from the `uv_env_prefix`
-string prefix), so they never reach params/trace/logs.
+`SandboxAdapter` carries `extra_env` into `SandboxSpec` as a new
+`EnvPolicy::BaselineWithExtra { extra }` variant (baseline env plus explicit
+pairs never sourced from the parent) → `bwrap --setenv K V`, macOS env args; the
+unsandboxed paths use `Command::env(k, v)`. Inject on **all** spawn paths
+(sandboxed, baybo-CLI bypass, bwrap-failed retry) — each is the user's
+authorized command. Secrets never enter the command string (kept separate from
+the `uv_env_prefix` string prefix), so they never reach params/trace/logs.
 
 *Rejected:* adding a bare `extra_env` param (positional sprawl) or a second
 `spawn_command_with_env` method (duplicated impl bodies, drift). The struct is a
@@ -146,19 +146,20 @@ output.
 The sandbox gates filesystem/network but **not** credentials, yet we do **not**
 add an approval prompt for secret injection: the user already chose to store the
 secret and the agent only names it. `BashTool::accessed_resources` is unchanged
-(still only destructive commands prompt). When `secret_env` is used, the tool
-emits an audit event via `ctx.events` recording the secret **names** (never
-values); the existing event-drain (`tools.md` event sink → `SpanEventKind::
-ToolEvent`) already runs payloads through `sanitize_stream_fragment`.
+(approval prompting is governed by `BashPermissionMode`, not by `secret_env`).
+When `secret_env` is used, the tool emits an audit event via `ctx.events`
+recording the secret **names** (never values); the existing event-drain
+(`tools.md` event sink → `SpanEventKind::ToolEvent`) already runs payloads
+through `sanitize_stream_fragment`.
 
 *Considered & rejected:* gating via the existing `ResourceAccess::Env { vars }`
 variant (which already models "wants these env vars on the user's behalf,
 sensitive, per-session re-prompt"). Available if the posture is revisited, but
 the chosen default is frictionless.
 
-### D7 — `secret_add` tool: accept any value, reveal at boundary
+### D7 — `SecretAdd` tool: accept any value, reveal at boundary
 
-`secret_add(name, value, overwrite?)`. `value` flows through the existing
+`SecretAdd(name, value, overwrite?)`. `value` flows through the existing
 tool-argument reveal boundary (`security.md` §"Tool-argument reveal boundary"):
 
 - A **minted-placeholder** value (user pasted a token → `LeakDetector` minted it
@@ -172,37 +173,38 @@ tool-argument reveal boundary (`security.md` §"Tool-argument reveal boundary"):
 ### D8 — CLI/tool surface details
 
 - **`secret add`** (CLI): prompt name (plain line) → if it exists, confirm
-  overwrite (`[y/N]`; `--force`/`--yes` skips; non-interactive requires the flag)
+  overwrite (`[y/N]`; `--force` skips; non-interactive requires the flag)
   → prompt value **masked** (`*` per char, via `read_masked_password`). Reject
   empty values. Validate name `^[A-Za-z_][A-Za-z0-9_]*$`, reject invalid,
   preserve case (no auto-uppercase).
 - **`secret list`**: full `NAME` + masked value preview (first/last ~4 chars,
   middle masked, fully masked if short — requires decrypt, master key is
-  in-process). The agent's **`secret_list` returns names only** (no value
+  in-process). The agent's **`SecretList` returns names only** (no value
   fragments to the LLM/trace).
 - **`secret delete [NAME]`**: no-arg → interactive single-select picker
   (`select_one`) + confirm; `<NAME>` → direct + confirm (`--yes` skips; slash
-  mode requires `--yes`). **No `secret_delete` agent tool.**
-- **`secret_check(names: [])`**: returns per-name existence map
+  mode requires `--yes`). **No `SecretDelete` agent tool.**
+- **`SecretCheck(names: [])`**: returns per-name existence map
   (`{"FOO": true, "BAR": false}`); names/booleans only. Lets the agent verify
   several secrets before a bash run.
-- **`secret_add` overwrite**: errors "already exists" unless `overwrite: true`,
+- **`SecretAdd` overwrite**: errors "already exists" unless `overwrite: true`,
   so the agent cannot silently clobber a credential.
 
 ## Data flows
 
 - **Add (CLI):** name → existence/overwrite check → masked value → validate →
-  `UserSecretManager.put("user_env.<NAME>", value, overwrite)` →
-  `SecretVault` encrypts + persists. Plaintext never leaves the local process.
-- **Add (tool):** agent calls `secret_add(name, <placeholder>)` → reveal boundary
+  `UserSecretManager.add("<NAME>", value, overwrite)` (the `user_env.` prefix is
+  applied inside the manager) → `SecretVault` encrypts + persists. Plaintext
+  never leaves the local process.
+- **Add (tool):** agent calls `SecretAdd(name, <placeholder>)` → reveal boundary
   turns placeholder → plaintext → `ctx.secrets.add(...)`. Trace sees placeholder.
 - **Bash run:** agent calls bash with `secret_env: ["FOO"]` →
   `ctx.secrets.resolve_env` → `[("FOO", val)]` → audit event (names) →
   `spawn_command(.., SpawnOpts { extra_env, .. })` → child sees `FOO=val` →
   capture → `ctx.secrets.redact(out, [val])` → return scrubbed → executor regex
   sanitize (defense-in-depth).
-- **List / Check / Delete:** `UserSecretManager.list_names` (+per-entry decrypt
-  for CLI preview) / `.exists` / `.delete`.
+- **List / Check / Delete:** `UserSecretManager.list` / `.list_with_previews`
+  (per-entry decrypt for the CLI preview) / `.exists_many` / `.delete`.
 
 ## Security notes
 

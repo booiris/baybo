@@ -625,6 +625,7 @@ async fn send_subscribe_state(state: &WsChannelState, sidecar: &Sidecar, session
         .into_iter()
         .map(|req| ApprovalCard {
             call_id: req.call_id,
+            tool_call_id: req.tool_call_id,
             user_id: req.user_id,
             tool: req.tool,
             accesses: req.accesses,
@@ -878,15 +879,19 @@ fn wire_to_content_blocks(content: String, attachments: Vec<WireAttachment>) -> 
             AttachmentKind::Image => ContentBlock::Image {
                 blob,
                 mime_type: att.mime_type,
+                filename: att.filename,
             },
             AttachmentKind::Audio => ContentBlock::Audio {
                 blob,
                 mime_type: att.mime_type,
+                filename: att.filename,
+                duration_ms: att.duration_ms,
             },
             AttachmentKind::File => ContentBlock::File {
                 blob,
                 filename: att.filename.unwrap_or_default(),
                 mime_type: att.mime_type,
+                duration_ms: att.duration_ms,
             },
         });
     }
@@ -905,6 +910,7 @@ mod tests {
             mime_type: mime.into(),
             size: 7,
             filename: filename.map(str::to_owned),
+            duration_ms: None,
         }
     }
 

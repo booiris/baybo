@@ -142,11 +142,11 @@ The vault-token scheme is a **workspace-binding** credential, *not*
 a defence against a same-UID hostile process.
 
 *Designed to reject*
-- connections from a different Unix user — the libsql vault file is
+- connections from a different Unix user — the sqlite vault file is
   `0o600` and `<workspace>/state/channel.port` is also `0o600`, so another
   UID can't even locate the listener's port, let alone read the
   freshly-rotated TUI token;
-- cross-workspace mix-ups — every workspace has its own libsql
+- cross-workspace mix-ups — every workspace has its own sqlite
   database with its own (master-key-encrypted) `gateway.tui_token`
   row, so a TUI pointed at workspace B will never come up with the
   matching value for workspace A;
@@ -157,7 +157,7 @@ a defence against a same-UID hostile process.
 
 *Not designed to defend against*
 - a malicious process running as the same UID as the gateway. Such a
-  process can read the libsql file, recompute the master key (or
+  process can read the sqlite file, recompute the master key (or
   read the env var that holds it), decrypt the row, and present the
   same token. Treat "same-UID local adversary" as out of scope for
   this mechanism — the practical tools are file permissions on the
@@ -370,10 +370,10 @@ browser — `/v1/*` still enforces `require_admin_token`.
 
 ### WebUI — embedded React dashboard, no `rust-embed`
 
-The admin TCP listener doubles as a web frontend. Sources live at the
-repo root in `web/` (React 19 + TypeScript + Vite + Tailwind v4 +
+The admin TCP listener doubles as a web frontend. Sources live at
+`app/web/` (React 19 + TypeScript + Vite + Tailwind v4 +
 react-router, neo-brutalist style). `crates/gateway/build.rs` walks
-the relevant `web/` source inputs (`src/`, `index.html`,
+the relevant `app/web/` source inputs (`src/`, `index.html`,
 `package.json`, `tsconfig*.json`, `vite.config.ts`,
 `docs/openapi.json`, and the pnpm lock/workspace files). If those
 inputs changed since the last successful web build, it runs
@@ -433,7 +433,7 @@ slow, so for UI iteration run the two sides separately:
 cargo run -- gateway start
 
 # terminal 2 — Vite dev server with HMR on http://localhost:5173
-cd web && npm run dev
+cd app/web && npm run dev
 ```
 
 `app/web/vite.config.ts` proxies `/v1`, `/healthz`, and `/readyz` to
@@ -453,7 +453,7 @@ override the stored `baseUrl`.
 default      = ["linux", "macos"]
 linux        = []              # systemd installer — renders ~/.config/systemd/user/baybo-gateway.service
 macos        = []              # launchd installer — renders ~/Library/LaunchAgents/com.baybo.gateway.plist
-test-support = ["dep:tempfile"] # cross-crate test helpers (CLAUDE.md gating rule)
+test-support = ["baybo-llm/test-support"]  # cross-crate test helpers (CLAUDE.md gating rule)
 ```
 
 One feature per OS. Any future OS-specific gateway code (beyond the
@@ -504,14 +504,16 @@ restart loop can thrash the lock. The systemd unit also sets
 
 ## CLI Surface
 
-All commands live under `baybo gateway` and are also usable over slash
-mode once a channel exposes them (not wired yet; the `Gateway` arm
-returns `UnknownCommand` from the normal dispatcher because
-`crates/baybo/src/main.rs` intercepts it before dispatch).
+All commands live under `baybo gateway` and are shell-only by policy —
+`crates/cli/src/slash.rs` excludes `gateway` from the slash menu and
+`slash_admissible()` rejects it ("run it from a shell"), since it controls
+the server process. The `Gateway` arm also returns `UnknownCommand` from
+the normal dispatcher because `crates/baybo/src/main.rs` intercepts it
+before dispatch.
 
 | Subcommand                                | Effect                                                                                               | Mutating |
 | ----------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------- |
-| `start`                                   | Run the server in the foreground. Prints `http://<bind>/v1/status?token=<TOKEN>` quick URL.           | —        |
+| `start`                                   | Run the server in the foreground. Prints the dashboard URL (`http://<bind>`) and the admin token on separate lines — deliberately not a `?token=` URL, which would leak the token into the access log. | —        |
 | `install [--system] [--exec-start <p>]`   | Write the platform service unit. `--system` flips from user mode to root/system-wide.                 | yes      |
 | `enable`                                  | Mint the auth token if absent; best-effort enable the service for autostart.                          | yes      |
 | `disable`                                 | Mark the service as not autostarting at boot.                                                         | yes      |
@@ -547,6 +549,7 @@ POST   /v1/config/reload               re-read config; hot fields applied live �
 GET    /v1/jobs                         ?session=&status=&limit=&cursor=  (cursor pagination)
 GET    /v1/jobs/:id
 POST   /v1/jobs/:id/cancel
+GET    /v1/background-jobs              long-running background job list
 
 GET    /v1/cron
 POST   /v1/cron                         { schedule, user_id, channel?, text, timezone, origin_session_id? }
@@ -560,6 +563,13 @@ GET    /v1/traces/:session_id/jobs/:job_id   per-job step/span tree
 GET    /v1/skills
 GET    /v1/tools
 GET    /v1/channels                     read-only registry list
+
+GET    /v1/agents                       agent-profile list
+POST   /v1/agents                       create an agent profile
+GET    /v1/agents/:agent_id
+PUT    /v1/agents/:agent_id             edit an agent profile
+PUT    /v1/agents/:agent_id/avatar      set the profile's avatar
+DELETE /v1/agents/:agent_id
 
 GET    /v1/llm                          currently active provider/model
 GET    /v1/llm/models                   configured LLM entries + effective settings
@@ -575,10 +585,11 @@ GET    /v1/chat/sessions/:id/sync       ?since_ordinal=&limit=  the one forward-
 GET    /v1/chat/sessions/:id/messages   ?platform_msg_id=  per-send durability point lookup for the client outbox
 PUT    /v1/chat/sessions/:id/model      pin this session's LLM (re-pins live actor; null ⇒ default-llm)
 PUT    /v1/chat/sessions/:id/pin        pin/unpin (lifts to the sidebar's Pinned block)
+PUT    /v1/chat/sessions/:id/archive    archive/unarchive the session
+PUT    /v1/chat/sessions/:id/read       clear the unread badge
 PUT    /v1/chat/sessions/:id/folder     file into a folder (null ⇒ Uncategorized)
 DELETE /v1/chat/sessions/:id            hide (row preserved); 204
 POST   /v1/chat/sessions/:id/unhide     restore a hidden session
-GET    /v1/chat/cron-messages           cron-fire sessions with prompt/response previews
 GET    /v1/chat/slash-manifest          slash commands for the composer's /-autocomplete
 GET    /v1/chat/folders                 the conversation-folder tree
 POST   /v1/chat/folders                 create a folder
@@ -586,6 +597,10 @@ PATCH  /v1/chat/folders/:id             rename / reparent a folder
 POST   /v1/chat/folders/:id/move        move a folder under a new parent
 POST   /v1/chat/folders/reorder         reorder folders among siblings
 DELETE /v1/chat/folders/:id             delete (dissolves; member sessions ⇒ Uncategorized); 204
+
+GET    /v1/push/params                  the gateway's Ed25519 push verifying key (hex) to delegate over
+POST   /v1/push/register                register a direct-mode device push binding (device id + APNs token + push_key + delegation)
+POST   /v1/mobile/apns-token            store a device's APNs token
 
 GET    /v1/analytics                    aggregated tokens / cost / sessions over a time range
 GET    /v1/logs                         paged snapshot from LogBuffer
@@ -697,11 +712,16 @@ The full frame set (see `crates/wire/src/lib.rs`):
   echo of inbound to other subscribers out), `Messages { messages }` (a
   client → server **atomic batch** — the web "send all queued at once"
   path, coalesced into one turn), `AnswerDelta` (incremental answer text,
-  server → client), `Notice` (out-of-band warn/error), `Attachment
-  { session_id, user_id, attachments }` (mid-turn tool-emitted media).
+  server → client), `Notice` (out-of-band warn/error). Tool-emitted media
+  rides `Message.attachments` on the turn's terminal assistant reply — there
+  is no standalone attachment frame.
 - **Turn progress (server → client, live-update only):** `Reasoning`
   (incremental thinking), `ToolStarted` / `ToolCompleted` (tool-call
   lifecycle), `TaskList { items }` (the agent's live task-checklist),
+  `Status { session_id, user_id, phase }` (a coarse turn-phase transition
+  — today `"compacting"` / `"compacted"` for context compaction; clients
+  show a transient banner/spinner on the start edge and clear it on the
+  matching end, surfaces without one drop it),
   `TurnState { active, started_at? }` (is a turn in flight). Both edges
   are projected from the job store by `spawn_turn_state_projector`
   (subscribed to the job lifecycle bus, which carries the `start` edge
@@ -759,7 +779,9 @@ themselves. See [`tui.md`](./tui.md) and [`security.md`](./security.md).
 Config mutation endpoints (`PUT /v1/config`, `DELETE /v1/config`, `PUT
 /v1/llm/...`) write through to the same on-disk `baybo.json` that `baybo
 config set/unset` targets, then trigger an **in-process reload** via the
-shared `ConfigReloader` (`crates/baybo/src/reload.rs`, re-exported from `lib.rs`).
+shared `ConfigReloader` (trait in `crates/gateway/src/reload.rs`, re-exported
+from `baybo_gateway`'s lib.rs; the concrete `RuntimeConfigReloader` lives in
+`crates/baybo/src/reload.rs`).
 Hot-updatable fields take effect live; only a non-hot field forces a
 restart, surfaced as `requires_restart: true` (the reloader reports
 `ReloadError::NotHotReloadable`, which the handler maps to "true", not an
@@ -814,7 +836,7 @@ type, including the always-on `http` channel and the bundled TUI when
 `cli.enabled`); incoming `/v1/channel-ws` connections then `attach` to
 the channel for their type rather than installing it.
 
-`build_secret_vault` is a narrow helper that only opens the libsql
+`build_secret_vault` is a narrow helper that only opens the sqlite
 store far enough to construct a `SecretVault`. The TUI's remote boot
 uses it to read the gateway token without touching the workspace
 singleton lock; the vault-only `gateway token {show,rotate}`
@@ -836,8 +858,9 @@ subcommands use it for the same reason.
   a *workspace binding*, not a defence against same-UID hostile
   processes — see the threat-model note under "Channel auth" for the
   boundary.
-- **All gateway logs pass through `RedactingMakeWriter`** — the same
-  writer wrapper the TUI uses (`src/logging.rs`). `BAYBO_LOG_FORMAT=json`
+- **All gateway logs pass through `RedactingMakeWriter`** (defined in
+  `crates/security/src/log_redact.rs`, wired into the gateway's tracing
+  stack in `crates/baybo/src/tracing_init.rs`). `BAYBO_LOG_FORMAT=json`
   is honoured. Request spans carry a `listener` field (`admin` /
   `channel`) so the origin of each request is obvious in logs.
 - **Every mutation goes through a manager.** Route handlers call
@@ -845,7 +868,7 @@ subcommands use it for the same reason.
   friends directly; there are no side-channel writes that bypass
   Trace/Job observability.
 - **Singleton lock applies only to the gateway.** `start` acquires
-  the per-workspace lock on `<workspace>/baybo.lock`. `baybo tui` is a
+  the per-workspace lock on `<workspace>/state/baybo.lock`. `baybo tui` is a
   `/v1/channel-ws` client (see [`tui.md`](./tui.md)) and **does not**
   take the lock, so one long-lived `baybo gateway` can serve many
   concurrent TUI sessions in the same workspace.
@@ -867,21 +890,36 @@ crates/gateway/
 │   ├── spawn.rs             # ChannelSpawner — spawn a subprocess client with a channel token
 │   ├── reload.rs            # ConfigReloader trait + ReloadOutcome/ReloadError (in-process config hot-reload)
 │   ├── log_buffer.rs        # LogBuffer ring + tracing Layer behind /v1/logs[/stream]
+│   ├── device.rs            # the gateway's long-term static Noise identity (device pairing + E2E sessions)
+│   ├── push/                # A-side push dispatcher
+│   │   ├── mod.rs           #   push dispatch fan-out
+│   │   └── web.rs           #   direct-mode device push bindings (/v1/push/*)
+│   ├── relay/               # the gateway's outbound A↔C relay control connection
+│   │   └── mod.rs
 │   ├── channel/             # /v1/channel-ws WS server + /v1/blobs for sidecars, TUI, and web chat
 │   │   ├── mod.rs           #   module glue + re-exports; notes every SessionEvent is sent live 1:1 (no coalescing)
 │   │   ├── adapter.rs       #   Sidecar — SessionEvent→Frame translator + outbound pump; attaches to Channel
+│   │   ├── api_tunnel.rs    #   gateway responder for E2E API-tunnel relay legs
 │   │   ├── blobs.rs         #   POST /v1/blobs + GET /v1/blobs/{id}
 │   │   ├── boot.rs          #   install_channels / build_channel; APPROVAL_TIMEOUT=300s; per-channel gate
 │   │   ├── bot_reconciler.rs#   reconciles StartBot/StopBot rosters to Multiplexed sidecars
 │   │   ├── control.rs       #   ChannelControlRegistry (push control frames from outside the route task)
 │   │   ├── dedup.rs         #   InboundDedup (recent-window (channel,bot,platform_msg_id) dedup)
-│   │   ├── handshake.rs     #   validate_register (Tui/Tool/Subprocess/Web gating via AuthedClient)
+│   │   ├── device_content.rs #  gateway side of a paired device's content (chat) session over the relay
+│   │   ├── device_pair.rs   #   XXpsk0 device-pairing handshake + mutual confirm (PairingHostDeps)
+│   │   ├── handshake.rs     #   validate_register (Tui/Tool/Subprocess/Web/Device gating via AuthedClient)
 │   │   ├── history.rs       #   TuiHistoryStore (vault-backed TUI input-history ring)
+│   │   ├── relay_content.rs #   the gateway's relay-content control side
+│   │   ├── relay_e2e.rs     #   cross-workspace E2E tests for the spliced relay path (pair + content)
+│   │   ├── relay_pair.rs    #   the relay host leg `baybo device pair` opens
 │   │   ├── route.rs         #   ws_handler + inbound loop (Subscribe/Message/ResolveApproval/…)
 │   │   ├── session_pulse.rs #   http-channel dispatch observer → throttled Frame::SessionActivity
 │   │   ├── session_resolver.rs # ChannelSessionResolver (Multiplexed (channel,user)→session)
+│   │   ├── session_title.rs #   conversation-title broadcaster
 │   │   ├── slash.rs         #   slash-command manifest + sidecar slash handling
-│   │   └── state.rs         #   WsChannelState (registry, tokens, stores, pairing, …)
+│   │   ├── state.rs         #   WsChannelState (registry, tokens, stores, pairing, …)
+│   │   ├── tunnel_http.rs   #   in-process HTTP surface for E2E API-tunnel forwarding
+│   │   └── work_steps.rs    #   folds buffered in-flight progress events into work-block steps
 │   ├── sidecar/             # embedded JS sidecar packaging + supervision
 │   │   ├── mod.rs           #   SidecarRuntime / SidecarSupervisor, BUN/NODE binary env, domains
 │   │   ├── assets.rs        #   include!s $OUT_DIR/sidecar_assets.rs; materialises bundles to disk
@@ -891,7 +929,7 @@ crates/gateway/
 │   ├── auth/                # gateway auth surface (re-exports common types from mod.rs)
 │   │   ├── mod.rs           #   re-exports AdminToken, AuthedClient, ChannelTokenTable, …
 │   │   ├── admin.rs         #   AdminAuthState, AdminToken, require_admin_token (constant_time_eq compare)
-│   │   ├── channel.rs       #   ChannelAuthState, AuthedClient {Tui,Tool,Subprocess,Web}, require_channel_auth
+│   │   ├── channel.rs       #   ChannelAuthState, AuthedClient {Tui,Tool,Subprocess,Web,Device}, require_channel_auth
 │   │   └── token.rs         #   ChannelTokenTable (DashMap lookup) + ClientIdentity + TokenHandle, consts
 │   ├── error.rs             # GatewayError : IntoResponse
 │   ├── test_support.rs      # cfg(test-support) build_test_deps + TestGateway
@@ -902,7 +940,7 @@ crates/gateway/
 │   │   ├── health.rs        # /healthz + /readyz (shared between listeners)
 │   │   ├── webui.rs         # admin-fallback handler; include!s $OUT_DIR/webui_assets.rs
 │   │   └── admin/           # mod.rs: v1_router_and_spec() → (Router, OpenApi), mounted on admin TCP
-│   │       └── {status,config,jobs,cron,traces,analytics,skills,tools,channels,chat,llm,logs}.rs
+│   │       └── {status,config,jobs,cron,traces,analytics,skills,tools,channels,chat,push,agents,llm,logs}.rs
 │   └── installer/
 │       ├── mod.rs           # ServiceInstaller trait, InstallContext, ServiceStatus,
 │       │                    # for_current_platform, resolve_exec_start
@@ -911,15 +949,17 @@ crates/gateway/
 └── tests/                   # all.rs aggregates the rest into one binary
     ├── auth.rs                  # admin bearer auth
     ├── admin_has_no_channels.rs # asserts 404 on /v1/sessions*/* approvals* (routes that never existed)
+    ├── agents_api.rs            # /v1/agents agent-profile REST surface
     ├── channel_ws.rs            # full loopback-TCP WS round-trip via tokio-tungstenite
     ├── chat_api.rs              # /v1/chat/* web-chat session + token-mint surface
+    ├── device_channel_ws.rs     # device-token auth on /v1/channel-ws against the real ChannelServer
     ├── jobs_pagination.rs       # /v1/jobs cursor pagination + filters
     ├── llm_endpoint.rs          # /v1/llm* models/default/usage surface
     ├── logs_endpoint.rs         # /v1/logs + /v1/logs/stream SSE
     └── openapi_spec_sync.rs     # asserts router spec == docs/openapi.json (UPDATE_OPENAPI=1 to rewrite)
 ```
 
-The frontend sources live outside the crate at `web/` (pnpm workspace,
+The frontend sources live outside the crate at `app/web/` (pnpm workspace,
 not a Cargo member) and produce `app/web/dist/` which `build.rs` consumes;
 the in-tree JS sidecars live at `sidecars/channel/*` and `sidecars/tool/*` and are
 bundled into `$OUT_DIR/sidecar_assets.rs`. Note `crates/baybo/src/runtime.rs` and

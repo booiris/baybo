@@ -4,7 +4,7 @@
 
 The `trace` crate is the home for the four-tier observability model: domain types (`Step`, `StepKind`, `Span`, `SpanKind`, `SpanEvent`, `SpanEventKind`, `ToolEventPayload`, `LlmToolCallRecord`, `ToolCallOrigin`), the row conversions that persist them, and the `SpanRecorder` lifecycle facade (with its `TraceEvent` / `TraceEventStream` broadcast bus).
 
-The `TraceStore` trait itself lives in the `baybo-store` ports crate and trades in row DTOs — `StepRow` / `SpanRow` / `SpanEventRow`, each a queryable key plus the serialized entity in a `data` field. This crate owns the `Step::to_row` / `Step::from_row` (and `Span` / `SpanEvent`) conversions and converts at the recorder boundary, so the rich types and the recorder logic stay here while the trait sits in a leaf crate every store consumer can reach. `baybo-storage` provides the libsql implementation, shuttling rows without depending on `baybo-trace` (it converts in its tests only). `impl From<baybo_store::StorageError> for TraceError` bridges errors at the call sites.
+The `TraceStore` trait itself lives in the `baybo-store` ports crate and trades in row DTOs — `StepRow` / `SpanRow` / `SpanEventRow`, each a queryable key plus the serialized entity in a `data` field. This crate owns the `Step::to_row` / `Step::from_row` (and `Span` / `SpanEvent`) conversions and converts at the recorder boundary, so the rich types and the recorder logic stay here while the trait sits in a leaf crate every store consumer can reach. `baybo-storage` provides the sqlite implementation, shuttling rows without depending on `baybo-trace` (it converts in its tests only). `impl From<baybo_store::StorageError> for TraceError` bridges errors at the call sites.
 
 Trace answers **"what exactly did this operation do"** by recording sanitized inputs, results, latency, and execution provenance. Its difference from `job` is: **Job manages state, Trace manages content.**
 
@@ -16,7 +16,7 @@ The hierarchy is `Session > Job > Step > Span (+ SpanEvent)` — see `session.md
 
 A `Step` is one iteration of the agent loop. A `Span` is one atomic action with a start/end window — naming aligns with OpenTelemetry so this trace can export to standard collectors without a translation layer. A `SpanEvent` is a zero-duration marker on a Span (sanitize hit, approval decision).
 
-Steps cannot nest. Spans within a Step can be parallel (siblings sharing a `parallel_group: GroupId`) but do not nest either. This is a fixed three-layer fan-out — not a free-form tree.
+Steps cannot nest. Spans within a Step can be parallel (siblings sharing a `parallel_group: ParallelGroup`; the field is `Option<ParallelGroup>`, and `None` means strictly sequential) but do not nest either. This is a fixed three-layer fan-out — not a free-form tree.
 
 ### Closed strong-typed enums
 
@@ -29,6 +29,8 @@ pub enum StepKind {
     MemoryRecall,
     MemoryWrite,
     SkillSelection,
+    ProgressObserver,   // out-of-band turn-progress summary LLM call
+    TitleGeneration,    // conversation-title generation
 }
 
 pub enum SpanKind {
@@ -45,10 +47,10 @@ pub enum SpanKind {
 
 ### Step / Span cardinality rules
 
-- One agent-loop iteration produces **exactly one** `Step` of kind `LlmIteration` containing 1 LLM `Span` + 0..N tool `Span`s. A pure-response iteration (no tool calls) still opens a Step containing one `LlmCall` span.
-- Parallel tool calls are **sibling spans** under the same Step with the same `parallel_group: GroupId`. Their time windows may overlap.
+- One agent-loop iteration produces **exactly one** `Step` of kind `LlmIteration` containing ≥1 LLM `Span` (one per attempt — a transient-error retry opens a new `LlmCall` span in the same Step; tool spans pair back to the last attempt) + 0..N tool `Span`s. A pure-response iteration (no tool calls) still opens a Step containing one `LlmCall` span.
+- Parallel tool calls are **sibling spans** under the same Step with the same `parallel_group: ParallelGroup`. Their time windows may overlap.
 - LLM ↔ tool pairing is by `ToolCallOrigin { llm_span_id, tool_use_id }`, not by tree structure. Tool spans are direct children of the Step.
-- `Compression`, `MemoryRecall`, `MemoryWrite`, `SkillSelection` are first-class Step kinds, not events on an LLM step.
+- `Compression`, `MemoryRecall`, `MemoryWrite`, `SkillSelection`, `ProgressObserver`, and `TitleGeneration` are first-class Step kinds, not events on an LLM step.
 
 ### Provenance lives on Span variants, not on Step
 
@@ -67,18 +69,34 @@ pub enum ToolEventPayload {
     Phase { duration_ms: u64 },
     HttpFetch { status: u16, bytes: u64, content_type: Option<String>, body_preview: Option<String> },
     LlmCall { model: String, input: String, output: String },
+    ParseFailure { command: String },
 }
 ```
 
 - `SanitizeHit` is emitted **only when sanitize actually modified content**. Misses are not recorded — the trace records what happened, not what ran.
 - `Approval` records **every** decision (`Approve`, `ApproveAlways`, `Deny`). The audit trail of "what did the user approve and when" is complete.
 - `ToolEvent` is a tool-emitted phase artifact — one per `ToolEventSink::emit` call inside a tool body (a sub-action's elapsed time, an HTTP response summary, a side-LLM round-trip). The agent layer drains the tool's event buffer after execution, sanitizes text payload fields, then emits one `SpanEvent` per entry. `ToolEventPayload` text fields are producer-truncated and still pass through the leak detector before persistence.
+- `ParseFailure` records a shell command the destructive-command detector failed to parse with the shell grammar (it fell back to the fail-closed keyword pre-filter), so parser gaps stay visible. `command` is producer-truncated and sanitized before persistence.
 
 ### Sanitization constraints
 
 - Record only sanitized payloads — secrets appear only as placeholders
 - `placeholder_ids` are kept in `SanitizeHit` so replay can resolve them via `SecretVault`
 - Apply uniform sanitization to every `SpanKind` result variant — error paths included
+
+### ToolCall output storage
+
+`ToolCallResult.output` is capped at `baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES`
+— the same budget the LLM transcript uses. The model never saw more than that
+either: its copy is capped *and* spilled to a file under the workspace, so
+storing the raw payload in the span only ever bought a third copy nobody reads
+(a single 285 KB `Grep` result once sat in a span verbatim). The cap is applied
+in `tool_output_to_trace_value` (`crates/agent/src/runtime/tool_executor.rs`)
+*after* the per-variant shaping, so the struct variants
+(`WithAttachments` / `MultiModalText`), which route through
+`serde_json::to_value`, cannot bypass it. When it cuts, the untruncated
+serialized length lands in `output_truncated_from` so the viewer says the output
+is partial rather than implying the tool returned only that much.
 
 ### Single-table persistence
 
@@ -113,9 +131,11 @@ prefix with the "active as of N" filter and appends `suffix`.
 step on the parent's own `AgentLoop`, so its `StepKind::Compression` / `LlmCall`
 spans live directly under the **parent** session and their `last_ordinal` /
 `prefix_len` are recorded against the parent's own transcript. Hydration reads
-each session's own log: both `replay` and `load_trace_overview` pass the replayed
-`session_id` straight to `hydrate_persisted_inputs`. Every session resolves to
-itself.
+each session's own log: `replay` passes the replayed `session_id` straight to
+`hydrate_persisted_inputs`, while `load_trace_overview` returns that same
+session's message log and `load_job_trace` leaves `Persisted` pointers intact for
+the web client to resolve via `hydratePersistedInput` against it. Every session
+resolves to itself.
 
 **`prefix_len` is a self-validating tripwire.** The reference points into mutable
 derived state (`superseded_by` bookkeeping), so a `superseded_by` bug, a deleted
@@ -130,9 +150,9 @@ re-runnable after the fix) — the tripwire only makes drift loud, not silent. T
 write-side / read-side filter equivalence is pinned by a differential test, the
 marker path by a negative test.
 
-### Async writes with LLM/tool fences
+### Synchronous lifecycle writes
 
-Writes are asynchronous, with **synchronous fences** before any LLM or tool call: previous span's `end` and current span's `begin` must be durable before the request goes out. Other writes happen on a background writer task — the agent actor never blocks on persistence except at fences.
+Every Step / Span lifecycle write is awaited inline before execution proceeds — `SpanRecorder::begin_*` / `end_*` return only once the row is durable — so the previous span's `end` and the current span's `begin` are always persisted before an LLM or tool request goes out. There is no deferred/background write path.
 
 ### Recovery
 
@@ -148,7 +168,7 @@ actor task's crash time as the close time.
 
 ## Constraints
 
-- Depends on `baybo-job` (for `JobId`, `CancelReason`) and `baybo-model` (for `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.). No dependency on `baybo-storage`.
+- Depends on `baybo-job` (for `CancelReason`) and `baybo-model` (for `JobId`, `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.). No dependency on `baybo-storage`.
 - IDs use ULID newtypes (`StepId`, `SpanId`); `SpanEvent` uses a `(span_id, seq)` compound key
 - Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity); the `Job > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists
 - All deletes are hard `DELETE FROM` — no `deleted_at` tombstone column (see [storage.md](./storage.md#hard-delete))
@@ -162,5 +182,5 @@ actor task's crash time as the close time.
 | `job`     | Job manages state, Trace manages content; linked via `JobId`; `partial_artifacts: Vec<SpanId>` references trace spans         |
 | `agent`   | Constructs and shares one `SpanRecorder` per session; uses `JobLifecycle` and `SpanRecorder` together as sibling facades       |
 | `store`   | Owns the `TraceStore` trait + its `StepRow` / `SpanRow` / `SpanEventRow` DTOs and `StorageError`; this crate converts rich types ↔ rows |
-| `storage` | Provides the libsql implementation of `TraceStore` (from `baybo-store`), shuttling rows; depends on `baybo-trace` only as a dev-dependency |
+| `storage` | Provides the sqlite implementation of `TraceStore` (from `baybo-store`), shuttling rows; depends on `baybo-trace` only as a dev-dependency |
 | `model`   | Provides `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, `PlaceholderId`, `ApprovalDecision`, `ResourceAccess`       |

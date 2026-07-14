@@ -29,7 +29,7 @@ scripts/check-ts-bindings.sh                                    # ts-rs regen CI
 
 **Slow tests are `#[ignore]` or gated.** The tmux render/smoke tests (`crates/tui/tests/chat_render.rs`, the `baybo-term-harness` lib tmux tests) are `#[ignore]` — they're flaky under load and run in CI's non-gating `render-tests` job via `--include-ignored`. Docker- and bwrap-backed sandbox smokes self-skip when their backend is absent. Any test that must sleep on a real timeout (e.g. the OpenViking timeout paths) injects ms-scale budgets — see `OpenVikingMemory::with_timeouts` — rather than sleeping real seconds.
 
-**Python tooling uses `uv` with a persistent project venv — never bare `pip` or the system interpreter.** Project-side Python (currently the `bench/swe` SWE-bench grader + dataset export) declares its deps in a `pyproject.toml`; `uv sync` materialises a reused on-disk `.venv` **and** provisions a pinned CPython, so the env is built once, reproducible, and independent of whatever `python3` the host ships (the system one is often too new for a given stack — e.g. `swebench`). Run through it — `uv run --project <dir> python …`, or point a tool at `<dir>/.venv/bin/python`. Commit `pyproject.toml` / `uv.lock` / `.python-version`; gitignore `.venv/`. Add a new Python tool the same way (its own `pyproject.toml` + `uv sync`), not with a global `pip install`.
+**Python tooling uses `uv` with a persistent project venv — never bare `pip` or the system interpreter.** Project-side Python (currently the `bench/` harnesses — `bench/swe`, `bench/swe-baseline`, `bench/swe-claude`, and the two `bench/terminal-bench-*` dirs) declares its deps in a `pyproject.toml`; `uv sync` materialises a reused on-disk `.venv` **and** provisions a pinned CPython, so the env is built once, reproducible, and independent of whatever `python3` the host ships (the system one is often too new for a given stack — e.g. `swebench`). Run through it — `uv run --project <dir> python …`, or point a tool at `<dir>/.venv/bin/python`. Commit `pyproject.toml` / `uv.lock` / `.python-version`; gitignore `.venv/`. Add a new Python tool the same way (its own `pyproject.toml` + `uv sync`), not with a global `pip install`.
 
 **Zero warnings means zero — including test files.** `--tests` is part of the clippy invocation above on purpose. Don't dismiss a warning as "pre-existing" or "only in a test"; if `cargo clippy` lights it up, fix it as part of the change.
 
@@ -41,8 +41,36 @@ Verbose / scoped logging:
 
 ```bash
 RUST_LOG=baybo=trace cargo run                # verbose
-RUST_LOG=baybo::agent=debug cargo run         # agent module only
+RUST_LOG=baybo_agent=debug cargo run          # agent crate only
 ```
+
+## Pull Requests
+
+**Open every PR as a draft (`gh pr create --draft`), and never mark it ready
+yourself.** The owner reviews it first and says when it may go ready. Marking it
+ready is what starts CI and what puts it in front of reviewers — that is the
+owner's call, not the author's.
+
+```bash
+gh pr create --draft --base master --head <branch> --title "…" --body "…"
+# … owner reviews, and only then:
+gh pr ready <number>
+```
+
+**A draft PR runs NO CI, and a skipped run looks exactly like a passing one.**
+Every job in `.github/workflows/ci.yml` carries
+`if: ${{ github.event.pull_request.draft == false }}` — deliberately, because a
+skipped job spins up no runner and bills no minutes. The trap is on the reading
+side: `gh pr checks --watch` on a draft reports every job as `skipping` and
+**exits 0**, which is indistinguishable from green at a glance. Before merging,
+confirm the gating jobs actually say `pass`. If they say `skipping`, CI has never
+seen the code.
+
+The macOS jobs cost 10× Linux minutes, which is why the iOS jobs are currently
+`if: false` (see `61eb9246`). While that holds, **nothing under `app/ios` is
+covered by CI** — the Rust core, the transcript bundle, and the Swift suite are
+all local-only. Run them by hand and say so in the PR body; do not let a green
+check imply coverage it does not have.
 
 ## Code Style
 
@@ -88,7 +116,7 @@ Prefer generic/extensible architectures over hardcoding specific integrations. A
 - **Modular**: Each crate is an independent module; traits are defined within their own crate; crates interact via traits — high cohesion, low coupling
 - **Extensible**: Channels, Tools, and Skills all plug in via registries
 - **Domain crates own their tools**: a crate that owns a domain hosts its own `Tool` impls and depends on `baybo-tools` for the trait; `baybo-tools` carries only generic/core tools and never depends back on a domain crate (that would be a cycle)
-- **Dedup at the seam, not the surface**: when two variants share a lifecycle (e.g. the mobile `direct` vs `relay` chat legs in `app/mobile/src-tauri/src/transport.rs`), unify that lifecycle **once** and let each variant plug in through a narrow trait seam (`ChatTransport::establish`, `FrameCodec`, `SessionLeg::registry`). Hoist identical delegation/boilerplate into a generic helper rather than re-declaring it per variant. Do **NOT** collapse genuinely divergent bodies — different protocol/crypto/auth (`establish`, the blob legs, pairing-vs-login) — into one function behind an `if variant` / `match` branch: that's a false dedup that couples things that differ essentially and grows worse with each new case. Share only what is literally identical; keep the divergent parts in their own per-variant files.
+- **Dedup at the seam, not the surface**: when two variants share a lifecycle (e.g. the mobile `direct` vs `relay` chat legs in `app/ios/ffi/src/transport.rs`), unify that lifecycle **once** and let each variant plug in through a narrow trait seam (`ChatTransport::establish`, `FrameCodec`, `SessionLeg::registry`). Hoist identical delegation/boilerplate into a generic helper rather than re-declaring it per variant. Do **NOT** collapse genuinely divergent bodies — different protocol/crypto/auth (`establish`, the blob legs, pairing-vs-login) — into one function behind an `if variant` / `match` branch: that's a false dedup that couples things that differ essentially and grows worse with each new case. Share only what is literally identical; keep the divergent parts in their own per-variant files.
 - **Secure**: Encrypted secret storage, input leak detection, least-privilege networking and credential injection
 - **Governable**: All Skill/Tool/extensions must carry source, version, hash, trust level, and capability declarations; selection and execution are auditable
 - **Observable**: Full call-chain tracing; Job system manages all async operation states; supports session replay, trace forking and rollback; logs/traces record only sanitized placeholders and summaries
@@ -108,12 +136,12 @@ Module index: [`docs/modules/README.md`](docs/modules/README.md)
 
 For non-module-crate topics, read the relevant doc before touching that area:
 
-- [`docs/webui.md`](docs/webui.md) — embedded React dashboard (`web/`), pnpm/Vite workflow, OpenAPI codegen, Tailwind v4 design tokens.
+- [`docs/webui.md`](docs/webui.md) — embedded React dashboard (`app/web/`), pnpm/Vite workflow, OpenAPI codegen, Tailwind v4 design tokens.
 - [`docs/web-chat.md`](docs/web-chat.md) — web chat UI **feature** reference (`app/web/src/pages/ChatPage.tsx` + `app/web/src/pages/chat/`): conversations/folders/pin, composer + attachments + model switch, slash-command completion, input-history ring, the interjection queue, thread/turn rendering, and the WS data-flow backbone.
 - [`docs/sync-protocol.md`](docs/sync-protocol.md) — chat sync protocol v2 (one cursor, one sync call, three data planes): the `sync`/point-lookup REST surface, the `SubscribeState`/`Gap` wire frames, the client sync loop + outbox, and rebase/gap handling. [`docs/CONTEXT.md`](docs/CONTEXT.md) is its terminology glossary (canonical names + retired-alias smells).
 - [`docs/bench-web.md`](docs/bench-web.md) — standalone read-only viewer (`bench/bench-web`) for bench `results/` + agent `trace/` artifacts; spine model + per-bench adapters, ts-rs gate.
 - [`docs/sidecars.md`](docs/sidecars.md) — embedded JS sidecars (`sidecars/channel/*`, `sidecars/tool/*`), bundling/install pipeline, domain registration, and the browser sidecar (CDDM wrapper, security trade-offs, docker mode).
-- [`docs/modules/storage.md`](docs/modules/storage.md) — libsql storage; all deletable tables use plain `DELETE` (no soft-delete tombstones).
+- [`docs/modules/storage.md`](docs/modules/storage.md) — sqlite storage; all deletable tables use plain `DELETE` (no soft-delete tombstones).
 - [`docs/fuzzing.md`](docs/fuzzing.md) — `baybo-security` cargo-fuzz harness and targets.
 - [`docs/testing.md`](docs/testing.md) — test layout, `test-support` gating, shared fixtures.
 - [`docs/external-commands.md`](docs/external-commands.md) — external binaries baybo shells out to (`git`/`sh`/`rg`/sandbox backends/`uv`/`bun`), required-vs-optional, and how the in-container benches provide or skip each.

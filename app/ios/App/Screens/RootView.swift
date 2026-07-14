@@ -28,12 +28,21 @@ struct RootView: View {
                 NavigationStack(path: $store.chatPath) {
                     HomeTabView()
                         .toolbar(.hidden, for: .navigationBar)
-                        .navigationDestination(for: String.self) { sessionId in
-                            ChatScreen(
-                                host: store.transcriptHost(for: sessionId),
-                                store: store.chatStore(for: sessionId)
-                            )
-                            .id(sessionId)
+                        .navigationDestination(for: AppStore.ChatRoute.self) { route in
+                            Group {
+                                switch route {
+                                case .session(let sessionId):
+                                    ChatScreen(
+                                        host: store.transcriptHost(for: sessionId),
+                                        store: store.chatStore(for: sessionId)
+                                    )
+                                    // The cross-session remount contract of the
+                                    // shared webview depends on this keying.
+                                    .id(sessionId)
+                                case .archived:
+                                    ArchivedScreen()
+                                }
+                            }
                             .toolbar(.hidden, for: .navigationBar)
                             .navigationBarBackButtonHidden(true)
                         }
@@ -56,6 +65,24 @@ struct RootView: View {
                 )
                 .zIndex(1)
             }
+
+            // The swipe-delete confirm shares the logout confirm's hosting: the
+            // app root is the one layer that dims and hit-blocks the whole shell.
+            if let sessionId = store.confirmDeleteSession {
+                ConfirmDialog(
+                    titleKey: "list.deleteConfirmTitle",
+                    bodyKey: "list.deleteConfirmBody",
+                    destructiveKey: "list.delete",
+                    onCancel: dismissDeleteConfirm,
+                    onConfirm: {
+                        dismissDeleteConfirm()
+                        withAnimation {
+                            store.requestDelete(sessionId)
+                        }
+                    }
+                )
+                .zIndex(1)
+            }
         }
         .sheet(isPresented: $store.scanPresented) {
             ScanView()
@@ -65,6 +92,12 @@ struct RootView: View {
     private func dismissLogoutConfirm() {
         withAnimation(ConfirmDialog.exitMotion) {
             store.confirmLogout = false
+        }
+    }
+
+    private func dismissDeleteConfirm() {
+        withAnimation(ConfirmDialog.exitMotion) {
+            store.confirmDeleteSession = nil
         }
     }
 }

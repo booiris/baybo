@@ -364,6 +364,7 @@ async fn session_event_to_frame(
         }
         SessionEvent::ApprovalRequested {
             call_id,
+            tool_call_id,
             session_id,
             user_id,
             tool,
@@ -372,6 +373,7 @@ async fn session_event_to_frame(
             description,
         } => Frame::ApprovalRequested {
             call_id,
+            tool_call_id,
             session_id,
             user_id,
             tool,
@@ -422,6 +424,7 @@ async fn agent_output_to_frame(
             call_id,
             status,
             summary,
+            approval,
         } => {
             let status = match status {
                 ToolStatus::Ok => "ok",
@@ -434,6 +437,7 @@ async fn agent_output_to_frame(
                 call_id,
                 status: status.to_owned(),
                 summary,
+                approval,
             }
         }
         AgentEvent::Status(status) => {
@@ -504,16 +508,6 @@ async fn agent_output_to_frame(
             active,
             started_at,
         },
-        // Reuse `split_content`'s media→`WireAttachment` mapping; the
-        // text half is empty for the media-only blocks this carries.
-        AgentEvent::Attachment(blocks) => {
-            let (_text, attachments) = split_content(&blocks, blob_store).await;
-            Frame::Attachment {
-                session_id,
-                user_id,
-                attachments,
-            }
-        }
     }
 }
 
@@ -538,12 +532,17 @@ pub(crate) async fn split_content(
                 }
                 text.push_str(t);
             }
-            ContentBlock::Image { blob, mime_type } => {
+            ContentBlock::Image {
+                blob,
+                mime_type,
+                filename,
+            } => {
                 if let Some(att) = stat_attachment(
                     blob_store,
                     AttachmentKind::Image,
                     &blob.blob_id,
                     Some(mime_type.clone()),
+                    filename.clone(),
                     None,
                 )
                 .await
@@ -551,13 +550,19 @@ pub(crate) async fn split_content(
                     attachments.push(att);
                 }
             }
-            ContentBlock::Audio { blob, mime_type } => {
+            ContentBlock::Audio {
+                blob,
+                mime_type,
+                filename,
+                duration_ms,
+            } => {
                 if let Some(att) = stat_attachment(
                     blob_store,
                     AttachmentKind::Audio,
                     &blob.blob_id,
                     Some(mime_type.clone()),
-                    None,
+                    filename.clone(),
+                    *duration_ms,
                 )
                 .await
                 {
@@ -568,6 +573,7 @@ pub(crate) async fn split_content(
                 blob,
                 filename,
                 mime_type,
+                duration_ms,
             } => {
                 if let Some(att) = stat_attachment(
                     blob_store,
@@ -575,6 +581,7 @@ pub(crate) async fn split_content(
                     &blob.blob_id,
                     Some(mime_type.clone()),
                     Some(filename.clone()),
+                    *duration_ms,
                 )
                 .await
                 {
@@ -597,6 +604,7 @@ async fn stat_attachment(
     blob_id: &str,
     mime_override: Option<String>,
     filename: Option<String>,
+    duration_ms: Option<u32>,
 ) -> Option<WireAttachment> {
     match blob_store.stat(blob_id).await {
         Ok(meta) => {
@@ -617,6 +625,7 @@ async fn stat_attachment(
                 mime_type: mime_override.unwrap_or(meta.mime_type),
                 size,
                 filename,
+                duration_ms,
             })
         }
         Err(e) => {

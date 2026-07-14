@@ -3,7 +3,7 @@
 //! Gated behind the `test-support` cargo feature so it never ships in
 //! release builds. Lives in `baybo-job` (next to the row conversions it
 //! pairs with) so crates that depend on `baybo-job` can spin up a fake
-//! store without pulling the libsql adapter.
+//! store without pulling the sqlite adapter.
 
 use std::collections::HashMap;
 

@@ -42,6 +42,7 @@ schemes:
     test:
       config: Debug
       targets:
+        - BayboTests
         - BayboUITests
     profile:
       config: Release
@@ -95,6 +96,13 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         NSCameraUsageDescription: "Baybo uses the camera to scan the pairing QR code."
+        # Required by the image viewer's share sheet: without it, tapping "Save
+        # Image" TERMINATES the app (add-only access still needs a purpose string).
+        NSPhotoLibraryAddUsageDescription: "Baybo saves a chat image to your photo library when you share it there."
+        # Chat audio (AudioPlayerCenter) keeps playing through lock/background;
+        # Now Playing + remote commands give it the Control Center transport.
+        UIBackgroundModes:
+          - audio
         BayboKeychainAccessGroup: "$(AppIdentifierPrefix)com.baybo.app"
         # Space Mono (OFL, App/Resources/Fonts) — the style guide's chrome face.
         UIAppFonts:
@@ -108,6 +116,48 @@ targets:
           - group.com.baybo.app
         keychain-access-groups:
           - "$(AppIdentifierPrefix)com.baybo.app"
+  # The unit bundle (swift-testing; XCTest stays for the UI smokes below —
+  # swift-testing has no UI-testing API). HOSTED in the app, never hostless:
+  #   * the xcframework wraps a STATIC lib already linked into the app, so a
+  #     hostless bundle would link a SECOND copy of the Rust core (and boot a
+  #     second tokio runtime); hosted resolves it through `-bundle_loader`;
+  #   * `Lang` resolves strings through `Bundle.main` — hostless that is the
+  #     xctest runner, so every `Lang.t(key)` silently returns the key;
+  #   * `PushKeyStore` reads `BayboKeychainAccessGroup` from the host Info.plist;
+  #   * everything in App/ is @MainActor over UIKit/WebKit anyway.
+  BayboTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+      # The NSE's decrypt path, compiled straight into the test bundle: an app
+      # EXTENSION cannot host a test bundle, so `@testable import
+      # NotificationExtension` is not a shape that exists. The three files are
+      # self-contained (CryptoKit / Security / Foundation), and until this
+      # target existed `NotificationServiceTests` was in the NSE's `excludes:`
+      # — compiled by NO target, so its pinned AEAD vector never ran.
+      - path: NotificationExtension/NotificationService.swift
+        createIntermediateGroups: false
+      - path: NotificationExtension/PushKeyStore.swift
+        createIntermediateGroups: false
+      - path: NotificationExtension/PushPayloadKeys.swift
+        createIntermediateGroups: false
+    dependencies:
+      - target: Baybo
+      # Header/module search paths only (`link: false`): the static core is
+      # already inside the host binary, and `@testable import Baybo` has to be
+      # able to load the `BayboCoreFFI` clang module the app's swiftmodule
+      # imports.
+      - framework: Externals/BayboCore.xcframework
+        embed: false
+        link: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.baybo.app.Tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Baybo
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Baybo.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Baybo"
+        BUNDLE_LOADER: "$(TEST_HOST)"
   # Headless interaction smokes (`xcodebuild test` on a sim) for flows that a
   # static `-baybo-*` screenshot can't prove — gesture/tap sequences like the
   # logout-confirm dismiss-and-reopen loop.
@@ -128,8 +178,6 @@ targets:
     platform: iOS
     sources:
       - path: NotificationExtension
-        excludes:
-          - "NotificationServiceTests.swift"
     dependencies:
       - sdk: UserNotifications.framework
     settings:

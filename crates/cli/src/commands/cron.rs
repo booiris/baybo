@@ -22,6 +22,7 @@ fn cron(ctx: &CommandContext) -> Result<&baybo_agent::CronScheduler> {
 fn job_summary(j: &CronJob) -> Value {
     json!({
         "id": j.id,
+        "title": j.display_title(),
         "user": j.user_id,
         "channel": format!("{:?}", j.channel),
         "schedule": j.schedule.display(),
@@ -50,12 +51,13 @@ async fn list(ctx: &CommandContext) -> Result<CommandOutput> {
 
     let rows: Vec<Value> = jobs.iter().map(job_summary).collect();
     let mut human = String::from(
-        "id                                    user       status    schedule              next_trigger\n",
+        "id                                    title                 user       status    schedule              next_trigger\n",
     );
     for j in &jobs {
         human.push_str(&format!(
-            "{:<38}  {:<9}  {:<8}  {:<20}  {}\n",
+            "{:<38}  {:<20}  {:<9}  {:<8}  {:<20}  {}\n",
             j.id,
+            j.display_title(),
             j.user_id,
             j.status.as_str(),
             j.schedule.display(),
@@ -99,8 +101,9 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     }
 
     let human = format!(
-        "id:                {}\nuser:              {}\nchannel:           {:?}\nstatus:            {}\nschedule:          {}\ntimezone:          {}\none_shot:          {}\nnext_trigger:      {}\nlast_triggered:    {}\norigin_session:    {}\ncreated:           {}\nupdated:           {}\nprompt:            {}",
+        "id:                {}\ntitle:             {}\nuser:              {}\nchannel:           {:?}\nstatus:            {}\nschedule:          {}\ntimezone:          {}\none_shot:          {}\nnext_trigger:      {}\nlast_triggered:    {}\norigin_session:    {}\ncreated:           {}\nupdated:           {}\nprompt:            {}",
         job.id,
+        job.display_title(),
         job.user_id,
         job.channel,
         job.status.as_str(),

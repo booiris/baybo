@@ -152,6 +152,85 @@ async fn chat_api_round_trip() {
 }
 
 #[tokio::test]
+async fn chat_archive_round_trip() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+
+    // The list ALWAYS serializes `archived` — even when false. Clients
+    // without an archived view rely on the field being present on every
+    // row; `archived: false` must not be dropped the way `hidden: false`
+    // is.
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("created session listed")
+        .clone();
+    assert_eq!(
+        row["archived"].as_bool(),
+        Some(false),
+        "archived must serialize as an explicit false, not be omitted: {row:?}",
+    );
+
+    // Archive → 204, and the row STAYS in the default list (no
+    // server-side filtering — clients group archived rows themselves).
+    let archived = put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/archive"),
+        Body::from(json!({ "archived": true }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert!(archived.is_null());
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("archived session must still be listed")
+        .clone();
+    assert_eq!(row["archived"].as_bool(), Some(true));
+
+    // Unarchive restores the flag.
+    put(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}/archive"),
+        Body::from(json!({ "archived": false }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("session listed after unarchive")
+        .clone();
+    assert_eq!(row["archived"].as_bool(), Some(false));
+
+    // Unknown session → 404.
+    put(
+        &router,
+        "/v1/chat/sessions/no-such-session/archive",
+        Body::from(json!({ "archived": true }).to_string()),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn chat_create_accepts_client_supplied_session_id() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
@@ -390,6 +469,142 @@ async fn seed_tool_turn_session(
             .expect("append");
     }
     session_id
+}
+
+/// The chat-list summary carries a Telegram-style second-line preview
+/// (`last_message_text`) that follows the WHOLE conversation: it settles on the
+/// newest displayable message regardless of author, skipping the turn's
+/// text-less tool rows, while `last_user_text` stays the user-only label the
+/// web sidebar uses.
+#[tokio::test]
+async fn chat_list_last_message_text_follows_latest_reply() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+    // user("run it") → tool_use → tool_result → reply("done")
+    let session_id = seed_tool_turn_session(&tg, &router).await;
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("seeded session listed")
+        .clone();
+
+    // Newest displayable message is the assistant's final answer — the
+    // intervening tool_use / tool_result rows carry no text and are skipped.
+    assert_eq!(
+        row["last_message_text"].as_str(),
+        Some("done"),
+        "preview must follow the conversation to the latest reply: {row:?}",
+    );
+    // The user-only label is unchanged: still the last human turn.
+    assert_eq!(row["last_user_text"].as_str(), Some("run it"));
+}
+
+/// The second-line preview mirrors the transcript's bubble rules: a turn that
+/// ends on tool activity (narration + tool_use + tool_result, no tool-free
+/// final answer) shows NO assistant bubble, so the preview must fall back to
+/// the user prompt rather than surface the mid-turn narration text.
+#[tokio::test]
+async fn chat_list_last_message_text_skips_mid_turn_narration() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+    let sid = SessionId::from(session_id.as_str());
+    // Newest tail rows are an assistant narration+tool row then a tool result —
+    // neither renders a bubble, so the preview must be the user prompt.
+    let rows = [
+        ChatMessage::user(vec![ContentBlock::Text("run it".into())]),
+        ChatMessage::assistant(vec![
+            ContentBlock::Text("let me check the logs".into()),
+            ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "Bash".into(),
+                input: json!({"command": "cat log"}),
+                signature: None,
+            },
+        ]),
+        ChatMessage::tool_result("c1".to_owned(), "…".to_owned()),
+    ];
+    for msg in rows {
+        tg.deps
+            .session_manager
+            .append_session_message(&sid, &msg)
+            .await
+            .expect("append");
+    }
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("seeded session listed")
+        .clone();
+    assert_eq!(
+        row["last_message_text"].as_str(),
+        Some("run it"),
+        "narration/tool rows must not surface as the preview: {row:?}",
+    );
+}
+
+/// A `/stop`-salvaged assistant reply carries the model-facing cancelled-turn
+/// marker folded into its text; the preview must strip it (the same contract
+/// the transcript renderer honours) so the list never shows internal framing.
+#[tokio::test]
+async fn chat_list_last_message_text_strips_cancelled_marker() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+    let sid = SessionId::from(session_id.as_str());
+    let salvaged = format!(
+        "here is the partial{}",
+        baybo_context::prompts::cancelled_turn::SUFFIX
+    );
+    let rows = [
+        ChatMessage::user(vec![ContentBlock::Text("do the thing".into())]),
+        ChatMessage::assistant(vec![ContentBlock::Text(salvaged)]),
+    ];
+    for msg in rows {
+        tg.deps
+            .session_manager
+            .append_session_message(&sid, &msg)
+            .await
+            .expect("append");
+    }
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(session_id.as_str()))
+        .expect("seeded session listed")
+        .clone();
+    assert_eq!(
+        row["last_message_text"].as_str(),
+        Some("here is the partial"),
+        "cancelled-turn marker must be stripped from the preview: {row:?}",
+    );
 }
 
 #[tokio::test]
@@ -788,6 +1003,88 @@ async fn chat_list_uses_device_scope_when_forwarded_from_tunnel() {
         .map(|row| row["session_id"].as_str().expect("session_id"))
         .collect();
     assert_eq!(ids, vec![device_session.id.as_str()]);
+}
+
+/// A recurring fire scheduled from the phone opens its conversation on the
+/// *device* channel, so it must appear in the iOS chat list — that list is
+/// where the fire's result is read, and the push deep-links into it. The
+/// one-shot's private workspace stays out, on this channel as on any other.
+///
+/// The device-scoped counterpart of
+/// `recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not`: the
+/// chat list is channel-scoped, so proving the rule on `http` proves nothing
+/// about the client that actually reads it.
+#[tokio::test]
+async fn a_recurring_fire_scheduled_from_the_phone_is_listed_on_the_phone() {
+    use baybo_model::TriggerSource;
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    // A cron job created from an iOS chat carries that session's channel, so
+    // its fires are minted on `device` (see `Router::handle_cron_trigger`).
+    let phone = User {
+        id: "device-1".into(),
+        name: None,
+        channel: ChannelType::device(),
+    };
+    let mut fires = Vec::new();
+    for conversation in [true, false] {
+        let fire = tg
+            .deps
+            .session_manager
+            .create_session_with_trigger(
+                phone.clone(),
+                ChannelType::device(),
+                TriggerSource::Cron {
+                    cron_job_id: "cj-news".into(),
+                    origin_session_id: None,
+                    conversation,
+                },
+            )
+            .await
+            .expect("create cron fire session on the device channel");
+        fires.push(fire.id.to_string());
+    }
+    let (recurring_id, one_shot_id) = (fires[0].clone(), fires[1].clone());
+
+    // Exactly what the iOS client fetches: `GET /v1/chat/sessions` under a
+    // device identity (see `app/ios/ffi/src/gateway_api.rs`).
+    let router = build_router(build_admin_state(&tg));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/chat/sessions")
+                .extension(AuthedClient::Device {
+                    device_id: "device-1".into(),
+                })
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("body bytes");
+    let list: Value = serde_json::from_slice(&bytes).expect("response is json");
+    let listed: Vec<&str> = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|row| row["session_id"].as_str().expect("session_id"))
+        .collect();
+
+    assert!(
+        listed.contains(&recurring_id.as_str()),
+        "a recurring fire's conversation must reach the phone's chat list, got {listed:?}",
+    );
+    assert!(
+        !listed.contains(&one_shot_id.as_str()),
+        "a one-shot's private workspace must not, got {listed:?}",
+    );
 }
 
 #[tokio::test]
@@ -1263,19 +1560,17 @@ async fn list_sessions_exposes_last_user_text_preview() {
     );
 }
 
-// Cron-spawned sessions are filtered out of `GET /v1/chat/sessions` so
-// the operator's chat sidebar isn't buried under background fires;
-// they instead surface via `GET /v1/chat/cron-messages`. The opt-in
-// `?include_cron=true` query restores them for parity with
-// `include_hidden`.
+// A recurring fire's session IS the conversation the user reads its result in,
+// so it is listed and attachable like any other. A one-shot's session is a
+// private workspace — its result is reported into the conversation that
+// scheduled it — so it stays out of the list and cannot be attached to. The
+// opt-in `?include_cron=true` query is the operator escape hatch that shows
+// both.
 #[tokio::test]
-async fn cron_sessions_split_into_dedicated_endpoint() {
+async fn recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not() {
     use baybo_model::{ChannelType, TriggerSource, User};
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
-
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
 
@@ -1285,54 +1580,51 @@ async fn cron_sessions_split_into_dedicated_endpoint() {
         .expect("session_id")
         .to_owned();
 
-    let cron_session = tg
-        .deps
-        .session_manager
-        .create_session_with_trigger(
-            User {
-                id: "operator".into(),
-                name: None,
-                channel: ChannelType::http(),
-            },
-            ChannelType::http(),
-            TriggerSource::Cron {
-                cron_job_id: "cj-test".into(),
-            },
-        )
-        .await
-        .expect("create cron session");
-    let cron_id = cron_session.id.to_string();
-
-    let cron_rows: &[ChatMessage] = &[
-        // The cron prompt persists as a `MessageSource::Cron` row; the inbox
-        // locates it by that provenance, then strips the `[cron:<id>]` framing
-        // for display.
-        ChatMessage::cron_fire(vec![ContentBlock::Text(
-            "[cron:cj-test] morning brief".into(),
-        )]),
-        ChatMessage::assistant(vec![ContentBlock::Text("daily summary\nready".into())]),
-    ];
-    for msg in cron_rows {
-        tg.deps
+    // The fire runs as the same web operator that scheduled it — attaching to
+    // its conversation is only allowed for that identity.
+    let operator = User {
+        id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
+        name: None,
+        channel: ChannelType::http(),
+    };
+    let mut ids = Vec::new();
+    for conversation in [true, false] {
+        let session = tg
+            .deps
             .session_manager
-            .append_session_message(&cron_session.id, msg)
+            .create_session_with_trigger(
+                operator.clone(),
+                ChannelType::http(),
+                TriggerSource::Cron {
+                    cron_job_id: "cj-test".into(),
+                    origin_session_id: None,
+                    conversation,
+                },
+            )
             .await
-            .expect("append cron row");
+            .expect("create cron session");
+        ids.push(session.id.to_string());
     }
+    let (recurring_id, one_shot_id) = (ids[0].clone(), ids[1].clone());
 
     let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
     let items = list["items"].as_array().expect("items");
-    assert!(
+    let listed = |id: &str| {
         items
             .iter()
-            .any(|row| row["session_id"].as_str() == Some(user_id.as_str())),
-        "user session must show up in default list",
+            .any(|row| row["session_id"].as_str() == Some(id))
+    };
+    assert!(
+        listed(&user_id),
+        "user session must show up in default list"
     );
     assert!(
-        items
-            .iter()
-            .all(|row| row["session_id"].as_str() != Some(cron_id.as_str())),
-        "cron session must be hidden from default chat list, got {items:?}",
+        listed(&recurring_id),
+        "a recurring fire's conversation is a first-class chat, got {items:?}",
+    );
+    assert!(
+        !listed(&one_shot_id),
+        "a one-shot fire session has no conversation to show, got {items:?}",
     );
 
     let list_inc = get(
@@ -1345,33 +1637,26 @@ async fn cron_sessions_split_into_dedicated_endpoint() {
     assert!(
         items_inc
             .iter()
-            .any(|row| row["session_id"].as_str() == Some(cron_id.as_str())),
-        "include_cron=true must bring cron sessions back",
+            .any(|row| row["session_id"].as_str() == Some(one_shot_id.as_str())),
+        "include_cron=true is the operator view: it shows even the private fire sessions",
     );
 
-    let inbox = get(&router, "/v1/chat/cron-messages", StatusCode::OK).await;
-    let inbox_items = inbox["items"].as_array().expect("items");
-    let cron_row = inbox_items
-        .iter()
-        .find(|row| row["session_id"].as_str() == Some(cron_id.as_str()))
-        .expect("cron inbox should surface the cron session");
-    assert_eq!(cron_row["cron_job_id"].as_str(), Some("cj-test"));
-    assert_eq!(
-        cron_row["prompt"].as_str(),
-        Some("morning brief"),
-        "prompt must strip the `[cron:<id>] ` routing prefix",
-    );
-    assert_eq!(
-        cron_row["response"].as_str(),
-        Some("daily summary ready"),
-        "response must collapse to a single-line preview",
-    );
-    assert!(
-        inbox_items
-            .iter()
-            .all(|row| row["session_id"].as_str() != Some(user_id.as_str())),
-        "cron inbox must not contain user-triggered sessions",
-    );
+    // Attaching: a recurring fire's conversation can be continued (the user
+    // replies to what the fire reported); a one-shot's workspace cannot.
+    post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "session_id": recurring_id }).to_string()),
+        StatusCode::OK,
+    )
+    .await;
+    post(
+        &router,
+        "/v1/chat/sessions",
+        Body::from(json!({ "session_id": one_shot_id }).to_string()),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
 }
 
 // Channel kind sanity: every kind the boot path declares must match

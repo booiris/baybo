@@ -26,8 +26,9 @@ Core responsibilities:
 - Define the kind-typed [`SubscribedView`] that gates operations like
   `subscribe` / `unsubscribe` / `echo_inbound` /
   `broadcast_session_patch` / `broadcast_session_activity` /
-  `set_dispatch_observer` on `Subscribed` channels — calling any of
-  those on a `Multiplexed` channel is structurally unreachable.
+  `broadcast_folders_changed` / `set_dispatch_observer` on `Subscribed`
+  channels — calling any of those on a `Multiplexed` channel is
+  structurally unreachable.
 - Define shared message types ([`Message`], [`IncomingMessage`],
   [`OutgoingMessage`], [`AgentOutput`], [`SessionEvent`],
   [`NoticeLevel`]).
@@ -64,6 +65,10 @@ pub struct Channel {
     subscriptions: DashMap<SessionId, DashSet<ConnectionId>>,
     // Pre-dispatch hook; installable only via SubscribedView.
     dispatch_observer: Mutex<Option<DispatchObserver>>,
+    // Per-session replay buffer of the in-flight turn's progress events
+    // (Subscribed channels only; reset at turn start, dropped at turn end,
+    // capped at MAX_INFLIGHT_ENTRIES = 2048).
+    in_flight: DashMap<SessionId, Vec<SessionEvent>>,
 }
 
 impl Channel {
@@ -85,13 +90,21 @@ impl Channel {
     pub fn has_subscribers(&self, session_id: &SessionId) -> bool;
     pub fn connection_count(&self) -> usize;
     pub fn pending_approvals(&self, session_id: &SessionId) -> Vec<ApprovalRequest>;
-    pub fn pending_approval_call_ids(&self, session_id: &SessionId) -> Vec<String>;
+    pub fn in_flight_events(&self, session_id: &SessionId) -> Vec<SessionEvent>;
     pub fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Option<SessionId>;
 
     // Kind narrowing — see `SubscribedView` below.
     pub fn as_subscribed(&self) -> Option<SubscribedView<'_>>;
 }
 ```
+
+The live stream is ephemeral until the turn's assistant message
+persists, so a client that joins **mid-turn** recovers the
+already-streamed progress from `in_flight` two ways:
+`SubscribedView::subscribe` replays the buffer to the fresh subscriber,
+and the gateway folds the same snapshot into both the
+`Frame::SubscribeState` bundle's `work_steps` and the REST chat-history
+transcript (one shared `channel::work_steps` helper).
 
 `Connection` is the per-WS handle the gateway hands to `Channel::attach`
 after the `Register` handshake:
@@ -124,15 +137,16 @@ fans output to connections:
 | Kind          | Meaning                                                                                          | Used by                  |
 | ------------- | ------------------------------------------------------------------------------------------------ | ------------------------ |
 | `Multiplexed` | One connection carries every session of this `ChannelType`. Subscribe / Unsubscribe are protocol errors. | telegram, weixin, discord sidecars |
-| `Subscribed`  | Connections receive only the sessions they explicitly subscribe to via `Subscribe` / `Unsubscribe` frames. | TUI (one subscription per process), http (the web chat page, switched on navigation) |
+| `Subscribed`  | Connections receive only the sessions they explicitly subscribe to via `Subscribe` / `Unsubscribe` frames. | TUI (one subscription per process), http (the web chat page, switched on navigation), device (the paired iOS companion) |
 
 ### Kind-typed `SubscribedView`
 
 Operations that only make sense on a `Subscribed` channel —
 `subscribe` / `unsubscribe` / `echo_inbound` /
 `broadcast_session_patch` / `broadcast_session_activity` /
-`set_dispatch_observer` — live on [`SubscribedView<'_>`], a cheap
-borrow obtained from `Channel::as_subscribed()`. Multiplexed channels
+`broadcast_folders_changed` / `set_dispatch_observer` — live on
+[`SubscribedView<'_>`], a cheap borrow obtained from
+`Channel::as_subscribed()`. Multiplexed channels
 return `None` from that call, so a caller holding only a `&Channel`
 cannot accidentally invoke a Subscribed-only operation on a telegram-
 shape channel. The previous runtime `WrongKind` error variant is
@@ -163,11 +177,12 @@ Plus one Subscribed-exclusive method on the view:
 | `SubscribedView::echo_inbound(msg)`   | Echo a user message back to all tabs subscribed to its `session_id` so multi-tab views render through one path |
 
 `SubscribedView` additionally exposes `broadcast_session_patch` /
-`broadcast_session_activity` for sidebar-level frames that target all
-attached connections regardless of subscription (sidebar freshness
-doesn't need per-session keying — every tab maintains its full list).
+`broadcast_session_activity` / `broadcast_folders_changed` for
+sidebar-level frames that target all attached connections regardless of
+subscription (sidebar freshness doesn't need per-session keying — every
+tab maintains its full list).
 
-All five funnel into the same internal `dispatch_event` /
+All of these funnel into the same internal `dispatch_event` /
 `broadcast_frame` machinery: non-blocking, drops the frame for any
 connection whose sink reports `Full` (and nudges it with a
 `Frame::Gap` — session-scoped from `dispatch_event`, session-less from
@@ -180,8 +195,9 @@ Subscribed channels can carry a single pre-dispatch observer installed
 via `SubscribedView::set_dispatch_observer`. It runs before fan-out
 and receives `(&SessionEvent, SubscribedView<'_>)`, so it can re-enter
 the typed broadcast path to emit a derived frame (today: the gateway's
-`SessionPulse` watches every dispatch on the `http` channel and throttles
-`Frame::SessionActivity` broadcasts for sidebar unread accounting).
+`SessionPulse` watches every dispatch on the `http` and `device` channels
+and throttles `Frame::SessionActivity` broadcasts for sidebar unread
+accounting).
 
 ## Event vs. Frame
 
@@ -199,9 +215,11 @@ agent / tool path           channel / connection
                                                        wire bytes
 ```
 
-[`AgentOutput`] is the narrow set of things the agent itself emits
-(`AnswerDelta`, `Reasoning`, `ToolStarted`/`ToolCompleted`, `Message`,
-`Notice`). [`SessionEvent`] wraps that plus the
+[`AgentOutput`] is an addressing envelope (`session_id` / `user_id` /
+`channel`) around [`AgentEvent`] — the narrow set of things the agent
+itself emits (`AnswerDelta`, `Reasoning`, `ToolStarted`/`ToolCompleted`,
+`Status`, `Progress`, `TaskList`, `TurnState`, `Message`, `Notice`).
+[`SessionEvent`] wraps that plus the
 channel-side events (`UserEcho`, `ApprovalRequested`, `ApprovalResolved`)
 so the agent's output surface stays statically narrow. The gateway's
 per-connection translator converts each `SessionEvent` to the matching
@@ -239,24 +257,31 @@ connection on the `tui` channel, keyed by `ConnectionId` like any other
 client.
 
 Bootstrap hands the shared `Arc<ApprovalGateMap>` to `ToolExecutor` so
-gates registered later are visible immediately without re-plumbing. The
-gate map is per-channel-type only (the registry no longer splits
-per-`(channel, session)`); concurrent TUI / web tabs subscribed to the
-same session resolve approvals through the same gate, and the channel
-fans out `ApprovalResolved` so the loser tabs drop their prompt card.
+gates registered later are visible immediately without re-plumbing.
+`ChannelRegistry::install` populates only the type-level tier of the gate
+map; the map itself is two-tier — a session-level `(ChannelType,
+SessionId)` entry (used by the one-shot `baybo prompt` path) wins over the
+channel-type gate, and lookup fails closed to `AutoDenyGate`. Concurrent
+TUI / web tabs subscribed to the same session still resolve approvals
+through the same per-channel gate, and the channel fans out
+`ApprovalResolved` so the loser tabs drop their prompt card.
 
 ## Channel Implementations
 
-Today the only in-tree transport is the gateway's `/v1/channel-ws`
-server (`crates/gateway/src/channel/`). Every channel — the built-in
-TUI, the embedded web chat page, and every out-of-process sidecar —
-reaches the agent through that same endpoint:
+Today the in-tree transports are the gateway's `/v1/channel-ws` server
+(`crates/gateway/src/channel/`) and, for paired iOS devices, the
+Noise-wrapped relay content leg
+(`crates/gateway/src/channel/device_content.rs` / `relay_content.rs`)
+that feeds the same frame loop. Every channel — the built-in TUI, the
+embedded web chat page, the paired iOS companion, and every
+out-of-process sidecar — reaches the agent through that one frame loop:
 
-| Channel        | Kind          | ID prefix | Transport / auth                                                            |
-| -------------- | ------------- | --------- | --------------------------------------------------------------------------- |
-| `tui`          | `Subscribed`  | `tui_`    | `/v1/channel-ws` (per-start token from `gateway.tui_token`)                 |
-| `http` (web)   | `Subscribed`  | `web_`    | `/v1/channel-ws` on the admin listener (dashboard admin token)                |
-| Sidecars       | `Multiplexed` | `<name>_` | `/v1/channel-ws` (per-spawn capability token, claims its own `channel_type`)|
+| Channel        | Kind          | User id                                             | Transport / auth                                                            |
+| -------------- | ------------- | --------------------------------------------------- | --------------------------------------------------------------------------- |
+| `tui`          | `Subscribed`  | `$USER` (falls back to `tui-user`)                  | `/v1/channel-ws` (per-start token from `gateway.tui_token`)                 |
+| `http` (web)   | `Subscribed`  | `web-operator`                                      | `/v1/channel-ws` on the admin listener (dashboard admin token)                |
+| `device` (iOS) | `Subscribed`  | the paired `device_id`                              | `/v1/channel-ws` on the admin listener (device auth token) or the relay Noise leg (authenticated by the device's static Noise key) |
+| Sidecars       | `Multiplexed` | `<channelType>_<botId>_<chatKey>_<platformUserId>`  | `/v1/channel-ws` (per-spawn capability token, claims its own `channel_type`)|
 
 See [`tui.md`](./tui.md) for the TUI client side and
 [`gateway.md`](./gateway.md) for the server side, including the split
@@ -295,9 +320,12 @@ from [`ChannelServer::port`] after it binds on `127.0.0.1:0`.
 drives it: at gateway boot, [`SidecarRuntime::install`] materialises
 each sidecar's JS bundle to
 `$XDG_CACHE_HOME/baybo/sidecars/<channel>-<hash>/bundle.mjs` (plus any
-declared aux assets next to it), then one supervised task per embedded
-channel type runs `Command::new("bun").arg(bundle).spawn()` through
-`ChannelSpawner` and restarts on exit with exponential backoff
+declared aux assets next to it), then the supervisor polls
+`ChannelBotStore` on a 2s discovery tick and starts one supervised task
+per embedded channel type the first time it reports ≥1 registered bot (a
+channel with no bots never spawns); each task runs
+`Command::new("bun").arg(bundle).spawn()` through `ChannelSpawner` and
+restarts on exit with exponential backoff
 (500ms → 30s, reset after ≥60s of stable uptime). The `bun` executable
 is resolved from `PATH`; set `BAYBO_BUN_BIN` to point at a specific
 install. Shutdown fans out via the shared `ShutdownSignal` — children
@@ -336,8 +364,10 @@ connects to `/v1/logs`'s admin endpoint. There is no SDK-level shortcut.
 the package (e.g. weixin's `silk.wasm`), is zstd-compressed into
 `target/sidecar-cache/<fingerprint>/` and embedded via
 `include_bytes!`. Sidecar packaging is keyed by the relevant sidecar
-inputs (workspace lockfiles, `sidecars/channel/*` sources/configs, and
-`sidecars/sdk/channel-ts/dist`): if those inputs are unchanged, a later
+inputs (workspace lockfiles, `sidecars/channel/*` and `sidecars/tool/*`
+sources/configs, and `sidecars/sdk/channel-ts` sources — `src/`,
+`package.json`, `tsconfig.json`, deliberately *not* the compiled
+`dist/`): if those inputs are unchanged, a later
 `cargo build` reuses the cached compressed bundles instead of
 re-running bun. `--target=bun` substitutes bun's own polyfills for
 `ws` (WHATWG `WebSocket`) and `node-fetch` (bun's native fetch); the
@@ -358,12 +388,15 @@ and the server is authoritative on the wire format.
 
 The first in-tree sidecar built on the SDK is the Telegram channel at
 `sidecars/channel/telegram/` (package `@baybo/channel-telegram`). It uses
-`grammy` for long-polling, maps Telegram `chat_id`s to stable UUIDv5
-`session_id`s, and surfaces `Frame::ApprovalRequested` as an inline-
-keyboard prompt in the originating chat. It's also the working example
-of the full `Channel` contract — `inbound(signal)` pump, `onMessage` /
-`onNotice` round-trip, concurrent `onApprovalRequested`, `onStop`
-cleanup.
+`grammy` for long-polling, sends inbound messages with an empty
+`session_id` and lets the gateway's `ChannelSessionResolver` allocate a
+stable per-`(channel_type, user_id)` session (persisted in the
+`channel_sessions` table), and surfaces `Frame::ApprovalRequested` as an
+inline-keyboard prompt in the originating chat. It is built on the SDK's
+`BotChannel` wrapper (`@baybo/channel-sdk/bot`) — a multi-tenant
+implementation of the `Channel` contract that the telegram package
+configures with platform/approvals plugins; the raw `Channel` hook
+surface lives in `sidecars/sdk/channel-ts/src/channel.ts` / `bot.ts`.
 
 ## Bot Registration
 
@@ -408,8 +441,9 @@ register: async (ctx) => {
 
 **CLI driver**: `crates/setup/src/flow/channel/register_driver.rs`
 (`run_registration`) enforces the contract from the host side. It runs the bundle with
-`Command::env_clear()` + a small allowlist (`PATH`, `HOME`, `TERM`,
-`LANG`, `LC_*`, `TZ`, `TMPDIR`, plus `BAYBO_CHANNEL_MODE=register`) so
+`Command::env_clear()` + the shared `SIDECAR_ENV_ALLOWLIST` (`PATH`,
+`HOME`, `USER`, `TERM`, `LANG`, `LC_*`, `TZ`, `TMPDIR`,
+`XDG_CACHE_HOME`), plus `BAYBO_CHANNEL_MODE=register`, so
 no `BAYBO_*` value (capability tokens, vault endpoints, gateway URL)
 leaks in. The driver enforces a 10-minute overall timeout, a 5-second
 post-result exit grace, and `kill_on_drop(true)` so any error path
@@ -439,11 +473,18 @@ examples.
 
 ## Unified Message Mapping
 
-All platforms map to the same [`IncomingMessage`] structure via
-consistent ID prefixing (e.g. `tg_{msg_id}`, `dc_{msg_id}`,
-`web_{uuid}`) and session derivation rules. Session ids are
-client-generated UUIDs; the router resolves or creates the session on
-first message via `SessionManager::get_or_create`.
+All platforms map to the same [`IncomingMessage`] structure. The message
+id is minted server-side as a fresh UUIDv4
+(`route.rs::build_inbound_message`) — there is no platform prefixing.
+User ids follow per-surface conventions: `$USER` (falling back to
+`tui-user`) for the TUI, `web-operator` for `http`, the paired
+`device_id` for `device`, and
+`<channelType>_<botId>_<chatKey>_<platformUserId>` for bot sidecars.
+Session ids come from the client only on the TUI (which mints its own
+UUID into `Register`); web / device sessions are allocated by the REST
+`create_session` path, and `Multiplexed` sidecar sessions by the
+gateway's `ChannelSessionResolver`. The router resolves or creates the
+session on first message via `SessionManager::get_or_create`.
 
 `IncomingMessage.platform_msg_id` is the client-supplied idempotency
 key carried over from `wire::Message.platform_msg_id`. It's echoed
@@ -455,8 +496,9 @@ carrier didn't set one (older bundles, TUI, fixtures).
 ## Constraints
 
 - `channels` stays independent of `agent`, `llm`, and other business
-  crates (depends only on `baybo-model` and `baybo-tools`; `baybo-tools`
-  is pulled in only for the `ApprovalGate` + `ApprovalGateMap` types).
+  crates (depends only on `baybo-model`, `wire`, and `baybo-tools`;
+  `baybo-tools` is pulled in only for the `ApprovalGate` +
+  `ApprovalGateMap` types).
 - Transports own framing and encoding. This crate only defines the
   neutral `wire::{Frame, Message}` shapes (MessagePack-named) and the
   `encode` / `decode` helpers both sides call; the gateway route and
@@ -469,5 +511,5 @@ carrier didn't set one (older bundles, TUI, fixtures).
 | `model`    | Provides `ContentBlock`, `ChannelType`, `SessionId`, `ResourceAccess`, `User`                      |
 | `agent`    | Router owns the registry and calls `Channel::dispatch_agent` (and the approval-dispatch helpers) by `ChannelType` |
 | `tools`    | Provides `ApprovalGate` + `ApprovalGateMap` reused by the registry; `ApprovalQueue` backs `ApprovalSurface`       |
-| `gateway`  | Hosts the only in-tree transport (`/v1/channel-ws`); installs channels at boot, builds per-WS `Connection`s, owns the `ConnectionSink` impl, and translates `SessionEvent` → `wire::Frame` |
+| `gateway`  | Hosts the in-tree transports (`/v1/channel-ws` and the paired-device Noise relay leg); installs channels at boot, builds per-WS `Connection`s, owns the `ConnectionSink` impl, and translates `SessionEvent` → `wire::Frame` |
 | `security` | Inbound user messages go to `SecurityGateway` first after entering the system                                     |

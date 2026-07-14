@@ -11,12 +11,9 @@ use sha2::Digest;
 use tokio::io::AsyncWriteExt;
 
 use super::pairing::load_paired_record;
-use super::tunnel::{
-    REQUEST_ID, collect_response_body, dial_tunnel_leg, expect_response_head, next_response,
-    send_request,
-};
+use super::tunnel::{BLOB_REQUEST_ID, body_frames, dial_tunnel_leg};
 use crate::blob_helper;
-use crate::core::{MAX_TUNNEL_CHUNK, TunnelHeader, TunnelRequest, TunnelResponse};
+use crate::core::{TunnelHeader, TunnelRequest, TunnelResponse};
 use crate::gateway_api::{GatewayBlobClient, PATH_BLOBS};
 
 const HEADER_CONTENT_TYPE: &str = "content-type";
@@ -27,10 +24,11 @@ const HEADER_RANGE: &str = "range";
 async fn download_to_path(
     blob_id: &str,
     entry: &blob_helper::BlobCacheEntry,
+    progress: blob_helper::ProgressSink,
 ) -> Result<(), String> {
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
-    let (mut ws, mut session) =
+    let mut leg =
         dial_tunnel_leg(&record, &local, remote_host_protocol::relay::LegClass::Blob).await?;
 
     let (mut hasher, resume_from) = blob_helper::hash_existing_part(entry).await?;
@@ -41,45 +39,56 @@ async fn download_to_path(
             format!("bytes={resume_from}-"),
         ));
     }
-    send_request(
-        &mut ws,
-        &mut session,
-        &TunnelRequest::Head {
-            request_id: REQUEST_ID,
-            method: "GET".into(),
-            path: format!("{PATH_BLOBS}/{blob_id}"),
-            headers,
-            body_len: None,
-        },
-    )
+    leg.send(&TunnelRequest::Head {
+        request_id: BLOB_REQUEST_ID,
+        method: "GET".into(),
+        path: format!("{PATH_BLOBS}/{blob_id}"),
+        headers,
+        body_len: None,
+    })
     .await?;
 
-    let (status, _headers, body_len) = expect_response_head(&mut ws, &mut session).await?;
-    if !(status == 200 || status == 206) {
-        return Err(format!("download failed: HTTP {status}"));
+    let head = leg.expect_response_head(BLOB_REQUEST_ID).await?;
+    if !(head.status == 200 || head.status == 206) {
+        return Err(format!("download failed: HTTP {}", head.status));
     }
-    if resume_from > 0 && status != 206 {
+    if resume_from > 0 && head.status != 206 {
         return Err("download resume was not accepted".into());
     }
+
+    // A 206's `body_len` counts the REMAINING bytes, so the blob's full length
+    // is what a resume already holds plus what this response will carry.
+    let total = head.body_len.map(|len| resume_from + len);
+    let mut ticker = blob_helper::ProgressTicker::new(progress, total, resume_from);
 
     let mut file = blob_helper::open_part_append(entry).await?;
 
     let mut expected_body_offset = resume_from;
-    if body_len == Some(0) {
+    if head.body_len == Some(0) {
         blob_helper::finalize_download(file, entry, hasher).await?;
-        let _ = ws.close(None).await;
+        ticker.finish();
+        leg.close().await;
         return Ok(());
     }
 
+    // Streamed to disk rather than collected: a blob runs to 100 MiB, so this is
+    // the one tunnel response we cannot buffer whole.
     loop {
-        match next_response(&mut ws, &mut session).await? {
+        match leg.next_response().await? {
             TunnelResponse::Body {
-                offset, data, last, ..
+                request_id,
+                offset,
+                data,
+                last,
             } => {
+                if request_id != BLOB_REQUEST_ID {
+                    drop(file);
+                    blob_helper::remove_part(entry).await;
+                    return Err(format!("blob body for request {request_id}"));
+                }
                 if offset != expected_body_offset {
                     drop(file);
                     blob_helper::remove_part(entry).await;
-                    let _ = ws.close(None).await;
                     return Err(format!(
                         "body offset {offset} != expected {expected_body_offset}",
                     ));
@@ -89,9 +98,11 @@ async fn download_to_path(
                     .map_err(|e| format!("write part: {e}"))?;
                 hasher.update(&data);
                 expected_body_offset += data.len() as u64;
+                ticker.advance(data.len());
                 if last {
                     blob_helper::finalize_download(file, entry, hasher).await?;
-                    let _ = ws.close(None).await;
+                    ticker.finish();
+                    leg.close().await;
                     return Ok(());
                 }
             }
@@ -118,64 +129,34 @@ async fn upload_bytes_over_tunnel(
     let record = load_paired_record()?.ok_or("not paired; pair a gateway first")?;
     let local = StaticKeypair::from_parts(record.noise_public, record.noise_secret);
     let size = bytes.len() as u64;
-    let (mut ws, mut session) =
+    let mut leg =
         dial_tunnel_leg(&record, &local, remote_host_protocol::relay::LegClass::Blob).await?;
 
-    send_request(
-        &mut ws,
-        &mut session,
-        &TunnelRequest::Head {
-            request_id: REQUEST_ID,
-            method: "POST".into(),
-            path: PATH_BLOBS.into(),
-            headers: vec![
-                TunnelHeader::new(HEADER_CONTENT_TYPE, mime_type),
-                TunnelHeader::new(HEADER_CONTENT_LENGTH, size.to_string()),
-                TunnelHeader::new(HEADER_CONTENT_SHA256, expected_hex),
-            ],
-            body_len: Some(size),
-        },
-    )
+    leg.send(&TunnelRequest::Head {
+        request_id: BLOB_REQUEST_ID,
+        method: "POST".into(),
+        path: PATH_BLOBS.into(),
+        headers: vec![
+            TunnelHeader::new(HEADER_CONTENT_TYPE, mime_type),
+            TunnelHeader::new(HEADER_CONTENT_LENGTH, size.to_string()),
+            TunnelHeader::new(HEADER_CONTENT_SHA256, expected_hex),
+        ],
+        body_len: Some(size),
+    })
     .await?;
 
-    let mut offset = 0u64;
-    if bytes.is_empty() {
-        send_request(
-            &mut ws,
-            &mut session,
-            &TunnelRequest::Body {
-                request_id: REQUEST_ID,
-                offset: 0,
-                data: Vec::new(),
-                last: true,
-            },
-        )
-        .await?;
-    } else {
-        for chunk in bytes.chunks(MAX_TUNNEL_CHUNK) {
-            let chunk_len = chunk.len() as u64;
-            let last = offset + chunk_len >= size;
-            send_request(
-                &mut ws,
-                &mut session,
-                &TunnelRequest::Body {
-                    request_id: REQUEST_ID,
-                    offset,
-                    data: chunk.to_vec(),
-                    last,
-                },
-            )
-            .await?;
-            offset += chunk_len;
-        }
+    for frame in body_frames(BLOB_REQUEST_ID, bytes) {
+        leg.send(&frame).await?;
     }
 
-    let (status, _headers, _body_len) = expect_response_head(&mut ws, &mut session).await?;
-    if !(200..300).contains(&status) {
-        return Err(format!("upload failed: HTTP {status}"));
+    let head = leg.expect_response_head(BLOB_REQUEST_ID).await?;
+    let body = leg
+        .collect_response_body(BLOB_REQUEST_ID, head.body_len)
+        .await?;
+    leg.close().await;
+    if !(200..300).contains(&head.status) {
+        return Err(format!("upload failed: HTTP {}", head.status));
     }
-    let body = collect_response_body(&mut ws, &mut session, _body_len).await?;
-    let _ = ws.close(None).await;
     #[derive(Deserialize)]
     struct BlobIdResp {
         blob_id: String,
@@ -186,9 +167,12 @@ async fn upload_bytes_over_tunnel(
     Ok(parsed.blob_id)
 }
 
-async fn download_blob_bytes(blob_id: String) -> Result<Vec<u8>, String> {
+async fn download_blob_bytes(
+    blob_id: String,
+    progress: blob_helper::ProgressSink,
+) -> Result<Vec<u8>, String> {
     blob_helper::read_or_download_blob_bytes(blob_id, |blob_id, entry| async move {
-        download_to_path(&blob_id, &entry).await
+        download_to_path(&blob_id, &entry, progress).await
     })
     .await
 }
@@ -206,7 +190,8 @@ impl GatewayBlobClient for super::GatewayApi {
     fn download_blob(
         &self,
         blob_id: String,
+        progress: blob_helper::ProgressSink,
     ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send + '_ {
-        async move { download_blob_bytes(blob_id).await }
+        async move { download_blob_bytes(blob_id, progress).await }
     }
 }

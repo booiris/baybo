@@ -1,6 +1,6 @@
 //! App side of the E2E content session.
 
-use baybo_model::{ChannelType, SessionId};
+use baybo_model::{ApprovalDecision as WireApprovalDecision, ChannelType, SessionId};
 use device_proto::noise::{FrameReassembler, NOISE_MAX_MESSAGE, StaticKeypair, write_chunked};
 use snow::{HandshakeState, TransportState};
 use wire::{Frame, Message, MessageRole, WireAttachment, decode, encode};
@@ -69,6 +69,15 @@ impl ContentSession {
 pub fn subscribe_frame(session_id: &str) -> Frame {
     Frame::Subscribe {
         session_id: SessionId::from(session_id),
+    }
+}
+
+/// The user's answer to a pending approval prompt. `call_id` is the prompt's
+/// own id (from `Frame::ApprovalRequested`), not the tool call's.
+pub fn resolve_approval_frame(call_id: &str, decision: WireApprovalDecision) -> Frame {
+    Frame::ResolveApproval {
+        call_id: call_id.to_owned(),
+        decision,
     }
 }
 

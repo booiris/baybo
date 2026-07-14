@@ -52,6 +52,7 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
         lineage: None,
         hidden: false,
         pinned: false,
+        archived: false,
         folder_id: None,
         title: None,
     };
@@ -120,10 +121,10 @@ async fn rehydrate_after_idle_eviction_preserves_session_state() {
 /// to the next freshly-hydrated actor. We don't run a full actor
 /// here — the contract under test is purely "session.state.pending
 /// survives the storage round-trip", which is the property the
-/// actor's `persist_session_state_after_pending_change` helper is
+/// actor's background-notification persistence helper is
 /// responsible for upholding.
 #[tokio::test]
-async fn pending_background_results_survive_session_round_trip() {
+async fn background_notification_buffer_survives_session_round_trip() {
     use baybo_model::{PendingBackgroundResult, SessionId, SubagentExitStatus};
 
     let session_store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
@@ -139,7 +140,8 @@ async fn pending_background_results_survive_session_round_trip() {
 
     session
         .state
-        .pending_background_results
+        .background_notifications
+        .buffered_results
         .push(PendingBackgroundResult::subagent(
             "bg-1",
             "general-purpose",
@@ -157,8 +159,15 @@ async fn pending_background_results_survive_session_round_trip() {
         .await
         .expect("load")
         .expect("row present");
-    assert_eq!(reloaded.state.pending_background_results.len(), 1);
-    let entry = &reloaded.state.pending_background_results[0];
+    assert_eq!(
+        reloaded
+            .state
+            .background_notifications
+            .buffered_results
+            .len(),
+        1
+    );
+    let entry = &reloaded.state.background_notifications.buffered_results[0];
     assert_eq!(entry.handle_id, "bg-1");
     assert_eq!(entry.label, "check the docs");
     assert_eq!(entry.summary_text, "found three matches");

@@ -1,11 +1,13 @@
 # Baybo Chat Sync
 
 The vocabulary of chat transcript synchronization between the gateway and its
-chat clients (web, iOS, TUI), as settled in
+transcript clients (web, iOS), as settled in
 [`sync-protocol.md`](sync-protocol.md) (designed 2026-07-06; **built
-2026-07-06** — the v1 mechanisms are deleted). Terms below are the canonical
-names; the "avoid" aliases are v1 mechanism names the migration retired —
-using them now is a smell.
+2026-07-06** — the v1 mechanisms are deleted). The TUI is live-only: it shares
+the wire vocabulary (**SubscribeState**, **Gap nudge**) but holds no **Cursor**
+and never **Sync**s a transcript. Terms below are the canonical names; the
+"avoid" aliases are v1 mechanism names the migration retired — using them now
+is a smell.
 
 ## Language
 

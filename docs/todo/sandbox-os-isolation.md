@@ -9,12 +9,18 @@
   tries the native backend first and falls back to docker when its
   binary is absent. Per-call cost is just an `Arc::clone` after the
   startup probe.
-- Filesystem scoping: workspace bind mount RW; curated system dirs
-  (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`,
-  `/run/systemd/resolve`) RO.
-- Network: per-call all-or-nothing — `ToolCapability::Http` ⇒
-  `--share-net` / `(allow network*)`, otherwise `--unshare-net` /
-  `(deny network*)`.
+- Filesystem scoping (`FilesystemPolicy::Permissive`): workspace root
+  **and** `$HOME` bind-mounted RW; curated system dirs (`/usr`, `/bin`,
+  `/sbin`, `/lib`, `/lib64`, `/etc`, `/run/systemd/resolve`) RO;
+  credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`,
+  `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`,
+  the baybo state dir) masked with per-call empty tmpfs.
+- Network: the crate supports per-call all-or-nothing
+  (`NetworkPolicy::All` ⇒ `--share-net` / `(allow network*)`, `None` ⇒
+  `--unshare-net` / `(deny network*)`); the `ToolExecutor` currently
+  passes `NetworkPolicy::All` for every ExecCommand tool — the per-tool
+  `ToolCapability::Http` gate described in the original design was not
+  wired.
 - **Resource caps** (`SandboxSpec.resource_limits` →
   `memory_max_bytes` + `pids_max`):
   - Library default is `ResourceLimits::unlimited()`;
@@ -49,9 +55,12 @@
   - **Docker**: same as bwrap — `allowed_hosts` is **advisory**,
     runner logs a warn and runs with the regular bridge network.
     Same enforcement design needed; same deferral.
-- Bootstrap probe at gateway startup; missing backend ⇒ ExecCommand
-  tools refuse with an actionable error, the rest of the gateway runs
-  normally.
+- Bootstrap resolve at gateway startup (`resolve_sandbox_runner` in
+  `crates/baybo/src/sandbox_boot.rs`): a missing/unusable backend records
+  a bypass reason — Bash emits a one-time notice and runs without the
+  inner OS sandbox (no refusal); inside a detected outer
+  container/sandbox the inner sandbox is skipped silently; the rest of
+  the gateway runs normally.
 - `BashTool` routes through `ToolContext.sandbox`; in-process Rust
   tools (Read, Write, Edit, Glob, Grep, Now) are untouched.
 
@@ -74,8 +83,9 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
   MCP servers as trusted extensions and refuse to register them when
   the runner is unavailable.
 - **Per-host network allowlist on Linux** (bwrap and Docker). The
-  macOS SBPL path shipped. Linux currently fail-closes — better than
-  the v1.0 silent-broad-allow, but operators who want host scopes on
+  macOS SBPL path shipped. Linux currently warns and ignores
+  `allowed_hosts` (advisory, warn-and-proceed with the broad allow — see
+  the v1 Status bullet above), so operators who want host scopes on
   Linux have nothing yet. Any working solution must enforce at
   kernel level (catches HTTPS, plain HTTP, raw TCP, SSH, postgres,
   … without requiring tool cooperation), because anything that
@@ -226,11 +236,12 @@ Module spec: [`docs/modules/sandbox.md`](../modules/sandbox.md).
   source so the trust boundary is reproducible across fresh hosts).
 - `[sandbox]` config section in `baybo.json` for timeouts, default
   resource limits (so operators can tighten or loosen the per-call
-  defaults without editing source), extra readable paths (especially
+  defaults without editing source), and extra readable paths (especially
   relevant for non-FHS distros like NixOS where `/usr` is essentially
-  empty), and an explicit override for the sandbox FS root (currently
-  inferred from `current_dir()` at startup; useful when baybo is
-  launched from a daemon manager whose cwd is `/`).
+  empty). The sandbox FS root is already operator-controlled — it is
+  `config.workspace.path` (absolute, validated; defaults to `~/.baybo` in
+  release) — so no separate override is needed unless a deployment wants
+  the sandbox root decoupled from the workspace root.
 
 ## Original Problem
 
@@ -241,8 +252,8 @@ invocation OS-level containment for shell/filesystem/network side
 effects. A WASM runtime does not help with that — it sandboxes compute,
 not the host syscalls tools actually make.
 
-Today `ToolExecutor` runs tools directly in-process. Without OS-native
-isolation, any tool that shells out runs with the full privileges of
+At the time of writing (pre-v1), `ToolExecutor` ran every tool directly
+in-process, so any tool that shelled out ran with the full privileges of
 the `baybo` process.
 
 ## Direction
@@ -253,7 +264,7 @@ platform. Tool manifests declare the capabilities they need
 in the platform's native sandbox with exactly those capabilities
 granted.
 
-### Linux — `bwrap` (+ future `socat`)
+### Linux — `bwrap`
 
 - **`bwrap`** provides the core isolation: new user/mount/pid/uts/ipc
   namespaces, RO bind of curated system dirs (`/usr`, `/bin`, `/sbin`,
@@ -261,14 +272,9 @@ granted.
   and an RW bind of the tool's workspace root. `--unshare-net` by
   default; selectively `--share-net` for tools whose manifest declares
   `ToolCapability::Http`.
-- **`socat`** (deferred) bridges allow-listed network endpoints into
-  the sandbox. When a tool's `Http` capability scopes to specific
-  hosts, spin up a `socat` proxy on a unix socket inside the sandbox
-  that forwards only to the declared host:port. Enforcement lives at
-  `socat` configuration time — the sandbox's network namespace has no
-  other route out.
 - Resource limits via `bwrap --die-with-parent` + cgroup v2 (memory,
-  pids) — cgroup caps are deferred.
+  pids) — shipped via `systemd-run --user --scope` (see v1 Status
+  above).
 
 ### macOS — `sandbox-exec`
 
@@ -281,15 +287,17 @@ granted.
     creates a per-invocation scratch dir under the workspace and
     points `$TMPDIR` / `$TMP` / `$TEMP` at it so callers respecting
     those env vars stay inside the bind.
-  - `network*` toggled by `NetworkPolicy`. Future: SBPL `(remote ip
-    "host:port")` style rules for per-host scoping.
+  - `network*` toggled by `NetworkPolicy`. Shipped: per-host scoping via
+    `(allow network-outbound (remote tcp "host:port"))` rules — see the
+    v1 Status per-host allowlist bullet.
 
 ### Shared surface (implemented)
 
 - `baybo-sandbox` exposes `SandboxRunner::run(spec)` returning a handle
   with stdout/stderr/exit. Implementation is `cfg(target_os)` gated:
   `linux` → bwrap backend, `macos` → sandbox-exec backend. Other
-  platforms return `SandboxError::UnsupportedPlatform`.
+  platforms fall through to the docker backend if available, else
+  `SandboxError::NoBackendAvailable`.
 - `baybo_tools::ToolCapability` (`ReadFile`, `WriteFile`, `Http`,
   `ExecCommand`) drives wrapping. The `ToolExecutor` consults the
   runner only for tools whose manifest declares `ExecCommand`.
@@ -300,18 +308,21 @@ granted.
 
 - **DNS resolution**: with `--unshare-net` we don't need DNS at all.
   With `--share-net` we bind `/etc` and `/run/systemd/resolve` RO.
-  When per-host `socat` lands, hostname resolution will move into the
-  host namespace and IPs get pre-resolved — document the TTL vs.
+  When per-host enforcement lands on Linux (Path A), `allowed_hosts` get
+  pre-resolved to IPs at install/config time — document the TTL vs.
   re-resolution tradeoff at that point.
 - **Process tree**: tools can fork inside the sandbox; bwrap caps the
   blast radius via PID namespace + `--die-with-parent`.
-- **Windows**: deferred — no planned support, `current_platform_runner()`
-  returns `SandboxError::UnsupportedPlatform`.
+- **Windows**: deferred — no planned support; `current_platform_runner()`
+  returns `SandboxError::NoBackendAvailable` (after the docker fallback
+  probe fails).
 - **Bootstrap check**: implemented — `baybo_sandbox::probe()` and
-  `current_platform_runner()` return `SandboxError::BackendMissing`
-  with an actionable install hint when the binary is absent.
-- **Config surface**: a `[sandbox]` section is deferred and would land
-  in `config-wire-remaining-sections.md` when it's needed.
+  `current_platform_runner()` return `SandboxError::NoBackendAvailable`
+  with an actionable install hint when the binary is absent (the
+  per-backend `BackendMissing` errors are swallowed by the fallback
+  chain; both variants carry actionable install hints).
+- **Config surface**: a `[sandbox]` section is still deferred — see the
+  Deferred list above for its intended contents.
 
 ## Related
 

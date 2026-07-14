@@ -27,8 +27,8 @@ const COMPONENTS: Components = {
   // phone). Without the wrapper the table inherits the prose's `overflow-wrap:
   // anywhere` and shrinks its cells to fit instead of overflowing — so it never
   // scrolls, it just folds each cell into a tall column of broken words. The
-  // wrapper is the scroll box; `white-space: nowrap` on the cells (styles.css)
-  // keeps content on one line so the table grows past the band and scrolls.
+  // wrapper is the scroll box; the cells cap their width and wrap inside it
+  // (styles.css), so the table grows past the band and scrolls.
   table({ children }) {
     return (
       <div className="md-table-wrap">
@@ -40,8 +40,12 @@ const COMPONENTS: Components = {
 
 /// The assistant-prose renderer. Memoized: during a stream the parent
 /// re-renders per animation frame, and without this every finalized message in
-/// the log would re-parse its markdown on each tick.
-const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
+/// the log would re-parse its markdown on each tick. Statically imported (not
+/// code-split): a lazy chunk left the first cold-start paint showing raw
+/// markdown source until the chunk loaded, then reflowed to formatted prose —
+/// a visible flash. Bundling it into the entry means the first paint is already
+/// rendered.
+export const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
   return (
     <div className="md">
       <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={COMPONENTS}>
@@ -50,5 +54,3 @@ const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
     </div>
   );
 });
-
-export default MarkdownBody;

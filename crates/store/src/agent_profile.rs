@@ -32,7 +32,7 @@ pub struct AgentProfileRow {
     pub system_prompt: Option<String>,
     pub framework: AgentFramework,
     pub llm: Option<LlmEntryName>,
-    /// Read-side state only — never bound on insert; the libsql seed is
+    /// Read-side state only — never bound on insert; the sqlite seed is
     /// the sole writer of `builtin = 1`.
     pub builtin: bool,
     pub created_at: DateTime<Utc>,

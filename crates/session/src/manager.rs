@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 
 use crate::SessionError;
 use baybo_store::{SessionFolderRow, SessionFolderStore};
-use baybo_store::{SessionStore, StoredMessage};
+use baybo_store::{SessionMessageAppendOutcome, SessionStore, StoredMessage};
 use baybo_store::{SessionSummaryRow, SessionSummaryStore};
 
 type Result<T> = std::result::Result<T, SessionError>;
@@ -52,11 +52,11 @@ fn validate_folder_name(name: String) -> Result<String> {
 pub struct SessionManager {
     store: Arc<dyn SessionStore>,
     /// Per-session summary-metadata store. Required at construction —
-    /// production wires the libsql backend; tests pass
+    /// production wires the sqlite backend; tests pass
     /// `crate::test_support::MemorySessionSummaryStore`.
     summary_store: Arc<dyn SessionSummaryStore>,
     /// Chat-list folder store. Required at construction — production wires
-    /// the libsql backend; tests pass `MemorySessionFolderStore`.
+    /// the sqlite backend; tests pass `MemorySessionFolderStore`.
     folder_store: Arc<dyn SessionFolderStore>,
 }
 
@@ -225,6 +225,7 @@ impl SessionManager {
             lineage: Some(lineage),
             hidden: false,
             pinned: false,
+            archived: false,
             folder_id: None,
             title: None,
         };
@@ -279,6 +280,7 @@ impl SessionManager {
             lineage: None,
             hidden: false,
             pinned: false,
+            archived: false,
             folder_id: None,
             title: None,
         };
@@ -363,7 +365,7 @@ impl SessionManager {
 
     /// Live sessions whose `channel` matches `channel`, newest-active
     /// first. Delegates to the store's `list_by_channel`, which
-    /// pushes the predicate into SQL on the libsql backend so a
+    /// pushes the predicate into SQL on the sqlite backend so a
     /// long-running gateway with thousands of bot sessions doesn't
     /// pay an O(all) round-trip when the caller only wants the
     /// http channel.
@@ -501,6 +503,31 @@ impl SessionManager {
     ) -> Result<i64> {
         self.store
             .append_session_message(session_id, message)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    /// Atomically append a transcript row once for a durable source event.
+    /// Replays return the original ordinal without creating another row.
+    pub async fn append_session_message_idempotent(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+        message: &ChatMessage,
+    ) -> Result<SessionMessageAppendOutcome> {
+        self.store
+            .append_session_message_idempotent(session_id, source_event_id, message)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    pub async fn find_message_ordinal_by_source_event_id(
+        &self,
+        session_id: &SessionId,
+        source_event_id: &str,
+    ) -> Result<Option<i64>> {
+        self.store
+            .find_message_ordinal_by_source_event_id(session_id, source_event_id)
             .await
             .map_err(SessionError::from)
     }
@@ -670,6 +697,19 @@ impl SessionManager {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
         debug!(session_id = %session_id, pinned, "toggled session pinned");
+        Ok(())
+    }
+
+    /// Flip the session's chat-list `archived` flag — the "move to
+    /// archive" affordance. Targeted flat-column write that survives a
+    /// concurrent `touch`; see [`baybo_store::SessionStore::set_archived`].
+    /// Returns `Err(NotFound)` when the session id is unknown.
+    pub async fn set_archived(&self, session_id: &SessionId, archived: bool) -> Result<()> {
+        let updated = self.store.set_archived(session_id, archived).await?;
+        if !updated {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        debug!(session_id = %session_id, archived, "toggled session archived");
         Ok(())
     }
 
@@ -1613,5 +1653,54 @@ mod tests {
 
         let loaded = mgr.load_active_session_messages(&session.id).await.unwrap();
         assert!(loaded.is_empty());
+    }
+
+    /// The unread badge counts what a user is meant to read: final assistant
+    /// replies past their read cursor. A cron notification — a one-shot fire's
+    /// result appended to the conversation that scheduled it — is exactly that,
+    /// even though no LLM call produced it, so it must raise the badge like any
+    /// other reply. This is what makes the redesign need no cron-specific
+    /// unread plumbing at all.
+    #[tokio::test]
+    async fn unread_counts_a_cron_notification_as_a_reply() {
+        use baybo_model::{ChatMessage, ContentBlock};
+
+        let mgr = SessionManager::new(
+            Arc::new(MemorySessionStore::new()),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
+        let session = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+
+        // The user's own message is not something they need to be told about.
+        mgr.append_session_message(
+            &session.id,
+            &ChatMessage::user(vec![ContentBlock::Text("remind me at 6".into())]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mgr.unread_reply_count(&session.id, 99).await.unwrap(), 0);
+
+        // The delivered cron result: a real, unread reply.
+        let ordinal = mgr
+            .append_session_message(
+                &session.id,
+                &ChatMessage::cron_notification(vec![ContentBlock::Text(
+                    r#"⏰ Scheduled task "Dinner reminder" ran:
+
+time to eat"#
+                        .into(),
+                )]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mgr.unread_reply_count(&session.id, 99).await.unwrap(), 1);
+
+        // Reading the conversation clears it.
+        mgr.set_read_cursor(&session.id, ordinal).await.unwrap();
+        assert_eq!(mgr.unread_reply_count(&session.id, 99).await.unwrap(), 0);
     }
 }

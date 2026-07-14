@@ -34,6 +34,18 @@ pub enum ApprovalDecision {
     Deny,
 }
 
+impl ApprovalDecision {
+    /// Canonical lowercase db/wire spelling, matching the
+    /// `#[serde(rename_all = "snake_case")]` form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ApprovalDecision::Approve => "approve",
+            ApprovalDecision::ApproveAlways => "approve_always",
+            ApprovalDecision::Deny => "deny",
+        }
+    }
+}
+
 /// Concrete resource a single tool call touches, derived from its parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]

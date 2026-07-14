@@ -682,6 +682,7 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
                 last_active: Some(created_at),
                 hidden: Some(false),
                 pinned: Some(false),
+                archived: Some(false),
                 folder_id: None,
                 title: None,
                 agent_id: None,

@@ -75,6 +75,14 @@ pub struct AgentTestHarness {
     /// loop's per-turn reminder. Exposed so a task e2e can assert what the
     /// model's tool calls persisted.
     pub task_store: Arc<dyn baybo_store::TaskStore>,
+    /// The concrete session store behind `session_manager`. Exposed so a test
+    /// can inject a transcript-append failure (`fail_appends`) and drive the
+    /// paths that must not treat an unpersisted row as delivered.
+    pub memory_session_store: Arc<baybo_session::test_support::MemorySessionStore>,
+    /// Cron delivery ledger the actor stamps when it appends a one-shot fire's
+    /// result to this session. Exposed so a test can seed an execution and
+    /// assert the delivery resolved it.
+    pub cron_store: Arc<baybo_cron::test_support::InMemoryCronStore>,
     pub mailbox: MailboxSender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
     actor_handle: Option<JoinHandle<()>>,
@@ -527,6 +535,7 @@ impl AgentTestHarnessBuilder {
             actor_parent_token.child_token(),
         );
 
+        let cron_store = Arc::new(baybo_cron::test_support::InMemoryCronStore::new());
         let job_lifecycle_for_harness = Arc::clone(&job_lifecycle);
         let actor = AgentActor::from_parts(
             baybo_agent::state::DurableActorState::new(session.clone()),
@@ -538,6 +547,7 @@ impl AgentTestHarnessBuilder {
                 actor_token,
                 supervisor: None,
                 session_manager: Arc::clone(&session_manager),
+                cron_store: Arc::clone(&cron_store) as Arc<dyn baybo_store::CronStore>,
             },
         );
         let actor_handle = tokio::spawn(actor.run(mailbox_rx));
@@ -558,6 +568,8 @@ impl AgentTestHarnessBuilder {
             token_calibration,
             session_manager,
             task_store,
+            cron_store,
+            memory_session_store,
             mailbox: mailbox_tx,
             outputs: output_rx,
             actor_handle: Some(actor_handle),

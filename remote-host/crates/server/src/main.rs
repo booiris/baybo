@@ -2,7 +2,7 @@
 //! roles on a single listener, distinguished by their disjoint route paths
 //! (`/notify` + `/register` vs `/pair`, `/content`, `/control`). The **relay is
 //! always on**; **push turns on automatically when an APNs `.p8` is configured**
-//! (`APNS_P8_PATH` is set). The gateway admission allow-list is a SQLite (libsql)
+//! (`APNS_P8_PATH` is set). The gateway admission allow-list is a SQLite
 //! table polled for external edits (`admission_db`). Bind + TLS are configured
 //! here (`BIND_ADDR`, and optional `TLS_CERT` + `TLS_KEY` to serve wss/https); the
 //! operator dashboard's separate listener takes its own optional `DASHBOARD_TLS_CERT`
@@ -24,6 +24,7 @@ mod admission_db;
 mod dashboard_backend;
 mod logging;
 mod serve;
+mod sqlite;
 mod traffic;
 mod traffic_query;
 

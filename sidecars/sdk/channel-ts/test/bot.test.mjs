@@ -563,10 +563,12 @@ test("double-send keeps typing alive between reply A and reply B (pending-turn c
   assert.equal(typed, beforeReplyB, "no pings after the final reply");
 });
 
-test("onAttachment delivers media via sendMedia and does NOT end the turn", async () => {
+test("a terminal reply carrying attachments delivers media via sendMedia and ends the turn", async () => {
   const fake = makePlatform();
   const media = [];
+  const texts = [];
   fake.platform.sendMedia = async (_handle, _chat, payload) => { media.push(payload); };
+  fake.platform.sendText = async (_handle, _chat, text) => { texts.push(text); };
   let typed = 0;
   fake.platform.notifyTyping = async () => { typed++; };
   const channel = new BotChannel({
@@ -579,32 +581,47 @@ test("onAttachment delivers media via sendMedia and does NOT end the turn", asyn
   await channel.onStartBot({ botId: "b1", token: "t" });
   fake.emit({ chat: 42, platformUserId: "u", content: "screenshot please" });
   await new Promise((r) => setTimeout(r, 50));
-  const beforeAttachment = typed;
-  assert.ok(beforeAttachment >= 3, `expected ≥3 typing pings, got ${beforeAttachment}`);
+  assert.ok(typed >= 3, `expected ≥3 typing pings, got ${typed}`);
 
-  // A mid-turn attachment lands while the agent is still working.
-  await channel.onAttachment({
+  // The turn's media rides on the terminal reply — one platform send.
+  await channel.onMessage({
     sessionId: "s",
     userId: "test_b1_42_u",
+    content: "here it is",
     attachments: [{ kind: "image", blob_id: "sha256:ab", mime_type: "image/png", size: 1 }],
   });
   assert.equal(media.length, 1, "sendMedia must deliver the attachment");
   assert.equal(media[0].attachments.length, 1);
-  assert.equal(media[0].text, "", "a standalone attachment carries no caption");
+  assert.equal(media[0].text, "here it is", "the reply rides along as the caption");
+  assert.equal(texts.length, 0, "no separate sendText when sendMedia carries the reply");
 
-  // The turn is NOT over: typing must keep pinging (unlike onMessage,
-  // which would terminate it).
-  await new Promise((r) => setTimeout(r, 40));
-  assert.ok(
-    typed > beforeAttachment,
-    `typing must continue after onAttachment (before=${beforeAttachment}, now=${typed})`,
-  );
-
-  // The real terminal reply still ends the turn afterward.
+  // The turn IS over: typing must stop.
   const beforeReply = typed;
-  await channel.onMessage({ sessionId: "s", userId: "test_b1_42_u", content: "here it is" });
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(typed, beforeReply, "the terminal reply ends the turn");
+});
+
+test("a terminal reply with attachments but no sendMedia still ships the text", async () => {
+  const fake = makePlatform();
+  const texts = [];
+  fake.platform.sendMedia = undefined;
+  fake.platform.sendText = async (_handle, _chat, text) => { texts.push(text); };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "screenshot please" });
+  await new Promise((r) => setTimeout(r, 20));
+
+  await channel.onMessage({
+    sessionId: "s",
+    userId: "test_b1_42_u",
+    content: "here it is",
+    attachments: [{ kind: "image", blob_id: "sha256:ab", mime_type: "image/png", size: 1 }],
+  });
+  assert.deepEqual(texts, ["here it is"], "text survives when the platform can't send media");
 });
 
 test("safety cap is not extended by subsequent inbounds from the same user", async () => {

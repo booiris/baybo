@@ -732,6 +732,7 @@ mod tests {
             }),
             hidden: false,
             pinned: false,
+            archived: false,
             folder_id: None,
             title: None,
         };
@@ -963,6 +964,7 @@ mod tests {
                         blob_id: "b-1".into(),
                     },
                     mime_type: "image/png".into(),
+                    filename: None,
                 },
             ]),
             status: SubagentExitStatus::Completed,

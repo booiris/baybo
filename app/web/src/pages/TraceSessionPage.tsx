@@ -583,6 +583,13 @@ function ToolCallDetail({
           <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
             Output {result.success ? '(success)' : '(failed)'}
           </h4>
+          {result.output_truncated_from != null && (
+            <p className="mb-2 font-mono text-[0.75rem] text-warning font-bold">
+              truncated for storage —{' '}
+              {result.output_truncated_from.toLocaleString()} bytes originally.
+              The model saw a capped copy too.
+            </p>
+          )}
           <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3">
             {renderWithSanitizeChips(
               typeof result.output === 'string'

@@ -6,18 +6,21 @@ The `baybo-memory` crate defines a **single pluggable [`Memory`] trait**. The
 system knows memory only through one `Arc<dyn Memory>` slot (not a many-registry
 like tools/channels): at most one implementation is registered at startup. The
 trait is intentionally thin and **storage-opaque** — an implementation owns its
-own persistence (libsql, a vector DB, an external service) and receives its LLM
+own persistence (sqlite, a vector DB, an external service) and receives its LLM
 handle and config in its own constructor.
 
 The core ships the trait, its value types (`MemoryContext`, `RecalledMemory`,
-`MemoryError`), and a **`NoopMemory`** reference default. **No real backend ships
-yet** — the runtime wires `None` (the inert no-op path), so in production today
-nothing is recalled, written, or billed. The plumbing below activates the moment
-a real `Arc<dyn Memory>` is registered.
+`MemoryError`), and a **`NoopMemory`** reference default. Two real backends
+(`mem0`, `openviking` — see [Backends](#backends) below) ship in
+`crates/memory/src/backends/`, constructed at startup by
+`boot::build_memory_backend`. The default config (`memory.enabled = false`,
+`provider = noop`) wires `None` (the inert no-op path), so an unconfigured
+deployment recalls, writes, and bills nothing.
 
 This supersedes the previous CRUD `MemoryManager` facade (now removed, along with
-`MemoryStore`/`MemoryEntry`/`MemoryCategory`, the libsql impl, the `/v1/memory`
-admin REST, and the `memories` table — dropped by migration). The earlier
+`MemoryStore`/`MemoryEntry`/`MemoryCategory`, the sqlite impl, the `/v1/memory`
+admin REST, and the `memories` table — no longer created; the cleanup migration
+was itself removed, so old databases keep it as an inert orphan). The earlier
 heuristic `recall` + `maybe_store` pipeline was retired because it (1) recalled
 by arbitrary substring match, (2) treated entire assistant outputs as memorable,
 and (3) re-injected snapshots as `Role::System` messages that polluted every
@@ -115,8 +118,8 @@ Two gates run independently:
   user input → would pollute / double-write).
 - **`should_fire_session_end(&Session)`** — session-level gate for the
   shutdown hook. Returns true for root `User` / `Cron` sessions; false for
-  `Subagent` and `System`-triggered actors (they send `ActorStop` too but are
-  not user-session endings).
+  `Subagent`-lineage actors (they send `ActorStop` too but are not
+  user-session endings).
 
 The agent loop (`agent_loop.rs`) owns the first three hooks; the actor's
 `AgentMessage::ActorStop` handler (`actor/mod.rs`) owns the fourth.
@@ -138,12 +141,13 @@ The agent loop (`agent_loop.rs`) owns the first three hooks; the actor's
    `AgentMessage::ActorStop` (idle reap, supervised shutdown, …),
    `spawn_session_end_write` detaches a task on the runtime root **before**
    cancelling `actor_token`, so the write survives the actor's teardown. The
-   task loads the FULL durable transcript via `SessionManager::history`
-   (the in-memory view may have been compressed), opens a `MemoryWrite` step,
-   mints a synthetic `JobId` for trace/cost keying, and calls
-   `on_session_end`. The session-level gate skips subagent / maintenance /
-   system actors (whose `ActorStop` is not a user-session ending). A missing
-   session row or empty transcript skips silently.
+   task loads the FULL durable transcript via `SessionManager::full_transcript`
+   (`history` filters out rows marked `superseded_by`, so a compacted session
+   would lose the turns compression folded into a summary), opens a
+   `MemoryWrite` step, mints a synthetic `JobId` for trace/cost keying, and
+   calls `on_session_end`. The session-level gate skips subagent-lineage actors
+   (whose `ActorStop` is not a user-session ending). A missing session row or
+   empty transcript skips silently.
 
 With `memory == None` every hook above is skipped entirely — no trace step is
 opened and nothing is billed, so the no-op path is genuinely inert.
@@ -151,7 +155,7 @@ opened and nothing is billed, so the no-op path is genuinely inert.
 ## Config
 
 `MemoryConfig` on `BayboConfig` (`crates/config/src/memory.rs`): typed
-core-wiring knobs (`enabled`, `llm` entry name) **plus** an opaque
+core-wiring knobs (`enabled`, `provider`, `llm` entry name) **plus** an opaque
 `extra: serde_json::Value` passed through verbatim to the plug-in. The `extra`
 bag is a deliberate, documented exception to the "typed over `Value`" rule —
 plug-in config is genuinely opaque to the core. Memory config is **not**
@@ -182,13 +186,14 @@ the typed config for future backends.
 
 ### `mem0` (`baybo_memory::mem0`)
 
-Hosted SaaS via the Mem0 Platform REST API. Per-user scope comes from the
-caller's `user_id` at every call; `agent_id` (see [Partitioning by
-agent](#partitioning-by-agent)) scopes both hook calls and tool calls to the
-session's bound agent (`ToolContext.agent_id`) — not overridable by any
-param. Tool reads separately accept an optional `scope: "session"` that
-narrows to the current session via Mem0's `run_id` (sourced from
-`ToolContext::session_id`).
+Mem0 Platform REST API — hosted SaaS by default; set `self_hosted: true` (+
+`base_url`) in `extra` to target a self-hosted OSS server, which needs no API
+key and takes a simpler `{query, user_id, limit}` recall body. Per-user scope
+comes from the caller's `user_id` at every call; `agent_id` (see [Partitioning
+by agent](#partitioning-by-agent)) scopes both hook calls and tool calls to the
+session's bound agent (`ToolContext.agent_id`) — not overridable by any param.
+Tool reads separately accept an optional `scope: "session"` that narrows to the
+current session via Mem0's `run_id` (sourced from `ToolContext::session_id`).
 
 | Hook | Behaviour |
 | --- | --- |
@@ -214,7 +219,8 @@ verbatim (`infer: false`) — the model already decided what is worth keeping.
 
 Failure handling: 5-failure / 120 s circuit breaker shared by every API call
 (pauses API calls after sustained outages). Recall failures are
-swallowed and logged at `warn`. API key resolution: vault entry
+swallowed and logged at `warn`. API key resolution (required only in Platform
+mode — a self-hosted OSS server runs unauthenticated): vault entry
 `user_env.<api_key_name>` (managed via `baybo secret add <name>`) → process
 env `<api_key_name>`. `<name>` defaults to `MEM0_API_KEY` when
 `api_key_name` is unset in config.
@@ -254,7 +260,7 @@ probe is `GET /health`; failure logs `warn` and continues.
 ### Operator CLI
 
 `baybo memory {status, setup, test, disable}` — see
-[`docs/cli.md`](../cli.md#baybo-memory). Configure is interactive (provider +
+[`cli.md`](cli.md#command-reference). `setup` is interactive (provider +
 per-field prompts, vault-stash for the API key); memory config is **not**
 hot-reload, so `setup` prints a restart hint.
 

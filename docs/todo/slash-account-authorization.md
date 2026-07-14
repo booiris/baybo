@@ -2,9 +2,9 @@
 
 ## Problem
 
-Slash commands (`/cron add`, `/config set`, `/memory clear`, …) are privileged operator actions: they mutate workspace state, spawn jobs, edit config, and move memory around. Today any message starting with `/` that a channel adapter forwards to the `SlashHandler` is dispatched without an identity check. On multi-user channels (Telegram, Discord, future group chats) this means **any sender in the chat can drive operator commands**, not just the workspace owner.
+Slash commands (`/config set`, `/config unset`, `/secret delete`, `/pair approve`, …) are privileged operator actions: they mutate workspace state, edit config, and move secrets and pairings around. Operator slash dispatch (`CliSlashHandler`) is currently unwired from every chat surface: sidecar channels only reach the gateway dispatcher (`crates/gateway/src/channel/slash.rs`, which owns `/new` only) and sit behind the per-user pairing gate (`docs/modules/pairing.md`), and the TUI exposes only local session commands. But pairing authorizes who may *talk to a bot*, not who may run *operator commands* — the moment `CliSlashHandler` is wired to a multi-user channel (Telegram, Discord, future group chats), **every paired sender can drive operator commands**, not just the workspace owner. This doc covers that gap.
 
-The only identity plumbing that exists today is the `sender: User` field on `Message` (`crates/channels/src/types.rs:12`). That field never reaches the slash dispatcher: `SlashHandler::handle(&self, raw: &str)` (`crates/channels/src/slash.rs:32`) takes only the raw line. The CLI adapter intercepts `/` lines *before* building the `Message` at all (`crates/channels/src/cli.rs` — slash lookup happens on the stdin line pre-Message), so even if the trait were widened, channel adapters still have to be audited to actually pass the sender in.
+Identity does exist at the wire level: `Frame::Message` carries `user_id` + `bot_id`, and the gateway's sidecar dispatcher already takes the caller — `try_handle(resolver, content, channel_type, user_id)` (`crates/gateway/src/channel/slash.rs:69`). None of it reaches the operator seam. On the `Message` side the identity is the `sender: User` field (`crates/channels/src/types.rs:12`), and that field never reaches the slash dispatcher: `SlashHandler::handle(&self, raw: &str)` (`crates/channels/src/slash.rs:120`) — the trait `CliSlashHandler` implements — takes only the raw line. The TUI adapter intercepts `/` lines *before* building the `Message` at all (`crates/tui/src/lib.rs` `handle_slash` — slash lookup happens on the input line pre-Message), so even if the trait were widened, channel adapters still have to be audited to actually pass the sender in.
 
 There is also no config-side notion of "which account is authorized." No `allowed_users`, no owner id, nothing cryptographically bound to a channel principal.
 
@@ -12,11 +12,11 @@ There is also no config-side notion of "which account is authorized." No `allowe
 
 1. **Sender identity does not reach `SlashHandler`.** The trait signature needs to grow a principal argument (or an auth context struct) so the dispatcher can see *who* invoked the command, not just *what*. This is a cross-crate surface change: `baybo-channels`, every adapter, and `baybo-cli`'s `CliSlashHandler` all move together.
 
-2. **No authorization model in config.** There is no `BayboConfig` section declaring the workspace owner, nor per-channel `allowed_users` lists. `docs/todo/config-wire-remaining-sections.md` already flags that several config sections are missing — auth should land in the same batch so the schema commitment is made once.
+2. **No authorization model in config.** There is no `BayboConfig` section declaring the workspace owner, nor per-channel `allowed_users` lists. The config-wiring batch that used to carry the other missing sections has since shipped, so the `access` schema has to be added to `baybo-config` on its own, with validation like the other sections.
 
 3. **`CommandContext::invocation` is too coarse.** It distinguishes `Argv` vs `Slash` but has no principal. Handlers that want to gate on "this is the owner" have nowhere to read it from. The `confirmed: bool` field follows the same pattern — an auth principal slot next to it is the natural shape.
 
-4. **CLI/stdin vs chat channels need different defaults.** A local `baybo` CLI invocation is implicitly authorized (the process runs as the operator); a Telegram message is not. Any design has to let the CLI adapter inject a "local owner" principal without making chat adapters silently inherit that trust.
+4. **CLI/local client vs chat channels need different defaults.** A local `baybo` CLI invocation is implicitly authorized (the process runs as the operator); a Telegram message is not. Any design has to let the local client (the TUI adapter) inject a "local owner" principal without making chat adapters silently inherit that trust.
 
 ## Proposed direction
 
@@ -40,7 +40,7 @@ pub trait SlashHandler {
 }
 ```
 
-Every channel adapter that currently calls `SlashHandler::handle` is updated to build a `SlashPrincipal` from its `sender: User`. The CLI adapter passes `PrincipalSource::Cli` with the process's `USER`.
+Every channel adapter that currently calls `SlashHandler::handle` is updated to build a `SlashPrincipal` from its `sender: User`. The local client (the TUI adapter) passes `PrincipalSource::Cli` with the process's `USER`.
 
 Thread the principal into `CommandContext` alongside `invocation` so handlers can read it.
 
@@ -65,7 +65,7 @@ Validated in `baybo-config::validate` the same way other allow-list sections are
 
 ### Stage 3 — enforcement
 
-In `CliSlashHandler::try_dispatch` (`crates/cli/src/slash.rs:26`), before `dispatch::run`, consult the `AccessPolicy`:
+In `CliSlashHandler::try_dispatch` (`crates/cli/src/slash.rs:30`), before `dispatch::run`, consult the `AccessPolicy`:
 
 - `PrincipalSource::Cli` → always allowed (local process trust).
 - `PrincipalSource::Channel` → must match an `[[access.allowed]]` row for `(channel, user_id)`. Otherwise return a new `CliError::Unauthorized` rendered as a terse `"not authorized"` outcome — no command enumeration, no hint about the allowlist.
@@ -83,9 +83,8 @@ Record every rejection through the recorder with the principal fields redacted t
 
 ## Related
 
-- `crates/channels/src/slash.rs:28-33` — `SlashHandler` trait, needs principal arg
+- `crates/channels/src/slash.rs:116-130` — `SlashHandler` trait, needs principal arg
 - `crates/channels/src/types.rs:12` — `Message.sender` is the identity source
-- `crates/cli/src/slash.rs:26` — `CliSlashHandler::try_dispatch`, enforcement point
+- `crates/cli/src/slash.rs:30` — `CliSlashHandler::try_dispatch`, enforcement point
 - `crates/cli/src/context.rs` — `CommandContext`, add `principal` + `access_policy`
-- `docs/todo/config-wire-remaining-sections.md` — batch the `access` section with other missing config
-- `docs/modules/cli.md` §"Command surface" — update once enforcement ships
+- `docs/modules/cli.md` §"Slash Integration" — update once enforcement ships
