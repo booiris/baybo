@@ -171,7 +171,7 @@ actor task's crash time as the close time.
 - Depends on `baybo-job` (for `CancelReason`) and `baybo-model` (for `JobId`, `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.). No dependency on `baybo-storage`.
 - IDs use ULID newtypes (`StepId`, `SpanId`); `SpanEvent` uses a `(span_id, seq)` compound key
 - Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity); the `Job > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists
-- All deletes are hard `DELETE FROM` — no `deleted_at` tombstone column (see [storage.md](./storage.md#hard-delete))
+- Trace deletes are hard `DELETE FROM` — no `deleted_at` tombstone column (see [storage.md](./storage.md#hard-delete-everywhere-but-cron_jobs))
 - `SpanRecorder` holds locks only for short critical sections, never across `await`
 - `test_support::MemoryTraceStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `baybo-trace = { workspace = true, features = ["test-support"] }`.
 

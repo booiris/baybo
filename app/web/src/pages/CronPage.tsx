@@ -8,12 +8,16 @@ import {
   RiChatSmile2Line,
   RiLoader4Line,
   RiDeleteBinLine,
+  RiPauseLine,
+  RiPlayLine,
+  RiArrowGoBackLine,
 } from 'react-icons/ri';
 import { Button } from '../components/Button';
 import { IconButton } from '../components/IconButton';
 import { SelectBox } from '../components/SelectBox';
 import { SearchBox } from '../components/SearchBox';
 import { useAdminClient, useAuth } from '../api/auth';
+import type { AdminClient } from '../api/client';
 import type { components } from '../api/schema';
 import { useMockMode, MOCK_CRONS } from '../api/mock';
 
@@ -24,6 +28,8 @@ type CronStatus = components['schemas']['CronStatus'];
 const DEFAULT_PAGE_SIZE = 20;
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
 
+const MOCK_BLOCKED = 'Cron mutations are disabled in mock mode.';
+
 const thCell =
   'px-6 py-4 text-left font-bold text-[0.85rem] uppercase tracking-wider border-b-2 border-black sticky top-0 z-10 bg-white';
 
@@ -32,6 +38,87 @@ const STATUS_BADGE_STYLE: Record<CronStatus, string> = {
   disabled: 'bg-gray-200 text-ink-soft',
   executed: 'bg-brand text-ink',
 };
+
+/** Which list the page is showing: the live jobs, or the recycle bin. */
+export type CronView = 'live' | 'deleted';
+
+/** The bodyless `POST /v1/cron/{id}/<action>` routes. */
+export type CronAction = 'pause' | 'resume' | 'restore';
+
+export type CronListOutcome =
+  | { kind: 'ok'; items: CronJob[] }
+  | { kind: 'unauthorized' }
+  | { kind: 'failed'; message: string };
+
+export type CronMutationOutcome =
+  | { kind: 'ok' }
+  | { kind: 'unauthorized' }
+  | { kind: 'failed'; message: string };
+
+function networkMessage(e: unknown): string {
+  return e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway';
+}
+
+/**
+ * A paused job resumes, a running one pauses; an executed one-shot has nothing
+ * left to schedule, so it offers neither.
+ */
+export function toggleActionFor(status: CronStatus): 'pause' | 'resume' | null {
+  if (status === 'enabled') return 'pause';
+  if (status === 'disabled') return 'resume';
+  return null;
+}
+
+export async function fetchCronJobs(client: AdminClient, view: CronView): Promise<CronListOutcome> {
+  try {
+    const { data, error, response } = await client.GET('/v1/cron', {
+      params: { query: { deleted: view === 'deleted' } },
+    });
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error || !response.ok) {
+      return { kind: 'failed', message: error?.error || `HTTP Error ${response.status}` };
+    }
+    return { kind: 'ok', items: data?.items ?? [] };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+async function runMutation(
+  call: () => Promise<{ error?: components['schemas']['ErrorBody']; response: Response }>,
+): Promise<CronMutationOutcome> {
+  try {
+    const { error, response } = await call();
+    if (response.status === 401) return { kind: 'unauthorized' };
+    if (error || !response.ok) {
+      return { kind: 'failed', message: error?.error || `HTTP Error ${response.status}` };
+    }
+    return { kind: 'ok' };
+  } catch (e) {
+    return { kind: 'failed', message: networkMessage(e) };
+  }
+}
+
+/** Soft delete: the row moves to the recycle bin, it does not disappear. */
+export function deleteCronJob(client: AdminClient, id: string): Promise<CronMutationOutcome> {
+  return runMutation(() => client.DELETE('/v1/cron/{id}', { params: { path: { id } } }));
+}
+
+export function actOnCronJob(
+  client: AdminClient,
+  id: string,
+  action: CronAction,
+): Promise<CronMutationOutcome> {
+  switch (action) {
+    case 'pause':
+      return runMutation(() => client.POST('/v1/cron/{id}/pause', { params: { path: { id } } }));
+    case 'resume':
+      // 400 when a one-shot's moment has already passed — the caller surfaces it.
+      return runMutation(() => client.POST('/v1/cron/{id}/resume', { params: { path: { id } } }));
+    case 'restore':
+      return runMutation(() => client.POST('/v1/cron/{id}/restore', { params: { path: { id } } }));
+  }
+}
 
 function formatTimestamp(iso: string | null | undefined): string {
   if (!iso) return '-';
@@ -49,6 +136,7 @@ export function CronPage() {
   const client = useAdminClient();
   const { logout } = useAuth();
 
+  const [view, setView] = useState<CronView>('live');
   const [filter, setFilter] = useState('');
   const [debouncedFilter, setDebouncedFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | CronStatus>('all');
@@ -66,6 +154,8 @@ export function CronPage() {
   const [mutating, setMutating] = useState(false);
   const [mutationError, setMutationError] = useState<string | null>(null);
 
+  const deletedView = view === 'deleted';
+
   // Debounce the filter input
   useEffect(() => {
     const handle = window.setTimeout(() => setDebouncedFilter(filter), 250);
@@ -75,13 +165,13 @@ export function CronPage() {
   // Reset offset on filter change
   useEffect(() => {
     setOffset(0);
-  }, [debouncedFilter, statusFilter, channelFilter, scheduleKindFilter, pageSize]);
+  }, [debouncedFilter, statusFilter, channelFilter, scheduleKindFilter, pageSize, view]);
 
   useEffect(() => {
     let canceled = false;
     async function fetchData() {
       if (isMock) {
-        setAllItems(MOCK_CRONS);
+        setAllItems(MOCK_CRONS.filter((job) => Boolean(job.deleted_at) === deletedView));
         setLoading(false);
         setError(null);
         return;
@@ -90,35 +180,29 @@ export function CronPage() {
       setLoading(true);
       setError(null);
 
-      try {
-        const { data, error: apiError, response } = await client.GET('/v1/cron');
-        if (canceled) return;
-        if (response.status === 401) {
-          logout();
-          return;
-        }
-        if (apiError || !response.ok) {
-          setError(apiError?.error || `HTTP Error ${response.status}`);
-          return;
-        }
-        setAllItems(data?.items ?? []);
-      } catch (e) {
-        if (canceled) return;
-        setError(e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway');
-      } finally {
-        if (!canceled) setLoading(false);
+      const outcome = await fetchCronJobs(client, view);
+      if (canceled) return;
+      setLoading(false);
+      if (outcome.kind === 'unauthorized') {
+        logout();
+        return;
       }
+      if (outcome.kind === 'failed') {
+        setError(outcome.message);
+        return;
+      }
+      setAllItems(outcome.items);
     }
     void fetchData();
     return () => { canceled = true; };
-  }, [client, logout, refreshKey, isMock]);
+  }, [client, logout, refreshKey, isMock, view, deletedView]);
 
   // Client-side filtering
   const filteredItems = allItems.filter(item => {
     if (statusFilter !== 'all' && item.status !== statusFilter) return false;
     if (channelFilter !== 'all' && item.channel !== channelFilter) return false;
     if (scheduleKindFilter !== 'all' && item.schedule.kind !== scheduleKindFilter) return false;
-    
+
     if (debouncedFilter.trim()) {
       const q = debouncedFilter.toLowerCase().trim();
       const matchId = item.id.toLowerCase().includes(q);
@@ -126,7 +210,7 @@ export function CronPage() {
       const matchPrompt = item.prompt.toLowerCase().includes(q);
       if (!matchId && !matchTitle && !matchPrompt) return false;
     }
-    
+
     return true;
   });
 
@@ -141,36 +225,34 @@ export function CronPage() {
   const hasPrev = offset > 0;
   const hasNext = pageEnd < total;
 
-  const handleDelete = async (id: string): Promise<void> => {
+  const mutate = async (id: string, run: () => Promise<CronMutationOutcome>): Promise<void> => {
     if (isMock) {
-      setMutationError('Delete disabled in mock mode.');
+      setMutationError(MOCK_BLOCKED);
       return;
     }
     setMutating(true);
     setMutationError(null);
-    try {
-      const { error: apiError, response } = await client.DELETE('/v1/cron/{id}', {
-        params: { path: { id } },
-      });
-      if (response.status === 401) {
-        logout();
-        return;
-      }
-      if (apiError || !response.ok) {
-        setMutationError(apiError?.error || `HTTP Error ${response.status}`);
-        return;
-      }
-      setPendingDeleteId(null);
-      setSelected((cur) => (cur?.id === id ? null : cur));
-      setRefreshKey((k) => k + 1);
-    } catch (e) {
-      setMutationError(
-        e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway',
-      );
-    } finally {
-      setMutating(false);
+    const outcome = await run();
+    setMutating(false);
+    if (outcome.kind === 'unauthorized') {
+      logout();
+      return;
     }
+    if (outcome.kind === 'failed') {
+      setMutationError(outcome.message);
+      return;
+    }
+    setPendingDeleteId(null);
+    // The row's status / list membership just changed server-side: drop the
+    // detail modal's stale copy and refetch rather than patching in place.
+    setSelected((cur) => (cur?.id === id ? null : cur));
+    setRefreshKey((k) => k + 1);
   };
+
+  const handleDelete = (id: string): Promise<void> => mutate(id, () => deleteCronJob(client, id));
+
+  const handleAction = (id: string, action: CronAction): Promise<void> =>
+    mutate(id, () => actOnCronJob(client, id, action));
 
   const toggleMock = () => {
     const newParams = new URLSearchParams(searchParams);
@@ -240,13 +322,26 @@ export function CronPage() {
       </div>
 
       <div className="flex items-center gap-3 mb-4">
+        <SelectBox
+          aria-label="Job list view"
+          value={view}
+          onChange={(e: ChangeEvent<HTMLSelectElement>) => {
+            setMutationError(null);
+            setView(e.target.value as CronView);
+          }}
+          className="h-10 px-3 min-w-[160px]"
+        >
+          <option value="live">Live Jobs</option>
+          <option value="deleted">Recycle Bin</option>
+        </SelectBox>
+
         <SearchBox
           placeholder="Filter by ID or message..."
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
           className="h-10"
         />
-        
+
         <SelectBox
           value={statusFilter}
           onChange={(e: ChangeEvent<HTMLSelectElement>) => setStatusFilter(e.target.value as any)}
@@ -286,6 +381,15 @@ export function CronPage() {
         </div>
       )}
 
+      {/* Row-level pause / resume have no modal of their own; the confirm and
+          detail modals each render their own copy of this while open, since a
+          banner painted here would sit under their overlay. */}
+      {mutationError && !pendingDeleteId && !selected && (
+        <div className="mb-6 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+          {mutationError}
+        </div>
+      )}
+
       <div className="flex-1 flex flex-col min-h-0 bg-white border-[3px] border-black rounded-md shadow-brutal">
         <div className="flex-1 overflow-auto overscroll-none">
           <table className="w-full border-separate border-spacing-0">
@@ -298,8 +402,10 @@ export function CronPage() {
                 <th className={`${thCell} w-[120px]`}>Channel</th>
                 <th className={thCell}>Action</th>
                 <th className={`${thCell} w-[160px]`}>Created At</th>
-                <th className={`${thCell} w-[160px]`}>Next Trigger</th>
-                <th className={`${thCell} w-[110px] text-right`}>Actions</th>
+                <th className={`${thCell} w-[160px]`}>
+                  {deletedView ? 'Deleted At' : 'Next Trigger'}
+                </th>
+                <th className={`${thCell} w-[150px] text-right`}>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -309,12 +415,13 @@ export function CronPage() {
                     colSpan={9}
                     className="px-6 py-10 text-center text-ink-soft text-[0.9rem]"
                   >
-                    No cron jobs found.
+                    {deletedView ? 'Recycle bin is empty.' : 'No cron jobs found.'}
                   </td>
                 </tr>
               )}
               {items.map((job) => {
                 const cell = `px-6 py-4 align-middle border-b border-black`;
+                const toggle = toggleActionFor(job.status);
                 return (
                   <tr key={job.id} className="hover:bg-gray-50">
                     <td className={cell}>
@@ -344,7 +451,7 @@ export function CronPage() {
                     </td>
                     <td className={cell}>
                       <div className="text-ink-soft text-[0.85rem] leading-snug">
-                        {formatTimestamp(job.next_trigger_at)}
+                        {formatTimestamp(deletedView ? job.deleted_at : job.next_trigger_at)}
                       </div>
                     </td>
                     <td className={`${cell} text-right`}>
@@ -355,17 +462,50 @@ export function CronPage() {
                         >
                           <RiEyeLine />
                         </IconButton>
-                        <IconButton
-                          aria-label="Delete cron job"
-                          onClick={() => {
-                            setMutationError(null);
-                            setPendingDeleteId(job.id);
-                          }}
-                          disabled={isMock || mutating}
-                          className="!border-err !text-err hover:!bg-err/10"
-                        >
-                          <RiDeleteBinLine />
-                        </IconButton>
+                        {deletedView ? (
+                          <IconButton
+                            aria-label="Restore cron job"
+                            title="Restore from the recycle bin"
+                            onClick={() => {
+                              void handleAction(job.id, 'restore');
+                            }}
+                            disabled={isMock || mutating}
+                            className="!border-ok !text-ok hover:!bg-ok/10"
+                          >
+                            <RiArrowGoBackLine />
+                          </IconButton>
+                        ) : (
+                          <>
+                            {toggle && (
+                              <IconButton
+                                aria-label={toggle === 'pause' ? 'Pause cron job' : 'Resume cron job'}
+                                title={
+                                  toggle === 'pause'
+                                    ? 'Pause: stop firing until resumed'
+                                    : 'Resume: next trigger recomputed from now'
+                                }
+                                onClick={() => {
+                                  void handleAction(job.id, toggle);
+                                }}
+                                disabled={isMock || mutating}
+                              >
+                                {toggle === 'pause' ? <RiPauseLine /> : <RiPlayLine />}
+                              </IconButton>
+                            )}
+                            <IconButton
+                              aria-label="Move cron job to recycle bin"
+                              title="Move to the recycle bin"
+                              onClick={() => {
+                                setMutationError(null);
+                                setPendingDeleteId(job.id);
+                              }}
+                              disabled={isMock || mutating}
+                              className="!border-err !text-err hover:!bg-err/10"
+                            >
+                              <RiDeleteBinLine />
+                            </IconButton>
+                          </>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -382,7 +522,7 @@ export function CronPage() {
                 <RiLoader4Line className="animate-spin" /> Loading jobs...
               </span>
             ) : total === 0 ? (
-              'No cron jobs'
+              deletedView ? 'Recycle bin is empty' : 'No cron jobs'
             ) : (
               `Showing ${pageStart} to ${pageEnd} of ${total.toLocaleString()} jobs`
             )}
@@ -425,20 +565,41 @@ export function CronPage() {
       {selected && (
         <CronDetailModal
           job={selected}
-          onClose={() => setSelected(null)}
-          onDelete={() => {
+          submitting={mutating}
+          error={mutationError}
+          onClose={() => {
             setMutationError(null);
-            setPendingDeleteId(selected.id);
+            setSelected(null);
           }}
+          onTrash={
+            selected.deleted_at
+              ? undefined
+              : () => {
+                  setMutationError(null);
+                  setPendingDeleteId(selected.id);
+                }
+          }
+          onRestore={
+            selected.deleted_at
+              ? () => {
+                  void handleAction(selected.id, 'restore');
+                }
+              : undefined
+          }
         />
       )}
       {pendingDeleteId && (
-        <DeleteConfirmModal
+        <TrashConfirmModal
           id={pendingDeleteId}
           submitting={mutating}
           error={mutationError}
-          onCancel={() => setPendingDeleteId(null)}
-          onConfirm={() => handleDelete(pendingDeleteId)}
+          onCancel={() => {
+            setPendingDeleteId(null);
+            setMutationError(null);
+          }}
+          onConfirm={() => {
+            void handleDelete(pendingDeleteId);
+          }}
         />
       )}
     </div>
@@ -447,12 +608,18 @@ export function CronPage() {
 
 function CronDetailModal({
   job,
+  submitting,
+  error,
   onClose,
-  onDelete,
+  onTrash,
+  onRestore,
 }: {
   job: CronJob;
+  submitting: boolean;
+  error: string | null;
   onClose: () => void;
-  onDelete?: () => void;
+  onTrash?: () => void;
+  onRestore?: () => void;
 }) {
   return (
     <div
@@ -471,13 +638,23 @@ function CronDetailModal({
             <code className="font-mono text-[0.9rem] bg-gray-100 px-2 py-0.5 rounded border border-black truncate">{job.id}</code>
           </div>
           <div className="flex items-center gap-4 shrink-0">
-            {onDelete && (
+            {onRestore && (
               <button
                 type="button"
-                onClick={onDelete}
+                onClick={onRestore}
+                disabled={submitting}
+                className="text-[0.85rem] font-bold uppercase tracking-wider text-ok hover:text-ok/80 cursor-pointer inline-flex items-center gap-1"
+              >
+                <RiArrowGoBackLine className="text-base" /> Restore
+              </button>
+            )}
+            {onTrash && (
+              <button
+                type="button"
+                onClick={onTrash}
                 className="text-[0.85rem] font-bold uppercase tracking-wider text-err hover:text-err/80 cursor-pointer inline-flex items-center gap-1"
               >
-                <RiDeleteBinLine className="text-base" /> Delete
+                <RiDeleteBinLine className="text-base" /> Move to Bin
               </button>
             )}
             <button
@@ -490,6 +667,11 @@ function CronDetailModal({
           </div>
         </header>
         <div className="px-6 py-4 space-y-4">
+          {error && (
+            <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
+              {error}
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">User ID</label>
@@ -511,6 +693,12 @@ function CronDetailModal({
               <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">Timezone</label>
               <div className="font-mono text-[0.9rem]">{job.timezone}</div>
             </div>
+            {job.deleted_at && (
+              <div>
+                <label className="block text-[0.7rem] font-bold uppercase text-ink-soft mb-1">Deleted At</label>
+                <div className="text-[0.9rem]">{formatTimestamp(job.deleted_at)}</div>
+              </div>
+            )}
           </div>
 
           <div>
@@ -532,7 +720,7 @@ function CronDetailModal({
   );
 }
 
-function DeleteConfirmModal({
+function TrashConfirmModal({
   id,
   submitting,
   error,
@@ -557,15 +745,16 @@ function DeleteConfirmModal({
         onClick={(e) => e.stopPropagation()}
       >
         <header className="px-6 py-4 border-b-2 border-black">
-          <h3 className="font-bold uppercase tracking-wider">Delete Cron Job</h3>
+          <h3 className="font-bold uppercase tracking-wider">Move to Recycle Bin</h3>
         </header>
         <div className="px-6 py-4 space-y-3">
           <p className="text-[0.95rem]">
-            Permanently delete cron job{' '}
+            Move cron job{' '}
             <code className="font-mono text-[0.85rem] bg-gray-100 px-1 rounded border border-black">
               {id}
             </code>
-            ? This cannot be undone.
+            {' '}to the recycle bin? It stops firing and leaves this list, but the record is kept —
+            you can restore it from the Recycle Bin view.
           </p>
           {error && (
             <div className="bg-white border-[2px] border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem]">
@@ -589,7 +778,7 @@ function DeleteConfirmModal({
             className="!py-1 !px-3 !text-[0.85rem] h-9 gap-1.5 !bg-err !text-white !border-err hover:!bg-err/90"
           >
             {submitting && <RiLoader4Line className="animate-spin text-base shrink-0" />}
-            <RiDeleteBinLine className="text-base shrink-0" /> Delete
+            <RiDeleteBinLine className="text-base shrink-0" /> Move to Bin
           </Button>
         </footer>
       </div>

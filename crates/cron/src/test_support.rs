@@ -53,6 +53,29 @@ impl InMemoryCronStore {
             None => Err(StorageError::NotFound(execution_id.to_string())),
         }
     }
+
+    /// Write a job's recycle-bin state, mirroring the sqlite impl: the row is
+    /// kept either way, only the `deleted_at` stamp moves.
+    fn stamp_deleted_at(&self, job_id: &str, deleted_at: Option<DateTime<Utc>>) -> Result<()> {
+        let mut jobs = self.jobs.lock();
+        match jobs.iter_mut().find(|j| j.id == job_id) {
+            Some(job) => {
+                job.deleted_at = deleted_at;
+                job.updated_at = Utc::now();
+                Ok(())
+            }
+            None => Err(StorageError::NotFound(job_id.to_string())),
+        }
+    }
+
+    fn is_deleted(&self, job_id: &str) -> Result<bool> {
+        self.jobs
+            .lock()
+            .iter()
+            .find(|j| j.id == job_id)
+            .map(CronJob::is_deleted)
+            .ok_or_else(|| StorageError::NotFound(job_id.to_string()))
+    }
 }
 
 #[async_trait]
@@ -66,25 +89,47 @@ impl CronStore for InMemoryCronStore {
         Ok(self.jobs.lock().iter().find(|j| j.id == job_id).cloned())
     }
 
+    /// Mirrors the sqlite impl: a save carries everything about a job *except*
+    /// its recycle-bin state, which only `delete` and `restore` may move. A
+    /// caller writing back a snapshot it read before a deletion must not
+    /// resurrect the job.
     async fn save(&self, job: &CronJob) -> Result<()> {
         let mut jobs = self.jobs.lock();
         if let Some(existing) = jobs.iter_mut().find(|j| j.id == job.id) {
+            let deleted_at = existing.deleted_at;
             *existing = job.clone();
+            existing.deleted_at = deleted_at;
             Ok(())
         } else {
             Err(StorageError::NotFound(job.id.clone()))
         }
     }
 
-    async fn delete(&self, job_id: &str) -> Result<()> {
+    /// Mirrors the sqlite impl's conditional UPDATE: the write lands only while
+    /// the row is still the enabled, live job the tick loop read, so a pause or
+    /// a delete that raced the fire is not undone by the write-back.
+    async fn save_if_still_enabled(&self, job: &CronJob) -> Result<bool> {
         let mut jobs = self.jobs.lock();
-        let len_before = jobs.len();
-        jobs.retain(|j| j.id != job_id);
-        if jobs.len() == len_before {
-            Err(StorageError::NotFound(job_id.to_string()))
-        } else {
-            Ok(())
+        match jobs.iter_mut().find(|j| j.id == job.id) {
+            Some(existing) if existing.is_enabled() && !existing.is_deleted() => {
+                let deleted_at = existing.deleted_at;
+                *existing = job.clone();
+                existing.deleted_at = deleted_at;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
+    }
+
+    async fn delete(&self, job_id: &str) -> Result<()> {
+        if self.is_deleted(job_id)? {
+            return Ok(());
+        }
+        self.stamp_deleted_at(job_id, Some(Utc::now()))
+    }
+
+    async fn restore(&self, job_id: &str) -> Result<()> {
+        self.stamp_deleted_at(job_id, None)
     }
 
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<CronJob>> {
@@ -92,13 +137,19 @@ impl CronStore for InMemoryCronStore {
             .jobs
             .lock()
             .iter()
-            .filter(|j| j.user_id == user_id)
+            .filter(|j| !j.is_deleted() && j.user_id == user_id)
             .cloned()
             .collect())
     }
 
     async fn list_all(&self) -> Result<Vec<CronJob>> {
-        Ok(self.jobs.lock().clone())
+        Ok(self
+            .jobs
+            .lock()
+            .iter()
+            .filter(|j| !j.is_deleted())
+            .cloned()
+            .collect())
     }
 
     async fn list_enabled(&self) -> Result<Vec<CronJob>> {
@@ -106,9 +157,21 @@ impl CronStore for InMemoryCronStore {
             .jobs
             .lock()
             .iter()
-            .filter(|j| j.status == CronStatus::Enabled)
+            .filter(|j| !j.is_deleted() && j.status == CronStatus::Enabled)
             .cloned()
             .collect())
+    }
+
+    async fn list_deleted(&self) -> Result<Vec<CronJob>> {
+        let mut deleted: Vec<CronJob> = self
+            .jobs
+            .lock()
+            .iter()
+            .filter(|j| j.is_deleted())
+            .cloned()
+            .collect();
+        deleted.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+        Ok(deleted)
     }
 
     async fn list_due(&self, now_us: i64) -> Result<Vec<CronJob>> {
@@ -117,7 +180,8 @@ impl CronStore for InMemoryCronStore {
             .lock()
             .iter()
             .filter(|j| {
-                j.status == CronStatus::Enabled
+                !j.is_deleted()
+                    && j.status == CronStatus::Enabled
                     && j.next_trigger_at
                         .is_some_and(|t| t.timestamp_micros() <= now_us)
             })

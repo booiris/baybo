@@ -144,7 +144,7 @@ Gate (all must hold): the turn is `UserChat`; a `SessionTitleSink` is wired (the
 
 ### LLM-invocable cron tools
 
-`baybo_cron::tools::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule/cancel/inspect cron jobs mid-conversation. They live in `baybo-cron::tools` (not `baybo-tools`) because they each hold `Arc<CronScheduler>`, and `baybo-tools` cannot depend on `baybo-cron` without creating a cycle. `crates/baybo/src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
+`baybo_cron::tools::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, `CronPauseTool`, `CronResumeTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule, pause, resume, cancel and inspect cron jobs mid-conversation. They live in `baybo-cron::tools` (not `baybo-tools`) because they each hold `Arc<CronScheduler>`, and `baybo-tools` cannot depend on `baybo-cron` without creating a cycle. `crates/baybo/src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
 
 ### Startup recovery
 

@@ -117,11 +117,25 @@ pub struct CronJob {
     /// Session where this cron job was created (for traceability).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_session_id: Option<SessionId>,
+    /// When the user moved this job to the recycle bin. `None` = live.
+    ///
+    /// Orthogonal to [`Self::status`]: a deleted one-shot that already fired
+    /// keeps `Executed`, and restoring it restores exactly the status it had.
+    /// A deleted job never fires and is hidden from every listing, but stays
+    /// resolvable by id — its execution rows and the conversations they opened
+    /// still name a real job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 impl CronJob {
     pub fn is_enabled(&self) -> bool {
         self.status == CronStatus::Enabled
+    }
+
+    /// True while the job sits in the recycle bin.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
     }
 
     pub fn is_one_shot(&self) -> bool {
@@ -387,6 +401,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             origin_session_id: None,
+            deleted_at: None,
         }
     }
 
@@ -429,6 +444,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             origin_session_id: Some(SessionId::from("sess-1")),
+            deleted_at: None,
         };
         let json = serde_json::to_string(&job).unwrap();
         let restored: CronJob = serde_json::from_str(&json).unwrap();
@@ -437,6 +453,7 @@ mod tests {
         assert_eq!(restored.timezone, "Asia/Shanghai");
         assert!(!restored.is_one_shot());
         assert!(restored.is_enabled());
+        assert!(!restored.is_deleted());
         assert_eq!(
             restored.origin_session_id.as_ref().map(|s| s.as_str()),
             Some("sess-1"),
@@ -460,6 +477,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             origin_session_id: None,
+            deleted_at: None,
         };
         let json = serde_json::to_string(&job).unwrap();
         let restored: CronJob = serde_json::from_str(&json).unwrap();
@@ -483,6 +501,28 @@ mod tests {
         }"#;
         let restored: CronJob = serde_json::from_str(json).unwrap();
         assert_eq!(restored.timezone, "UTC");
+        assert!(
+            !restored.is_deleted(),
+            "a stored row is live unless stamped"
+        );
+    }
+
+    #[test]
+    fn deleted_at_round_trips_and_is_orthogonal_to_status() {
+        let deleted_at: DateTime<Utc> = "2026-07-01T08:00:00Z".parse().unwrap();
+        let mut job = job_with_tz("UTC");
+        job.status = CronStatus::Executed;
+        job.deleted_at = Some(deleted_at);
+
+        let restored: CronJob =
+            serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+        assert!(restored.is_deleted());
+        assert_eq!(restored.deleted_at, Some(deleted_at));
+        assert_eq!(
+            restored.status,
+            CronStatus::Executed,
+            "a fired one-shot keeps its status in the recycle bin"
+        );
     }
 
     #[test]

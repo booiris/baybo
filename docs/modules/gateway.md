@@ -551,10 +551,13 @@ GET    /v1/jobs/:id
 POST   /v1/jobs/:id/cancel
 GET    /v1/background-jobs              long-running background job list
 
-GET    /v1/cron
+GET    /v1/cron                         ?deleted=  live jobs; deleted=true serves the recycle bin
 POST   /v1/cron                         { schedule, user_id, channel?, text, timezone, origin_session_id? }
-GET    /v1/cron/:id
-DELETE /v1/cron/:id
+GET    /v1/cron/:id                     resolves a job live or deleted
+DELETE /v1/cron/:id                     move to the recycle bin: stops firing, leaves the list, row survives
+POST   /v1/cron/:id/pause               status → disabled, next trigger cleared
+POST   /v1/cron/:id/resume              status → enabled, next trigger recomputed from now (no backfill)
+POST   /v1/cron/:id/restore             out of the recycle bin, with the status it was deleted with
 
 GET    /v1/traces                       ?status=&since=&until=&limit=&cursor=  filtered session-summary list
 GET    /v1/traces/:session_id           session overview (message log + job summaries)

@@ -661,6 +661,13 @@ pub struct CronJob {
     pub next_trigger_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When the job was moved to the recycle bin. Absent on a live job.
+    /// A present value means the job never fires and is listed only by
+    /// `GET /v1/cron?deleted=true`, until `POST /v1/cron/{id}/restore`
+    /// brings it back. `status` is orthogonal — a deleted one-shot that
+    /// already fired stays `executed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_session_id: Option<String>,
 }
@@ -680,6 +687,7 @@ impl From<baybo_cron::CronJob> for CronJob {
             next_trigger_at: v.next_trigger_at,
             created_at: v.created_at,
             updated_at: v.updated_at,
+            deleted_at: v.deleted_at,
             origin_session_id: v.origin_session_id.map(|s| s.into_inner()),
         }
     }

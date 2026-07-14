@@ -10,6 +10,8 @@ mod auth;
 mod channel_ws;
 #[path = "chat_api.rs"]
 mod chat_api;
+#[path = "cron_api.rs"]
+mod cron_api;
 #[path = "device_channel_ws.rs"]
 mod device_channel_ws;
 #[path = "jobs_pagination.rs"]
