@@ -463,6 +463,7 @@
                     | gateway | Channel gateway & session routing | tokio, axum | stable | core-team |
                     | wire | Frame protocol & serialization | serde, rmp-serde | stable | core-team |
                     | agent | Agent execution loop | tokio, baybo-tools | iterating | agent-team |
+                    | Dicklesworthstone/destructive_llm_agent_experiments | 一个比列宽还长、且没有断行机会的 token —— 必须在格子内折行,不能压到隔壁列上 | serde | stable | ext |
 
                     A narrow table stretches to fill the row:
 

@@ -27,8 +27,8 @@ const COMPONENTS: Components = {
   // phone). Without the wrapper the table inherits the prose's `overflow-wrap:
   // anywhere` and shrinks its cells to fit instead of overflowing — so it never
   // scrolls, it just folds each cell into a tall column of broken words. The
-  // wrapper is the scroll box; `white-space: nowrap` on the cells (styles.css)
-  // keeps content on one line so the table grows past the band and scrolls.
+  // wrapper is the scroll box; the cells cap their width and wrap inside it
+  // (styles.css), so the table grows past the band and scrolls.
   table({ children }) {
     return (
       <div className="md-table-wrap">

@@ -325,7 +325,6 @@ button {
   border: 1px solid var(--color-line);
   border-radius: 10px;
   overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
 }
 /* Scroll a LITTLE, then wrap. A pure sideways scroller makes a 4 KB base64 line
    a scroll to nowhere; a pure soft-wrap shatters the alignment of ordinary code
@@ -365,11 +364,9 @@ button {
    Each column is capped (max-width) so one long cell can't dominate: content
    wraps within the cap. The table sizes to its (capped) content, and when that
    overflows the reading band it scrolls left/right inside the wrapper (its own
-   box, momentum scroll for the WKWebView) rather than squeezing to fit. */
+   box) rather than squeezing to fit. */
 .md-table-wrap {
-  margin: var(--md-block-gap) 0;
   overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
 }
 .md-table-wrap table {
   /* max-content = the table takes each column's own content width (capped by the
@@ -383,9 +380,16 @@ button {
 }
 .md-table-wrap th,
 .md-table-wrap td {
-  /* Reset the prose's break-anywhere so tokens don't shatter mid-word; wrap on
-     natural boundaries only once the cell hits its max-width cap. */
-  overflow-wrap: normal;
+  /* `word-break: normal` is load-bearing, not a redundant default: the prose
+     ancestor's `word-break: break-word` inherits in and behaves like
+     `overflow-wrap: anywhere`, shattering ordinary words mid-token. `break-word`
+     is the last resort that reset re-opens — WebKit clamps a cell's MIN-content
+     preferred width to a fixed `max-width`, so a token with no break opportunity
+     (`Dicklesworthstone/destructive_llm_agent_experiments` — `_` is not one)
+     can't widen the capped column and, left unbroken, paints over the next one.
+     Unlike `anywhere`, it never lowers a min-content contribution, so no column
+     collapses: it only fires on a token that can't fit a line of its own. */
+  overflow-wrap: break-word;
   word-break: normal;
   max-width: 12rem;
   padding: 0.4rem 0.7rem;
