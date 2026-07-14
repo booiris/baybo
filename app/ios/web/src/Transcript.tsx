@@ -1512,6 +1512,19 @@ export function Transcript({
   // Guards one in-flight sync request (the `sync_page`/`sync_failed` reply
   // clears it) so a burst of triggers coalesces to one pull.
   const syncInFlight = useRef(false);
+  // Render-visible mirror of that guard. An EMPTY thread with a sync in flight
+  // is the one open the mirror cannot serve — a session this device has never
+  // rendered (started on web/TUI, a cron fire, a push tap into a new session,
+  // the first open after a re-pair) has no cached rows by construction, so its
+  // first rows MUST come off the network. Everything else paints from the mirror
+  // at mount and never sees this. The guard is a ref precisely so it doesn't
+  // re-render; the loading line needs state, so keep the two in lockstep through
+  // `setSyncInFlight` and never write the ref directly.
+  const [syncing, setSyncing] = useState(false);
+  const setSyncInFlight = useCallback((inFlight: boolean) => {
+    syncInFlight.current = inFlight;
+    setSyncing(inFlight);
+  }, []);
   // Highest ordinal already reported to native as read — dedupes the
   // fire-and-forget `mark_read` posts (the cursor advances on every sync and
   // every live reply while the transcript is on screen).
@@ -1600,8 +1613,17 @@ export function Transcript({
 
   // Mirror the thread to native on every change so a webview reload / app
   // relaunch restores it (via init.restoredState). Debounced bridge-side.
+  //
+  // An empty thread with no cursor writes NOTHING. It has nothing to restore, and
+  // the transcript mounts for every compose draft — including the throwaway one
+  // the app prewarms at launch — each under a fresh uuid that never becomes a
+  // chat-list row. Persisting those minted a mirror file per abandoned draft that
+  // no code could ever reach again: a draft has no row, so the user can't delete
+  // it, and nothing sweeps the directory (see `TranscriptStore`). Don't create
+  // the orphan rather than hunt it later.
   useEffect(() => {
-    persistLatest.current = () =>
+    persistLatest.current = () => {
+      if (messages.length === 0 && cursorRef.current.cursor === null) return;
       persistState({
         messages,
         lastOrdinal: cursorRef.current.cursor,
@@ -1609,6 +1631,7 @@ export function Transcript({
         hasMoreOlder,
         imageDims: Object.fromEntries(imageDims),
       });
+    };
     persistLatest.current();
   }, [messages, hasMoreOlder, imageDims]);
 
@@ -2091,14 +2114,14 @@ export function Transcript({
     if (syncInFlight.current) return;
     const cursor = cursorRef.current.cursor;
     const limit = cursor === null ? SYNC_BASELINE_LIMIT : SYNC_MERGE_LIMIT;
-    syncInFlight.current = true;
+    setSyncInFlight(true);
     try {
       postSyncRequest(cursor, limit);
     } catch (e) {
-      syncInFlight.current = false;
+      setSyncInFlight(false);
       log("warn", `sync request failed: ${String(e)}`);
     }
-  }, []);
+  }, [setSyncInFlight]);
 
   const advanceCursorFromSync = useCallback((nextCursor: number | null, rebased: boolean) => {
     cursorRef.current = advanceFromSync(cursorRef.current, nextCursor, rebased);
@@ -2127,7 +2150,7 @@ export function Transcript({
   // `platform_msg_id`. Rows arrive ascending; each carries its stable id.
   const applySyncPage = useCallback(
     (frame: Extract<WireFrame, { kind: "sync_page" }>) => {
-      syncInFlight.current = false;
+      setSyncInFlight(false);
       const replace = frame.rebased || frame.since_ordinal === null;
       const pageRows = frame.rows
         .map(transcriptItemToRow)
@@ -2257,7 +2280,7 @@ export function Transcript({
       advanceCursorFromSync(frame.next_cursor, frame.rebased);
       markReadIfAdvanced();
     },
-    [advanceCursorFromSync, markReadIfAdvanced],
+    [advanceCursorFromSync, markReadIfAdvanced, setSyncInFlight],
   );
 
   const handleFrame = (frameJson: string) => {
@@ -2467,7 +2490,7 @@ export function Transcript({
       case "sync_failed":
         // The native chatFetchSync API call failed — unwind the in-flight
         // guard so the next trigger retries; the durable record is intact.
-        syncInFlight.current = false;
+        setSyncInFlight(false);
         log("warn", `sync fetch failed: ${frame.error}`);
         break;
       case "history_page": {
@@ -2563,14 +2586,28 @@ export function Transcript({
     pagingRef.current = false;
     setLoadingOlder(false);
     setConnEpoch(epoch);
+    // A sync issued on the leg that just died will never be answered — release
+    // its coalescing guard, or the pull below is swallowed by a reply that isn't
+    // coming (see `handleSyncRequested`).
+    setSyncInFlight(false);
     runSync();
   };
 
-  // Native asked for a sync run (offscreen-buffer-overflow re-attach, or any
-  // native-side "go sync" edge). Same one forward-recovery pull.
+  // Native asked for a sync run (the offscreen-buffer-overflow re-attach, or any
+  // other native-side "go sync" edge). Same one forward-recovery pull — but
+  // release the in-flight guard FIRST. Native only asks because it dropped what
+  // it was carrying, and the `sync_page` it dropped may be the very reply this
+  // guard is waiting on: the page rides the ordinary buffered frame path, so an
+  // overflow while the user sat on the chat list discards it (`ChatStore
+  // .overflowBufferedFrames`) and no `sync_page`/`sync_failed` ever lands. The
+  // guard would then stay set for the life of the React tree — which a
+  // same-session re-entry does NOT remount — dead-ending every later sync edge
+  // (mount, connEpoch, gap, the 3-minute tick) and stranding the thread empty
+  // with `.thread-loading` promising a page that will never arrive.
   const handleSyncRequested = useCallback(() => {
+    setSyncInFlight(false);
     runSync();
-  }, [runSync]);
+  }, [runSync, setSyncInFlight]);
 
   // The one client loop's OPEN edge: run sync on mount (a resident re-entry —
   // hydration-matrix cell E in the retired scheme — that fires no connEpoch
@@ -2760,6 +2797,17 @@ export function Transcript({
           <div className="work-pending">
             <span className="work-spin">✻</span>
             {t("chat.working")}
+          </div>
+        )}
+        {renderRows.length === 0 && !streaming && !turnActive && syncing && (
+          // Nothing cached and nothing live, with the first page still in
+          // flight — the only open the mirror can't serve. Blank paper here
+          // reads as a broken chat; say we're fetching instead. The 400ms CSS
+          // delay keeps it invisible on the two opens that resolve instantly: a
+          // restored thread (rows already painted, so this branch never runs)
+          // and a compose draft (native answers with a synthesized empty page).
+          <div className="thread-loading" aria-live="polite">
+            {t("chat.loadingThread")}
           </div>
         )}
       </div>
