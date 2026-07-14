@@ -9,16 +9,16 @@
 //! registered by [`default_tools`] — a follow-up will wire them in as each
 //! backing subsystem arrives.
 //!
-//! | Tool       | Status        |
-//! |------------|---------------|
-//! | `Read`     | implemented   |
-//! | `Write`    | implemented   |
-//! | `Edit`     | implemented   |
-//! | `Bash`     | implemented   |
-//! | `Glob`     | implemented   |
-//! | `Grep`     | implemented   |
-//! | `WebFetch` | implemented   |
-//! | `SendFile` | implemented   |
+//! | Tool         | Status        |
+//! |--------------|---------------|
+//! | `Read`       | implemented   |
+//! | `Write`      | implemented   |
+//! | `Edit`       | implemented   |
+//! | `Bash`       | implemented   |
+//! | `Glob`       | implemented   |
+//! | `Grep`       | implemented   |
+//! | `WebFetch`   | implemented   |
+//! | `AttachFile` | implemented   |
 //! | everything else listed in `todo.rs` | stubbed  |
 
 use std::sync::Arc;
@@ -29,6 +29,7 @@ use baybo_workspace::WorkspacePaths;
 
 use crate::{Tool, ToolCapability, ToolManifest};
 
+pub mod attach_file;
 pub mod background_jobs;
 pub mod bash;
 pub mod edit;
@@ -39,7 +40,6 @@ pub(crate) mod paths;
 pub mod read;
 mod rg;
 pub mod secret;
-pub mod send_local_file;
 pub mod todo;
 pub mod web_fetch;
 pub mod write;
@@ -99,7 +99,7 @@ pub fn default_tools(
             WebFetchTool::new(blob_store.clone(), proxy),
             vec![ToolCapability::Http],
         ),
-        send_local_file::tool(blob_store.clone()),
+        attach_file::tool(blob_store.clone()),
         trusted(NowTool, vec![]),
         trusted(secret::SecretAddTool, vec![]),
         trusted(secret::SecretListTool, vec![]),

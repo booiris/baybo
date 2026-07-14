@@ -330,6 +330,7 @@ mod tests {
                 "…file body…".into(),
                 Some(baybo_model::ToolResultMeta {
                     read_fingerprint: Some(recorded),
+                    approval: None,
                 }),
             ),
         ];

@@ -145,21 +145,24 @@ function generateMockCrons(count: number): components['schemas']['CronJob'][] {
     'Check for new releases in my watched repos',
     'Reminder: Weekly sync starting in 10 minutes',
   ];
+  const titles = ['Unread digest', 'Weather report', 'Release watch', 'Weekly sync reminder'];
 
   for (let i = 0; i < count; i++) {
     const isCron = Math.random() > 0.2;
     const createdAt = new Date(now - i * 1000 * 60 * 60 * 24);
     const updatedAt = new Date(now - i * 1000 * 60 * 60 * 2);
     
+    const pick = Math.floor(Math.random() * prompts.length);
     crons.push({
       id: `cron-${Math.random().toString(36).substring(2, 9)}`,
       user_id: `user-${Math.floor(Math.random() * 100)}`,
       channel: channels[Math.floor(Math.random() * channels.length)],
+      title: titles[pick],
       status: statuses[Math.floor(Math.random() * statuses.length)],
       schedule: isCron 
         ? { kind: 'cron', expr: schedules[Math.floor(Math.random() * schedules.length)] }
         : { kind: 'at', time: new Date(now + Math.random() * 1000 * 60 * 60 * 24).toISOString() },
-      prompt: prompts[Math.floor(Math.random() * prompts.length)],
+      prompt: prompts[pick],
       timezone: 'UTC',
       last_triggered_at: Math.random() > 0.3 ? new Date(now - Math.random() * 1000 * 60 * 60).toISOString() : null,
       next_trigger_at: new Date(now + Math.random() * 1000 * 60 * 60).toISOString(),

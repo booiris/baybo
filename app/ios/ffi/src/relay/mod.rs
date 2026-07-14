@@ -11,6 +11,7 @@ mod api;
 mod blob;
 mod chat;
 mod dial;
+pub(crate) mod leg_pool;
 mod pairing;
 mod tunnel;
 

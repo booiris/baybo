@@ -16,13 +16,16 @@ Reproduced on:
 Both runs send 41 `function_declarations` (Bash, Read, Write, browser/*, …).
 Baybo-side prefix stability has been audited and is not the cause:
 
-- `crates/agent/src/soul.rs:73` env block contains only workdir + platform — no
-  timestamps, no UUIDs.
+- The stable prefix carries no timestamps or UUIDs: workdir + platform ride on
+  the Bash tool description (`crates/tools/src/builtin/bash/mod.rs:102-104`) and
+  the system prompt is assembled from static identity files
+  (`crates/context/src/prompts/soul.rs`) — the old soul-level env block was
+  dissolved (commit 61f7311e).
 - `crates/tools/src/registry.rs:151` already sorts the tool list by name so the
   serialised `tools` array is byte-identical across calls.
-- The rig path at `crates/llm/src/lib.rs:373` (and `:279` for streaming) already
-  works around rig 0.34's missing `cached_input_tokens` mapping by reading
-  `usage_metadata.cached_content_token_count` directly off the raw response —
+- The rig path at `crates/llm/src/lib.rs:528-545` (and `from_gemini_stream` at
+  `:365-396` for streaming) reads `usage_metadata.cached_content_token_count`
+  directly off the raw response (rig 0.37, now pinned, also maps it upstream) —
   so a 0 here is what Google returned, not a parse loss.
 
 Matches the open community report at
@@ -36,14 +39,15 @@ Gemini's *explicit* cache (`cachedContents` resource) is the only path to a
 cache hit while tools are in play, but the API constraint is positional, not
 existential: `system_instruction` and `tools` must live **inside** the
 `CachedContent` itself, and the per-turn `generateContent` request must then
-*not* re-send them. rig 0.34 has no plumbing for either side:
+*not* re-send them. rig 0.37 (the pinned version) still has no plumbing for
+either side:
 
 - `GenerateContentRequest` has no `cachedContent` field —
-  `~/.cargo/registry/src/.../rig-core-0.34.0/src/providers/gemini/completion.rs:1945`
+  `~/.cargo/registry/src/.../rig-core-0.37.0/src/providers/gemini/completion.rs:2001`
   is a literal commented-out `// cachedContent: Optional<String>`.
-- `create_request_body` (same file, line 281) unconditionally writes
-  `system_instruction` and `tools` into the request, with no bypass for the
-  cached-content case.
+- `create_request_body` (same file, line 194; the request is built at line 283)
+  unconditionally writes `system_instruction` and `tools` into the request, with
+  no bypass for the cached-content case.
 - No client API for `POST /v1beta/cachedContents` resource creation.
 
 Pushing `cachedContent` through `additional_params` (which is `flatten`-ed) is
@@ -61,7 +65,10 @@ Three options, ordered by cost:
 near the `cached_input_tokens` workaround) that fires once per session when
 `cached_content_token_count` is 0/absent on a call with non-empty `tools` on a
 2.5-or-newer Gemini model. Documents the gap in operator logs without committing
-engineering effort. Revisit when rig 0.35 ships or Google fixes implicit caching.
+engineering effort. Revisit when a rig release adds `cachedContent` plumbing
+(still absent as of the pinned rig 0.37 — the 0.34 → 0.37 bump in 499709c9 fixed
+the cached-token usage mapping but not the request field) or Google fixes
+implicit caching.
 
 **B — Explicit-cache POC.** Behind a feature flag, bypass rig for the Gemini
 path: write a `GeminiExplicitCacheClient` that
@@ -101,15 +108,18 @@ implicit caching. Cheapest; only viable if Gemini stays a side experiment.
 
 - Does Google's implicit caching ever start working with tools? Watch
   vercel/ai #11513 and the Gemini API release notes.
-- Does rig 0.35+ expose `cachedContent`? If so, option B collapses to "wire it
-  up + write the resource manager."
+- Does a future rig release expose `cachedContent`? Verified NO through 0.37
+  (the pinned version — field still commented out, no `cachedContents` client).
+  If a later release adds it, option B collapses to "wire it up + write the
+  resource manager."
 - Storage-cost break-even point — at what number of turns does a 7-8k cache
   resource pay back its 1-hour storage fee? Run the math against current
   Gemini pricing before committing to B.
 
 ## Related
 
-- `crates/llm/src/lib.rs:264-294, :340-384` — rig 0.34 cache-token workaround.
+- `crates/llm/src/lib.rs:365-396, :527-545` — Gemini cache-token re-derive
+  (streaming + non-streaming).
 - `crates/llm/src/providers/gemini.rs` — provider factory; explicit-cache work
   would land alongside.
 - `crates/tools/src/registry.rs:144-152` — tool ordering rationale (Anthropic

@@ -5,6 +5,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -18,6 +19,40 @@ const UPLOAD_PART_SUFFIX: &str = "upload.part";
 static UPLOAD_PART_COUNTER: AtomicU64 = AtomicU64::new(0);
 static UPLOAD_PART_SWEEP: OnceCell<()> = OnceCell::const_new();
 static CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+static BLOB_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Where downloaded blobs live. Set once at client construction from
+/// `ClientConfig.blob_cache_dir`; host tests (and any embedder that leaves it
+/// unset) fall back to the OS temp dir.
+///
+/// Nothing evicts from here. The blobs are durable on purpose — a file the user
+/// downloaded stays downloaded — so the directory only ever grows. When that
+/// becomes a problem it wants a real retention policy, not a surprise sweep.
+pub(crate) fn set_blob_cache_dir(dir: PathBuf) {
+    let _ = BLOB_CACHE_DIR.set(dir);
+}
+
+fn blob_cache_dir() -> PathBuf {
+    BLOB_CACHE_DIR.get().cloned().unwrap_or_else(fallback_dir)
+}
+
+#[cfg(not(test))]
+fn fallback_dir() -> PathBuf {
+    std::env::temp_dir().join(BLOB_CACHE_SUBDIR)
+}
+
+/// Under test the fallback is per-PROCESS, and that is load-bearing.
+/// `sweep_stale_upload_parts_once` deletes every `*.upload.part` it finds: it
+/// exists to clear parts a previous crashed RUN left behind, and it cannot tell
+/// a dead run's leftovers from another live process's in-flight write. The app
+/// is one process, so that holds. `cargo nextest` is not — it runs each test in
+/// its own process, and on a shared fallback dir one test's sweep deletes
+/// another's live part mid-write, the rename finds no source, and the read comes
+/// back `NotFound`. Test-only: production behaviour is unchanged.
+#[cfg(test)]
+fn fallback_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("{BLOB_CACHE_SUBDIR}-{}", std::process::id()))
+}
 
 #[derive(Clone)]
 pub(crate) struct BlobCacheEntry {
@@ -40,7 +75,7 @@ impl BlobCacheEntry {
     }
 }
 
-async fn cache_entry(blob_id: &str) -> Result<BlobCacheEntry, String> {
+pub(crate) async fn cache_entry(blob_id: &str) -> Result<BlobCacheEntry, String> {
     let expected_hex = blob_id_sha256_hex(blob_id)
         .filter(|hex| is_sha256_hex(hex))
         .ok_or_else(|| "invalid blob id".to_string())?
@@ -125,7 +160,7 @@ pub(crate) fn ensure_blob_id_matches(expected_hex: &str, blob_id: &str) -> Resul
 }
 
 async fn cache_entry_for_hex(expected_hex: String) -> Result<BlobCacheEntry, String> {
-    let dir = std::env::temp_dir().join(BLOB_CACHE_SUBDIR);
+    let dir = blob_cache_dir();
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("create cache dir: {e}"))?;
@@ -200,6 +235,81 @@ async fn cache_exists(entry: &BlobCacheEntry) -> bool {
     tokio::fs::try_exists(entry.path()).await.unwrap_or(false)
 }
 
+/// Is this blob already on disk? Never downloads. The cache lives under the
+/// OS temp dir, which iOS purges under storage pressure, so a caller must ask
+/// again rather than remembering a `true` from earlier.
+pub(crate) async fn is_cached(blob_id: &str) -> bool {
+    match cache_entry(blob_id).await {
+        Ok(entry) => cache_exists(&entry).await,
+        Err(_) => false,
+    }
+}
+
+/// A foreign progress observer, absent when the caller doesn't want ticks.
+pub(crate) type ProgressSink = Option<Arc<dyn crate::api::BlobProgress>>;
+
+/// Chunks arrive every few KiB. Coalesce them: each tick crosses the FFI and
+/// (on iOS) a webview bridge, and no one can read faster than this anyway.
+const PROGRESS_TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Rate-limits `BlobProgress::on_progress` over a chunked download. Ticks on
+/// construction (so a resumed download opens at its floor, not zero), at most
+/// once per [`PROGRESS_TICK_INTERVAL`] while bytes flow, and once on `finish`.
+pub(crate) struct ProgressTicker {
+    sink: ProgressSink,
+    total: Option<u64>,
+    downloaded: u64,
+    interval: Duration,
+    last_emit: Instant,
+}
+
+impl ProgressTicker {
+    pub(crate) fn new(sink: ProgressSink, total: Option<u64>, already_on_disk: u64) -> Self {
+        Self::with_interval(sink, total, already_on_disk, PROGRESS_TICK_INTERVAL)
+    }
+
+    fn with_interval(
+        sink: ProgressSink,
+        total: Option<u64>,
+        already_on_disk: u64,
+        interval: Duration,
+    ) -> Self {
+        let ticker = Self {
+            sink,
+            total,
+            downloaded: already_on_disk,
+            interval,
+            last_emit: Instant::now(),
+        };
+        ticker.emit();
+        ticker
+    }
+
+    fn emit(&self) {
+        if let Some(sink) = &self.sink {
+            sink.on_progress(self.downloaded, self.total);
+        }
+    }
+
+    /// Account for `n` freshly written bytes, emitting only when the interval
+    /// has elapsed. Returns whether it emitted (the tests read this).
+    pub(crate) fn advance(&mut self, n: usize) -> bool {
+        self.downloaded = self.downloaded.saturating_add(n as u64);
+        if self.sink.is_none() || self.last_emit.elapsed() < self.interval {
+            return false;
+        }
+        self.last_emit = Instant::now();
+        self.emit();
+        true
+    }
+
+    /// The download completed: report the final byte count even if the last
+    /// chunk landed inside the throttle window.
+    pub(crate) fn finish(&self) {
+        self.emit();
+    }
+}
+
 async fn read_cached(entry: &BlobCacheEntry) -> Result<Vec<u8>, String> {
     tokio::fs::read(entry.path())
         .await
@@ -270,6 +380,98 @@ fn is_sha256_hex(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingProgress {
+        ticks: Mutex<Vec<(u64, Option<u64>)>>,
+    }
+
+    impl crate::api::BlobProgress for RecordingProgress {
+        fn on_progress(&self, downloaded: u64, total: Option<u64>) {
+            self.ticks.lock().push((downloaded, total));
+        }
+    }
+
+    fn ticker_with(
+        interval: Duration,
+        total: Option<u64>,
+        already: u64,
+    ) -> (ProgressTicker, Arc<RecordingProgress>) {
+        let sink = Arc::new(RecordingProgress::default());
+        let ticker = ProgressTicker::with_interval(
+            Some(sink.clone() as Arc<dyn crate::api::BlobProgress>),
+            total,
+            already,
+            interval,
+        );
+        (ticker, sink)
+    }
+
+    /// A resumed download must open at what is already on disk. Reporting 0
+    /// first would snap the reader's byte counter backwards.
+    #[test]
+    fn a_resumed_download_opens_at_its_floor() {
+        let (_ticker, sink) = ticker_with(Duration::ZERO, Some(900), 400);
+        assert_eq!(sink.ticks.lock().as_slice(), [(400, Some(900))]);
+    }
+
+    #[test]
+    fn ticks_are_throttled_and_the_last_byte_always_lands() {
+        let (mut ticker, sink) = ticker_with(Duration::from_secs(3600), Some(30), 0);
+        for _ in 0..3 {
+            assert!(!ticker.advance(10), "the window has not elapsed");
+        }
+        // Only the opening tick so far; `finish` is what reports the tail.
+        assert_eq!(sink.ticks.lock().as_slice(), [(0, Some(30))]);
+        ticker.finish();
+        assert_eq!(
+            sink.ticks.lock().as_slice(),
+            [(0, Some(30)), (30, Some(30))]
+        );
+    }
+
+    #[test]
+    fn a_zero_interval_ticks_every_chunk() {
+        let (mut ticker, sink) = ticker_with(Duration::ZERO, None, 0);
+        assert!(ticker.advance(5));
+        assert!(ticker.advance(7));
+        assert_eq!(
+            sink.ticks.lock().as_slice(),
+            [(0, None), (5, None), (12, None)]
+        );
+    }
+
+    /// The whole point of the config knob: blobs must land where the embedder
+    /// said, not in the OS temp dir iOS purges. Sets the process-wide `OnceLock`,
+    /// so it is the only test allowed to.
+    #[tokio::test]
+    async fn the_configured_cache_dir_is_where_blobs_land() {
+        let nonce = UPLOAD_PART_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("baybo-configured-cache-{nonce}"));
+        set_blob_cache_dir(dir.clone());
+
+        let hex = "a".repeat(64);
+        let entry = cache_entry(&format!("sha256:{hex}.tok"))
+            .await
+            .expect("cache entry");
+
+        assert_eq!(entry.path().parent(), Some(dir.as_path()));
+        assert!(
+            !entry
+                .path()
+                .starts_with(std::env::temp_dir().join(BLOB_CACHE_SUBDIR)),
+            "the temp fallback must not win once a dir is configured"
+        );
+    }
+
+    /// The common case: an image thumbnail nobody is watching. The ticker must
+    /// not pay for a tick it has nowhere to send.
+    #[test]
+    fn no_sink_means_no_work() {
+        let mut ticker = ProgressTicker::with_interval(None, Some(10), 0, Duration::ZERO);
+        assert!(!ticker.advance(10));
+        ticker.finish();
+    }
 
     #[tokio::test]
     async fn concurrent_upload_cache_writes_share_final_without_part_stomping() {

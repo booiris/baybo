@@ -133,7 +133,7 @@ if [ "$want_agent" = 1 ]; then
       echo "musl target missing — run: rustup target add $MUSL_TARGET" >&2; exit 1; }
     musl_cc="$(command -v x86_64-linux-musl-gcc || command -v musl-gcc || true)"
     [ -n "$musl_cc" ] || {
-      echo "musl C compiler missing (Arch: sudo pacman -S musl) — libsql's bundled SQLite needs it" >&2
+      echo "musl C compiler missing (Arch: sudo pacman -S musl) — sqlite's bundled SQLite needs it" >&2
       exit 1; }
     echo ">> building static-musl baybo (--features bench-bash)"
     CC_x86_64_unknown_linux_musl="$musl_cc" \

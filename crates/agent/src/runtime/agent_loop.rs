@@ -9,17 +9,17 @@ use baybo_llm::{
 };
 use baybo_memory::{Memory, MemoryContext};
 use baybo_model::{
-    ChatMessage, ContentBlock, JobId, LlmEntryName, MessageSource, Role, SessionId, ThinkingContent,
+    ChatMessage, ContentBlock, JobId, LlmEntryName, MessageSource, SessionId, ThinkingContent,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use baybo_model::{LineageKind, Session, TriggerSource};
-use baybo_tools::{ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
+use baybo_model::{ControlEventKind, LineageKind, Session, TriggerSource};
+use baybo_tools::{ApprovalDecision, ReadTracker, ToolConcurrency, ToolOutput, ToolRegistry};
 use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
@@ -29,7 +29,7 @@ use crate::runtime::progress_observer::{
 };
 use crate::runtime::scope::JobSpec;
 
-use crate::runtime::tool_executor::ToolExecutor;
+use crate::runtime::tool_executor::{ExecutedTool, ToolExecutor};
 use crate::security::SecurityGateway;
 use tokio_util::sync::CancellationToken;
 
@@ -83,32 +83,80 @@ fn summarize_text(s: &str) -> String {
     }
 }
 
+/// Content identity of a media block. Keys on the blob's digest, never on the
+/// `blob_id` — every `put` mints a fresh read token, so the same bytes staged
+/// twice carry two different ids.
+fn media_digest(block: &ContentBlock) -> Option<&str> {
+    match block {
+        ContentBlock::Image { blob, .. }
+        | ContentBlock::Audio { blob, .. }
+        | ContentBlock::File { blob, .. } => blob.content_digest(),
+        _ => None,
+    }
+}
+
+/// Fold a tool's attachments into the turn's accumulator, skipping content the
+/// turn already staged. `AttachFile` called twice on one path stages the same
+/// bytes twice; the reply must show the user that file once. A block with no
+/// digest (a malformed id, or a non-media block a tool wrongly passed) has no
+/// identity to compare, so it rides through untouched.
+fn extend_unique_attachments(acc: &mut Vec<ContentBlock>, incoming: &[ContentBlock]) {
+    for block in incoming {
+        if let Some(digest) = media_digest(block)
+            && acc
+                .iter()
+                .filter_map(media_digest)
+                .any(|seen| seen == digest)
+        {
+            continue;
+        }
+        acc.push(block.clone());
+    }
+}
+
+/// Name what the user is about to receive rather than counting blocks —
+/// the work block reads better as "report.pdf" than "1 attachment(s)".
+fn summarize_attachments(blocks: &[ContentBlock]) -> String {
+    let named: Vec<&str> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::File { filename, .. } => Some(filename.as_str()),
+            ContentBlock::Image { mime_type, .. } | ContentBlock::Audio { mime_type, .. } => {
+                Some(mime_type.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if named.is_empty() {
+        return format!("{} attachment(s)", blocks.len());
+    }
+    truncate_summary(&named.join(", "))
+}
+
 /// Derive the `(status, summary)` for a finished tool call's
 /// `ToolCompleted` progress event from its result. Presentation-only and
 /// content-light; the summary still passes the leak boundary before it is
 /// emitted. Mirrors the result match the loop runs for the LLM-facing
 /// `tool_result` text.
-fn tool_completion_summary(result: &anyhow::Result<ToolOutput>) -> (ToolStatus, String) {
-    match result {
+fn tool_completion_summary(executed: &ExecutedTool) -> (ToolStatus, String) {
+    // A recorded `Deny` is the authoritative denial signal, whatever shape the
+    // refusal took: the pre-execute gate raises a typed `ToolError::Denied`,
+    // but a tool that prompts MID-CALL folds the refusal into its own (untyped)
+    // error — and both must read as "denied", not "the tool crashed".
+    if executed.approval == Some(ApprovalDecision::Deny) {
+        return (ToolStatus::Denied, "denied".to_string());
+    }
+    match &executed.output {
         Ok(ToolOutput::Text(s)) => (ToolStatus::Ok, summarize_text(s)),
         Ok(ToolOutput::Json(_)) => (ToolStatus::Ok, "ok".to_string()),
-        Ok(ToolOutput::WithAttachments { attachments, .. }) => (
-            ToolStatus::Ok,
-            format!("{} attachment(s)", attachments.len()),
-        ),
+        Ok(ToolOutput::WithAttachments { attachments, .. }) => {
+            (ToolStatus::Ok, summarize_attachments(attachments))
+        }
         Ok(ToolOutput::MultiModalText { llm_images, .. }) => {
             (ToolStatus::Ok, format!("{} image(s)", llm_images.len()))
         }
         Ok(ToolOutput::Error(msg)) => (ToolStatus::Error, truncate_summary(msg)),
-        Err(e) => {
-            if let Some(baybo_tools::ToolError::Denied { .. }) =
-                e.downcast_ref::<baybo_tools::ToolError>()
-            {
-                (ToolStatus::Denied, "denied".to_string())
-            } else {
-                (ToolStatus::Error, truncate_summary(&e.to_string()))
-            }
-        }
+        Err(e) => (ToolStatus::Error, truncate_summary(&e.to_string())),
     }
 }
 
@@ -264,21 +312,6 @@ impl baybo_tools::SessionNotifier for DeltaTxNotifier {
             event: AgentEvent::Notice { level, text },
         });
     }
-
-    fn emit_attachment(&self, blocks: &[ContentBlock]) {
-        if blocks.is_empty() {
-            return;
-        }
-        // Media carries no free text, so no leak boundary applies. `try_send`
-        // (like `emit`) drops on a full channel rather than blocking the
-        // sync tool path.
-        let _ = self.tx.try_send(AgentOutput {
-            session_id: self.session_id.clone(),
-            user_id: self.user_id.clone(),
-            channel: self.channel.clone(),
-            event: AgentEvent::Attachment(blocks.to_vec()),
-        });
-    }
 }
 
 /// What one `LlmIteration` step's body produced. The terminal-vs-loop
@@ -288,8 +321,8 @@ impl baybo_tools::SessionNotifier for DeltaTxNotifier {
 enum IterationOutcome {
     /// Final assistant response — caller returns this from `run_inner`.
     /// `outgoing.content` is both the channel-bound reply and the persisted
-    /// assistant turn (text / thinking); tool media was delivered live as it
-    /// was produced, never bundled here.
+    /// assistant turn: text / thinking, plus any media the turn's tools
+    /// produced (`ToolOutput::WithAttachments`) folded in at the tail.
     Final { outgoing: OutgoingMessage },
     /// LLM emitted tool calls; loop continues. `task_mutated` is `true`
     /// when one of this iteration's tool calls changed the planning
@@ -337,16 +370,19 @@ pub trait InterjectionSource: Send {
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 /// The recall query for a job, or `None` for job kinds that don't recall.
 /// Memory recall/write run only for `UserChat` and `Cron` jobs — `Compact`,
-/// `Spawned` (subagent), and `SubagentNotification` have no direct user input
-/// and would pollute or double-write. The exhaustive match forces a
-/// classification when a new `JobInput` variant is added.
+/// `Spawned` (subagent), `SubagentNotification`, and `CronNotification` have no
+/// direct user input and would pollute or double-write (a `CronNotification`
+/// also runs no LLM call at all, so there is nothing to recall *for*). The
+/// exhaustive match forces a classification when a new `JobInput` variant is
+/// added.
 fn memory_recall_query(input: &JobInput) -> Option<Vec<ContentBlock>> {
     match input {
         JobInput::UserChat { content } => Some(content.clone()),
         JobInput::Cron { action_payload } => Some(cron_prompt_blocks(action_payload)),
-        JobInput::Compact | JobInput::Spawned { .. } | JobInput::SubagentNotification { .. } => {
-            None
-        }
+        JobInput::Compact
+        | JobInput::Spawned { .. }
+        | JobInput::SubagentNotification { .. }
+        | JobInput::CronNotification { .. } => None,
     }
 }
 
@@ -571,21 +607,6 @@ impl AgentLoop {
             .rebuild_from_messages(self.context_manager.messages());
     }
 
-    /// Snapshot the in-memory transcript so a fallible turn can be rolled
-    /// back. Used by the subagent-notification retry path: that turn's
-    /// synthetic prompt is appended in-memory only (not persisted), so on
-    /// failure the actor restores this snapshot to drop the row before the
-    /// next retry rebuilds it — otherwise the live context would stack a copy
-    /// per attempt.
-    pub fn context_snapshot(&self) -> Vec<ChatMessage> {
-        self.context_manager.messages().to_vec()
-    }
-
-    /// Restore a transcript snapshot taken by [`Self::context_snapshot`].
-    pub fn restore_context(&mut self, messages: Vec<ChatMessage>) {
-        self.context_manager.restore_messages(messages);
-    }
-
     /// Load the session's planning checklist, (throttled) refresh the transient
     /// reminder the model sees, and push the live list to any work-block client
     /// (the web checklist) via `delta_tx`. `inject` is the per-turn throttle
@@ -627,16 +648,6 @@ impl AgentLoop {
         }
     }
 
-    /// Seed the system prompt (+ skill reminder) if the transcript doesn't
-    /// already lead with it. Idempotent. Exposed so the subagent-notification
-    /// path can establish the (persisted) system row *before* snapshotting the
-    /// context for rollback — otherwise a rollback on a fresh session would
-    /// drop the just-persisted system row in-memory and the next retry would
-    /// re-seed and re-persist it.
-    pub async fn ensure_system_prompt_seeded(&mut self) {
-        self.context_manager.ensure_seeded().await;
-    }
-
     /// Run the main conversation loop for a single user message.
     ///
     /// When `delta_tx` is `Some`, each text chunk emitted by the LLM is
@@ -649,8 +660,8 @@ impl AgentLoop {
     // kicked it off — User / Cron / Spawned), used for the JobSpec.
     // The turn's triggering message is appended to the transcript by the
     // actor *before* this runs (via `append_user_message` / `append_cron_fire`
-    // / `append_subagent_notification`), so the loop iterates the current
-    // context rather than appending here.
+    // / `append_background_notification_prompt_once`), so the loop iterates
+    // the current context rather than appending here.
     /// Re-resolve the active client from the (possibly hot-swapped)
     /// pool at the start of a turn. When the resolved model changed
     /// since the last turn, swap the client, rebuild the billed-chat
@@ -824,6 +835,10 @@ impl AgentLoop {
         // Accumulates this job's user-authored input (initial prompt + any
         // mid-turn interjections) for the `on_job_complete` write at turn end.
         let mut job_user_input: Vec<ContentBlock> = memory_query.clone().unwrap_or_default();
+        // Media the turn's tools produced (`ToolOutput::WithAttachments`),
+        // folded into the final assistant row so it persists. Dropped on any
+        // non-`Final` exit: attachments are durable only when the turn is.
+        let mut turn_attachments: Vec<ContentBlock> = Vec::new();
 
         // Iterative LLM loop
         let mut iterations = 0;
@@ -941,6 +956,7 @@ impl AgentLoop {
                         iter_delta_tx,
                         notifier.clone(),
                         &cancel_token,
+                        &mut turn_attachments,
                     );
                     async move { Ok((LifecycleOutcome::Ok, fut.await?)) }
                 },
@@ -1013,9 +1029,10 @@ impl AgentLoop {
             }
         }
 
-        // If we exhausted iterations, return what we have. Any media the
-        // tools produced was already delivered live as it was produced, so
-        // there's nothing to append here.
+        // If we exhausted iterations, return what we have. `turn_attachments`
+        // is dropped with the rest of this turn's locals: this path persists
+        // no assistant row, so folding media into `content` would deliver it
+        // live and then lose it on the next resync.
         let content = vec![ContentBlock::Text(
             "I've reached the maximum number of processing steps. Please try again with a simpler request.".to_string(),
         )];
@@ -1064,6 +1081,7 @@ impl AgentLoop {
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         cancel_token: &CancellationToken,
+        turn_attachments: &mut Vec<ContentBlock>,
     ) -> anyhow::Result<IterationOutcome> {
         let (response, llm_span_id) = match self
             .call_llm_with_retry(session, span_recorder, &step, delta_tx, cancel_token)
@@ -1092,11 +1110,15 @@ impl AgentLoop {
         if response.tool_calls.is_empty() {
             // Use content_blocks when available, falling back to the
             // text string.
-            let response_blocks = if response.content_blocks.is_empty() {
+            let mut response_blocks = if response.content_blocks.is_empty() {
                 vec![ContentBlock::Text(response.content.clone())]
             } else {
                 response.content_blocks.clone()
             };
+            // Media the turn's tools produced rides out on this row. The
+            // provider conversion drops media blocks from an assistant
+            // message, so replaying this row to the LLM stays valid.
+            response_blocks.extend(std::mem::take(turn_attachments));
 
             let final_text = baybo_llm::multimodal::extract_text(&response_blocks);
 
@@ -1107,9 +1129,8 @@ impl AgentLoop {
             );
 
             // The reply blocks are both the channel-bound content and the
-            // persisted assistant row (tool media was delivered live, never
-            // bundled here). Capture the persisted ordinal so the channel
-            // adapter can stamp the live `Frame::Message`.
+            // persisted assistant row. Capture the persisted ordinal so the
+            // channel adapter can stamp the live `Frame::Message`.
             let assistant_msg = ChatMessage::assistant(response_blocks.clone());
             let ordinal = self.context_manager.append(&assistant_msg).await;
 
@@ -1151,7 +1172,7 @@ impl AgentLoop {
         self.context_manager.append(&assistant_msg).await;
 
         // Surface each tool call as a live progress line before dispatch
-        // (streaming turns only; cron / subagent pass `delta_tx = None`).
+        // (streaming turns only; cron passes `delta_tx = None`).
         // Emitted ahead of `join_all` so the user sees "starting" before
         // any approval prompt the executor raises mid-call.
         for tc in &response.tool_calls {
@@ -1188,6 +1209,7 @@ impl AgentLoop {
 
         let executor = Arc::clone(&self.tool_executor);
         let session_id_for_calls = session.id.clone();
+        let session_trigger_for_calls = session.trigger.clone();
         let user_for_calls = session.user.clone();
         let agent_for_calls = session.state.agent_id.clone();
         // Gate (Copy, captured per closure): only a user-facing session may
@@ -1209,6 +1231,7 @@ impl AgentLoop {
         let exec_futures = response.tool_calls.iter().map(|tc| {
             let executor = Arc::clone(&executor);
             let session_id = session_id_for_calls.clone();
+            let session_trigger = session_trigger_for_calls.clone();
             let user = user_for_calls.clone();
             let agent_id = agent_for_calls.clone();
             let approved = Arc::clone(&approved);
@@ -1248,6 +1271,7 @@ impl AgentLoop {
                         &tool_name,
                         arguments,
                         &session_id,
+                        &session_trigger,
                         &user,
                         agent_id,
                         &approved,
@@ -1270,10 +1294,18 @@ impl AgentLoop {
 
         // Sequential post-processing: append results in `tool_calls`
         // order so context state stays byte-stable across calls.
-        for (tool_call, tool_result) in response.tool_calls.iter().zip(tool_results) {
-            let (status, raw_summary) = tool_completion_summary(&tool_result);
-            self.emit_tool_completed(delta_tx, session, tool_call.id.clone(), status, raw_summary)
-                .await;
+        for (tool_call, executed) in response.tool_calls.iter().zip(tool_results) {
+            let (status, raw_summary) = tool_completion_summary(&executed);
+            let call_approval = executed.approval;
+            self.emit_tool_completed(
+                delta_tx,
+                session,
+                tool_call.id.clone(),
+                status,
+                raw_summary,
+                call_approval,
+            )
+            .await;
 
             // Count a grouped subagent spawn into its barrier cohort so the
             // turn-end seal knows the member total. Only a *successful
@@ -1283,8 +1315,9 @@ impl AgentLoop {
             // broad: counting it would stall the cohort until its group
             // timeout. A real dispatch returns the ack with its `bg-…` handle.
             let dispatched = matches!(
-                &tool_result,
-                Ok(ToolOutput::Text(t)) if t.starts_with(baybo_model::BACKGROUND_DISPATCH_ACK_PREFIX)
+                &executed.output,
+                Ok(ToolOutput::Text(t))
+                    if t.starts_with(baybo_model::BACKGROUND_DISPATCH_ACK_PREFIX)
             );
             if tool_call.name == baybo_model::SPAWN_SUBAGENT_TOOL_NAME
                 && dispatched
@@ -1302,22 +1335,24 @@ impl AgentLoop {
                 // same helper, so routing back into the cohort agrees.
                 session
                     .state
-                    .background_groups
-                    .entry(baybo_model::GroupState::cohort_key(job_id, group))
-                    .or_default()
-                    .expected += 1;
+                    .background_notifications
+                    .register_group_member(job_id, group);
             }
 
-            let raw_result_text = match &tool_result {
+            let raw_result_text = match &executed.output {
                 Ok(ToolOutput::Text(s)) => s.clone(),
                 Ok(ToolOutput::Json(v)) => {
                     serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
                 }
-                // A tool that delivers media to the user does so itself via
-                // `ctx.notifier.emit_attachment` (e.g. `SendFile`); the loop
-                // forwards only the text result to the LLM.
-                Ok(ToolOutput::WithAttachments { text, .. })
-                | Ok(ToolOutput::MultiModalText { text, .. }) => text.clone(),
+                // Media a tool produced for the *user* (e.g. `AttachFile`) is
+                // hoisted onto the turn's final assistant row; the LLM sees
+                // only the text result. `MultiModalText`'s images are for the
+                // LLM's own next turn, so they are NOT hoisted here.
+                Ok(ToolOutput::WithAttachments { text, attachments }) => {
+                    extend_unique_attachments(turn_attachments, attachments);
+                    text.clone()
+                }
+                Ok(ToolOutput::MultiModalText { text, .. }) => text.clone(),
                 Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
                 Err(e) => {
                     if let Some(denied) = e.downcast_ref::<baybo_tools::ToolError>()
@@ -1350,25 +1385,30 @@ impl AgentLoop {
             );
 
             // Append tool result to context with the tool_use_id so the
-            // LLM can correlate results with their originating calls. For a
-            // `Read`, stamp the fingerprint it recorded onto the row so the
-            // read-before-write tracker can be rebuilt on hydration (the
-            // fingerprint persists with the transcript but is never sent to
-            // the LLM). `get` returns `None` for a failed/virtual read, which
-            // collapses to a plain `tool_result`.
-            let tool_msg = if tool_call.name == baybo_tools::READ_TOOL_NAME {
-                let meta = tool_call
-                    .arguments
-                    .get("file_path")
-                    .and_then(|v| v.as_str())
-                    .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
-                    .map(|fp| baybo_model::ToolResultMeta {
-                        read_fingerprint: Some(fp),
-                    });
-                ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, meta)
-            } else {
-                ChatMessage::tool_result(tool_call.id.clone(), wrapped)
-            };
+            // LLM can correlate results with their originating calls. The
+            // meta rides the persisted row but is never sent to the LLM: a
+            // `Read` stamps the fingerprint it recorded (so the
+            // read-before-write tracker can be rebuilt on hydration; `get`
+            // returns `None` for a failed/virtual read), and any call that
+            // raised an approval prompt stamps the decision (so reloads can
+            // label the work step). Both `None` collapses to a plain
+            // `tool_result`.
+            let read_fingerprint = (tool_call.name == baybo_tools::READ_TOOL_NAME)
+                .then(|| {
+                    tool_call
+                        .arguments
+                        .get("file_path")
+                        .and_then(|v| v.as_str())
+                        .and_then(|p| self.read_tracker.get(std::path::Path::new(p)))
+                })
+                .flatten();
+            let meta = (read_fingerprint.is_some() || call_approval.is_some()).then_some(
+                baybo_model::ToolResultMeta {
+                    read_fingerprint,
+                    approval: call_approval,
+                },
+            );
+            let tool_msg = ChatMessage::tool_result_with_meta(tool_call.id.clone(), wrapped, meta);
             self.context_manager.append(&tool_msg).await;
         }
 
@@ -1955,6 +1995,42 @@ impl AgentLoop {
         Ok(())
     }
 
+    /// Append a one-shot cron fire's result to **this** (the scheduling)
+    /// conversation as a persisted `Role::Assistant` row. A one-shot origin
+    /// delivery supplies `source_event_id` so a crash replay returns the
+    /// existing row instead of appending another copy; recurring fires pass
+    /// `None` because each fire owns a fresh conversation.
+    ///
+    /// No inference runs: `content` is the fire's own reply, already framed
+    /// with a scheduled-task header ([`baybo_context::prompts::cron`]). The
+    /// row is stamped `MessageSource::CronNotification`, so chat surfaces can
+    /// badge it and the next real turn reads it back as something the
+    /// assistant already reported. Seeds the system prompt first — the
+    /// notification can be the first thing an otherwise-cold session appends.
+    ///
+    /// `None` when the session runs with no durable store (tests); the caller
+    /// then has no ordinal to push or to record on the job.
+    pub async fn append_cron_notification(
+        &mut self,
+        content: Vec<ContentBlock>,
+        source_event_id: Option<&str>,
+    ) -> Option<baybo_session::SessionMessageAppendOutcome> {
+        self.context_manager.ensure_seeded().await;
+        let message = ChatMessage::cron_notification(content);
+        match source_event_id {
+            Some(source_event_id) => {
+                self.context_manager
+                    .append_idempotent(source_event_id, &message)
+                    .await
+            }
+            None => self
+                .context_manager
+                .append(&message)
+                .await
+                .map(|ordinal| baybo_session::SessionMessageAppendOutcome::Inserted { ordinal }),
+        }
+    }
+
     /// Append a subagent-spawned session's initial prompt as a persisted
     /// agent-context row ahead of the turn (hidden from chat surfaces).
     pub async fn append_spawned_prompt(
@@ -1967,41 +2043,39 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Append the synthetic `SubagentNotification` prompt **in-memory only**.
-    /// It is rebuilt from the durable `pending_background_results` buffer on
-    /// every retry, so persisting per-attempt would stack duplicate hidden
-    /// rows under the infinite-backoff retry. The caller seeds the system
-    /// prompt and snapshots the transcript *before* this so a failed turn can
-    /// roll the row back; `content` is built via
-    /// [`baybo_context::prompts::subagent::build_notification_content`].
-    pub fn append_subagent_notification(&mut self, content: Vec<ContentBlock>) {
-        // Unlike the other append_* helpers this does NOT seed the system
-        // prompt: the caller must have seeded (and snapshotted) *before* this,
-        // so a failed turn's rollback can't drop the system row. Self-seeding
-        // here would append the system row to the tail, after the notification.
-        let seeded = self
-            .context_manager
-            .messages()
-            .first()
-            .is_some_and(|m| m.role == Role::System);
-        debug_assert!(
-            seeded,
-            "append_subagent_notification requires the system prompt already seeded \
-             (call ensure_system_prompt_seeded before snapshotting)"
-        );
-        if !seeded {
-            // Unreachable given the sole caller, but in release (debug_assert
-            // compiled out) don't push the notification ahead of a not-yet-seeded
-            // system row: that would leave messages[0] off the system prompt and
-            // break the prompt-cache prefix. Drop the row and log loudly instead.
-            error!(
-                "append_subagent_notification called before the system prompt was seeded; \
-                 dropping the in-memory notification to keep the transcript prefix intact"
-            );
-            return;
-        }
-        let msg = ChatMessage::agent_context(content);
-        self.context_manager.append_in_memory(&msg);
+    /// Append the public, non-LLM completion reply for a background batch.
+    /// The stable source-event id keeps crash replay from creating a second
+    /// assistant bubble.
+    pub async fn append_background_completion_reply_once(
+        &mut self,
+        content: Vec<ContentBlock>,
+        source_event_id: &str,
+    ) -> Option<baybo_session::SessionMessageAppendOutcome> {
+        self.context_manager.ensure_seeded().await;
+        self.context_manager
+            .append_idempotent(source_event_id, &ChatMessage::assistant(content))
+            .await
+    }
+
+    /// Append the crash-replayable hidden prompt that carries a background
+    /// batch into its analysis turn. Existing rows are returned without
+    /// duplicating the live context window.
+    pub async fn append_background_notification_prompt_once(
+        &mut self,
+        content: Vec<ContentBlock>,
+        source_event_id: &str,
+    ) -> Option<baybo_session::SessionMessageAppendOutcome> {
+        self.context_manager.ensure_seeded().await;
+        self.context_manager
+            .append_idempotent(source_event_id, &ChatMessage::agent_context(content))
+            .await
+    }
+
+    /// Arm or clear the request-time background-notification retry cue. Applied
+    /// only while the transcript tail is an assistant row; never persisted. See
+    /// [`baybo_context::ContextManager::set_notification_cue`].
+    pub fn set_notification_cue(&mut self, armed: bool) {
+        self.context_manager.set_notification_cue(armed);
     }
 
     /// Run a streaming chat request, forwarding each text chunk through
@@ -2241,7 +2315,7 @@ impl AgentLoop {
     /// Emit a `ToolStarted` progress event before a tool call runs. The
     /// `label` (from `Tool::progress_label`, derived from LLM-written
     /// arguments) passes the leak boundary first. No-op when the turn
-    /// isn't streaming (`delta_tx` is `None`: cron / subagent).
+    /// isn't streaming (`delta_tx` is `None`: cron).
     async fn emit_tool_started(
         &self,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
@@ -2284,6 +2358,7 @@ impl AgentLoop {
         call_id: String,
         status: ToolStatus,
         raw_summary: String,
+        approval: Option<ApprovalDecision>,
     ) {
         let Some(tx) = delta_tx else { return };
         let summary = self
@@ -2300,6 +2375,7 @@ impl AgentLoop {
                     call_id,
                     status,
                     summary,
+                    approval,
                 },
             })
             .await;
@@ -2308,7 +2384,7 @@ impl AgentLoop {
     /// Emit a transient turn-[`AgentEvent::Status`] event (today:
     /// compaction start/end). No sanitization — the variant carries no
     /// free text. No-op when the turn isn't streaming (`delta_tx` is
-    /// `None`: cron / subagent).
+    /// `None`: cron).
     async fn emit_status(
         &self,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
@@ -2425,6 +2501,10 @@ impl AgentLoop {
                             // Record only what actually reaches the user, so the
                             // next tick dedupes against their real view.
                             observer_state.sent_notices.push(text.clone());
+                            // Durably shadow the line as a `progress` control
+                            // event so a reload reconstructs it into this turn's
+                            // work block (the live frame below is ephemeral).
+                            self.persist_progress_narration(session, &text).await;
                             self.emit_progress(delta_tx, session, text).await;
                         }
                     }
@@ -2535,6 +2615,36 @@ impl AgentLoop {
                 event: AgentEvent::Progress(text),
             })
             .await;
+    }
+
+    /// Persist one progress line as a `progress` control event, anchored after
+    /// the session's newest ordinal so the reconstruction folds it into the
+    /// in-flight turn's work block at the right spot. Best-effort: a missing
+    /// session store (test loops) or a write error just skips the durable
+    /// shadow — the live frame already reached the user.
+    async fn persist_progress_narration(&self, session: &Session, text: &str) {
+        let Some(sessions) = self.sessions.as_ref() else {
+            return;
+        };
+        let after_ordinal = match sessions.latest_session_ordinal(&session.id).await {
+            Ok(max) => max.unwrap_or(-1),
+            Err(e) => {
+                debug!(session_id = %session.id, error = %e, "progress: ordinal lookup failed; skipping persist");
+                return;
+            }
+        };
+        if let Err(e) = sessions
+            .append_control_event(
+                &session.id,
+                after_ordinal,
+                ControlEventKind::Progress,
+                text,
+                chrono::Utc::now(),
+            )
+            .await
+        {
+            debug!(session_id = %session.id, error = %e, "failed to persist progress narration");
+        }
     }
 
     /// Run an on-demand compression pass and return the confirmation
@@ -3269,6 +3379,7 @@ mod session_end_gate_tests {
             lineage,
             hidden: false,
             pinned: false,
+            archived: false,
             folder_id: None,
             title: None,
         }
@@ -3287,6 +3398,8 @@ mod session_end_gate_tests {
         let s = session_with(
             TriggerSource::Cron {
                 cron_job_id: "c-1".into(),
+                origin_session_id: None,
+                conversation: true,
             },
             None,
         );
@@ -3370,5 +3483,49 @@ mod bg_compression_at_most_one_tests {
             may_spawn(&handle),
             "a finished pass must not block the next spawn"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_completion_summary_tests {
+    use super::*;
+
+    fn executed(
+        output: anyhow::Result<ToolOutput>,
+        approval: Option<ApprovalDecision>,
+    ) -> ExecutedTool {
+        ExecutedTool { output, approval }
+    }
+
+    #[test]
+    fn a_recorded_denial_reads_denied_even_though_the_error_is_untyped() {
+        // The regression this pins: a tool that prompts MID-CALL folds the
+        // refusal into its own error, which reaches us as a plain `anyhow`
+        // (the executor sanitizes and re-wraps it, losing the type). Keying
+        // off the error type alone reported that as a crash — an "error" step
+        // with no verdict — while the user had explicitly denied it.
+        let (status, summary) = tool_completion_summary(&executed(
+            Err(anyhow::anyhow!("skill 'x' requires env-var approval")),
+            Some(ApprovalDecision::Deny),
+        ));
+        assert_eq!(status, ToolStatus::Denied);
+        assert_eq!(summary, "denied");
+    }
+
+    #[test]
+    fn an_approved_call_that_then_fails_still_reads_as_an_error() {
+        let (status, _) = tool_completion_summary(&executed(
+            Err(anyhow::anyhow!("boom")),
+            Some(ApprovalDecision::ApproveAlways),
+        ));
+        assert_eq!(status, ToolStatus::Error, "the approval isn't the outcome");
+    }
+
+    #[test]
+    fn an_ungated_call_is_unaffected() {
+        let (status, summary) =
+            tool_completion_summary(&executed(Ok(ToolOutput::Text("3 files".into())), None));
+        assert_eq!(status, ToolStatus::Ok);
+        assert_eq!(summary, "3 files");
     }
 }

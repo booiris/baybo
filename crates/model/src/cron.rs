@@ -89,6 +89,14 @@ pub struct CronJob {
     pub id: String,
     pub user_id: String,
     pub channel: ChannelType,
+    /// Short human name for the job, written by the model at creation
+    /// (`CronCreate` requires it). Names the fire's conversation
+    /// (`{title} · {M/d}`), heads a one-shot's notification, and labels the
+    /// job in `baybo cron list` / the admin cron page. Rows persisted before
+    /// this field existed deserialize empty; display sites fall back to a
+    /// prompt truncation.
+    #[serde(default)]
+    pub title: String,
     /// When this job fires. See [`CronSchedule`] for the two variants.
     pub schedule: CronSchedule,
     /// Prompt fed through the agent loop on every fire.
@@ -143,6 +151,34 @@ impl CronJob {
     pub fn format_time_opt(&self, dt: Option<DateTime<Utc>>) -> Option<String> {
         dt.map(|t| self.format_time(t))
     }
+
+    /// Display name for this job: its [`Self::title`], falling back to a
+    /// truncated prompt for rows created before the field existed.
+    pub fn display_title(&self) -> String {
+        display_title(&self.title, &self.prompt)
+    }
+}
+
+/// Longest prompt prefix used as a stand-in title for a legacy (title-less)
+/// cron row.
+const LEGACY_TITLE_MAX_CHARS: usize = 40;
+
+/// A job's display name: `title` when set, else a truncated `prompt` (legacy
+/// rows predate the title field). Shared by every surface that names a job so
+/// the fallback can't drift between the CLI, the admin page, and the fire's
+/// conversation title.
+pub fn display_title(title: &str, prompt: &str) -> String {
+    let title = title.trim();
+    if !title.is_empty() {
+        return title.to_string();
+    }
+    let prompt = prompt.trim();
+    let truncated: String = prompt.chars().take(LEGACY_TITLE_MAX_CHARS).collect();
+    if prompt.chars().count() > LEGACY_TITLE_MAX_CHARS {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
 }
 
 // ── ExecutionStatus ──────────────────────────────────────────────────
@@ -162,16 +198,59 @@ pub enum ExecutionStatus {
     Dispatched,
 }
 
+// ── ExecutionOutcome ─────────────────────────────────────────────────
+
+/// How a fire's turn ended, recorded on the execution when the fire reaches a
+/// terminal job state. Drives the notification a one-shot delivers into its
+/// origin conversation: every outcome notifies (a scheduled reminder that
+/// silently evaporates is this feature's worst failure), only the framing
+/// differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionOutcome {
+    /// The turn completed with a reply — the notification carries it.
+    Success,
+    /// The turn completed but produced no text (tool-only or empty reply);
+    /// the notification carries a fallback line instead.
+    Blank,
+    /// The turn failed or was cancelled; the notification says so.
+    Failed,
+}
+
+impl ExecutionOutcome {
+    /// Stable wire/db spelling, matching `serde(rename_all = "snake_case")`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExecutionOutcome::Success => "success",
+            ExecutionOutcome::Blank => "blank",
+            ExecutionOutcome::Failed => "failed",
+        }
+    }
+}
+
 // ── CronExecution ────────────────────────────────────────────────────
 
-/// An immutable record of a single cron job execution.
-/// Preserved even after one-shot jobs are evicted.
+/// An immutable record of a single cron job execution — and, for one-shot
+/// jobs, the durable ledger of its result's delivery into the origin
+/// conversation. Preserved even after one-shot jobs are evicted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronExecution {
     pub id: String,
     pub job_id: String,
     pub user_id: String,
     pub channel: ChannelType,
+    /// The job's title at fire time — snapshotted like `prompt`, so a fire's
+    /// notification and conversation stay correctly named even after the job
+    /// row is edited or deleted. Empty for rows predating the field (and for
+    /// title-less legacy jobs); [`Self::display_title`] falls back to the
+    /// prompt.
+    #[serde(default)]
+    pub title: String,
+    /// The job's IANA timezone at fire time. Dates the conversation a recurring
+    /// fire opens (`{title} · {M/d}`) in the zone the user scheduled it in.
+    /// Empty for rows predating the field; consumers fall back to UTC.
+    #[serde(default)]
+    pub timezone: String,
     pub schedule: CronSchedule,
     pub prompt: String,
     /// The schedule slot that was due (i.e. the `next_trigger_at` value from the job).
@@ -185,6 +264,108 @@ pub struct CronExecution {
     /// lineage plumbing for subagents and maintenance.
     #[serde(default)]
     pub origin_session_id: Option<SessionId>,
+
+    // ── Delivery ledger (one-shot result → origin conversation) ──
+    /// The isolated session this fire ran in. Stamped when the fire's turn
+    /// reaches a terminal state; the notification's content is read from this
+    /// session's reply row.
+    #[serde(default)]
+    pub fire_session_id: Option<SessionId>,
+    /// When the fire's turn reached a terminal job state.
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    /// How the turn ended. `None` until the fire completes.
+    #[serde(default)]
+    pub outcome: Option<ExecutionOutcome>,
+    /// `session_messages.ordinal` of the fire's reply row in
+    /// `fire_session_id`, taken off the `Completed` lifecycle edge — the
+    /// notification reads exactly that row (no read-after-write poll).
+    #[serde(default)]
+    pub reply_ordinal: Option<i64>,
+    /// When this execution's delivery was **resolved**: either the result was
+    /// appended to the origin conversation, or it was terminally dropped
+    /// (no usable origin — see the router's fallbacks). Both are resolutions,
+    /// so the boot re-drive scan (`completed_at` set, `notified_at` unset)
+    /// converges instead of re-attempting a hopeless delivery on every boot.
+    #[serde(default)]
+    pub notified_at: Option<DateTime<Utc>>,
+}
+
+impl CronExecution {
+    /// A freshly-recorded execution for `job`'s due slot, `Pending` (not yet
+    /// dispatched) and with an empty delivery ledger — the ledger fields are
+    /// stamped later, as the fire completes and its result is delivered.
+    pub fn pending(
+        job: &CronJob,
+        scheduled_fire_time: DateTime<Utc>,
+        triggered_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            job_id: job.id.clone(),
+            user_id: job.user_id.clone(),
+            channel: job.channel.clone(),
+            title: job.title.clone(),
+            timezone: job.timezone.clone(),
+            schedule: job.schedule.clone(),
+            prompt: job.prompt.clone(),
+            scheduled_fire_time,
+            triggered_at,
+            status: ExecutionStatus::Pending,
+            origin_session_id: job.origin_session_id.clone(),
+            fire_session_id: None,
+            completed_at: None,
+            outcome: None,
+            reply_ordinal: None,
+            notified_at: None,
+        }
+    }
+
+    /// True once the fire's turn reached a terminal state but its result has
+    /// not yet been delivered to (or terminally dropped by) the origin
+    /// conversation — the boot re-drive's scan predicate.
+    pub fn awaits_delivery(&self) -> bool {
+        self.completed_at.is_some() && self.notified_at.is_none()
+    }
+
+    /// True when this execution ran a one-shot job, i.e. its result belongs in
+    /// the origin conversation rather than in its own.
+    pub fn is_one_shot(&self) -> bool {
+        self.schedule.is_one_shot()
+    }
+
+    /// Display name for the fire: the snapshotted [`Self::title`], falling
+    /// back to a truncated prompt for legacy rows.
+    pub fn display_title(&self) -> String {
+        display_title(&self.title, &self.prompt)
+    }
+}
+
+// ── PendingCronResult ────────────────────────────────────────────────
+
+/// A finished one-shot fire, handed to the **origin** conversation's actor
+/// (`AgentMessage::CronResultReady`) for zero-inference delivery: the actor
+/// appends the framed result as an assistant row, dispatches it, and stamps
+/// the execution's `notified_at`.
+///
+/// Built by the cron waiter from the fire's terminal lifecycle event, and
+/// rebuilt verbatim by the boot re-drive from the persisted [`CronExecution`]
+/// — so both paths deliver identical content. `execution_id` is the
+/// source of the transcript row's durable idempotency key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCronResult {
+    pub execution_id: String,
+    pub cron_job_id: String,
+    /// The job's display title, used in the notification header.
+    pub job_title: String,
+    /// Session the fire ran in; its reply row at `reply_ordinal` carries the
+    /// content to deliver.
+    pub fire_session_id: SessionId,
+    pub reply_ordinal: Option<i64>,
+    pub outcome: ExecutionOutcome,
+    /// Why the fire failed, when `outcome` is [`ExecutionOutcome::Failed`].
+    pub failure_reason: Option<String>,
+    pub completed_at: DateTime<Utc>,
 }
 
 #[cfg(test)]
@@ -196,6 +377,7 @@ mod tests {
             id: "cj-fmt".to_string(),
             user_id: "u-1".to_string(),
             channel: ChannelType::tui(),
+            title: "fmt job".to_string(),
             schedule: CronSchedule::cron("0 9 * * *"),
             prompt: "fmt".to_string(),
             timezone: tz.to_string(),
@@ -237,6 +419,7 @@ mod tests {
             id: "cj-1".to_string(),
             user_id: "u-1".to_string(),
             channel: ChannelType::tui(),
+            title: "morning news".to_string(),
             schedule: CronSchedule::cron("0 9 * * *"),
             prompt: "push news".to_string(),
             timezone: "Asia/Shanghai".to_string(),
@@ -267,6 +450,7 @@ mod tests {
             id: "cj-at".to_string(),
             user_id: "u-1".to_string(),
             channel: ChannelType::tui(),
+            title: "one shot".to_string(),
             schedule: CronSchedule::at(fire_at),
             prompt: "one shot".to_string(),
             timezone: "UTC".to_string(),
@@ -326,23 +510,44 @@ mod tests {
 
     #[test]
     fn execution_serde_round_trip() {
-        let exec = CronExecution {
-            id: "ce-1".to_string(),
-            job_id: "cj-1".to_string(),
-            user_id: "u-1".to_string(),
-            channel: ChannelType::tui(),
-            schedule: CronSchedule::at(Utc::now()),
-            prompt: "push news".to_string(),
-            scheduled_fire_time: Utc::now(),
-            triggered_at: Utc::now(),
-            status: ExecutionStatus::Pending,
-            origin_session_id: Some("sess-cron".into()),
-        };
+        let mut exec = CronExecution::pending(&job_with_tz("UTC"), Utc::now(), Utc::now());
+        exec.origin_session_id = Some("sess-cron".into());
+        exec.fire_session_id = Some("cron-abc".into());
+        exec.completed_at = Some(Utc::now());
+        exec.outcome = Some(ExecutionOutcome::Success);
+        exec.reply_ordinal = Some(7);
+
         let json = serde_json::to_string(&exec).unwrap();
         let restored: CronExecution = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.job_id, "cj-1");
-        assert!(restored.schedule.is_one_shot());
+        assert_eq!(restored.job_id, "cj-fmt");
         assert_eq!(restored.status, ExecutionStatus::Pending);
+        assert_eq!(restored.outcome, Some(ExecutionOutcome::Success));
+        assert_eq!(restored.reply_ordinal, Some(7));
+        assert_eq!(
+            restored.fire_session_id.as_ref().map(|s| s.as_str()),
+            Some("cron-abc")
+        );
+        // Completed but never notified — the boot re-drive's scan predicate.
+        assert!(restored.awaits_delivery());
+    }
+
+    #[test]
+    fn legacy_execution_row_deserializes_with_empty_delivery_ledger() {
+        // Rows persisted before the ledger existed must load, and must not
+        // look like they are awaiting delivery (no `completed_at`).
+        let json = r#"{
+            "id":"ce-old","job_id":"cj-old","user_id":"u-1","channel":"tui",
+            "schedule":{"kind":"at","time":"2025-01-01T00:00:00Z"},
+            "prompt":"x",
+            "scheduled_fire_time":"2025-01-01T00:00:00Z",
+            "triggered_at":"2025-01-01T00:00:00Z",
+            "status":"dispatched"
+        }"#;
+        let restored: CronExecution = serde_json::from_str(json).unwrap();
+        assert!(restored.fire_session_id.is_none());
+        assert!(restored.outcome.is_none());
+        assert!(restored.notified_at.is_none());
+        assert!(!restored.awaits_delivery());
     }
 
     #[test]
@@ -355,5 +560,24 @@ mod tests {
             serde_json::to_string(&ExecutionStatus::Dispatched).unwrap(),
             "\"dispatched\""
         );
+        assert_eq!(
+            serde_json::to_string(&ExecutionOutcome::Blank).unwrap(),
+            "\"blank\""
+        );
+    }
+
+    #[test]
+    fn display_title_falls_back_to_truncated_prompt() {
+        let mut job = job_with_tz("UTC");
+        assert_eq!(job.display_title(), "fmt job");
+
+        job.title = String::new();
+        job.prompt = "short prompt".to_string();
+        assert_eq!(job.display_title(), "short prompt");
+
+        job.prompt = "x".repeat(60);
+        let fallback = job.display_title();
+        assert!(fallback.ends_with('…'), "{fallback}");
+        assert_eq!(fallback.chars().count(), LEGACY_TITLE_MAX_CHARS + 1);
     }
 }

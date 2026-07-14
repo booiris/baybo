@@ -27,10 +27,12 @@ Session (TriggerKind::User|Cron)
     │            BackgroundCompressionRunner::run(current_job_id)
     │              → baybo_context::run_background_summary:
     │                  1. load the session's session_messages (active, ordinal ≤ up_to_ordinal)
-    │                  2. read summary.md (if exists)
-    │                  3. one tool-free LLM call (same model as the session)
-    │                  4. atomic write summary.md (tempfile + rename)
-    │                  5. update libsql metadata (retry on transient failure)
+    │                  2. read summary.md, seeding DEFAULT_NOTES_TEMPLATE if absent
+    │                  3. append the session-notes prompt after the transcript
+    │                  4. tool loop (≤ MAX_BACKGROUND_SUMMARY_ITERATIONS): Read/Edit
+    │                     scoped to the notes path — the model rewrites summary.md
+    │                     in place (same model as the session)
+    │                  5. record sqlite metadata (warn-and-continue on failure)
     │          store the JoinHandle on AgentLoop.bg_compression
     └─ compress_if_needed → ContextManager::run_compression_flow
                               ├─ stage 1: load summary.md → assemble → return
@@ -49,22 +51,24 @@ Session (TriggerKind::User|Cron)
 <workspace>/state/sessions/<session_id>/summary.md
 ```
 
-Atomic write via tempfile + `rename` (mirrors `crates/workspace/src/identity.rs:36-40`).
+The first-pass seed (`DEFAULT_NOTES_TEMPLATE`) is written atomically via tempfile + `rename` (mirrors `crates/workspace/src/identity.rs:36-40`); later passes rewrite the file in place through the model's `Edit` calls.
 
-### libsql — table `session_summaries`
+### sqlite — table `session_summaries`
 
 ```sql
 CREATE TABLE session_summaries (
   session_id  TEXT    PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
   cursor      INTEGER NOT NULL,           -- session_messages.ordinal at last successful pass
   pass_count  INTEGER NOT NULL DEFAULT 0,
-  updated_at  INTEGER NOT NULL,           -- unix ms
+  updated_at  INTEGER NOT NULL,           -- unix µs
   cost_micros INTEGER NOT NULL DEFAULT 0, -- per `feedback_money_no_float.md`: integer micro-USD
   model_id    TEXT    NOT NULL,
   span_id     TEXT    NOT NULL,
   error_count INTEGER NOT NULL DEFAULT 0  -- telemetry only; does NOT gate triggers
 );
 ```
+
+The live table additionally carries two legacy inert columns — `in_flight` / `in_flight_owner`, left over from the DB-flag at-most-one mechanism the in-memory `JoinHandle` replaced. Nothing reads or writes them; they stay only so old DBs need no migration.
 
 ## Trigger Conditions (session side)
 
@@ -96,11 +100,7 @@ Before measuring the anchor-relative clauses (b) and (c), the gate reads `sessio
 
 ### Anchor re-positioning on every compression apply
 
-| Compression kind | New anchor |
-|---|---|
-| Stage 1 fast-path (summary.md hit) | `system.len() + 1 (summary blob) = recent slice start index` |
-| Stage 2 LLM summary | `system.len() + 1 (summary blob)` (no recent slice) |
-| Stage 3 truncate fallback | `min(prev_anchor, new_messages.len())` |
+Every successful apply — all three stages — re-anchors at `messages.len()` (`ContextManager::run_compression`): the entire freshly-applied transcript, recent slice included, counts as covered, so the skill trailer / kept tail can't immediately re-trip the diff threshold.
 
 `tool_calls_since_anchor` measures `ToolUse` blocks in `messages[anchor..]`. Fresh-installed and post-compression turns both legitimately accumulate beyond the anchor.
 
@@ -156,30 +156,34 @@ Key properties:
 `BackgroundCompressionRunner` (in `crates/agent/src/runtime/compression.rs`) is the agent-side adapter: it bundles the agent-layer deps (`BillableLlm`, `SpanRecorder`, `SecurityGateway`, `SessionManager`, `WorkspacePaths`, tokenizer, model info, the session identity, the minted `job_id`, and the cancel token), wraps a fresh `CompressionRunner` per LLM iteration into the context-crate callback shape, and delegates the actual flow to `baybo_context::run_background_summary`. That flow:
 
 1. Load the session's active messages up to `up_to_ordinal` (`load_active_session_messages_up_to`).
-2. Load `summary.md` from `<workspace>/state/sessions/<session_id>/summary.md` (None if absent).
-3. Build `ChatRequest` (extended `SUMMARIZE_INSTRUCTION`, see Appendix A).
-4. Call the chat callback — each call opens its own `StepKind::Compression` + `LlmCall` span via `CompressionRunner::run`. No tools. Same model as the session.
-5. Parse response (`<analysis>` + `<summary>` block; reuse `parse_summary_response`).
-6. **Atomic file write**: write to `summary.md.tmp`, fsync, rename to `summary.md`.
-7. **libsql metadata update** (retry on transient failure, leave FS orphan on exhaustion):
+2. Load `summary.md` from `<workspace>/state/sessions/<session_id>/summary.md`.
+3. **Seed the notes file when absent** (`ensure_notes_file`): write `DEFAULT_NOTES_TEMPLATE` — the canonical section scaffold — via tempfile + rename, so the model's `Edit` calls always land against a real file.
+4. Append the session-notes prompt after the transcript (`build_summary_prompt`: `PROMPT_TEMPLATE` with `{{notesPath}}` / `{{currentNotes}}` substituted, plus the size-budget appendices — see Appendix A).
+5. **Run the tool loop** (at most `MAX_BACKGROUND_SUMMARY_ITERATIONS` = 10 turns): the model is offered `Read` / `Edit`, scoped by `enforce_notes_scope` to the notes path, and rewrites `summary.md` **in place** through its `Edit` calls. Tool errors come back as `ERROR:`-prefixed `tool_result` bodies so the model can retry. Each iteration calls the chat callback, which opens its own `StepKind::Compression` + `LlmCall` span via `CompressionRunner::run`. Same model as the session. The loop ends when the model responds without tool calls.
+6. **sqlite metadata record** (`record_summary_success` — a single-statement upsert; no retry, a failure is logged at `warn` and the pass still succeeds, leaving an FS orphan for the startup reaper):
    ```sql
-   INSERT OR REPLACE INTO session_summaries
+   INSERT INTO session_summaries
        (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count)
-   VALUES
-       (?, ?, prev.pass_count + 1, ?, prev.cost_micros + ?, ?, ?, 0);
+   VALUES (?, ?, 1, ?, ?, ?, ?, 0)
+   ON CONFLICT(session_id) DO UPDATE SET
+       cursor = excluded.cursor,
+       pass_count = session_summaries.pass_count + 1,
+       cost_micros = session_summaries.cost_micros + excluded.cost_micros,
+       error_count = 0, …;
    ```
-8. Return a `BackgroundSummaryOutcome`, which the spawned task logs on failure/success boundaries; the durable summary metadata remains the source of truth.
+7. Return a `BackgroundSummaryOutcome` (the *last* iteration's `span_id`, the summed `cost_micros`), which the spawned task logs on failure/success boundaries; the durable summary metadata remains the source of truth.
 
 ### Cancellation
 
 The detached pass uses a **fresh `CancellationToken::new()` that is never cancelled** — deliberately decoupled from the actor's `actor_token`. The actor reaper (`AgentSupervisor::reap_idle`) cancels an idle session's `actor_token`; if the pass's token derived from it, a reap that fires mid-pass would tear down an in-flight summary and waste the LLM call. By minting a standalone token we let an in-flight pass run to completion even if the session's actor is reaped between turns. This mirrors `spawn_session_end_write`, which mints its own `JobId` and runs detached for the same reason.
 
-The trade-off is that a process shutdown does not actively cancel an in-flight pass; the task is detached and simply abandoned when the runtime stops. That is acceptable — the pass is idempotent (atomic file write + INSERT OR REPLACE), so an abandoned pass just leaves the previous summary in place and the next trigger fires fresh.
+The trade-off is that a process shutdown does not actively cancel an in-flight pass; the task is detached and simply abandoned when the runtime stops. That is acceptable — an abandoned pass may leave partially-applied `Edit`s in `summary.md`, but the metadata cursor never advanced, so the notes stay usable as-is and the next trigger fires fresh over the same window (the metadata write is an idempotent upsert).
 
 ### Failure handling (linear retry, no backoff)
 
-- LLM call fails → metadata `error_count++`, no summary.md written, next trigger fires fresh.
-- Disk write fails → metadata not updated; cost paid for nothing (logged); next trigger fires fresh.
+- LLM call fails → `record_summary_failure` bumps metadata `error_count`; `summary.md` may already carry the seeded scaffold and any earlier iterations' `Edit`s; next trigger fires fresh.
+- A single `Edit` / `Read` fails → **not** a pass failure: the error returns to the model as an `ERROR:`-prefixed `tool_result` for retry. A pass that applies no `Edit` at all still records success (logged at `debug`).
+- Seeding `summary.md` fails → logged at `warn` only; the default template is inlined into the prompt and the pass continues.
 - Metadata update fails → file orphan; the startup FS reaper deletes orphan summary dirs whose `session_id` has no metadata row.
 
 `error_count` is **telemetry only** — it does not gate future triggers. Acceptable cost: a persistent failure burns one LLM call per trigger event until conditions self-resolve.
@@ -193,8 +197,8 @@ The fast-path lives as a private `try_summary_fast_path` method on `ContextManag
 The fast-path **never waits** for an in-flight background pass — it reads whatever cursor + `summary.md` is currently on file and tolerates being stale-by-one. A refresh that lands just after this read simply applies on the next turn.
 
 1. Load `session_summaries` row + `summary.md` content for `session_id`.
-2. **Cursor mapping**: walk `load_session_messages_with_supersede(session_id)` counting active rows (`superseded_by IS NULL`) until ordinal == `metadata.cursor`; the count is the cursor's index in the in-memory `messages` (full frame, including system). Fall through if:
-   - The active row count from the supersede log doesn't equal `messages.len()` (snapshot drift, an unpersisted system prompt, compaction in flight).
+2. **Cursor mapping**: resolve `metadata.cursor` to its index among the session's active rows via `SessionManager::active_index_of_ordinal` (the supersede filter is pushed into SQL, not walked client-side); that index is the cursor's position in the in-memory `messages` (full frame, including system), cross-checked against `SessionManager::count_active_messages`. Fall through if:
+   - The active row count doesn't equal `messages.len()` (snapshot drift, an unpersisted system prompt, compaction in flight).
    - The cursor ordinal isn't present in the active log (compression has rewritten it).
    - The cursor maps inside the system block.
 3. **Recent slice selection** (atomic-pair backward walk):
@@ -210,7 +214,8 @@ The fast-path **never waits** for an in-flight background pass — it reads what
 5. **Assemble**:
    ```
    [system messages (all)]
-   [user(<context-summary>...summary content...</context-summary>)]
+   [user(continuation-summary message: intro + summary.md body +
+         transcript pointer + footer)]
    [recent slice]
    ```
 6. Return `CompressOutput::Replaced { messages }` — `ContextManager::run_compression` then inserts the skill trailer right after the system block via `insert_skill_trailer` (σ-A).
@@ -232,7 +237,7 @@ The continuation-summary message follows Claude Code's compaction format: a fixe
 
 Any of the following → fall through to stage 2 (LLM summary) / stage 3 (truncate fallback):
 - summary.md missing (first compression on a session)
-- supersede-log lookup fails or its active count disagrees with `messages.len()`
+- the `active_index_of_ordinal` / `count_active_messages` lookup fails, or the active count disagrees with `messages.len()`
 - the cursor ordinal isn't in the active log (compaction has rewritten it)
 - the cursor maps inside the system block
 - assembled `summary + recent_slice + skill_trailer` exceeds 0.6 × max_tokens
@@ -250,7 +255,7 @@ The first compression on every session pays a one-time synchronous-LLM-summary l
 |---|---|
 | Compression fires while refresh in-flight | Fast-path reads the last-successful summary without waiting (stale-by-one tolerated) |
 | Compression fires before any summary written | Fall through to inner `Summarize` |
-| Refresh writes summary.md while compression reads | Atomic tempfile+rename — never partial |
+| Refresh writes summary.md while compression reads | The refresh's writes are the model's in-place `Edit` calls (only the first-pass template seed is tempfile+rename), so a concurrent read can see mid-pass notes — but the `session_summaries` cursor the fast-path keys on only advances via `record_summary_success` once the pass finishes |
 | Two refreshes interleave on same session | In-memory `AgentLoop.bg_compression` `JoinHandle` rejects the second: a present, not-finished handle short-circuits the spawn. |
 | Stale cursor (covers very old prefix) | Recent slice must cover everything after cursor; if `summary + recent + skill_trailer > 0.6 × max_tokens`, fall through |
 | Process restart mid-pass | The detached task is abandoned (its `JoinHandle` lived only in the dead actor); the previous summary stays on disk and the next trigger fires fresh. A summary dir whose metadata row never committed is swept by the startup FS reaper. Any half-open `Compression` step/span under the already-completed parent job is closed by boot trace recovery's unfinished-step sweep without changing the parent job status. |
@@ -260,7 +265,7 @@ The first compression on every session pays a one-time synchronous-LLM-summary l
 In `ContextManager::restore_from_store`:
 1. Load `session_messages` (existing behaviour).
 2. Load `session_summaries` row for `session_id`.
-3. If row exists: walk loaded messages to find the index whose source `session_messages.ordinal == row.cursor`; set `last_summary_anchor = that_index`.
+3. If row exists: resolve the index whose source `session_messages.ordinal == row.cursor`; set `last_summary_anchor = that_index + 1` — the position *after* the cursor's row, since the cursor message itself is already summarized and must not count toward `tokens_since_anchor`. The `last_synced_cursor` cache is primed at the same time.
 4. If no row: `last_summary_anchor = None`.
 
 ### Orphan reaping (startup)
@@ -299,15 +304,16 @@ SELECT cost_micros FROM session_summaries WHERE session_id = ?;
 
 | Constant | Value | Where |
 |---|---|---|
-| `SUMMARY_TRIGGER_TOKEN_THRESHOLD` | `0.5 × max_tokens` | `baybo-context` |
+| `SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO` | `0.5` (× `max_tokens`) | `baybo-context` |
 | `SUMMARY_DIFF_TOKEN_THRESHOLD` | `5_000` | `baybo-context` |
 | `SUMMARY_TRIGGER_TOOL_CALL_THRESHOLD` | `3` | `baybo-context` |
 | `RECENT_SLICE_MIN_TOKENS` | `10_000` | `baybo-context` |
 | `RECENT_SLICE_MIN_TEXT_BLOCK_MSGS` | `5` | `baybo-context` |
 | `RECENT_SLICE_MAX_TOKENS` | `40_000` | `baybo-context` |
-| `FAST_PATH_FALLTHROUGH_THRESHOLD` | `0.6 × max_tokens` | `baybo-context` |
-| `STATE_SESSIONS_DIR` | `"state/sessions"` | `baybo-workspace` |
-| `SUMMARY_FILE_NAME` | `"summary.md"` | `baybo-workspace` |
+| `FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO` | `0.6` (× `max_tokens`) | `baybo-context` |
+| `STATE_SESSIONS_SUBDIR` | `"sessions"` (under `STATE_DIR` = `"state"`) | `baybo-workspace` |
+| `SUMMARY_FILE` | `"summary.md"` | `baybo-workspace` |
+| `SUMMARY_FILE_TMP` | `"summary.md.tmp"` | `baybo-workspace` |
 
 ## Known Limitations
 
@@ -315,58 +321,22 @@ SELECT cost_micros FROM session_summaries WHERE session_id = ?;
 
 After a fast-path or full-`Summarize` compression, the session's *active* `session_messages` no longer contains the original conversation — it contains the compressed list. Subsequent `BackgroundCompressionRunner` passes load active messages only (`superseded_by IS NULL`), so they see the embedded prior summary blob as just-another-message rather than re-deriving from original turns.
 
-**Net effect**: Pattern B (authoritative rewrite from original transcript) is achieved on **pre-compression** passes only. Post-first-compression passes are effectively Pattern A (refine from prior summary + new turns). The summary prompt's "conversation is authoritative" instruction still helps because the prior summary appears verbatim in the messages and the LLM is told to use it as scaffolding — but the original transcript is unrecoverable from the active slice.
+**Net effect**: Pattern B (authoritative rewrite from original transcript) is achieved on **pre-compression** passes only. Post-first-compression passes are effectively Pattern A (refine from prior summary + new turns). The prior notes still ride in the prompt's `<current_notes_content>` block and the model is told to update them "based on the user conversation above", so continuity holds — but the original pre-compression transcript is unrecoverable from the active slice.
 
 **Why accepted**: loading all superseded rows for a long session would mean feeding 500K+ tokens to the LLM each pass — not feasible.
 
 ### Small-model caveat
 
-Design is sized for `max_tokens ≥ ~100K`. On smaller-context models (32K), the fast-path's assembled total can approach or exceed `max_tokens`, forcing immediate re-compression next turn. Acceptable for big-context deployments; smaller models fall through more often (which the existing inner `Summarize` handles correctly).
+Design is sized for `max_tokens ≥ ~100K`. The pre-assembly gate caps the fast-path's assembled non-system total at `0.6 × max_tokens` by construction (summary + skill trailer + recent slice), and the notes file itself is budgeted to ~12K tokens (`MAX_TOTAL_SESSION_MEMORY_TOKENS`) — so an over-budget assembly never lands. On smaller-context models (32K) that ceiling is ~19K, which the recent slice alone (up to `RECENT_SLICE_MAX_TOKENS` = 40K) can exceed: those sessions simply **fall through more often** to the inner `Summarize`, which handles them correctly. Acceptable for big-context deployments.
 
-Worst-case sizing:
+## Appendix A — Summary Prompt (`PROMPT_TEMPLATE`)
 
-| Model context | Fast-path assembled total | Headroom |
-|---|---|---|
-| 200K | ~1K + 120K + 40K = 161K | ~20% |
-| 100K | ~1K + 60K + 40K = 101K | tight |
-| 32K | ~1K + 19K + 40K = 60K | overflows |
+The background pass does **not** reuse the inline path's `SUMMARIZE_INSTRUCTION` (which lives at `crates/context/src/prompts/compression.rs` and belongs to the inline stage-2 `summarize_or_truncate` path only). It has its own prompt: `PROMPT_TEMPLATE` in `crates/context/src/background_summary.rs` — a *session-notes update* instruction, not a produce-a-summary-blob instruction.
 
-## Appendix A — Summary Prompt (extended `SUMMARIZE_INSTRUCTION`)
+Shape (assembled by `build_summary_prompt`, appended as the trailing user message after the transcript):
 
-Prepend to the existing instruction (`crates/context/src/strategy/summarize.rs:13-103`):
+- `PROMPT_TEMPLATE` with two mustache placeholders substituted: `{{notesPath}}` (the session's `summary.md` path) and `{{currentNotes}}` (its current contents, wrapped in a `<current_notes_content>` block).
+- The instruction tells the model to update the notes **based on the conversation above**, using parallel `Edit` calls against `{{notesPath}}` and nothing else, while preserving the `DEFAULT_NOTES_TEMPLATE` section scaffold verbatim (headers + italic `_descriptors_`).
+- Size-budget appendices, conditionally appended: a `CRITICAL … condense` directive when the notes exceed `MAX_TOTAL_SESSION_MEMORY_TOKENS` (12K), and a per-section list when any section exceeds `MAX_SECTION_LENGTH` (2K). Both are measured with the session's own tokenizer.
 
-```
-CONTEXT: A previous summary of part of this conversation exists and is provided
-below for terminology and structural consistency. The conversation transcript
-above is the authoritative source — re-derive every fact from it. Only use the
-prior summary as a scaffold to keep names, file paths, and concept labels stable
-across passes.
-
-PRIOR SUMMARY:
-{summary.md content, or "(none — this is the first pass)"}
-
----
-
-{existing SUMMARIZE_INSTRUCTION text}
-
-SIZE TARGET: aim for ~8-12K tokens. Grow when genuinely more substance has
-accumulated; do not pad.
-```
-
-Output format unchanged (`<analysis>` + `<summary>`); `parse_summary_response` keeps working.
-
-## Appendix B — Wrapper Text for Embedded Summary
-
-```
-<context-summary>
-The conversation prior to this point has been compressed for context-window
-management. The summary below was produced from the full prior conversation
-and represents its substantive content. Treat it as established context for
-the user's current request; the recent messages that follow are the only
-unsummarized exchanges.
-
-{summary content from summary.md, verbatim}
-</context-summary>
-```
-
-Role: `Role::User`.
+The output contract is therefore **`Edit` tool calls**, not an `<analysis>` + `<summary>` text block — `parse_summary_response` plays no role in the background path.

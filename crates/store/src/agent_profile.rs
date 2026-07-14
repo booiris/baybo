@@ -39,7 +39,7 @@ pub struct AgentProfileRow {
     /// Per-request reasoning effort for providers that support it.
     /// `None` = follow the LLM entry's own configured value.
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// Read-side state only — never bound on insert; the libsql seed is
+    /// Read-side state only — never bound on insert; the sqlite seed is
     /// the sole writer of `builtin = 1`.
     pub builtin: bool,
     pub created_at: DateTime<Utc>,

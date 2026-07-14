@@ -36,23 +36,26 @@ different flavor of LLM:
 
 ## Where things live
 
-- `baybo_model::SubagentBackend` — `Baybo { llm: Option<String> } |
-  External { kind: ExternalAgentKind }`. Carried on
-  `SubagentSpawnRequest.backend`.
+- `baybo_model::SubagentBackend` — `Baybo | External { external_kind:
+  ExternalAgentKind }`. Carried on `SubagentSpawnRequest.backend`; the
+  Baybo backend's model choice travels separately as
+  `SubagentSpawnRequest.model_tier`.
 - `baybo_model::ExternalAgentKind` — discriminator enum: `Claude`,
   `Codex`, `Gemini`. Carried on `SubagentBackendTag::External {
   external_kind, workspace_dir, resume_key }`.
 - `baybo_model::SubagentBackendKind` — discriminator-only view of
   `SubagentBackendTag` for runtime decisions that don't care about
   per-instance state (resume validation, error labels, dispatch).
-- `baybo_agent::external_agent::ExternalAgent` — async trait with one
-  method: `run(request) -> Result<Stream<ExternalAgentEvent>>`.
+- `baybo_agent::external_agent::ExternalAgent` — async trait with
+  `kind()` (registry key) and `run(request) ->
+  Result<Stream<ExternalAgentEvent>>`.
 - `baybo_agent::external_agent::ExternalAgentRegistry` — built at boot
   in `crates/baybo/src/runtime.rs`; the spawn router looks impls up by kind.
 - `baybo_agent::external_agent::claude_cli::ClaudeCliAgent` — concrete
   impl for `claude -p` (subprocess + stream-json NDJSON parser +
   ETXTBSY-retrying existence check).
-- `baybo_agent::actor::router::system_spawn::subagent` — branches on
+- `baybo_agent::runtime::subagent_spawner::ActorSubagentSpawner`
+  (`crates/agent/src/runtime/subagent_spawner.rs`) — branches on
   `request.backend`: `Baybo` takes the existing `AgentActor` spawn
   path; `External` looks up the agent, builds a fresh child Session
   (or loads an existing one on resume), runs the agent, persists any
@@ -62,19 +65,25 @@ different flavor of LLM:
 
 ```jsonc
 spawn_subagent({
-  "task_description": "...",
-  "must_include_context": ["..."],
-  "timeout_secs": 600,
+  "subagent_type": "general-purpose",
+  "description": "3-5 word summary",  // trace label; the child never sees it
+  "prompt": "self-contained brief",   // the child's first user message
 
   // Backend selection:
-  "backend": "claude",         // or "baybo" (default)
-  "llm": "fast",                   // only valid when backend = "baybo"
+  "backend": "claude",       // or "codex" | "gemini" | "baybo" (default)
+  "model_tier": "fast",      // baybo backend only; fast|balanced|deep
 
   // Optional:
-  "workspace_name": "...",         // human-readable working-dir slug
-  "resume_session_id": "child-..." // continue a prior subagent
+  "background": false,
+  "on_timeout": "background",      // or "kill"
+  "resume_session_id": "child-...", // continue a prior subagent
+  "group": "..."                   // barrier cohort
 })
 ```
+
+There is no per-spawn timeout: baybo children stop at
+`max_iterations`, external children at a hardcoded 8-hour idle timeout
+(`EXTERNAL_SUBAGENT_TIMEOUT`).
 
 The tool's `to_tool_result_text()` appends
 `[subagent_session_id: <id>]` on a successful return so the parent
@@ -104,10 +113,7 @@ On a resume spawn, the router:
    forward it as `--resume <uuid>`.
 3. Reads the durable `workspace_dir` from
    `SubagentBackendTag::External.workspace_dir` — resume always lands
-   in the same on-disk dir picked at genesis, regardless of any
-   `workspace_name` the parent LLM might supply on the resume call.
-   (The spawn-tool parser rejects `workspace_name` combined with
-   `resume_session_id` to make this explicit.)
+   in the same on-disk dir picked at genesis.
 
 Continuity survives baybo restarts because the child Session row is
 durable.
@@ -222,19 +228,14 @@ running `claude -p '...'` in a shell on the baybo host.
 
 ## claude — where it runs
 
-`<workspace_root>/work/claude/<dir>/`, where `<dir>` is either
-the `workspace_name` slug picked by the parent LLM in the
-`spawn_subagent` call (sanitised kebab-case ASCII, capped at 32
-chars), or the child session_id when no name was supplied. The dir
-is resolved exactly once — at genesis — and persisted on
-`SubagentBackendTag::External.workspace_dir`. Resume calls read it
-back from the tag; they do not re-derive from the resume-time
-request. Two spawns with the same `workspace_name` deliberately
-share the same on-disk dir — pass the same name when a sibling
-subagent should pick up where another left off. The dir is created
-on demand and never auto-cleaned (matches CLAUDE.md's "session data
-is core data — never deleted" rule); operators who want to reclaim
-disk delete the dir manually.
+`<workspace_root>/work/claude/<child_session_id>/` — the dir name is
+always the child session id. It is resolved exactly once — at genesis
+— and persisted on `SubagentBackendTag::External.workspace_dir`.
+Resume calls read it back from the tag; they do not re-derive from the
+resume-time request. The dir is created on demand and never
+auto-cleaned (matches CLAUDE.md's "session data is core data — never
+deleted" rule); operators who want to reclaim disk delete the dir
+manually.
 
 ## claude — config
 
@@ -425,8 +426,9 @@ may resolve it.
   gateway service (different cwd, possibly a narrower PATH) pins
   the same binary instead of re-walking PATH at boot. If the write
   would leave multiple kinds configured without a default, the
-  wizard also prompts for `default_external_agent`. Restarts the
-  gateway to take effect.
+  wizard also prompts for `default_external_agent`. Requires a
+  gateway restart to take effect (the command prints a restart hint;
+  it does not restart the gateway itself).
 - `baybo external-agent disable` — interactive multi-select: check the
   currently-enabled kinds to turn off and set each
   `external_agents.<kind>.enabled = false`. If a disabled kind was
@@ -434,7 +436,8 @@ may resolve it.
   ≤1 kind remains, else the wizard prompts for a new one). Each
   recorded `binary_path` is left intact for an easy re-enable. When
   nothing is enabled it's a no-op success — the feature is already
-  off. Restarts the gateway to take effect.
+  off. Requires a gateway restart to take effect (the command prints
+  a restart hint; it does not restart the gateway itself).
 - `baybo external-agent default` — interactive picker that sets
   `external_agents.default_external_agent` to one of the
   currently-enabled kinds. Errors when nothing is enabled. The
@@ -442,9 +445,10 @@ may resolve it.
   still requires an explicit `backend`), so it only matters once
   more than one kind is enabled; nothing in the boot/spawn path
   reads it yet, so **no gateway restart** is needed.
-- `baybo setup` (quick mode) probes every kind on PATH after the
-  other setup steps. Each detected binary triggers a y/n confirm;
-  the operator picks which to enable. If multiple end up enabled,
+- `baybo setup` (quick and full modes) probes every kind on PATH
+  after the other setup steps and shows the detected ones in a single
+  multi-select (already-enabled kinds pre-checked; on a fresh install
+  everything detected is pre-checked). If multiple end up enabled,
   prompts for `default_external_agent` automatically.
 
 ## Adding a new external agent
@@ -455,10 +459,12 @@ may resolve it.
    underlying tool supports continuation; otherwise just emit
    `FinalContent` (and a parent-side `resume_session_id` for that
    agent will return "doesn't support resume").
-3. Optionally add a config section under
-   `crates/config/src/external_agents.rs`.
-4. Register in `crates/baybo/src/runtime.rs` alongside the `claude`
-   registration.
+3. Add a config struct field in
+   `crates/config/src/external_agents.rs` and extend `boot_entries()`
+   (required — boot only probes config-backed kinds).
+4. Extend the `match kind` in `build_registry`
+   (`crates/agent/src/external_agent/mod.rs`) to call the new agent's
+   `probe_and_build`; `crates/baybo/src/runtime.rs` needs no change.
 
 That's it — no spawn-protocol changes, no LLM-pool / agent-loop
 plumbing, no need to touch the rig-shape `AnyCompletionModel`.

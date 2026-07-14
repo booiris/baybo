@@ -57,7 +57,7 @@ const INPROCESS_EVENT_CAPACITY: usize = 256;
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(5);
 
 /// Upper bound on flushing detached cost-record writes before teardown —
-/// generous for a libsql write, short enough not to hang the CLI if one
+/// generous for a sqlite write, short enough not to hang the CLI if one
 /// wedges.
 const COST_DRAIN_BUDGET: Duration = Duration::from_secs(3);
 
@@ -284,7 +284,7 @@ async fn run_in_process(
     // persists on a spawned task; the long-running gateway outlives
     // those, but here the process exits seconds later, so an un-drained
     // write would be aborted and the turn's spend lost. Bounded so a
-    // wedged libsql write can't hang the CLI.
+    // wedged sqlite write can't hang the CLI.
     let _ = tokio::time::timeout(COST_DRAIN_BUDGET, graph.cost_manager.drain()).await;
 
     // Tear the runtime down: trip the shutdown signal (cascades to actors
@@ -343,17 +343,15 @@ async fn consume_inprocess_turn(
             }
             AgentEvent::Notice { level, text } => eprint_notice(level, &text),
             // Transient turn progress (reasoning, tool steps, compaction
-            // status, observer narration, the planning checklist) and
-            // out-of-band media (attachments) aren't part of the one-shot
-            // text answer.
+            // status, observer narration, the planning checklist) isn't part
+            // of the one-shot text answer.
             AgentEvent::Reasoning(_)
             | AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolCompleted { .. }
             | AgentEvent::Status(_)
             | AgentEvent::Progress(_)
             | AgentEvent::TaskList(_)
-            | AgentEvent::TurnState { .. }
-            | AgentEvent::Attachment(_) => {}
+            | AgentEvent::TurnState { .. } => {}
         }
     }
     writer.finish_incomplete()
@@ -618,6 +616,7 @@ mod tests {
     async fn ws_approval_is_auto_resolved_from_queue() {
         let q = ApprovalQueue::new();
         q.enqueue_mirror(ApprovalRequest {
+            tool_call_id: None,
             call_id: "c1".into(),
             session_id: SessionId::from("s1"),
             user_id: String::new(),

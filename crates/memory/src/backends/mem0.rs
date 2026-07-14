@@ -1708,6 +1708,7 @@ mod tests {
                     blob_id: "sha256:0".into(),
                 },
                 mime_type: "image/png".into(),
+                filename: None,
             },
             ContentBlock::Text("world".into()),
         ];

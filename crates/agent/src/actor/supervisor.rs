@@ -133,7 +133,7 @@ impl AgentSupervisor {
     /// Peek whether a specific background subagent is still tracked. The wait
     /// task calls this BEFORE delivering its terminal result: a `false` means
     /// `/stop` already drained the entry, so the delivery must be suppressed
-    /// (a user-stopped result must not repopulate `pending_background_results`).
+    /// (a user-stopped result must not repopulate the notification buffer).
     pub fn is_background_subagent_in_flight(
         &self,
         parent_session_id: &SessionId,

@@ -52,7 +52,7 @@ cargo build --release --target x86_64-unknown-linux-musl --features bench-bash -
 
 That needs the musl target (`rustup target add x86_64-unknown-linux-musl`) and a
 musl C compiler (`x86_64-linux-musl-gcc`; on Arch: `sudo pacman -S musl`), which
-libsql's bundled SQLite requires. Point the bench at a prebuilt binary with
+sqlite's bundled SQLite requires. Point the bench at a prebuilt binary with
 `BAYBO_BIN=…` to skip the build.
 
 ## Prerequisites

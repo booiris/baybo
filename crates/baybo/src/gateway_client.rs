@@ -37,7 +37,7 @@ pub fn admin_addr_from_config(config: &BayboConfig) -> anyhow::Result<SocketAddr
 
 /// Best-effort read of the per-start TUI token from the secret vault.
 /// Returns `None` if the vault can't be opened (no encryption key,
-/// libsql missing) or the key isn't present yet — both surface to the
+/// sqlite missing) or the key isn't present yet — both surface to the
 /// caller as the same "no live gateway" fallback path. A loud error
 /// would only mask the more specific connect-failure message that the
 /// dial attempt produces a moment later.

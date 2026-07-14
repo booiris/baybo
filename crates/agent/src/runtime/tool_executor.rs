@@ -37,17 +37,21 @@ const APPROVAL_PARAMS_PREVIEW_LEN: usize = 512;
 const APPROVAL_HEADROOM: Duration = Duration::from_secs(300);
 
 /// Cap on the failure-reason string we copy out of a `ToolOutput::Error`
-/// payload. The full text is still preserved verbatim in the span's
-/// `result.output`; this bound only governs the row-level reason label.
+/// payload. This bound governs only the row-level reason label; the body
+/// lands in the span's `result.output`, itself capped at
+/// `MAX_TOOL_OUTPUT_BYTES` (see [`cap_trace_output`]).
 const FAILURE_REASON_MAX_BYTES: usize = 512;
 
-/// Hard cap on the total byte size of text fields carried inside the
-/// drained payloads of a single tool call. Tools are expected to
-/// truncate their own snippets/inputs/outputs before emitting, but
-/// this cap protects `span_events` from a tool that emits one very
-/// large payload (or many medium ones). Entries that would push the
-/// running total past this cap are dropped silently — the trace is
-/// best-effort, not load-bearing.
+/// Hard cap on the *aggregate* byte size of the drained payloads of a single
+/// tool call — a backstop against a tool that emits a very large number of
+/// events. Individual fields are already bounded by
+/// `SPAN_EVENT_TEXT_MAX_BYTES` in the sink, so no single event can approach
+/// this on its own.
+///
+/// Entries past the cap are dropped whole and silently (the trace is
+/// best-effort, not load-bearing), which is exactly why the per-field bound
+/// has to come first: a fat field here would evict later events, including the
+/// `ParseFailure` audit record.
 ///
 /// There is no separate cap on entry count: tools that emit a steady
 /// trickle of small `Phase` events are bounded by this same byte
@@ -104,7 +108,14 @@ fn payload_text_bytes(payload: &ToolEventPayload) -> usize {
 }
 
 impl baybo_tools::ToolEventSink for SpanEventRecorder {
-    fn emit(&self, action: &str, payload: ToolEventPayload) {
+    fn emit(&self, action: &str, mut payload: ToolEventPayload) {
+        // Bound each text field here, at the one sink every emitter passes
+        // through, rather than trusting five producers to remember. Note this
+        // must happen *before* the running-total check below: that check drops
+        // the whole entry, so an unbounded field would not merely bloat the
+        // trace, it would make later events (including `ParseFailure`, which is
+        // an audit record) vanish depending on arrival order.
+        payload.truncate_text_fields();
         let mut guard = self.entries.lock();
         let cost = action.len() + payload_text_bytes(&payload);
         if guard.text_bytes.saturating_add(cost) > TOOL_EVENTS_MAX_PAYLOAD_BYTES {
@@ -139,9 +150,9 @@ fn truncate_for_reason(s: &str, max_bytes: usize) -> String {
 /// `Json(Object)` are unaffected — those are the cases that previously
 /// rendered correctly (e.g. `NowTool` returns `Json({...})`), so we
 /// preserve their on-disk shape verbatim.
-fn tool_output_to_trace_value(output: &ToolOutput) -> Value {
+fn tool_output_to_trace_value(output: &ToolOutput) -> (Value, Option<usize>) {
     use serde_json::Map;
-    match output {
+    let value = match output {
         ToolOutput::Text(s) => {
             let mut m = Map::new();
             m.insert("type".into(), Value::String("text".into()));
@@ -175,7 +186,99 @@ fn tool_output_to_trace_value(output: &ToolOutput) -> Value {
             // keep the historical shape exactly.
             serde_json::to_value(output).unwrap_or(Value::Null)
         }
+    };
+    cap_trace_output(value)
+}
+
+/// Cap the span's copy of a tool result at the same byte budget the LLM
+/// transcript uses. The transcript copy is capped *and* spilled to a file one
+/// layer up (`AgentLoop::cap_tool_output`); the span kept the raw payload, so a
+/// single 285 KB `Grep` result was stored verbatim forever — a third copy of
+/// bytes the model never saw.
+///
+/// Capping happens here, after the variant-shaping match, so no variant can
+/// bypass it: the struct variants (`WithAttachments` / `MultiModalText`) route
+/// through `serde_json::to_value` and would slip past a per-variant cap.
+/// Attachments themselves are `BlobRef` pointers, not bytes, so only the
+/// text-bearing payload is ever large.
+///
+/// Returns the untruncated serialized length when it cut, for
+/// `ToolCallResult::output_truncated_from`.
+fn cap_trace_output(value: Value) -> (Value, Option<usize>) {
+    use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+
+    let full_len = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
+    if full_len <= MAX_TOOL_OUTPUT_BYTES {
+        return (value, None);
     }
+
+    // Over budget. Keep the type tag (the viewer keys off it) and replace the
+    // body with a capped rendering of whatever carried the bytes.
+    let Value::Object(map) = &value else {
+        return (value, None);
+    };
+    let tag = map
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("json")
+        .to_string();
+    // The field the payload actually lives in, per the shapes built above.
+    let (field, body) = match tag.as_str() {
+        "text" => (
+            "text",
+            map.get("text").and_then(Value::as_str).map(String::from),
+        ),
+        "error" => (
+            "error",
+            map.get("error").and_then(Value::as_str).map(String::from),
+        ),
+        _ => ("text", None),
+    };
+    let body = body.unwrap_or_else(|| {
+        // `json` and the struct variants have no single string field — render
+        // the whole thing and cap that.
+        serde_json::to_string(&value).unwrap_or_default()
+    });
+
+    // The budget is on the row as PERSISTED, i.e. the serialized JSON —
+    // escaping (`\n` → `\\n`, `"` → `\\"`, control chars → `\uXXXX`) inflates
+    // a raw-byte cut by up to ~6x, so trim against the serialized candidate
+    // until it fits. The proportional shrink converges in a couple of rounds;
+    // `min(cut - 1, …)` makes every round strictly smaller, so it terminates.
+    let mut cut = MAX_TOOL_OUTPUT_BYTES.min(body.len());
+    loop {
+        while cut > 0 && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut out = serde_json::Map::new();
+        out.insert("type".into(), Value::String(tag.clone()));
+        out.insert(field.into(), Value::String(body[..cut].to_string()));
+        let candidate = Value::Object(out);
+        let serialized = serde_json::to_string(&candidate)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        if serialized <= MAX_TOOL_OUTPUT_BYTES || cut == 0 {
+            return (candidate, Some(full_len));
+        }
+        cut = (cut.saturating_mul(MAX_TOOL_OUTPUT_BYTES) / serialized).min(cut - 1);
+    }
+}
+
+/// A finished tool call: whatever the call produced, plus the approval decision
+/// it went through when it raised a prompt.
+///
+/// `output` keeps the call's own `Result` rather than making the whole struct
+/// one, because `approval` must survive EVERY exit — a denial, a tool error, a
+/// timeout — not just success. A mid-call denial (a tool that asks through
+/// [`baybo_tools::ApprovalHandle`] and turns the refusal into its own error) is
+/// exactly the case that loses its verdict otherwise: it reaches the loop as an
+/// untyped error, indistinguishable from a crash.
+pub struct ExecutedTool {
+    pub output: anyhow::Result<ToolOutput>,
+    /// `None` when the call never prompted (covered by a prior grant, or an
+    /// ungated tool). When a call prompts more than once, the LAST decision
+    /// wins — it is the one that shaped the outcome.
+    pub approval: Option<ApprovalDecision>,
 }
 
 /// Executes tools with trust-level validation, approval gating, and
@@ -323,6 +426,10 @@ impl ToolExecutor {
         tool_name: &str,
         params: Value,
         session_id: &SessionId,
+        // What started this session. Reaches the tool as
+        // [`ToolContext::session_trigger`]; `CronCreate` reads it so a job
+        // created inside a cron fire inherits the fire's origin conversation.
+        session_trigger: &baybo_model::TriggerSource,
         user: &User,
         agent_id: Option<AgentProfileId>,
         approved_resources: &Arc<Mutex<Vec<ApprovedResource>>>,
@@ -342,11 +449,16 @@ impl ToolExecutor {
         // Per-session read-before-write tracker. `Read` records into it;
         // `Edit`/`Write` enforce against it. Cheap to clone (one `Arc`).
         read_tracker: ReadTracker,
-    ) -> anyhow::Result<ToolOutput> {
+    ) -> ExecutedTool {
         debug!(tool = tool_name, "executing tool");
 
-        if let Some(manifest) = self.tool_registry.get_manifest(tool_name) {
-            self.validate_trust(tool_name, &manifest)?;
+        if let Some(manifest) = self.tool_registry.get_manifest(tool_name)
+            && let Err(e) = self.validate_trust(tool_name, &manifest)
+        {
+            return ExecutedTool {
+                output: Err(e),
+                approval: None,
+            };
         }
 
         let job_id = step.job_id;
@@ -355,11 +467,19 @@ impl ToolExecutor {
         // ownership into `ctx` while `with_span` keeps a borrow for
         // the cancel-aware close-on-Err path.
         let cancel_for_close = cancel_token.clone();
+        let cancel_for_gate = cancel_token.clone();
+
+        // The call's approval decision, written from inside the span body and
+        // read back after it — including on the paths where the body returns
+        // `Err` (denial, tool error, timeout) and the decision would otherwise
+        // die with the closure.
+        let approval_slot: Arc<Mutex<Option<ApprovalDecision>>> = Arc::new(Mutex::new(None));
+        let approval_sink = Arc::clone(&approval_slot);
 
         // Open the tool span up front so denials and approval failures
         // still appear in the trace tree. The handle carries the
         // begin-time kind, so close-time only supplies the result.
-        crate::runtime::scope::with_span(
+        let output = crate::runtime::scope::with_span(
             recorder.as_ref(),
             step,
             job_id,
@@ -413,17 +533,28 @@ impl ToolExecutor {
 
                 if !uncovered.is_empty() {
                     let gate = self.gate_map.get(&user.channel, session_id);
-                    let decision = gate
-                        .request(ApprovalRequest {
-                            call_id: Uuid::new_v4().to_string(),
-                            session_id: session_id.clone(),
-                            user_id: user.id.clone(),
-                            tool: tool_name_owned.clone(),
-                            accesses: uncovered.clone(),
-                            params_preview: preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
-                            description: call_label.clone(),
-                        })
-                        .await;
+                    let request = gate.request(ApprovalRequest {
+                        call_id: Uuid::new_v4().to_string(),
+                        tool_call_id: Some(tool_use_id.clone()),
+                        session_id: session_id.clone(),
+                        user_id: user.id.clone(),
+                        tool: tool_name_owned.clone(),
+                        accesses: uncovered.clone(),
+                        params_preview: preview_params(&params, APPROVAL_PARAMS_PREVIEW_LEN),
+                        description: call_label.clone(),
+                    });
+                    // A prompt parks the turn for up to the gate's timeout, so
+                    // it MUST answer to `/stop` — otherwise cancelling a turn
+                    // that is waiting on the user hangs until the gate denies
+                    // itself minutes later, and the client keeps showing a card
+                    // for a turn that is already unwinding. Dropping the request
+                    // future also unqueues it (the gate's RAII cleanup), so the
+                    // prompt disappears everywhere rather than lingering.
+                    let decision = tokio::select! {
+                        d = request => d,
+                        _ = cancel_for_gate.cancelled() => ApprovalDecision::Deny,
+                    };
+                    *approval_sink.lock() = Some(decision);
                     for access in &uncovered {
                         let _ = recorder
                             .emit_event(
@@ -457,6 +588,16 @@ impl ToolExecutor {
                                 reason: "user denied approval".to_string(),
                             }));
                         }
+                    }
+                    // Approved — but the turn may have been cancelled WHILE the
+                    // prompt was up (the select above only fires when the token
+                    // trips before the answer). Running now would execute a
+                    // side-effecting call on behalf of a turn the user already
+                    // stopped.
+                    if cancel_for_gate.is_cancelled() {
+                        return Err(anyhow::anyhow!(
+                            "tool '{tool_name_owned}' cancelled while awaiting approval"
+                        ));
                     }
                 }
 
@@ -497,9 +638,16 @@ impl ToolExecutor {
                     None
                 };
 
-                // Mid-execution approval handle.
+                // Mid-execution approval handle. The probe clone shares the
+                // handle's decision cell, so after the tool returns we can
+                // read back what any mid-call prompt decided.
                 let approval_gate = self.gate_map.get(&user.channel, session_id);
-                let approval = ApprovalHandle::new(approval_gate, Arc::clone(approved_resources));
+                let approval = ApprovalHandle::new(
+                    approval_gate,
+                    Arc::clone(approved_resources),
+                    Some(tool_use_id.clone()),
+                );
+                let approval_probe = approval.clone();
 
                 // Per-call event sink. Drained into span events after
                 // tool execution so phase timers and richer artifacts
@@ -530,6 +678,7 @@ impl ToolExecutor {
                 });
                 let ctx = ToolContext {
                     session_id: session_id.clone(),
+                    session_trigger: session_trigger.clone(),
                     job_id,
                     span_id: span_handle.span_id,
                     user: user.clone(),
@@ -590,6 +739,16 @@ impl ToolExecutor {
                 )
                 .await;
 
+                // A tool can raise its own prompts mid-execution (through
+                // `ctx.approval`), and those come AFTER the pre-execute gate —
+                // so the handle's last decision wins. Read it here, before any
+                // of the arms below can return early: a mid-call denial reaches
+                // the loop as the tool's own error, and without this the verdict
+                // would be indistinguishable from a crash.
+                if let Some(decision) = approval_probe.last_decision() {
+                    *approval_sink.lock() = Some(decision);
+                }
+
                 // Flush tool-reported events as span events, regardless
                 // of whether the tool succeeded, failed, or hit the
                 // outer timeout. Each entry continues the span-local
@@ -618,7 +777,8 @@ impl ToolExecutor {
                             .sanitize_tool_output(&mut output)
                             .await
                             .map_err(|e| anyhow::anyhow!("sanitize_tool_output: {e}"))?;
-                        let output_value = tool_output_to_trace_value(&output);
+                        let (output_value, output_truncated_from) =
+                            tool_output_to_trace_value(&output);
                         let success = !matches!(output, ToolOutput::Error(_));
                         let outcome = if success {
                             LifecycleOutcome::Ok
@@ -647,6 +807,7 @@ impl ToolExecutor {
                             SpanFinalize::ToolCall(ToolCallResult {
                                 output: output_value,
                                 success,
+                                output_truncated_from,
                             }),
                             outcome,
                             output,
@@ -659,10 +820,10 @@ impl ToolExecutor {
                         // `Failed { reason }` and from there into
                         // persisted trace storage. Returning the raw
                         // error would leak any secrets in the original
-                        // text. Downcasts on this path aren't used (the
-                        // `ToolError::Denied` downcast in `agent_loop`
-                        // sees the approval-gate Err, which is built
-                        // separately above).
+                        // text. The error's TYPE is lost here (a
+                        // `ToolError::Denied` a tool raised from a mid-call
+                        // prompt included) — the decision that shaped it rides
+                        // `approval_slot` instead, read back by the caller.
                         let raw = e.to_string();
                         let sanitized = self
                             .security_gateway
@@ -679,28 +840,90 @@ impl ToolExecutor {
                 }
             },
         )
-        .await
+        .await;
+
+        ExecutedTool {
+            output,
+            approval: *approval_slot.lock(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baybo_tools::ToolEventSink;
+    use baybo_trace::SPAN_EVENT_TEXT_MAX_BYTES;
     use serde_json::json;
+
+    /// The sink is the enforcement point: emitters used to be trusted to
+    /// truncate their own payloads (WebFetch shipped a whole 96 KiB page), and
+    /// the only backstop dropped the *entire* entry, so an oversized field
+    /// could silently swallow later audit events. Bound it here instead.
+    #[test]
+    fn event_sink_truncates_oversized_payload_fields() {
+        let sink = SpanEventRecorder::new();
+        sink.emit(
+            "llm_summary",
+            ToolEventPayload::LlmCall {
+                model: "m".into(),
+                input: "p".repeat(SPAN_EVENT_TEXT_MAX_BYTES * 4),
+                output: "o".repeat(SPAN_EVENT_TEXT_MAX_BYTES * 4),
+            },
+        );
+        // A later event must still land — the old whole-entry drop made this
+        // order-dependent.
+        sink.emit(
+            "parse_failure",
+            ToolEventPayload::ParseFailure {
+                command: "rm -rf /".into(),
+            },
+        );
+
+        let items = sink.drain();
+        assert_eq!(
+            items.len(),
+            2,
+            "the oversized event must not evict later ones"
+        );
+        let ToolEventPayload::LlmCall { input, output, .. } = &items[0].1 else {
+            panic!("expected the LlmCall payload first");
+        };
+        for (name, field) in [("input", input), ("output", output)] {
+            assert!(
+                field.len() < SPAN_EVENT_TEXT_MAX_BYTES * 2,
+                "{name} must be bounded, got {} bytes",
+                field.len()
+            );
+            assert!(
+                field.contains("truncated"),
+                "{name} must say it was truncated rather than look complete"
+            );
+        }
+        assert!(
+            matches!(&items[1].1, ToolEventPayload::ParseFailure { command } if command == "rm -rf /"),
+            "the audit event must survive intact"
+        );
+    }
+
+    use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
 
     #[test]
     fn trace_value_preserves_text_payload() {
-        let v = tool_output_to_trace_value(&ToolOutput::Text("hello world".into()));
+        let (v, truncated) = tool_output_to_trace_value(&ToolOutput::Text("hello world".into()));
         assert_eq!(v, json!({ "type": "text", "text": "hello world" }));
+        assert_eq!(truncated, None);
     }
 
     #[test]
     fn trace_value_preserves_error_payload() {
-        let v = tool_output_to_trace_value(&ToolOutput::Error("read_page failed: …".into()));
+        let (v, truncated) =
+            tool_output_to_trace_value(&ToolOutput::Error("read_page failed: …".into()));
         assert_eq!(
             v,
             json!({ "type": "error", "error": "read_page failed: …" })
         );
+        assert_eq!(truncated, None);
     }
 
     #[test]
@@ -709,7 +932,7 @@ mod tests {
         // shape — type tag flattened into the inner map — is what the
         // web UI is already showing for spans like Now, so changing
         // it would invalidate older traces.
-        let v = tool_output_to_trace_value(&ToolOutput::Json(json!({
+        let (v, truncated) = tool_output_to_trace_value(&ToolOutput::Json(json!({
             "utc": "2026-01-01T00:00:00Z",
             "timezone": "UTC",
         })));
@@ -721,11 +944,75 @@ mod tests {
                 "timezone": "UTC",
             })
         );
+        assert_eq!(truncated, None);
     }
 
     #[test]
     fn trace_value_wraps_non_object_json_payload() {
-        let v = tool_output_to_trace_value(&ToolOutput::Json(json!("scalar")));
+        let (v, truncated) = tool_output_to_trace_value(&ToolOutput::Json(json!("scalar")));
         assert_eq!(v, json!({ "type": "json", "value": "scalar" }));
+        assert_eq!(truncated, None);
+    }
+
+    /// A 285 KB `Grep` result used to be stored verbatim in the span — a third
+    /// copy of bytes the model never saw (its transcript copy is capped and
+    /// spilled). The span copy now rides the same budget and says so.
+    #[test]
+    fn trace_value_caps_oversized_text_and_records_original_size() {
+        let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES * 3);
+        let (v, truncated) = tool_output_to_trace_value(&ToolOutput::Text(big));
+
+        let text = v["text"].as_str().expect("text field survives the cap");
+        assert_eq!(v["type"], "text", "the type tag must survive");
+        assert!(
+            text.len() <= MAX_TOOL_OUTPUT_BYTES,
+            "capped text must fit the budget, got {}",
+            text.len()
+        );
+        let original = truncated.expect("truncation must be reported");
+        assert!(
+            original > MAX_TOOL_OUTPUT_BYTES * 3,
+            "the reported original length must be the full serialized size"
+        );
+    }
+
+    /// The struct variants route through `serde_json::to_value`, so a cap
+    /// applied per-variant to Text/Error/Json only would let them through.
+    #[test]
+    fn trace_value_caps_oversized_struct_variant() {
+        let (v, truncated) = tool_output_to_trace_value(&ToolOutput::MultiModalText {
+            text: "y".repeat(MAX_TOOL_OUTPUT_BYTES * 2),
+            llm_images: vec![],
+        });
+        assert!(
+            serde_json::to_string(&v).unwrap().len() <= MAX_TOOL_OUTPUT_BYTES + 64,
+            "no variant may bypass the cap"
+        );
+        assert!(truncated.is_some());
+    }
+
+    /// Truncation must not split a multi-byte character.
+    #[test]
+    fn trace_value_cap_lands_on_a_char_boundary() {
+        let big = "★".repeat(MAX_TOOL_OUTPUT_BYTES); // 3 bytes each
+        let (v, _) = tool_output_to_trace_value(&ToolOutput::Text(big));
+        let text = v["text"].as_str().expect("still valid UTF-8 text");
+        assert!(text.chars().all(|c| c == '★'), "no mangled char at the cut");
+    }
+
+    /// The budget is on the row as persisted — the serialized JSON. Escaping
+    /// doubles a newline (`\n` → `\\n`), so a raw-byte cut of escape-heavy
+    /// content used to overshoot the stated bound by ~2x (and up to ~6x for
+    /// control characters).
+    #[test]
+    fn trace_value_cap_bounds_the_serialized_size() {
+        let big = "line with \"quotes\" and \\slashes\\\n".repeat(MAX_TOOL_OUTPUT_BYTES / 16);
+        let (v, truncated) = tool_output_to_trace_value(&ToolOutput::Text(big));
+        let serialized = serde_json::to_string(&v).unwrap().len();
+        assert!(
+            serialized <= MAX_TOOL_OUTPUT_BYTES,
+            "the persisted row must fit the budget after escaping, got {serialized}"
+        );
+        assert!(truncated.is_some());
     }
 }

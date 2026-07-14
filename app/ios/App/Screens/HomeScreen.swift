@@ -98,12 +98,15 @@ extension AppStore.HomeTab {
 }
 
 /// The shared paper-veil header: the centered wordmark, optionally flanked by a
-/// glass compose circle on the trailing edge (Chats only). Reuses the chat
-/// header's veil so the screens' fades can't drift apart. A transient
-/// compose-failure line hangs under it.
+/// glass compose circle on the trailing edge and a glass ☰ menu circle on the
+/// leading edge (both Chats only). Reuses the chat header's veil so the
+/// screens' fades can't drift apart. A transient compose-failure line hangs
+/// under it.
 struct HomeHeaderView: View {
     var notice: String? = nil
     var onCompose: (() -> Void)? = nil
+    /// Chats only: the ☰ menu's single entry — push the archived list.
+    var onArchived: (() -> Void)? = nil
     /// Chats only: pull-to-refresh feedback rendered BESIDE the wordmark (as an
     /// overlay, so it never shifts it). Shown only while the refresh runs — after
     /// the pull rebounds — never during the drag.
@@ -124,6 +127,26 @@ struct HomeHeaderView: View {
                         RefreshRing(isRefreshing: isRefreshing)
                             .offset(x: 18)
                     }
+
+                if let onArchived {
+                    HStack {
+                        Menu {
+                            Button(action: onArchived) {
+                                Label(
+                                    Lang.shared.t("list.menuArchived"),
+                                    systemImage: "archivebox")
+                            }
+                        } label: {
+                            Image(systemName: "line.3.horizontal")
+                                .font(.system(size: 16, weight: .medium))
+                                .foregroundStyle(Theme.ink)
+                                .frame(width: 45, height: 45)
+                        }
+                        .glassEffect(.regular.interactive(), in: .circle)
+                        .accessibilityLabel(Text(verbatim: Lang.shared.t("list.menu")))
+                        Spacer()
+                    }
+                }
 
                 if let onCompose {
                     HStack {

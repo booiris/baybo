@@ -66,7 +66,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use baybo_llm::{BilledChat, ChatRequest};
-use baybo_model::{ChatMessage, ContentBlock, SHA256_PREFIX};
+use baybo_model::{ChatMessage, ContentBlock, blob_content_digest};
 use baybo_store::BlobStore;
 use dom_smoothie::Readability;
 use htmd::HtmlToMarkdown;
@@ -75,7 +75,7 @@ use reqwest::redirect;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use baybo_trace::ToolEventPayload;
+use baybo_trace::{SPAN_EVENT_TEXT_MAX_BYTES, ToolEventPayload};
 
 use crate::{
     ResourceAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, start_timer,
@@ -97,12 +97,6 @@ const MAX_SUMMARY_INPUT_BYTES: usize = 96 * 1024;
 /// scripts.
 const SUMMARY_MIN_CHARS: usize = 2048;
 const ERROR_BODY_PREVIEW_BYTES: usize = 8 * 1024;
-/// Cap on the rendered-body preview persisted into the trace's
-/// `HttpFetch` event payload. The full rendered text still flows back
-/// to the agent via `ToolOutput::Text`; this only governs what shows
-/// up in the audit trail. Bytes (not chars) — `truncate_utf8` cuts on
-/// a UTF-8 boundary.
-const HTTP_BODY_PREVIEW_BYTES: usize = 32 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIRECT_LIMIT: usize = 5;
 const CALL_LABEL_MAX: usize = 120;
@@ -476,9 +470,12 @@ Usage notes:
                 status: status.as_u16(),
                 bytes: body_bytes_read as u64,
                 content_type: empty_to_none(&content_type),
+                // A preview, not a second copy of the page — the full rendering
+                // is archived in the blob store just below and reachable via
+                // `raw_content_file`.
                 body_preview: empty_to_none(&truncate_utf8(
                     rendered.as_bytes(),
-                    HTTP_BODY_PREVIEW_BYTES,
+                    SPAN_EVENT_TEXT_MAX_BYTES,
                 )),
             },
         );
@@ -542,7 +539,14 @@ Usage notes:
                         "llm_summary",
                         ToolEventPayload::LlmCall {
                             model: llm.model_info().id.clone(),
-                            input: summary_user_text.clone(),
+                            // The prompt embeds the whole (96 KiB-capped) page;
+                            // cloning it here persisted a second copy of the
+                            // page per fetch. The event only needs enough to
+                            // recognise the call.
+                            input: truncate_utf8(
+                                summary_user_text.as_bytes(),
+                                SPAN_EVENT_TEXT_MAX_BYTES,
+                            ),
                             output: body.clone(),
                         },
                     );
@@ -699,16 +703,15 @@ fn extract_article(raw_html: &str, host: &str) -> String {
     }
 }
 
-/// Mirror of `LibsqlBlobStore::blob_path` + its private `mime_extension`
-/// table for the two MIME types this tool uses. The libsql backend
+/// Mirror of `SqliteBlobStore::blob_path` + its private `mime_extension`
+/// table for the two MIME types this tool uses. The sqlite backend
 /// stores `text/markdown` as `<hex>.md` and `text/plain` as `<hex>.txt`
 /// under `<root>/<hex[..2]>/`; if that mapping ever changes upstream
 /// this helper must move with it. In-memory test backends keep no files
 /// on disk — the path is still computed (so the response header has a
 /// stable shape) but the file won't exist.
 fn blob_local_path(state_dir: &Path, blob_id: &str, mime: &str) -> Option<PathBuf> {
-    let hex_all = blob_id.strip_prefix(SHA256_PREFIX)?;
-    let hex = hex_all.split('.').next()?;
+    let hex = blob_content_digest(blob_id)?;
     if hex.len() < 2 {
         return None;
     }

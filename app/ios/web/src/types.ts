@@ -7,7 +7,19 @@ export type WireAttachment = {
   mime_type: string;
   size: number;
   filename?: string;
+  /** Playback length in ms for `audio`, probed server-side at attach time —
+   * what lets the card show a track's length before any byte is downloaded. */
+  duration_ms?: number;
 };
+
+/** The content-addressed half of a `blob_id` (`sha256:<hex>.<read-token>`) — the
+ * web mirror of the core's `blob_content_digest`. Every upload of the same bytes
+ * mints a FRESH read token, so two ids can name one blob; the digest, not the
+ * id, is a blob's identity. The `sha256:` prefix rides along — this is only ever
+ * a local map key, never sent back over the wire. */
+export function blobContentDigest(blobId: string): string {
+  return blobId.split(".")[0] ?? blobId;
+}
 
 /** Bucket a mime type into the wire attachment kind — same rule the web chat and
  * gateway use (the kind selects the agent-side content block). */
@@ -32,29 +44,39 @@ export type WireMessage = {
 
 /// One in-flight work step in a `Frame::SubscribeState` bundle — the wire
 /// mirror of the Rust `wire::WireWorkStep` (snake_case fields). `reasoning` /
-/// `prose` carry `text`; a `tool` step carries the call's id + display
+/// `prose` / `status` carry `text` (`status` is the progress observer's
+/// transient narration line); a `tool` step carries the call's id + display
 /// name/label and, once the call finished within the buffered turn, `status` +
 /// `summary`.
 export type WireWorkStepFrame = {
-  kind: "reasoning" | "prose" | "tool";
+  kind: "reasoning" | "prose" | "tool" | "status";
   text?: string;
   call_id?: string;
   tool?: string;
   label?: string;
   status?: string;
   summary?: string;
+  /// The decision the call's approval prompt returned, once it completed within
+  /// the buffered turn — the durable twin of the live `tool_completed.approval`.
+  approval?: string;
 };
 
 /// One reconstructed step inside a REST `work` transcript row — the gateway's
 /// `ChatWorkStep` DTO. Note the REST field names (`tool_label` / `tool_status`
-/// / `tool_summary`), unlike the wire `WireWorkStepFrame` above.
+/// / `tool_summary`), unlike the wire `WireWorkStepFrame` above. `status` is
+/// the durable shadow of a progress-narration line (a persisted `progress`
+/// control event folded back into the block).
 export type RestWorkStep = {
-  kind: "reasoning" | "prose" | "tool";
+  kind: "reasoning" | "prose" | "tool" | "status";
   text?: string;
   tool?: string;
   tool_label?: string;
   tool_status?: string;
   tool_summary?: string;
+  /// `"approve"` / `"approve_always"` / `"deny"` — persisted on the tool result
+  /// (`ToolResultMeta::approval`), so a reload still labels the step the user
+  /// judged. Absent when the call never prompted.
+  approval?: string;
 };
 
 /// One full-fidelity transcript row — the gateway's `ChatTranscriptItem` DTO,
@@ -79,6 +101,17 @@ export type TranscriptRowItem = {
   notice_level?: string;
 };
 
+/// One pending approval prompt inside a `subscribe_state` bundle — the wire
+/// mirror of the Rust `wire::ApprovalCard`. The transcript uses only
+/// `tool_call_id` (which work step is waiting); the rest drives the native card.
+export type WireApprovalCard = {
+  call_id: string;
+  tool_call_id?: string;
+  tool: string;
+  params_preview: string;
+  description?: string;
+};
+
 /// A decrypted wire `Frame`, arriving as JSON text via `window.baybo.pushFrame`.
 /// MessagePack field names round-trip as snake_case JSON; we only model the few
 /// variants the transcript renders and tolerate the rest.
@@ -89,7 +122,28 @@ export type WireFrame =
   // turn's work block instead of the reply body.
   | { kind: "reasoning"; text: string }
   | { kind: "tool_started"; call_id: string; tool: string; label?: string | null }
-  | { kind: "tool_completed"; call_id: string; status: string; summary: string }
+  | {
+      kind: "tool_completed";
+      call_id: string;
+      status: string;
+      summary: string;
+      // The decision the call's approval prompt returned; absent when it never
+      // prompted. Persisted server-side, so a reload re-labels the same step.
+      approval?: string;
+    }
+  // A tool call is blocked on this user's decision. `call_id` is the PROMPT's id
+  // (what a resolve answers with); `tool_call_id` is the blocked TOOL call — the
+  // work step to badge. The card itself is NATIVE (see ChatStore.pendingApprovals);
+  // the transcript only marks the step as waiting.
+  | {
+      kind: "approval_requested";
+      call_id: string;
+      tool_call_id?: string;
+      tool: string;
+    }
+  // Someone answered (this device, or another client). Broadcast to every
+  // session's sink, so it is matched by prompt id, never by session.
+  | { kind: "approval_resolved"; call_id: string; decision: string }
   // `started_at` is present iff `active` — it is the turn's identity for the
   // SubscribeState staleness test and for re-opening a restored work block.
   | { kind: "turn_state"; active: boolean; started_at?: string }
@@ -106,7 +160,10 @@ export type WireFrame =
       as_of_ordinal?: number;
       turn: { active: boolean; started_at?: string };
       work_steps?: WireWorkStepFrame[];
-      pending_approvals?: unknown[];
+      // The authoritative pending set on (re)subscribe. The native card renders
+      // them; the transcript reads only `tool_call_id`, to restore the awaiting
+      // badge on a work step whose prompt outlived a reconnect.
+      pending_approvals?: WireApprovalCard[];
       tasks?: unknown[];
     }
   // The server dropped frames it owed this connection — run sync. (`session_id`
@@ -122,8 +179,6 @@ export type WireFrame =
       newest_ordinal?: number | null;
       has_more: boolean;
     }
-  // Server-pushed standalone media a tool produced mid-turn (its own bubble).
-  | { kind: "attachment"; user_id?: string; attachments?: WireAttachment[] }
   // Synthesized NATIVE-side (not a wire frame): one sync page — the one
   // forward-recovery pull. `since_ordinal` echoes the request's cursor so a
   // baseline (`null`) REPLACE is distinguishable from a difference merge.
@@ -157,6 +212,11 @@ export type ChatMsg = {
   // when the server echoes the message back. On restore a stale "sending" is
   // stripped (the leg is gone), but "failed" persists so the retry dot survives.
   sendState?: "sending" | "failed";
+  // A `role:"notice"` row that stands in for the gateway's `/stop`
+  // acknowledgement: rendered as a compact "Stopped" indicator instead of the
+  // raw multi-line notice text (which reads oddly as a bubble). `content` is
+  // unused for these.
+  stopped?: boolean;
 };
 
 /// One entry in a turn's work block — the agent's process (thinking, tool
@@ -168,7 +228,25 @@ export type WorkStep =
   // agent "went back to thinking", so the text so far was intermediate.
   | { kind: "prose"; text: string }
   | { kind: "status"; text: string }
-  | { kind: "tool"; callId: string; label: string; status: string; summary?: string };
+  // An out-of-band agent notice (skill warning, degraded-mode banner) that
+  // landed WHILE the turn's work block was open — folded in as a step (styled by
+  // `level`) instead of severing the block into two cards. A notice with no open
+  // block still renders as its own centered `role:"notice"` row.
+  | { kind: "notice"; level: string; text: string }
+  | {
+      kind: "tool";
+      callId: string;
+      label: string;
+      status: string;
+      summary?: string;
+      /// Prompt id, set while this call is blocked on the user's decision — the
+      /// step renders "waiting for approval" and clears when the matching
+      /// `approval_resolved` (or the call's completion) lands.
+      awaitingApproval?: string;
+      /// `"approve"` / `"approve_always"` / `"deny"` once the user judged it.
+      /// Survives reload (persisted on the tool result).
+      approval?: string;
+    };
 
 /// A turn's collapsible work block, kept as its own transcript row (the web
 /// chat's model: the final answer renders BELOW the block, never inside it).
@@ -194,6 +272,11 @@ export type PersistedState = {
   lastOrdinal: number | null;
   oldestOrdinal: number | null;
   hasMoreOlder: boolean;
+  /// Natural `[width, height]` of every image this thread has decoded, keyed by
+  /// blob DIGEST (never the id — its read token rotates). Lets a re-open reserve
+  /// each image's exact box before its bytes arrive, so the transcript doesn't
+  /// resize under the reader. Absent on a mirror written before this existed.
+  imageDims?: Record<string, [number, number]>;
 };
 
 let uidCounter = 0;

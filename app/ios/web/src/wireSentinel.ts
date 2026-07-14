@@ -29,13 +29,14 @@ type Assert<T extends true> = T;
 /// `other` are transcript-local, native-synthesized shapes).
 type MirroredKind =
   | "message"
-  | "attachment"
   | "answer_delta"
   | "reasoning"
   | "tool_started"
   | "tool_completed"
   | "turn_state"
   | "subscribe_state"
+  | "approval_requested"
+  | "approval_resolved"
   | "gap"
   | "notice";
 

@@ -119,6 +119,7 @@ baybo-gateway = { workspace = true, features = ["test-support"] }
 baybo-security = { workspace = true, features = ["test-support"] }
 baybo-storage = { workspace = true, features = ["test-support"] }
 baybo-config = { workspace = true }
+baybo-context = { workspace = true }
 baybo-model = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }

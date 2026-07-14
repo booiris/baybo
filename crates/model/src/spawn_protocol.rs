@@ -171,7 +171,7 @@ pub enum SubagentExitStatus {
 /// Persistent record of a background job — a `background` (or
 /// timeout-converted) subagent, or a detached `Bash` command — that
 /// reached a terminal state while the parent actor was between turns.
-/// Held on [`crate::SessionState::pending_background_results`] until
+/// Held in [`crate::BackgroundNotificationState::buffered_results`] until
 /// drained into a notification turn.
 ///
 /// `handle_id` is the synthetic identifier the spawning tool minted and
@@ -382,6 +382,7 @@ mod tests {
                         blob_id: "b-1".into(),
                     },
                     mime_type: "image/png".into(),
+                    filename: None,
                 },
                 ContentBlock::Thinking {
                     id: None,

@@ -59,19 +59,33 @@ pub enum SpanEventKind {
     },
 }
 
+/// Byte budget for any single text field inside a [`ToolEventPayload`].
+///
+/// These fields exist to make a tool's internals *legible* in the trace — a
+/// preview, not an archive. WebFetch was persisting the fetched page twice per
+/// call (the whole 96 KiB summariser prompt as `LlmCall.input`, plus a 32 KiB
+/// `HttpFetch.body_preview` of the same text), which is why `span_events` was
+/// 93% page text. The full page is already archived in the blob store; the
+/// event only needs enough to recognise what happened.
+pub const SPAN_EVENT_TEXT_MAX_BYTES: usize = 4 * 1024;
+
 /// Payload carried inside [`SpanEventKind::ToolEvent`]. Closed enum —
 /// each variant has a concrete shape so downstream consumers can
 /// `match` exhaustively and the trace UI can render structured fields
 /// instead of opaque JSON blobs.
+///
+/// Text fields are bounded by [`SPAN_EVENT_TEXT_MAX_BYTES`], enforced by the
+/// executor's event sink via [`Self::truncate_text_fields`] — see that method
+/// for why the bound is not left to the producers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolEventPayload {
     /// Duration of a sub-action inside a tool body. Emitted via the
     /// RAII `ToolTimer` guard returned by `start_timer`.
     Phase { duration_ms: u64 },
-    /// Summary of an outbound HTTP request made by a tool. `body_preview`
-    /// is the producer-truncated rendering of the response body — the
-    /// raw full content is *not* persisted to the trace.
+    /// Summary of an outbound HTTP request made by a tool. `body_preview` is a
+    /// preview of the response body — the raw full content is *not* persisted
+    /// to the trace.
     HttpFetch {
         status: u16,
         bytes: u64,
@@ -79,9 +93,8 @@ pub enum ToolEventPayload {
         body_preview: Option<String>,
     },
     /// Summary of a side-LLM call made by a tool (e.g. WebFetch's
-    /// summary path). `input` and `output` are producer-truncated; the
-    /// executor still runs them through the leak detector before
-    /// persistence.
+    /// summary path). The executor also runs `input` / `output` through the
+    /// leak detector before persistence.
     LlmCall {
         model: String,
         input: String,
@@ -89,9 +102,62 @@ pub enum ToolEventPayload {
     },
     /// A shell command the destructive-command detector could not parse
     /// with the shell grammar; it fell back to the fail-closed keyword
-    /// pre-filter. Recorded so parser gaps are visible. `command` is
-    /// producer-truncated; the executor sanitizes it before persistence.
+    /// pre-filter. Recorded so parser gaps are visible. The executor
+    /// sanitizes it before persistence.
     ParseFailure { command: String },
+}
+
+impl ToolEventPayload {
+    /// Truncate every text field to [`SPAN_EVENT_TEXT_MAX_BYTES`] at a UTF-8
+    /// boundary, appending a byte-count notice so a reader can tell a preview
+    /// from a complete value.
+    ///
+    /// Enforced by the executor's event sink rather than trusted to each
+    /// emitter: the fields used to carry only a "producer-truncated" comment,
+    /// and the producers disagreed about what that meant (WebFetch shipped a
+    /// whole 96 KiB page). A bound that every emitter must remember is a bound
+    /// that does not hold.
+    pub fn truncate_text_fields(&mut self) {
+        match self {
+            Self::Phase { .. } => {}
+            Self::HttpFetch {
+                content_type,
+                body_preview,
+                ..
+            } => {
+                if let Some(s) = content_type {
+                    truncate_field(s);
+                }
+                if let Some(s) = body_preview {
+                    truncate_field(s);
+                }
+            }
+            Self::LlmCall {
+                model,
+                input,
+                output,
+            } => {
+                truncate_field(model);
+                truncate_field(input);
+                truncate_field(output);
+            }
+            Self::ParseFailure { command } => truncate_field(command),
+        }
+    }
+}
+
+fn truncate_field(s: &mut String) {
+    if s.len() <= SPAN_EVENT_TEXT_MAX_BYTES {
+        return;
+    }
+    let total = s.len();
+    let mut cut = SPAN_EVENT_TEXT_MAX_BYTES;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    use std::fmt::Write as _;
+    let _ = write!(s, "\n… [truncated, {total} bytes total]");
 }
 
 impl SpanEventKind {

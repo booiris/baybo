@@ -6,17 +6,20 @@ NAT-traversed phone without putting bytes on the chat WebSocket.
 
 Implemented pieces:
 
-- chat-priority background bandwidth (`remote-host/crates/ratelimit`,
+- chat-priority background bandwidth (`remote-host/crates/edge`,
   `remote-host/crates/relay/src/bandwidth.rs`);
 - `x-relay-leg-class` plumbing and connection-cap reserve
   (`remote-host/crates/{protocol,relay}`);
 - the gateway API tunnel blob responder, backed by the same blob service used by
   `/v1/blobs` for range download, per-blob size enforcement, and content-hash
-  validation (`crates/gateway/src/channel/{api_tunnel,blob_service,blobs}.rs`,
-  `crates/store`, `crates/storage`);
+  validation (`crates/gateway/src/channel/{api_tunnel,tunnel_http,blobs}.rs` — the
+  tunnel reuses the `/v1/blobs` HTTP routes through an in-process router rather
+  than a separate blob service module — `crates/store`, `crates/storage`);
 - the shared tunnel protocol (`crates/device-proto/src/api_tunnel.rs`);
-- the mobile Rust/Tauri/TS client (`app/mobile/core/src/api_tunnel.rs`,
-  `app/mobile/src-tauri/src/relay/blob.rs`, `app/mobile/src/blob.ts`).
+- the iOS Rust FFI client (`app/ios/ffi/src/core/api_tunnel.rs`,
+  `app/ios/ffi/src/relay/blob.rs`, `app/ios/ffi/src/lib.rs` — `blob_upload_bytes` /
+  `blob_download_bytes` — plus the content-addressed on-device cache in
+  `app/ios/ffi/src/blob_helper.rs`).
 
 There is deliberately no background blob sweeper and no
 `BlobStore::purge_older_than`: device-uploaded blobs are durable. The upload
@@ -24,12 +27,12 @@ path keeps the per-blob 100 MiB cap, but does not enforce a per-device aggregate
 quota. A global disk ceiling or reference-tied lifetime sweep would need
 additional `BlobStore` surface.
 
-The mobile chat-view UI is now wired (`app/mobile/src/App.tsx` + `blob.ts`): an
-`accept="image/*"` picker stages picked images and uploads them over a blob leg
-(`blob_upload_bytes`, raw IPC body since iOS hands the webview `File` bytes, not a path),
-successful uploads seed the same content-addressed on-device cache used by downloads,
-the outgoing `Frame::Message` carries the resulting `WireAttachment`s, and inbound/restored
-image attachments render via a download-to-cache + object-URL component (`blob_download_bytes`).
+The mobile chat-view UI is wired in the SwiftUI app (`app/ios/App/Screens/ComposerView.swift`
++ the `ffi` crate): a `PhotosPicker` stages picked images and uploads them over a blob leg
+(`blob_upload_bytes` on `app/ios/ffi/src/lib.rs`), successful uploads seed the same
+content-addressed on-device cache used by downloads (`blob_helper.rs`), the outgoing
+`Frame::Message` carries the resulting `WireAttachment`s, and inbound/restored image
+attachments render via `blob_download_bytes` into that cache.
 
 The shape in one line: a **dedicated relay leg per blob transfer** (separate TCP + Noise +
 pump from chat), metered against the **same** per-tenant bandwidth budget as chat but as a
@@ -70,7 +73,7 @@ Two hard requirements drove the design:
 ## Background
 
 The relay (`remote-host/crates/relay/`) is a blind WebSocket splice with exactly five
-routes (`remote-host/crates/protocol/src/relay.rs:18-22`): `/pair/host`, `/pair/join`,
+routes (`remote-host/crates/protocol/src/relay.rs:63-67`): `/pair/host`, `/pair/join`,
 `/control`, `/content/join/{relay_node_id}`, `/content/host/{relay_key}`. None carry blob
 bytes. A content session rides one Noise-IK leg over the
 `/content/join` ↔ `/content/host` splice; the gateway runs the Noise IK responder
@@ -78,8 +81,8 @@ bytes. A content session rides one Noise-IK leg over the
 initiator static key to an approved device row, then runs the **same** `wire::Frame` chat
 loop the TUI/web use.
 
-On that loop the gateway emits `Frame::Attachment` carrying `WireAttachment{kind, blob_id,
-mime_type, size, filename}` — a **reference only**. The `WireAttachment` doc
+On that loop the gateway emits `Frame::Message` whose `attachments` carry `WireAttachment{kind,
+blob_id, mime_type, size, filename, duration_ms}` — a **reference only**. The `WireAttachment` doc
 (`crates/wire/src/lib.rs:95-101`) is explicit: the bytes "never ride the WS — they live in
 the gateway's `BlobStore` and are uploaded/fetched out-of-band via `POST/GET /v1/blobs/*`."
 That out-of-band route is HTTP on the gateway — channel-token-authenticated for the TUI
@@ -116,7 +119,7 @@ The decision space and why the alternatives lose:
   isolates TCP/Noise/pump, but the relay throttle meters by `(remote_api_key, server_id)`,
   **not by connection** (`remote-host/crates/relay/src/bandwidth.rs:8-17`). Both legs of a
   gateway resolve to the *same* bucket pair (`limiter_for` returns a shared handle;
-  test `both_legs_of_a_session_share_one_bucket_pair`, `bandwidth.rs:175`). So a saturating
+  test `both_legs_of_a_session_share_one_bucket_pair`, `bandwidth.rs:246`). So a saturating
   blob transfer drains the shared bucket and chat is paced at the relay anyway — the
   dedicated leg buys nothing at the bandwidth layer.
 - **Dedicated blob leg + separate bandwidth ceiling** ("B+ separate-class"). Gives blob its
@@ -146,10 +149,10 @@ x-relay-leg-class: chat | api | blob  (RELAY_LEG_CLASS_HEADER; default chat when
 
 The phone owns the join, so the phone authors the class. `api` and `blob` both route to the
 gateway API tunnel; `api` is interactive, while `blob` is background. `content_join_handler`
-(`remote-host/crates/relay/src/serve.rs:532`) reads it and stores `(server_id, class)` as
+(`remote-host/crates/relay/src/serve.rs:836`) reads it and stores `(server_id, class)` as
 the value of `pending_content_legs`. It threads the class into the control signal,
 and recovers it on the gateway-side host leg
-(`content_host_handler`, `serve.rs:586,618`) so **both** spliced legs meter against the
+(`content_host_handler`, `remote-host/crates/relay/src/serve.rs`) so **both** spliced legs meter against the
 class-matched limiter. The class picks `Interactive` vs `Background` reservation on the
 **same** bucket pair — `limiter_for` is unchanged.
 
@@ -159,7 +162,8 @@ cannot cross the per-key wall.
 
 ### Control signal
 
-`ControlSignal::OpenDataLeg` gains a `class` field (or a sibling `OpenBlobLeg{relay_key}`):
+`ControlSignal::OpenDataLeg` carries a `class` field
+(`remote-host/crates/protocol/src/relay.rs`):
 
 ```rust
 ControlSignal::OpenDataLeg { relay_key: String, class: LegClass }   // LegClass = Chat | Api | Blob
@@ -195,7 +199,7 @@ gw → phone   Body { data: {"blob_id": "..."} }
 ```
 
 60 KiB chunks seal to ~one Noise message with MessagePack + Noise overhead, comfortably
-under the relay's 128 KiB frame cap (`serve.rs:61`).
+under the relay's 128 KiB frame cap (`serve.rs:69`).
 
 ### Bandwidth: chat-priority background class
 
@@ -204,7 +208,7 @@ bucket, no new admission column, no doubled ceiling. `limiter_for` is unchanged:
 gateway's chat and blob legs resolve to the **same** `(key)` and `(key, server)` buckets
 (one wall). Only the per-frame `throttle` call differs by class.
 
-Add to `TokenBucket` (`remote-host/crates/ratelimit/src/lib.rs`):
+Add to `TokenBucket` (`remote-host/crates/edge/src/lib.rs`):
 
 ```rust
 /// Like `reserve`, but keep `headroom` tokens out of reach so a higher-priority
@@ -277,7 +281,8 @@ per-key connection cap.
 
 The fallback per-key connection cap is `DEFAULT_MAX_CONNS_PER_KEY = 200`
 (`conns.rs`, `register`; `/control` uses cap-exempt `register_unchecked`). Docker
-Compose may set a different fallback through `MAX_CONNS_PER_REMOTE_API_KEY`.
+Compose may set a different fallback through `MAX_CONNS_PER_REMOTE_API_KEY_FALLBACK`
+(Docker Compose defaults it to 64).
 Blob host legs go through `register_background`, capped at
 `cap - CHAT_CONN_RESERVE`, so a chat leg can always reconnect into the reserved
 headroom. Under the shared-`remote_api_key` model, that cap is shared by all
@@ -286,25 +291,25 @@ refinement.
 
 Other mitigations (see Adversarial #4):
 - **Pre-Noise reaping:** the blob responder reuses `HANDSHAKE_TIMEOUT` (10 s,
-  `device_content.rs:44`); a stalled handshake closes the gateway leg, which breaks the
+  `device_content.rs:46`); a stalled handshake closes the gateway leg, which breaks the
   splice and frees the relay cap slot. A per-device pending-blob-leg bound (so a dial flood
   can't accumulate to the cap within the timeout window) is a possible refinement.
 - **Half-open reaping:** add a read-idle timeout (mirroring `CONTROL_IDLE_TIMEOUT`,
-  `serve.rs:52`) or a keepalive ping to content/blob **host** legs on the relay, so a phone
+  `serve.rs:60`) or a keepalive ping to content/blob **host** legs on the relay, so a phone
   that vanishes without a FIN doesn't pin a cap slot until OS TCP keepalive.
 
 ### Read authorization (the capability token)
 
 Read scope is the `read_token` already baked into every `blob_id`, **not** a session ACL or
 an offered-set. `blob_id = "sha256:<hex>.<read_token>"`, where `read_token` is a 128-bit
-unguessable value minted per put. `crates/storage/src/libsql/blob.rs` enforces the token
+unguessable value minted per put. `crates/storage/src/sqlite/blob.rs` enforces the token
 in `stat()`; `get()`, `open()`, and `open_at()` are token-safe because they call `stat()`
 before resolving the content-addressed path. The on-disk path is keyed by the hex digest
 alone (`blob_path`), and `split_id` never compares the token — **any read path that
 bypasses `stat()` has zero token enforcement.**
 
 A device only ever learns a full token-bearing `blob_id` over its **own authenticated chat
-leg** (the agent Noise-seals a `Frame::Attachment` to it). It cannot guess another blob's
+leg** (the agent Noise-seals a `Frame::Message` bearing it). It cannot guess another blob's
 token, so it cannot pull a blob it was never sent — identical to how the existing
 `GET /v1/blobs/{id}` authorizes on the token alone through the shared blob service.
 Defense-in-depth: the blob leg also requires a Noise-IK-approved device row to exist at all.
@@ -318,8 +323,9 @@ compatibility, so legacy NULL-token blobs remain pullable with the bare hex.
 
 ### Upload gate and limits
 
-The upload path flips the gateway's receive-only posture (`authorize_upload` currently
-rejects `AuthedClient::Device`, `blobs.rs`) only behind these bounds (Adversarial #5):
+The upload path flipped the gateway's receive-only posture (`authorize_upload` now maps
+`AuthedClient::Device` to `UploadAuth::Device`, `blobs.rs`) behind these bounds
+(Adversarial #5):
 
 - **Gate:** the Noise-IK approved-device check already authenticates the leg; no extra
   token needed.
@@ -334,16 +340,19 @@ rejects `AuthedClient::Device`, `blobs.rs`) only behind these bounds (Adversaria
 
 ## Mobile client
 
-The companion is a Tauri app (`app/mobile/`): a Rust core that runs the Noise IK
-**initiator**, and a TS/React UI.
+The companion is a SwiftUI app (`app/ios/`): a Rust FFI core (`app/ios/ffi/`) that runs the
+Noise IK **initiator**, and a native Swift UI.
 
-- **Rust core:** a blob-leg client that dials `/content/join` with `x-relay-leg-class: blob`,
-  runs the Noise IK initiator and the API tunnel protocol, writes response `Body` chunks to
-  a temp file at `offset`, verifies `sha256` against the requested `blob_id` hex, and resumes
-  by reissuing `GET /v1/blobs/{id}` with `Range: bytes=<temp_file_len>-` after a drop.
-- **TS/React:** `useBlobDownload` / `useBlobUpload` hooks; `MessageAttachment` renders an
-  image/file once downloaded (spinner + retry); send-with-attachment uploads first, then
-  embeds the returned `blob_id` in the outgoing `Message`.
+- **Rust core** (`app/ios/ffi/src/relay/blob.rs`): a blob-leg client that dials
+  `/content/join` with `x-relay-leg-class: blob`, runs the Noise IK initiator and the API
+  tunnel protocol, writes response `Body` chunks to a temp file at `offset`, verifies
+  `sha256` against the requested `blob_id` hex, and resumes by reissuing
+  `GET /v1/blobs/{id}` with `Range: bytes=<temp_file_len>-` after a drop.
+- **Swift UI:** `ComposerView.swift` stages a picked image via `PhotosPicker` and uploads it
+  before send, then embeds the returned `blob_id` in the outgoing `Message`; attachment
+  rendering in `ChatScreen.swift` / `Web/TranscriptBridge.swift` is backed by
+  `blob_download_bytes` and the content-addressed on-device cache (driven from
+  `App/Core/ChatStore.swift`).
 
 ## B+ vs in-band: when to pick which
 
@@ -391,6 +400,6 @@ shared bucket, so mislabeling blob-as-chat only forfeits the device's own chat p
 
 - [`sidecars.md`](../../sidecars.md) — the existing `/v1/blobs/*` media side-channel and
   `BlobStore` model this extends to NAT'd clients.
-- [`storage.md`](../storage.md) — libsql `BlobStore`, `read_token` capability.
+- [`storage.md`](../storage.md) — sqlite `BlobStore`, `read_token` capability.
 - [`pairing.md`](../pairing.md) / [`gateway.md`](../gateway.md) —
   device pairing, the relay content path, and the gateway channel loop.

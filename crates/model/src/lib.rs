@@ -25,7 +25,10 @@ pub use agent_profile::{
 pub use approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
 pub use control_event::{ControlEvent, ControlEventKind};
 pub use cost::{CallReason, CostRecord, CostSummary, TimeRange};
-pub use cron::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
+pub use cron::{
+    CronExecution, CronJob, CronSchedule, CronStatus, ExecutionOutcome, ExecutionStatus,
+    PendingCronResult,
+};
 pub use external_agent::{
     BAYBO_BACKEND_TAG, ExternalAgentKind, SubagentBackend, SubagentBackendKind, SubagentBackendTag,
 };
@@ -37,6 +40,7 @@ pub use llm_entry_name::LlmEntryName;
 pub use message::{
     BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role, SHA256_PREFIX,
     TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX, ThinkingContent, ToolResultMeta,
+    blob_content_digest,
 };
 pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};
@@ -44,8 +48,9 @@ pub use pricing::LlmPricingOverride;
 pub use reasoning_effort::ReasoningEffort;
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
-    BackgroundCompressionPayload, ChannelType, GroupState, Lineage, LineageKind, Session,
-    SessionState, TriggerKind, TriggerSource, User,
+    BackgroundCompressionPayload, BackgroundNotificationDelivery, BackgroundNotificationGroup,
+    BackgroundNotificationState, ChannelType, Lineage, LineageKind, Session, SessionState,
+    TriggerKind, TriggerSource, User,
 };
 pub use spawn_protocol::{
     BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_SUBAGENT_HANDLE_PREFIX, BackgroundJobKind,

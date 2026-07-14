@@ -28,4 +28,11 @@ size: number,
  * Original filename for `File` kind. Servers ignore for image /
  * audio (where the platform usually picks its own name).
  */
-filename?: string, };
+filename?: string, 
+/**
+ * Playback length in milliseconds for `Audio` (probed at attach
+ * time). `None` when unknown — inbound channel audio, unparseable
+ * containers, rows persisted before the field existed. Lets a client
+ * render a track's length before downloading a byte.
+ */
+duration_ms?: number, };

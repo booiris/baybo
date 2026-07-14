@@ -471,6 +471,15 @@ async fn finish_pair(
         .map_err(|e| format!("persist active binding: {e}"))?;
     crate::keychain::store_paired_record(&bytes)
         .map_err(|e| format!("persist paired record: {e}"))?;
+    // A fresh scan overwrites an existing pairing WITHOUT going through
+    // `forget_pairing`, and re-pairing the SAME gateway keeps every field of the
+    // leg pool's `BindingKey` — the Noise static and the signing key that
+    // `device_id` derives from are never deleted, and the gateway's static key and
+    // relay node id do not move. So a leg parked before the re-pair would pass
+    // every reuse gate while carrying the gateway's snapshot of the auth token it
+    // has just rotated away: a 401, and (because a 401 is a perfectly well-formed
+    // response) one that gets re-parked with a refreshed TTL. Drop them.
+    super::leg_pool::pool().invalidate();
     // One app binds one Baybo: a fresh scan-pairing supersedes any direct-login
     // credentials so the two binding modes can't both linger. Best-effort — the
     // marker above keeps resolution correct even if this leaves the direct creds.
@@ -490,6 +499,13 @@ pub(crate) fn paired_device() -> Option<String> {
 /// unpaired state. One app binds one gateway, so there is exactly one record to
 /// drop. Idempotent — succeeds even if nothing was stored.
 pub(crate) fn forget_pairing() -> Result<(), String> {
+    // Every warm API leg belongs to the binding we are dropping. Each one holds a
+    // gateway-side `AuthenticatedDevice` snapshotted at ITS handshake, so a leg
+    // that outlives the credentials answers with a token the gateway has already
+    // rotated away. Do this HERE rather than in each caller: `logout`, a direct
+    // login that supersedes a pairing, and a re-pair all reach this function, and
+    // none of them should have to remember.
+    super::leg_pool::pool().invalidate();
     // Read the record first to learn the device_id, so its push key
     // (`baybo.push-key.<device_id>`) is cleared too; a missing record is fine.
     if let Some(record) = load_paired_record()? {
@@ -579,4 +595,157 @@ fn decode_secret(s: &str) -> Result<PairingSecret, String> {
         .try_into()
         .map_err(|_| format!("pairing secret must be {KEY_LEN} bytes"))?;
     Ok(PairingSecret::from_bytes(arr))
+}
+
+/// The keychain byte format of [`PairedRecord`] is the upgrade-continuity contract
+/// with installs made by the Tauri shell: a paired user who upgrades reads THIS
+/// blob back. A renamed field, a re-typed key, or a dropped `#[serde(default)]`
+/// deserializes to `None`/an error and the app silently forgets its gateway
+/// binding — no error the user can act on, no way back but a re-pair. So the
+/// assertions below are on the literal JSON TEXT, not on a round-trip (which
+/// passes happily with every field renamed).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact bytes `finish_pair` writes to `baybo.paired-gateway`. Every field
+    /// name here is frozen; the two 32-byte keys are JSON ARRAYS of numbers.
+    const GOLDEN_RECORD_JSON: &str = r#"{"device_id":"device-abc","auth_token":"tok-1","gateway_static_pubkey":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"relay_node_id":"node-1","relay_url":"wss://relay.example","remote_api_key":"key-1","noise_secret":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"noise_public":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3]}"#;
+
+    /// A record written by a Tauri-shell build that predates `relay_url`,
+    /// `remote_api_key`, and `noise_public` — all three are `#[serde(default)]`
+    /// precisely so this blob still loads.
+    const LEGACY_RECORD_JSON: &str = r#"{"device_id":"device-legacy","auth_token":"tok-old","gateway_static_pubkey":[9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9],"relay_node_id":"node-old","noise_secret":[8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8]}"#;
+
+    fn golden_record() -> PairedRecord {
+        PairedRecord {
+            device_id: "device-abc".to_string(),
+            auth_token: "tok-1".to_string(),
+            gateway_static_pubkey: [1u8; KEY_LEN],
+            relay_node_id: "node-1".to_string(),
+            relay_url: "wss://relay.example".to_string(),
+            remote_api_key: "key-1".to_string(),
+            noise_secret: [2u8; KEY_LEN],
+            noise_public: [3u8; KEY_LEN],
+        }
+    }
+
+    #[test]
+    fn the_serialized_record_is_byte_for_byte_the_frozen_format() {
+        let json = serde_json::to_string(&golden_record()).expect("serialize");
+        assert_eq!(json, GOLDEN_RECORD_JSON);
+    }
+
+    /// Someone WILL want to "clean up" the 32-number arrays into a hex string.
+    /// That reads back as a type error on every existing install.
+    #[test]
+    fn the_key_fields_serialize_as_arrays_of_32_numbers_never_hex() {
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&golden_record()).expect("serialize"))
+                .expect("parse");
+        for field in ["gateway_static_pubkey", "noise_secret", "noise_public"] {
+            let value = &json[field];
+            let array = value
+                .as_array()
+                .unwrap_or_else(|| panic!("{field} must be a JSON array, got {value}"));
+            assert_eq!(array.len(), KEY_LEN, "{field} must carry {KEY_LEN} bytes");
+            assert!(
+                array.iter().all(|byte| byte.is_u64()),
+                "{field} must be numbers, not a hex string"
+            );
+        }
+    }
+
+    #[test]
+    fn the_field_names_are_frozen() {
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&golden_record()).expect("serialize"))
+                .expect("parse");
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "auth_token",
+                "device_id",
+                "gateway_static_pubkey",
+                "noise_public",
+                "noise_secret",
+                "relay_node_id",
+                "relay_url",
+                "remote_api_key",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_legacy_record_without_the_defaulted_fields_still_loads() {
+        let record: PairedRecord = serde_json::from_str(LEGACY_RECORD_JSON).expect("decode legacy");
+        assert_eq!(record.device_id, "device-legacy");
+        assert_eq!(record.auth_token, "tok-old");
+        assert_eq!(record.gateway_static_pubkey, [9u8; KEY_LEN]);
+        assert_eq!(record.relay_node_id, "node-old");
+        assert_eq!(record.noise_secret, [8u8; KEY_LEN]);
+        assert_eq!(record.relay_url, "");
+        assert_eq!(record.remote_api_key, "");
+        assert_eq!(record.noise_public, [0u8; KEY_LEN]);
+    }
+
+    /// The other half of the contract: the fields with no `#[serde(default)]` are
+    /// REQUIRED, so a blob missing one is a loud decode error rather than a record
+    /// that silently reconnects with an empty auth token.
+    #[test]
+    fn a_record_missing_a_required_field_fails_to_decode() {
+        let missing_token = LEGACY_RECORD_JSON.replace(r#""auth_token":"tok-old","#, "");
+        assert!(serde_json::from_str::<PairedRecord>(&missing_token).is_err());
+    }
+
+    /// A newer Tauri/iOS build may add a field this build doesn't know; reading the
+    /// blob must not fail on it.
+    #[test]
+    fn an_unknown_field_from_a_newer_build_is_ignored() {
+        let with_extra = GOLDEN_RECORD_JSON.replace(
+            r#"{"device_id""#,
+            r#"{"future_field":"whatever","device_id""#,
+        );
+        let record: PairedRecord = serde_json::from_str(&with_extra).expect("decode");
+        assert_eq!(record.device_id, "device-abc");
+    }
+
+    #[test]
+    fn the_golden_blob_re_serializes_to_itself() {
+        let record: PairedRecord = serde_json::from_str(GOLDEN_RECORD_JSON).expect("decode");
+        assert_eq!(
+            serde_json::to_string(&record).expect("serialize"),
+            GOLDEN_RECORD_JSON
+        );
+    }
+
+    /// Dropping the binding has to drop the warm API legs with it.
+    ///
+    /// The gateway resolves a leg's `AuthenticatedDevice` ONCE, at its handshake, so
+    /// a leg that outlives the credentials keeps presenting a token the gateway has
+    /// already rotated away. And re-pairing the SAME gateway changes NOTHING the leg
+    /// pool keys on — the Noise static and the signing key `device_id` derives from
+    /// are never deleted, and the gateway's static key and relay node id do not move
+    /// — so without this the pool would hand a freshly re-paired app a leg that 401s
+    /// every call.
+    #[test]
+    fn forgetting_a_pairing_drops_every_warm_api_leg() {
+        let before = super::super::leg_pool::pool().epoch();
+
+        // The keychain wipe may fail on a host build; the invalidation runs first
+        // precisely because it must not depend on it.
+        let _ = forget_pairing();
+
+        assert!(
+            super::super::leg_pool::pool().epoch() > before,
+            "a leg must not outlive the credentials it was authenticated with"
+        );
+    }
 }

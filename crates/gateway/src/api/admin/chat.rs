@@ -24,6 +24,10 @@
 //! * `PUT /v1/chat/sessions/:id/pin` — pin (or unpin) the session to
 //!   the top of the chat list. Presentation only; the row is otherwise
 //!   unchanged.
+//! * `PUT /v1/chat/sessions/:id/archive` — archive (or unarchive) the
+//!   session. Presentation only; the list endpoint keeps returning
+//!   archived rows (clients group them) and new activity never clears
+//!   the flag.
 //! * `GET /v1/chat/slash-manifest` — list of slash commands the input
 //!   composer's `/`-autocomplete should surface.
 //!
@@ -44,9 +48,9 @@ use baybo_channels::wire::{
 };
 use baybo_channels::{STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent};
 use baybo_model::{
-    AgentFramework, AgentProfileId, BUILTIN_AGENT_PROFILE_ID, ChannelType, ChatMessage,
-    ContentBlock, ControlEvent, ControlEventKind, FolderId, FolderSummary, LlmEntryName,
-    MessageSource, Role, Session, SessionId, ThinkingContent, TriggerSource, User,
+    AgentFramework, AgentProfileId, ApprovalDecision, BUILTIN_AGENT_PROFILE_ID, ChannelType,
+    ChatMessage, ContentBlock, ControlEvent, ControlEventKind, FolderId, FolderSummary,
+    LlmEntryName, Role, Session, SessionId, ThinkingContent, TriggerSource, User,
 };
 use baybo_session::SessionError;
 use chrono::{DateTime, Utc};
@@ -69,12 +73,12 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(lookup_session_message))
         .routes(routes!(set_session_model))
         .routes(routes!(set_session_pin))
+        .routes(routes!(set_session_archive))
         .routes(routes!(mark_session_read))
         .routes(routes!(set_session_folder))
         .routes(routes!(delete_session))
         .routes(routes!(unhide_session))
         .routes(routes!(slash_manifest))
-        .routes(routes!(list_cron_messages))
         .routes(routes!(list_folders))
         .routes(routes!(create_folder))
         .routes(routes!(update_folder))
@@ -89,10 +93,15 @@ pub struct ListSessionsQuery {
     /// Include hidden sessions in the response. Defaults to false.
     #[serde(default)]
     pub include_hidden: bool,
-    /// Include cron-triggered sessions in the response. Defaults to
-    /// false so the chat sidebar stays free of background fires; the
-    /// dedicated `GET /v1/chat/cron-messages` endpoint surfaces those
-    /// in their own pane.
+    /// Include **every** cron-triggered session, not just the ones that are
+    /// conversations in their own right. Defaults to false.
+    ///
+    /// A recurring fire opens a real conversation (`TriggerSource::Cron
+    /// { conversation: true }`) and is listed like any other. What this flag
+    /// admits is the rest: one-shot fire sessions — private workspaces whose
+    /// result is reported into the conversation that scheduled them — and
+    /// historical fires from before that distinction existed. An operator
+    /// escape hatch, not a chat-sidebar affordance.
     #[serde(default)]
     pub include_cron: bool,
 }
@@ -127,17 +136,17 @@ const PREVIEW_MAX_CHARS: usize = 120;
 /// the per-session count scan (see `SessionManager::unread_reply_count`).
 const UNREAD_COUNT_CAP: usize = 99;
 
-/// Default page size for the cron-messages list. Tuned to roughly
-/// match what the right-side panel renders before the user scrolls.
-const DEFAULT_CRON_MESSAGE_LIMIT: usize = 50;
-/// Hard cap on the cron-messages list so a curious client can't ask
-/// the gateway to walk thousands of cron sessions in one shot.
-const MAX_CRON_MESSAGE_LIMIT: usize = 200;
-/// How deep to walk a cron session's transcript when extracting the
-/// prompt/response previews. Cron sessions are one-shot — a small
-/// constant covers the realistic shape (the framed trigger prompt
-/// followed by one or two assistant turns).
-const CRON_PREVIEW_SCAN_DEPTH: usize = 12;
+/// How far back the second-line preview (`last_message_preview`) walks the
+/// transcript tail for the newest bubble. A completed turn's final answer is
+/// its LAST row (the loop ends on the first tool-free reply, and control events
+/// live outside `session_messages`), so a shallow scan finds it; the extra rows
+/// only tolerate an occasional non-bubble row (a compaction summary or an
+/// attachment-only message) sitting above it. A turn still mid-tool-loop has no
+/// final answer yet, so the scan finds no bubble and the row falls back to
+/// `last_user_text` client-side — which is that turn's own prompt, exactly the
+/// bubble a deeper walk would reach — so scanning deeper buys almost nothing
+/// while multiplying the per-session tail fetch + deserialize.
+const LAST_MESSAGE_PREVIEW_SCAN: usize = 4;
 
 /// Query string for `GET /v1/chat/sessions/{session_id}`. Reverse-
 /// paginates the active transcript: the response carries the
@@ -239,13 +248,17 @@ pub enum TranscriptItemKind {
 }
 
 /// Kind of a reconstructed [`ChatWorkStep`] — serialized as
-/// `"reasoning"` / `"prose"` / `"tool"`.
-#[derive(Debug, Serialize, ToSchema)]
+/// `"reasoning"` / `"prose"` / `"tool"` / `"status"`.
+#[derive(Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkStepKind {
     Reasoning,
     Prose,
     Tool,
+    /// The progress observer's transient narration, reconstructed from a
+    /// persisted `progress` control event — the durable shadow of the live
+    /// `AgentEvent::Progress` line.
+    Status,
 }
 
 /// One transcript row, flattened from `ChatMessage` into a shape the
@@ -336,6 +349,9 @@ pub struct ChatAttachment {
     pub size: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
+    /// Playback length in ms for `audio` (see `WireAttachment::duration_ms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
 }
 
 impl From<WireAttachment> for ChatAttachment {
@@ -351,6 +367,7 @@ impl From<WireAttachment> for ChatAttachment {
             mime_type: att.mime_type,
             size: att.size,
             filename: att.filename,
+            duration_ms: att.duration_ms,
         }
     }
 }
@@ -433,6 +450,12 @@ pub struct ChatWorkStep {
     /// the live UI withheld — acceptable for the operator's own view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_summary: Option<String>,
+    /// Decision the call's approval prompt returned (`"approve"` /
+    /// `"approve_always"` / `"deny"`), read from the persisted
+    /// `ToolResultMeta`; `None` when the call never prompted (or the row
+    /// predates the field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
 }
 
 impl ChatWorkStep {
@@ -444,6 +467,7 @@ impl ChatWorkStep {
             tool_label: None,
             tool_status: None,
             tool_summary: None,
+            approval: None,
         }
     }
 
@@ -455,6 +479,19 @@ impl ChatWorkStep {
             tool_label: None,
             tool_status: None,
             tool_summary: None,
+            approval: None,
+        }
+    }
+
+    fn status(text: String) -> Self {
+        Self {
+            kind: WorkStepKind::Status,
+            text,
+            tool: None,
+            tool_label: None,
+            tool_status: None,
+            tool_summary: None,
+            approval: None,
         }
     }
 
@@ -466,6 +503,7 @@ impl ChatWorkStep {
             tool_label,
             tool_status: None,
             tool_summary: None,
+            approval: None,
         }
     }
 }
@@ -479,6 +517,7 @@ impl From<WireWorkStep> for ChatWorkStep {
         match step.kind {
             WireWorkStepKind::Reasoning => Self::reasoning(step.text),
             WireWorkStepKind::Prose => Self::prose(step.text),
+            WireWorkStepKind::Status => Self::status(step.text),
             WireWorkStepKind::Tool => Self {
                 kind: WorkStepKind::Tool,
                 text: String::new(),
@@ -486,6 +525,7 @@ impl From<WireWorkStep> for ChatWorkStep {
                 tool_label: step.label,
                 tool_status: step.status,
                 tool_summary: step.summary,
+                approval: step.approval.map(|d| d.as_str().to_owned()),
             },
         }
     }
@@ -546,6 +586,11 @@ pub struct ChatSessionSummary {
     /// chat list. Always emitted so the sidebar can place every row in
     /// the right block; set via `PUT /v1/chat/sessions/{id}/pin`.
     pub pinned: bool,
+    /// True when the user has archived this session. Always emitted —
+    /// the list never filters on it, so clients with an archived view
+    /// group rows themselves and clients without one keep showing every
+    /// row; set via `PUT /v1/chat/sessions/{id}/archive`.
+    pub archived: bool,
     /// Preview text drawn from the session's most-recent user-authored
     /// message, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar
     /// renders this as the row label so users can scan past
@@ -554,6 +599,16 @@ pub struct ChatSessionSummary {
     /// transcript holds only system/tool rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_text: Option<String>,
+    /// Preview text drawn from the session's most-recent **displayable**
+    /// message regardless of author — the newest user prompt or final
+    /// assistant answer carrying text, truncated to [`PREVIEW_MAX_CHARS`].
+    /// Telegram-style list clients render this as the row's second line so
+    /// the preview follows the conversation (an agent reply shows once it
+    /// lands), while [`Self::last_user_text`] stays the user-only label the
+    /// web sidebar uses. `None` when the scanned tail holds only tool /
+    /// media rows or the session has no turn yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_text: Option<String>,
     /// The user-created folder this session is filed under, or absent for
     /// uncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web
     /// sidebar groups rows by this id.
@@ -584,55 +639,6 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatSessionsList {
     pub items: Vec<ChatSessionSummary>,
-}
-
-/// One entry in the cron-messages list. Each row corresponds to a
-/// distinct cron fire (cron creates a fresh session per trigger, so
-/// `session_id` uniquely identifies the fire). The chat surface
-/// surfaces these in a right-side notification pane rather than the
-/// main sidebar so unattended cron output doesn't bury user-driven
-/// conversations.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ChatCronMessage {
-    /// The session created for this cron fire. Reuse against
-    /// `/v1/chat/sessions/{id}` to drill into the full transcript.
-    pub session_id: String,
-    /// Cron job that produced this fire. Stable across fires of the
-    /// same job; missing in the (theoretically impossible) case of a
-    /// trigger without a job id.
-    pub cron_job_id: String,
-    /// When the cron session was created — the actual fire time, to
-    /// within scheduler tick precision.
-    pub fired_at: DateTime<Utc>,
-    /// Latest activity timestamp on the session. Lets the panel sort
-    /// by "freshest" without the client having to fetch transcripts.
-    pub last_active: DateTime<Utc>,
-    /// The user-facing prompt for this fire. Truncated to
-    /// [`PREVIEW_MAX_CHARS`]. The persisted user row carries the cron
-    /// dispatcher's fire-time framing; `baybo_context::prompts::cron::original_cron_prompt`
-    /// recovers the instruction as configured so the panel shows that,
-    /// not the framing boilerplate.
-    pub prompt: String,
-    /// Latest assistant text — what the agent produced in response.
-    /// `None` while the fire is still running or if the agent emitted
-    /// only tool calls / attachments.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response: Option<String>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ChatCronMessagesList {
-    pub items: Vec<ChatCronMessage>,
-}
-
-/// Query string for `GET /v1/chat/cron-messages`.
-#[derive(Debug, Default, Deserialize, IntoParams)]
-pub struct ListCronMessagesQuery {
-    /// Maximum number of cron messages to return. Defaults to
-    /// [`DEFAULT_CRON_MESSAGE_LIMIT`], clamped to
-    /// [`MAX_CRON_MESSAGE_LIMIT`].
-    #[serde(default)]
-    pub limit: Option<usize>,
 }
 
 /// Wire DTO for slash command entries. Mirror of
@@ -697,6 +703,7 @@ async fn create_session(
             last_active: Some(session.last_active),
             hidden: Some(session.hidden),
             pinned: Some(session.pinned),
+            archived: Some(session.archived),
             // A freshly-created session is always uncategorized; absent =
             // no change, which a newly-constructed client row renders as
             // uncategorized.
@@ -728,7 +735,7 @@ async fn list_sessions(
     let channel_type = chat_list_channel(authed.as_ref().map(|ext| &ext.0));
     // Push the channel filter into SQL so a long-running gateway
     // with thousands of bot sessions (telegram / weixin / …) doesn't
-    // pay an O(all-sessions) libsql round-trip on every chat-list
+    // pay an O(all-sessions) sqlite round-trip on every chat-list
     // refresh — see `SessionStore::list_by_channel`. We still walk
     // the result to apply the hidden filter; that's a userland-only
     // pass over the (now scoped) result.
@@ -745,16 +752,17 @@ async fn list_sessions(
     let visible: Vec<Session> = scoped
         .into_iter()
         .filter(|s| query.include_hidden || !s.hidden)
-        .filter(|s| query.include_cron || !is_cron_triggered(s))
+        .filter(|s| query.include_cron || !is_hidden_cron_session(s))
         .collect();
     // Fan out the per-session preview fetch — each row is a single
     // back-of-the-index lookup (`load_last_user_message`,
     // `ORDER BY ordinal DESC LIMIT 1`) but they add up serially when a tab
-    // has dozens of conversations open. `join_all` runs the libsql queries
-    // concurrently against the shared connection pool. A preview that
-    // fails to load is dropped to `None` rather than failing the whole
-    // list — the sidebar still renders the row, just without a
-    // preview, and the next list refresh will retry.
+    // has dozens of conversations open. `join_all` overlaps them; the real
+    // parallelism is whatever the store's connection pool can hand out, and
+    // the rest queue behind it, so a wide fan-out costs latency rather than
+    // connections. A preview that fails to load is dropped to `None` rather
+    // than failing the whole list — the sidebar still renders the row, just
+    // without a preview, and the next list refresh will retry.
     let previews = futures::future::join_all(visible.iter().map(|s| {
         let manager = state.session_manager.clone();
         let sid = s.id.clone();
@@ -776,23 +784,38 @@ async fn list_sessions(
         }
     }))
     .await;
+    // The Telegram-style second-line preview: the newest displayable message
+    // regardless of author. Fanned out concurrently like the user-only preview
+    // above, each degrading to `None` on error so one bad row can't fail the
+    // whole list.
+    let last_messages = futures::future::join_all(visible.iter().map(|s| {
+        let manager = state.session_manager.clone();
+        let sid = s.id.clone();
+        async move { last_message_preview(&manager, &sid).await }
+    }))
+    .await;
     let items: Vec<ChatSessionSummary> = visible
         .into_iter()
         .zip(previews)
         .zip(unread_counts)
-        .map(|((s, last_user_text), unread)| ChatSessionSummary {
-            session_id: s.id.to_string(),
-            created_at: s.created_at,
-            last_active: s.last_active,
-            hidden: s.hidden,
-            pinned: s.pinned,
-            last_user_text,
-            folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
-            unread_count: unread as i64,
-            title: s.title.clone(),
-            agent_id: s.state.agent_id.as_ref().map(|a| a.to_string()),
-            agent_framework: s.state.agent_framework.map(|f| f.as_str().to_owned()),
-        })
+        .zip(last_messages)
+        .map(
+            |(((s, last_user_text), unread), last_message_text)| ChatSessionSummary {
+                session_id: s.id.to_string(),
+                created_at: s.created_at,
+                last_active: s.last_active,
+                hidden: s.hidden,
+                pinned: s.pinned,
+                archived: s.archived,
+                last_user_text,
+                last_message_text,
+                folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
+                unread_count: unread as i64,
+                title: s.title.clone(),
+                agent_id: s.state.agent_id.as_ref().map(|a| a.to_string()),
+                agent_framework: s.state.agent_framework.map(|f| f.as_str().to_owned()),
+            },
+        )
         .collect();
     Ok(Json(ChatSessionsList { items }))
 }
@@ -1290,6 +1313,14 @@ async fn set_session_pin(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// Request body for `PUT /v1/chat/sessions/{session_id}/archive`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetSessionArchiveRequest {
+    /// `true` to move this session into the archived group, `false` to
+    /// restore it to the main chat list.
+    pub archived: bool,
+}
+
 /// Request body for `PUT /v1/chat/sessions/{session_id}/read`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct MarkReadRequest {
@@ -1297,6 +1328,49 @@ pub struct MarkReadRequest {
     /// cursor advances max-wins, so a stale/lower value is a no-op — a client
     /// can safely fire this on open and after each new reply while foreground.
     pub ordinal: i64,
+}
+
+#[utoipa::path(
+    put,
+    path = "/chat/sessions/{session_id}/archive",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to archive or unarchive"),
+    ),
+    request_body = SetSessionArchiveRequest,
+    responses(
+        (status = 204, description = "Archive state updated"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn set_session_archive(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    authed: Option<Extension<AuthedClient>>,
+    Json(req): Json<SetSessionArchiveRequest>,
+) -> Result<axum::http::StatusCode> {
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let (sid, session) = load_scoped_chat_session(&state, &session_id, authed).await?;
+    // Targeted flat-column write — like `set_pinned`, it survives a
+    // concurrent `touch` (full-blob save) so the flag can't be clobbered.
+    state
+        .session_manager
+        .set_archived(&sid, req.archived)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("set session archive: {e}")))?;
+    // Broadcast so every open chat client moves the row between the main
+    // list and the archived group without a list refetch.
+    broadcast_session_patch(
+        &state,
+        &session.channel,
+        &sid,
+        SessionPatch {
+            archived: Some(req.archived),
+            ..SessionPatch::default()
+        },
+    );
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -1411,9 +1485,10 @@ async fn unhide_session(
             created_at: Some(session.created_at),
             last_active: Some(session.last_active),
             hidden: Some(false),
-            // Carry the live pin state so a sibling tab re-adding the
-            // row drops it straight into the correct block.
+            // Carry the live pin + archive state so a sibling tab
+            // re-adding the row drops it straight into the correct block.
             pinned: Some(session.pinned),
+            archived: Some(session.archived),
             // Carry the folder assignment too so the re-added row lands in
             // the right folder (absent ⇒ uncategorized).
             folder_id: session.folder_id.as_ref().map(|f| FolderChange::Set {
@@ -1765,53 +1840,6 @@ async fn delete_folder(
 
 #[utoipa::path(
     get,
-    path = "/chat/cron-messages",
-    tag = "chat",
-    params(ListCronMessagesQuery),
-    responses(
-        (status = 200, description = "Cron-triggered http sessions with prompt + agent response previews, newest fire first", body = ChatCronMessagesList),
-        (status = 401, description = "Unauthorized", body = ErrorBody),
-    )
-)]
-async fn list_cron_messages(
-    State(state): State<AdminState>,
-    Query(query): Query<ListCronMessagesQuery>,
-) -> Result<Json<ChatCronMessagesList>> {
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_CRON_MESSAGE_LIMIT)
-        .clamp(1, MAX_CRON_MESSAGE_LIMIT);
-    let scoped = state
-        .session_manager
-        .list_by_channel(&ChannelType::http())
-        .await
-        .map_err(|e| GatewayError::Internal(format!("list cron messages: {e}")))?;
-    // `list_by_channel` already returns rows ordered by `last_active`
-    // desc; the filter preserves order so the take(limit) below is the
-    // freshest N cron fires.
-    let cron_sessions: Vec<Session> = scoped
-        .into_iter()
-        .filter(|s| !s.hidden)
-        .filter_map(|s| match &s.trigger {
-            TriggerSource::Cron { cron_job_id } if !cron_job_id.is_empty() => Some(s),
-            _ => None,
-        })
-        .take(limit)
-        .collect();
-    let manager = state.session_manager.clone();
-    let items = futures::future::join_all(cron_sessions.into_iter().map(|s| {
-        let manager = manager.clone();
-        async move { cron_message_from_session(&manager, s).await }
-    }))
-    .await
-    .into_iter()
-    .flatten()
-    .collect();
-    Ok(Json(ChatCronMessagesList { items }))
-}
-
-#[utoipa::path(
-    get,
     path = "/chat/slash-manifest",
     tag = "chat",
     responses(
@@ -1947,7 +1975,7 @@ async fn create_or_load_chat_session(
     {
         if existing.channel != channel_type
             || existing.user.id != user.id
-            || is_cron_triggered(&existing)
+            || is_hidden_cron_session(&existing)
         {
             return Err(GatewayError::NotFound(format!("chat session {session_id}")));
         }
@@ -2061,78 +2089,16 @@ fn chat_broadcast_channels() -> [ChannelType; 2] {
     [ChannelType::http(), ChannelType::device()]
 }
 
-/// True when the session was spawned by a cron trigger rather than a user
-/// conversation. Cron sessions are filtered out of the chat list unless
-/// `include_cron` is set.
-fn is_cron_triggered(session: &Session) -> bool {
-    matches!(session.trigger, TriggerSource::Cron { .. })
-}
-
-/// Walk a cron session's tail to extract the prompt + freshest
-/// assistant response. Returns `None` only when the walk itself fails;
-/// a fire that's still running (no assistant turn yet) returns the
-/// prompt with `response = None`, and a fire with no decodable rows
-/// at all surfaces empty strings so the panel still pins the
-/// timestamp instead of silently dropping the row.
-async fn cron_message_from_session(
-    manager: &baybo_session::SessionManager,
-    session: Session,
-) -> Option<ChatCronMessage> {
-    let cron_job_id = match &session.trigger {
-        TriggerSource::Cron { cron_job_id } => cron_job_id.clone(),
-        _ => return None,
-    };
-    let tail = manager
-        .history_tail(&session.id, None, CRON_PREVIEW_SCAN_DEPTH)
-        .await
-        .ok()?;
-    let mut prompt: Option<String> = None;
-    let mut response: Option<String> = None;
-    // `history_tail` returns ascending; the cron prompt is the first
-    // user row (oldest) and the assistant response is the freshest
-    // assistant row (newest). Walk forward for the prompt; walk in
-    // reverse for the response so we land on the last assistant turn
-    // even when the agent emitted multiple.
-    for (_ord, _at, msg) in &tail {
-        // The cron prompt persists as a `MessageSource::Cron` row; locate it by
-        // provenance, then strip the framing for display. It rides as a
-        // `Role::User` turn, indistinguishable by role from a skill reminder.
-        if matches!(msg.source(), MessageSource::Cron) {
-            let text = extract_text(&msg.content);
-            prompt = Some(baybo_context::prompts::cron::original_cron_prompt(&text).to_owned());
-            break;
-        }
-    }
-    for (_ord, _at, msg) in tail.iter().rev() {
-        if matches!(msg.role, Role::Assistant) {
-            let text = extract_text(&msg.content);
-            if !text.is_empty() {
-                response = Some(truncate_preview(&text));
-                break;
-            }
-        }
-    }
-    Some(ChatCronMessage {
-        session_id: session.id.to_string(),
-        cron_job_id,
-        fired_at: session.created_at,
-        last_active: session.last_active,
-        prompt: prompt.map(|p| truncate_preview(&p)).unwrap_or_default(),
-        response,
-    })
-}
-
-fn extract_text(content: &[ContentBlock]) -> String {
-    let mut text = String::new();
-    for block in content {
-        if let ContentBlock::Text(t) = block {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(t);
-        }
-    }
-    text
+/// True for a cron fire session that is **not** a conversation of its own: a
+/// one-shot's private workspace (its result is reported into the conversation
+/// that scheduled it), or a historical fire from before recurring fires became
+/// conversations. Such a session is kept out of the chat list and cannot be
+/// attached to — there is nothing there for a user to read or continue.
+///
+/// A recurring fire's session *is* the notification, so it is listed and
+/// replyable like any other conversation.
+fn is_hidden_cron_session(session: &Session) -> bool {
+    matches!(session.trigger, TriggerSource::Cron { .. }) && !session.trigger.is_cron_conversation()
 }
 
 async fn transcript_attachments(
@@ -2184,6 +2150,53 @@ async fn last_user_preview(
     let (created_at, msg) = manager.last_user_message(session_id).await.ok().flatten()?;
     let item = message_item(0, created_at, "user", &msg, Vec::new())?;
     (!item.text.is_empty()).then(|| truncate_preview(&item.text))
+}
+
+/// Newest **displayable** message regardless of author — the freshest user
+/// prompt or final assistant answer carrying text — collapsed into the chat
+/// list's second-line preview. Walks the transcript tail newest-first and
+/// returns the first row that renders as a message BUBBLE, applying the same
+/// visibility rules as [`reconstruct_transcript`] so the preview never surfaces
+/// something the transcript itself hides: only a real user turn
+/// ([`ChatMessage::from_user`]) or a tool-free final assistant answer counts —
+/// agent-injected user rows (cron / recalled-memory framing), work-block
+/// narration (an assistant row with tool calls), and tool rows are skipped, and
+/// the model-facing cancelled-turn marker is stripped. `None` when the scanned
+/// tail holds no such bubble (media-only, a mid-tool-loop turn, or a fresh
+/// session) or the lookup fails — the row then falls back to its title / user
+/// preview client-side. Bounded to [`LAST_MESSAGE_PREVIEW_SCAN`] rows so a long
+/// tool loop can't turn one preview into an unbounded tail read.
+async fn last_message_preview(
+    manager: &baybo_session::SessionManager,
+    session_id: &SessionId,
+) -> Option<String> {
+    let tail = manager
+        .history_tail(session_id, None, LAST_MESSAGE_PREVIEW_SCAN)
+        .await
+        .ok()?;
+    tail.into_iter()
+        .rev()
+        .find_map(|(_ordinal, created_at, msg)| {
+            // Match reconstruct_transcript's bubble rules: a real user turn, or a
+            // tool-free final assistant answer. Everything else (agent-injected
+            // user rows, assistant work-block narration, tool results) renders no
+            // bubble there, so it must not become a preview here.
+            let role = if msg.from_user() {
+                "user"
+            } else if matches!(msg.role, Role::Assistant) && !msg.has_tool_use() {
+                "assistant"
+            } else {
+                return None;
+            };
+            let item = message_item(0, created_at, role, &msg, Vec::new())?;
+            // Strip the model-facing cancelled-turn marker (a no-op when absent):
+            // a /stop-salvaged reply keeps only its partial text, and a
+            // thinking-only marker-only row strips to empty and is skipped — the
+            // same "frame for the model, strip for the user" contract the
+            // transcript honours.
+            let text = baybo_context::prompts::cancelled_turn::strip_marker(&item.text);
+            (!text.is_empty()).then(|| truncate_preview(text))
+        })
 }
 
 /// Collapse whitespace and clip to [`PREVIEW_MAX_CHARS`] for the
@@ -2371,6 +2384,22 @@ fn reconstruct_transcript_with_attachments(
     for (idx, (_, _, _, entry)) in entries.into_iter().enumerate() {
         let (ordinal, created_at, msg) = match entry {
             Entry::Control(ev) => {
+                // Progress narration is NOT a turn boundary: it folds INTO the
+                // open work block as a `status` step (the durable shadow of the
+                // live `notice { transient }` line) instead of flushing the
+                // block and emitting its own row. Seed the accumulator if this
+                // is the turn's first step (progress fired before any tool
+                // iteration persisted), inheriting the turn start so timing is
+                // consistent with the tool path.
+                if ev.kind == ControlEventKind::Progress {
+                    if work.started.is_none() {
+                        work.started = Some(turn_started.unwrap_or(ev.created_at));
+                        work.ordinal = Some(ev.after_ordinal);
+                    }
+                    work.last = Some(ev.created_at);
+                    work.steps.push(ChatWorkStep::status(ev.text));
+                    continue;
+                }
                 // A control event interrupting an open work block bounds it:
                 // for the common case — the `/stop` echo + notice right after
                 // a cancelled turn's partial rows — the event instant is when
@@ -2524,13 +2553,24 @@ fn reconstruct_transcript_with_attachments(
                     if let ContentBlock::ToolResult {
                         tool_use_id,
                         content,
-                        ..
+                        meta,
                     } = block
                         && let Some(&idx) = work.pending_tools.get(tool_use_id)
                         && let Some(step) = work.steps.get_mut(idx)
                     {
-                        step.tool_status = Some(tool_result_status(content));
+                        let approval = meta.as_ref().and_then(|m| m.approval);
+                        // A recorded `Deny` outranks the text sniff: a tool that
+                        // prompted MID-CALL folds the refusal into its own error
+                        // message, which carries none of the sentinel wording, so
+                        // sniffing alone would reconstruct it as a plain failure
+                        // while the live view showed it denied. Rows persisted
+                        // before the field existed still fall through to the sniff.
+                        step.tool_status = Some(match approval {
+                            Some(ApprovalDecision::Deny) => "denied".to_owned(),
+                            _ => tool_result_status(content),
+                        });
                         step.tool_summary = Some(summarize_tool_result(content));
+                        step.approval = approval.map(|d| d.as_str().to_owned());
                     }
                 }
             }
@@ -2551,7 +2591,23 @@ fn reconstruct_transcript_with_attachments(
     // it joined. For a turn still in its first iteration there's no persisted
     // intermediate row, so seed the block's ordinal from the newest message.
     let has_in_flight = !in_flight_steps.is_empty();
-    work.steps.extend(in_flight_steps);
+    // A `status` step reaches the trailing block from TWO sources at once for
+    // the in-flight turn: the persisted `progress` control events (folded above,
+    // at their anchor positions) AND the live channel's in-flight buffer. Drop
+    // the buffered duplicates so the same narration line isn't rendered twice —
+    // the positioned control-event copy wins; any status line the buffer holds
+    // that hasn't persisted yet still appends.
+    let folded_status: std::collections::HashSet<String> = work
+        .steps
+        .iter()
+        .filter(|s| s.kind == WorkStepKind::Status)
+        .map(|s| s.text.clone())
+        .collect();
+    work.steps.extend(
+        in_flight_steps
+            .into_iter()
+            .filter(|s| s.kind != WorkStepKind::Status || !folded_status.contains(&s.text)),
+    );
     if has_in_flight && work.ordinal.is_none() {
         work.ordinal = Some(last_ordinal);
     }
@@ -2789,6 +2845,105 @@ mod tests {
             text: body.to_owned(),
             created_at: ts(secs),
         }
+    }
+
+    #[test]
+    fn reconstruct_folds_progress_control_event_into_work_block() {
+        use baybo_model::ControlEventKind::Progress;
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![
+                    thinking("planning"),
+                    tool_use("c1", "Bash", serde_json::json!({"command": "ls"})),
+                ]),
+            ),
+            (
+                4,
+                ts(5),
+                ChatMessage::tool_result(
+                    "c1".to_owned(),
+                    "<tool_output name=\"Bash\">ok</tool_output>".to_owned(),
+                ),
+            ),
+            (5, ts(7), ChatMessage::assistant(vec![text("done")])),
+        ];
+        // A progress line fired mid-turn, anchored after the tool iteration row.
+        let control = vec![ctl(1, 3, Progress, "Running ls", 4)];
+        let items = reconstruct_transcript(tail, control, None, Vec::new());
+
+        // Three items — the progress line folds INTO the work block, it is NOT
+        // its own row.
+        assert_eq!(items.len(), 3, "user + work + answer: {items:?}");
+        let work = &items[1];
+        assert!(matches!(work.kind, TranscriptItemKind::Work));
+        assert_eq!(
+            work.steps.len(),
+            3,
+            "reasoning + tool + status: {:?}",
+            work.steps
+        );
+        assert!(matches!(work.steps[0].kind, WorkStepKind::Reasoning));
+        assert!(matches!(work.steps[1].kind, WorkStepKind::Tool));
+        assert!(matches!(work.steps[2].kind, WorkStepKind::Status));
+        assert_eq!(work.steps[2].text, "Running ls");
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i.kind, TranscriptItemKind::Notice)),
+            "a progress control event must not surface as a notice row"
+        );
+    }
+
+    #[test]
+    fn reconstruct_dedups_progress_against_in_flight_status() {
+        use baybo_model::ControlEventKind::Progress;
+        // An in-flight turn: one persisted tool iteration, a progress line that
+        // BOTH persisted (control event) AND still sits in the live buffer.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![tool_use(
+                    "c1",
+                    "Bash",
+                    serde_json::json!({"command": "ls"}),
+                )]),
+            ),
+        ];
+        let control = vec![ctl(1, 3, Progress, "narrate", 4)];
+        // The channel's in-flight buffer still holds the same narration line
+        // plus a fresher reasoning step not yet persisted.
+        let in_flight = vec![
+            ChatWorkStep::status("narrate".to_owned()),
+            ChatWorkStep::reasoning("more".to_owned()),
+        ];
+        let items = reconstruct_transcript(tail, control, Some(ts(2)), in_flight);
+
+        let work = items
+            .iter()
+            .find(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .expect("a trailing work block");
+        let status_count = work
+            .steps
+            .iter()
+            .filter(|s| s.kind == WorkStepKind::Status && s.text == "narrate")
+            .count();
+        assert_eq!(
+            status_count, 1,
+            "the duplicate in-flight status is dropped: {:?}",
+            work.steps
+        );
+        assert!(
+            work.steps
+                .iter()
+                .any(|s| s.kind == WorkStepKind::Reasoning && s.text == "more"),
+            "a non-duplicate in-flight step still appends: {:?}",
+            work.steps
+        );
     }
 
     #[test]
@@ -3351,6 +3506,83 @@ mod tests {
         assert_eq!(work.steps.len(), 1);
         assert_eq!(work.steps[0].tool_status.as_deref(), Some("ok"));
         assert_eq!(work.steps[0].tool_summary.as_deref(), Some("ok output"));
+        assert_eq!(work.steps[0].approval, None, "no prompt, no label");
+    }
+
+    #[test]
+    fn reconstruct_reads_approval_off_tool_result_meta() {
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![
+                    tool_use("c1", "Bash", serde_json::json!({"command": "ls"})),
+                    tool_use("c2", "Bash", serde_json::json!({"command": "rm x"})),
+                ]),
+            ),
+            (
+                4,
+                ts(4),
+                ChatMessage::tool_result_with_meta(
+                    "c1".to_owned(),
+                    "ok output".to_owned(),
+                    Some(baybo_model::ToolResultMeta {
+                        read_fingerprint: None,
+                        approval: Some(baybo_tools::ApprovalDecision::ApproveAlways),
+                    }),
+                ),
+            ),
+            // A denied row persisted BEFORE the meta field existed: the
+            // status sniff still fires, the approval label stays absent.
+            (
+                5,
+                ts(5),
+                ChatMessage::tool_result(
+                    "c2".to_owned(),
+                    "The user explicitly denied permission for tool 'Bash'.".to_owned(),
+                ),
+            ),
+        ];
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
+        let work = &items[1];
+        assert_eq!(work.steps.len(), 2);
+        assert_eq!(work.steps[0].tool_status.as_deref(), Some("ok"));
+        assert_eq!(work.steps[0].approval.as_deref(), Some("approve_always"));
+        assert_eq!(work.steps[1].tool_status.as_deref(), Some("denied"));
+        assert_eq!(work.steps[1].approval, None);
+    }
+
+    #[test]
+    fn a_recorded_denial_outranks_the_text_sniff() {
+        // A tool that prompted MID-CALL folds the refusal into its own error
+        // message, which carries none of the sentinel wording — so the sniff
+        // alone reconstructs it as a plain failure while the live view showed
+        // it denied. The recorded decision settles it.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![tool_use("c1", "Skill", serde_json::json!({}))]),
+            ),
+            (
+                4,
+                ts(4),
+                ChatMessage::tool_result_with_meta(
+                    "c1".to_owned(),
+                    "Error: skill 'x' requires env-var approval".to_owned(),
+                    Some(baybo_model::ToolResultMeta {
+                        read_fingerprint: None,
+                        approval: Some(ApprovalDecision::Deny),
+                    }),
+                ),
+            ),
+        ];
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
+        let work = &items[1];
+        assert_eq!(work.steps[0].tool_status.as_deref(), Some("denied"));
+        assert_eq!(work.steps[0].approval.as_deref(), Some("deny"));
     }
 
     #[test]

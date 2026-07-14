@@ -113,6 +113,48 @@ final class TranscriptBridge: NSObject, ObservableObject {
         call("blobResult", jsonObjectLiteral(payload))
     }
 
+    /// One file card's lifecycle step. `loaded`/`total` only ride a `loading`
+    /// tick; `error` only a `failed` one.
+    func fileState(
+        blobId: String, state: String, loaded: UInt64? = nil, total: UInt64? = nil,
+        error: String? = nil
+    ) {
+        var payload: [String: Any] = ["blobId": blobId, "state": state]
+        if let loaded { payload["loaded"] = loaded }
+        if let total { payload["total"] = total }
+        if let error { payload["error"] = error }
+        call("fileState", jsonObjectLiteral(payload))
+    }
+
+    /// One audio track's engine state (see `AudioPlayerCenter`): play/pause
+    /// flips, 2 Hz position ticks, and the `stopped` reset on end/usurp.
+    func audioState(blobId: String, state: String, position: Double, duration: Double) {
+        let payload: [String: Any] = [
+            "blobId": blobId,
+            "state": state,
+            "position": position,
+            "duration": duration,
+        ]
+        call("audioState", jsonObjectLiteral(payload))
+    }
+
+    /// Answer to `requestVideoPoster`: the poster frame's JPEG bytes plus the
+    /// natural size and duration, or `dataBase64: nil` + error.
+    func videoPoster(
+        id: Int, dataBase64: String?, width: Int, height: Int, durationMs: Int,
+        error: String? = nil
+    ) {
+        let payload: [String: Any] = [
+            "id": id,
+            "dataBase64": dataBase64 as Any,
+            "width": width,
+            "height": height,
+            "durationMs": durationMs,
+            "error": error as Any,
+        ]
+        call("videoPoster", jsonObjectLiteral(payload))
+    }
+
     func setLanguage(_ lang: String) {
         call("setLanguage", jsonLiteral(lang))
     }
@@ -302,6 +344,76 @@ extension TranscriptBridge: WKScriptMessageHandler {
             {
                 store?.requestBlob(id: id, blobId: blobId)
             }
+        case "queryFileState":
+            if let blobId = body["blobId"] as? String {
+                store?.queryFileState(blobId: blobId)
+            }
+        case "downloadFile":
+            if let blobId = body["blobId"] as? String {
+                store?.downloadFile(blobId: blobId)
+            }
+        case "previewFile":
+            if let blobId = body["blobId"] as? String,
+                let filename = body["filename"] as? String,
+                let mimeType = body["mimeType"] as? String
+            {
+                store?.previewFile(blobId: blobId, filename: filename, mimeType: mimeType)
+            }
+        case "shareFile":
+            // A long-press on a downloaded file / audio / video card — raise
+            // the system share sheet on the materialised file.
+            if let blobId = body["blobId"] as? String,
+                let filename = body["filename"] as? String,
+                let mimeType = body["mimeType"] as? String
+            {
+                store?.shareFile(blobId: blobId, filename: filename, mimeType: mimeType)
+            }
+        case "viewImage":
+            // A tap on an image bubble — decode the cached blob and present the
+            // full-screen zoomable viewer (images only; files use previewFile).
+            // Name + mime ride along so the viewer's share sheet can hand over the
+            // file under its real name.
+            if let blobId = body["blobId"] as? String {
+                store?.viewImage(
+                    blobId: blobId,
+                    filename: body["filename"] as? String ?? "",
+                    mimeType: body["mimeType"] as? String ?? "")
+            }
+        case "audioToggle":
+            if let blobId = body["blobId"] as? String,
+                let filename = body["filename"] as? String,
+                let mimeType = body["mimeType"] as? String
+            {
+                store?.audioToggle(blobId: blobId, filename: filename, mimeType: mimeType)
+            }
+        case "audioSeek":
+            if let blobId = body["blobId"] as? String,
+                let position = (body["position"] as? NSNumber)?.doubleValue
+            {
+                store?.audioSeek(blobId: blobId, position: position)
+            }
+        case "queryAudioState":
+            if let blobId = body["blobId"] as? String {
+                store?.queryAudioState(blobId: blobId)
+            }
+        case "playVideo":
+            // A tap on a downloaded video tile — materialise and present the
+            // native full-screen player.
+            if let blobId = body["blobId"] as? String,
+                let filename = body["filename"] as? String,
+                let mimeType = body["mimeType"] as? String
+            {
+                store?.playVideo(blobId: blobId, filename: filename, mimeType: mimeType)
+            }
+        case "requestVideoPoster":
+            if let id = (body["id"] as? NSNumber)?.intValue,
+                let blobId = body["blobId"] as? String,
+                let filename = body["filename"] as? String,
+                let mimeType = body["mimeType"] as? String
+            {
+                store?.requestVideoPoster(
+                    id: id, blobId: blobId, filename: filename, mimeType: mimeType)
+            }
         case "retry":
             // The failed-bubble dot was tapped. The webview carries the payload
             // (so retry survives an eviction/relaunch that rebuilt the bubble);
@@ -314,6 +426,10 @@ extension TranscriptBridge: WKScriptMessageHandler {
             }
         case "jumpVisible":
             jumpVisible = (body["visible"] as? Bool) ?? false
+        case "runState":
+            // The transcript's turn is/ isn't in flight — drives the composer's
+            // send↔stop button on the store this webview currently targets.
+            store?.setAgentRunning((body["running"] as? Bool) ?? false)
         case "openUrl":
             // Markdown links leave the app for the system browser — navigating
             // the transcript webview itself would replace the thread.
@@ -323,6 +439,14 @@ extension TranscriptBridge: WKScriptMessageHandler {
                 scheme == "http" || scheme == "https"
             {
                 UIApplication.shared.open(url)
+            }
+        case "copy":
+            // A user-bubble long-press. Native owns the write: a WKWebView
+            // rejects `navigator.clipboard` outside a live gesture (the web
+            // timer has none), and only native can fire the confirming haptic.
+            if let text = body["text"] as? String, !text.isEmpty {
+                UIPasteboard.general.string = text
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             }
         case "log":
             let level = body["level"] as? String ?? "info"

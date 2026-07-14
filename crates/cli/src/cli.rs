@@ -364,7 +364,7 @@ pub enum ChannelCmd {
     /// Register a new bot. Opens an interactive single-select over the
     /// supported channel types, then dispatches into that channel's
     /// registration flow (e.g. telegram prompts once for a masked bot
-    /// token). Writes directly to libsql + the vault; a running
+    /// token). Writes directly to sqlite + the vault; a running
     /// gateway picks up the new bot within a couple of seconds via
     /// the reconciler.
     Add,

@@ -14,7 +14,7 @@ already has locally. It is intentionally decoupled from the production
 One-click launcher (`bench/bench-web/run.sh`):
 
 ```bash
-bench/bench-web/run.sh                 # build embedded UI + serve on :7000
+bench/bench-web/run.sh                 # precompute sidecars + build embedded UI + serve on :7000
 bench/bench-web/run.sh --port 8080     # pick a port
 bench/bench-web/run.sh --dev           # Vite dev server (HMR) + API, on :5173
 bench/bench-web/run.sh --release       # optimized backend
@@ -30,23 +30,34 @@ cargo run -p baybo-bench-web -- --root bench --port 7000   # embedded UI
 Backend flags: `--root` (default `bench`), `--host` (default `127.0.0.1`),
 `--port` (default `7000`). Logging via `RUST_LOG=baybo_bench_web=debug`.
 
+Before serving, `run.sh` sweeps every bench's traces to refresh their
+`<trace>.tools.json` tool-count sidecars (`--bin precompute_tool_counts`,
+incremental, `|| non-fatal`). Each bench's `consolidate.sh` runs the same
+bin scoped to its own traces (`--root .. --bench <id>`) — that is where
+sidecars normally get written; the launcher sweep is the all-bench catch-up.
+
 ## Layout
 
 ```
 bench/bench-web/
-  build.rs              pnpm build + zstd-embed app/web/dist (gateway pattern, webui-only)
+  build.rs              pnpm build + zstd-embed web/dist (gateway pattern, webui-only)
   src/
     main.rs             clap CLI + axum serve
+    lib.rs              crate root (pub adapters/api/model/precompute; bin + tests consume it)
     api.rs              /api/* routes + state; webui fallback
     model.rs            the spine: BenchInfo / RunSummary / Item / BenchExtra … (#[derive(TS)] under ts-export)
     input.rs            Deserialize mirrors of each bench's results JSON
     adapters/           swe.rs / tb.rs / memory.rs + mod.rs (scan, standing, search, path helpers)
-    trace.rs            trace reshape + raw-file endpoint + safe_join path guard
+    trace.rs            trace reshape + raw-file endpoint + safe_join path guard + sidecar read
+    precompute.rs       offline sweep: writes <trace>.tools.json per-tool call-count
+                        sidecars next to each (gitignored) trace; mtime-incremental,
+                        best-effort per file
+    bin/precompute_tool_counts.rs  the sweep as a CLI (--root, --bench)
     webui.rs            serve the embedded bundle
     error.rs            ApiError → HTTP
   web/                  fresh Vite+React+TS+Tailwind-v4 app (pnpm pkg baybo-bench-web)
     src/generated/      ts-rs output (COMMITTED; gated by scripts/check-ts-bindings.sh)
-    src/types/trace.ts, components/trace/{MessageList,SanitizeChip}.tsx  (ported from web/)
+    src/types/trace.ts, components/trace/{MessageList,SanitizeChip}.tsx  (ported from app/web/)
     components/trace/FlowRail.tsx  the item view's default: a dense step rail —
                         one ~30px row per action (user/llm/tool/aux: glyph + label +
                         args preview + duration micro-bar + outcome + token delta),
@@ -63,8 +74,11 @@ Each bench has an adapter that reads its result files into one shared
 `RunSummary` → `Item` spine; bench-specific detail rides in the tagged
 `BenchExtra` enum (`swe` / `tb` / `memory`), which the UI renders in a
 per-item detail panel. The adapters read the **`arm` / `run_id` / `id`
-fields inside each JSON**, never the filename (id formats are
-inconsistent — `2026-06-13__15-40-24` vs `swe-20260611-005135`).
+fields inside each JSON** rather than trusting filenames (id formats are
+inconsistent — `2026-06-13__15-40-24` vs `swe-20260611-005135`); the one
+exception is TB-1.0, whose in-JSON `id` is a UUID, so its `run_id` is taken
+from the `results-<ts>` filename suffix that keys the trace dirs and
+`run_metadata.json`.
 
 Two lenses per bench:
 
@@ -101,18 +115,22 @@ the static bench registry before any file access.
 ## ts-rs bindings
 
 `model.rs` derives `ts_rs::TS` under the `ts-export` feature and exports
-to `app/web/src/generated/` (committed, like `sidecars/sdk/channel-ts/src/generated`).
+to `web/src/generated/` (i.e. `bench/bench-web/web/src/generated/`;
+committed, like `sidecars/sdk/channel-ts/src/generated`).
 `scripts/check-ts-bindings.sh` regenerates and diffs against HEAD — a
 spine change must land with the regenerated `.ts`. 64-bit / `usize`
 fields carry `#[ts(type = "number")]` so the TS side is JSON-safe
 `number`, not `bigint`. The trace types stay a hand-written mirror
-(`app/web/src/types/trace.ts`, ported from the gateway dashboard).
+(`web/src/types/trace.ts`, ported from the gateway dashboard's
+`app/web/src/types/trace.ts`).
 
 ## Per-bench notes / gotchas
 
 - **swe / memory** carry an `arm` dimension (noop / oracle / agent;
   noop / mem0 / openviking / oracle) — the comparison axis. Arms do not
-  share a run timestamp.
+  share a run timestamp. The viewer hides swe's diagnostic `oracle`/`noop`
+  arms (`SWE_HIDDEN_ARMS` in `adapters/mod.rs`) — only the `agent` arm is
+  shown; memory keeps all four arms as the comparison axis.
 - The **`merged-*` consolidations write `mean_latency_ms` as a fractional
   mean** (e.g. `182740.5`) while individual runs write an integer — the
   input DTO types it `f64` and rounds. (A `u64` there silently dropped
@@ -134,6 +152,12 @@ fields carry `#[ts(type = "number")]` so the TS side is JSON-safe
   `trace_path` field (TB-2.0 individual + both merged) or derived from
   the `trial_name` timestamp (TB-1.0 individual); memory
   `trace/<run_id>/<arm>/<session_id>.{trace,messages}.json`.
+- **Traces are never read on a list path.** A single terminal-bench trace
+  has hit 166 MB, so per-tool call counts come from the precomputed
+  `<trace>.tools.json` sidecar next to each trace (`precompute.rs`, read
+  back by `trace::tool_counts` and attached to the items in `run_detail`),
+  and the item view lazy-gates the full trace fetch on `TracePaths.bytes`.
+  A missing/stale sidecar just means empty tool chips — never an error.
 - **Artifacts**: swe → the instance patch (extracted from the predictions
   `.jsonl`); TB-2.0 → `verifier/{test-stdout.txt,ctrf.json}`; TB-1.0 →
   the asciinema `agent.cast` (link only — no in-browser player yet).

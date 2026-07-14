@@ -77,6 +77,7 @@ pub async fn adapt_call_result(
                     images.push(baybo_model::ContentBlock::Image {
                         blob: BlobRef { blob_id },
                         mime_type: mime,
+                        filename: None,
                     });
                 }
                 None => {
@@ -161,6 +162,7 @@ async fn decode_image(
     Ok(baybo_model::ContentBlock::Image {
         blob: blob_ref,
         mime_type: mime.to_string(),
+        filename: None,
     })
 }
 
@@ -315,7 +317,9 @@ mod tests {
                 assert_eq!(text, "here it is");
                 assert_eq!(llm_images.len(), 1);
                 match &llm_images[0] {
-                    baybo_model::ContentBlock::Image { blob, mime_type } => {
+                    baybo_model::ContentBlock::Image {
+                        blob, mime_type, ..
+                    } => {
                         assert_eq!(blob.blob_id, "sha256:deadbeef");
                         assert_eq!(mime_type, "image/png");
                     }

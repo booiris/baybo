@@ -220,7 +220,7 @@ impl<T> MailboxReceiver<T> {
 
     /// Priority of the highest-priority queued message, without removing
     /// it; `None` when the queue is empty. Lets the actor decide whether
-    /// to drain its pending-subagent buffer now or defer to higher work.
+    /// to drain its background-notification buffer now or defer to higher work.
     pub fn peek_priority(&self) -> Option<MessagePriority> {
         self.shared.queue.lock().peek().map(|e| e.priority)
     }

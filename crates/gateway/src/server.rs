@@ -103,10 +103,10 @@ pub struct GatewayDeps {
     pub channel_tokens: ChannelTokenTable,
     /// Vault handle shared with the channel server so the WS route can
     /// build a [`crate::channel::TuiHistoryStore`] without re-opening
-    /// libsql. The gateway is the only process that writes the TUI
+    /// sqlite. The gateway is the only process that writes the TUI
     /// input-history key; the TUI itself never touches the vault.
     pub secret_vault: Arc<SecretVault>,
-    /// Cloneable bundle of every libsql-backed store (trace, channel
+    /// Cloneable bundle of every sqlite-backed store (trace, channel
     /// session/bot/pairing, …). Exposing the whole [`Store`] here means
     /// adding a new store to the gateway only touches [`Store`] itself,
     /// not every `GatewayDeps`-style wrapper. Handlers read the specific

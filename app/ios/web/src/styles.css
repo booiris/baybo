@@ -20,8 +20,22 @@
 
   --radius: 14px;
   --radius-pill: 9999px;
+  /* Tallest an inline image renders. One source of truth: the <img> clamps to
+     it, and a reserved box (`.attachment-bubble.sized`) has to solve the SAME
+     cap or the box and the image it holds disagree — which is the shift the
+     reservation exists to remove. */
+  --attachment-max-h: 16rem;
   --chat-row-gap: 1.5rem;
   --md-block-gap: 0.75rem;
+  /* How wide a code block may grow before it soft-wraps (see `.md pre code`) —
+     a MULTIPLE OF THE READING BAND, so the cap is really a bound on how far the
+     block can be scrolled sideways: 130% = at most 0.3 bands of travel, about
+     58 mono chars on a phone (the band holds ~47). Deliberately not `ch`: that
+     unit resolves against the "0" glyph of the font in force when the style is
+     computed, and the bundled mono webfont is still loading then, so WebKit
+     substitutes the 0.5em fallback and the cap lands ~20% narrower than
+     written (measured: 80ch → 62 chars). */
+  --code-max-width: 130%;
 
   /* Top inset so the thread's oldest visible row starts below the native
      header (status bar + the 42pt glass bar), not under its icons. The
@@ -50,6 +64,18 @@
   user-select: none;
   -webkit-touch-callout: none;
   -webkit-tap-highlight-color: transparent;
+  /* Hold the type scale we actually wrote. WebKit's text autosizing boosts the
+     font of any WRAPPING block laid out wider than the viewport — on the theory
+     that the reader will pinch out to see it — and the code block, which is
+     allowed to overrun the band up to `--code-max-width`, is exactly that: it
+     rendered ~1.5x, dwarfing the prose beside it. (Nothing catches this from
+     inside the page: an absolutely-positioned measuring probe is its own
+     autosize cluster and reads back unboosted, and getComputedStyle reports the
+     unadjusted size — only a screenshot shows it.) The transcript sets every
+     size deliberately and is never pinch-zoomed, so opt out of the whole
+     mechanism rather than fight it per-block. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 * { box-sizing: border-box; }
@@ -124,7 +150,65 @@ button {
   white-space: pre-wrap;
   word-break: break-word;
 }
-.bubble.user { align-self: flex-end; background: var(--color-ink); color: var(--color-paper); border-color: var(--color-ink); }
+.bubble.user {
+  position: relative;
+  align-self: flex-end;
+  background: var(--color-ink);
+  color: var(--color-paper);
+  border-color: var(--color-ink);
+  /* This bubble is the long-press-to-copy affordance, so it OWNS the long-press:
+     the native iOS selection callout (turned on for every .bubble above) is
+     turned back OFF here — else it fires its own selection UI at the same ~500ms
+     and fights the custom copy. Assistant prose keeps native selection. */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+/* Copy confirm: a quick squish-and-pop on the bubble plus a floating "copied"
+   pill that rises above it and fades. Monochrome, on the app's soft spring. The
+   pill's fade matches COPY_TOAST_MS in Transcript.tsx (React unmounts it then). */
+.bubble.user.copied {
+  animation: copy-squish 320ms cubic-bezier(0.34, 1.4, 0.64, 1);
+}
+@keyframes copy-squish {
+  0% { transform: scale(1); }
+  35% { transform: scale(0.95); }
+  70% { transform: scale(1.03); }
+  100% { transform: scale(1); }
+}
+.copy-toast {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 0.4rem);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.22rem 0.6rem;
+  border-radius: 999px;
+  background: var(--color-ink);
+  color: var(--color-paper);
+  font-family: var(--font-sans);
+  font-size: 0.8rem;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+  transform-origin: bottom center;
+  animation: copy-toast 1300ms ease forwards;
+}
+.copy-toast-check { font-weight: 700; }
+/* Near the top of the scroll the above-anchored pill would hide under the
+   native header — flip it below the bubble there (set from Transcript.tsx). */
+.copy-toast-below {
+  top: calc(100% + 0.4rem);
+  bottom: auto;
+}
+@keyframes copy-toast {
+  0% { opacity: 0; transform: translateX(-50%) translateY(5px) scale(0.9); }
+  14% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+  78% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateX(-50%) translateY(-5px) scale(0.98); }
+}
 /* Optimistic-send status: both indicators sit to the LEFT of the (right-aligned)
    bubble, vertically centered. Centered via top + negative margin (NOT
    translateY) so the spinner's transform stays free for its rotation. */
@@ -240,16 +324,30 @@ button {
   background: var(--color-surface);
   border: 1px solid var(--color-line);
   border-radius: 10px;
-  padding: 0.6rem 0.7rem;
   overflow-x: auto;
 }
+/* Scroll a LITTLE, then wrap. A pure sideways scroller makes a 4 KB base64 line
+   a scroll to nowhere; a pure soft-wrap shatters the alignment of ordinary code
+   that only just overruns the narrow band. So the block sizes to its content
+   (`max-content` = its longest authored line) but is capped at
+   `--code-max-width`: up to the cap it overflows the band and scrolls, past the
+   cap it soft-wraps (`pre-wrap` keeps the authored newlines + indentation,
+   `anywhere` breaks the unbreakable token). `min-width: 100%` keeps a short
+   block full-width. The padding lives HERE, not on the `<pre>`: a scroll
+   container's inline-end padding is dropped from its scrollable overflow, so
+   padding on the `<pre>` would vanish at the right end of a scrolled line. */
 .md pre code {
   display: block;
   border: 0;
   background: none;
-  padding: 0;
+  width: max-content;
+  min-width: 100%;
+  max-width: var(--code-max-width);
+  padding: 0.6rem 0.7rem;
   font-size: 0.78rem;
   line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .md a { color: var(--color-ink); text-decoration: underline; text-underline-offset: 2px; }
 .md blockquote {
@@ -266,11 +364,9 @@ button {
    Each column is capped (max-width) so one long cell can't dominate: content
    wraps within the cap. The table sizes to its (capped) content, and when that
    overflows the reading band it scrolls left/right inside the wrapper (its own
-   box, momentum scroll for the WKWebView) rather than squeezing to fit. */
+   box) rather than squeezing to fit. */
 .md-table-wrap {
-  margin: var(--md-block-gap) 0;
   overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
 }
 .md-table-wrap table {
   /* max-content = the table takes each column's own content width (capped by the
@@ -284,9 +380,16 @@ button {
 }
 .md-table-wrap th,
 .md-table-wrap td {
-  /* Reset the prose's break-anywhere so tokens don't shatter mid-word; wrap on
-     natural boundaries only once the cell hits its max-width cap. */
-  overflow-wrap: normal;
+  /* `word-break: normal` is load-bearing, not a redundant default: the prose
+     ancestor's `word-break: break-word` inherits in and behaves like
+     `overflow-wrap: anywhere`, shattering ordinary words mid-token. `break-word`
+     is the last resort that reset re-opens — WebKit clamps a cell's MIN-content
+     preferred width to a fixed `max-width`, so a token with no break opportunity
+     (`Dicklesworthstone/destructive_llm_agent_experiments` — `_` is not one)
+     can't widen the capped column and, left unbroken, paints over the next one.
+     Unlike `anywhere`, it never lowers a min-content contribution, so no column
+     collapses: it only fires on a token that can't fit a line of its own. */
+  overflow-wrap: break-word;
   word-break: normal;
   max-width: 12rem;
   padding: 0.4rem 0.7rem;
@@ -315,8 +418,13 @@ button {
 }
 
 /* The turn's work block (thinking trace + tool progress). Active: a soft card
-   with a spinner header; closed: a dim tappable "Worked Xs ›" summary. */
-.work { width: 100%; font-family: var(--font-mono); }
+   with a spinner header; closed: a dim tappable "Worked Xs ›" summary.
+   `overflow-wrap: anywhere` (inherited by every step — reasoning markdown, tool
+   label/summary, status text) breaks a long unbroken token (a path, URL, id) so
+   a wide work step wraps instead of overflowing the viewport and scrolling the
+   whole document sideways. `<pre>` is exempt — it keeps its own bounded
+   overflow-x scroll and soft-wraps past the cap (see `.md pre code`). */
+.work { width: 100%; font-family: var(--font-mono); overflow-wrap: anywhere; }
 .work.active {
   display: flex;
   flex-direction: column;
@@ -386,10 +494,37 @@ button {
 .step.tool.failed { color: var(--color-err); }
 .work.active .step.tool.running .step-glyph { animation: glyph-pulse 1s ease-in-out infinite; }
 @keyframes glyph-pulse { 50% { opacity: 0.25; } }
+/* A call blocked on the user: the glyph BREATHES (slower, shallower than the
+   running pulse) rather than pulsing — nothing is executing, the turn is simply
+   parked on the composer's approval card. */
+.work.active .step.tool.awaiting .step-glyph { animation: glyph-breathe 2s ease-in-out infinite; }
+@keyframes glyph-breathe { 50% { opacity: 0.5; } }
+/* The verdict rides the step's own line, quiet and monochrome: a boxed label,
+   never a colored badge (a denied call already reads red via `.failed`). */
+.step.tool .step-approval {
+  margin-left: 0.4rem;
+  padding: 0 0.3rem;
+  border: 1px solid var(--color-line);
+  border-radius: 0.35rem;
+  font-size: 0.62rem;
+  line-height: 1.5;
+  color: var(--color-ink-soft);
+  white-space: nowrap;
+}
+.step.tool.awaiting .step-approval { border-color: var(--color-ink); color: var(--color-ink); }
 .step.prose { display: block; font-family: var(--font-sans); font-size: 0.85rem; color: var(--color-ink); }
 .step.status { white-space: pre-wrap; }
+/* Mid-turn notice folded into the block: a severity ramp on the monochrome
+   system (info dim grey → warn full ink → error the established red), no new
+   accent hue. */
+.step.notice { color: var(--color-ink-soft); }
+.step.notice .step-text { white-space: pre-wrap; }
+.step.notice.notice-warn { color: var(--color-ink); }
+.step.notice.notice-error { color: var(--color-err); }
 
-/* Pre-first-frame turn indicator (the web chat's "Working…" card, as a line). */
+/* Pre-first-frame turn indicator (the web chat's "Working…" card, as a line).
+   It renders only a fixed i18n label, but wrap it too so no future translation
+   string can overflow the document sideways. */
 .work-pending {
   display: flex;
   align-items: center;
@@ -397,6 +532,28 @@ button {
   font-family: var(--font-mono);
   font-size: 0.75rem;
   color: var(--color-ink-soft);
+  overflow-wrap: anywhere;
+}
+
+/* The `/stop` acknowledgement, compact: a small filled square (echoing the
+   composer's stop glyph) + "Stopped", centered and soft — the monochrome
+   stand-in for the gateway's raw multi-line notice text. */
+.stopped-indicator {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.15rem 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: var(--color-ink-soft);
+}
+.stopped-mark {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 1.5px;
+  background: var(--color-ink-soft);
 }
 
 /* Scroll-up "load earlier" affordance: a centered hairline pill, monospace
@@ -404,6 +561,7 @@ button {
 .load-older {
   flex: 0 0 auto;
   align-self: center;
+  max-width: 100%;
   padding: 0.3rem 0.9rem;
   border: 1px solid var(--color-line);
   border-radius: var(--radius-pill);
@@ -411,40 +569,402 @@ button {
   color: var(--color-ink-soft);
   font-family: var(--font-mono);
   font-size: 0.75rem;
+  overflow-wrap: anywhere;
 }
 .load-older:active { opacity: 0.7; transform: scale(0.98); }
 
-/* Image attachments rendered inside a chat bubble. */
-.attachments {
+/* A message renders as a GROUP of stacked bubbles — each attachment on its own
+   bubble, the text on its own, never merged — grouped so they still read as one
+   message: a tight intra-message gap (the wider --chat-row-gap stays between
+   messages), aligned as a unit (right for the user, left for the agent). */
+.msg-group {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-  margin-bottom: 0.35rem;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 0;
 }
+.msg-group.user { align-items: flex-end; }
+.msg-group.assistant { align-items: flex-start; }
+/* Each attachment stands on its own bubble: the image tile / file chip alone,
+   no text-bubble background. */
+.attachment-bubble { max-width: 100%; min-width: 0; }
+.attachment-bubble.sending,
+.attachment-bubble.failed { position: relative; }
 .attachment-img {
   display: block;
   max-width: 100%;
-  max-height: 16rem;
+  max-height: var(--attachment-max-h);
   border-radius: var(--radius);
   object-fit: contain;
+  /* Fade the decoded image in instead of snapping it visible: it sits at
+     opacity 0 while the frame decodes underneath, then eases to 1 the moment the
+     frame gains `.loaded`. */
+  transition: opacity 260ms ease-out;
+  /* Don't let iOS lift the image into a drag-and-drop session on press — a
+     dragged-out image ghost fights both the long-press copy and the scroll. */
+  -webkit-user-drag: none;
 }
-.attachment-loading { font-size: 0.85rem; color: inherit; opacity: 0.85; }
+/* An image not yet scrolled near the viewport is a reserved box, not a fetched
+   blob (see AttachmentImage) — a history page full of images then costs nothing
+   until each row approaches the screen, instead of every blob crossing the
+   bridge at once and stalling the transcript. The loading frame and the retry
+   tile share that box, so nothing resizes as those states swap; the frame
+   releases to the image's natural size only once it decodes. */
+.attachment-placeholder,
+.attachment-frame:not(.loaded),
 .attachment-retry {
-  flex: 0 0 auto;
-  padding: 0.4rem 0.8rem;
-  font-size: 0.85rem;
-  font-weight: 400;
-  letter-spacing: 0;
-  color: var(--color-ink);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 12rem;
+  max-width: 100%;
+  height: 12rem;
   background: var(--color-surface);
-  border: 1px solid var(--color-line);
-  border-radius: var(--radius-pill);
+  border: 1px solid var(--color-ink);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+/* The reserved box holds the monochrome ring spinner (the send/older-spinner
+   idiom) until the image decodes; the decoding image is invisible underneath. */
+.attachment-spinner {
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-ink-soft);
+  border-top-color: transparent;
+  animation: send-spin 0.7s linear infinite;
+  pointer-events: none;
+}
+.attachment-frame:not(.loaded) .attachment-img { opacity: 0; }
+/* A decoded image is a button: tapping opens the native full-screen zoomable
+   image viewer (`viewImage` → pinch, double-tap-to-restore). Strip the UA button
+   chrome so only the image shows; the pointer cursor is a dev-browser nicety,
+   gated to the loaded state. The native iOS image callout (Save/Copy/Share) and
+   text selection are turned OFF so a long-press can't fire its own menu at ~500ms
+   and fight the tap or the scroll. */
+.attachment-open {
+  display: block;
+  max-width: 100%;
+  padding: 0;
+  border: none;
+  background: none;
+  border-radius: var(--radius);
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.attachment-frame.loaded .attachment-open { cursor: pointer; }
+/* No `:active` dim: a flick-scroll that starts on the image would otherwise
+   briefly dim it, since iOS applies `:active` eagerly on touch-down. The user
+   bubble omits it for the same reason; opening the viewer is the feedback. */
+/* A failed fetch keeps the same tile, centering only the ↻ retry glyph (tap to
+   refetch) — no text label. */
+.attachment-retry {
+  font-size: 1.6rem;
+  color: var(--color-ink-soft);
 }
 .attachment-retry:active { opacity: 0.7; transform: none; }
+
+/* AN IMAGE THIS THREAD HAS ALREADY DECODED (its size came back with the mirror,
+   so its blob is on the device) skips the loading tile entirely and reserves its
+   EXACT final box from the first paint. It is the box that matters: the 12rem
+   tile releasing to each image's real height is what resized the transcript
+   mid-read — several images compounding it shook the whole page — and no spinner
+   is honest anyway when the bytes are a disk read away.
+
+   `width` solves the same contain-fit the <img> resolves (natural width, capped
+   by the column and by the max height), and `aspect-ratio` then derives the
+   height — so the reserved box IS the decoded box and nothing moves when the
+   image lands. It sits on the BUBBLE, not on the frame inside it: the frame's
+   containing block is the bubble, a shrink-to-fit flex item under `.msg-group`,
+   where a percentage width is cyclic and WebKit resolves it to ZERO (a 0x0
+   reservation, i.e. no fix at all). The file card above sizes itself the same way.
+
+   --img-w / --img-h are inline BARE numbers; a unit, a zero, or a missing var
+   invalidates the calc and `width` falls back to `auto` (a full-bleed image).
+   Hence the `sized` class as the gate — never a var() fallback, which would
+   quietly reserve a 1:1 box. */
+.attachment-bubble.sized {
+  width: min(
+    100%,
+    calc(var(--img-w) * 1px),
+    calc(var(--attachment-max-h) * var(--img-w) / var(--img-h))
+  );
+}
+/* Every state takes that one box — unfetched placeholder, loading frame, retry
+   tile, decoded image — so the swaps between them have no geometry left to
+   change. (0,3,0) outranks the 12rem tile's (0,2,0). */
+.attachment-bubble.sized .attachment-placeholder,
+.attachment-bubble.sized .attachment-frame,
+.attachment-bubble.sized .attachment-retry {
+  position: relative;
+  width: 100%;
+  height: auto;
+  aspect-ratio: var(--img-w) / var(--img-h);
+}
+/* ...but a retry tile is a TAP TARGET, and a banner-shaped image reserves a box
+   too short to hit (1600x400 lands at 88px, and it only gets worse). A failure is
+   already the exceptional state, so let that one box grow rather than ship an
+   untappable ↻. */
+.attachment-bubble.sized .attachment-retry {
+  min-height: 2.75rem;
+}
+/* Blank, not chrome: the wait is a disk read, and a bordered tile that appears
+   for two frames and vanishes is exactly the flicker being removed. (The retry
+   tile above keeps its border — a failure has something to say.) */
+.attachment-bubble.sized .attachment-placeholder,
+.attachment-bubble.sized .attachment-frame:not(.loaded) {
+  background: none;
+  border: 0;
+}
+/* The bubble already solved the fit, so the image just fills it — a second,
+   independent constraint solve could disagree by a sub-pixel and shift. */
+.attachment-bubble.sized .attachment-open { width: 100%; }
+.attachment-bubble.sized .attachment-img {
+  width: 100%;
+  height: auto;
+  max-height: none;
+}
+/* A mirror can outlive its blobs (a restored backup carries the transcript, not
+   the blob cache), and that fetch is a real download — a box that just sits
+   blank for seconds is worse than a tile. So hold the spinner back: invisible on
+   the cache hit this whole rule exists for, present before the wait turns into a
+   mystery. Delay-gated in CSS, so it costs no layout either way. */
+.attachment-bubble.sized .attachment-spinner {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  animation:
+    send-spin 0.7s linear infinite,
+    attachment-spinner-in 160ms ease-out 400ms both;
+}
+@keyframes attachment-spinner-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* File cards share one width so a stack of them keeps a straight edge (the
+   bubble otherwise shrinks to each filename). Capped so a lone card doesn't
+   stretch across the whole reading column. */
+.attachment-bubble.file { width: min(100%, 19rem); }
+/* A button, not a div: an undownloaded file is fetched by tapping it, a
+   downloaded one opens. `text-align: left` undoes the UA button centering. */
 .attachment-file {
-  font-size: 0.85rem;
-  padding: 0.35rem 0.6rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  padding: 0.55rem 0.7rem;
   background: var(--color-surface);
-  border: 1px solid var(--color-line);
+  border: 1px solid var(--color-ink);
   border-radius: var(--radius);
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+.attachment-file:active { opacity: 0.65; }
+/* Mid-download the card is inert; a press that does nothing must not pretend. */
+.attachment-file.loading:active { opacity: 1; }
+.attachment-file.failed { border-color: var(--color-err); }
+.attachment-file.failed .file-glyph { color: var(--color-err); }
+
+/* The ring orbits the glyph, so the icon itself never moves between states. */
+.file-glyph-slot {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.7rem;
+  height: 1.7rem;
+}
+.file-glyph {
+  width: 1.15rem;
+  height: 1.15rem;
+  color: var(--color-ink-soft);
+}
+/* Indeterminate on purpose: the byte counter beside it carries the real
+   progress, and an arc that stalls on a slow chunk reads as a hang. */
+.file-spinner {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-line);
+  border-top-color: var(--color-ink-soft);
+  animation: file-spin 720ms linear infinite;
+}
+@keyframes file-spin {
+  to { transform: rotate(360deg); }
+}
+/* `min-width: 0` is what lets the name actually ellipsize inside the flex row;
+   `flex: 1` makes the column claim the row's remaining width instead of
+   shrink-wrapping the name — the audio card's seek bar is 100% of THIS column,
+   and without the grow it was only ever as long as the filename. */
+.file-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.05rem;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* Middle ellipsis: the head absorbs the clipping, the tail never shrinks, so
+   `…-Q3-final.pdf` keeps the part that distinguishes the file. */
+.file-name {
+  display: flex;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.35;
+  color: var(--color-ink);
+}
+.file-name-head {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-name-tail {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.file-meta {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  line-height: 1.3;
+  letter-spacing: 0.03em;
+  color: var(--color-ink-soft);
+}
+
+/* ---- audio cards ------------------------------------------------------- */
+/* The audio card keeps the file card's frame; only the glyph slot's meaning
+   changes (download → play/pause). While a track is engaged the scrubber sits
+   between name and meta: a hit area tall enough for a finger around a hairline
+   rail (drawn as a centered pseudo-element), the played part inked. */
+.audio-track {
+  position: relative;
+  width: 100%;
+  height: 14px;
+  margin: 0.1rem 0;
+  /* A horizontal scrub must not become a page scroll. */
+  touch-action: none;
+}
+.audio-track::before {
+  content: "";
+  position: absolute;
+  inset: 50% 0 auto;
+  height: 3px;
+  margin-top: -1.5px;
+  border-radius: 2px;
+  background: var(--color-line);
+}
+.audio-track-fill {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  height: 3px;
+  margin-top: -1.5px;
+  border-radius: 2px;
+  background: var(--color-ink);
+  pointer-events: none;
+}
+
+/* ---- video tiles -------------------------------------------------------- */
+/* Video shares the file card's width so a mixed stack keeps a straight edge. */
+.attachment-bubble.video { width: min(100%, 19rem); }
+/* The tile is one big button. Its ratio rides in on --video-ar (clamped
+   JS-side to keep the reading column sane); the same height cap as images so
+   the two media kinds obey one rule. The cover-fit poster absorbs any clamp
+   as a crop. */
+.attachment-video {
+  position: relative;
+  display: block;
+  width: 100%;
+  aspect-ratio: var(--video-ar, 1.7778);
+  max-height: var(--attachment-max-h);
+  padding: 0;
+  background: var(--color-surface);
+  border: 1px solid var(--color-ink);
+  border-radius: var(--radius);
+  overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
+}
+.attachment-video:active { opacity: 0.85; }
+/* Mid-download the tile is inert; a press that does nothing must not pretend. */
+.attachment-video.loading:active { opacity: 1; }
+/* Once the poster paints the frame IS the edge — the ink border was only
+   there to give the blank pre-download surface a boundary (same idiom as
+   images, whose loaded <img> carries no border). `.failed` below still wins:
+   an error must stay visible even over a stale poster. */
+.attachment-video.has-poster { border-color: transparent; }
+.attachment-video.failed { border-color: var(--color-err); }
+.attachment-video.failed .video-disc-glyph { color: var(--color-err); }
+.video-poster {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  -webkit-user-drag: none;
+}
+.video-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+/* The centered control: a translucent paper disc so the glyph/ring stays
+   legible over any poster frame, in the monochrome idiom (no glass here — the
+   webview has no material to sample). */
+.video-disc {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--color-paper) 86%, transparent);
+  border: 1px solid var(--color-ink);
+}
+.video-disc-glyph {
+  width: 1.3rem;
+  height: 1.3rem;
+  color: var(--color-ink);
+  /* Optically center the play triangle (its mass leans left). */
+  transform: translateX(0.05rem);
+}
+/* Determinate ring: the tile knows the blob's total, so the arc IS the
+   progress (the corner chip counts the bytes). Start at 12 o'clock. */
+.video-ring {
+  width: 2.1rem;
+  height: 2.1rem;
+  transform: rotate(-90deg);
+}
+.video-ring-rail,
+.video-ring-fill {
+  fill: none;
+  stroke-width: 2.5;
+}
+.video-ring-rail { stroke: var(--color-line); }
+.video-ring-fill {
+  stroke: var(--color-ink);
+  stroke-linecap: round;
+  transition: stroke-dashoffset 200ms linear;
+}
+/* Size pre-download, byte counter mid-download, duration once known. */
+.video-chip {
+  position: absolute;
+  right: 0.45rem;
+  bottom: 0.4rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--color-paper) 86%, transparent);
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  line-height: 1.4;
+  letter-spacing: 0.03em;
+  color: var(--color-ink);
 }

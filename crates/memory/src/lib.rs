@@ -3,7 +3,7 @@
 //! The system knows memory only through a single [`Memory`] trait object
 //! (`Arc<dyn Memory>`), not a many-registry: at most one implementation is
 //! registered at startup. The trait is intentionally thin and
-//! **storage-opaque** — an implementation owns its own persistence (libsql, a
+//! **storage-opaque** — an implementation owns its own persistence (sqlite, a
 //! vector DB, an external service) and receives its LLM handle and config in
 //! its own constructor.
 //!

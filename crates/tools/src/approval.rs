@@ -41,6 +41,13 @@ pub use baybo_model::approval::{ApprovalDecision, ApprovedResource, HostPattern,
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub call_id: String,
+    /// `call_id` of the tool call this prompt blocks — the LLM `tool_use_id`
+    /// that `ToolStarted`/`ToolCompleted` events carry, NOT this request's own
+    /// `call_id` (a fresh UUID per prompt; one call can prompt more than once).
+    /// Lets clients badge the exact work step that is waiting. `None` for a
+    /// prompt raised outside a tool-call context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     /// Session the tool call runs under. Lets HTTP clients (e.g. the
     /// gateway-backed TUI) render approvals alongside the session they belong to.
     pub session_id: SessionId,
@@ -351,14 +358,19 @@ impl Default for ApprovalQueue {
 /// `Deny` is returned.
 pub struct ChannelApprovalGate {
     queue: ApprovalQueue,
-    waker: Arc<dyn Fn() + Send + Sync>,
+    /// Handed the request it is being woken FOR. It must not re-read the queue
+    /// to find one: the queue is per-CHANNEL, so two sessions prompting at once
+    /// race, and a waker that took (say) the tail would broadcast one prompt
+    /// twice and the other never — leaving a user staring at a turn that
+    /// silently denies itself minutes later.
+    waker: Arc<dyn Fn(ApprovalRequest) + Send + Sync>,
     timeout: Duration,
 }
 
 impl ChannelApprovalGate {
     pub fn new(
         queue: ApprovalQueue,
-        waker: Arc<dyn Fn() + Send + Sync>,
+        waker: Arc<dyn Fn(ApprovalRequest) + Send + Sync>,
         timeout: Duration,
     ) -> Self {
         Self {
@@ -379,11 +391,12 @@ impl ApprovalGate for ChannelApprovalGate {
     async fn request(&self, req: ApprovalRequest) -> ApprovalDecision {
         let call_id = req.call_id.clone();
         let (tx, rx) = oneshot::channel();
+        let woken_for = req.clone();
         self.queue.push(PendingApproval {
             req,
             responder: Some(tx),
         });
-        (self.waker)();
+        (self.waker)(woken_for);
 
         // RAII guard: if our future is dropped before a decision lands
         // (e.g. the outer tool timeout fires while the user is still
@@ -448,6 +461,7 @@ mod tests {
         let gate = AutoDenyGate;
         let out = gate
             .request(ApprovalRequest {
+                tool_call_id: None,
                 call_id: "x".into(),
                 session_id: "s".into(),
                 user_id: "u".into(),
@@ -458,6 +472,60 @@ mod tests {
             })
             .await;
         assert_eq!(out, ApprovalDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn the_waker_is_handed_the_request_it_was_woken_for() {
+        // The regression this pins: the waker used to re-read the queue to find
+        // "the" pending entry. The queue is per-CHANNEL, so two sessions
+        // prompting at once interleave push/wake — and a waker that re-read the
+        // tail announced one prompt twice while the other was never announced at
+        // all, leaving that turn to silently deny itself on timeout.
+        let queue = ApprovalQueue::new();
+        let woken: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let woken_for_gate = Arc::clone(&woken);
+        let gate = Arc::new(ChannelApprovalGate::new(
+            queue.clone(),
+            Arc::new(move |req: ApprovalRequest| {
+                woken_for_gate.lock().push(req.call_id);
+            }),
+            Duration::from_millis(50),
+        ));
+
+        let req = |call_id: &str| ApprovalRequest {
+            tool_call_id: None,
+            call_id: call_id.into(),
+            session_id: "s".into(),
+            user_id: "u".into(),
+            tool: "Bash".into(),
+            accesses: vec![ResourceAccess::ExecCommand {
+                command: "x".into(),
+            }],
+            params_preview: "{}".into(),
+            description: None,
+        };
+
+        // Two prompts in flight on the one shared queue; both time out (nobody
+        // answers), which is irrelevant — what matters is what the waker saw.
+        let a = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.request(req("a")).await }
+        });
+        let b = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.request(req("b")).await }
+        });
+        let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+        assert_eq!(ra, ApprovalDecision::Deny, "unanswered gate fails closed");
+        assert_eq!(rb, ApprovalDecision::Deny);
+
+        let mut seen = woken.lock().clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["a".to_string(), "b".to_string()],
+            "every prompt is announced exactly once, with its own id"
+        );
     }
 
     #[test]
@@ -475,13 +543,14 @@ mod tests {
         let woken2 = Arc::clone(&woken);
         let gate = ChannelApprovalGate::new(
             queue.clone(),
-            Arc::new(move || {
+            Arc::new(move |_| {
                 woken2.store(true, std::sync::atomic::Ordering::SeqCst);
             }),
             Duration::from_secs(60),
         );
 
         let req = ApprovalRequest {
+            tool_call_id: None,
             call_id: "c1".into(),
             session_id: "s".into(),
             user_id: "u".into(),
@@ -533,9 +602,10 @@ mod tests {
     async fn dropped_request_future_cleans_up_queue_entry() {
         let queue = ApprovalQueue::new();
         let gate =
-            ChannelApprovalGate::new(queue.clone(), Arc::new(|| {}), Duration::from_secs(60));
+            ChannelApprovalGate::new(queue.clone(), Arc::new(|_| {}), Duration::from_secs(60));
 
         let req = ApprovalRequest {
+            tool_call_id: None,
             call_id: "stale".into(),
             session_id: "s".into(),
             user_id: "u".into(),
@@ -571,9 +641,10 @@ mod tests {
     async fn cleanup_guard_is_noop_when_consumer_resolves_first() {
         let queue = ApprovalQueue::new();
         let gate =
-            ChannelApprovalGate::new(queue.clone(), Arc::new(|| {}), Duration::from_secs(60));
+            ChannelApprovalGate::new(queue.clone(), Arc::new(|_| {}), Duration::from_secs(60));
 
         let req = ApprovalRequest {
+            tool_call_id: None,
             call_id: "live".into(),
             session_id: "s".into(),
             user_id: "u".into(),

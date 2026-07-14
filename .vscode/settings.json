@@ -330,6 +330,14 @@
         "**/relative-soul-test": true
     },
     "rust-analyzer.cargo.features": [],
+    // `baybo-gateway`'s build script compiles the embedded dashboard and
+    // hard-fails when it can't. rust-analyzer re-runs build scripts on every
+    // check, so an in-progress edit under `app/web` would otherwise paint the
+    // whole Rust tree red — and a clean edit would run vite on every save.
+    // Scope the escape hatch to the IDE; a terminal `cargo build` stays strict.
+    "rust-analyzer.cargo.extraEnv": {
+        "BAYBO_SKIP_WEBUI": "1"
+    },
     "rust-analyzer.linkedProjects": [
         "Cargo.toml",
         "remote-host/Cargo.toml"

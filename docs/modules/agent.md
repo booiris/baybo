@@ -14,7 +14,7 @@ Core responsibilities:
 - **Cost management**: `CostManager` (in `baybo-cost`) records LLM-call cost and gates spend; agent constructs it and threads it through the loop
 - **Runtime logic**: error recovery, timeout control
 
-It does not own low-level storage or backend implementation — it consumes every `*Store` trait from the `baybo-store` ports crate through dependency injection, and the libsql impls (`baybo-storage`) are wired in at assembly time. Domain managers and rich types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`); the `JobStore` / `TraceStore` it calls trade in row DTOs that `baybo-job` / `baybo-trace` convert to and from. Each manager defines its own error type for business-level failures (e.g. `JobLifecycle` defines errors for invalid state transitions).
+It does not own low-level storage or backend implementation — it consumes every `*Store` trait from the `baybo-store` ports crate through dependency injection, and the sqlite impls (`baybo-storage`) are wired in at assembly time. Domain managers and rich types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`); the `JobStore` / `TraceStore` it calls trade in row DTOs that `baybo-job` / `baybo-trace` convert to and from. Each manager defines its own error type for business-level failures (e.g. `JobLifecycle` defines errors for invalid state transitions).
 
 ## Source Layout
 
@@ -25,23 +25,30 @@ agent/src/
 ├── lib.rs
 ├── security.rs               # SecurityGateway (cross-cutting interception facade)
 ├── service.rs                # ShutdownSignal, TaskTracker (process-level)
+├── recovery.rs               # startup + actor-panic recovery
+├── external_agent/           # claude / codex / gemini CLI subagents + version probe
 ├── runtime/                  # per-turn execution core
 │   ├── agent_loop.rs         # AgentLoop, AgentLoopConfig
 │   ├── tool_executor.rs      # ToolExecutor + approval gate; wires virtual-file providers into ToolContext
 │   ├── virtual_read.rs       # SessionTranscriptReader: VirtualReadResolver serving the transcript (ReadTool consults it)
 │   ├── compression.rs        # inline + background compression wiring
-│   ├── soul.rs               # system-prompt + identity assembly
 │   ├── billed_chat.rs        # cost-aware LLM call wrapper
 │   ├── error_recovery.rs     # retry / degrade policy
 │   ├── sandbox.rs            # SandboxAdapter glue for tool exec
 │   ├── scope.rs              # with_job / with_step / with_span guards
-│   └── llm_pool.rs           # per-provider LlmClient pool
+│   ├── llm_pool.rs           # per-provider LlmClient pool
+│   ├── background_jobs.rs    # backgrounded-Bash sink + detached escort
+│   ├── progress_observer.rs  # out-of-band status emitter for long turns
+│   ├── subagent_spawner.rs   # out-of-band subagent-spawn ingress
+│   └── title.rs              # conversation-title pass
 └── actor/                    # per-session actor + orchestration
     ├── mod.rs                # AgentActor + AgentMessage
+    ├── background_notification.rs # durable background-result delivery pipeline
+    ├── mailbox.rs            # bounded priority mailbox
     ├── runner.rs             # tokio task boundary + actor panic recovery
     ├── supervisor.rs         # AgentSupervisor + idle reaper
     ├── subagent.rs           # subagent wait routine
-    ├── router/               # ingress dispatch (cron / user / output / system_spawn)
+    ├── router/               # ingress dispatch (cron / user / output; subagent-spawn ingress lives in runtime/subagent_spawner.rs)
     └── state/                # DurableActorState + VolatileResources
 ```
 
@@ -55,7 +62,7 @@ One Actor per session: natural serialization within a session (no context races)
 
 ### Main execution path (AgentLoop)
 
-1. System-prompt assembly lives in [`baybo_context::prompts::soul`](context.md) (`assemble_from_workspace` reads `profile/{SOUL,USER,IDENTITY}.md` and frames them with TOP/TAIL hints). `ContextManager` owns the whole system-prompt lifecycle: `ensure_seeded()` resolves the prompt (`resolve_system_prompt` — a subagent profile looked up by name in the registry, else the workspace soul assembled fresh, else a fallback), seeds the leading `System` row, and appends the skill reminder. `AgentLoop` reaches it only through the thin `ensure_system_prompt_seeded` seam, which delegates to `ensure_seeded()`. The reseed-after-compaction re-resolves from the same source, so a mid-session profile write is picked up on the next compaction (which re-reads the workspace), not mid-turn.
+1. System-prompt assembly lives in [`baybo_context::prompts::soul`](context.md) (`assemble_from_workspace` reads `profile/{SOUL,USER,IDENTITY}.md` and frames them with TOP/TAIL hints). `ContextManager` owns the whole system-prompt lifecycle: `ensure_seeded()` resolves the prompt (`resolve_system_prompt` — a subagent profile looked up by name in the registry, else the workspace soul assembled fresh, else a fallback), seeds the leading `System` row, and appends the skill reminder. Every `AgentLoop::append_*` entry point calls `ensure_seeded()` before appending its row. The reseed-after-compaction re-resolves from the same source, so a mid-session profile write is picked up on the next compaction (which re-reads the workspace), not mid-turn.
 2. Append current user message to Context
 3. Skill selection (`ContextManager::invocable_skill_summaries()`): `SkillRegistry::all_summaries_sorted()` filtered by `agent_invocable && trust_level != Untrusted`. The same set backs the seed-time skill reminder and the per-turn `/command` candidate list, so the advertised and slash-invocable sets can't drift. Risk assessment fires later, inside `SkillTool` at invocation time (see `crates/skills/src/tools.rs`), not during selection — except an explicit user `/command`, which `ContextManager::expand_slash_command` treats as authorized and injects directly. The skill reminder is seeded once by `ensure_seeded` (and re-inserted after each compaction), not rebroadcast per turn.
 4. Loop: `maybe_compress()` → build `ChatRequest` → call `LlmClient` → parse response → dispatch tool execution
@@ -63,13 +70,13 @@ One Actor per session: natural serialization within a session (no context races)
 
 ### SpanRecorder lock strategy
 
-`SpanRecorder` exposes short-lived `begin/succeed/fail`. `AgentLoop` and `ToolExecutor` must never hold locks while waiting for LLM calls or tool execution.
+`SpanRecorder` exposes short-lived `begin_step`/`end_step` and `begin_span`/`end_span` (closed with a `LifecycleOutcome`). `AgentLoop` and `ToolExecutor` must never hold locks while waiting for LLM calls or tool execution.
 
 ### ToolExecutor responsibility
 
 ToolExecutor: lookup tool → validate trust/capability → consult approval gate → construct `ToolContext` → create child Job/Trace nodes → reveal placeholders in args → execute → sanitize output → write results. It does **not** decide whether a tool should be called — that's `AgentLoop`.
 
-`ToolExecutor` holds an `Arc<SecurityGateway>`. Tool invocation is the one legitimate plaintext boundary for arguments: the pre-reveal `params` is what flows into `SpanInput::ToolExecution` and the approval preview (placeholder form), while a cloned `params_revealed` — with `reveal_in_value` applied — is what's passed to `tool_registry.execute`. After execution the returned `ToolOutput` is run through `sanitize_tool_output` so any tool-echoed secret is re-minted and vaulted before it enters the trace, the next LLM call, or memory. Errors are passed through `sanitize_error` before `recorder.fail`.
+`ToolExecutor` holds an `Arc<SecurityGateway>`. Tool invocation is the one legitimate plaintext boundary for arguments: the pre-reveal `params` is what flows into `SpanKind::ToolCall`'s `ToolCallBegin.params` and the approval preview (placeholder form), while a cloned `params_revealed` — with `reveal_in_value` applied — is what's passed to `tool_registry.execute`. After execution the returned `ToolOutput` is run through `sanitize_tool_output` so any tool-echoed secret is re-minted and vaulted before it enters the trace, the next LLM call, or memory. Errors are passed through `sanitize_error` before the error bubbles into `with_span`, which closes the span as `Failed { reason }`.
 
 ### LLM-response defensive scrubbing
 
@@ -99,22 +106,33 @@ Parallel tool calls within a turn each go through the gate independently; the ga
 
 Cron jobs flow through the Actor model and observability chain: `CronScheduler` → `Router` → `AgentSupervisor` → `AgentMessage::CronTrigger` → `AgentLoop`. All create Job and Trace records. Background results are delivered asynchronously without polluting foreground conversation. Cron jobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration; sessions are resolved dynamically at trigger time.
 
-`AgentMessage::CronTrigger { job_id, prompt }` carries the cron job id and the prompt string directly. `AgentActor` dispatches `prompt` through `dispatch_cron_prompt` with `JobInput::Cron`, which appends the fire via `AgentLoop::append_cron_fire` (framed by `baybo_context::prompts::cron`, so it reads as a task, not a user message) and runs the normal `AgentLoop` path; the LLM decides what tools (if any) to invoke.
+`AgentMessage::CronTrigger { job_id, prompt, delivery }` carries the cron job id, the prompt, and where the reply goes. `AgentActor` dispatches `prompt` through `dispatch_cron_prompt` with `JobInput::Cron`, which appends the fire via `AgentLoop::append_cron_fire` (framed by `baybo_context::prompts::cron`, so it reads as a task, not a user message) and runs the normal `AgentLoop` path; the LLM decides what tools (if any) to invoke. A hard-failed fire persists an error control event in its own session, so the conversation doesn't just look blank.
 
-Background subagent results arrive as `AgentMessage::BackgroundJobFinished`, are buffered on `session.state.pending_background_results` (dedup by `handle_id`, cap 64 drop-oldest), and — once no higher-priority message is queued — drained into their own autonomous `SubagentNotification` agent-loop turn (same main path / system prompt + toolset, so the prompt cache holds; the model proactively reports to the user, and an empty reply is suppressed). The synthetic XML prompt for that turn (built by `baybo_context::prompts::subagent::build_notification_content`) is appended **in-memory only** (`AgentLoop::append_subagent_notification` → `ContextManager::append_in_memory`), never persisted to `session_messages`: it is rebuilt from the durable buffer on every retry, so persisting per-attempt would stack duplicate hidden rows under the infinite-backoff retry. On failure the turn rolls the in-memory context back to a pre-turn snapshot (after seeding the system prompt, so the rollback can't drop it) and re-buffers for retry.
+`delivery` (`CronDelivery`) splits the two cron shapes:
 
-The per-session mailbox is a **priority queue** (`mailbox::channel`): `UserInput`/trigger > `BackgroundJobFinished` > `ActorStop`. A rapid burst of `UserInput`s coalesces into one turn; a leading `/command` is a hard boundary.
+- **`Channel`** — a **recurring** fire. Its session is a first-class conversation (titled, listed, replyable), so the reply dispatches out through the channel as usual: the conversation *is* the notification.
+- **`OriginSession`** — a **one-shot** fire. Its session is a private workspace that emits nothing; the result is delivered into the conversation that scheduled the job. A waiter in `actor/router/cron.rs` (subscribed to the lifecycle bus *before* the trigger is sent) picks the outcome off the fire job's terminal edge, stamps it on the `CronExecution` delivery ledger, and hands it to the origin as `AgentMessage::CronResultReady`.
+
+`AgentMessage::CronResultReady` is handled at a turn boundary with **no inference** (`handle_cron_result_ready`): un-hide the conversation if the user had removed it, read the fire's reply row, and atomically append it under `cron-execution:<execution_id>` as a `MessageSource::CronNotification` assistant row framed with a scheduled-task header. The `(session_id, source_event_id)` unique index turns a boot replay into an existing-row result, so the actor skips the duplicate job/channel dispatch and only resolves the ledger. A new row opens a `JobInput::CronNotification` job whose `Completed { reply_ordinal }` edge drives the push preview. Every outcome creates a notification row, including failure and an empty reply. This exactly-once guarantee stops at the transcript boundary; job/push/channel delivery is not part of that database transaction. See [`cron.md`](cron.md) for the full delivery contract.
+
+### Background-result notifications
+
+Detached subagents and detached `Bash` commands share one durable notification pipeline, implemented in `actor/background_notification.rs`. `SessionState::background_notifications` owns three explicit stages: grouped results waiting on a barrier, completed results buffered before transcript commit, and one active transcript-backed delivery ledger. The active delivery and fresh buffered results may coexist; the older batch always settles first.
+
+Delivery is append-first and forward-only. For each batch the actor first persists and dispatches a deterministic assistant reply saying the background work finished, including the bounded `summary_text`; it then persists the hidden `<background_results>` prompt under a separate deterministic source-event key. Once the delivery ledger is durable, the parent runs a normal streaming turn: `Reasoning`, tool progress, and `AnswerDelta` events are visible before the canonical final `Message`. Failed turns retain their transcript rows and retry from the ledger on a timed exponential backoff; compaction re-anchors have their own deterministic operation key, so a crash replay recovers the prior ordinal instead of duplicating the hidden prompt. The retry cue — the synthetic user-role tail that keeps a request from ending on a cancelled attempt's assistant salvage (provider prefill, which Anthropic rejects with extended thinking on) — is **not** a transcript row: it is a request-time suffix applied only while the tail is actually an assistant row, so it is recomputed per request (a persisted, attempt-keyed cue was a no-op on the exact crash-replay it had to survive) and rides the trace marker so replay matches what the model saw. Successful user turns can settle an open delivery passively, and the attempt cap also degrades to passive delivery because the prompt remains durable. Actor eviction preserves every stage in the session row. See [`docs/background-notifications.md`](../background-notifications.md) for the complete intake, grouping, scheduling, persistence, retry, `/stop`, compaction, and crash contract.
+
+The per-session mailbox is a **priority queue** (`mailbox::channel`): `UserInput`/trigger > `BackgroundJobFinished` / `CronResultReady` > `ActorStop`. A rapid burst of `UserInput`s coalesces into one turn; a leading `/command` is a hard boundary.
 
 **Mid-turn user interjection (steering).** A message the user sends *while a `UserChat` turn is running* is injected into that turn at the next tool boundary — drained from the mailbox at the top of each loop iteration after the first (before `compress_if_needed`, never mid-call), framed with a `<user_interjection>` steering envelope, and appended before the next LLM call. The loop reaches the mailbox through the `runtime::agent_loop::InterjectionSource` seam, which `AgentActor` implements over its `MailboxReceiver` (`MailboxInterjections`) using `MailboxReceiver::try_recv_if` to pop only the leading run of **non-slash** `UserInput`s — a queued slash command / `BackgroundJobFinished` / `ActorStop` stops the drain and is left for normal dispatch. Only `handle_merged_user_turn` (the non-slash user path) passes the source; cron / subagent-spawned / `/skill` / notification turns pass `None`. Each drained message is persisted as a faithful `MessageSource::UserInterjection` row (a clean user bubble — `from_user()` is true for it); the envelope is applied **wire-only** in `ContextManager::messages_for_llm` (`frame_interjections`, re-derived each call so it survives compaction). Non-preemptive: the in-flight tool/LLM call is never cancelled (`/stop` remains the only hard interrupt), and a message that never reaches a tool boundary (e.g. the turn ends with a `Final` response, or iteration 1 produced no tool calls) falls through to the next turn. See `docs/mid-turn-user-interjection.md`.
 
-**`/stop`** is an out-of-band control command recognised in `Router::handle_incoming` (not the actor — a busy actor can't read its mailbox to preempt its own turn; the `@BotName` group-command suffix is stripped, mirroring the gateway slash parser). It cancels the session's in-flight turn + every in-flight subagent (foreground via job lineage `JobLifecycle::list_children`, background via the supervisor's `in_flight_background_subagents` registry). Background subagents are stopped by **cancelling the child's `CancellationToken`** — stored in the registry at dispatch, so this works even in the window *before* the child's job row exists (a job-store lookup would miss it and let it run on); the job is also cancelled `UserStopped` best-effort for audit when the row exists. Draining the registry doubles as the suppress signal: a cancelled background subagent's wait task sees its entry gone and drops its terminal delivery, so a stopped result can't repopulate the buffer. `/stop` stops only what's **running** — it deliberately leaves `pending_background_results` and any queued `BackgroundJobFinished` alone, so results from subagents that already *completed* still report normally once the cancelled turn returns. The ack lists each cancelled (running) background task by type + summary. `/stop` is published in every surface's slash list (gateway `MANIFEST`, web `/chat/slash-manifest`, TUI `commands()`) but `PassThrough` at each edge — execution is central.
+**`/stop`** is an out-of-band control command recognised in `Router::handle_incoming` (not the actor — a busy actor can't read its mailbox to preempt its own turn; the `@BotName` group-command suffix is stripped, mirroring the gateway slash parser). It cancels the session's in-flight turn + every in-flight subagent (foreground via job lineage `JobLifecycle::list_children`, background via the supervisor's `in_flight_background_subagents` registry). Background subagents are stopped by **cancelling the child's `CancellationToken`** — stored in the registry at dispatch, so this works even in the window *before* the child's job row exists (a job-store lookup would miss it and let it run on); the job is also cancelled `UserStopped` best-effort for audit when the row exists. Draining the registry doubles as the suppress signal: a cancelled background subagent's wait task sees its entry gone and drops its terminal delivery, so a stopped result can't repopulate the buffer. `/stop` stops only what's **running** — it deliberately leaves `session.state.background_notifications` and any queued `BackgroundJobFinished` alone, so results from subagents that already *completed* still report normally once the cancelled turn returns. The ack lists each cancelled (running) background task by type + summary. `/stop` is published in every surface's slash list (gateway `MANIFEST`, web `/chat/slash-manifest`, TUI `commands()`) but `PassThrough` at each edge — execution is central.
 
 **Non-obvious scheduling invariants (don't revert on intuition):**
 
 - `ActorStop` is the **lowest** priority, not the highest — so cron's back-to-back `CronTrigger`→stop FIFO holds and a reaper stop never jumps ahead of a just-delivered `BackgroundJobFinished`. "Stop now" is `/stop`'s cancel path, never a mailbox tier.
 - Automatic priority is **queue-ordering only, non-preemptive** — a running turn is never interrupted by a higher-priority arrival; `/stop` is the only explicit preemption.
 - The notification framing lives in **per-turn content, never the system prompt** — moving it would change the cached prefix and break the prompt cache. This is why the turn reuses the exact main-path system prompt + toolset.
-- There is **no `<no_output/>` sentinel** — the model isn't told it may stay silent; an empty final message is simply not sent.
+- There is **no `<no_output/>` sentinel** — the model isn't told it may stay silent; an empty analysed report is simply not sent after the already-delivered completion reply.
 - UserInput coalescing has **no debounce timer** (drains already-queued only — it does not batch rapid sends to an idle actor); every leading-slash message is a hard merge boundary, not just `/compact`.
 - **No cron-vs-`BackgroundJobFinished` priority rule** — a cron session is one-shot and unregistered, so `BackgroundJobFinished` never reaches it.
 
@@ -171,7 +189,7 @@ Consolidated reference for every time bound a turn can hit. Two structural facts
 | `backoff_base` | 1s |
 | `backoff_max` | 30s |
 
-Backoff sequence is `1, 2, 4, 8, 16, 30, 30, 30, 30, 30` s — worst case ≈ 2.7 min of waiting before the call gives up. Only `LlmError::is_retriable()` errors (transient) and raw `io::Error` retry; config / model-shape errors surface immediately.
+Backoff sequence is `1, 2, 4, 8, 16, 30, 30, 30, 30, 30` s — worst case ≈ 3 min of waiting before the call gives up. Only `LlmError::is_retriable()` errors (transient) and raw `io::Error` retry; config / model-shape errors surface immediately.
 
 **Tool execution** (`runtime/tool_executor.rs`) — two nested deadlines:
 
@@ -186,11 +204,11 @@ Per-tool `max_timeout()`:
 | Bash | 600s | `tools/src/builtin/bash/mod.rs` — per-call `timeout_ms` and the sandbox spawn tighten further |
 | WebFetch | 120s | `tools/src/builtin/web_fetch.rs` — connect phase capped at 10s independently |
 | Grep / Glob | 60s | `tools/src/builtin/{grep,glob_tool}.rs` |
-| send_local_file | 60s | `tools/src/builtin/send_local_file.rs` |
+| attach_file | 60s | `tools/src/builtin/attach_file.rs` |
 | Skill read (risk-assessed) | 60s | `skills/src/tools.rs` |
 | Skill install pipeline | 120s | `skills/src/tools.rs` |
 | MCP tool | 60s | `tools/src/mcp/tool.rs` |
-| OpenViking memory store | 120s | `STORE_MAX_TIMEOUT` in `memory/src/backends/openviking.rs` |
+| OpenViking memory store | 120s | `OpenVikingTimeouts::store_max` (default) in `memory/src/backends/openviking.rs` |
 | Subagent (in-process) | `TOOL_WAIT_BACKSTOP` = 30 days | `subagent/src/tool.rs` — effectively unbounded; the real bound is the caller's cancel / job lineage |
 
 **Approval gate** — `APPROVAL_TIMEOUT` = 300s (`gateway/src/channel/boot.rs`). How long a tool-approval prompt waits for the user before timing out; the executor's `APPROVAL_HEADROOM` tracks it.
@@ -218,8 +236,8 @@ The observer fires from the loop's **`Continue` arm only** — after an iteratio
 |-------|-------|---------|
 | `REAP_INTERVAL` (`actor/supervisor.rs`) | 5 min | idle-reaper tick |
 | `idle_timeout()` (`actor/supervisor.rs`) | 30 min | drop the in-memory actor after this much idle; the session row is never touched (see CLAUDE.md, "Session data is core data") |
-| `NOTIFY_RETRY_INITIAL_BACKOFF` (`actor/mod.rs`) | 60s | subagent-completion notify retry, initial |
-| `NOTIFY_RETRY_MAX_BACKOFF` (`actor/mod.rs`) | 300s | …capped at |
+| `RETRY_INITIAL_BACKOFF` (`actor/background_notification.rs`) | 60s | background-result notification retry, initial |
+| `RETRY_MAX_BACKOFF` (`actor/background_notification.rs`) | 300s | …capped at |
 
 Router-level user rate limiting (`actor/router`) uses a sliding window (default 60s) — a time *window*, not a timeout.
 
@@ -238,7 +256,7 @@ Router-level user rate limiting (`actor/router`) uses a sliding window (default 
 | `tools` | `ToolExecutor` executes tools |
 | `skills` | `AgentLoop` parses and executes skills |
 | `model` | Provides `MessageSource::RecalledMemory` (the framed recall-injection marker); session domain types (`Session`, `User`, `ChannelType`) used by `baybo-session::SessionManager` |
-| `memory` | Owns the pluggable `Memory` trait + `NoopMemory` default. The agent loop drives `recall` / `on_job_complete` for `UserChat` + `Cron` jobs; no real backend ships yet (runtime wires `None`) |
+| `memory` | Owns the pluggable `Memory` trait + `NoopMemory` default. The agent loop drives `recall` / `on_job_complete` for `UserChat` + `Cron` jobs; real backends (`mem0`, `openviking`) are built from `config.memory.provider` via `baybo_memory::boot::build_memory_backend`; the runtime wires `None` only when memory is disabled or `provider = noop` |
 | `workspace` | Identity files for system prompt |
 | `cron` | Owns `CronJob`, `CronExecution`, and `CronScheduler`; agent re-exports `CronScheduler` / `CronTriggerEvent` for assembly-layer wiring |
 | `context` | Conversation window and compression |
@@ -249,4 +267,4 @@ Router-level user rate limiting (`actor/router`) uses a sliding window (default 
 | `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |
 | `channels` | `Channel` handles + `ChannelRegistry`; Router owns the registry for dispatch by `ChannelType` |
 | `store` | The ports crate: owns every `*Store` trait contract, the row/DTO types they exchange, and `StorageError`. Agent injects these trait objects |
-| `storage` | Provides the libsql implementations of every `*Store` trait (the contracts all live in `baybo-store`) and bundles them in `Store` for DI |
+| `storage` | Provides the sqlite implementations of every `*Store` trait (the contracts all live in `baybo-store`) and bundles them in `Store` for DI |

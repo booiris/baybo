@@ -4,9 +4,9 @@
 
 The `config` crate owns the root `BayboConfig` struct, JSON loading, and the `validate()` method. It centralizes settings that were previously scattered across individual crates or hardcoded in `main.rs` (context-window budget, channel buffer sizes, rate limits, etc.).
 
-A single JSON file — typically `baybo.json` — maps 1:1 to `BayboConfig`. Consumers (`main.rs` and `baybo-agent`) map each section into the corresponding domain type.
+A single JSON file — typically `baybo.json` — maps 1:1 to `BayboConfig`. Consumers (the `baybo` bin crate's boot/runtime layer, plus `baybo-cli`, `baybo-gateway`, `baybo-memory`, and `baybo-setup`) map each section into the corresponding domain type.
 
-Top-level entries: `llm` (a `Vec<LlmEntry>`) plus `default-llm: LlmEntryName`, `agent`, `channels`, `security`, `skills`, `cost`, `workspace`, `gateway`, `browser`, `external_agents`, `permission`, and an optional `proxy`.
+Top-level entries: `llm` (a `Vec<LlmEntry>`) plus `default-llm: LlmEntryName`, `agent`, `channels`, `security`, `skills`, `cost`, `workspace`, `gateway`, `browser`, `external_agents`, `memory`, `permission`, and an optional `proxy`.
 
 > **Proxy.** `proxy` is an optional `{ url, no_proxy? }` block (omitted ⇒ direct
 > connections). When set, every outbound HTTP call — LLM providers, model
@@ -35,7 +35,7 @@ There is no `storage` section. Storage paths are **derived** from the project ro
 
 ### Leaf-level placement in the dependency graph
 
-The crate sits near the leaf of the dependency graph: its only runtime `baybo-*` deps are `baybo-model` (for shared newtypes the config surface reuses directly — `LlmEntryName`, `ModelTier`, `MicroUsd`, `ExternalAgentKind`) and `baybo-workspace` (paths only, pulled in with `default-features = false` to keep the I/O layer out of the dep graph). It otherwise depends on external libraries only — `serde`, `serde_json`, `tokio`, `thiserror`, `parking_lot`. (`baybo-tools` is a dev-dependency, used solely by the mirror contract tests.) This keeps the surface small and deliberate:
+The crate sits near the leaf of the dependency graph: its only runtime `baybo-*` deps are `baybo-model` (for shared newtypes the config surface reuses directly — `LlmEntryName`, `ModelTier`, `MicroUsd`, `ExternalAgentKind`) and `baybo-workspace` (paths only, pulled in with `default-features = false` to keep the I/O layer out of the dep graph). It otherwise depends on external libraries only — `serde`, `serde_json`, `tokio`, `thiserror`, `parking_lot`. This keeps the surface small and deliberate:
 
 - Avoids coupling the config surface to most domain type changes
 - Keeps `config` cheap to build, low in the graph
@@ -51,6 +51,8 @@ This does **not** extend uniformly into nested structs. The following nested typ
 
 - `TelegramChannelConfig` (`enabled`, `bot_token_env`) — under `channels.telegram`
 - `DiscordChannelConfig` (`enabled`, `bot_token_env`) — under `channels.discord`
+- `WeixinChannelConfig` (`enabled`) — under `channels.weixin`
+- `ProxyConfig` (`url`) — the top-level `proxy` block
 - `LlmEntry` (`name`, `provider`, `model`) — every element of the top-level `llm` array
 
 Required-ness beyond serde (non-empty strings, numeric ranges, URL schemes) is enforced by `validate()`.
@@ -67,7 +69,7 @@ JSON is the sole supported format. It has the widest tooling support, round-trip
 
 `serde`'s default tolerance applies: unknown keys are silently ignored. This is permissive by design so a newer JSON file (with fields an older binary does not yet know about) does not hard-fail at load. The cost is that typos in field names are also silent — `"agent": { "max_iteration": 10 }` parses fine and the real `max_iterations` stays at its default.
 
-Sections that must not accept typos (security-sensitive or governance-sensitive shapes, e.g. `security` and — once reintroduced — `tools.mcp_servers[]`) may opt into `#[serde(deny_unknown_fields)]` individually. The root `BayboConfig` intentionally keeps permissive semantics.
+Sections that must not accept typos (security-sensitive or governance-sensitive shapes, e.g. `security`) may opt into `#[serde(deny_unknown_fields)]` individually; today no section has. The root `BayboConfig` intentionally keeps permissive semantics.
 
 ### Secret handling
 
@@ -82,16 +84,17 @@ Sections mirror Baybo's real runtime concerns, not a 1:1 copy of any external re
 
 | Section    | Maps to                                                     | Notes                                                                                                                                                                                                |
 | ---------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `llm`      | `Vec<LlmEntry>` + `default-llm: String` → `baybo_llm::LlmProviderConfig` | Each `LlmEntry` is a `{name, provider, model, api_key_env?, base_url?, supports_vision?, reasoning_effort?}` record. `default-llm` names the entry the agent loop uses by default; the field is serde-renamed to `default-llm`. Multiple entries can target the same provider with distinct credentials. |
-| `agent`    | `ExecutionPolicy` + `TokenBudget` + `Truncate::keep_recent` + subagent caps + tier map | Carries `max_iterations`, the context-window budget, `max_subagent_depth`, `max_subagents_per_root`, and `model_tiers` (`ModelTier` → `LlmEntryName`). Per-tool timeouts are not configured here — each `Tool` impl declares its own ceiling via `Tool::max_timeout` (default 30 s). |
+| `llm`      | `Vec<LlmEntry>` + `default-llm: LlmEntryName` → `baybo_llm::LlmProviderConfig` | Each `LlmEntry` is a `{name, provider, model, api_key_env?, base_url?, supports_vision?, context_window?, pricing?, reasoning_effort?}` record. `default-llm` names the entry the agent loop uses by default; the field is serde-renamed to `default-llm`. Multiple entries can target the same provider with distinct credentials. |
+| `agent`    | `AgentLoopConfig` (`max_iterations`) + `ContextManager`/`TokenBudget` (context budget, `keep_recent`) + subagent caps + tier map | Carries `max_iterations`, the context-window budget, `max_subagent_depth`, `max_subagents_per_root`, and `model_tiers` (`ModelTier` → `LlmEntryName`). Per-tool timeouts are not configured here — each `Tool` impl declares its own ceiling via `Tool::max_timeout` (default 30 s). |
 | `channels` | `ChannelRegistry` adapter enablement + mpsc buffer sizes    | See §"Channel enablement model".                                                                                                                                                                     |
 | `security` | `EncryptionKey` location + `LeakDetector` enablement        |                                                                                                                                                                                                      |
 | `skills`   | `baybo_skills_assessor::AssessmentMode`                      | `risk_check`: `off` disables the LLM classifier, `primary` (default) judges `SKILL.md` only, `full` judges the whole directory tree.                                                                 |
-| `cost`     | `SpendingLimits` + `Router::with_rate_limit`                |                                                                                                                                                                                                      |
+| `cost`     | `SpendingLimits` + `baybo_agent::router::LiveRateLimit` (via `RouterConfig.rate_limit`; hot-swapped on reload) |                                                                                                                                                                            |
 | `workspace`| `WorkspaceManager` + storage path composition               | Single field: `path`. The project root from which all persistent data paths are composed (e.g. `<workspace.path>/state/storage.db`).                                                                |
 | `gateway`  | `baybo_gateway::RuntimeGatewayConfig`                        | Admin bind address + port, CORS allowlist, shutdown grace. See [`gateway.md`](gateway.md).                                                                                                          |
 | `browser`  | `baybo_tools::browser` configuration                         | Browser sidecar launch settings (docker mode, profile path).                                                                                                                                         |
 | `external_agents` | `baybo_agent::external_agent` registry                | Per-kind opt-in for the host-execution external agents — `claude`, `codex`, `gemini` (each `{ enabled, binary_path? }`), plus an optional `default_external_agent` that designates the primary when more than one is enabled. `enabled` defaults to `false`: an installed binary on PATH does not auto-grant access. |
+| `memory`   | `baybo-memory` backend selection                             | `{ enabled (default false), provider: noop\|mem0\|openviking, llm?, extra? }` — `llm` names the entry used for salience/extraction (unset ⇒ `default-llm`); `extra` is an opaque per-plugin bag (a documented exception to the typed-over-`Value` rule). Not hot-reloadable. See [`memory.md`](memory.md). |
 | `permission` | `baybo_tools::builtin::BashPermissionMode`                   | Shell-out permission policy: `auto` (default), `manual`, or `free` (`open`/`none` accepted as legacy aliases for `free`). Hot-reloadable through `LivePermissionMode`; see [`../permission.md`](../permission.md). |
 
 `registry` and `cron` currently have no top-level section. See §"Out-of-scope modules" for rationale and planned placement.
@@ -114,8 +117,8 @@ Principle: a module earns a config section when operators need to tune it in pro
 `baybo-config` holds mirrors of selected domain types (today, `TrustLevelConfig` in `baybo-config::tools` mirrors `baybo_model::TrustLevel`). The MCP-specific mirrors (`McpServerEntry`, `McpTransportConfig`, `OAuthConfig`, plus a second `TrustLevelConfig`) live in `baybo-tools::mcp::config`, not here, because `.mcp.json` is owned by `baybo-tools`. Drift prevention applies to both crates:
 
 1. **Ownership** — mirrors live in `baybo-config`. Whenever the upstream domain type (e.g. `baybo_model::TrustLevel`) changes shape, the same PR updates the mirror and the conversion between them.
-2. **Contract tests** — each mirror has a round-trip test (`From<DomainType> for MirrorType` and `TryFrom<MirrorType> for DomainType`) in `baybo-config`'s integration tests. These act as the drift detector: adding a variant upstream without a mirror update breaks match exhaustiveness and fails CI.
-3. **Forward compatibility** — domain enums that mirrors target should be `#[non_exhaustive]`; the mirror's `TryFrom` returns a typed `ConfigError::UnsupportedVariant { ty, variant }` rather than panicking when it encounters an unknown variant.
+2. **Contract tests** — each mirror has a round-trip test in `baybo-config`'s integration tests, converting domain → mirror → domain over every variant. These act as the drift detector: adding a variant upstream without a mirror update breaks match exhaustiveness and fails CI.
+3. **Forward compatibility** — domain enums that mirrors target should be `#[non_exhaustive]`; the mirror→domain conversion returns a typed `ConfigError::UnsupportedVariant { ty, variant }` rather than panicking when it encounters an unknown variant.
 4. **Scope limit** — only types that appear in the config surface are mirrored. Transient/internal domain types must not leak into `baybo-config`.
 
 ## Reload semantics
@@ -123,7 +126,7 @@ Principle: a module earns a config section when operators need to tune it in pro
 `baybo-config` ships the reload **primitives**, not the orchestration. As a leaf crate it owns two pure pieces in `reload.rs`: a live, swappable handle to the applied config (`ConfigHandle`) and the whitelist gate (`hot_reload_diff`). The fallible derived-state rebuilds (the LLM pool, cost limits) and the end-to-end reload flow live in consumer crates — see [`docs/config-hot-reload.md`](../config-hot-reload.md) before touching reload code. The contract below is the part `baybo-config` itself enforces.
 
 - **Live handle** — `ConfigHandle` wraps `Arc<parking_lot::RwLock<Arc<BayboConfig>>>`. `current()` clones out the applied `Arc`; `store()` is the infallible commit half that swaps a new `Arc` in. Reads happen per-turn / per-request (resolving the active model, dashboard reads), never per-token, so a plain `RwLock<Arc<_>>` is ample — no `ArcSwap` dependency. The previous `Arc` stays alive until its last in-flight reader drops it, which gives the "in-flight requests finish on the old config" behaviour below.
-- **Hot-updatable whitelist** — `hot_reload_diff(old, new)` enforces an explicit allowlist: `llm`, `default_llm`, `agent.model_tiers`, `cost.rate_limit`, `cost.spending_limits`, and `permission`. Any reload whose diff touches a field **outside** this set hard-rejects the entire reload (atomic — nothing swaps) with `ConfigError::NotHotReloadable { section }` naming the offending section. Not hot-updatable: `gateway.*`, `workspace.path`, `security.*`, `channels.*`, `external_agents.*`, and the rest of `agent` (`max_iterations`, `context`, `max_subagent_depth`, `max_subagents_per_root`). `new` is destructured field-by-field so adding a field to `BayboConfig` or `AgentConfig` forces a hot/non-hot classification here rather than silently defaulting to "hot, unchecked".
+- **Hot-updatable whitelist** — `hot_reload_diff(old, new)` enforces an explicit allowlist: `llm`, `default_llm`, `agent.model_tiers`, `cost.rate_limit`, `cost.spending_limits`, and `permission`. Any reload whose diff touches a field **outside** this set hard-rejects the entire reload (atomic — nothing swaps) with `ConfigError::NotHotReloadable { section }` naming the offending section. Not hot-updatable: `gateway.*`, `workspace.path`, `security.*`, `channels.*`, `skills.*`, `browser.*`, `external_agents.*`, `proxy`, `memory.*`, and the rest of `agent` (`max_iterations`, `context`, `max_subagent_depth`, `max_subagents_per_root`). `new` is destructured field-by-field so adding a field to `BayboConfig` or `AgentConfig` forces a hot/non-hot classification here rather than silently defaulting to "hot, unchecked".
 - **Atomic swap** — a successful reload swaps a single `Arc<BayboConfig>` holding all whitelisted changes together. Partial application is forbidden.
 - **Validation rollback** — a reload that fails `validate()` leaves the running config untouched and returns `ConfigError` to the caller; no partial state is exposed.
 - **In-flight behavior** — requests already running against the old config continue with its values; only new requests pick up the new config. For LLM turns this is per-turn: a turn finishes on the client it resolved at turn start.
@@ -146,27 +149,33 @@ Principle: a module earns a config section when operators need to tune it in pro
 | `agent.context.keep_recent`           | ≥ 1                                                  |
 | `agent.max_subagent_depth`            | ≤ 32                                                 |
 | `agent.max_subagents_per_root`        | in `1..=256`                                         |
-| `workspace.path`                      | non-empty                                            |
+| `workspace.path`                      | non-empty; absolute (no `./`, no `~`)                |
+| `browser.chrome_path`                 | if set, absolute                                     |
+| `browser.profile_dir`                 | if set, absolute                                     |
 | `channels.message_buffer_size`        | in `1..=65536`                                       |
+| `channels.telegram` / `channels.discord` | `enabled: false` is rejected — omit the section instead (enablement-model self-consistency) |
 | `channels.telegram.bot_token_env`     | non-empty                                            |
 | `channels.discord.bot_token_env`      | non-empty                                            |
 | `cost.spending_limits.daily_usd`      | if set, strictly positive, finite                    |
 | `cost.spending_limits.monthly_usd`    | if set, strictly positive, finite                    |
 | `cost.spending_limits`                | cross-field: `daily_usd ≤ monthly_usd` when both set |
 | `cost.rate_limit.*`                   | `max_requests ≥ 1`, `window_secs ≥ 1`                |
+| `gateway.bind_address`                | non-empty                                            |
+| `gateway.port`                        | > 0                                                  |
+| `gateway.shutdown_grace_secs`         | ≥ 1                                                  |
+| `gateway.cors_allowed_origins[i]`     | non-empty                                            |
+| `proxy.url`                           | when `proxy` is set: non-empty; scheme one of `http`/`https`/`socks5`/`socks5h`/`socks4`/`socks4a` |
 
 ### Cross-section rules
 
-Field-level checks catch syntax errors; cross-section checks catch policy inconsistencies. These live in a dedicated `validate_cross_section(&self, ...)` pass that runs after the per-section passes complete:
+Field-level checks catch syntax errors; cross-section checks catch policy inconsistencies. These live in a dedicated `validate_cross_section(config, errors)` pass that runs after the per-section passes complete:
 
 | Rule                                                                                                                                                                             | Sections involved  |
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
 | `default-llm` (when `llm` is non-empty) must reference an existing `llm[i].name`                                                                                                 | `llm`              |
 | Each `agent.model_tiers` target must name an existing `llm[i].name`                                                                                                             | `agent` / `llm`    |
 | When more than one `external_agents` kind is `enabled`, `default_external_agent` must be set and name one of the enabled kinds                                                   | `external_agents`  |
-| `channels.telegram` / `channels.discord` with `enabled: false` is rejected (enablement-model self-consistency)                                                                  | `channels`         |
-| `security.encryption_key_file` must be set and absolute (string path to a hex-encoded 32-byte file)                                                                              | `security`         |
-| `workspace.path`, `security.encryption_key_file`, `browser.chrome_path`, and `browser.profile_dir` must be absolute paths (no `./`, no `~`)                                      | `workspace` / `security` / `browser` |
+| `security.encryption_key_file` must be set and absolute (string path to a hex-encoded 32-byte file; no `./`, no `~`)                                                             | `security`         |
 
 The MCP-specific trust/capability rules (stdio requires `trusted`, `installed`/`untrusted` may not declare `WriteFile`/`ExecCommand`) live with the MCP file in `baybo-tools::mcp::config` since `.mcp.json` is owned there.
 
@@ -186,9 +195,8 @@ Cross-section rules are part of the default `validate()` pass. A future strict-l
 | Module     | Role                                                                                                                                                                                   |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `main.rs`  | Loads the config at startup, maps each section into domain types, passes them down                                                                                                     |
-| `agent`    | Consumes `AgentConfig`, `CostConfig`, `ExternalAgentsConfig`                                                                                                                            |
+| `agent`    | Receives domain values the bin crate builds from the `agent` / `cost` / `external_agents` sections (`AgentLoopConfig`, `SpendingLimits` / `LiveRateLimit`, `build_registry` entries) — no direct `baybo-config` dep |
 | `llm`      | Receives `LlmProviderConfig` built from each `LlmEntry`                                                                                                                                |
-| `tools`    | No `baybo.json` section: per-tool timeouts come from `Tool::max_timeout`. (Once MCP lands again, the workspace-local `.mcp.json` continues to own MCP server records.)                                 |
+| `tools`    | No `baybo.json` section: per-tool timeouts come from `Tool::max_timeout`. (MCP server records live in the workspace-local `<workspace>/config/.mcp.json`, owned by `baybo-tools::mcp` — see the MCP status note above.)                                 |
 | `channels` | Channel adapters are registered based on `ChannelsConfig` section enablement                                                                                                           |
-| `hook`     | `ConfigChange` is an extension point that _observes_ or _vetoes_ proposed changes. It does **not** emit provenance — provenance is recorded by the bootstrap/agent layer into `trace`. |
-| `trace`    | Records `provider_config_hash` / `config_version` in `ExecutionProvenance` when config is loaded or changed                                                                            |
+| `trace`    | `LlmCall` spans carry a `provider_config_hash` on their begin payload (`LlmCallBegin`, `baybo-trace::span`) — the slot for which provider config a call ran under; today every call site writes it empty and the hash is not yet computed. Config load/change itself is not traced. |

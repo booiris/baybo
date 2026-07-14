@@ -2,7 +2,7 @@
 //!
 //! Constructs the admin router by hand (same pattern as
 //! `logs_endpoint.rs`), points it at a tempdir-backed `baybo.json` plus
-//! the test gateway's libsql cost store, then drives each endpoint via
+//! the test gateway's sqlite cost store, then drives each endpoint via
 //! `tower::ServiceExt::oneshot`.
 //!
 //! Why these exist: `update_model` / `set_default` rewrite `baybo.json`
@@ -95,7 +95,7 @@ async fn router_with_reloader(
             require_admin_token,
         ));
     let router = axum::Router::new().merge(admin_router);
-    // tg.tempdir keeps libsql alive — leak it so the cost store keeps
+    // tg.tempdir keeps sqlite alive — leak it so the cost store keeps
     // pointing at a live file for the duration of the test. Returning
     // the cfg_dir guarantees `cfg_path` stays live too.
     Box::leak(Box::new(tg));

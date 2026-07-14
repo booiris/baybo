@@ -65,7 +65,7 @@ impl CallReason {
 
     /// Parse a stored token back into a reason. Unknown / legacy values
     /// (rows written before the column existed read as `None` from the
-    /// store) are the caller's problem — see the read path in the libsql
+    /// store) are the caller's problem — see the read path in the sqlite
     /// cost store, which maps them to [`CallReason::default`]. A bare
     /// `tool:` with no name parses to `Tool("")` rather than failing.
     pub fn parse(s: &str) -> Option<Self> {
@@ -86,7 +86,7 @@ impl CallReason {
 
 // Flat-string serde so a `Tool(name)` never degrades to an object on the
 // wire: it stays the same `tool:<name>` token used for storage. Lenient
-// on read (unknown token -> default) to match the libsql read path.
+// on read (unknown token -> default) to match the sqlite read path.
 impl Serialize for CallReason {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.to_token())

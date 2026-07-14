@@ -3,6 +3,27 @@
 //! `LegClass::Api` and `LegClass::Blob` both enter here. The relay meters `Api`
 //! as interactive and `Blob` as background, but after the shared Noise IK device
 //! authentication the plaintext is the same HTTP-shaped tunnel protocol.
+//!
+//! An `Api` leg may serve SEVERAL requests in sequence: dialing one costs the
+//! phone a WSS upgrade plus a Noise IK handshake (~4 round trips), which the
+//! relay-mode client used to pay on every single REST call. The gateway
+//! advertises that with [`TunnelReuse`] on each response head — the only
+//! capability signal, and one an old client simply ignores.
+//!
+//! A `Blob` leg keeps the original single-request shape. Its transfers run to
+//! 100 MiB / ten minutes, so a leg-lifetime bound would guillotine a legitimate
+//! upload, and the relay meters it as background bandwidth. It answers
+//! `reuse: None`, which makes "blobs are never pooled" a property of THIS side
+//! rather than a promise the client has to keep.
+//!
+//! ## The framing rule
+//!
+//! A leg may serve another request only if the previous request's declared body
+//! was fully drained (or there was none) AND its response was fully sent.
+//! Anything else leaves the Noise stream ambiguous — the peer may still be
+//! writing body chunks we will never read — so the leg closes. [`LegState`] and
+//! [`BodyDrain`] carry that decision out of every exit path; a one-shot leg made
+//! it structurally impossible, and reuse buys it back at this price.
 
 use std::collections::VecDeque;
 use std::io;
@@ -12,10 +33,11 @@ use axum::body::{self, Body};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri, header};
 use bytes::Bytes;
 use device_proto::api_tunnel::{
-    self, MAX_TUNNEL_CHUNK, TunnelHeader, TunnelRequest, TunnelResponse,
+    self, MAX_TUNNEL_CHUNK, TunnelHeader, TunnelRequest, TunnelResponse, TunnelReuse,
 };
 use device_proto::noise::{FrameReassembler, write_chunked};
 use futures::StreamExt;
+use remote_host_protocol::relay::LegClass;
 use snow::TransportState;
 use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceExt;
@@ -28,7 +50,56 @@ use super::device_content::{
 use super::state::WsChannelState;
 use crate::auth::DEVICE_ID_HEADER;
 
+/// How long to wait for the FIRST request head after the handshake. A leg that
+/// dials and then says nothing is a leak either way, so this is unchanged — and
+/// because it applies on both the old and the new gateway, a client can park a
+/// freshly dialed leg for a bounded window with no negotiation at all.
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long to wait for a SUBSEQUENT request head on an `Api` leg, and the value
+/// advertised as `reuse.idle_ms`. Covers the human-paced gaps that dominate the
+/// relay REST surface — list appears → user taps in (1-10s), chat opens → first
+/// send — without parking legs on the relay for long.
+///
+/// The relay is a third, independently versioned component with no reaper for
+/// data legs (only its control link has an idle timeout), so THIS timeout is the
+/// only thing that reclaims them. A parked leg holds one of the relay's
+/// non-reserved connection slots, shared with chat legs; that is why this is 60s
+/// and not several minutes.
+const TUNNEL_REUSE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Whether the leg's framing is still unambiguous enough to serve another
+/// request. See the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegState {
+    Reusable,
+    MustClose,
+}
+
+/// Whether the peer's declared request body was fully consumed.
+///
+/// `Abandoned` is the one that matters: the router can hang up on the body (a
+/// 401 returned before any extractor reads it), leaving the peer still sending
+/// chunks we will never read. The response is still delivered — the client needs
+/// that 401 — but the leg cannot survive it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyDrain {
+    Drained,
+    Abandoned,
+}
+
+/// The reuse offer that may ride out on a response head.
+///
+/// `reuse` is the ONLY thing the client reads, and `LegState` is the only thing
+/// that closes the leg. Computing them independently let them drift: a response
+/// on a leg we were about to hang up on still advertised a 60s budget, so the
+/// client parked a corpse and served the next call from it. Deriving one from the
+/// other makes that unrepresentable.
+fn offer(reuse: Option<TunnelReuse>, state: LegState) -> Option<TunnelReuse> {
+    match state {
+        LegState::Reusable => reuse,
+        LegState::MustClose => None,
+    }
+}
 const TUNNEL_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TUNNEL_UPLOAD_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HEADER_CONTENT_LENGTH: &str = "content-length";
@@ -55,82 +126,163 @@ struct RequestHead {
     body_len: Option<u64>,
 }
 
-pub(crate) async fn run_api_tunnel_over_relay(ws: RelayWs, state: &WsChannelState) {
+pub(crate) async fn run_api_tunnel_over_relay(
+    ws: RelayWs,
+    class: LegClass,
+    state: &WsChannelState,
+) {
     let (sink, source) = ws.split();
-    if let Err(reason) = run_tunnel_session(TungBinSink(sink), TungBinSource(source), state).await {
+    if let Err(reason) =
+        run_tunnel_session(TungBinSink(sink), TungBinSource(source), class, state).await
+    {
         tracing::debug!(reason = %reason, "relay api tunnel aborted");
+    }
+}
+
+/// The reuse budget this leg advertises, or `None` for a one-shot leg.
+///
+/// Only `Api` legs are reusable. A `Blob` leg answers `None`, so a client that
+/// tried to pool one would simply not — the exclusion is enforced here, not
+/// trusted to the phone.
+fn reuse_for(class: LegClass) -> Option<TunnelReuse> {
+    match class {
+        LegClass::Api => Some(TunnelReuse {
+            idle_ms: TUNNEL_REUSE_IDLE_TIMEOUT.as_millis() as u32,
+        }),
+        LegClass::Blob | LegClass::Chat => None,
     }
 }
 
 async fn run_tunnel_session<Si: BinarySink, So: BinarySource>(
     mut sink: Si,
     mut source: So,
+    class: LegClass,
     state: &WsChannelState,
 ) -> Result<(), String> {
     let (mut transport, device) = responder_handshake(&mut sink, &mut source, state).await?;
     let mut reassembler = FrameReassembler::new();
     let mut pending = VecDeque::new();
+    let reuse = reuse_for(class);
+    // Requests served on this leg, and the highest id seen. `served` picks the
+    // idle budget and tells EOF-is-fine from EOF-is-an-error; `last_id` is what
+    // makes a late frame from an already-answered request distinguishable from a
+    // desync.
+    let mut served: u64 = 0;
+    let mut last_id: u64 = 0;
 
     tracing::info!(
         device = %super::short_hash(&device.device_id),
+        class = ?class,
+        reusable = reuse.is_some(),
         "device api tunnel established",
     );
 
-    let first = tokio::time::timeout(
-        TUNNEL_IDLE_TIMEOUT,
-        next_request(&mut source, &mut transport, &mut reassembler, &mut pending),
-    )
-    .await
-    .map_err(|_| "timed out waiting for tunnel request".to_string())??;
+    loop {
+        let idle = if served == 0 {
+            TUNNEL_IDLE_TIMEOUT
+        } else {
+            TUNNEL_REUSE_IDLE_TIMEOUT
+        };
+        let next = match tokio::time::timeout(
+            idle,
+            next_request(&mut source, &mut transport, &mut reassembler, &mut pending),
+        )
+        .await
+        {
+            // A reused leg idling out is how it is SUPPOSED to end.
+            Err(_) if served > 0 => return Ok(()),
+            Err(_) => return Err("timed out waiting for tunnel request".to_string()),
+            Ok(Err(reason)) => return Err(reason),
+            // A one-shot client (or an old one) closes after its request. Leave at
+            // once rather than sitting on the idle budget.
+            Ok(Ok(None)) if served > 0 => return Ok(()),
+            Ok(Ok(None)) => return Err("peer closed before request head".into()),
+            Ok(Ok(Some(req))) => req,
+        };
 
-    let head = match first {
-        Some(TunnelRequest::Head {
-            request_id,
-            method,
-            path,
-            headers,
-            body_len,
-        }) => RequestHead {
-            request_id,
-            method,
-            path,
-            headers,
-            body_len,
-        },
-        Some(TunnelRequest::Cancel { reason, .. }) => {
-            return Err(format!("request canceled: {reason}"));
-        }
-        Some(TunnelRequest::Body { request_id, .. }) => {
-            send_error(
-                &mut sink,
-                &mut transport,
+        let head = match next {
+            // Ids must strictly increase. A repeat is either a replay or a client
+            // whose framing we no longer understand; either way this leg is done.
+            TunnelRequest::Head { request_id, .. } if request_id <= last_id => {
+                send_error(
+                    &mut sink,
+                    &mut transport,
+                    request_id,
+                    400,
+                    "request id must increase",
+                )
+                .await?;
+                return Ok(());
+            }
+            TunnelRequest::Head {
                 request_id,
-                400,
-                "body sent before request head",
-            )
-            .await?;
+                method,
+                path,
+                headers,
+                body_len,
+            } => {
+                last_id = request_id;
+                RequestHead {
+                    request_id,
+                    method,
+                    path,
+                    headers,
+                    body_len,
+                }
+            }
+            // A late frame for a request already answered. Its only sources are a
+            // client that encodes an empty body as `Head{body_len: Some(0)}` plus a
+            // `Body{last: true}` the no-body branch below never reads (every shipped
+            // client does), and a Cancel that lost its race. Framing is still clean
+            // here, because every path that ABANDONS a body drain has already closed
+            // the leg.
+            TunnelRequest::Body { request_id, .. } | TunnelRequest::Cancel { request_id, .. }
+                if request_id <= last_id =>
+            {
+                continue;
+            }
+            // A body for an id we have never seen: we cannot know how much of it is
+            // coming, so the stream is unreadable from here.
+            TunnelRequest::Body { request_id, .. } => {
+                send_error(
+                    &mut sink,
+                    &mut transport,
+                    request_id,
+                    400,
+                    "body sent before request head",
+                )
+                .await?;
+                return Ok(());
+            }
+            TunnelRequest::Cancel { reason, .. } => {
+                return Err(format!("request canceled: {reason}"));
+            }
+        };
+
+        if let Err((status, reason)) = validate_request_head(&head) {
+            send_error(&mut sink, &mut transport, head.request_id, status, reason).await?;
             return Ok(());
         }
-        None => return Err("peer closed before request head".into()),
-    };
 
-    if let Err((status, reason)) = validate_request_head(&head) {
-        send_error(&mut sink, &mut transport, head.request_id, status, reason).await?;
-        return Ok(());
+        match handle_http_forward(
+            &mut sink,
+            &mut source,
+            &mut transport,
+            &mut reassembler,
+            &mut pending,
+            state,
+            &device,
+            head,
+            reuse,
+        )
+        .await?
+        {
+            LegState::Reusable if reuse.is_some() => served += 1,
+            // A one-shot leg: the request is answered, and we never told the client
+            // it could send another.
+            LegState::Reusable | LegState::MustClose => return Ok(()),
+        }
     }
-
-    handle_http_forward(
-        &mut sink,
-        &mut source,
-        &mut transport,
-        &mut reassembler,
-        &mut pending,
-        state,
-        &device,
-        head,
-    )
-    .await?;
-    Ok(())
 }
 
 async fn send_error<S: BinarySink>(
@@ -178,7 +330,8 @@ async fn handle_http_forward<Si: BinarySink, So: BinarySource>(
     state: &WsChannelState,
     device: &AuthenticatedDevice,
     head: RequestHead,
-) -> Result<(), String> {
+    reuse: Option<TunnelReuse>,
+) -> Result<LegState, String> {
     if request_body_len(&head) != 0 {
         return handle_http_body_forward(
             sink,
@@ -189,6 +342,7 @@ async fn handle_http_forward<Si: BinarySink, So: BinarySource>(
             state,
             device,
             head,
+            reuse,
         )
         .await;
     }
@@ -197,14 +351,24 @@ async fn handle_http_forward<Si: BinarySink, So: BinarySource>(
         Ok(req) => req,
         Err((status, reason)) => {
             send_error(sink, transport, head.request_id, status, &reason).await?;
-            return Ok(());
+            return Ok(LegState::MustClose);
         }
     };
     let response = super::tunnel_http::router(state.clone())
         .oneshot(req)
         .await
         .map_err(|e| format!("forward tunnel HTTP request: {e}"))?;
-    send_http_response(sink, transport, head.request_id, response).await
+    // Nothing to drain and the response goes out whole, so this leg survives.
+    let leg_state = LegState::Reusable;
+    send_http_response(
+        sink,
+        transport,
+        head.request_id,
+        response,
+        offer(reuse, leg_state),
+    )
+    .await?;
+    Ok(leg_state)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -217,8 +381,11 @@ async fn handle_http_body_forward<Si: BinarySink, So: BinarySource>(
     state: &WsChannelState,
     device: &AuthenticatedDevice,
     head: RequestHead,
-) -> Result<(), String> {
+    reuse: Option<TunnelReuse>,
+) -> Result<LegState, String> {
     let declared_len = request_body_len(&head);
+    // The peer is (or is about to be) streaming a body we are refusing. We never
+    // read it, so the stream is left mid-message: answer, then close.
     if declared_len > MAX_BLOB_BYTES as u64 {
         send_error(
             sink,
@@ -228,7 +395,7 @@ async fn handle_http_body_forward<Si: BinarySink, So: BinarySource>(
             "request body exceeds size limit",
         )
         .await?;
-        return Ok(());
+        return Ok(LegState::MustClose);
     }
 
     let request_id = head.request_id;
@@ -239,7 +406,7 @@ async fn handle_http_body_forward<Si: BinarySink, So: BinarySource>(
         Err((status, reason)) => {
             close_forward_body(tx, reason.clone()).await;
             send_error(sink, transport, request_id, status, &reason).await?;
-            return Ok(());
+            return Ok(LegState::MustClose);
         }
     };
 
@@ -250,7 +417,7 @@ async fn handle_http_body_forward<Si: BinarySink, So: BinarySource>(
             .await
             .map_err(|e| format!("forward tunnel HTTP request: {e}"))
     });
-    if let Err((status, reason)) = stream_forward_body(
+    let drain = match stream_forward_body(
         source,
         transport,
         reassembler,
@@ -261,16 +428,37 @@ async fn handle_http_body_forward<Si: BinarySink, So: BinarySource>(
     )
     .await
     {
-        response_task.abort();
-        let _ = response_task.await;
-        send_error(sink, transport, request_id, status, &reason).await?;
-        return Ok(());
-    }
+        Ok(drain) => drain,
+        Err((status, reason)) => {
+            response_task.abort();
+            let _ = response_task.await;
+            send_error(sink, transport, request_id, status, &reason).await?;
+            return Ok(LegState::MustClose);
+        }
+    };
 
     let response = response_task
         .await
         .map_err(|e| format!("forward tunnel HTTP task failed: {e}"))??;
-    send_http_response(sink, transport, request_id, response).await
+    let leg_state = match drain {
+        BodyDrain::Drained => LegState::Reusable,
+        // The router answered without reading the body (a 401 before any extractor
+        // touched it). The peer may still be writing chunks addressed to a request
+        // we have finished, so the next `next_request` would decode them as this
+        // leg's future. Deliver the response — the client needs that status — then
+        // hang up, and say so on the head: `offer` is what stops us telling the
+        // client to keep a leg we are closing under it.
+        BodyDrain::Abandoned => LegState::MustClose,
+    };
+    send_http_response(
+        sink,
+        transport,
+        request_id,
+        response,
+        offer(reuse, leg_state),
+    )
+    .await?;
+    Ok(leg_state)
 }
 
 fn build_forward_request(
@@ -331,10 +519,10 @@ async fn stream_forward_body<So: BinarySource>(
     tx: tokio::sync::mpsc::Sender<io::Result<Bytes>>,
     request_id: u64,
     declared_len: u64,
-) -> Result<(), (u16, String)> {
+) -> Result<BodyDrain, (u16, String)> {
     if declared_len == 0 {
         drop(tx);
-        return Ok(());
+        return Ok(BodyDrain::Drained);
     }
 
     let mut received = 0u64;
@@ -387,8 +575,12 @@ async fn stream_forward_body<So: BinarySource>(
                     close_forward_body(tx, "upload ended before content length").await;
                     return Err((400, "upload ended before content length".to_string()));
                 }
+                // The router dropped the body receiver — it answered without ever
+                // reading the request body (a 401 rejected before any extractor ran
+                // is the common one). We stop reading, but the peer does not stop
+                // writing: the rest of its chunks are still coming.
                 if tx.send(Ok(Bytes::from(data))).await.is_err() {
-                    return Ok(());
+                    return Ok(BodyDrain::Abandoned);
                 }
                 received = next_received;
                 if last {
@@ -410,7 +602,7 @@ async fn stream_forward_body<So: BinarySource>(
     }
 
     drop(tx);
-    Ok(())
+    Ok(BodyDrain::Drained)
 }
 
 async fn close_forward_body(
@@ -426,6 +618,7 @@ async fn send_http_response<S: BinarySink>(
     transport: &mut TransportState,
     request_id: u64,
     response: axum::response::Response,
+    reuse: Option<TunnelReuse>,
 ) -> Result<(), String> {
     let (parts, body) = response.into_parts();
     if let Some(body_len) = response_content_length(&parts.headers) {
@@ -437,6 +630,7 @@ async fn send_http_response<S: BinarySink>(
                 status: parts.status.as_u16(),
                 headers: forwarded_response_headers(&parts.headers, Some(body_len)),
                 body_len: Some(body_len),
+                reuse,
             },
         )
         .await?;
@@ -460,6 +654,7 @@ async fn send_http_response<S: BinarySink>(
                 status: parts.status.as_u16(),
                 headers: forwarded_response_headers(&parts.headers, None),
                 body_len: None,
+                reuse,
             },
         )
         .await?;
@@ -478,6 +673,7 @@ async fn send_http_response<S: BinarySink>(
             status: parts.status.as_u16(),
             headers: forwarded_response_headers(&parts.headers, Some(body_len)),
             body_len: Some(body_len),
+            reuse,
         },
     )
     .await?;
@@ -759,5 +955,430 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err, (400, "forbidden tunnel header"));
         }
+    }
+
+    #[test]
+    fn only_an_api_leg_advertises_reuse() {
+        assert_eq!(
+            reuse_for(LegClass::Api),
+            Some(TunnelReuse { idle_ms: 60_000 })
+        );
+        // A blob transfer runs to 100 MiB / ten minutes: pooling one would block
+        // every API call behind it, and the relay meters it as background
+        // bandwidth. Enforced HERE, not trusted to the client.
+        assert_eq!(reuse_for(LegClass::Blob), None);
+        assert_eq!(reuse_for(LegClass::Chat), None);
+    }
+}
+
+/// The leg as a whole: one Noise IK handshake, then N requests over a duplex that
+/// stands in for a spliced relay data leg. These pin the framing rule — the thing
+/// a one-shot leg used to get for free.
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::device::load_or_create_static_keypair;
+    use crate::test_support::build_test_deps;
+    use baybo_store::{DeviceRow, DeviceStatus};
+    use device_proto::noise::{NOISE_MAX_MESSAGE, StaticKeypair};
+    use snow::{HandshakeState, TransportState};
+    use tokio::sync::mpsc;
+
+    const TEST_TOKEN: &str = "device-auth-token-fixed-0123456789abcdef";
+
+    fn signing_key_for_tests() -> device_proto::delegation::SigningKey {
+        device_proto::delegation::generate_signing_key()
+    }
+
+    struct ChanSink(mpsc::Sender<Vec<u8>>);
+    struct ChanSource(mpsc::Receiver<Vec<u8>>);
+
+    #[async_trait::async_trait]
+    impl BinarySink for ChanSink {
+        async fn send_bytes(&mut self, bytes: Vec<u8>) -> Result<(), ()> {
+            self.0.send(bytes).await.map_err(|_| ())
+        }
+        async fn close(&mut self) {}
+    }
+
+    #[async_trait::async_trait]
+    impl BinarySource for ChanSource {
+        async fn next_bytes(&mut self) -> Option<Vec<u8>> {
+            self.0.recv().await
+        }
+    }
+
+    /// The phone half of a tunnel leg: the IK initiator, plus seal/open over the
+    /// same chunked Noise framing the real client uses.
+    struct Phone {
+        tx: mpsc::Sender<Vec<u8>>,
+        rx: mpsc::Receiver<Vec<u8>>,
+        transport: TransportState,
+        reassembler: FrameReassembler,
+        pending: VecDeque<TunnelResponse>,
+        session: tokio::task::JoinHandle<Result<(), String>>,
+    }
+
+    impl Phone {
+        async fn send(&mut self, req: &TunnelRequest) {
+            let plaintext = api_tunnel::encode(req).expect("encode");
+            for message in write_chunked(&mut self.transport, &plaintext).expect("seal") {
+                self.tx.send(message).await.expect("leg alive");
+            }
+        }
+
+        /// Next response frame, or `None` once the gateway hung up.
+        async fn recv(&mut self) -> Option<TunnelResponse> {
+            loop {
+                if let Some(res) = self.pending.pop_front() {
+                    return Some(res);
+                }
+                let bytes = self.rx.recv().await?;
+                for frame in self
+                    .reassembler
+                    .read(&mut self.transport, &bytes)
+                    .expect("open")
+                {
+                    self.pending
+                        .push_back(api_tunnel::decode(&frame).expect("decode"));
+                }
+            }
+        }
+
+        /// Drive one whole GET and return its head plus the assembled body.
+        async fn get(&mut self, id: u64, path: &str) -> (TunnelResponse, Vec<u8>) {
+            self.send(&TunnelRequest::Head {
+                request_id: id,
+                method: "GET".into(),
+                path: path.into(),
+                headers: vec![],
+                body_len: None,
+            })
+            .await;
+            self.read_response(id).await
+        }
+
+        async fn read_response(&mut self, id: u64) -> (TunnelResponse, Vec<u8>) {
+            let head = self.recv().await.expect("a response head");
+            let body_len = match &head {
+                TunnelResponse::Head {
+                    request_id,
+                    body_len,
+                    ..
+                } => {
+                    assert_eq!(*request_id, id, "a response must answer its own request");
+                    body_len.unwrap_or(0)
+                }
+                // An Error head has no body to collect.
+                _ => return (head, Vec::new()),
+            };
+            let mut body = Vec::new();
+            while (body.len() as u64) < body_len {
+                match self.recv().await.expect("a body frame") {
+                    TunnelResponse::Body { data, last, .. } => {
+                        body.extend(data);
+                        if last {
+                            break;
+                        }
+                    }
+                    other => panic!("expected a body frame, got {other:?}"),
+                }
+            }
+            (head, body)
+        }
+
+        /// Hang up and report how the gateway's session ended.
+        async fn close(mut self) -> Result<(), String> {
+            drop(self.tx);
+            tokio::time::timeout(Duration::from_secs(5), &mut self.session)
+                .await
+                .expect("the session must not sit on its idle budget after the peer closes")
+                .expect("session task")
+        }
+
+        /// Whether the gateway closed the leg on its own.
+        async fn hung_up(&mut self) -> bool {
+            tokio::time::timeout(Duration::from_secs(5), self.recv())
+                .await
+                .expect("the gateway must not hang")
+                .is_none()
+        }
+    }
+
+    async fn connect(class: LegClass) -> Phone {
+        let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+        // Two keys, as on a real device: the Noise static that the responder
+        // resolves the leg by, and the ed25519 identity the `device-<hex>` id is
+        // derived from — the admin auth middleware re-derives a pubkey from that
+        // id, so a made-up string is a 400 before any route runs.
+        let device = StaticKeypair::generate().expect("device key");
+        let device_id =
+            device_proto::delegation::device_id_for(&signing_key_for_tests().verifying_key());
+        tg.deps
+            .stores
+            .device
+            .create(&DeviceRow {
+                device_id: device_id.clone(),
+                device_pubkey: device.public().to_vec(),
+                auth_token: TEST_TOKEN.into(),
+                status: DeviceStatus::Approved,
+                rendezvous_id: Some("11111111-2222-4333-8444-555555555555".into()),
+                created_at: 0,
+                approved_at: Some(0),
+                last_seen_at: None,
+                relay_url: "wss://relay.test".into(),
+                remote_api_key: "inst-test".into(),
+            })
+            .await
+            .expect("seed approved device row");
+        let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
+            .await
+            .expect("gateway static key");
+        let gw_pub = gw_static.public();
+        let state = WsChannelState::from_deps(&tg.deps);
+
+        let (gw_tx, mut phone_rx) = mpsc::channel::<Vec<u8>>(32);
+        let (phone_tx, gw_rx) = mpsc::channel::<Vec<u8>>(32);
+        let session = tokio::spawn(async move {
+            // `tg` owns the stores; keep it alive for the session's lifetime.
+            let _tg = tg;
+            run_tunnel_session(ChanSink(gw_tx), ChanSource(gw_rx), class, &state).await
+        });
+
+        let mut hs: HandshakeState = device.ik_initiator(&gw_pub).expect("ik initiator");
+        let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
+        let n = hs.write_message(&[], &mut buf).expect("msg1");
+        phone_tx.send(buf[..n].to_vec()).await.expect("send msg1");
+        let msg2 = phone_rx.recv().await.expect("gateway msg2");
+        hs.read_message(&msg2, &mut buf).expect("read msg2");
+
+        Phone {
+            tx: phone_tx,
+            rx: phone_rx,
+            transport: hs.into_transport_mode().expect("transport"),
+            reassembler: FrameReassembler::new(),
+            pending: VecDeque::new(),
+            session,
+        }
+    }
+
+    fn reuse_of(head: &TunnelResponse) -> Option<TunnelReuse> {
+        match head {
+            TunnelResponse::Head { reuse, .. } => *reuse,
+            other => panic!("expected a head, got {other:?}"),
+        }
+    }
+
+    fn status_of(head: &TunnelResponse) -> u16 {
+        match head {
+            TunnelResponse::Head { status, .. } | TunnelResponse::Error { status, .. } => *status,
+            other => panic!("expected a head or an error, got {other:?}"),
+        }
+    }
+
+    /// THE point of the change: one handshake, two requests. Each response answers
+    /// its own id, and both advertise the reuse budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_sequential_requests_run_on_one_leg() {
+        let mut phone = connect(LegClass::Api).await;
+
+        let (first, body) = phone.get(1, "/v1/chat/sessions").await;
+        assert_eq!(status_of(&first), 200, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(reuse_of(&first), Some(TunnelReuse { idle_ms: 60_000 }));
+        assert!(!body.is_empty(), "the session list is JSON");
+
+        let (second, _) = phone.get(2, "/v1/chat/sessions").await;
+        assert_eq!(status_of(&second), 200);
+        assert_eq!(reuse_of(&second), Some(TunnelReuse { idle_ms: 60_000 }));
+
+        phone.close().await.expect("a clean close");
+    }
+
+    /// A blob leg answers exactly one request and never advertises reuse, so a
+    /// client cannot pool it even by accident — and it keeps today's shape, with no
+    /// lifetime cap to guillotine a ten-minute upload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blob_leg_serves_one_request_and_never_advertises_reuse() {
+        let mut phone = connect(LegClass::Blob).await;
+
+        let (head, _) = phone.get(1, "/v1/chat/sessions").await;
+        assert_eq!(status_of(&head), 200);
+        assert_eq!(reuse_of(&head), None, "a blob leg is never poolable");
+
+        assert!(phone.hung_up().await, "and it closes after its one request");
+    }
+
+    /// An old client sends one request and hangs up. The gateway must leave at once
+    /// rather than sit on the 60s idle budget waiting for a request that will never
+    /// come — this is the old-app/new-gateway skew direction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_that_closes_after_one_request_exits_promptly() {
+        let mut phone = connect(LegClass::Api).await;
+        let (head, _) = phone.get(1, "/v1/chat/sessions").await;
+        assert_eq!(status_of(&head), 200);
+
+        phone
+            .close()
+            .await
+            .expect("EOF after a served request is a clean end, not an error");
+    }
+
+    /// Every shipped client encodes an empty body as `Head{body_len: Some(0)}` plus
+    /// a `Body{last: true}` that the no-body branch never reads. On a one-shot leg
+    /// the close reclaimed it; on a reused one it surfaces as the NEXT request. It
+    /// must be dropped, and the next request must still get its own answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_legacy_empty_body_frame_does_not_poison_the_next_request() {
+        let mut phone = connect(LegClass::Api).await;
+
+        phone
+            .send(&TunnelRequest::Head {
+                request_id: 1,
+                method: "POST".into(),
+                path: "/v1/chat/sessions".into(),
+                headers: vec![TunnelHeader::new("content-type", "application/json")],
+                body_len: Some(0),
+            })
+            .await;
+        phone
+            .send(&TunnelRequest::Body {
+                request_id: 1,
+                offset: 0,
+                data: Vec::new(),
+                last: true,
+            })
+            .await;
+        let (first, _) = phone.read_response(1).await;
+        assert!((200..300).contains(&status_of(&first)));
+
+        let (second, body) = phone.get(2, "/v1/chat/sessions").await;
+        assert_eq!(status_of(&second), 200);
+        assert!(
+            !body.is_empty(),
+            "the straggler must not have been read as request 2's body"
+        );
+
+        phone.close().await.expect("a clean close");
+    }
+
+    /// The router can answer without ever reading the request body (an unrouted
+    /// POST is 404'd before any extractor runs). We stop reading; the peer does
+    /// not stop writing. The response is still delivered, and then the leg MUST
+    /// close — its framing is no longer knowable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_router_that_hangs_up_on_the_body_closes_the_leg() {
+        let mut phone = connect(LegClass::Api).await;
+
+        // More chunks than the forward channel's buffer, so at least one send has to
+        // reach a receiver the router has already dropped.
+        const CHUNKS: u64 = 12;
+        phone
+            .send(&TunnelRequest::Head {
+                request_id: 1,
+                method: "POST".into(),
+                path: "/v1/definitely-not-a-route".into(),
+                headers: vec![TunnelHeader::new("content-type", "application/json")],
+                body_len: Some(CHUNKS),
+            })
+            .await;
+        for offset in 0..CHUNKS {
+            phone
+                .send(&TunnelRequest::Body {
+                    request_id: 1,
+                    offset,
+                    data: vec![b'x'],
+                    last: offset + 1 == CHUNKS,
+                })
+                .await;
+        }
+
+        let (head, _) = phone.read_response(1).await;
+        assert_eq!(status_of(&head), 404, "the client still gets its answer");
+        assert_eq!(
+            reuse_of(&head),
+            None,
+            "and a leg we are about to close must not advertise reuse — the client \
+             reads NOTHING else, so it would park a corpse and serve the next call from it"
+        );
+        assert!(
+            phone.hung_up().await,
+            "but the leg cannot survive a body it never drained"
+        );
+    }
+
+    /// A request whose head is rejected outright gets a `TunnelResponse::Error` —
+    /// which carries no `reuse` field and therefore cannot say "keep going". Every
+    /// Error means the leg is dead, so the client's rule stays one line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_head_that_fails_validation_closes_the_leg() {
+        let mut phone = connect(LegClass::Api).await;
+
+        phone
+            .send(&TunnelRequest::Head {
+                request_id: 1,
+                method: "GET".into(),
+                path: "/internal/metrics".into(), // not under /v1
+                headers: vec![],
+                body_len: None,
+            })
+            .await;
+
+        let err = phone.recv().await.expect("an error response");
+        assert!(
+            matches!(err, TunnelResponse::Error { status: 403, .. }),
+            "{err:?}"
+        );
+        assert!(phone.hung_up().await);
+    }
+
+    /// A body for an id we never issued a head for: we cannot know how much of it is
+    /// coming, so the stream is unreadable from here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_body_for_an_unknown_request_id_closes_the_leg() {
+        let mut phone = connect(LegClass::Api).await;
+
+        phone
+            .send(&TunnelRequest::Body {
+                request_id: 7,
+                offset: 0,
+                data: vec![1, 2, 3],
+                last: true,
+            })
+            .await;
+
+        let err = phone.recv().await.expect("an error response");
+        assert!(
+            matches!(err, TunnelResponse::Error { status: 400, .. }),
+            "{err:?}"
+        );
+        assert!(phone.hung_up().await);
+    }
+
+    /// Ids must strictly increase. A repeat is a replay or a client whose framing we
+    /// no longer understand — and it is exactly what would let a stale response be
+    /// matched to the wrong request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeated_request_id_closes_the_leg() {
+        let mut phone = connect(LegClass::Api).await;
+
+        let (first, _) = phone.get(1, "/v1/chat/sessions").await;
+        assert_eq!(status_of(&first), 200);
+
+        phone
+            .send(&TunnelRequest::Head {
+                request_id: 1,
+                method: "GET".into(),
+                path: "/v1/chat/sessions".into(),
+                headers: vec![],
+                body_len: None,
+            })
+            .await;
+
+        let err = phone.recv().await.expect("an error response");
+        assert!(
+            matches!(err, TunnelResponse::Error { status: 400, .. }),
+            "{err:?}"
+        );
+        assert!(phone.hung_up().await);
     }
 }

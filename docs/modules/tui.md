@@ -38,7 +38,7 @@ server side.
 - Input history keeps up to `HISTORY_CAP = 500` non-empty submissions with trivial de-duplication of consecutive identical lines. The ring is **persistent**: see [Persistent input history](#persistent-input-history) below.
 - Chat scrolling is the terminal's own (mouse wheel / the emulator's scrollback); the TUI keeps no scroll offset for chat. `PageUp`/`PageDown` page the **dashboard** table only (`DashboardPageUp`/`DashboardPageDown`, ±10 rows).
 - While the LLM is responding, an ephemeral streaming buffer is drawn immediately below the scrollback tail. Each `AgentEvent::AnswerDelta` extends it; complete lines are committed to the terminal scrollback (`insert_before`) as they arrive, leaving only the trailing partial in the buffer. The agent loop streams deltas on **every** iteration, so a final answer that lands after tool calls still streams.
-- The final `AgentEvent::Message` does **not** replace the streamed text — those lines are already committed. `finalize_stream` (via the pure `finalize_lines`) commits the trailing partial plus any non-text extras the stream didn't carry (e.g. the CronCreate hint). When the response **never streamed** — the non-streaming delivery path, where the agent loop ran with `delta_tx = None` (cron fires, subagent-notification turns) and only a final Message arrives — it renders the full message body from the blocks so the text isn't dropped.
+- The final `AgentEvent::Message` does **not** replace the streamed text — those lines are already committed. `finalize_stream` (via the pure `finalize_lines`) commits the trailing partial plus any non-text extras the stream didn't carry (e.g. the CronCreate hint). When a Message has no preceding stream — a cron fire (`delta_tx = None`) or a direct synthetic Message such as the background-completion reply — it renders the full body from the blocks so the text isn't dropped. The subsequent background analysis turn streams normally.
 - **Message styling.** There are no `you>` / `baybo>` prefixes. A user message is a **full-width highlighted bar** — bright white background, black text (not `REVERSED`, which renders muted on many terminals) — with a `> ` quote leader, the row padded with spaces (via `render_user_lines(text, width)`) so the background spans the whole line. Everything else leads with a same-size `●` dot: an assistant answer (**pale `●`**, continuation lines indented under it), the tool line (cyan `●`), the resolved-approval summary, and the `cooked for` footer using the answer text foreground.
 - **Spacing (leading separators, no trailing blanks).** Blocks are separated by **exactly one** blank row via a *leading* separator: `begin_block(kind)` emits one blank when the block kind changes (always for `Other`; same-kind `Answer`/`Tool` lines stack tight as one block). It's deduped against `AppState.last_row_blank` so it never doubles, and there are **no** trailing blanks — the reserved working row (below) separates the last block from the input, and the next block adds its own leading separator. `AppState.last_block: Option<BlockKind>` tracks the kind.
 - **Turn-done footer.** When a turn (job) finishes, `finalize_stream` commits a `● cooked for <elapsed>` stamp (same foreground as answer text) with its own deduped separator above it, so it sits one blank below the answer/tool block. It's the turn's wall-clock from when its `working_since` clock armed; only turns the TUI actually clocked get it (a cancelled `/stop` turn or a non-streaming cron delivery does not).
@@ -95,7 +95,7 @@ encrypted at rest rather than in a plaintext history file — but the TUI
 process itself never opens the vault. The gateway is the single writer,
 and the TUI exchanges the ring over the channel WS like any other state.
 
-- Wire protocol: two `baybo_channels::wire::Frame` variants carry the history end-to-end. `Frame::HistorySnapshot { session_id, entries }` is pushed from the server once, right after `Frame::RegisterAck { ok: true }`, for session-scoped TUI clients only — sidecars never see it. `Frame::HistoryAppend { session_id, entry }` is sent by the TUI after every accepted submission.
+- Wire protocol: two `baybo_channels::wire::Frame` variants carry the history end-to-end. `Frame::HistorySnapshot { session_id, entries }` is pushed by the server in response to each `Frame::Subscribe` from a TUI-channel connection — so once during the bootstrap handshake (Register → RegisterAck → Subscribe → HistorySnapshot), and again on a `/new` re-subscribe, where the pump drops the redundant resend — sidecars never see it. `Frame::HistoryAppend { session_id, entry }` is sent by the TUI after every accepted submission.
 - Gateway side: `baybo_gateway::channel::TuiHistoryStore` (`crates/gateway/src/channel/history.rs`) wraps `Arc<SecretVault>` behind a `tokio::sync::Mutex`, so concurrent appends from multiple TUIs on the same gateway serialize into the same vault blob. It reads the current ring from the fixed key `baybo.tui.input_history`, pushes the new entry (de-duping consecutive duplicates), caps the ring at 500 newest entries, and writes it back (see [`security.md`](./security.md)). Load failures or write errors are logged `warn!` and are non-fatal.
 - TUI side: `WsTransport` (`crates/tui/src/client/ws.rs`, `transport.rs`) buffers the one-shot snapshot inside `initial_history: Mutex<Option<Vec<String>>>` during `connect_tui`. The main loop calls `ctx.input.take_history_snapshot().await` before the first `terminal.draw`, so the prior ring is populated when the input box first renders. `Action::Submit` calls `ctx.input.append_history(&entry)` in a detached `tokio::spawn` — no vault handle, no lock file, no local `baybo-security` dependency.
 - The TUI crate no longer carries an `InputHistoryStore` trait or any history builder on `TuiAdapter`. The store is implicit in the transport; tests that construct an adapter without a live gateway just get no snapshot and no-op appends.
@@ -134,7 +134,6 @@ These are intercepted by `TuiAdapter` before `SlashHandler::handle` is called.
 | `Ctrl-C` | Clear input if non-empty, otherwise request shutdown                                                                                                                |
 | `Ctrl-D` | Two-press exit (only when input is empty): the first press prints a hint; a second press within 2s exits. Any other key or a longer pause cancels the confirmation. |
 | `Ctrl-L` | Clear chat scrollback                                                                                                                                               |
-| `Alt-M`  | Toggle terminal mouse capture. Off restores native drag-to-select across terminals (wheel-scroll stops working until re-enabled).                                   |
 
 ### Chat
 
@@ -143,7 +142,6 @@ These are intercepted by `TuiAdapter` before `SlashHandler::handle` is called.
 | `Enter`                                          | Submit input (or run slash command)                                          |
 | `Shift-Enter` / `Alt-Enter`                      | Insert newline in the input (see terminal support below)                     |
 | `Up`/`Down`                                      | Move cursor within a multi-line draft; on the first/last line walks history  |
-| `PageUp`/`PageDown`                              | Scroll scrollback                                                            |
 | `Home`/`End`/`Left`/`Right`/`Backspace`/`Delete` | Standard cursor edits                                                        |
 | Any printable character                          | Insert at cursor                                                             |
 
@@ -262,12 +260,17 @@ The loop multiplexes three sources with `tokio::select!`:
 
 `WsTransport` (`crates/tui/src/client/transport.rs`) is the single
 concrete transport used by the TUI. The adapter holds an
-`Arc<WsTransport>` and calls three methods on it:
+`Arc<WsTransport>` and drives it through `submit`, `subscribe`,
+`approval_queue`, plus the session-pin (`current_session_id` /
+`switch_session`) and history (`take_history_snapshot` /
+`append_history`) helpers:
 
 - `submit(msg)` — flatten an `IncomingMessage`'s text blocks and
   send a `Frame::Message` over the WS.
-- `subscribe(session_id) -> TransportEventStream` — decode inbound
-  frames from the same WS and translate them into
+- `subscribe() -> TransportEventStream` — decode inbound frames from
+  the same WS for the currently pinned session (the pump re-reads the
+  pin on every frame, so a `/new`-driven `switch_session(new_id)` rolls
+  over without a stream restart) and translate them into
   `TransportEvent::{StreamDelta, ToolStarted, ToolCompleted, Status, Response, Notice, ApprovalRequested, ApprovalResolved}`. `Frame::Reasoning` is dropped (no variant) — the TUI shows a working indicator instead of the thinking trace.
 - `approval_queue()` — returns the transport's local `ApprovalQueue`.
   On construction, `WsTransport::connect` installs a resolver so
@@ -303,14 +306,14 @@ Single-consumer ordering on the mpsc keeps delta/response ordering correct as WS
 
 ### Logging in chat mode
 
-Writing `tracing` records to stdout while ratatui owns raw mode corrupts the frame. Chat mode therefore uses a two-layer subscriber:
+Writing `tracing` records to stdout while ratatui owns raw mode corrupts the frame. Chat mode (`TracingMode::Tui`, `crates/baybo/src/tracing_init.rs`) therefore uses a two-layer subscriber, and writes **no file on disk** — the TUI is a thin gateway client, and the gateway process owns the authoritative log file:
 
-- **File layer** — `tracing_appender::rolling::daily("<workspace>/logs", "baybo.log")` wrapped in a non-blocking writer. A `WorkerGuard` held on the stack of `main` flushes pending lines on shutdown.
-- **TUI echo layer** — `TuiLogLayer` (`crates/baybo/src/tui_log.rs`) filters **tracing** events to `WARN` and `ERROR` (lower `tracing` levels stay in the file only), extracts `message` + structured fields, and forwards them through `TuiLogSink::emit` as `AppEvent::Log(LogRecord)`. The event loop pushes the record onto the scrollback as a coloured line (`warn` yellow, `error` red, with the event `target` in grey).
+- **Buffer layer** — `LogBufferLayer` keeps recent events in the bounded in-memory `LogBuffer`. There is no file appender (`TracingGuards { _worker: None, .. }`); the `tracing_appender::rolling::daily` writer belongs to `TracingMode::File`, the gateway-server path.
+- **TUI echo layer** — `TuiLogLayer` (`crates/baybo/src/tui_log.rs`) filters **tracing** events to `WARN` and `ERROR` (lower `tracing` levels are kept only in the in-memory `LogBuffer`), extracts `message` + structured fields, and forwards them through `TuiLogSink::emit` as `AppEvent::Log(LogRecord)`. The event loop pushes the record onto the scrollback as a coloured line (`warn` yellow, `error` red, with the event `target` in grey).
 
 The `WARN`/`ERROR` cut applies only to this tracing-echo layer. Agent **notices** take a separate route: the transport maps `Frame::Notice` → `TransportEvent::Notice` → `AppEvent::Log` (see [Output path](#output-path)), preserving all three `NoticeLevel`s — `Info` notices reach the same `LogRecord` surface and render as a cyan `info` line (`LogLevel::Info`), so an agent-emitted info notice is not filtered out the way a `tracing` INFO event is.
 
-The sink is plumbed into the layer via `Arc<OnceLock<TuiLogSink>>`: `init_tracing` allocates the cell, then `main` sets it from `TuiAdapter::log_sink()` after the adapter is constructed. Events emitted before the cell is filled still reach the file layer; they simply don't appear in the TUI.
+The sink is plumbed into the layer via `Arc<OnceLock<TuiLogSink>>`: `init_tracing` allocates the cell, then `main` sets it from `TuiAdapter::log_sink()` after the adapter is constructed. Events emitted before the cell is filled reach only the in-memory `LogBuffer`; they don't appear in the TUI (and TUI-process events are never written to disk — the gateway owns the log file).
 
 Argv mode keeps the old stdout layer — one-shot commands don't own the terminal, so normal formatting works.
 
@@ -321,7 +324,7 @@ Argv mode keeps the old stdout layer — one-shot commands don't own the termina
 
 ## Constraints
 
-- The streamed deltas and the final `AgentEvent::Message` are **not** redundant: deltas commit the body to scrollback line-by-line as it streams, and the final Message only finalises it (trailing partial + non-text extras). The Message re-renders the body from its blocks **only** when nothing streamed (`delta_tx = None`: cron / subagent-notification) — so the body is never both streamed and re-rendered.
+- The streamed deltas and the final `AgentEvent::Message` are **not** redundant: deltas commit the body to scrollback line-by-line as it streams, and the final Message only finalises it (trailing partial + non-text extras). A Message re-renders the body from its blocks **only** when nothing preceded it (a cron result or direct synthetic completion reply), so the body is never both streamed and re-rendered.
 - Renderer state (`AppState`) is mutated only on the event-loop task. External code uses the mpsc event channel; there is no shared `Mutex<AppState>`.
 - Input/state mutation in `app.rs` and key translation in `keymap.rs` are pure — unit tests exercise them without a terminal. Line-rendering helpers (e.g. `finalize_lines`, the `render_*` functions) are pure too — they return `Vec<Line>`, so tests assert on them directly; the one buffer-level fixup (`elide_wide_char_continuations`) is tested against a ratatui `Buffer`.
 - Dashboard providers must not block; the `DashboardProvider` trait method is `async` and the bundled `TuiDashboardProvider` returns synchronously without I/O.

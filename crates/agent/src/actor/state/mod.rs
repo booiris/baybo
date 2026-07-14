@@ -36,6 +36,7 @@ use crate::actor::supervisor::AgentSupervisor;
 use crate::runtime::agent_loop::AgentLoop;
 use baybo_job::JobLifecycle;
 use baybo_session::SessionManager;
+use baybo_store::CronStore;
 use baybo_trace::SpanRecorder;
 
 pub mod marker;
@@ -98,11 +99,16 @@ pub struct VolatileResources {
     /// Session-row writer used by handlers whose state mutations must
     /// survive actor eviction. Today only the background-subagent
     /// path reaches for this — `AgentMessage::BackgroundJobFinished`
-    /// persists `session.state.pending_background_results`, and the
-    /// next-turn drain re-persists the cleared list, so a parent that
+    /// persists `session.state.background_notifications`, and the next-turn
+    /// drain re-persists the cleared buffer, so a parent that
     /// the idle reaper eventually reclaims still hands the pending
     /// notifications to the fresh actor on hydration.
     pub session_manager: Arc<SessionManager>,
+    /// Delivery ledger for one-shot cron results. The actor that appends a
+    /// result is the one that knows the delivery is done, so it is the one
+    /// that stamps `notified_at` — closing out the boot re-drive that would
+    /// otherwise replay it (`AgentMessage::CronResultReady`).
+    pub cron_store: Arc<dyn CronStore>,
 }
 
 /// Compile-time assertion: every field type of [`VolatileResources`]
@@ -121,6 +127,7 @@ const _ASSERT_VOLATILE_FIELDS: fn() = || {
     assert_volatile::<CancellationToken>();
     assert_volatile::<Option<AgentSupervisor>>();
     assert_volatile::<Arc<SessionManager>>();
+    assert_volatile::<Arc<dyn CronStore>>();
 };
 
 /// Compile-time assertion: [`DurableActorState`] is fully

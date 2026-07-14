@@ -5,13 +5,13 @@ import XCTest
 /// latched true, so the next logout tap wrote true-over-true and nothing
 /// presented. Drives the real hit-test path: present → scrim-dismiss →
 /// re-present → cancel-dismiss → re-present.
-final class LogoutConfirmUITests: XCTestCase {
+final class LogoutConfirmUITests: BayboUITestCase {
+    private static let settingsArguments = [
+        "-baybo-open-home", "-baybo-home-tab", "settings",
+    ]
+
     func testConfirmReopensAfterScrimAndCancelDismissals() throws {
-        let app = XCUIApplication()
-        app.launchArguments = [
-            "-baybo-open-home", "-baybo-home-tab", "settings", "-baybo.lang", "en",
-        ]
-        app.launch()
+        let app = launch(Self.settingsArguments)
 
         let logoutPill = app.buttons["Log out"]
         XCTAssertTrue(logoutPill.waitForExistence(timeout: 5))
@@ -47,11 +47,7 @@ final class LogoutConfirmUITests: XCTestCase {
     /// hit-blocks the pill, the re-tap dies and the dialog never re-presents —
     /// the exact "tapped, nothing happened" the user reports.
     func testImmediateRetapAfterCancelStillPresents() throws {
-        let app = XCUIApplication()
-        app.launchArguments = [
-            "-baybo-open-home", "-baybo-home-tab", "settings", "-baybo.lang", "en",
-        ]
-        app.launch()
+        let app = launch(Self.settingsArguments)
 
         let logoutPill = app.buttons["Log out"]
         XCTAssertTrue(logoutPill.waitForExistence(timeout: 5))
@@ -76,11 +72,7 @@ final class LogoutConfirmUITests: XCTestCase {
     /// dialog's destructive button lands on the landing screen (route flips
     /// before any network await — logout is best-effort teardown).
     func testConfirmNavigatesToLanding() throws {
-        let app = XCUIApplication()
-        app.launchArguments = [
-            "-baybo-open-home", "-baybo-home-tab", "settings", "-baybo.lang", "en",
-        ]
-        app.launch()
+        let app = launch(Self.settingsArguments)
 
         let logoutPill = app.buttons["Log out"]
         XCTAssertTrue(logoutPill.waitForExistence(timeout: 5))
@@ -111,11 +103,7 @@ final class LogoutConfirmUITests: XCTestCase {
     /// the Liquid Glass tab bar must be hit-blocked — a tab switch under the
     /// scrim would orphan the presentation.
     func testTabBarBlockedWhileConfirmUp() throws {
-        let app = XCUIApplication()
-        app.launchArguments = [
-            "-baybo-open-home", "-baybo-home-tab", "settings", "-baybo.lang", "en",
-        ]
-        app.launch()
+        let app = launch(Self.settingsArguments)
 
         let logoutPill = app.buttons["Log out"]
         XCTAssertTrue(logoutPill.waitForExistence(timeout: 5))
@@ -147,11 +135,7 @@ final class LogoutConfirmUITests: XCTestCase {
     /// dialog the user never saw: haptic fires, nothing appears, the button
     /// reads as dead.
     func testRapidDoubleTapStillPresentsConfirm() throws {
-        let app = XCUIApplication()
-        app.launchArguments = [
-            "-baybo-open-home", "-baybo-home-tab", "settings", "-baybo.lang", "en",
-        ]
-        app.launch()
+        let app = launch(Self.settingsArguments)
 
         let logoutPill = app.buttons["Log out"]
         XCTAssertTrue(logoutPill.waitForExistence(timeout: 5))
@@ -171,11 +155,7 @@ final class LogoutConfirmUITests: XCTestCase {
     /// settings pill and the dialog's red commit) read as randomly dead.
     /// Drives flank taps through both, all the way to landing.
     func testPillFlankTapsDriveTheWholeLogoutFlow() throws {
-        let app = XCUIApplication()
-        app.launchArguments = [
-            "-baybo-open-home", "-baybo-home-tab", "settings", "-baybo.lang", "en",
-        ]
-        app.launch()
+        let app = launch(Self.settingsArguments)
 
         let logoutPill = app.buttons["Log out"]
         XCTAssertTrue(logoutPill.waitForExistence(timeout: 5))

@@ -34,7 +34,6 @@ type InboundKind =
   | 'gap'
   | 'message'
   | 'messages'
-  | 'attachment'
   | 'answer_delta'
   | 'reasoning'
   | 'tool_started'

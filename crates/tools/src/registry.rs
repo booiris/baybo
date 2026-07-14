@@ -234,11 +234,11 @@ mod tests {
     }
 
     #[test]
-    fn defaults_register_send_file() {
+    fn defaults_register_attach_file() {
         let registry = default_registry();
 
-        assert!(registry.get("SendFile").is_some());
-        assert!(registry.get_manifest("SendFile").is_some());
+        assert!(registry.get("AttachFile").is_some());
+        assert!(registry.get_manifest("AttachFile").is_some());
     }
 
     #[test]
@@ -262,7 +262,7 @@ mod tests {
                 "{name} should be concurrent"
             );
         }
-        for name in ["Write", "Edit", "Bash", "SendFile", "SecretAdd"] {
+        for name in ["Write", "Edit", "Bash", "AttachFile", "SecretAdd"] {
             assert_eq!(
                 registry.concurrency(name),
                 ToolConcurrency::Exclusive,

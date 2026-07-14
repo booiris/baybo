@@ -47,9 +47,17 @@ remote-host-protocol = { path = "crates/protocol" }
 # (`ip_limit`), and the per-`(ip, endpoint)` traffic recorder (`ip_traffic`) — the
 # last two small axum middleware both routers mount.
 remote-host-edge = { path = "crates/edge" }
-# Admission allow-list is a libsql/SQLite table, hot-reloaded by polling (it may
-# be updated out of band). `core` = embedded SQLite, no remote/replication.
-libsql = { version = "0.9", default-features = false, features = ["core"] }
+# Admission allow-list and the traffic ledger are SQLite tables (the allow-list
+# is hot-reloaded by polling, since it may be updated out of band).
+#
+# `Connection` is `Send` but deliberately NOT `Sync`, so the compiler forbids two
+# threads from entering one sqlite handle. That is not a style preference: a
+# connection owns an unsynchronised private heap (its lookaside allocator) and
+# the C API mutates it while *decoding* — `sqlite3_value_text()` allocates in
+# order to NUL-terminate a TEXT column. Sharing one handle across the dashboard's
+# concurrent handlers corrupts that heap and segfaults the process.
+rusqlite = { version = "0.38", features = ["bundled"] }
+deadpool-sqlite = { version = "0.13", features = ["rt_tokio_1"] }
 futures = "0.3"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 reqwest = { version = "0.13", features = ["json"] }

@@ -1240,12 +1240,13 @@ mod tests {
     /// Minimal in-memory `SessionStore` for query-API tests. The
     /// `session_messages` log is a real append-only vector so the
     /// hydration test can drive the same supersede semantics the
-    /// libsql backend implements.
+    /// sqlite backend implements.
     #[derive(Default)]
     struct MemSessionStore {
         sessions: parking_lot::Mutex<HashMap<SessionId, Session>>,
         children: parking_lot::Mutex<HashMap<SessionId, Vec<(SessionId, LineageKind)>>>,
         messages: parking_lot::Mutex<HashMap<SessionId, Vec<StoredMessage>>>,
+        source_event_ordinals: parking_lot::Mutex<HashMap<(SessionId, String), i64>>,
         read_cursors: parking_lot::Mutex<HashMap<SessionId, i64>>,
     }
 
@@ -1303,6 +1304,20 @@ mod tests {
             match data.get_mut(id) {
                 Some(s) => {
                     s.pinned = pinned;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+        async fn set_archived(
+            &self,
+            id: &SessionId,
+            archived: bool,
+        ) -> std::result::Result<bool, baybo_store::StorageError> {
+            let mut data = self.sessions.lock();
+            match data.get_mut(id) {
+                Some(s) => {
+                    s.archived = archived;
                     Ok(true)
                 }
                 None => Ok(false),
@@ -1398,6 +1413,38 @@ mod tests {
                 message: message.clone(),
             });
             Ok(ordinal)
+        }
+        async fn append_session_message_idempotent(
+            &self,
+            id: &SessionId,
+            source_event_id: &str,
+            message: &baybo_model::ChatMessage,
+        ) -> std::result::Result<baybo_store::SessionMessageAppendOutcome, baybo_store::StorageError>
+        {
+            if let Some(ordinal) = self
+                .source_event_ordinals
+                .lock()
+                .get(&(id.clone(), source_event_id.to_string()))
+                .copied()
+            {
+                return Ok(baybo_store::SessionMessageAppendOutcome::Existing { ordinal });
+            }
+            let ordinal = self.append_session_message(id, message).await?;
+            self.source_event_ordinals
+                .lock()
+                .insert((id.clone(), source_event_id.to_string()), ordinal);
+            Ok(baybo_store::SessionMessageAppendOutcome::Inserted { ordinal })
+        }
+        async fn find_message_ordinal_by_source_event_id(
+            &self,
+            id: &SessionId,
+            source_event_id: &str,
+        ) -> std::result::Result<Option<i64>, baybo_store::StorageError> {
+            Ok(self
+                .source_event_ordinals
+                .lock()
+                .get(&(id.clone(), source_event_id.to_string()))
+                .copied())
         }
         async fn append_control_event(
             &self,
@@ -1618,6 +1665,7 @@ mod tests {
             lineage: None,
             hidden: false,
             pinned: false,
+            archived: false,
             folder_id: None,
             title: None,
         }

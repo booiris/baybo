@@ -9,7 +9,7 @@
 //! The `TraceStore` trait lives in `baybo-store` (the ports crate) and
 //! trades in `StepRow` / `SpanRow` / `SpanEventRow`; this crate owns the
 //! `to_row` / `from_row` conversions and converts at the recorder
-//! boundary, while `baybo-storage` provides the libsql implementation.
+//! boundary, while `baybo-storage` provides the sqlite implementation.
 
 mod error;
 mod event;
@@ -24,7 +24,7 @@ pub mod test_support;
 
 pub use baybo_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
 pub use error::TraceError;
-pub use event::{SpanEvent, SpanEventKind, ToolEventPayload};
+pub use event::{SPAN_EVENT_TEXT_MAX_BYTES, SpanEvent, SpanEventKind, ToolEventPayload};
 pub use outcome::{LifecycleOutcome, LifecycleState};
 pub use recorder::{SpanRecorder, TraceEvent, TraceEventStream};
 pub use span::{

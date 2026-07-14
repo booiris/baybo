@@ -37,6 +37,7 @@ use crate::security::SecurityGateway;
 use baybo_cost::CostManager;
 use baybo_job::JobLifecycle;
 use baybo_session::SessionManager;
+use baybo_store::CronStore;
 
 /// Live, atomically-updatable rate-limit knobs, shared between the
 /// `Router`'s [`RateLimiter`] (reader) and the config-reload
@@ -180,6 +181,10 @@ pub struct Router {
     /// Job lifecycle handle — subscribe to terminal-event broadcasts and
     /// reconcile via the store on broadcast lag.
     job_lifecycle: Arc<JobLifecycle>,
+    /// Delivery ledger for one-shot cron results: the cron waiter stamps a
+    /// fire's outcome here, and `run()` scans it at boot to re-drive results
+    /// that never reached their conversation.
+    cron_store: Arc<dyn CronStore>,
     /// Stored as `Option<Receiver>` so `run()` can `take()` it out of
     /// `self` to drive in a `select!` arm; populated unconditionally from
     /// `RouterConfig` at construction.
@@ -204,6 +209,8 @@ pub struct RouterConfig {
     /// See [`Router::agent_profile_store`].
     pub agent_profile_store: Arc<dyn AgentProfileStore>,
     pub job_lifecycle: Arc<JobLifecycle>,
+    /// Delivery ledger for one-shot cron results — see [`Router::cron_store`].
+    pub cron_store: Arc<dyn CronStore>,
     pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream.
@@ -226,6 +233,7 @@ impl Router {
             actor_spawner,
             agent_profile_store,
             job_lifecycle,
+            cron_store,
             cron_trigger_rx,
             actor_parent_token,
             rate_limit,
@@ -240,6 +248,7 @@ impl Router {
             actor_spawner,
             agent_profile_store,
             job_lifecycle,
+            cron_store,
             cron_trigger_rx: Some(cron_trigger_rx),
             actor_parent_token,
         }
@@ -253,6 +262,11 @@ impl Router {
     ) {
         let channel_count = self.channels.len();
         info!(channel_count, "router starting");
+
+        // Before any live traffic: hand over one-shot cron results whose
+        // delivery a crash interrupted. Idempotent — an origin that already
+        // has the result drops the replay.
+        self.redrive_cron_deliveries().await;
 
         let mut cron_rx = self.cron_trigger_rx.take();
 

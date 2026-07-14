@@ -25,7 +25,8 @@ parking_lot = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-libsql = { workspace = true }
+rusqlite = { workspace = true }
+deadpool-sqlite = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }

@@ -1,7 +1,8 @@
 # Chat Sync Protocol v2 — One Cursor, One Sync
 
-**Status:** ✅ Built (2026-07-06, branch `docs/chat-sync-protocol-v2`) —
-designed the same day, reviewed (codex + code-grounded verification) with all
+**Status:** ✅ Built (2026-07-06; designed on branch
+`docs/chat-sync-protocol-v2`, implemented in `20d50454` on `feat/ios-swiftui`,
+merged to master) — reviewed (codex + code-grounded verification) with all
 launch open questions resolved (see the Decision log), then implemented as one
 atomic cut-over series: the `sync` endpoint + `platform_msg_id` point lookup,
 `Frame::SubscribeState` / `Frame::Gap`, the Subscribe scoping fix and
@@ -18,8 +19,8 @@ Related docs: [`docs/web-chat.md`](web-chat.md) (current web data flow),
 [`docs/turn-progress-events.md`](turn-progress-events.md) (streaming frames +
 work-block reconstruction), [`docs/modules/gateway.md`](modules/gateway.md)
 (wire + REST surface), [`docs/modules/channels.md`](modules/channels.md)
-(channel kinds, dispatch), `app/ios/CLAUDE.md` (the hydration matrix this
-proposal deletes).
+(channel kinds, dispatch), `app/ios/CLAUDE.md` (the v2 iOS transcript-sync
+loop; the seven-cell hydration matrix this doc proposed deleting is gone).
 
 ## Problem
 
@@ -106,7 +107,7 @@ References: [Telegram updates](https://core.telegram.org/api/updates) ·
 
 baybo already has the hard part: `session_messages.ordinal` **is** a correct
 per-box sequence (dense, monotonic, actor-serialized, assigned at persist —
-`crates/storage/src/libsql/session.rs:515-519`). Per-session ordinals are
+`crates/storage/src/sqlite/session.rs:515-519`). Per-session ordinals are
 exactly Telegram's per-channel `pts` model. What's missing is the discipline
 around it.
 
@@ -366,7 +367,7 @@ on open / reconnect / foreground / Gap / push-tap / safety timer:
   else:
       APPEND/merge page.rows          # dedup by ordinal / platform_msg_id
   cursor = page.next_cursor ?? cursor
-  replay buffered frames (ordinal/platform_msg_id dedup), then go live
+  apply buffered frames (ordinal/platform_msg_id dedup), then go live
 ```
 
 On reconnect and on `Gap(None)`, clients additionally refetch the session
