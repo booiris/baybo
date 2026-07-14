@@ -44,9 +44,11 @@ The live lookup is what makes a rename propagate **with no hooks and no rewrite 
 The snapshot exists for exactly one question — *"the job is gone; what was this history called?"* —
 which is why it is written once and never touched again.
 
-There is no `CronUpdate` today (the tools are `CronCreate` / `CronDelete` / `CronList`; the admin
-REST surface is list/create/get/delete), so a job cannot actually be renamed yet. When that lands,
-group naming follows for free.
+A rename is a real operation (`CronUpdate`, `PATCH /v1/cron/{id}`), and group naming follows from the
+live lookup with no work of its own. It also makes the two sources of the name observable at once: a
+job renamed mid-life has fires snapshotted under **both** names, so the tombstone branch must take
+the name off the **newest** member, as written above. A client that folds the members in the other
+direction renders the name the job was born with, and disagrees with every other client.
 
 A fire session's own title (`{job title} · {M/d}`) is **not** rewritten on a rename. The group takes
 the new name; the historical rows keep the name they were fired under. That is history, not staleness.
@@ -146,13 +148,13 @@ not need to be a row in a mutable table.** Making it one means storing the same 
 inventing machinery to keep the copies in sync. An adversarial review of that design found these,
 all from that one root cause:
 
-- **`CronStore::save` is a whole-blob read-modify-write** with no CAS (`storage/src/sqlite/cron.rs`).
-  A `folder_id` written back by the router is clobbered by the scheduler's next `advance_recurring`,
-  which saves the snapshot it read at `list_due`. The next fire then mints a **second** folder. The
-  first one holds a fire (so it is not empty), is named identically, and — with `delete_folder`
-  refusing cron folders — **no API can ever remove it**. The window opens on any boot with a pending
-  execution, because `recover_pending` dispatches before the loop and `tokio::time::interval`'s first
-  tick fires immediately.
+- **Every write to a cron job's row is a conditional one** (`storage/src/sqlite/cron.rs`): an in-place
+  change CASes on the row it read, and a fire's write-back stamps its own four fields and refuses a row
+  whose slot moved under it. A `folder_id` living on that row makes the router a **third** writer, which
+  has to join that protocol or lose: a link written on a snapshot the fire has already moved is dropped
+  silently, and the next fire — finding no link — mints a **second** folder. The first one holds a fire
+  (so it is not empty), is named identically, and — with `delete_folder` refusing cron folders — **no API
+  can ever remove it**.
 - **A job deleted mid-first-fire** leaves the same immortal orphan, with no race at all: the delete
   hook reads `folder_id`, finds `None`, flips nothing — and the fire (whose event is snapshotted off
   the execution row) goes on to create the folder anyway.
@@ -176,8 +178,10 @@ sortable alongside their own folders — is a capability we explicitly ruled out
 
 - **Batch archive.** Mark-all-read clears the badge; *"never show me this job again"* is still
   "delete the job".
-- **`CronUpdate`.** A real gap in the cron module (a job can only be replaced, not edited), but an
-  independent one. Group naming already reads the job's live title, so it needs no change when it lands.
+- **Showing the job's state on the group row.** A group whose job is paused or in the recycle bin is
+  pixel-identical to a live one — the row carries `cron_job_id` and a title, not a status — so the
+  only signal that a job stopped firing is that its group stopped growing. Closing that means putting
+  the job's state on `ChatSessionSummary`, which is a wire change; it is not free, and it is not this.
 - **Per-user scoping.** `session_folders` has no `user_id`, the session list scopes by channel only,
   and `CronList` calls `list_all_jobs()` unfiltered. A pre-existing gap; cron groups inherit the
   session list's visibility exactly and neither widen nor fix it.

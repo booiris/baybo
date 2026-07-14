@@ -421,7 +421,7 @@ export interface paths {
         delete: operations["delete_cron"];
         options?: never;
         head?: never;
-        patch?: never;
+        patch: operations["update_cron"];
         trace?: never;
     };
     "/v1/cron/{id}/pause": {
@@ -1860,6 +1860,29 @@ export interface components {
             llm?: string | null;
             name: string;
             system_prompt?: string | null;
+        };
+        /**
+         * @description `PATCH /v1/cron/{id}` body: a partial edit of the job's authored fields.
+         *     Every field is optional and named exactly as it is on [`CronJob`], so a
+         *     client patches by sending back the subset it changed on the job it fetched.
+         *     An absent field keeps the value the job already has, and a body that sets
+         *     nothing at all is rejected — there is nothing to write, and answering with
+         *     the unchanged job would tell the user their edit landed.
+         *
+         *     The scheduler's own fields (`status`, `next_trigger_at`,
+         *     `last_triggered_at`) are not patchable: they are derived from the schedule,
+         *     or moved by `POST /v1/cron/{id}/{pause,resume}`.
+         */
+        UpdateCronRequest: {
+            prompt?: string | null;
+            schedule?: null | components["schemas"]["CronSchedule"];
+            /**
+             * @description IANA timezone the cron expression is evaluated in. Changing it alone
+             *     reschedules the job: the same expression names a different instant in a
+             *     different zone.
+             */
+            timezone?: string | null;
+            title?: string | null;
         };
         /** @description Request body for `POST /v1/mobile/apns-token`. */
         UpdateDeviceApnsTokenRequest: {
@@ -3468,7 +3491,7 @@ export interface operations {
                     "application/json": components["schemas"]["CronJob"];
                 };
             };
-            /** @description Invalid schedule */
+            /** @description Invalid schedule, or a blank prompt */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3577,6 +3600,78 @@ export interface operations {
             };
         };
     };
+    update_cron: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cron job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateCronRequest"];
+            };
+        };
+        responses: {
+            /** @description The edited job, with the `next_trigger_at` the edit produced — a client need not refetch. Fields the body left out are unchanged. Editing the schedule or the timezone recomputes the next fire time from now: the slots the job missed are never back-filled. A paused job stays paused — it keeps `disabled` and no next trigger until `POST /v1/cron/{id}/resume` — while a one-shot that already fired is re-armed by an `at` still in the future */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CronJob"];
+                };
+            };
+            /** @description The body sets no field, blanks the prompt, or carries a schedule with no future fire time (an `at` whose moment has passed) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such job, or the job is in the recycle bin — `POST /v1/cron/{id}/restore` it before editing it */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The edit kept losing to a concurrent write (the job fired while it was being applied). Nothing changed; retry */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Scheduler error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     pause_cron: {
         parameters: {
             query?: never;
@@ -3607,6 +3702,15 @@ export interface operations {
             };
             /** @description Not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The pause kept losing to a concurrent write (the job fired, or was edited, while it was being applied). Nothing changed; retry */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3712,6 +3816,15 @@ export interface operations {
             };
             /** @description Not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The resume kept losing to a concurrent write (the job was edited while it was being applied). Nothing changed; retry */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

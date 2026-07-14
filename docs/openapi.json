@@ -1974,7 +1974,7 @@
             }
           },
           "400": {
-            "description": "Invalid schedule",
+            "description": "Invalid schedule, or a blank prompt",
             "content": {
               "application/json": {
                 "schema": {
@@ -2097,6 +2097,95 @@
             }
           }
         }
+      },
+      "patch": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "update_cron",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCronRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The edited job, with the `next_trigger_at` the edit produced — a client need not refetch. Fields the body left out are unchanged. Editing the schedule or the timezone recomputes the next fire time from now: the slots the job missed are never back-filled. A paused job stays paused — it keeps `disabled` and no next trigger until `POST /v1/cron/{id}/resume` — while a one-shot that already fired is re-armed by an `at` still in the future",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CronJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body sets no field, blanks the prompt, or carries a schedule with no future fire time (an `at` whose moment has passed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job, or the job is in the recycle bin — `POST /v1/cron/{id}/restore` it before editing it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The edit kept losing to a concurrent write (the job fired while it was being applied). Nothing changed; retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Scheduler error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/v1/cron/{id}/pause": {
@@ -2132,6 +2221,16 @@
           },
           "404": {
             "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The pause kept losing to a concurrent write (the job fired, or was edited, while it was being applied). Nothing changed; retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -2250,6 +2349,16 @@
           },
           "404": {
             "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The resume kept losing to a concurrent write (the job was edited while it was being applied). Nothing changed; retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -5640,6 +5749,42 @@
             "type": "string"
           },
           "system_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "UpdateCronRequest": {
+        "type": "object",
+        "description": "`PATCH /v1/cron/{id}` body: a partial edit of the job's authored fields.\nEvery field is optional and named exactly as it is on [`CronJob`], so a\nclient patches by sending back the subset it changed on the job it fetched.\nAn absent field keeps the value the job already has, and a body that sets\nnothing at all is rejected — there is nothing to write, and answering with\nthe unchanged job would tell the user their edit landed.\n\nThe scheduler's own fields (`status`, `next_trigger_at`,\n`last_triggered_at`) are not patchable: they are derived from the schedule,\nor moved by `POST /v1/cron/{id}/{pause,resume}`.",
+        "properties": {
+          "prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schedule": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CronSchedule",
+                "description": "The new schedule, in the same tagged shape [`CronJob`] reports:\n`{\"kind\":\"cron\",\"expr\":\"0 8 * * *\"}` or\n`{\"kind\":\"at\",\"time\":\"2026-07-15T08:00:00Z\"}`. Swapping one kind for the\nother is allowed — that is how a fired one-shot gets a new moment."
+              }
+            ]
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "IANA timezone the cron expression is evaluated in. Changing it alone\nreschedules the job: the same expression names a different instant in a\ndifferent zone."
+          },
+          "title": {
             "type": [
               "string",
               "null"
