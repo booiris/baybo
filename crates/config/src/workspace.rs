@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 /// Project-root configuration.
 ///
 /// `path` is the single workspace / project root — the directory that holds
-/// all persistent baybo data (libsql storage, lock file, identity files).
+/// all persistent baybo data (sqlite storage, lock file, identity files).
 /// Individual subsystems do not expose their own path knobs; they compose
 /// directly under `path`.
 ///

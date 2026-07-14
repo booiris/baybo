@@ -1,5 +1,5 @@
-pub mod libsql;
 pub mod retry;
+pub mod sqlite;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -41,9 +41,9 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (or create) a `Store` backed by a libsql database at `path`.
+    /// Open (or create) a `Store` backed by a sqlite database at `path`.
     /// Parent directories are created if missing. Blob payloads land in
-    /// `<parent>/blobs/` — kept alongside the libsql db so a single
+    /// `<parent>/blobs/` — kept alongside the sqlite db so a single
     /// state directory holds the whole persistent state.
     pub async fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
@@ -62,32 +62,32 @@ impl Store {
             _ => std::path::PathBuf::from("."),
         };
         let blob_root = parent_dir.join("blobs");
-        let pool = libsql::LibsqlPool::open(path).await?;
-        let blob = libsql::LibsqlBlobStore::open(pool.clone(), &blob_root).await?;
-        let agent_profile = libsql::LibsqlAgentProfileStore::open(pool.clone()).await?;
+        let pool = sqlite::SqlitePool::open(path).await?;
+        let blob = sqlite::SqliteBlobStore::open(pool.clone(), &blob_root).await?;
+        let agent_profile = sqlite::SqliteAgentProfileStore::open(pool.clone()).await?;
         Ok(Self {
-            session: std::sync::Arc::new(libsql::LibsqlSessionStore::new(pool.clone())),
-            session_summary: std::sync::Arc::new(libsql::LibsqlSessionSummaryStore::new(
+            session: std::sync::Arc::new(sqlite::SqliteSessionStore::new(pool.clone())),
+            session_summary: std::sync::Arc::new(sqlite::SqliteSessionSummaryStore::new(
                 pool.clone(),
             )),
-            session_folder: std::sync::Arc::new(libsql::LibsqlSessionFolderStore::new(
+            session_folder: std::sync::Arc::new(sqlite::SqliteSessionFolderStore::new(
                 pool.clone(),
             )),
-            task: std::sync::Arc::new(libsql::LibsqlTaskStore::new(pool.clone())),
-            trace: std::sync::Arc::new(libsql::LibsqlTraceStore::new(pool.clone())),
-            secret: std::sync::Arc::new(libsql::LibsqlSecretStore::new(pool.clone())),
-            cost: std::sync::Arc::new(libsql::LibsqlCostStore::new(pool.clone())),
-            job: std::sync::Arc::new(libsql::LibsqlJobStore::new(pool.clone())),
-            cron: std::sync::Arc::new(libsql::LibsqlCronStore::new(pool.clone())),
-            risk: std::sync::Arc::new(libsql::LibsqlSkillRiskStore::new(pool.clone())),
-            channel_session: std::sync::Arc::new(libsql::LibsqlChannelSessionStore::new(
+            task: std::sync::Arc::new(sqlite::SqliteTaskStore::new(pool.clone())),
+            trace: std::sync::Arc::new(sqlite::SqliteTraceStore::new(pool.clone())),
+            secret: std::sync::Arc::new(sqlite::SqliteSecretStore::new(pool.clone())),
+            cost: std::sync::Arc::new(sqlite::SqliteCostStore::new(pool.clone())),
+            job: std::sync::Arc::new(sqlite::SqliteJobStore::new(pool.clone())),
+            cron: std::sync::Arc::new(sqlite::SqliteCronStore::new(pool.clone())),
+            risk: std::sync::Arc::new(sqlite::SqliteSkillRiskStore::new(pool.clone())),
+            channel_session: std::sync::Arc::new(sqlite::SqliteChannelSessionStore::new(
                 pool.clone(),
             )),
-            channel_bot: std::sync::Arc::new(libsql::LibsqlChannelBotStore::new(pool.clone())),
-            channel_pairing: std::sync::Arc::new(libsql::LibsqlChannelPairingStore::new(
+            channel_bot: std::sync::Arc::new(sqlite::SqliteChannelBotStore::new(pool.clone())),
+            channel_pairing: std::sync::Arc::new(sqlite::SqliteChannelPairingStore::new(
                 pool.clone(),
             )),
-            device: std::sync::Arc::new(libsql::LibsqlDeviceStore::new(pool.clone())),
+            device: std::sync::Arc::new(sqlite::SqliteDeviceStore::new(pool.clone())),
             agent_profile: std::sync::Arc::new(agent_profile),
             blob: std::sync::Arc::new(blob),
         })

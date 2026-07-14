@@ -4,7 +4,7 @@
 
 The `cost` crate is the home for spend-tracking logic: the `CostManager` business-logic facade plus its budget primitives (`SpendingLimits`, `CostGuardError`, `CostMetrics`) and `CostError`. The `CostStore` trait lives in the `baybo-store` ports crate; the data types (`CostRecord`, `CostSummary`, `TimeRange`) live in `baybo-model`.
 
-`baybo-storage` provides the libsql implementation of `CostStore` (the trait itself lives in `baybo-store`), so downstream callers and tests can depend on `baybo-cost` plus the ports crate for cost-management work.
+`baybo-storage` provides the sqlite implementation of `CostStore` (the trait itself lives in `baybo-store`), so downstream callers and tests can depend on `baybo-cost` plus the ports crate for cost-management work.
 
 ## Design Decisions
 
@@ -39,8 +39,8 @@ The bundled `ModelPricing` snapshot is good enough for first boot, but rates dri
 
 ## Constraints
 
-- Depends on `baybo-llm` (for `ModelPricing`); `baybo-storage` must not pull `baybo-cost` — the storage adapter stays below the domain layer. The libsql `CostStore` impl (`LibsqlCostStore`) lives in `baybo-storage` and implements the `baybo-store` trait over `baybo-model` types only, so no edge from storage back into cost/llm exists.
-- No dependency on `baybo-storage` — the libsql impl converts its own errors at the trait boundary
+- Depends on `baybo-llm` (for `ModelPricing`); `baybo-storage` must not pull `baybo-cost` — the storage adapter stays below the domain layer. The sqlite `CostStore` impl (`SqliteCostStore`) lives in `baybo-storage` and implements the `baybo-store` trait over `baybo-model` types only, so no edge from storage back into cost/llm exists.
+- No dependency on `baybo-storage` — the sqlite impl converts its own errors at the trait boundary
 - `test_support::MemoryCostStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `baybo-cost = { workspace = true, features = ["test-support"] }`
 
 ## Collaboration
@@ -52,4 +52,4 @@ The bundled `ModelPricing` snapshot is good enough for first boot, but rates dri
 | `agent`   | Gates `Router` ingress with `check`; binds per-call `Attribution` so `BillableLlm`'s recorder lands spend on the right span; records subscription-billed external-agent runs via `record_external_tokens` |
 | `baybo` (runtime) | Constructs one `CostManager` per process (`runtime.rs`), awaits `hydrate` before any actor can spawn, and wires `cost_hooks` into every `BillableLlm` |
 | `store`   | Owns the `CostStore` trait contract and `StorageError`                                                              |
-| `storage` | `LibsqlCostStore` implements the `CostStore` trait (from `baybo-store`) over `baybo-model` types; no dependency on `baybo-cost`  |
+| `storage` | `SqliteCostStore` implements the `CostStore` trait (from `baybo-store`) over `baybo-model` types; no dependency on `baybo-cost`  |

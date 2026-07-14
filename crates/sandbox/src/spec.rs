@@ -33,7 +33,7 @@ pub struct SandboxSpec {
 /// Sensitive host subpaths the permissive sandbox masks with a per-call
 /// empty `tmpfs`. Targets credential vaults (SSH/GPG keys, cloud-CLI
 /// tokens, Docker / kube auth) and the agent's own state directory
-/// (libsql, identity files, secrets) — paths the agent has zero
+/// (sqlite, identity files, secrets) — paths the agent has zero
 /// legitimate need to read or write through a shell. Filesystem
 /// permission bits already block most of these for an unprivileged
 /// agent process; the tmpfs adds defence-in-depth so a misbehaving

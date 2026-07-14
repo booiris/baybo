@@ -141,7 +141,7 @@ For non-module-crate topics, read the relevant doc before touching that area:
 - [`docs/sync-protocol.md`](docs/sync-protocol.md) — chat sync protocol v2 (one cursor, one sync call, three data planes): the `sync`/point-lookup REST surface, the `SubscribeState`/`Gap` wire frames, the client sync loop + outbox, and rebase/gap handling. [`docs/CONTEXT.md`](docs/CONTEXT.md) is its terminology glossary (canonical names + retired-alias smells).
 - [`docs/bench-web.md`](docs/bench-web.md) — standalone read-only viewer (`bench/bench-web`) for bench `results/` + agent `trace/` artifacts; spine model + per-bench adapters, ts-rs gate.
 - [`docs/sidecars.md`](docs/sidecars.md) — embedded JS sidecars (`sidecars/channel/*`, `sidecars/tool/*`), bundling/install pipeline, domain registration, and the browser sidecar (CDDM wrapper, security trade-offs, docker mode).
-- [`docs/modules/storage.md`](docs/modules/storage.md) — libsql storage; all deletable tables use plain `DELETE` (no soft-delete tombstones).
+- [`docs/modules/storage.md`](docs/modules/storage.md) — sqlite storage; all deletable tables use plain `DELETE` (no soft-delete tombstones).
 - [`docs/fuzzing.md`](docs/fuzzing.md) — `baybo-security` cargo-fuzz harness and targets.
 - [`docs/testing.md`](docs/testing.md) — test layout, `test-support` gating, shared fixtures.
 - [`docs/external-commands.md`](docs/external-commands.md) — external binaries baybo shells out to (`git`/`sh`/`rg`/sandbox backends/`uv`/`bun`), required-vs-optional, and how the in-container benches provide or skip each.

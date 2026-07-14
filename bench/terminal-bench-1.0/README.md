@@ -35,7 +35,7 @@ cargo build --release --target x86_64-unknown-linux-musl --features bench-bash -
 # -> target/x86_64-unknown-linux-musl/release/baybo
 ```
 
-If the musl build is awkward on your host (e.g. the bundled SQLite in `libsql`),
+If the musl build is awkward on your host (e.g. the bundled SQLite in `sqlite`),
 a glibc release binary also works when the
 task container's glibc is compatible — musl is just the safe default.
 

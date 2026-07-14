@@ -48,7 +48,7 @@ The job read path needs `JobLifecycle::list_by_session` / `list_recoverable` (pr
 | Module    | Role                                                                                                          |
 | --------- | ------------------------------------------------------------------------------------------------------------- |
 | `store`   | Owns the `SessionStore` / `JobStore` / `TraceStore` / `CostStore` trait contracts, the `StoredMessage` row type, and `StorageError`; `QueryApi` reads through these trait objects |
-| `storage` | Provides the libsql implementations those trait objects resolve to                                             |
+| `storage` | Provides the sqlite implementations those trait objects resolve to                                             |
 | `job`     | `JobLifecycle` facade + domain types (`Job`, `JobStatus`, …); the `JobStore` it wraps is an `baybo-store` trait  |
 | `trace`   | `Step`, `Span`, `SpanEvent` + their `from_row` conversions — `QueryApi` rehydrates rows into rich types here    |
 | `cost`    | DTOs (`CostSummary`, `TimeRange`); `CostScope` lives here in `query` as the scope enum                          |

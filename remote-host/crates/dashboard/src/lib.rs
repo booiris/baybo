@@ -46,7 +46,7 @@ const JS_CT: &str = "text/javascript; charset=utf-8";
 
 /// The read + control surface the runtime implements over its live components.
 /// Every method is `async` and `Result`-returning so the `dyn` trait stays
-/// uniform whether a call hits libsql or an in-memory registry.
+/// uniform whether a call hits sqlite or an in-memory registry.
 #[async_trait::async_trait]
 pub trait DashboardBackend: Send + Sync {
     async fn overview(&self) -> Result<OverviewSnapshot, DashboardError>;

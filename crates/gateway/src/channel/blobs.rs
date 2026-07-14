@@ -439,13 +439,13 @@ mod tests {
     //! shape without spinning a real server.
     use super::*;
     use baybo_pairing::PairingService;
-    use baybo_storage::libsql::{LibsqlChannelPairingStore, LibsqlPool};
+    use baybo_storage::sqlite::{SqliteChannelPairingStore, SqlitePool};
     use baybo_store::ChannelPairingStore;
     use std::sync::Arc;
 
     async fn fresh_pairing() -> (Arc<dyn ChannelPairingStore>, Arc<PairingService>) {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store: Arc<dyn ChannelPairingStore> = Arc::new(LibsqlChannelPairingStore::new(pool));
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store: Arc<dyn ChannelPairingStore> = Arc::new(SqliteChannelPairingStore::new(pool));
         let svc = Arc::new(PairingService::new(store.clone()));
         (store, svc)
     }

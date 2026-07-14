@@ -1,4 +1,4 @@
-//! libsql implementation of `TraceStore`.
+//! sqlite implementation of `TraceStore`.
 //!
 //! Schema lives in `super::mod::init_db`. Each table stores the entity as
 //! a single canonical JSON `data` blob; queryable fields surface as
@@ -8,194 +8,193 @@
 //! row conversion, this layer just shuttles rows.
 
 use async_trait::async_trait;
+use rusqlite::OptionalExtension;
 
-use super::LibsqlPool;
+use super::SqlitePool;
 use baybo_model::{JobId, SpanId, StepId};
 use baybo_store::trace::Result;
-use baybo_store::{SpanEventRow, SpanRow, StepRow, StorageError, TraceStore};
+use baybo_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
 
-pub struct LibsqlTraceStore {
-    pool: LibsqlPool,
+pub struct SqliteTraceStore {
+    pool: SqlitePool,
 }
 
-impl LibsqlTraceStore {
-    pub fn new(pool: LibsqlPool) -> Self {
+impl SqliteTraceStore {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 }
 
-fn err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
-    StorageError::Internal(anyhow::anyhow!("libsql {ctx}: {e}"))
-}
-
 #[async_trait]
-impl TraceStore for LibsqlTraceStore {
+impl TraceStore for SqliteTraceStore {
     async fn save_step(&self, step: &StepRow) -> Result<()> {
+        let id = step.id.to_string();
+        let data = step.data.clone();
         self.pool
-            .conn()
-            .execute(
-                "INSERT OR REPLACE INTO steps (id, data) VALUES (?1, ?2)",
-                libsql::params![step.id.to_string(), step.data.clone()],
-            )
+            .interact("trace.save_step", move |conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO steps (id, data) VALUES (?1, ?2)",
+                    rusqlite::params![id, data],
+                )?;
+                Ok(())
+            })
             .await
-            .map_err(|e| err("insert step", e))?;
-        Ok(())
     }
 
     async fn load_step(&self, step_id: &StepId) -> Result<Option<StepRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT data FROM steps WHERE id = ?1",
-                libsql::params![step_id.to_string()],
-            )
+        let id = *step_id;
+        let key = id.to_string();
+        self.pool
+            .interact("trace.load_step", move |conn| {
+                let data = conn
+                    .query_row(
+                        "SELECT data FROM steps WHERE id = ?1",
+                        rusqlite::params![key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                Ok(data.map(|data| StepRow { id, data }))
+            })
             .await
-            .map_err(|e| err("query step", e))?;
-        match rows.next().await.map_err(|e| err("row", e))? {
-            Some(row) => Ok(Some(StepRow {
-                id: *step_id,
-                data: row.get::<String>(0).map_err(|e| err("get", e))?,
-            })),
-            None => Ok(None),
-        }
     }
 
     async fn list_steps_by_job(&self, job_id: &JobId) -> Result<Vec<StepRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT id, data FROM steps WHERE job_id = ?1 ORDER BY started_at",
-                libsql::params![job_id.to_string()],
-            )
+        let job_id = job_id.to_string();
+        self.pool
+            .interact("trace.list_steps_by_job", move |conn| {
+                let mut stmt = conn
+                    .prepare("SELECT id, data FROM steps WHERE job_id = ?1 ORDER BY started_at")?;
+                let rows = stmt
+                    .query_map(rusqlite::params![job_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut out = Vec::with_capacity(rows.len());
+                for (id, data) in rows {
+                    out.push(StepRow {
+                        id: id.parse()?,
+                        data,
+                    });
+                }
+                Ok(out)
+            })
             .await
-            .map_err(|e| err("query steps", e))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| err("row", e))? {
-            out.push(StepRow {
-                id: row
-                    .get::<String>(0)
-                    .map_err(|e| err("get", e))?
-                    .parse()
-                    .map_err(|e| err("parse step id", e))?,
-                data: row.get::<String>(1).map_err(|e| err("get", e))?,
-            });
-        }
-        Ok(out)
     }
 
     async fn list_unfinished_steps(&self) -> Result<Vec<StepRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT id, data FROM steps \
-                 WHERE ended_at IS NULL \
-                    OR EXISTS (SELECT 1 FROM spans WHERE spans.step_id = steps.id AND spans.ended_at IS NULL) \
-                 ORDER BY started_at",
-                (),
-            )
+        self.pool
+            .interact("trace.list_unfinished_steps", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, data FROM steps \
+                     WHERE ended_at IS NULL \
+                        OR EXISTS (SELECT 1 FROM spans WHERE spans.step_id = steps.id AND spans.ended_at IS NULL) \
+                     ORDER BY started_at",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut out = Vec::with_capacity(rows.len());
+                for (id, data) in rows {
+                    out.push(StepRow {
+                        id: id.parse()?,
+                        data,
+                    });
+                }
+                Ok(out)
+            })
             .await
-            .map_err(|e| err("query unfinished steps", e))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| err("row", e))? {
-            out.push(StepRow {
-                id: row
-                    .get::<String>(0)
-                    .map_err(|e| err("get", e))?
-                    .parse()
-                    .map_err(|e| err("parse step id", e))?,
-                data: row.get::<String>(1).map_err(|e| err("get", e))?,
-            });
-        }
-        Ok(out)
     }
 
     async fn save_span(&self, span: &SpanRow) -> Result<()> {
+        let id = span.id.to_string();
+        let data = span.data.clone();
         self.pool
-            .conn()
-            .execute(
-                "INSERT OR REPLACE INTO spans (id, data) VALUES (?1, ?2)",
-                libsql::params![span.id.to_string(), span.data.clone()],
-            )
+            .interact("trace.save_span", move |conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO spans (id, data) VALUES (?1, ?2)",
+                    rusqlite::params![id, data],
+                )?;
+                Ok(())
+            })
             .await
-            .map_err(|e| err("insert span", e))?;
-        Ok(())
     }
 
     async fn load_span(&self, span_id: &SpanId) -> Result<Option<SpanRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT data FROM spans WHERE id = ?1",
-                libsql::params![span_id.to_string()],
-            )
+        let id = *span_id;
+        let key = id.to_string();
+        self.pool
+            .interact("trace.load_span", move |conn| {
+                let data = conn
+                    .query_row(
+                        "SELECT data FROM spans WHERE id = ?1",
+                        rusqlite::params![key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                Ok(data.map(|data| SpanRow { id, data }))
+            })
             .await
-            .map_err(|e| err("query span", e))?;
-        match rows.next().await.map_err(|e| err("row", e))? {
-            Some(row) => Ok(Some(SpanRow {
-                id: *span_id,
-                data: row.get::<String>(0).map_err(|e| err("get", e))?,
-            })),
-            None => Ok(None),
-        }
     }
 
     async fn list_spans_by_step(&self, step_id: &StepId) -> Result<Vec<SpanRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT id, data FROM spans WHERE step_id = ?1 ORDER BY started_at",
-                libsql::params![step_id.to_string()],
-            )
+        let step_id = step_id.to_string();
+        self.pool
+            .interact("trace.list_spans_by_step", move |conn| {
+                let mut stmt = conn
+                    .prepare("SELECT id, data FROM spans WHERE step_id = ?1 ORDER BY started_at")?;
+                let rows = stmt
+                    .query_map(rusqlite::params![step_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut out = Vec::with_capacity(rows.len());
+                for (id, data) in rows {
+                    out.push(SpanRow {
+                        id: id.parse()?,
+                        data,
+                    });
+                }
+                Ok(out)
+            })
             .await
-            .map_err(|e| err("query spans", e))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| err("row", e))? {
-            out.push(SpanRow {
-                id: row
-                    .get::<String>(0)
-                    .map_err(|e| err("get", e))?
-                    .parse()
-                    .map_err(|e| err("parse span id", e))?,
-                data: row.get::<String>(1).map_err(|e| err("get", e))?,
-            });
-        }
-        Ok(out)
     }
 
     async fn append_span_event(&self, event: &SpanEventRow) -> Result<()> {
+        let span_id = event.span_id.to_string();
+        let seq = event.seq as i64;
+        let data = event.data.clone();
         self.pool
-            .conn()
-            .execute(
-                "INSERT OR REPLACE INTO span_events (span_id, seq, data) VALUES (?1, ?2, ?3)",
-                libsql::params![
-                    event.span_id.to_string(),
-                    event.seq as i64,
-                    event.data.clone()
-                ],
-            )
+            .interact("trace.append_span_event", move |conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO span_events (span_id, seq, data) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![span_id, seq, data],
+                )?;
+                Ok(())
+            })
             .await
-            .map_err(|e| err("insert span_event", e))?;
-        Ok(())
     }
 
     async fn list_span_events(&self, span_id: &SpanId) -> Result<Vec<SpanEventRow>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT seq, data FROM span_events WHERE span_id = ?1 ORDER BY seq",
-                libsql::params![span_id.to_string()],
-            )
+        let span_id = *span_id;
+        let key = span_id.to_string();
+        self.pool
+            .interact("trace.list_span_events", move |conn| {
+                let mut stmt = conn
+                    .prepare("SELECT seq, data FROM span_events WHERE span_id = ?1 ORDER BY seq")?;
+                let out = stmt
+                    .query_map(rusqlite::params![key], |row| {
+                        Ok(SpanEventRow {
+                            span_id,
+                            seq: row.get::<_, i64>(0)? as u32,
+                            data: row.get::<_, String>(1)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(out)
+            })
             .await
-            .map_err(|e| err("query span_events", e))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| err("row", e))? {
-            out.push(SpanEventRow {
-                span_id: *span_id,
-                seq: row.get::<i64>(0).map_err(|e| err("get", e))? as u32,
-                data: row.get::<String>(1).map_err(|e| err("get", e))?,
-            });
-        }
-        Ok(out)
     }
 }
 
@@ -267,8 +266,8 @@ mod tests {
 
     #[tokio::test]
     async fn step_round_trip() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteTraceStore::new(pool);
         let s = make_step(JobId::new());
         store.save_step(&s.to_row().unwrap()).await.unwrap();
         let loaded = Step::from_row(store.load_step(&s.id).await.unwrap().unwrap()).unwrap();
@@ -277,8 +276,8 @@ mod tests {
 
     #[tokio::test]
     async fn span_round_trip_and_list_by_step() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteTraceStore::new(pool);
         let job_id = JobId::new();
         let step = make_step(job_id);
         store.save_step(&step.to_row().unwrap()).await.unwrap();
@@ -299,8 +298,8 @@ mod tests {
         // round-trip/load tests don't touch. Guards against a schema
         // path typo or a rename of `Step::job_id` silently dropping
         // every step out of the by-job query.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteTraceStore::new(pool);
         let job_a = JobId::new();
         let job_b = JobId::new();
 
@@ -321,8 +320,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_unfinished_steps_finds_open_steps_and_open_child_spans() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteTraceStore::new(pool);
 
         let open_step = make_step(JobId::new());
         store.save_step(&open_step.to_row().unwrap()).await.unwrap();
@@ -376,8 +375,8 @@ mod tests {
 
     #[tokio::test]
     async fn span_event_round_trip() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteTraceStore::new(pool);
         let span_id = SpanId::new();
         let event = SpanEvent::new(
             span_id,
@@ -402,8 +401,8 @@ mod tests {
     async fn span_event_kind_columns_index_by_variant() {
         use baybo_trace::ToolEventPayload;
 
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlTraceStore::new(pool.clone());
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteTraceStore::new(pool.clone());
         let span_id = SpanId::new();
         let approval = SpanEvent::new(
             span_id,
@@ -448,23 +447,26 @@ mod tests {
             .await
             .unwrap();
 
-        let conn = pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT seq, kind, tool_event_kind FROM span_events \
-                 WHERE span_id = ?1 ORDER BY seq",
-                libsql::params![span_id.to_string()],
-            )
+        let key = span_id.to_string();
+        let got = pool
+            .interact("test.list_span_event_kinds", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT seq, kind, tool_event_kind FROM span_events \
+                     WHERE span_id = ?1 ORDER BY seq",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![key], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
             .await
             .unwrap();
-        let mut got: Vec<(i64, String, Option<String>)> = Vec::new();
-        while let Some(row) = rows.next().await.unwrap() {
-            got.push((
-                row.get::<i64>(0).unwrap(),
-                row.get::<String>(1).unwrap(),
-                row.get::<Option<String>>(2).unwrap(),
-            ));
-        }
         assert_eq!(
             got,
             vec![
@@ -474,16 +476,17 @@ mod tests {
             ]
         );
 
-        let mut count_rows = conn
-            .query(
-                "SELECT COUNT(*) FROM span_events \
-                 WHERE kind = 'tool_event' AND tool_event_kind = 'llm_call'",
-                (),
-            )
+        let count = pool
+            .interact("test.count_llm_call_events", move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM span_events \
+                     WHERE kind = 'tool_event' AND tool_event_kind = 'llm_call'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
             .await
             .unwrap();
-        let row = count_rows.next().await.unwrap().unwrap();
-        let count: i64 = row.get(0).unwrap();
         assert_eq!(count, 1);
     }
 }

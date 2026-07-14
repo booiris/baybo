@@ -72,7 +72,7 @@ Cli::parse()
 Long-running paths (`gateway_cmd::start`, and `prompt_cmd::run` when no gateway holds the workspace lock) build their own runtime through `runtime::*`. The chat-loop assembly used by the gateway is:
 
 ```
-runtime::build_secret_vault            ── opens libsql + master key only
+runtime::build_secret_vault            ── opens sqlite + master key only
   │
   ▼
 mint admin token + fresh TUI token, register on ChannelTokenTable

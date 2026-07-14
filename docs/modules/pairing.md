@@ -54,7 +54,7 @@ already maintains its own `user_id → bot_id` map for routing.
 
 ### Pairing state
 
-`channel_pairings` libsql table:
+`channel_pairings` sqlite table:
 
 ```
 channel_type TEXT    NOT NULL
@@ -79,7 +79,7 @@ A pending row carries an `expires_at` stamp computed at insert time:
 (`PENDING_TTL_SECONDS` in `crates/pairing/src/service.rs`) — long
 enough for a human operator to notice a Telegram buzz and run `baybo
 pair approve`, short enough that a one-time curious user's code
-doesn't linger in libsql for days.
+doesn't linger in sqlite for days.
 
 Expiry only applies to `pending` rows. On approval, `status` flips
 to `approved` and `expires_at` is cleared (`NULL`). Approved rows
@@ -154,7 +154,7 @@ janitor sweep followed by a new inbound mints a fresh code.
 ```
 
 The refusal path does **not** create an baybo session or a
-`channel_sessions` row. Nothing lands in libsql for the user beyond
+`channel_sessions` row. Nothing lands in sqlite for the user beyond
 the pending pairing itself.
 
 ### CLI
@@ -182,7 +182,7 @@ path: the operator messages the bot, reads the code out of the
 returned Notice, and runs `baybo pair approve <code>`. Keeps one
 code-path for everyone; no "trust me" escape hatch.
 
-All three run under `retry_on_busy` (CLI shares the libsql file
+All three run under `retry_on_busy` (CLI shares the sqlite file
 with a potentially-running gateway; a `database is locked` is a
 logged retry, not an operator-facing error).
 
@@ -190,7 +190,7 @@ logged retry, not an operator-facing error).
 
 Per the project convention documented in `docs/modules/storage.md`,
 store traits and row types live in the `baybo-store` ports crate; the
-libsql adapter lives in `baybo-storage` and business logic lives in a
+sqlite adapter lives in `baybo-storage` and business logic lives in a
 dedicated crate. The split here is:
 
 ```
@@ -207,7 +207,7 @@ crates/pairing/                 # business logic only
 
 crates/store/src/channel_pairing.rs      // ChannelPairingStore trait
                                           // + ChannelPairingRow + PairingStatus
-crates/storage/src/libsql/channel_pairing.rs  // LibsqlChannelPairingStore
+crates/storage/src/sqlite/channel_pairing.rs  // SqliteChannelPairingStore
 ```
 
 The crate hosts two orthogonal things: the channel-pairing gate this
@@ -216,14 +216,14 @@ doc describes, and the mobile device-pairing business logic
 
 Dependency direction: `baybo-pairing → baybo-store` for the trait +
 row types, matching how `baybo-session` reaches `SessionStore`. The
-trait sits in `baybo-store` next to every other store trait; the libsql
+trait sits in `baybo-store` next to every other store trait; the sqlite
 impl lives in `baybo-storage`, which the assembly layer wires in.
 
 ```
 baybo-store   ──► model                       (defines ChannelPairingStore + row + PairingStatus)
-baybo-storage ──► store, model                (LibsqlChannelPairingStore; implements the trait)
+baybo-storage ──► store, model                (SqliteChannelPairingStore; implements the trait)
 baybo-pairing ──► model, store                (PairingService + code gen; consumes the trait + row types)
-baybo-gateway ──► pairing, store, storage, …  (holds the Arc<dyn ChannelPairingStore>, wires the libsql impl)
+baybo-gateway ──► pairing, store, storage, …  (holds the Arc<dyn ChannelPairingStore>, wires the sqlite impl)
 baybo-cli     ──► store, storage, pairing*    (pair commands talk to the store directly)
 ```
 
@@ -239,9 +239,9 @@ dead weight.
 ### Test support
 
 `baybo-pairing` ships no in-memory store fake: gateway tests
-exercise the gate through the real libsql adapter (the
+exercise the gate through the real sqlite adapter (the
 `authorize_upload` tests in `crates/gateway/src/channel/blobs.rs`
-build `LibsqlChannelPairingStore` over an in-memory pool), and the
+build `SqliteChannelPairingStore` over an in-memory pool), and the
 adapter has its own per-method unit tests. A fake can be added later
 if service-level tests need one — nothing does today.
 
@@ -299,7 +299,7 @@ as the slash-account-auth doc's `PrincipalSource::Cli` branch.
 - Approvals produce no trace log — the CLI prints the approved triple
   (raw; it's the operator's own terminal) in its command output.
 - The refusal Notice's code is not logged — it is surfaced to the
-  end-user verbatim and belongs only in the libsql row.
+  end-user verbatim and belongs only in the sqlite row.
 
 ## Constraints
 

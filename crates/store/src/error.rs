@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 /// Error returned by every `*Store` trait. Concrete adapters (e.g. the
-/// libsql impls in `baybo-storage`) map their backend failures onto these
+/// sqlite impls in `baybo-storage`) map their backend failures onto these
 /// variants; callers that need a domain-specific error convert at the
 /// boundary (e.g. `impl From<StorageError> for SessionError`).
 #[derive(Debug, Error)]
@@ -24,7 +24,7 @@ pub enum StorageError {
     #[error("payload too large: {actual} bytes exceeds limit of {limit}")]
     TooLarge { limit: u64, actual: u64 },
 
-    /// Generic wrapper for unexpected lower-layer errors (e.g. libsql
+    /// Generic wrapper for unexpected lower-layer errors (e.g. sqlite
     /// driver failures that don't map cleanly onto a richer variant).
     #[error(transparent)]
     Internal(#[from] anyhow::Error),

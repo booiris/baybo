@@ -1,7 +1,7 @@
 //! Background loop that keeps each connected sidecar's bot roster in
-//! sync with the `channel_bots` libsql table.
+//! sync with the `channel_bots` sqlite table.
 //!
-//! Tokens live in the vault, rows in libsql describe which bots are
+//! Tokens live in the vault, rows in sqlite describe which bots are
 //! live for a given `channel_type`. The CLI (`baybo channel
 //! add/remove`) writes to those two stores directly; the gateway
 //! doesn't know when that happens. This loop polls every

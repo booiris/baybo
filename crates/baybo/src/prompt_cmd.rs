@@ -57,7 +57,7 @@ const INPROCESS_EVENT_CAPACITY: usize = 256;
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(5);
 
 /// Upper bound on flushing detached cost-record writes before teardown —
-/// generous for a libsql write, short enough not to hang the CLI if one
+/// generous for a sqlite write, short enough not to hang the CLI if one
 /// wedges.
 const COST_DRAIN_BUDGET: Duration = Duration::from_secs(3);
 
@@ -284,7 +284,7 @@ async fn run_in_process(
     // persists on a spawned task; the long-running gateway outlives
     // those, but here the process exits seconds later, so an un-drained
     // write would be aborted and the turn's spend lost. Bounded so a
-    // wedged libsql write can't hang the CLI.
+    // wedged sqlite write can't hang the CLI.
     let _ = tokio::time::timeout(COST_DRAIN_BUDGET, graph.cost_manager.drain()).await;
 
     // Tear the runtime down: trip the shutdown signal (cascades to actors

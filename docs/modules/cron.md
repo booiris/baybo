@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `cron` crate owns scheduled recurring work end-to-end: the `CronScheduler` (`scheduler.rs`) that ticks against the store, the `Shutdown` trait (`shutdown.rs`) used to bound the scheduler's tick loop, and `CronError`. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`, `ExecutionOutcome`, `PendingCronResult`) live in `baybo-model` (re-exported here for back-compat); the `CronStore` persistence trait lives in the `baybo-store` ports crate. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs. The libsql implementation of `CronStore` lives in `baybo-storage`; the LLM-invocable cron tools (`CronCreate` / `CronDelete` / `CronList`) live in `baybo-cron::tools` (the crate depends on `baybo-tools` for the `Tool` trait). `baybo-agent` re-exports `CronScheduler` and `CronTriggerEvent` for assembly-layer consumers.
+The `cron` crate owns scheduled recurring work end-to-end: the `CronScheduler` (`scheduler.rs`) that ticks against the store, the `Shutdown` trait (`shutdown.rs`) used to bound the scheduler's tick loop, and `CronError`. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`, `ExecutionOutcome`, `PendingCronResult`) live in `baybo-model` (re-exported here for back-compat); the `CronStore` persistence trait lives in the `baybo-store` ports crate. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs. The sqlite implementation of `CronStore` lives in `baybo-storage`; the LLM-invocable cron tools (`CronCreate` / `CronDelete` / `CronList`) live in `baybo-cron::tools` (the crate depends on `baybo-tools` for the `Tool` trait). `baybo-agent` re-exports `CronScheduler` and `CronTriggerEvent` for assembly-layer consumers.
 
 CronJobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration. Each fire mints a brand-new session in the agent layer — one trigger = one session — so the run sees a clean transcript and fresh `SessionState`. A `CronJob` also records its `origin_session_id`: the conversation it was created from, which for a one-shot is where the fire's result is reported back.
 
@@ -128,7 +128,7 @@ A fire is delivered to the model as a *user* turn, so a bare prompt is ambiguous
 
 ### Storage decoupling
 
-The `CronStore` trait lives in the `baybo-store` ports crate (its libsql impl in `baybo-storage`) and operates on the domain types directly — `CronJob` / `CronExecution` / `ExecutionStatus` / `ExecutionCompletion` rather than opaque row shapes. The libsql implementation in `baybo-storage::libsql::cron` handles JSON serialization of the `data` column internally; the delivery ledger additionally projects `completed_at` / `notified_at` into columns so the boot re-drive's scan is an indexed query rather than a full-table deserialize.
+The `CronStore` trait lives in the `baybo-store` ports crate (its sqlite impl in `baybo-storage`) and operates on the domain types directly — `CronJob` / `CronExecution` / `ExecutionStatus` / `ExecutionCompletion` rather than opaque row shapes. The sqlite implementation in `baybo-storage::sqlite::cron` handles JSON serialization of the `data` column internally; the delivery ledger additionally projects `completed_at` / `notified_at` into columns so the boot re-drive's scan is an indexed query rather than a full-table deserialize.
 
 ## Constraints
 
@@ -140,7 +140,7 @@ The `CronStore` trait lives in the `baybo-store` ports crate (its libsql impl in
 
 | Module | Role |
 |--------|------|
-| `storage` | `LibsqlCronStore` implements the `CronStore` trait (from `baybo-store`) against libsql, over `baybo-model` types; no dependency on `baybo-cron` |
+| `storage` | `SqliteCronStore` implements the `CronStore` trait (from `baybo-store`) against sqlite, over `baybo-model` types; no dependency on `baybo-cron` |
 | `tools`   | `baybo-cron::tools` implements the `Tool` trait (`CronCreate` / `CronDelete` / `CronList`), bridging `Arc<CronScheduler>` to the registry; `crates/baybo/src/runtime.rs` registers them |
 | `agent`   | Re-exports `CronScheduler` / `CronTriggerEvent`; `Router` consumes the event stream, mints the fire session, routes `AgentMessage::CronTrigger`, waits on one-shot fires, and re-drives undelivered results at boot. The origin actor handles `AgentMessage::CronResultReady` |
 | `job`     | `JobInput::Cron` marks a fire; `JobInput::CronNotification` marks the (inference-free) delivery of a one-shot's result, whose `Completed { reply_ordinal }` edge drives push |

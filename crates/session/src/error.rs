@@ -7,7 +7,7 @@ use thiserror::Error;
 /// boundary.
 ///
 /// Storage-layer failures collapse into [`SessionError::Storage`] —
-/// the libsql backend's structured `StorageError` is stringified at
+/// the sqlite backend's structured `StorageError` is stringified at
 /// the boundary so callers never need to depend on `baybo-storage`'s
 /// error type.
 #[derive(Debug, Error)]
@@ -30,7 +30,7 @@ pub enum SessionError {
     Internal(#[from] anyhow::Error),
 }
 
-/// Bridge the libsql-backed store error to the public `SessionError`.
+/// Bridge the sqlite-backed store error to the public `SessionError`.
 /// Stringifies generic failures into [`SessionError::Storage`].
 impl From<baybo_store::StorageError> for SessionError {
     fn from(e: baybo_store::StorageError) -> Self {

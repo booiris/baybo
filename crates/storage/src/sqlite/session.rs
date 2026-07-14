@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rusqlite::OptionalExtension;
 
-use super::LibsqlPool;
+use super::SqlitePool;
 use baybo_model::{
     ChatMessage, ControlEvent, ControlEventKind, FolderId, LineageKind, LlmEntryName, Session,
     SessionId,
@@ -9,12 +10,12 @@ use baybo_model::{
 use baybo_store::StorageError;
 use baybo_store::session::{Result, SessionMessageAppendOutcome, SessionStore, StoredMessage};
 
-pub struct LibsqlSessionStore {
-    pool: LibsqlPool,
+pub struct SqliteSessionStore {
+    pool: SqlitePool,
 }
 
-impl LibsqlSessionStore {
-    pub fn new(pool: LibsqlPool) -> Self {
+impl SqliteSessionStore {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 }
@@ -24,6 +25,30 @@ impl LibsqlSessionStore {
 /// (read side). Keeping it here as a named constant prevents drift
 /// when a new variant lands.
 pub(super) const LINEAGE_KIND_SUBAGENT: &str = "subagent";
+
+/// Raw `session_messages` columns as they come off a row, decoded into a
+/// [`ChatMessage`] only once the connection has been released: `(role,
+/// content_json, source, platform_msg_id)`. The serde/enum decode can fail with
+/// a non-`Internal` [`StorageError`], which the pool's `anyhow` closure cannot
+/// build, so every read path collects these tuples first and rehydrates after.
+type RawMessageRow = (String, String, String, String);
+
+/// [`RawMessageRow`] plus the row's `ordinal` and `created_at` (Unix µs), for
+/// the paging reads that surface both.
+type RawMessageRowWithMeta = (i64, String, String, String, i64, String);
+
+/// Raw `sessions` columns projected by the list/get reads:
+/// `(data, hidden, last_llm, pinned, id, folder_id, archived, title)`.
+type RawSessionListRow = (
+    String,
+    i64,
+    Option<String>,
+    i64,
+    String,
+    Option<String>,
+    i64,
+    Option<String>,
+);
 
 fn lineage_kind_str(s: &Session) -> Option<&'static str> {
     s.lineage.as_ref().map(|l| match l.kind {
@@ -65,64 +90,100 @@ fn rehydrate_message(
     .with_platform_msg_id(platform_msg_id))
 }
 
+/// Decode one [`RawMessageRow`] into a [`ChatMessage`].
+fn decode_message_row(row: RawMessageRow) -> Result<ChatMessage> {
+    let (role, content_json, source_str, platform_msg_id) = row;
+    let content = serde_json::from_str(&content_json)
+        .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
+    rehydrate_message(&role, content, &source_str, platform_msg_id)
+}
+
+/// Rebuild a [`Session`] from a [`RawSessionListRow`], patching the flat
+/// columns over the JSON blob. Flat columns are authoritative; targeted setters
+/// leave the JSON blob untouched to avoid load/save races.
+fn decode_session_row(row: &RawSessionListRow) -> serde_json::Result<Session> {
+    let (data, hidden_col, last_llm_col, pinned_col, _id, folder_id_col, archived_col, title_col) =
+        row;
+    let mut session: Session = serde_json::from_str(data)?;
+    session.hidden = *hidden_col != 0;
+    session.state.last_llm = last_llm_col.clone().map(LlmEntryName::from);
+    session.pinned = *pinned_col != 0;
+    session.folder_id = folder_id_col.clone().map(FolderId::from);
+    session.archived = *archived_col != 0;
+    session.title = title_col.clone();
+    Ok(session)
+}
+
+fn read_session_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSessionListRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+fn read_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawMessageRow> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+}
+
 #[async_trait]
-impl SessionStore for LibsqlSessionStore {
+impl SessionStore for SqliteSessionStore {
     async fn get(&self, session_id: &SessionId) -> Result<Option<Session>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT data, hidden, last_llm, pinned, folder_id, archived, title FROM sessions WHERE id = ?1",
-                libsql::params![session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+        let sid = session_id.as_str().to_string();
+        let row = self
+            .pool
+            .interact("sessions.get", move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT data, hidden, last_llm, pinned, folder_id, archived, title FROM sessions WHERE id = ?1",
+                        rusqlite::params![sid],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                                row.get::<_, i64>(5)?,
+                                row.get::<_, Option<String>>(6)?,
+                            ))
+                        },
+                    )
+                    .optional()?)
+            })
+            .await?;
 
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
-
-        match row {
-            Some(row) => {
-                let data: String = row
-                    .get(0)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let hidden_col: i64 = row
-                    .get(1)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let last_llm_col: Option<String> = row
-                    .get(2)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let pinned_col: i64 = row
-                    .get(3)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let folder_id_col: Option<String> = row
-                    .get(4)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let archived_col: i64 = row
-                    .get(5)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let title_col: Option<String> = row
-                    .get(6)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let mut session: Session = serde_json::from_str(&data)
-                    .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
-                // Flat columns are authoritative; targeted setters leave the
-                // JSON blob untouched to avoid load/save races.
-                session.hidden = hidden_col != 0;
-                session.state.last_llm = last_llm_col.map(LlmEntryName::from);
-                session.pinned = pinned_col != 0;
-                session.folder_id = folder_id_col.map(FolderId::from);
-                session.archived = archived_col != 0;
-                session.title = title_col;
-                Ok(Some(session))
-            }
-            None => Ok(None),
-        }
+        let Some((
+            data,
+            hidden_col,
+            last_llm_col,
+            pinned_col,
+            folder_id_col,
+            archived_col,
+            title_col,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let mut session: Session = serde_json::from_str(&data)
+            .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
+        // Flat columns are authoritative; targeted setters leave the
+        // JSON blob untouched to avoid load/save races.
+        session.hidden = hidden_col != 0;
+        session.state.last_llm = last_llm_col.map(LlmEntryName::from);
+        session.pinned = pinned_col != 0;
+        session.folder_id = folder_id_col.map(FolderId::from);
+        session.archived = archived_col != 0;
+        session.title = title_col;
+        Ok(Some(session))
     }
 
     async fn save(&self, session: &Session) -> Result<()> {
-        let conn = self.pool.conn();
         let data = serde_json::to_string(session)
             .map_err(|e| StorageError::Storage(format!("serialize session: {e}")))?;
         let trigger_kind = match session.trigger.kind() {
@@ -146,6 +207,11 @@ impl SessionStore for LibsqlSessionStore {
         let hidden_flag: i64 = if session.hidden { 1 } else { 0 };
         let pinned_flag: i64 = if session.pinned { 1 } else { 0 };
         let archived_flag: i64 = if session.archived { 1 } else { 0 };
+        let id = session.id.as_str().to_string();
+        let root_id = session.root_session_id.as_str().to_string();
+        let trigger_kind = trigger_kind.to_string();
+        let created_us = super::time::to_us(session.created_at);
+        let last_active_us = super::time::to_us(session.last_active);
         // Upsert in place (NOT `INSERT OR REPLACE`, which delete+reinserts
         // the row). The DO UPDATE clause omits the flat columns owned by
         // targeted setters (`hidden`, `last_llm`, `pinned`, `folder_id`,
@@ -154,58 +220,62 @@ impl SessionStore for LibsqlSessionStore {
         // archived the conversation) cannot clobber them. `hidden` / `pinned` /
         // `archived` are seeded only on a brand-new row (`?10`–`?12`); `get`
         // reads all flat columns as authoritative over the JSON blob.
-        conn.execute(
-            "INSERT INTO sessions \
-             (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
-              parent_span_id, lineage_kind, created_at, last_active, \
-              hidden, pinned, archived, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
-             ON CONFLICT(id) DO UPDATE SET \
-               root_session_id = excluded.root_session_id, \
-               trigger_kind = excluded.trigger_kind, \
-               parent_session_id = excluded.parent_session_id, \
-               parent_job_id = excluded.parent_job_id, \
-               parent_span_id = excluded.parent_span_id, \
-               lineage_kind = excluded.lineage_kind, \
-               created_at = excluded.created_at, \
-               last_active = excluded.last_active, \
-               data = excluded.data",
-            libsql::params![
-                session.id.as_str().to_string(),
-                session.root_session_id.as_str().to_string(),
-                trigger_kind.to_string(),
-                parent_session,
-                parent_job,
-                parent_span,
-                lineage_kind,
-                super::time::to_us(session.created_at),
-                super::time::to_us(session.last_active),
-                hidden_flag,
-                pinned_flag,
-                archived_flag,
-                data,
-            ],
-        )
-        .await
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql insert session: {e}")))?;
-        Ok(())
+        self.pool
+            .interact("sessions.save", move |conn| {
+                conn.execute(
+                    "INSERT INTO sessions \
+                     (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
+                      parent_span_id, lineage_kind, created_at, last_active, \
+                      hidden, pinned, archived, data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                       root_session_id = excluded.root_session_id, \
+                       trigger_kind = excluded.trigger_kind, \
+                       parent_session_id = excluded.parent_session_id, \
+                       parent_job_id = excluded.parent_job_id, \
+                       parent_span_id = excluded.parent_span_id, \
+                       lineage_kind = excluded.lineage_kind, \
+                       created_at = excluded.created_at, \
+                       last_active = excluded.last_active, \
+                       data = excluded.data",
+                    rusqlite::params![
+                        id,
+                        root_id,
+                        trigger_kind,
+                        parent_session,
+                        parent_job,
+                        parent_span,
+                        lineage_kind,
+                        created_us,
+                        last_active_us,
+                        hidden_flag,
+                        pinned_flag,
+                        archived_flag,
+                        data,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
     }
 
     async fn set_hidden(&self, session_id: &SessionId, hidden: bool) -> Result<bool> {
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
         let flag: i64 = if hidden { 1 } else { 0 };
         // Targeted UPDATE on the flat column only — the JSON `data`
         // blob is left alone so a concurrent `touch` (which goes
         // through load + save) can't lose this write. `get` patches
         // `Session.hidden` from the column on read, so observers see
         // the up-to-date value regardless of blob staleness.
-        let affected = conn
-            .execute(
-                "UPDATE sessions SET hidden = ?2 WHERE id = ?1",
-                libsql::params![session_id.as_str().to_string(), flag],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_hidden: {e}")))?;
+        let affected = self
+            .pool
+            .interact("sessions.set_hidden", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE sessions SET hidden = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, flag],
+                )?)
+            })
+            .await?;
         Ok(affected > 0)
     }
 
@@ -214,54 +284,60 @@ impl SessionStore for LibsqlSessionStore {
         session_id: &SessionId,
         llm: Option<&LlmEntryName>,
     ) -> Result<bool> {
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
         // Targeted UPDATE on the flat column only — like `set_hidden`,
         // the JSON `data` blob is left alone so a concurrent `touch`
         // (load + full save) can't lose this write. `get` patches
         // `Session.state.last_llm` from the column on read. `NULL`
         // clears the pin back to `default-llm`.
         let value: Option<String> = llm.map(|n| n.as_str().to_string());
-        let affected = conn
-            .execute(
-                "UPDATE sessions SET last_llm = ?2 WHERE id = ?1",
-                libsql::params![session_id.as_str().to_string(), value],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_last_llm: {e}")))?;
+        let affected = self
+            .pool
+            .interact("sessions.set_last_llm", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE sessions SET last_llm = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, value],
+                )?)
+            })
+            .await?;
         Ok(affected > 0)
     }
 
     async fn set_pinned(&self, session_id: &SessionId, pinned: bool) -> Result<bool> {
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
         let flag: i64 = if pinned { 1 } else { 0 };
         // Targeted UPDATE on the flat column only — like `set_hidden`,
         // the JSON `data` blob is left alone so a concurrent `touch`
         // (load + full save) can't lose this write. `get` patches
         // `Session.pinned` from the column on read.
-        let affected = conn
-            .execute(
-                "UPDATE sessions SET pinned = ?2 WHERE id = ?1",
-                libsql::params![session_id.as_str().to_string(), flag],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_pinned: {e}")))?;
+        let affected = self
+            .pool
+            .interact("sessions.set_pinned", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE sessions SET pinned = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, flag],
+                )?)
+            })
+            .await?;
         Ok(affected > 0)
     }
 
     async fn set_archived(&self, session_id: &SessionId, archived: bool) -> Result<bool> {
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
         let flag: i64 = if archived { 1 } else { 0 };
         // Targeted UPDATE on the flat column only — like `set_hidden`,
         // the JSON `data` blob is left alone so a concurrent `touch`
         // (load + full save) can't lose this write. `get` patches
         // `Session.archived` from the column on read.
-        let affected = conn
-            .execute(
-                "UPDATE sessions SET archived = ?2 WHERE id = ?1",
-                libsql::params![session_id.as_str().to_string(), flag],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_archived: {e}")))?;
+        let affected = self
+            .pool
+            .interact("sessions.set_archived", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE sessions SET archived = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, flag],
+                )?)
+            })
+            .await?;
         Ok(affected > 0)
     }
 
@@ -270,207 +346,158 @@ impl SessionStore for LibsqlSessionStore {
         session_id: &SessionId,
         folder_id: Option<&FolderId>,
     ) -> Result<bool> {
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
         // Targeted UPDATE on the flat column only — like `set_hidden` /
         // `set_pinned`, the JSON `data` blob is left alone so a concurrent
         // `touch` (load + full save) can't lose this write. `get` patches
         // `Session.folder_id` from the column on read. `NULL` clears the
         // assignment back to uncategorized.
         let value: Option<String> = folder_id.map(|f| f.as_str().to_string());
-        let affected = conn
-            .execute(
-                "UPDATE sessions SET folder_id = ?2 WHERE id = ?1",
-                libsql::params![session_id.as_str().to_string(), value],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_folder: {e}")))?;
+        let affected = self
+            .pool
+            .interact("sessions.set_folder", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE sessions SET folder_id = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, value],
+                )?)
+            })
+            .await?;
         Ok(affected > 0)
     }
 
     async fn set_read_cursor(&self, session_id: &SessionId, ordinal: i64) -> Result<bool> {
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
         // Targeted, max-wins UPDATE on the flat column only — the `CASE`
         // guards against a reordered/stale marker regressing the cursor (a
         // background tab PUTting an older read position must not undo a newer
         // one). The JSON `data` blob is untouched, like `set_pinned`.
-        let affected = conn
-            .execute(
-                "UPDATE sessions \
-                 SET read_cursor = CASE \
-                     WHEN read_cursor IS NULL OR ?2 > read_cursor THEN ?2 \
-                     ELSE read_cursor END \
-                 WHERE id = ?1",
-                libsql::params![session_id.as_str().to_string(), ordinal],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_read_cursor: {e}")))?;
+        let affected = self
+            .pool
+            .interact("sessions.set_read_cursor", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE sessions \
+                     SET read_cursor = CASE \
+                         WHEN read_cursor IS NULL OR ?2 > read_cursor THEN ?2 \
+                         ELSE read_cursor END \
+                     WHERE id = ?1",
+                    rusqlite::params![sid, ordinal],
+                )?)
+            })
+            .await?;
         Ok(affected > 0)
     }
 
     async fn read_cursor(&self, session_id: &SessionId) -> Result<Option<i64>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT read_cursor FROM sessions WHERE id = ?1",
-                libsql::params![session_id.as_str().to_string()],
-            )
+        let sid = session_id.as_str().to_string();
+        self.pool
+            .interact("sessions.read_cursor", move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT read_cursor FROM sessions WHERE id = ?1",
+                        rusqlite::params![sid],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?
+                    .flatten())
+            })
             .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql read_cursor: {e}")))?;
-        let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        else {
-            return Ok(None);
-        };
-        row.get::<Option<i64>>(0)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get read_cursor: {e}")))
     }
 
     async fn set_title(&self, session_id: &SessionId, title: Option<&str>) -> Result<bool> {
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
         let value: Option<String> = title.map(|t| t.to_string());
-        let affected = conn
-            .execute(
-                "UPDATE sessions SET title = ?2 WHERE id = ?1",
-                libsql::params![session_id.as_str().to_string(), value],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_title: {e}")))?;
+        let affected = self
+            .pool
+            .interact("sessions.set_title", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE sessions SET title = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, value],
+                )?)
+            })
+            .await?;
         Ok(affected > 0)
     }
 
     async fn delete(&self, session_id: &SessionId) -> Result<bool> {
-        // The message-log cascade and the session-row delete must commit
-        // as a unit (see below); BEGIN IMMEDIATE takes the write lock up
-        // front so the pair runs without an interleaved writer.
-        let conn = self.pool.conn();
-        let tx = conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql begin delete tx: {e}")))?;
+        let sid = session_id.as_str().to_string();
+        self.pool
+            .interact("sessions.delete", move |conn| {
+                // The message-log cascade and the session-row delete must commit
+                // as a unit (see below); BEGIN IMMEDIATE takes the write lock up
+                // front so the pair runs without an interleaved writer.
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        // Cascade the message log first — there's no FK in sqlite, so
-        // a stranded `session_messages` row would otherwise outlive
-        // its parent.
-        tx.execute(
-            "DELETE FROM session_messages WHERE session_id = ?1",
-            libsql::params![session_id.as_str().to_string()],
-        )
-        .await
-        .map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!("libsql delete session_messages: {e}"))
-        })?;
+                // Cascade the message log first — there's no FK in sqlite, so
+                // a stranded `session_messages` row would otherwise outlive
+                // its parent.
+                tx.execute(
+                    "DELETE FROM session_messages WHERE session_id = ?1",
+                    rusqlite::params![sid],
+                )?;
 
-        let affected = tx
-            .execute(
-                "DELETE FROM sessions WHERE id = ?1",
-                libsql::params![session_id.as_str().to_string()],
-            )
+                let affected =
+                    tx.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![sid])?;
+                if affected == 0 {
+                    // Dropping the transaction rolls it back.
+                    drop(tx);
+                    return Ok(false);
+                }
+                tx.commit()?;
+                Ok(true)
+            })
             .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete session: {e}")))?;
-        if affected == 0 {
-            let _ = tx.rollback().await;
-            return Ok(false);
-        }
-        tx.commit()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql commit: {e}")))?;
-        Ok(true)
     }
 
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT id FROM sessions WHERE last_active < ?1",
-                libsql::params![super::time::to_us(before)],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-
-        let mut expired = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let id: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            expired.push(SessionId::from(id));
-        }
-        Ok(expired)
+        let before_us = super::time::to_us(before);
+        let ids = self
+            .pool
+            .interact("sessions.list_expired", move |conn| {
+                let mut stmt = conn.prepare("SELECT id FROM sessions WHERE last_active < ?1")?;
+                let ids = stmt
+                    .query_map(rusqlite::params![before_us], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(ids)
+            })
+            .await?;
+        Ok(ids.into_iter().map(SessionId::from).collect())
     }
 
     async fn list_all(&self) -> Result<Vec<Session>> {
-        let conn = self.pool.conn();
         // Project the flat `hidden` column — `set_hidden` writes there
         // directly without rewriting the JSON `data` blob, so trusting
         // only the blob would read stale values. `id` rides along purely
         // so a row whose `data` blob fails to deserialize (e.g. one
         // written by an older build whose lineage kind this build doesn't
         // know) can be named in the skip warning.
-        let mut rows = conn
-            .query(
-                "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title FROM sessions \
-                 ORDER BY last_active DESC",
-                (),
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+        let rows = self
+            .pool
+            .interact("sessions.list_all", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title FROM sessions \
+                     ORDER BY last_active DESC",
+                )?;
+                let rows = stmt
+                    .query_map([], read_session_list_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
 
         let mut sessions = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let hidden_col: i64 = row
-                .get(1)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let last_llm_col: Option<String> = row
-                .get(2)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let pinned_col: i64 = row
-                .get(3)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let id_col: String = row
-                .get(4)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let folder_id_col: Option<String> = row
-                .get(5)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let archived_col: i64 = row
-                .get(6)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let title_col: Option<String> = row
-                .get(7)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+        for row in &rows {
             // A single undeserializable row (e.g. one written by an older
             // build whose `lineage.kind` this build doesn't know) must
             // degrade to "silently absent from the listing", never fail
             // the whole listing and 500 the CLI picker / web UI.
-            let mut session: Session = match serde_json::from_str(&data) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        session_id = %id_col,
-                        "skipping session row that failed to deserialize: {e}"
-                    );
-                    continue;
-                }
-            };
-            session.hidden = hidden_col != 0;
-            session.state.last_llm = last_llm_col.map(LlmEntryName::from);
-            session.pinned = pinned_col != 0;
-            session.folder_id = folder_id_col.map(FolderId::from);
-            session.archived = archived_col != 0;
-            session.title = title_col;
-            sessions.push(session);
+            match decode_session_row(row) {
+                Ok(session) => sessions.push(session),
+                Err(e) => tracing::warn!(
+                    session_id = %row.4,
+                    "skipping session row that failed to deserialize: {e}"
+                ),
+            }
         }
         Ok(sessions)
     }
@@ -481,70 +508,37 @@ impl SessionStore for LibsqlSessionStore {
         // (it rides inside the JSON `data` blob), so a real index
         // isn't available without a schema migration. This is still
         // a full table scan, but non-matching rows never ship their
-        // `data` blob over the libsql wire or pay the serde decode
+        // `data` blob out of sqlite or pay the serde decode
         // in userland, which is the cost we actually care about for
         // a long-running gateway with thousands of bot sessions.
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title FROM sessions \
-                 WHERE json_extract(data, '$.channel') = ?1 \
-                 ORDER BY last_active DESC",
-                libsql::params![channel.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query by channel: {e}")))?;
+        let channel = channel.as_str().to_string();
+        let rows = self
+            .pool
+            .interact("sessions.list_by_channel", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT data, hidden, last_llm, pinned, id, folder_id, archived, title FROM sessions \
+                     WHERE json_extract(data, '$.channel') = ?1 \
+                     ORDER BY last_active DESC",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![channel], read_session_list_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
 
         let mut sessions = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let hidden_col: i64 = row
-                .get(1)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let last_llm_col: Option<String> = row
-                .get(2)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let pinned_col: i64 = row
-                .get(3)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let id_col: String = row
-                .get(4)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let folder_id_col: Option<String> = row
-                .get(5)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let archived_col: i64 = row
-                .get(6)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let title_col: Option<String> = row
-                .get(7)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+        for row in &rows {
             // Same skip-on-error discipline as `list_all`: a row whose
             // blob fails to deserialize drops out of the listing rather
             // than failing the whole chat-list query.
-            let mut session: Session = match serde_json::from_str(&data) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        session_id = %id_col,
-                        "skipping session row that failed to deserialize: {e}"
-                    );
-                    continue;
-                }
-            };
-            session.hidden = hidden_col != 0;
-            session.state.last_llm = last_llm_col.map(LlmEntryName::from);
-            session.pinned = pinned_col != 0;
-            session.folder_id = folder_id_col.map(FolderId::from);
-            session.archived = archived_col != 0;
-            session.title = title_col;
-            sessions.push(session);
+            match decode_session_row(row) {
+                Ok(session) => sessions.push(session),
+                Err(e) => tracing::warn!(
+                    session_id = %row.4,
+                    "skipping session row that failed to deserialize: {e}"
+                ),
+            }
         }
         Ok(sessions)
     }
@@ -553,39 +547,34 @@ impl SessionStore for LibsqlSessionStore {
         &self,
         parent_session_id: &SessionId,
     ) -> Result<Vec<(SessionId, LineageKind)>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT id, lineage_kind FROM sessions \
-                 WHERE parent_session_id = ?1 AND lineage_kind IS NOT NULL",
-                libsql::params![parent_session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+        let parent = parent_session_id.as_str().to_string();
+        self.pool
+            .interact("sessions.list_lineage_children", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, lineage_kind FROM sessions \
+                     WHERE parent_session_id = ?1 AND lineage_kind IS NOT NULL",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![parent], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        let mut children = Vec::new();
-        while let Some(row) = rows
-            .next()
+                let mut children = Vec::new();
+                for (id, kind_tag) in rows {
+                    // The variant is payload-free, so the kind tag alone
+                    // reconstructs the `LineageKind` — no JSON decode needed.
+                    // An unrecognised tag is skipped rather than erroring the whole
+                    // listing.
+                    let kind = match kind_tag.as_str() {
+                        LINEAGE_KIND_SUBAGENT => LineageKind::Subagent,
+                        _ => continue,
+                    };
+                    children.push((SessionId::from(id), kind));
+                }
+                Ok(children)
+            })
             .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let id: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let kind_tag: String = row
-                .get(1)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            // The variant is payload-free, so the kind tag alone
-            // reconstructs the `LineageKind` — no JSON decode needed.
-            // An unrecognised tag is skipped rather than erroring the whole
-            // listing.
-            let kind = match kind_tag.as_str() {
-                LINEAGE_KIND_SUBAGENT => LineageKind::Subagent,
-                _ => continue,
-            };
-            children.push((SessionId::from(id), kind));
-        }
-        Ok(children)
     }
 
     async fn append_session_message(
@@ -593,49 +582,37 @@ impl SessionStore for LibsqlSessionStore {
         session_id: &SessionId,
         message: &ChatMessage,
     ) -> Result<i64> {
-        let conn = self.pool.conn();
-        let role = message.role.as_str();
+        let sid = session_id.as_str().to_string();
+        let role = message.role.as_str().to_string();
         let content = serde_json::to_string(&message.content)
             .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
         let now_us = super::time::to_us(chrono::Utc::now());
+        let source = message.source().as_str().to_string();
+        let platform_msg_id = message.platform_msg_id().to_string();
         // `INSERT … SELECT COALESCE(MAX(ordinal),-1)+1 … RETURNING` keeps
         // ordinals contiguous without an explicit sequence and hands
         // back the assigned value in one round trip. The actor model
         // serialises writes per session, so there's no concurrent-
         // append race to defend against here.
-        let mut rows = conn
-            .query(
-                "INSERT INTO session_messages \
-             (session_id, ordinal, role, content, created_at, source, platform_msg_id) \
-             SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4, ?5, ?6 \
-             FROM session_messages WHERE session_id = ?1 \
-             RETURNING ordinal",
-                libsql::params![
-                    session_id.as_str().to_string(),
-                    role.to_string(),
-                    content,
-                    now_us,
-                    message.source().as_str().to_string(),
-                    message.platform_msg_id().to_string(),
-                ],
-            )
+        self.pool
+            .interact("sessions.append_session_message", move |conn| {
+                let ordinal: i64 = conn
+                    .query_row(
+                        "INSERT INTO session_messages \
+                     (session_id, ordinal, role, content, created_at, source, platform_msg_id) \
+                     SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4, ?5, ?6 \
+                     FROM session_messages WHERE session_id = ?1 \
+                     RETURNING ordinal",
+                        rusqlite::params![sid, role, content, now_us, source, platform_msg_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("INSERT … RETURNING returned no rows for session_messages")
+                    })?;
+                Ok(ordinal)
+            })
             .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql append session_message: {e}"))
-            })?;
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-            .ok_or_else(|| {
-                StorageError::Internal(anyhow::anyhow!(
-                    "INSERT … RETURNING returned no rows for session_messages"
-                ))
-            })?;
-        let ordinal: i64 = row
-            .get(0)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ordinal: {e}")))?;
-        Ok(ordinal)
     }
 
     async fn append_session_message_idempotent(
@@ -650,76 +627,58 @@ impl SessionStore for LibsqlSessionStore {
             ));
         }
 
-        let conn = self.pool.conn();
-        let role = message.role.as_str();
+        let role = message.role.as_str().to_string();
         let content = serde_json::to_string(&message.content)
             .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
         let now_us = super::time::to_us(chrono::Utc::now());
         let session_id = session_id.as_str().to_string();
         let source_event_id = source_event_id.to_string();
-        let mut rows = conn
-            .query(
-                "INSERT INTO session_messages \
-                 (session_id, ordinal, role, content, created_at, source, \
-                  platform_msg_id, source_event_id) \
-                 SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4, ?5, ?6, ?7 \
-                 FROM session_messages WHERE session_id = ?1 \
-                 ON CONFLICT DO NOTHING \
-                 RETURNING ordinal",
-                libsql::params![
-                    session_id.clone(),
-                    role.to_string(),
-                    content,
-                    now_us,
-                    message.source().as_str().to_string(),
-                    message.platform_msg_id().to_string(),
-                    source_event_id.clone(),
-                ],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!(
-                    "libsql idempotent append session_message: {e}"
-                ))
-            })?;
+        let source = message.source().as_str().to_string();
+        let platform_msg_id = message.platform_msg_id().to_string();
+        self.pool
+            .interact("sessions.append_session_message_idempotent", move |conn| {
+                let inserted: Option<i64> = conn
+                    .query_row(
+                        "INSERT INTO session_messages \
+                         (session_id, ordinal, role, content, created_at, source, \
+                          platform_msg_id, source_event_id) \
+                         SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4, ?5, ?6, ?7 \
+                         FROM session_messages WHERE session_id = ?1 \
+                         ON CONFLICT DO NOTHING \
+                         RETURNING ordinal",
+                        rusqlite::params![
+                            session_id,
+                            role,
+                            content,
+                            now_us,
+                            source,
+                            platform_msg_id,
+                            source_event_id,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
 
-        if let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let ordinal = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ordinal: {e}")))?;
-            return Ok(SessionMessageAppendOutcome::Inserted { ordinal });
-        }
-        drop(rows);
+                if let Some(ordinal) = inserted {
+                    return Ok(SessionMessageAppendOutcome::Inserted { ordinal });
+                }
 
-        let mut rows = conn
-            .query(
-                "SELECT ordinal FROM session_messages \
-                 WHERE session_id = ?1 AND source_event_id = ?2",
-                libsql::params![session_id, source_event_id],
-            )
+                let ordinal: i64 = conn
+                    .query_row(
+                        "SELECT ordinal FROM session_messages \
+                         WHERE session_id = ?1 AND source_event_id = ?2",
+                        rusqlite::params![session_id, source_event_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "idempotent session_message insert returned no row and no existing key"
+                        )
+                    })?;
+                Ok(SessionMessageAppendOutcome::Existing { ordinal })
+            })
             .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!(
-                    "libsql find idempotent session_message: {e}"
-                ))
-            })?;
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-            .ok_or_else(|| {
-                StorageError::Internal(anyhow::anyhow!(
-                    "idempotent session_message insert returned no row and no existing key"
-                ))
-            })?;
-        let ordinal = row
-            .get(0)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ordinal: {e}")))?;
-        Ok(SessionMessageAppendOutcome::Existing { ordinal })
     }
 
     async fn find_message_ordinal_by_source_event_id(
@@ -727,30 +686,23 @@ impl SessionStore for LibsqlSessionStore {
         session_id: &SessionId,
         source_event_id: &str,
     ) -> Result<Option<i64>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT ordinal FROM session_messages \
-                 WHERE session_id = ?1 AND source_event_id = ?2",
-                libsql::params![session_id.as_str().to_string(), source_event_id.to_string()],
+        let sid = session_id.as_str().to_string();
+        let source_event_id = source_event_id.to_string();
+        self.pool
+            .interact(
+                "sessions.find_message_ordinal_by_source_event_id",
+                move |conn| {
+                    Ok(conn
+                        .query_row(
+                            "SELECT ordinal FROM session_messages \
+                             WHERE session_id = ?1 AND source_event_id = ?2",
+                            rusqlite::params![sid, source_event_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?)
+                },
             )
             .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!(
-                    "libsql find session_message by source event: {e}"
-                ))
-            })?;
-        let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        else {
-            return Ok(None);
-        };
-        let ordinal = row
-            .get(0)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ordinal: {e}")))?;
-        Ok(Some(ordinal))
     }
 
     async fn append_control_event(
@@ -761,75 +713,59 @@ impl SessionStore for LibsqlSessionStore {
         text: &str,
         created_at: DateTime<Utc>,
     ) -> Result<i64> {
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
+        let kind = kind.as_str().to_string();
+        let text = text.to_string();
         let created_us = super::time::to_us(created_at);
-        let mut rows = conn
-            .query(
-                "INSERT INTO session_control_events \
-             (session_id, seq, after_ordinal, kind, text, created_at) \
-             SELECT ?1, COALESCE(MAX(seq), -1) + 1, ?2, ?3, ?4, ?5 \
-             FROM session_control_events WHERE session_id = ?1 \
-             RETURNING seq",
-                libsql::params![
-                    session_id.as_str().to_string(),
-                    after_ordinal,
-                    kind.as_str().to_string(),
-                    text.to_string(),
-                    created_us,
-                ],
-            )
+        self.pool
+            .interact("sessions.append_control_event", move |conn| {
+                let seq: i64 = conn
+                    .query_row(
+                        "INSERT INTO session_control_events \
+                     (session_id, seq, after_ordinal, kind, text, created_at) \
+                     SELECT ?1, COALESCE(MAX(seq), -1) + 1, ?2, ?3, ?4, ?5 \
+                     FROM session_control_events WHERE session_id = ?1 \
+                     RETURNING seq",
+                        rusqlite::params![sid, after_ordinal, kind, text, created_us],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "INSERT … RETURNING returned no rows for session_control_events"
+                        )
+                    })?;
+                Ok(seq)
+            })
             .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql append control event: {e}"))
-            })?;
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-            .ok_or_else(|| {
-                StorageError::Internal(anyhow::anyhow!(
-                    "INSERT … RETURNING returned no rows for session_control_events"
-                ))
-            })?;
-        let seq: i64 = row
-            .get(0)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get seq: {e}")))?;
-        Ok(seq)
     }
 
     async fn list_control_events(&self, session_id: &SessionId) -> Result<Vec<ControlEvent>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT seq, after_ordinal, kind, text, created_at FROM session_control_events \
-                 WHERE session_id = ?1 ORDER BY seq",
-                libsql::params![session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql list control events: {e}"))
-            })?;
+        let sid = session_id.as_str().to_string();
+        let rows = self
+            .pool
+            .interact("sessions.list_control_events", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT seq, after_ordinal, kind, text, created_at FROM session_control_events \
+                     WHERE session_id = ?1 ORDER BY seq",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![sid], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+
         let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let seq: i64 = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get seq: {e}")))?;
-            let after_ordinal: i64 = row.get(1).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get after_ordinal: {e}"))
-            })?;
-            let kind_str: String = row
-                .get(2)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get kind: {e}")))?;
-            let text: String = row
-                .get(3)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get text: {e}")))?;
-            let created_us: i64 = row.get(4).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}"))
-            })?;
+        for (seq, after_ordinal, kind_str, text, created_us) in rows {
             let kind = kind_str
                 .parse::<ControlEventKind>()
                 .map_err(StorageError::Storage)?;
@@ -854,163 +790,128 @@ impl SessionStore for LibsqlSessionStore {
         session_id: &SessionId,
         new_active: &[ChatMessage],
     ) -> Result<()> {
-        let conn = self.pool.conn();
-        let tx = conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql begin compaction tx: {e}"))
-            })?;
-
-        // Next ordinal doubles as the supersede pointer: every
-        // existing active row points at it, and the first new active
-        // message lands there.
-        let mut rows = tx
-            .query(
-                "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM session_messages WHERE session_id = ?1",
-                libsql::params![session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql max ordinal: {e}")))?;
-        let next_ordinal: i64 = match rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            Some(row) => row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?,
-            None => 0,
-        };
-        drop(rows);
-
-        tx.execute(
-            "UPDATE session_messages SET superseded_by = ?2 \
-             WHERE session_id = ?1 AND superseded_by IS NULL",
-            libsql::params![session_id.as_str().to_string(), next_ordinal],
-        )
-        .await
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql supersede: {e}")))?;
-
-        let now_us = super::time::to_us(chrono::Utc::now());
-        // Multi-row INSERT, batched under SQLite's 999-bind limit.
-        // 7 columns per row → 142 rows per batch leaves 5 spare;
-        // typical Summarize emits ≤4 rows so this is one batch in
-        // practice. Keeps the whole compaction inside one tx and
-        // round-trip count constant (1) instead of O(new_active).
-        const COLS_PER_ROW: usize = 7;
-        const ROWS_PER_BATCH: usize = 999 / COLS_PER_ROW;
         let session_param = session_id.as_str().to_string();
-        for (chunk_idx, chunk) in new_active.chunks(ROWS_PER_BATCH).enumerate() {
-            let mut sql = String::from(
-                "INSERT INTO session_messages \
-                 (session_id, ordinal, role, content, created_at, source, platform_msg_id) VALUES ",
-            );
-            let mut params: Vec<libsql::Value> = Vec::with_capacity(chunk.len() * COLS_PER_ROW);
-            for (i, msg) in chunk.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                let p = i * COLS_PER_ROW;
-                sql.push_str(&format!(
-                    "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
-                    p + 1,
-                    p + 2,
-                    p + 3,
-                    p + 4,
-                    p + 5,
-                    p + 6,
-                    p + 7
-                ));
-                let ordinal = next_ordinal + (chunk_idx * ROWS_PER_BATCH) as i64 + i as i64;
-                let content = serde_json::to_string(&msg.content).map_err(|e| {
-                    StorageError::Storage(format!("serialize message content: {e}"))
-                })?;
-                params.push(libsql::Value::Text(session_param.clone()));
-                params.push(libsql::Value::Integer(ordinal));
-                params.push(libsql::Value::Text(msg.role.as_str().to_string()));
-                params.push(libsql::Value::Text(content));
-                params.push(libsql::Value::Integer(now_us));
-                params.push(libsql::Value::Text(msg.source().as_str().to_string()));
-                params.push(libsql::Value::Text(msg.platform_msg_id().to_string()));
-            }
-            tx.execute(&sql, params).await.map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql compaction insert: {e}"))
-            })?;
+        // Serialize the message contents up front: a failure here is a
+        // `StorageError::Storage`, which the pool's `anyhow` closure can't
+        // build.
+        let mut prepared: Vec<(String, String, String, String)> =
+            Vec::with_capacity(new_active.len());
+        for msg in new_active {
+            let content = serde_json::to_string(&msg.content)
+                .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
+            prepared.push((
+                msg.role.as_str().to_string(),
+                content,
+                msg.source().as_str().to_string(),
+                msg.platform_msg_id().to_string(),
+            ));
         }
 
-        tx.commit().await.map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!("libsql commit compaction: {e}"))
-        })?;
-        Ok(())
+        self.pool
+            .interact("sessions.apply_session_compaction", move |conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+                // Next ordinal doubles as the supersede pointer: every
+                // existing active row points at it, and the first new active
+                // message lands there.
+                let next_ordinal: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM session_messages WHERE session_id = ?1",
+                    rusqlite::params![session_param],
+                    |row| row.get(0),
+                )?;
+
+                tx.execute(
+                    "UPDATE session_messages SET superseded_by = ?2 \
+                     WHERE session_id = ?1 AND superseded_by IS NULL",
+                    rusqlite::params![session_param, next_ordinal],
+                )?;
+
+                let now_us = super::time::to_us(chrono::Utc::now());
+                // Multi-row INSERT, batched under SQLite's 999-bind limit.
+                // 7 columns per row → 142 rows per batch leaves 5 spare;
+                // typical Summarize emits ≤4 rows so this is one batch in
+                // practice. Keeps the whole compaction inside one tx and
+                // round-trip count constant (1) instead of O(new_active).
+                const COLS_PER_ROW: usize = 7;
+                const ROWS_PER_BATCH: usize = 999 / COLS_PER_ROW;
+                for (chunk_idx, chunk) in prepared.chunks(ROWS_PER_BATCH).enumerate() {
+                    let mut sql = String::from(
+                        "INSERT INTO session_messages \
+                         (session_id, ordinal, role, content, created_at, source, platform_msg_id) VALUES ",
+                    );
+                    let mut params: Vec<rusqlite::types::Value> =
+                        Vec::with_capacity(chunk.len() * COLS_PER_ROW);
+                    for (i, (role, content, source, platform_msg_id)) in chunk.iter().enumerate() {
+                        if i > 0 {
+                            sql.push_str(", ");
+                        }
+                        let p = i * COLS_PER_ROW;
+                        sql.push_str(&format!(
+                            "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                            p + 1,
+                            p + 2,
+                            p + 3,
+                            p + 4,
+                            p + 5,
+                            p + 6,
+                            p + 7
+                        ));
+                        let ordinal = next_ordinal + (chunk_idx * ROWS_PER_BATCH) as i64 + i as i64;
+                        params.push(rusqlite::types::Value::Text(session_param.clone()));
+                        params.push(rusqlite::types::Value::Integer(ordinal));
+                        params.push(rusqlite::types::Value::Text(role.clone()));
+                        params.push(rusqlite::types::Value::Text(content.clone()));
+                        params.push(rusqlite::types::Value::Integer(now_us));
+                        params.push(rusqlite::types::Value::Text(source.clone()));
+                        params.push(rusqlite::types::Value::Text(platform_msg_id.clone()));
+                    }
+                    tx.execute(&sql, rusqlite::params_from_iter(params))?;
+                }
+
+                tx.commit()?;
+                Ok(())
+            })
+            .await
     }
 
     async fn load_active_session_messages(
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<ChatMessage>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT role, content, source, platform_msg_id FROM session_messages \
-                 WHERE session_id = ?1 AND superseded_by IS NULL \
-                 ORDER BY ordinal",
-                libsql::params![session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql query session_messages: {e}"))
-            })?;
+        let sid = session_id.as_str().to_string();
+        let rows = self
+            .pool
+            .interact("sessions.load_active_session_messages", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT role, content, source, platform_msg_id FROM session_messages \
+                     WHERE session_id = ?1 AND superseded_by IS NULL \
+                     ORDER BY ordinal",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![sid], read_message_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
 
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let role: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
-            let content_json: String = row
-                .get(1)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let source_str: String = row
-                .get(2)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
-            let platform_msg_id: String = row.get(3).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get platform_msg_id: {e}"))
-            })?;
-            let content = serde_json::from_str(&content_json)
-                .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
-            out.push(rehydrate_message(
-                &role,
-                content,
-                &source_str,
-                platform_msg_id,
-            )?);
-        }
-        Ok(out)
+        rows.into_iter().map(decode_message_row).collect()
     }
 
     async fn latest_session_ordinal(&self, session_id: &SessionId) -> Result<Option<i64>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT MAX(ordinal) FROM session_messages WHERE session_id = ?1",
-                libsql::params![session_id.as_str().to_string()],
-            )
+        let sid = session_id.as_str().to_string();
+        self.pool
+            .interact("sessions.latest_session_ordinal", move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT MAX(ordinal) FROM session_messages WHERE session_id = ?1",
+                        rusqlite::params![sid],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?
+                    .flatten())
+            })
             .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql max ordinal: {e}")))?;
-        match rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            Some(row) => Ok(row
-                .get::<Option<i64>>(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?),
-            None => Ok(None),
-        }
     }
 
     async fn active_index_of_ordinal(
@@ -1018,36 +919,28 @@ impl SessionStore for LibsqlSessionStore {
         session_id: &SessionId,
         ordinal: i64,
     ) -> Result<Option<usize>> {
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
         // Both sub-selects hit `idx_session_messages_active`
         // (`session_id, ordinal WHERE superseded_by IS NULL`), so this
         // is two index-only counts — the row content is never read.
-        let mut rows = conn
-            .query(
-                "SELECT \
-                   (SELECT COUNT(*) FROM session_messages \
-                    WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal < ?2), \
-                   EXISTS (SELECT 1 FROM session_messages \
-                           WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal = ?2)",
-                libsql::params![session_id.as_str().to_string(), ordinal],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql active_index query: {e}"))
-            })?;
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-            .ok_or_else(|| {
-                StorageError::Internal(anyhow::anyhow!("active_index returned no rows"))
-            })?;
-        let count: i64 = row
-            .get(0)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get count: {e}")))?;
-        let present: i64 = row
-            .get(1)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get present: {e}")))?;
+        let (count, present) = self
+            .pool
+            .interact("sessions.active_index_of_ordinal", move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT \
+                           (SELECT COUNT(*) FROM session_messages \
+                            WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal < ?2), \
+                           EXISTS (SELECT 1 FROM session_messages \
+                                   WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal = ?2)",
+                        rusqlite::params![sid, ordinal],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?
+                    .ok_or_else(|| anyhow::anyhow!("active_index returned no rows"))?;
+                Ok(row)
+            })
+            .await?;
         if present == 0 {
             return Ok(None);
         }
@@ -1055,27 +948,22 @@ impl SessionStore for LibsqlSessionStore {
     }
 
     async fn count_active_messages(&self, session_id: &SessionId) -> Result<usize> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT COUNT(*) FROM session_messages \
-                 WHERE session_id = ?1 AND superseded_by IS NULL",
-                libsql::params![session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql count_active query: {e}"))
-            })?;
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-            .ok_or_else(|| {
-                StorageError::Internal(anyhow::anyhow!("count_active returned no rows"))
-            })?;
-        let count: i64 = row
-            .get(0)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get count: {e}")))?;
+        let sid = session_id.as_str().to_string();
+        let count = self
+            .pool
+            .interact("sessions.count_active_messages", move |conn| {
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM session_messages \
+                         WHERE session_id = ?1 AND superseded_by IS NULL",
+                        rusqlite::params![sid],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| anyhow::anyhow!("count_active returned no rows"))?;
+                Ok(count)
+            })
+            .await?;
         Ok(count as usize)
     }
 
@@ -1084,47 +972,23 @@ impl SessionStore for LibsqlSessionStore {
         session_id: &SessionId,
         up_to_ordinal: i64,
     ) -> Result<Vec<ChatMessage>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT role, content, source, platform_msg_id FROM session_messages \
-                 WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal <= ?2 \
-                 ORDER BY ordinal",
-                libsql::params![session_id.as_str().to_string(), up_to_ordinal],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql query active up_to: {e}"))
-            })?;
+        let sid = session_id.as_str().to_string();
+        let rows = self
+            .pool
+            .interact("sessions.load_active_session_messages_up_to", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT role, content, source, platform_msg_id FROM session_messages \
+                     WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal <= ?2 \
+                     ORDER BY ordinal",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![sid, up_to_ordinal], read_message_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
 
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let role: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
-            let content_json: String = row
-                .get(1)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let source_str: String = row
-                .get(2)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
-            let platform_msg_id: String = row.get(3).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get platform_msg_id: {e}"))
-            })?;
-            let content = serde_json::from_str(&content_json)
-                .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
-            out.push(rehydrate_message(
-                &role,
-                content,
-                &source_str,
-                platform_msg_id,
-            )?);
-        }
-        Ok(out)
+        rows.into_iter().map(decode_message_row).collect()
     }
 
     async fn load_active_session_messages_tail(
@@ -1136,7 +1000,7 @@ impl SessionStore for LibsqlSessionStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
         // `before_ordinal IS NULL OR ordinal < before_ordinal` so a
         // single SQL string handles both the "fresh tail" and the
         // scroll-up "next page" calls. The partial active index
@@ -1145,55 +1009,46 @@ impl SessionStore for LibsqlSessionStore {
         // than `limit` row contents off disk even on a million-row
         // session.
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut rows = conn
-            .query(
-                "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages \
-                 WHERE session_id = ?1 AND superseded_by IS NULL \
-                   AND (?2 IS NULL OR ordinal < ?2) \
-                 ORDER BY ordinal DESC \
-                 LIMIT ?3",
-                libsql::params![session_id.as_str().to_string(), before_ordinal, limit_i64,],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql query active tail: {e}"))
-            })?;
+        let rows: Vec<RawMessageRowWithMeta> = self
+            .pool
+            .interact("sessions.load_active_session_messages_tail", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages \
+                     WHERE session_id = ?1 AND superseded_by IS NULL \
+                       AND (?2 IS NULL OR ordinal < ?2) \
+                     ORDER BY ordinal DESC \
+                     LIMIT ?3",
+                )?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![sid, before_ordinal, limit_i64],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, String>(5)?,
+                            ))
+                        },
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
 
         let mut out: Vec<(i64, DateTime<Utc>, baybo_model::ChatMessage)> = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let ordinal: i64 = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ord: {e}")))?;
-            let role: String = row
-                .get(1)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
-            let content_json: String = row
-                .get(2)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let source_str: String = row
-                .get(3)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
-            let created_us: i64 = row.get(4).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}"))
-            })?;
-            let platform_msg_id: String = row.get(5).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get platform_msg_id: {e}"))
-            })?;
+        for (ordinal, role, content_json, source_str, created_us, platform_msg_id) in rows {
             let created_at = super::time::from_us(created_us).ok_or_else(|| {
                 StorageError::Storage(format!(
                     "session_messages.created_at out of range: {created_us}"
                 ))
             })?;
-            let content = serde_json::from_str(&content_json)
-                .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
             out.push((
                 ordinal,
                 created_at,
-                rehydrate_message(&role, content, &source_str, platform_msg_id)?,
+                decode_message_row((role, content_json, source_str, platform_msg_id))?,
             ));
         }
         // Caller expects ascending ordinal order — the SQL pulled the
@@ -1212,62 +1067,53 @@ impl SessionStore for LibsqlSessionStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
         // Forward difference: rows with ordinal strictly greater than the
         // client's cursor, capped at `limit`. The partial active index
         // bites the front of the range (`ordinal > N`) so a session
         // with hundreds of older rows pays nothing for them — only the
         // difference window is read.
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut rows = conn
-            .query(
-                "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages \
-                 WHERE session_id = ?1 AND superseded_by IS NULL \
-                   AND ordinal > ?2 \
-                 ORDER BY ordinal ASC \
-                 LIMIT ?3",
-                libsql::params![session_id.as_str().to_string(), after_ordinal, limit_i64,],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql query active since: {e}"))
-            })?;
+        let rows: Vec<RawMessageRowWithMeta> = self
+            .pool
+            .interact("sessions.load_active_session_messages_since", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT ordinal, role, content, source, created_at, platform_msg_id FROM session_messages \
+                     WHERE session_id = ?1 AND superseded_by IS NULL \
+                       AND ordinal > ?2 \
+                     ORDER BY ordinal ASC \
+                     LIMIT ?3",
+                )?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![sid, after_ordinal, limit_i64],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, String>(5)?,
+                            ))
+                        },
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
 
         let mut out: Vec<(i64, DateTime<Utc>, baybo_model::ChatMessage)> = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let ordinal: i64 = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ord: {e}")))?;
-            let role: String = row
-                .get(1)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
-            let content_json: String = row
-                .get(2)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let source_str: String = row
-                .get(3)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
-            let created_us: i64 = row.get(4).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}"))
-            })?;
-            let platform_msg_id: String = row.get(5).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get platform_msg_id: {e}"))
-            })?;
+        for (ordinal, role, content_json, source_str, created_us, platform_msg_id) in rows {
             let created_at = super::time::from_us(created_us).ok_or_else(|| {
                 StorageError::Storage(format!(
                     "session_messages.created_at out of range: {created_us}"
                 ))
             })?;
-            let content = serde_json::from_str(&content_json)
-                .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
             out.push((
                 ordinal,
                 created_at,
-                rehydrate_message(&role, content, &source_str, platform_msg_id)?,
+                decode_message_row((role, content_json, source_str, platform_msg_id))?,
             ));
         }
         Ok(out)
@@ -1283,88 +1129,74 @@ impl SessionStore for LibsqlSessionStore {
             // side; matching it would return an arbitrary keyless row.
             return Ok(None);
         }
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
+        let platform_msg_id = platform_msg_id.to_string();
         // No superseded filter: a compacted-away row still proves the
         // send was durably persisted, which is all the outbox needs.
-        let mut rows = conn
-            .query(
-                "SELECT ordinal FROM session_messages \
-                 WHERE session_id = ?1 AND platform_msg_id = ?2 \
-                 ORDER BY ordinal DESC \
-                 LIMIT 1",
-                libsql::params![session_id.as_str().to_string(), platform_msg_id.to_string(),],
+        self.pool
+            .interact(
+                "sessions.find_message_ordinal_by_platform_msg_id",
+                move |conn| {
+                    Ok(conn
+                        .query_row(
+                            "SELECT ordinal FROM session_messages \
+                             WHERE session_id = ?1 AND platform_msg_id = ?2 \
+                             ORDER BY ordinal DESC \
+                             LIMIT 1",
+                            rusqlite::params![sid, platform_msg_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?)
+                },
             )
             .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql query platform_msg_id: {e}"))
-            })?;
-        let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        else {
-            return Ok(None);
-        };
-        let ordinal: i64 = row
-            .get(0)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ord: {e}")))?;
-        Ok(Some(ordinal))
     }
 
     async fn load_last_user_message(
         &self,
         session_id: &SessionId,
     ) -> Result<Option<(DateTime<Utc>, baybo_model::ChatMessage)>> {
-        let conn = self.pool.conn();
+        let sid = session_id.as_str().to_string();
         // Newest human-authored row (source `user` / `user_interjection`,
         // i.e. `from_user`). The partial active index makes `ORDER BY
         // ordinal DESC LIMIT 1` a single back-of-index probe regardless of
         // how many tool/agent rows the turn appended after the prompt.
-        let mut rows = conn
-            .query(
-                "SELECT created_at, role, content, source, platform_msg_id FROM session_messages \
-                 WHERE session_id = ?1 AND superseded_by IS NULL \
-                   AND source IN ('user', 'user_interjection') \
-                 ORDER BY ordinal DESC \
-                 LIMIT 1",
-                libsql::params![session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql query last user message: {e}"))
-            })?;
-        let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        else {
+        let row = self
+            .pool
+            .interact("sessions.load_last_user_message", move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT created_at, role, content, source, platform_msg_id FROM session_messages \
+                         WHERE session_id = ?1 AND superseded_by IS NULL \
+                           AND source IN ('user', 'user_interjection') \
+                         ORDER BY ordinal DESC \
+                         LIMIT 1",
+                        rusqlite::params![sid],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?)
+            })
+            .await?;
+
+        let Some((created_us, role, content_json, source_str, platform_msg_id)) = row else {
             return Ok(None);
         };
-        let created_us: i64 = row
-            .get(0)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}")))?;
         let created_at = super::time::from_us(created_us).ok_or_else(|| {
             StorageError::Storage(format!(
                 "session_messages.created_at out of range: {created_us}"
             ))
         })?;
-        let role: String = row
-            .get(1)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
-        let content_json: String = row
-            .get(2)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-        let source_str: String = row
-            .get(3)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
-        let platform_msg_id: String = row.get(4).map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!("libsql get platform_msg_id: {e}"))
-        })?;
-        let content = serde_json::from_str(&content_json)
-            .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
         Ok(Some((
             created_at,
-            rehydrate_message(&role, content, &source_str, platform_msg_id)?,
+            decode_message_row((role, content_json, source_str, platform_msg_id))?,
         )))
     }
 
@@ -1372,58 +1204,46 @@ impl SessionStore for LibsqlSessionStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<StoredMessage>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT ordinal, superseded_by, role, content, created_at, source, platform_msg_id \
-                 FROM session_messages \
-                 WHERE session_id = ?1 ORDER BY ordinal",
-                libsql::params![session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql query session_messages: {e}"))
-            })?;
+        let sid = session_id.as_str().to_string();
+        let rows = self
+            .pool
+            .interact("sessions.load_session_messages_with_supersede", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT ordinal, superseded_by, role, content, created_at, source, platform_msg_id \
+                     FROM session_messages \
+                     WHERE session_id = ?1 ORDER BY ordinal",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![sid], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
 
         let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        for (ordinal, superseded_by, role, content_json, created_us, source_str, platform_msg_id) in
+            rows
         {
-            let ordinal: i64 = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ord: {e}")))?;
-            let superseded_by: Option<i64> = row
-                .get(1)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get sup: {e}")))?;
-            let role: String = row
-                .get(2)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
-            let content_json: String = row
-                .get(3)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let created_us: i64 = row
-                .get(4)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get created: {e}")))?;
-            let source_str: String = row
-                .get(5)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
-            let platform_msg_id: String = row.get(6).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get platform_msg_id: {e}"))
-            })?;
             let created_at = super::time::from_us(created_us).ok_or_else(|| {
                 StorageError::Internal(anyhow::anyhow!(
                     "session_messages.created_at out of range: {created_us}"
                 ))
             })?;
-            let content = serde_json::from_str(&content_json)
-                .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
             out.push(StoredMessage {
                 ordinal,
                 superseded_by,
                 created_at,
-                message: rehydrate_message(&role, content, &source_str, platform_msg_id)?,
+                message: decode_message_row((role, content_json, source_str, platform_msg_id))?,
             });
         }
         Ok(out)
@@ -1459,10 +1279,33 @@ mod tests {
         }
     }
 
+    /// Run one raw statement against the pool (test-only schema surgery /
+    /// hand-written rows the store's own API can't produce).
+    async fn exec(pool: &SqlitePool, sql: &'static str, params: Vec<rusqlite::types::Value>) {
+        pool.interact("test.exec", move |conn| {
+            conn.execute(sql, rusqlite::params_from_iter(params))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Re-run the schema/migration boot path (what a new binary does against
+    /// an older DB).
+    async fn init_db(pool: &SqlitePool) {
+        pool.interact("test.init_db", super::super::init_db)
+            .await
+            .unwrap();
+    }
+
+    fn text_value(s: &str) -> rusqlite::types::Value {
+        rusqlite::types::Value::Text(s.to_string())
+    }
+
     #[tokio::test]
     async fn round_trip_session() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
         let s = make_root_session("cli-1");
         store.save(&s).await.unwrap();
 
@@ -1478,8 +1321,8 @@ mod tests {
     async fn control_events_round_trip_seq_kind_and_micros() {
         use baybo_model::ControlEventKind;
 
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
         let s = make_root_session("ctl-1");
         store.save(&s).await.unwrap();
 
@@ -1534,8 +1377,8 @@ mod tests {
         // `list_all` must skip that one row (log + continue) and still
         // return every good session, rather than erroring the whole listing
         // and 500-ing the CLI picker / web UI.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let good = make_root_session("good-1");
         store.save(&good).await.unwrap();
@@ -1557,24 +1400,21 @@ mod tests {
             serde_json::from_str::<Session>(bad_blob).is_err(),
             "the unknown-lineage-kind blob must not deserialize"
         );
-        store
-            .pool
-            .conn()
-            .execute(
-                "INSERT INTO sessions \
-                 (id, root_session_id, trigger_kind, created_at, last_active, data) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                libsql::params![
-                    "bad-lineage".to_string(),
-                    "good-1".to_string(),
-                    "user".to_string(),
-                    super::super::time::to_us(Utc::now()),
-                    super::super::time::to_us(Utc::now()),
-                    bad_blob.to_string(),
-                ],
-            )
-            .await
-            .unwrap();
+        exec(
+            &store.pool,
+            "INSERT INTO sessions \
+             (id, root_session_id, trigger_kind, created_at, last_active, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            vec![
+                text_value("bad-lineage"),
+                text_value("good-1"),
+                text_value("user"),
+                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
+                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
+                text_value(bad_blob),
+            ],
+        )
+        .await;
 
         let listed = store.list_all().await.unwrap();
         let ids: Vec<&str> = listed.iter().map(|s| s.id.as_str()).collect();
@@ -1587,8 +1427,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_expired_filters_by_last_active() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
         let mut old = make_root_session("old");
         old.last_active = Utc::now() - chrono::Duration::hours(2);
         store.save(&old).await.unwrap();
@@ -1604,11 +1444,11 @@ mod tests {
     async fn list_by_channel_pushes_predicate_into_sql() {
         // Mixed-channel fixture: two http sessions, one telegram. The
         // chat REST surface only wants http; the push-down keeps
-        // telegram rows out of the libsql round-trip entirely so a
+        // telegram rows out of the sqlite round-trip entirely so a
         // gateway hosting thousands of bot sessions doesn't pay an
         // O(all-sessions) cost on every chat-list refresh.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let mut http_a = make_root_session("http-a");
         http_a.channel = ChannelType::http();
@@ -1648,8 +1488,8 @@ mod tests {
         // column without rewriting the JSON `data` blob, so trusting
         // the deserialised `Session.hidden` alone would read stale
         // values.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("hide-me");
         s.channel = ChannelType::http();
@@ -1667,8 +1507,8 @@ mod tests {
         // `Session` (hidden=false) AFTER the user hid the conversation
         // via `set_hidden`. `save` must not rewrite the flat `hidden`
         // column, or it would silently un-hide the row.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let s = make_root_session("hide-then-save");
         store.save(&s).await.unwrap();
@@ -1691,8 +1531,8 @@ mod tests {
         // stale in-memory `Session` with last_llm=None — must NOT wipe a
         // pin set via the targeted `set_last_llm`. Same flat-column guard
         // as `hidden`.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let s = make_root_session("pin-then-save");
         store.save(&s).await.unwrap(); // blob carries last_llm=None
@@ -1723,38 +1563,34 @@ mod tests {
     #[tokio::test]
     async fn legacy_sessions_table_without_pinned_is_migrated() {
         // The "DB created before `pinned` existed" case the migration list
-        // (libsql/mod.rs) handles. Simulate the pre-`pinned` schema by
+        // (sqlite/mod.rs) handles. Simulate the pre-`pinned` schema by
         // dropping the column the fresh `init_db` created, write a row the
         // way an old build would (no `pinned`), then re-run `init_db` — the
         // boot path a new binary takes. Without the ALTER migration the
         // store's `SELECT … pinned` would fail with "no such column"; with
         // it the column comes back and the old row defaults to unpinned.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        pool.conn()
-            .execute("ALTER TABLE sessions DROP COLUMN pinned", libsql::params![])
-            .await
-            .unwrap();
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        exec(&pool, "ALTER TABLE sessions DROP COLUMN pinned", Vec::new()).await;
         let data = serde_json::to_string(&make_root_session("legacy-1")).unwrap();
-        pool.conn()
-            .execute(
-                "INSERT INTO sessions \
-                 (id, root_session_id, trigger_kind, created_at, last_active, data) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                libsql::params![
-                    "legacy-1".to_string(),
-                    "legacy-1".to_string(),
-                    "user".to_string(),
-                    super::super::time::to_us(Utc::now()),
-                    super::super::time::to_us(Utc::now()),
-                    data,
-                ],
-            )
-            .await
-            .unwrap();
+        exec(
+            &pool,
+            "INSERT INTO sessions \
+             (id, root_session_id, trigger_kind, created_at, last_active, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            vec![
+                text_value("legacy-1"),
+                text_value("legacy-1"),
+                text_value("user"),
+                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
+                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
+                rusqlite::types::Value::Text(data),
+            ],
+        )
+        .await;
         // Re-running init_db applies the idempotent ALTER (re-adds pinned).
-        pool.init_db().await.unwrap();
+        init_db(&pool).await;
 
-        let store = LibsqlSessionStore::new(pool);
+        let store = SqliteSessionStore::new(pool);
         let id = SessionId::from("legacy-1");
         let loaded = store.get(&id).await.unwrap().expect("legacy row present");
         assert!(!loaded.pinned, "migrated legacy row defaults to unpinned");
@@ -1765,8 +1601,8 @@ mod tests {
 
     #[tokio::test]
     async fn message_platform_msg_id_round_trips_and_legacy_defaults_empty() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool.clone());
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool.clone());
         let session = make_root_session("platform-msg-id");
         store.save(&session).await.unwrap();
 
@@ -1784,33 +1620,33 @@ mod tests {
             .unwrap();
         assert_eq!(loaded[0].platform_msg_id(), "device-msg-1");
 
-        pool.conn()
-            .execute(
-                "ALTER TABLE session_messages DROP COLUMN platform_msg_id",
-                libsql::params![],
-            )
-            .await
-            .unwrap();
-        pool.conn()
-            .execute(
-                "INSERT INTO session_messages \
-                 (session_id, ordinal, role, content, created_at, source) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                libsql::params![
-                    "platform-msg-id".to_string(),
-                    1_i64,
-                    "user".to_string(),
+        exec(
+            &pool,
+            "ALTER TABLE session_messages DROP COLUMN platform_msg_id",
+            Vec::new(),
+        )
+        .await;
+        exec(
+            &pool,
+            "INSERT INTO session_messages \
+             (session_id, ordinal, role, content, created_at, source) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            vec![
+                text_value("platform-msg-id"),
+                rusqlite::types::Value::Integer(1),
+                text_value("user"),
+                rusqlite::types::Value::Text(
                     serde_json::to_string(&vec![baybo_model::ContentBlock::Text("legacy".into())])
                         .unwrap(),
-                    super::super::time::to_us(Utc::now()),
-                    "user".to_string(),
-                ],
-            )
-            .await
-            .unwrap();
-        pool.init_db().await.unwrap();
+                ),
+                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
+                text_value("user"),
+            ],
+        )
+        .await;
+        init_db(&pool).await;
 
-        let store = LibsqlSessionStore::new(pool);
+        let store = SqliteSessionStore::new(pool);
         let loaded = store
             .load_active_session_messages(&session.id)
             .await
@@ -1821,8 +1657,8 @@ mod tests {
 
     #[tokio::test]
     async fn source_event_append_is_idempotent_across_compaction() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
         let session = make_root_session("source-event");
         store.save(&session).await.unwrap();
 
@@ -1877,24 +1713,22 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_session_messages_table_gains_source_event_id() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        pool.conn()
-            .execute(
-                "DROP INDEX idx_session_messages_source_event",
-                libsql::params![],
-            )
-            .await
-            .unwrap();
-        pool.conn()
-            .execute(
-                "ALTER TABLE session_messages DROP COLUMN source_event_id",
-                libsql::params![],
-            )
-            .await
-            .unwrap();
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        exec(
+            &pool,
+            "DROP INDEX idx_session_messages_source_event",
+            Vec::new(),
+        )
+        .await;
+        exec(
+            &pool,
+            "ALTER TABLE session_messages DROP COLUMN source_event_id",
+            Vec::new(),
+        )
+        .await;
 
-        pool.init_db().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        init_db(&pool).await;
+        let store = SqliteSessionStore::new(pool);
         let session = make_root_session("source-event-migrated");
         store.save(&session).await.unwrap();
         let message =
@@ -1923,8 +1757,8 @@ mod tests {
         // concurrent full-blob `save` (a `touch` on the next inbound
         // message, carrying a stale in-memory `Session` with pinned=false)
         // must NOT wipe a pin set via the targeted `set_pinned`.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let s = make_root_session("pin-then-save");
         store.save(&s).await.unwrap();
@@ -1950,8 +1784,8 @@ mod tests {
         // `list_by_channel` / `list_all` must project the flat `pinned`
         // column the same way `get` does, so a listed `Session` carries
         // the authoritative flag rather than the (stale) blob value.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("pin-list");
         s.channel = ChannelType::http();
@@ -1971,8 +1805,8 @@ mod tests {
         // `list_by_channel` / `list_all` must project the flat `last_llm`
         // column the same way `get` does, so a listed `Session` carries
         // the authoritative pin rather than the (stale) blob value.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("pin-list");
         s.channel = ChannelType::http();
@@ -2000,8 +1834,8 @@ mod tests {
         // message, carrying a stale in-memory `Session` with
         // archived=false) must NOT wipe a flag set via the targeted
         // `set_archived`.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let s = make_root_session("archive-then-save");
         store.save(&s).await.unwrap();
@@ -2035,8 +1869,8 @@ mod tests {
         // `list_by_channel` / `list_all` must project the flat `archived`
         // column the same way `get` does, so a listed `Session` carries
         // the authoritative flag rather than the (stale) blob value.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("archive-list");
         s.channel = ChannelType::http();
@@ -2059,37 +1893,35 @@ mod tests {
     #[tokio::test]
     async fn legacy_sessions_table_without_archived_is_migrated() {
         // The "DB created before `archived` existed" case the migration
-        // list (libsql/mod.rs) handles — same shape as the `pinned`
+        // list (sqlite/mod.rs) handles — same shape as the `pinned`
         // migration test above.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        pool.conn()
-            .execute(
-                "ALTER TABLE sessions DROP COLUMN archived",
-                libsql::params![],
-            )
-            .await
-            .unwrap();
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        exec(
+            &pool,
+            "ALTER TABLE sessions DROP COLUMN archived",
+            Vec::new(),
+        )
+        .await;
         let data = serde_json::to_string(&make_root_session("legacy-arch")).unwrap();
-        pool.conn()
-            .execute(
-                "INSERT INTO sessions \
-                 (id, root_session_id, trigger_kind, created_at, last_active, data) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                libsql::params![
-                    "legacy-arch".to_string(),
-                    "legacy-arch".to_string(),
-                    "user".to_string(),
-                    super::super::time::to_us(Utc::now()),
-                    super::super::time::to_us(Utc::now()),
-                    data,
-                ],
-            )
-            .await
-            .unwrap();
+        exec(
+            &pool,
+            "INSERT INTO sessions \
+             (id, root_session_id, trigger_kind, created_at, last_active, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            vec![
+                text_value("legacy-arch"),
+                text_value("legacy-arch"),
+                text_value("user"),
+                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
+                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
+                rusqlite::types::Value::Text(data),
+            ],
+        )
+        .await;
         // Re-running init_db applies the idempotent ALTER (re-adds archived).
-        pool.init_db().await.unwrap();
+        init_db(&pool).await;
 
-        let store = LibsqlSessionStore::new(pool);
+        let store = SqliteSessionStore::new(pool);
         let id = SessionId::from("legacy-arch");
         let loaded = store.get(&id).await.unwrap().expect("legacy row present");
         assert!(
@@ -2103,8 +1935,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_folder_round_trips_and_clears() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
         let s = make_root_session("fld-1");
         store.save(&s).await.unwrap();
 
@@ -2134,8 +1966,8 @@ mod tests {
         // concurrent full-blob `save` carrying a stale in-memory `Session`
         // (folder_id = None) must NOT wipe an assignment set via the
         // targeted `set_folder`.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let s = make_root_session("fld-then-save");
         store.save(&s).await.unwrap();
@@ -2154,8 +1986,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_by_channel_reflects_folder_id_column() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("fld-list");
         s.channel = ChannelType::http();
@@ -2178,44 +2010,41 @@ mod tests {
         // the fresh `init_db` created, write a row the old way, then re-run
         // `init_db` (the boot path) — the idempotent ALTER re-adds it and
         // the old row defaults to uncategorized.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let pool = SqlitePool::open_in_memory().await.unwrap();
         // SQLite refuses to drop an indexed column, so drop the index first
         // — this also recreates the genuine pre-folder_id schema (no column,
         // no index), the exact state `init_db`'s migration must recover from.
-        pool.conn()
-            .execute(
-                "DROP INDEX IF EXISTS idx_sessions_folder",
-                libsql::params![],
-            )
-            .await
-            .unwrap();
-        pool.conn()
-            .execute(
-                "ALTER TABLE sessions DROP COLUMN folder_id",
-                libsql::params![],
-            )
-            .await
-            .unwrap();
+        exec(
+            &pool,
+            "DROP INDEX IF EXISTS idx_sessions_folder",
+            Vec::new(),
+        )
+        .await;
+        exec(
+            &pool,
+            "ALTER TABLE sessions DROP COLUMN folder_id",
+            Vec::new(),
+        )
+        .await;
         let data = serde_json::to_string(&make_root_session("legacy-fld")).unwrap();
-        pool.conn()
-            .execute(
-                "INSERT INTO sessions \
-                 (id, root_session_id, trigger_kind, created_at, last_active, data) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                libsql::params![
-                    "legacy-fld".to_string(),
-                    "legacy-fld".to_string(),
-                    "user".to_string(),
-                    super::super::time::to_us(Utc::now()),
-                    super::super::time::to_us(Utc::now()),
-                    data,
-                ],
-            )
-            .await
-            .unwrap();
-        pool.init_db().await.unwrap();
+        exec(
+            &pool,
+            "INSERT INTO sessions \
+             (id, root_session_id, trigger_kind, created_at, last_active, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            vec![
+                text_value("legacy-fld"),
+                text_value("legacy-fld"),
+                text_value("user"),
+                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
+                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
+                rusqlite::types::Value::Text(data),
+            ],
+        )
+        .await;
+        init_db(&pool).await;
 
-        let store = LibsqlSessionStore::new(pool);
+        let store = SqliteSessionStore::new(pool);
         let id = SessionId::from("legacy-fld");
         let loaded = store.get(&id).await.unwrap().expect("legacy row present");
         assert_eq!(
@@ -2229,8 +2058,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_title_round_trips_and_clears() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
         let s = make_root_session("title-1");
         store.save(&s).await.unwrap();
 
@@ -2258,8 +2087,8 @@ mod tests {
 
     #[tokio::test]
     async fn save_does_not_clobber_title_set_by_set_title() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let s = make_root_session("title-then-save");
         store.save(&s).await.unwrap();
@@ -2276,8 +2105,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_by_channel_reflects_title_column() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("title-list");
         s.channel = ChannelType::http();
@@ -2295,31 +2124,27 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_sessions_table_without_title_is_migrated() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        pool.conn()
-            .execute("ALTER TABLE sessions DROP COLUMN title", libsql::params![])
-            .await
-            .unwrap();
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        exec(&pool, "ALTER TABLE sessions DROP COLUMN title", Vec::new()).await;
         let data = serde_json::to_string(&make_root_session("legacy-title")).unwrap();
-        pool.conn()
-            .execute(
-                "INSERT INTO sessions \
-                 (id, root_session_id, trigger_kind, created_at, last_active, data) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                libsql::params![
-                    "legacy-title".to_string(),
-                    "legacy-title".to_string(),
-                    "user".to_string(),
-                    super::super::time::to_us(Utc::now()),
-                    super::super::time::to_us(Utc::now()),
-                    data,
-                ],
-            )
-            .await
-            .unwrap();
-        pool.init_db().await.unwrap();
+        exec(
+            &pool,
+            "INSERT INTO sessions \
+             (id, root_session_id, trigger_kind, created_at, last_active, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            vec![
+                text_value("legacy-title"),
+                text_value("legacy-title"),
+                text_value("user"),
+                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
+                rusqlite::types::Value::Integer(super::super::time::to_us(Utc::now())),
+                rusqlite::types::Value::Text(data),
+            ],
+        )
+        .await;
+        init_db(&pool).await;
 
-        let store = LibsqlSessionStore::new(pool);
+        let store = SqliteSessionStore::new(pool);
         let id = SessionId::from("legacy-title");
         let loaded = store.get(&id).await.unwrap().expect("legacy row present");
         assert_eq!(
@@ -2339,8 +2164,8 @@ mod tests {
         // tail loader is the path the chat REST surface uses to ship
         // a long-running session's transcript a page at a time
         // without fetching the whole row stream up-front.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
         let session = make_root_session("paginate-me");
         store.save(&session).await.unwrap();
         for i in 0..7 {
@@ -2389,8 +2214,8 @@ mod tests {
 
     #[tokio::test]
     async fn load_last_user_message_finds_freshest_human_turn_past_tool_churn() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
         let session = make_root_session("preview-me");
         store.save(&session).await.unwrap();
         let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
@@ -2452,8 +2277,8 @@ mod tests {
 
     #[tokio::test]
     async fn load_last_user_message_counts_interjections_not_agent_user_rows() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
         let session = make_root_session("interjection-me");
         store.save(&session).await.unwrap();
         let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
@@ -2498,8 +2323,8 @@ mod tests {
         // Same 7-row fixture as the `_tail` test, but exercising the
         // forward difference scan the REST sync endpoint uses to
         // deliver missed rows to a client presenting its cursor.
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteSessionStore::new(pool);
         let session = make_root_session("catch-up-me");
         store.save(&session).await.unwrap();
         for i in 0..7 {

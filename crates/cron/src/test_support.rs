@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 
 /// In-memory [`CronStore`] — the whole cron domain against `Vec`s, so a test
 /// can drive the scheduler (and the agent layer's cron waiter / boot re-drive)
-/// without libsql.
+/// without sqlite.
 #[derive(Default)]
 pub struct InMemoryCronStore {
     jobs: Mutex<Vec<CronJob>>,
@@ -39,7 +39,7 @@ impl InMemoryCronStore {
     }
 
     /// Mutate an execution in place, or return `NotFound`. The ledger writers
-    /// are read-modify-write on the stored row, exactly like the libsql impl.
+    /// are read-modify-write on the stored row, exactly like the sqlite impl.
     fn with_execution<F>(&self, execution_id: &str, f: F) -> Result<()>
     where
         F: FnOnce(&mut CronExecution),

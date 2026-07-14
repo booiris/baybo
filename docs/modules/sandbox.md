@@ -339,7 +339,7 @@ These are **distinct scopes**, on purpose — though not disjoint paths:
 the sandbox FS root is a subdirectory of the Baybo state root.
 
 - `baybo_workspace::WorkspaceManager.root` is `config.workspace.path`
-  (defaults to `~/.baybo`). It's where Baybo keeps its libsql storage,
+  (defaults to `~/.baybo`). It's where Baybo keeps its sqlite storage,
   identity files, lock file, and skill bundles. The agent reads from
   here in-process, not via subprocesses.
 - The sandbox FS root passed to `ToolExecutor::new` is the workspace

@@ -2,10 +2,10 @@
 //! [`StorageError`], decoupled from any concrete backend.
 //!
 //! Domain crates and other consumers depend on this crate to *call* a
-//! store; `baybo-storage` is the libsql adapter that *implements* the
+//! store; `baybo-storage` is the sqlite adapter that *implements* the
 //! traits. Keeping the contracts here — a leaf over `baybo-model` — lets
 //! low-level crates depend on a store interface without pulling the heavy
-//! libsql adapter, and keeps the dependency graph acyclic.
+//! sqlite adapter, and keeps the dependency graph acyclic.
 
 pub mod agent_profile;
 pub mod blob;

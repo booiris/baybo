@@ -14,7 +14,7 @@ Core responsibilities:
 - **Cost management**: `CostManager` (in `baybo-cost`) records LLM-call cost and gates spend; agent constructs it and threads it through the loop
 - **Runtime logic**: error recovery, timeout control
 
-It does not own low-level storage or backend implementation — it consumes every `*Store` trait from the `baybo-store` ports crate through dependency injection, and the libsql impls (`baybo-storage`) are wired in at assembly time. Domain managers and rich types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`); the `JobStore` / `TraceStore` it calls trade in row DTOs that `baybo-job` / `baybo-trace` convert to and from. Each manager defines its own error type for business-level failures (e.g. `JobLifecycle` defines errors for invalid state transitions).
+It does not own low-level storage or backend implementation — it consumes every `*Store` trait from the `baybo-store` ports crate through dependency injection, and the sqlite impls (`baybo-storage`) are wired in at assembly time. Domain managers and rich types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`); the `JobStore` / `TraceStore` it calls trade in row DTOs that `baybo-job` / `baybo-trace` convert to and from. Each manager defines its own error type for business-level failures (e.g. `JobLifecycle` defines errors for invalid state transitions).
 
 ## Source Layout
 
@@ -265,4 +265,4 @@ Router-level user rate limiting (`actor/router`) uses a sliding window (default 
 | `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |
 | `channels` | `Channel` handles + `ChannelRegistry`; Router owns the registry for dispatch by `ChannelType` |
 | `store` | The ports crate: owns every `*Store` trait contract, the row/DTO types they exchange, and `StorageError`. Agent injects these trait objects |
-| `storage` | Provides the libsql implementations of every `*Store` trait (the contracts all live in `baybo-store`) and bundles them in `Store` for DI |
+| `storage` | Provides the sqlite implementations of every `*Store` trait (the contracts all live in `baybo-store`) and bundles them in `Store` for DI |

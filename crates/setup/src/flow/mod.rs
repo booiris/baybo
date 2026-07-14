@@ -1,6 +1,6 @@
 //! Per-step interactive primitives shared between the setup wizard
 //! and `baybo llm add` / `baybo channel add`. Each primitive runs its
-//! own side effects (vault writes, libsql rows, sidecar registrations)
+//! own side effects (vault writes, sqlite rows, sidecar registrations)
 //! and mutates `BayboConfig` in memory; `baybo.json` is committed once
 //! at the end (β2).
 

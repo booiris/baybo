@@ -142,11 +142,11 @@ The vault-token scheme is a **workspace-binding** credential, *not*
 a defence against a same-UID hostile process.
 
 *Designed to reject*
-- connections from a different Unix user — the libsql vault file is
+- connections from a different Unix user — the sqlite vault file is
   `0o600` and `<workspace>/state/channel.port` is also `0o600`, so another
   UID can't even locate the listener's port, let alone read the
   freshly-rotated TUI token;
-- cross-workspace mix-ups — every workspace has its own libsql
+- cross-workspace mix-ups — every workspace has its own sqlite
   database with its own (master-key-encrypted) `gateway.tui_token`
   row, so a TUI pointed at workspace B will never come up with the
   matching value for workspace A;
@@ -157,7 +157,7 @@ a defence against a same-UID hostile process.
 
 *Not designed to defend against*
 - a malicious process running as the same UID as the gateway. Such a
-  process can read the libsql file, recompute the master key (or
+  process can read the sqlite file, recompute the master key (or
   read the env var that holds it), decrypt the row, and present the
   same token. Treat "same-UID local adversary" as out of scope for
   this mechanism — the practical tools are file permissions on the
@@ -836,7 +836,7 @@ type, including the always-on `http` channel and the bundled TUI when
 `cli.enabled`); incoming `/v1/channel-ws` connections then `attach` to
 the channel for their type rather than installing it.
 
-`build_secret_vault` is a narrow helper that only opens the libsql
+`build_secret_vault` is a narrow helper that only opens the sqlite
 store far enough to construct a `SecretVault`. The TUI's remote boot
 uses it to read the gateway token without touching the workspace
 singleton lock; the vault-only `gateway token {show,rotate}`

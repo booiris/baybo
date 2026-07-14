@@ -199,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
     let llm_client = if needs_llm(&cmd) {
         // `llm` / `doctor` / `status` never send multimodal content,
         // so it's fine to skip the BlobStore wiring here — opening
-        // libsql for a status probe would be wasteful.
+        // sqlite for a status probe would be wasteful.
         // No vault here either: argv-mode `llm` / `doctor` / `status` are
         // probes that don't need OAuth tokens; the openai-subscription
         // provider's create() returns a clear error if it's selected

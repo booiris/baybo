@@ -32,7 +32,8 @@ remote-host-dashboard = { workspace = true }
 # The dashboard backend trait is `#[async_trait]`; the server's impl needs it too.
 async-trait = { workspace = true }
 # The admission allow-list table (hot-reloaded by the admission_db poller).
-libsql = { workspace = true }
+rusqlite = { workspace = true }
+deadpool-sqlite = { workspace = true }
 # Generated-key path: random bytes + hex encoding (`generate_remote_api_key`).
 rand = { workspace = true }
 hex = { workspace = true }

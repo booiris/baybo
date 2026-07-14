@@ -1,8 +1,8 @@
 //! Read-only query layer over the durable traffic ledger.
 //!
 //! The flush task in [`crate::traffic`] is the sole writer; this reader opens its
-//! own connection (WAL, so it never blocks the writer) and runs every aggregate
-//! the dashboard's Traffic / Devices pages need: per-bucket time series, top-N by
+//! own pool (WAL, so it never blocks the writer) and runs every aggregate the
+//! dashboard's Traffic / Devices pages need: per-bucket time series, top-N by
 //! bytes, and the overview last-hour / last-24h totals.
 //!
 //! Two safety invariants hold throughout:
@@ -15,9 +15,10 @@
 //! `device_id` / `ip`; the backend masks (or drops) the secret before any DTO is
 //! serialized.
 
-use libsql::{Builder, Connection, Database, params};
 use remote_host_dashboard::Range;
+use rusqlite::params;
 
+use crate::sqlite::{SqliteError, SqlitePool};
 use crate::traffic::{IP_TRAFFIC_TABLE, PUSH_TRAFFIC_TABLE, RELAY_TRAFFIC_TABLE, ensure_schema};
 
 /// `datetime('now', ?1)` window modifiers, bound (never interpolated).
@@ -58,9 +59,9 @@ fn nonneg(v: i64) -> u64 {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TrafficQueryError {
     #[error("open traffic read db at {path}: {source}")]
-    Open { path: String, source: libsql::Error },
+    Open { path: String, source: SqliteError },
     #[error("traffic query failed: {0}")]
-    Query(#[from] libsql::Error),
+    Query(#[from] SqliteError),
 }
 
 // --- Reader-local row shapes (the backend maps + masks these into the DTOs) ---
@@ -119,39 +120,27 @@ pub(crate) struct IpSourceRow {
 }
 
 pub(crate) struct TrafficReader {
-    // Held only to keep the connection valid for the reader's lifetime.
-    _db: Database,
-    conn: Connection,
+    pool: SqlitePool,
 }
 
 impl TrafficReader {
     /// Open the ledger read-only. An empty `path` means `TRAFFIC_DB_PATH` is unset
-    /// (persistence off) → `Ok(None)`, so the backend degrades to empty stats. The
-    /// `busy_timeout` and WAL pragmas mirror the writer; [`ensure_schema`] guards
-    /// against a read before the first flush has created the tables.
+    /// (persistence off) → `Ok(None)`, so the backend degrades to empty stats.
+    /// [`ensure_schema`] guards against a read before the first flush has created
+    /// the tables.
     pub(crate) async fn open(path: &str) -> Result<Option<Self>, TrafficQueryError> {
         if path.is_empty() {
             return Ok(None);
         }
-        let db = Builder::new_local(path)
-            .build()
-            .await
-            .map_err(|e| TrafficQueryError::Open {
-                path: path.to_owned(),
-                source: e,
-            })?;
-        let conn = db.connect().map_err(|e| TrafficQueryError::Open {
+        let open_err = |e: SqliteError| TrafficQueryError::Open {
             path: path.to_owned(),
             source: e,
-        })?;
-        let mut r = conn.query("PRAGMA journal_mode=WAL", ()).await?;
-        let _ = r.next().await?;
-        // `PRAGMA busy_timeout=N` echoes the new value as a row in this libsql
-        // build, so drain it rather than `execute` (which would error).
-        let mut r = conn.query("PRAGMA busy_timeout=5000", ()).await?;
-        let _ = r.next().await?;
-        ensure_schema(&conn).await?;
-        Ok(Some(Self { _db: db, conn }))
+        };
+        let pool = SqlitePool::open(path).await.map_err(open_err)?;
+        pool.interact(|conn| ensure_schema(conn))
+            .await
+            .map_err(open_err)?;
+        Ok(Some(Self { pool }))
     }
 
     // --- Per-bucket time series ---
@@ -167,18 +156,23 @@ impl TrafficReader {
              GROUP BY bucket ORDER BY bucket",
             bucket = bucket_expr(range),
         );
-        let mut rows = self.conn.query(&sql, params![window(range)]).await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(RelayBucketRow {
-                bucket: row.get::<String>(0)?,
-                bytes_up: nonneg(row.get::<i64>(1)?),
-                bytes_down: nonneg(row.get::<i64>(2)?),
-                frames_up: nonneg(row.get::<i64>(3)?),
-                frames_down: nonneg(row.get::<i64>(4)?),
-            });
-        }
-        Ok(out)
+        let window = window(range);
+        Ok(self
+            .pool
+            .interact(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                stmt.query_map(params![window], |row| {
+                    Ok(RelayBucketRow {
+                        bucket: row.get(0)?,
+                        bytes_up: nonneg(row.get(1)?),
+                        bytes_down: nonneg(row.get(2)?),
+                        frames_up: nonneg(row.get(3)?),
+                        frames_down: nonneg(row.get(4)?),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?)
     }
 
     pub(crate) async fn push_series(
@@ -191,16 +185,21 @@ impl TrafficReader {
              GROUP BY bucket ORDER BY bucket",
             bucket = bucket_expr(range),
         );
-        let mut rows = self.conn.query(&sql, params![window(range)]).await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(PushBucketRow {
-                bucket: row.get::<String>(0)?,
-                sends: nonneg(row.get::<i64>(1)?),
-                bytes: nonneg(row.get::<i64>(2)?),
-            });
-        }
-        Ok(out)
+        let window = window(range);
+        Ok(self
+            .pool
+            .interact(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                stmt.query_map(params![window], |row| {
+                    Ok(PushBucketRow {
+                        bucket: row.get(0)?,
+                        sends: nonneg(row.get(1)?),
+                        bytes: nonneg(row.get(2)?),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?)
     }
 
     pub(crate) async fn ip_series(
@@ -213,16 +212,21 @@ impl TrafficReader {
              GROUP BY bucket ORDER BY bucket",
             bucket = bucket_expr(range),
         );
-        let mut rows = self.conn.query(&sql, params![window(range)]).await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(IpBucketRow {
-                bucket: row.get::<String>(0)?,
-                requests: nonneg(row.get::<i64>(1)?),
-                bytes: nonneg(row.get::<i64>(2)?),
-            });
-        }
-        Ok(out)
+        let window = window(range);
+        Ok(self
+            .pool
+            .interact(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                stmt.query_map(params![window], |row| {
+                    Ok(IpBucketRow {
+                        bucket: row.get(0)?,
+                        requests: nonneg(row.get(1)?),
+                        bytes: nonneg(row.get(2)?),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?)
     }
 
     // --- Top-N by bytes (raw identifiers; backend masks) ---
@@ -239,21 +243,24 @@ impl TrafficReader {
              FROM {RELAY_TRAFFIC_TABLE} WHERE hour >= datetime('now', ?1) \
              GROUP BY remote_api_key ORDER BY (up + down) DESC LIMIT ?2"
         );
-        let mut rows = self
-            .conn
-            .query(&sql, params![window(range), i64::from(limit)])
-            .await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(RelayKeyRow {
-                remote_api_key: row.get::<String>(0)?,
-                bytes_up: nonneg(row.get::<i64>(1)?),
-                bytes_down: nonneg(row.get::<i64>(2)?),
-                frames_up: nonneg(row.get::<i64>(3)?),
-                frames_down: nonneg(row.get::<i64>(4)?),
-            });
-        }
-        Ok(out)
+        let window = window(range);
+        let limit = i64::from(limit);
+        Ok(self
+            .pool
+            .interact(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                stmt.query_map(params![window, limit], |row| {
+                    Ok(RelayKeyRow {
+                        remote_api_key: row.get(0)?,
+                        bytes_up: nonneg(row.get(1)?),
+                        bytes_down: nonneg(row.get(2)?),
+                        frames_up: nonneg(row.get(3)?),
+                        frames_down: nonneg(row.get(4)?),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?)
     }
 
     pub(crate) async fn push_top_devices(
@@ -266,19 +273,22 @@ impl TrafficReader {
              FROM {PUSH_TRAFFIC_TABLE} WHERE hour >= datetime('now', ?1) \
              GROUP BY device_id ORDER BY b DESC LIMIT ?2"
         );
-        let mut rows = self
-            .conn
-            .query(&sql, params![window(range), i64::from(limit)])
-            .await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(PushDeviceRow {
-                device_id: row.get::<String>(0)?,
-                sends: nonneg(row.get::<i64>(1)?),
-                bytes: nonneg(row.get::<i64>(2)?),
-            });
-        }
-        Ok(out)
+        let window = window(range);
+        let limit = i64::from(limit);
+        Ok(self
+            .pool
+            .interact(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                stmt.query_map(params![window, limit], |row| {
+                    Ok(PushDeviceRow {
+                        device_id: row.get(0)?,
+                        sends: nonneg(row.get(1)?),
+                        bytes: nonneg(row.get(2)?),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?)
     }
 
     pub(crate) async fn ip_top_endpoints(
@@ -291,19 +301,22 @@ impl TrafficReader {
              FROM {IP_TRAFFIC_TABLE} WHERE hour >= datetime('now', ?1) \
              GROUP BY endpoint ORDER BY b DESC LIMIT ?2"
         );
-        let mut rows = self
-            .conn
-            .query(&sql, params![window(range), i64::from(limit)])
-            .await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(IpEndpointRow {
-                endpoint: row.get::<String>(0)?,
-                requests: nonneg(row.get::<i64>(1)?),
-                bytes: nonneg(row.get::<i64>(2)?),
-            });
-        }
-        Ok(out)
+        let window = window(range);
+        let limit = i64::from(limit);
+        Ok(self
+            .pool
+            .interact(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                stmt.query_map(params![window, limit], |row| {
+                    Ok(IpEndpointRow {
+                        endpoint: row.get(0)?,
+                        requests: nonneg(row.get(1)?),
+                        bytes: nonneg(row.get(2)?),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?)
     }
 
     pub(crate) async fn ip_top_sources(
@@ -316,19 +329,22 @@ impl TrafficReader {
              FROM {IP_TRAFFIC_TABLE} WHERE hour >= datetime('now', ?1) \
              GROUP BY ip ORDER BY b DESC LIMIT ?2"
         );
-        let mut rows = self
-            .conn
-            .query(&sql, params![window(range), i64::from(limit)])
-            .await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(IpSourceRow {
-                ip: row.get::<String>(0)?,
-                requests: nonneg(row.get::<i64>(1)?),
-                bytes: nonneg(row.get::<i64>(2)?),
-            });
-        }
-        Ok(out)
+        let window = window(range);
+        let limit = i64::from(limit);
+        Ok(self
+            .pool
+            .interact(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                stmt.query_map(params![window, limit], |row| {
+                    Ok(IpSourceRow {
+                        ip: row.get(0)?,
+                        requests: nonneg(row.get(1)?),
+                        bytes: nonneg(row.get(2)?),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?)
     }
 
     /// One source IP's per-endpoint totals over the window. `ip` is **bound** (`?2`),
@@ -345,19 +361,23 @@ impl TrafficReader {
              FROM {IP_TRAFFIC_TABLE} WHERE hour >= datetime('now', ?1) AND ip = ?2 \
              GROUP BY endpoint ORDER BY b DESC LIMIT ?3"
         );
-        let mut rows = self
-            .conn
-            .query(&sql, params![window(range), ip, i64::from(limit)])
-            .await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(IpEndpointRow {
-                endpoint: row.get::<String>(0)?,
-                requests: nonneg(row.get::<i64>(1)?),
-                bytes: nonneg(row.get::<i64>(2)?),
-            });
-        }
-        Ok(out)
+        let window = window(range);
+        let ip = ip.to_owned();
+        let limit = i64::from(limit);
+        Ok(self
+            .pool
+            .interact(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                stmt.query_map(params![window, ip, limit], |row| {
+                    Ok(IpEndpointRow {
+                        endpoint: row.get(0)?,
+                        requests: nonneg(row.get(1)?),
+                        bytes: nonneg(row.get(2)?),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?)
     }
 
     /// All-time per-device send/byte totals (no window, no `LIMIT`), keyed by
@@ -370,15 +390,19 @@ impl TrafficReader {
             "SELECT device_id, coalesce(sum(sends),0), coalesce(sum(bytes),0) \
              FROM {PUSH_TRAFFIC_TABLE} GROUP BY device_id"
         );
-        let mut rows = self.conn.query(&sql, ()).await?;
-        let mut out = std::collections::HashMap::new();
-        while let Some(row) = rows.next().await? {
-            out.insert(
-                row.get::<String>(0)?,
-                (nonneg(row.get::<i64>(1)?), nonneg(row.get::<i64>(2)?)),
-            );
-        }
-        Ok(out)
+        Ok(self
+            .pool
+            .interact(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (nonneg(row.get(1)?), nonneg(row.get(2)?)),
+                    ))
+                })?
+                .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()
+            })
+            .await?)
     }
 }
 
@@ -386,23 +410,50 @@ impl TrafficReader {
 mod tests {
     use super::*;
 
-    async fn reader() -> TrafficReader {
-        TrafficReader::open(":memory:")
+    /// A temp on-disk DB path that removes the `.db`/`-wal`/`-shm` sidecars on drop.
+    /// The reader sits on a *pool*, so `:memory:` would give each pooled connection
+    /// its own private database — a seed and a read could land on different ones.
+    struct TempDbPath(String);
+    impl TempDbPath {
+        fn new() -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("traffic-query-{}.db", rand::random::<u64>()))
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+    }
+    impl Drop for TempDbPath {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
+            }
+        }
+    }
+
+    async fn reader() -> (TrafficReader, TempDbPath) {
+        let path = TempDbPath::new();
+        let r = TrafficReader::open(&path.0)
             .await
             .unwrap()
-            .expect(":memory: is non-empty so open yields Some")
+            .expect("a non-empty path so open yields Some");
+        (r, path)
     }
 
     /// Insert a relay row stamped `hours_ago` hours before now (truncated to the
     /// hour by the same `strftime` the writer uses).
     async fn seed_relay(r: &TrafficReader, key: &str, hours_ago: i64, up: i64, down: i64) {
-        r.conn
-            .execute(
-                "INSERT INTO relay_traffic(remote_api_key, server_id, hour, bytes_up, bytes_down, \
-                 frames_up, frames_down) VALUES(?1, 'srv', \
-                 strftime('%Y-%m-%d %H:00:00','now', ?2), ?3, ?4, 1, 1)",
-                params![key, format!("-{hours_ago} hours"), up, down],
-            )
+        let key = key.to_owned();
+        r.pool
+            .interact(move |conn| {
+                conn.execute(
+                    "INSERT INTO relay_traffic(remote_api_key, server_id, hour, bytes_up, \
+                     bytes_down, frames_up, frames_down) VALUES(?1, 'srv', \
+                     strftime('%Y-%m-%d %H:00:00','now', ?2), ?3, ?4, 1, 1)",
+                    params![key, format!("-{hours_ago} hours"), up, down],
+                )
+            })
             .await
             .unwrap();
     }
@@ -415,23 +466,30 @@ mod tests {
         reqs: i64,
         bytes: i64,
     ) {
-        r.conn
-            .execute(
-                "INSERT INTO ip_traffic(ip, endpoint, hour, requests, bytes) VALUES(?1, ?2, \
-                 strftime('%Y-%m-%d %H:00:00','now', ?3), ?4, ?5)",
-                params![ip, endpoint, format!("-{hours_ago} hours"), reqs, bytes],
-            )
+        let ip = ip.to_owned();
+        let endpoint = endpoint.to_owned();
+        r.pool
+            .interact(move |conn| {
+                conn.execute(
+                    "INSERT INTO ip_traffic(ip, endpoint, hour, requests, bytes) VALUES(?1, ?2, \
+                     strftime('%Y-%m-%d %H:00:00','now', ?3), ?4, ?5)",
+                    params![ip, endpoint, format!("-{hours_ago} hours"), reqs, bytes],
+                )
+            })
             .await
             .unwrap();
     }
 
     async fn seed_push(r: &TrafficReader, device: &str, hours_ago: i64, sends: i64, bytes: i64) {
-        r.conn
-            .execute(
-                "INSERT INTO push_traffic(device_id, hour, sends, bytes) VALUES(?1, \
-                 strftime('%Y-%m-%d %H:00:00','now', ?2), ?3, ?4)",
-                params![device, format!("-{hours_ago} hours"), sends, bytes],
-            )
+        let device = device.to_owned();
+        r.pool
+            .interact(move |conn| {
+                conn.execute(
+                    "INSERT INTO push_traffic(device_id, hour, sends, bytes) VALUES(?1, \
+                     strftime('%Y-%m-%d %H:00:00','now', ?2), ?3, ?4)",
+                    params![device, format!("-{hours_ago} hours"), sends, bytes],
+                )
+            })
             .await
             .unwrap();
     }
@@ -443,14 +501,14 @@ mod tests {
 
     #[tokio::test]
     async fn empty_db_yields_empty_and_zeroed() {
-        let r = reader().await;
+        let (r, _path) = reader().await;
         assert!(r.relay_series(Range::H24).await.unwrap().is_empty());
         assert!(r.relay_top_keys(Range::H24, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn range_filters_across_the_window_boundary() {
-        let r = reader().await;
+        let (r, _path) = reader().await;
         seed_relay(&r, "k", 1, 100, 10).await; // inside 24h
         seed_relay(&r, "k", 48, 200, 20).await; // outside 24h, inside 7d
         let h24: u64 = r
@@ -473,7 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn daily_buckets_collapse_same_day_hours() {
-        let r = reader().await;
+        let (r, _path) = reader().await;
         // Two rows a few hours apart but (assuming the test doesn't straddle
         // midnight UTC) within the same calendar day.
         seed_relay(&r, "k", 1, 10, 0).await;
@@ -490,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn top_n_orders_by_bytes_and_truncates() {
-        let r = reader().await;
+        let (r, _path) = reader().await;
         seed_relay(&r, "small", 1, 1, 1).await;
         seed_relay(&r, "big", 1, 1000, 1000).await;
         seed_relay(&r, "mid", 1, 100, 100).await;
@@ -502,7 +560,7 @@ mod tests {
 
     #[tokio::test]
     async fn ip_top_endpoints_and_sources() {
-        let r = reader().await;
+        let (r, _path) = reader().await;
         seed_ip(&r, "1.1.1.1", "content/join", 1, 5, 500).await;
         seed_ip(&r, "2.2.2.2", "notify", 1, 2, 50).await;
         let by_ep = r.ip_top_endpoints(Range::H24, 10).await.unwrap();
@@ -514,7 +572,7 @@ mod tests {
 
     #[tokio::test]
     async fn ip_endpoints_filters_to_one_source_and_orders_by_bytes() {
-        let r = reader().await;
+        let (r, _path) = reader().await;
         seed_ip(&r, "1.1.1.1", "content/join", 1, 5, 500).await;
         seed_ip(&r, "1.1.1.1", "control", 1, 9, 90).await;
         seed_ip(&r, "2.2.2.2", "notify", 1, 2, 50).await; // a different IP, must be excluded
@@ -533,7 +591,7 @@ mod tests {
     /// `push_device_totals` (no window) the Devices page joins onto live bindings.
     #[tokio::test]
     async fn push_series_top_devices_and_all_time_totals() {
-        let r = reader().await;
+        let (r, _path) = reader().await;
         seed_push(&r, "dev-a", 1, 3, 300).await; // inside 24h
         seed_push(&r, "dev-a", 100, 5, 5000).await; // older — only in all-time totals
         seed_push(&r, "dev-b", 2, 7, 70).await;

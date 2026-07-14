@@ -2,7 +2,7 @@
 //!
 //! Business logic (code minting, TTL semantics, refusal shape) lives
 //! in `baybo-pairing`. This module keeps only the trait + row shape so
-//! baybo-storage stays the single owner of every libsql adapter. See
+//! baybo-storage stays the single owner of every sqlite adapter. See
 //! `docs/modules/pairing.md` for the end-to-end picture.
 
 use async_trait::async_trait;

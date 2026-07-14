@@ -1,7 +1,7 @@
 //! Persistence contract for the iOS-companion **device registry**.
 //!
 //! Distinct from the in-memory channel token table: device credentials must
-//! survive a gateway restart, so they live in libsql. The gateway binds to at
+//! survive a gateway restart, so they live in sqlite. The gateway binds to at
 //! most **one** device — one gateway = one app. Rows are keyed by `device_id`
 //! (minted fresh per pairing, but stable per physical device), and at most one
 //! row is ever `Approved` at a time: re-pairing supersedes the prior binding
@@ -20,7 +20,7 @@
 //!
 //! Business logic (the XXpsk0 handshake, rendezvous/secret minting, TTL) lives
 //! in `baybo-pairing`; this module is only the trait + row shape, keeping
-//! `baybo-storage` the single owner of every libsql adapter.
+//! `baybo-storage` the single owner of every sqlite adapter.
 
 use async_trait::async_trait;
 

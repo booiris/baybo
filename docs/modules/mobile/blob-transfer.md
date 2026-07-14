@@ -302,7 +302,7 @@ Other mitigations (see Adversarial #4):
 
 Read scope is the `read_token` already baked into every `blob_id`, **not** a session ACL or
 an offered-set. `blob_id = "sha256:<hex>.<read_token>"`, where `read_token` is a 128-bit
-unguessable value minted per put. `crates/storage/src/libsql/blob.rs` enforces the token
+unguessable value minted per put. `crates/storage/src/sqlite/blob.rs` enforces the token
 in `stat()`; `get()`, `open()`, and `open_at()` are token-safe because they call `stat()`
 before resolving the content-addressed path. The on-disk path is keyed by the hex digest
 alone (`blob_path`), and `split_id` never compares the token — **any read path that
@@ -400,6 +400,6 @@ shared bucket, so mislabeling blob-as-chat only forfeits the device's own chat p
 
 - [`sidecars.md`](../../sidecars.md) — the existing `/v1/blobs/*` media side-channel and
   `BlobStore` model this extends to NAT'd clients.
-- [`storage.md`](../storage.md) — libsql `BlobStore`, `read_token` capability.
+- [`storage.md`](../storage.md) — sqlite `BlobStore`, `read_token` capability.
 - [`pairing.md`](../pairing.md) / [`gateway.md`](../gateway.md) —
   device pairing, the relay content path, and the gateway channel loop.

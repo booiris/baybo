@@ -1,6 +1,6 @@
 //! Test-only helpers for gateway crate-level tests.
 //!
-//! Builds a minimal [`GatewayDeps`] wired against an in-memory libsql
+//! Builds a minimal [`GatewayDeps`] wired against an in-memory sqlite
 //! store, plus the primitives that the `uds`, `admin_has_no_channels`,
 //! and spawn-lifecycle tests share.
 //!
@@ -116,7 +116,7 @@ pub const TEST_ADMIN_TOKEN: &str = "test-admin-token-fixed-32-bytes!!";
 
 /// Bundle returned by [`build_test_deps`]. Holds the deps plus the
 /// auxiliary handles tests need to keep alive (the tempdir backing
-/// libsql, the shared shutdown signal for orderly teardown).
+/// sqlite, the shared shutdown signal for orderly teardown).
 pub struct TestGateway {
     pub deps: GatewayDeps,
     pub shutdown: ShutdownSignal,

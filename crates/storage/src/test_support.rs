@@ -21,7 +21,7 @@ use baybo_store::blob::{
 };
 
 /// In-memory `BlobStore` for tests. Bytes live in a `Mutex<HashMap>`,
-/// keyed by the same `sha256:<hex>.<read_token>` capability id shape the libsql
+/// keyed by the same `sha256:<hex>.<read_token>` capability id shape the sqlite
 /// backend uses, so downstream tests can swap between fakes and real stores.
 #[derive(Debug, Default)]
 pub struct MemoryBlobStore {
@@ -103,7 +103,7 @@ impl BlobStore for MemoryBlobStore {
         max_bytes: u64,
     ) -> BlobResult<BlobRef> {
         // Tests only — buffer everything into a Vec and reuse the
-        // single-shot `put` path. The real LibsqlBlobStore streams to
+        // single-shot `put` path. The real SqliteBlobStore streams to
         // disk; the fake stays in memory.
         let mut buf = Vec::new();
         while let Some(chunk) = stream.next().await {
@@ -122,7 +122,7 @@ impl BlobStore for MemoryBlobStore {
 
     async fn get(&self, blob_id: &str) -> BlobResult<Vec<u8>> {
         // Funnel through `stat` so the LRU touch + token check fire on
-        // every read, matching the libsql backend's contract.
+        // every read, matching the sqlite backend's contract.
         let _ = self.stat(blob_id).await?;
         match self.blobs.lock().get(blob_id) {
             Some(b) => Ok(b.bytes.clone()),
@@ -144,7 +144,7 @@ impl BlobStore for MemoryBlobStore {
                 if b.read_token != token {
                     return Err(StorageError::NotFound(format!("blob {blob_id}")));
                 }
-                // LRU touch — mirror the libsql backend so tests that
+                // LRU touch — mirror the sqlite backend so tests that
                 // exercise touch-on-access behave identically against
                 // either store.
                 b.last_accessed_at = now;

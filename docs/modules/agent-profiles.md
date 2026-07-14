@@ -10,7 +10,7 @@ This is a cross-crate feature subsystem, not a crate. The pieces live where thei
 
 - `crates/model/src/agent_profile.rs` — `AgentProfileId`, `AgentFramework`, `BUILTIN_AGENT_PROFILE_ID`, `MAX_AGENT_PROFILE_NAME_CHARS`.
 - `crates/store/src/agent_profile.rs` — `AgentProfileRow`, `AgentProfileUpdate`, the `AgentProfileStore` trait.
-- `crates/storage/src/libsql/agent_profile.rs` — `LibsqlAgentProfileStore` + the `agent_profiles` table in `init_db()`.
+- `crates/storage/src/sqlite/agent_profile.rs` — `SqliteAgentProfileStore` + the `agent_profiles` table in `init_db()`.
 - `crates/gateway/src/api/admin/agents.rs` — the `/v1/agents` handlers and DTOs.
 - `app/web/src/pages/AgentsPage.tsx` — the management page.
 
@@ -49,13 +49,13 @@ pub struct AgentProfileRow {
 
 ### The built-in `baybo` profile
 
-Exactly one row is seeded with `id = BUILTIN_AGENT_PROFILE_ID` (`"baybo"`), `name = "baybo"`, `builtin = 1`, `framework = baybo`, every nullable field `NULL`, and its description from the `BUILTIN_AGENT_PROFILE_DESCRIPTION` const in the libsql impl — the row *is* the default behavior. It is **read-only except its avatar** and cannot be deleted: the agent list always has an honest entry for "the assistant you already have", and a future session-binding UI gets a default target without special-casing "no profile".
+Exactly one row is seeded with `id = BUILTIN_AGENT_PROFILE_ID` (`"baybo"`), `name = "baybo"`, `builtin = 1`, `framework = baybo`, every nullable field `NULL`, and its description from the `BUILTIN_AGENT_PROFILE_DESCRIPTION` const in the sqlite impl — the row *is* the default behavior. It is **read-only except its avatar** and cannot be deleted: the agent list always has an honest entry for "the assistant you already have", and a future session-binding UI gets a default target without special-casing "no profile".
 
 ## Design Decisions
 
 ### DB-backed, not workspace files
 
-Web CRUD is the primary interface, avatars are binary, and edits are concurrent — that is the profile of the libsql-managed entities (`sessions`, `session_folders`, `cron_jobs`), not of the git-versioned workspace markdown (Soul `profile/`, `skills/`, subagent `agents/`). The DB row is the single source of truth; there is no file mirror, no watcher, no `reload()` semantics.
+Web CRUD is the primary interface, avatars are binary, and edits are concurrent — that is the profile of the sqlite-managed entities (`sessions`, `session_folders`, `cron_jobs`), not of the git-versioned workspace markdown (Soul `profile/`, `skills/`, subagent `agents/`). The DB row is the single source of truth; there is no file mirror, no watcher, no `reload()` semantics.
 
 ### The builtin row is locked structurally, not by convention
 
@@ -63,7 +63,7 @@ Web CRUD is the primary interface, avatars are binary, and edits are concurrent 
 
 ### Seeding is `INSERT OR IGNORE` at store open
 
-`LibsqlAgentProfileStore::open(pool)` (async, mirroring `LibsqlBlobStore::open`) runs the builtin seed after `init_db()`: `INSERT OR IGNORE` with the fixed id, so a fresh DB gets the row and an existing DB keeps it — including a user-set avatar, because ignore-on-conflict never touches the live row. `init_db()` itself stays pure DDL, and there is no boot-time re-assert of the other builtin fields: no write path can reach them.
+`SqliteAgentProfileStore::open(pool)` (async, mirroring `SqliteBlobStore::open`) runs the builtin seed after `init_db()`: `INSERT OR IGNORE` with the fixed id, so a fresh DB gets the row and an existing DB keeps it — including a user-set avatar, because ignore-on-conflict never touches the live row. `init_db()` itself stays pure DDL, and there is no boot-time re-assert of the other builtin fields: no write path can reach them.
 
 ### The `llm` pin is validated at write, tolerated at read
 
@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     framework       TEXT NOT NULL,          -- AgentFramework::as_str()
     llm             TEXT,
     builtin         INTEGER NOT NULL DEFAULT 0,
-    created_at      INTEGER NOT NULL,       -- Unix µs (libsql/time.rs)
+    created_at      INTEGER NOT NULL,       -- Unix µs (sqlite/time.rs)
     updated_at      INTEGER NOT NULL
 );
 ```
@@ -167,7 +167,7 @@ Shape changes ride the standard openapi regen chain — see the header of `crate
 |---|---|
 | `model` | `AgentProfileId` (ULID-minted string newtype), `AgentFramework` (+ `to_backend_kind`), `BUILTIN_AGENT_PROFILE_ID`, `MAX_AGENT_PROFILE_NAME_CHARS` |
 | `store` | `AgentProfileRow` / `AgentProfileUpdate` / `AgentProfileStore` port; `StorageError::Conflict` carries duplicate names |
-| `storage` | `LibsqlAgentProfileStore` (async `open` seeds the builtin), `agent_profiles` DDL in `init_db()`, `Store.agent_profile` bundle field |
+| `storage` | `SqliteAgentProfileStore` (async `open` seeds the builtin), `agent_profiles` DDL in `init_db()`, `Store.agent_profile` bundle field |
 | `gateway` | `api/admin/agents.rs` handlers + DTOs, `AdminState.{agent_profile_store, blob_store}`, the shared `validate_llm_pin`; `GET /v1/skills` (now `{name, description}` from `all_summaries_sorted`) and `GET /v1/llm/models` feed the read-only skills readout and the model picker |
 | `skills` | `SkillRegistry::all_summaries_sorted()` is the live source rendered read-only in the skills readout |
 | `agent` | the `LlmPoolHandle` on `AdminState` validates the `llm` pin at write time |

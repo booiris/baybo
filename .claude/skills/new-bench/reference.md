@@ -190,7 +190,7 @@ fi
 echo ">> building $PKG bins"; cargo build -p "$PKG" --bins
 if [ "$want_real" = 1 ] && [ -z "$BAYBO_BIN" ]; then
   # In-container bench → static musl (`--target x86_64-unknown-linux-musl`, needs
-  # musl-gcc for libsql's bundled SQLite). In-process bench → a normal release build.
+  # musl-gcc for sqlite's bundled SQLite). In-process bench → a normal release build.
   echo ">> building baybo --features <bench-feature>"
   cargo build --release -p baybo --features <bench-feature>
   BAYBO_BIN="$REPO_ROOT/target/release/baybo"

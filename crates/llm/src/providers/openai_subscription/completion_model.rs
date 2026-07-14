@@ -1142,7 +1142,7 @@ async fn do_single_flight_refresh(
 
 /// Retry vault save with bounded exponential backoff. The backoff
 /// schedule is small ({100ms, 500ms, 2s}) — vault writes hit local
-/// libsql, so any failure is either "disk is genuinely broken" (retry
+/// sqlite, so any failure is either "disk is genuinely broken" (retry
 /// won't help much) or "transient FS glitch" (retry will succeed
 /// quickly). Three attempts is the sweet spot.
 async fn save_with_retries(

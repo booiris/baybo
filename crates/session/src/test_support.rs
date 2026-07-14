@@ -21,7 +21,7 @@ use baybo_store::session_folder::{SessionFolderRow, SessionFolderStore};
 use baybo_store::session_summary::{SessionSummaryRow, SessionSummaryStore};
 
 /// One stored row in the in-memory session transcript log — mirrors
-/// the libsql layout closely enough that `apply_session_compaction`
+/// the sqlite layout closely enough that `apply_session_compaction`
 /// can supersede rows the same way the real backend does.
 #[derive(Clone)]
 struct StoredMessageRow {
@@ -34,7 +34,7 @@ struct StoredMessageRow {
 
 /// In-memory `SessionStore` for tests across the workspace. Lineage
 /// columns are stubbed (`list_lineage_children` returns empty) — tests
-/// that need that surface should use the real libsql store via
+/// that need that surface should use the real sqlite store via
 /// `baybo_storage::Store::open` against a tempfile.
 #[derive(Default)]
 pub struct MemorySessionStore {
@@ -549,7 +549,7 @@ impl SessionStore for MemorySessionStore {
 }
 
 /// In-memory `SessionSummaryStore` for tests across the workspace.
-/// Mirrors the libsql backend's behaviour for the trait surface
+/// Mirrors the sqlite backend's behaviour for the trait surface
 /// (`upsert_success` resets `error_count`, `bump_error_count` inserts
 /// a zero row when missing) so unit tests can assert against the same
 /// invariants production exercises.
@@ -642,7 +642,7 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
 /// `delete` promotes sub-folders and removes the row but cannot reach a
 /// sibling `SessionStore` to null member sessions (it returns an empty
 /// affected list). Tests asserting the session-nulling side of dissolve
-/// should use the real libsql store via a tempfile.
+/// should use the real sqlite store via a tempfile.
 #[derive(Default)]
 pub struct MemorySessionFolderStore {
     rows: Mutex<HashMap<FolderId, SessionFolderRow>>,
@@ -765,8 +765,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_preserves_flat_columns_like_libsql() {
-        // The fake must mirror the libsql upsert, whose DO UPDATE omits
+    async fn save_preserves_flat_columns_like_sqlite() {
+        // The fake must mirror the sqlite upsert, whose DO UPDATE omits
         // the flat columns owned by the targeted setters — a stale
         // in-memory re-save must not un-hide, un-pin, or un-archive.
         let store = MemorySessionStore::new();

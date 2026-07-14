@@ -32,7 +32,7 @@ Session (TriggerKind::User|Cron)
     │                  4. tool loop (≤ MAX_BACKGROUND_SUMMARY_ITERATIONS): Read/Edit
     │                     scoped to the notes path — the model rewrites summary.md
     │                     in place (same model as the session)
-    │                  5. record libsql metadata (warn-and-continue on failure)
+    │                  5. record sqlite metadata (warn-and-continue on failure)
     │          store the JoinHandle on AgentLoop.bg_compression
     └─ compress_if_needed → ContextManager::run_compression_flow
                               ├─ stage 1: load summary.md → assemble → return
@@ -53,7 +53,7 @@ Session (TriggerKind::User|Cron)
 
 The first-pass seed (`DEFAULT_NOTES_TEMPLATE`) is written atomically via tempfile + `rename` (mirrors `crates/workspace/src/identity.rs:36-40`); later passes rewrite the file in place through the model's `Edit` calls.
 
-### libsql — table `session_summaries`
+### sqlite — table `session_summaries`
 
 ```sql
 CREATE TABLE session_summaries (
@@ -160,7 +160,7 @@ Key properties:
 3. **Seed the notes file when absent** (`ensure_notes_file`): write `DEFAULT_NOTES_TEMPLATE` — the canonical section scaffold — via tempfile + rename, so the model's `Edit` calls always land against a real file.
 4. Append the session-notes prompt after the transcript (`build_summary_prompt`: `PROMPT_TEMPLATE` with `{{notesPath}}` / `{{currentNotes}}` substituted, plus the size-budget appendices — see Appendix A).
 5. **Run the tool loop** (at most `MAX_BACKGROUND_SUMMARY_ITERATIONS` = 10 turns): the model is offered `Read` / `Edit`, scoped by `enforce_notes_scope` to the notes path, and rewrites `summary.md` **in place** through its `Edit` calls. Tool errors come back as `ERROR:`-prefixed `tool_result` bodies so the model can retry. Each iteration calls the chat callback, which opens its own `StepKind::Compression` + `LlmCall` span via `CompressionRunner::run`. Same model as the session. The loop ends when the model responds without tool calls.
-6. **libsql metadata record** (`record_summary_success` — a single-statement upsert; no retry, a failure is logged at `warn` and the pass still succeeds, leaving an FS orphan for the startup reaper):
+6. **sqlite metadata record** (`record_summary_success` — a single-statement upsert; no retry, a failure is logged at `warn` and the pass still succeeds, leaving an FS orphan for the startup reaper):
    ```sql
    INSERT INTO session_summaries
        (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count)

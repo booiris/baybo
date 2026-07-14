@@ -23,7 +23,7 @@ The layering follows the `session_summaries` precedent:
   tool-name consts (`TASK_CREATE_TOOL_NAME`, …, `TASK_MUTATING_TOOL_NAMES`).
   Pure data, shared one-way like `PendingBackgroundResult`.
 - **`baybo-store`** — the `TaskStore` trait + `TaskPatch` (the ports contract).
-- **`baybo-storage`** — `LibsqlTaskStore` over the dedicated `session_tasks`
+- **`baybo-storage`** — `SqliteTaskStore` over the dedicated `session_tasks`
   table.
 - **`baybo-task`** — the `Tool` impls + the `tools::agent_tools` factory + a
   `MemoryTaskStore` test fixture behind `#[cfg(any(test, feature = "test-support"))]`.
@@ -47,7 +47,7 @@ never sweeps them (session data is core data).
 ### Tools write directly through `TaskStore` — no actor round-trip
 
 Unlike `SessionState`, the `session_tasks` table is shared state, not actor-owned
-`&mut`. Per-row writes are atomic in libsql, so a tool writes straight from
+`&mut`. Per-row writes are atomic in sqlite, so a tool writes straight from
 `execute()` even though tool calls run concurrently under `join_all` and a REST
 handler could write while the actor is mid-turn. This sidesteps the
 single-writer `mpsc` dance `spawn_subagent` needs (that exists only because
@@ -111,7 +111,7 @@ work, which has no durable model yet. They remain `NotImplemented` stubs in
 |--------|------|
 | `model` | Owns `Task` / `TaskStatus` / `TaskId` + the `TASK_*_TOOL_NAME` consts |
 | `store` | Owns the `TaskStore` trait + `TaskPatch` |
-| `storage` | `LibsqlTaskStore` + the `session_tasks` DDL; `task` field on the `Store` bundle |
+| `storage` | `SqliteTaskStore` + the `session_tasks` DDL; `task` field on the `Store` bundle |
 | `agent` | `crates/baybo/src/runtime.rs` registers `baybo_task::tools::agent_tools(stores.task)`; `AgentLoop` holds the `Arc<dyn TaskStore>`, refreshes the per-turn reminder, and emits `AgentEvent::TaskList` |
 | `context` | `ContextManager::refresh_task_reminder` + `prompts::tasks::render_task_list` render the transient reminder |
 | `channels` | `AgentEvent::TaskList` + the `Frame::TaskList` / `TaskView` wire types |

@@ -2,7 +2,7 @@
 //!
 //! The TUI deliberately does not open the workspace vault itself — it
 //! only holds a WS connection — so the persistent ring lives here, on
-//! the single process that already owns [`SecretVault`] and the libsql
+//! the single process that already owns [`SecretVault`] and the sqlite
 //! file. Clients request their snapshot via the [`Frame::HistorySnapshot`](baybo_channels::wire::Frame::HistorySnapshot)
 //! frame the route emits right after a successful TUI register, and
 //! push new entries with [`Frame::HistoryAppend`](baybo_channels::wire::Frame::HistoryAppend).

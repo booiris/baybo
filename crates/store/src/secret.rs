@@ -6,7 +6,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Async trait for encrypted secret persistence.
 ///
-/// Implemented by `baybo_storage::libsql::LibsqlSecretStore` (production)
+/// Implemented by `baybo_storage::sqlite::SqliteSecretStore` (production)
 /// and `baybo_security::test_support::MemorySecretStore` (tests). The bytes
 /// handed in are already AES-256-GCM ciphertext minted by
 /// `baybo_security::SecretVault` — this layer only persists opaque blobs

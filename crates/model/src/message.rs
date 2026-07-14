@@ -461,7 +461,7 @@ pub enum Role {
 
 impl Role {
     /// Canonical lowercase wire/db spelling. Matches the
-    /// `#[serde(rename_all = "snake_case")]` form so JSON, libsql
+    /// `#[serde(rename_all = "snake_case")]` form so JSON, sqlite
     /// rows, and any other string-shaped channel agree.
     pub fn as_str(&self) -> &'static str {
         match self {

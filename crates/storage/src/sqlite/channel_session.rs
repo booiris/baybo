@@ -1,45 +1,39 @@
 use async_trait::async_trait;
 use baybo_model::{ChannelType, SessionId};
+use rusqlite::OptionalExtension;
 
-use super::LibsqlPool;
-use baybo_store::StorageError;
+use super::SqlitePool;
 use baybo_store::channel_session::{ChannelSessionStore, Result};
 
-pub struct LibsqlChannelSessionStore {
-    pool: LibsqlPool,
+pub struct SqliteChannelSessionStore {
+    pool: SqlitePool,
 }
 
-impl LibsqlChannelSessionStore {
-    pub fn new(pool: LibsqlPool) -> Self {
+impl SqliteChannelSessionStore {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 }
 
 #[async_trait]
-impl ChannelSessionStore for LibsqlChannelSessionStore {
+impl ChannelSessionStore for SqliteChannelSessionStore {
     async fn get(&self, channel_type: &ChannelType, user_id: &str) -> Result<Option<SessionId>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT session_id FROM channel_sessions
+        let channel_type = channel_type.as_str().to_string();
+        let user_id = user_id.to_string();
+        let session_id = self
+            .pool
+            .interact("channel_sessions.get", move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT session_id FROM channel_sessions
                  WHERE channel_type = ?1 AND user_id = ?2",
-                libsql::params![channel_type.as_str().to_string(), user_id.to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
-        match row {
-            Some(row) => {
-                let session_id: String = row
-                    .get(0)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                Ok(Some(SessionId::from(session_id)))
-            }
-            None => Ok(None),
-        }
+                        rusqlite::params![channel_type, user_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?)
+            })
+            .await?;
+        Ok(session_id.map(SessionId::from))
     }
 
     async fn put(
@@ -49,34 +43,36 @@ impl ChannelSessionStore for LibsqlChannelSessionStore {
         session_id: &SessionId,
     ) -> Result<()> {
         let now = super::time::now_us();
-        let conn = self.pool.conn();
-        // Live row wins: `INSERT OR IGNORE` keeps the existing
-        // `session_id` so two racing inserts don't split the mapping.
-        conn.execute(
-            "INSERT OR IGNORE INTO channel_sessions (channel_type, user_id, session_id, created_at)
+        let channel_type = channel_type.as_str().to_string();
+        let user_id = user_id.to_string();
+        let session_id = session_id.as_str().to_string();
+        self.pool
+            .interact("channel_sessions.put", move |conn| {
+                // Live row wins: `INSERT OR IGNORE` keeps the existing
+                // `session_id` so two racing inserts don't split the mapping.
+                conn.execute(
+                    "INSERT OR IGNORE INTO channel_sessions (channel_type, user_id, session_id, created_at)
              VALUES (?1, ?2, ?3, ?4)",
-            libsql::params![
-                channel_type.as_str().to_string(),
-                user_id.to_string(),
-                session_id.as_str().to_string(),
-                now,
-            ],
-        )
-        .await
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql upsert: {e}")))?;
-        Ok(())
+                    rusqlite::params![channel_type, user_id, session_id, now],
+                )?;
+                Ok(())
+            })
+            .await
     }
 
     async fn delete(&self, channel_type: &ChannelType, user_id: &str) -> Result<()> {
-        let conn = self.pool.conn();
-        conn.execute(
-            "DELETE FROM channel_sessions
+        let channel_type = channel_type.as_str().to_string();
+        let user_id = user_id.to_string();
+        self.pool
+            .interact("channel_sessions.delete", move |conn| {
+                conn.execute(
+                    "DELETE FROM channel_sessions
              WHERE channel_type = ?1 AND user_id = ?2",
-            libsql::params![channel_type.as_str().to_string(), user_id.to_string()],
-        )
-        .await
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete: {e}")))?;
-        Ok(())
+                    rusqlite::params![channel_type, user_id],
+                )?;
+                Ok(())
+            })
+            .await
     }
 }
 
@@ -90,16 +86,16 @@ mod tests {
 
     #[tokio::test]
     async fn get_returns_none_for_missing_mapping() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlChannelSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteChannelSessionStore::new(pool);
         let out = store.get(&ChannelType::telegram(), "tg_42").await.unwrap();
         assert!(out.is_none());
     }
 
     #[tokio::test]
     async fn put_then_get_round_trips() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlChannelSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteChannelSessionStore::new(pool);
         store
             .put(&ChannelType::telegram(), "tg_42", &sid("sess-abc"))
             .await
@@ -110,8 +106,8 @@ mod tests {
 
     #[tokio::test]
     async fn put_on_conflict_keeps_existing_session_id() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlChannelSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteChannelSessionStore::new(pool);
         store
             .put(&ChannelType::telegram(), "tg_42", &sid("sess-first"))
             .await
@@ -126,8 +122,8 @@ mod tests {
 
     #[tokio::test]
     async fn delete_then_put_creates_fresh_mapping() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlChannelSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteChannelSessionStore::new(pool);
         store
             .put(&ChannelType::telegram(), "tg_42", &sid("sess-a"))
             .await
@@ -157,8 +153,8 @@ mod tests {
 
     #[tokio::test]
     async fn different_channel_types_do_not_collide() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlChannelSessionStore::new(pool);
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteChannelSessionStore::new(pool);
         store
             .put(&ChannelType::telegram(), "tg_42", &sid("sess-tg"))
             .await

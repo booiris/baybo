@@ -107,7 +107,7 @@ References: [Telegram updates](https://core.telegram.org/api/updates) ·
 
 baybo already has the hard part: `session_messages.ordinal` **is** a correct
 per-box sequence (dense, monotonic, actor-serialized, assigned at persist —
-`crates/storage/src/libsql/session.rs:515-519`). Per-session ordinals are
+`crates/storage/src/sqlite/session.rs:515-519`). Per-session ordinals are
 exactly Telegram's per-channel `pts` model. What's missing is the discipline
 around it.
 

@@ -4,7 +4,7 @@
 
 The `security` crate provides low-level security primitives: cryptographic operations (`EncryptionKey` is re-exported at the crate root; the `encrypt`/`decrypt` functions are reached as `crypto::encrypt` / `crypto::decrypt`), encrypted secret storage (`SecretVault`, `SecretValue`, plus `SecretVault::list_names`), the user-managed env-secret policy layered over the vault (`UserSecretManager`, `AddOutcome`, `USER_SECRET_PREFIX` — namespaces user secrets under `user_env.<NAME>` and is the single source of truth for env-var-name validation and masked previews), leak detection (`LeakDetector`, `LeakDetectionRule`, `LeakMatch`, `LeakScanResult`, `LeakAction`), deterministic placeholder minting (`PlaceholderMinter`), prompt-injection detection (`InjectionDetector`, `InjectionWarning`, `InjectionSeverity`), filesystem path sensitivity checks (`is_sensitive_path`), log redaction (the `log_redact` module with `RedactingMakeWriter` / `RedactingWriter`), and the `SecurityError` error type.
 
-The gateway (`SecurityGateway`) lives in `agent::security` — it holds session-scoped state and orchestrates scanning, minting, and reveal across the agent loop. The `SecretStore` trait lives in the `baybo-store` ports crate; `SecretVault` and the rest of the crypto surface live here, and `baybo-storage` provides the libsql implementation. `MemorySecretStore` for downstream tests is exposed via the `test-support` feature gate.
+The gateway (`SecurityGateway`) lives in `agent::security` — it holds session-scoped state and orchestrates scanning, minting, and reveal across the agent loop. The `SecretStore` trait lives in the `baybo-store` ports crate; `SecretVault` and the rest of the crypto surface live here, and `baybo-storage` provides the sqlite implementation. `MemorySecretStore` for downstream tests is exposed via the `test-support` feature gate.
 
 Core responsibilities of the primitives in this crate:
 
@@ -147,4 +147,4 @@ Security only decides allow/deny. It does not execute network access. There is n
 | `channels` | Input messages go to `agent::security::SecurityGateway` first |
 | `agent` | `agent::security::SecurityGateway` and `SecretVault` own business logic |
 | `trace` / `job` | Receive only sanitized payloads and placeholders |
-| `store` / `storage` | `baybo-store` defines the `SecretStore` trait; `baybo-storage` provides the libsql implementation |
+| `store` / `storage` | `baybo-store` defines the `SecretStore` trait; `baybo-storage` provides the sqlite implementation |
