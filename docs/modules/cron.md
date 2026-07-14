@@ -225,6 +225,8 @@ The `CronStore` trait lives in the `baybo-store` ports crate (its sqlite impl in
 
 A fire owns when it ran and where the schedule goes next. It owns nothing the user typed. And because its write is still `UNMOVED`-conditional, a pause, a delete or a reschedule that lands mid-fire wins outright: the write-back is dropped whole rather than advancing a schedule the user has just replaced. The fire already in flight completes either way — it was legitimately due — only the row's schedule is left as the user's write left it.
 
+Dropping the write-back whole costs that fire its `last_triggered_at` stamp: the job's "last run" under-reports a fire that a pause, a delete or a reschedule raced. That is deliberate and it is the cheap half of the trade — the fire itself is not lost (its `CronExecution` row is written before dispatch, so the history is intact and the fire's own conversation exists), and the alternative is to split the write-back so the stamp lands even when the slot moved, which re-opens exactly the hole the conditional write closes: a schedule the user has just replaced getting re-armed by the fire that was already in the air.
+
 Rejected: matching the blob text itself as the CAS. A stored blob that lacks a field a newer job carries (a title-less legacy row) does not re-serialize byte-identically, so its job would never advance again — a permanently dead schedule. `updated_at` as a version is the same class of fragility (an RFC3339 text comparison), and a dedicated version column would be a schema change to answer a question `status` and `next_trigger_at` already answer.
 
 ## Constraints
