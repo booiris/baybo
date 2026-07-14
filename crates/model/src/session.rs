@@ -117,6 +117,17 @@ pub enum TriggerSource {
         /// with no migration.
         #[serde(default)]
         conversation: bool,
+        /// The job's title at the moment this fire was minted. A tombstone,
+        /// not a source of truth: clients group a job's fires into one
+        /// chat-list row (see `docs/cron-groups.md`) and the gateway labels
+        /// that group with the job's *live* title, so a rename propagates
+        /// with no rewrite here. This snapshot answers only the one question
+        /// the live lookup cannot — "the job is gone; what was this history
+        /// called?" — which is why it is written once at mint and never
+        /// updated, and why it cannot go stale. `None` for fires persisted
+        /// before it existed; those group only while their job is alive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_title: Option<String>,
     },
 }
 
@@ -154,6 +165,16 @@ impl TriggerSource {
     /// this: a cron session that is *not* a conversation stays invisible.
     pub fn is_cron_conversation(&self) -> bool {
         matches!(self, TriggerSource::Cron { conversation, .. } if *conversation)
+    }
+
+    /// The job's title as it stood when this fire was minted — the fallback
+    /// label for a cron group whose job has since been deleted. Prefer the
+    /// job's live title when the job still exists.
+    pub fn cron_job_title(&self) -> Option<&str> {
+        match self {
+            TriggerSource::User => None,
+            TriggerSource::Cron { job_title, .. } => job_title.as_deref(),
+        }
     }
 }
 
@@ -772,6 +793,7 @@ mod tests {
             cron_job_id: "cron-1".into(),
             origin_session_id: Some(SessionId::from("sess-origin")),
             conversation: true,
+            job_title: Some("Morning brief".into()),
         };
         let s = serde_json::to_string(&t).unwrap();
         let back: TriggerSource = serde_json::from_str(&s).unwrap();
@@ -783,17 +805,39 @@ mod tests {
             Some("sess-origin")
         );
         assert!(back.is_cron_conversation());
+        assert_eq!(back.cron_job_title(), Some("Morning brief"));
     }
 
     /// A cron session persisted before the visibility marker existed must
     /// deserialize as "not a conversation" — that default is what keeps
     /// historical fires out of the chat sidebar with no migration.
+    ///
+    /// The same default carries the cron-group tombstone: a fire minted before
+    /// `job_title` existed has no snapshot, so it can only be grouped while its
+    /// job is alive to supply the label (see `docs/cron-groups.md`).
     #[test]
     fn legacy_cron_trigger_defaults_to_invisible() {
         let back: TriggerSource =
             serde_json::from_str(r#"{"kind":"cron","cron_job_id":"cron-old"}"#).unwrap();
         assert!(!back.is_cron_conversation());
         assert!(back.cron_origin_session_id().is_none());
+        assert!(back.cron_job_title().is_none());
+    }
+
+    /// The snapshot is a tombstone, not a source of truth — it must survive a
+    /// round-trip through the `sessions.data` blob so a group whose job has
+    /// been deleted keeps its name.
+    #[test]
+    fn cron_job_title_snapshot_survives_a_blob_round_trip() {
+        let t = TriggerSource::Cron {
+            cron_job_id: "cron-1".into(),
+            origin_session_id: None,
+            conversation: true,
+            job_title: Some("每日晨报".into()),
+        };
+        let back: TriggerSource =
+            serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back.cron_job_title(), Some("每日晨报"));
     }
 
     #[test]

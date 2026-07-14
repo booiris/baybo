@@ -366,6 +366,7 @@ mod tests {
                 cron_job_id: "cj-1".into(),
                 origin_session_id: Some("sess-user".into()),
                 conversation: false,
+                job_title: None,
             },
         );
         assert_eq!(origin_session(&ctx).as_str(), "sess-user");
@@ -385,6 +386,7 @@ mod tests {
                 cron_job_id: "cj-news".into(),
                 origin_session_id: Some("sess-somewhere-else".into()),
                 conversation: true,
+                job_title: Some("Daily news".into()),
             },
         );
         assert_eq!(origin_session(&ctx).as_str(), "cron-daily-news");
@@ -401,6 +403,7 @@ mod tests {
                 cron_job_id: "cj-legacy".into(),
                 origin_session_id: None,
                 conversation: false,
+                job_title: None,
             },
         );
         assert_eq!(origin_session(&ctx).as_str(), "cron-fire-2");

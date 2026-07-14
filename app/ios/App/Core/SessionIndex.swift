@@ -27,11 +27,19 @@ struct SessionRow: Codable, Identifiable, Equatable {
     /// Local-only unread counter — the server never surfaces it. Bumped by a
     /// `SessionActivity` ping for a backgrounded session, cleared on open.
     var unread: Int
+    /// The cron job this row is a fire of — the key the list groups on so one
+    /// job's fires collapse into a single row instead of flooding the list (a
+    /// **cron group**; see `docs/cron-groups.md`). `nil` for an ordinary chat.
+    var cronJobId: String?
+    /// That group's label (the job's live title, else the name it had when the
+    /// job was deleted). `nil` when the group cannot be named at all — such a
+    /// row stays flat rather than joining a nameless group.
+    var cronJobTitle: String?
 
     init(
         id: String, createdAt: Date, lastActive: Date, title: String? = nil,
         preview: String?, userText: String? = nil, pinned: Bool, archived: Bool = false,
-        unread: Int = 0
+        unread: Int = 0, cronJobId: String? = nil, cronJobTitle: String? = nil
     ) {
         self.id = id
         self.createdAt = createdAt
@@ -42,6 +50,8 @@ struct SessionRow: Codable, Identifiable, Equatable {
         self.pinned = pinned
         self.archived = archived
         self.unread = unread
+        self.cronJobId = cronJobId
+        self.cronJobTitle = cronJobTitle
     }
 
     /// The pre-Telegram schema stored the preview under `lastUserText`; decode
@@ -71,6 +81,13 @@ struct SessionRow: Codable, Identifiable, Equatable {
         pinned = try c.decode(Bool.self, forKey: .pinned)
         archived = try c.decodeIfPresent(Bool.self, forKey: .archived) ?? false
         unread = try c.decodeIfPresent(Int.self, forKey: .unread) ?? 0
+        // Miss these two and the whole cron grouping silently vanishes on a cold
+        // start — the rows load, they just forget which job they belong to. Note
+        // `PersistedFormatTests` only asserts a key is PRESENT in the encoded
+        // JSON, so it cannot catch a forgotten decode; `SessionIndexMergeTests`
+        // round-trips through disk for exactly that reason.
+        cronJobId = try c.decodeIfPresent(String.self, forKey: .cronJobId)
+        cronJobTitle = try c.decodeIfPresent(String.self, forKey: .cronJobTitle)
     }
 }
 
@@ -117,6 +134,11 @@ final class SessionIndex: ObservableObject {
     }
 
     @Published private(set) var rows: [SessionRow] = []
+
+    /// Bumped whenever the gateway tells us our list mirror is behind — see
+    /// [`noteListStale`]. `ChatListScreen` observes it and refetches. Not
+    /// persisted: staleness is a fact about *this* connection, not about disk.
+    @Published private(set) var listStaleEpoch: UInt64 = 0
 
     /// The Application Support root this registry — and the transcript mirrors
     /// and outboxes it prunes/wipes — lives under. Injected rather than resolved
@@ -232,11 +254,20 @@ final class SessionIndex: ObservableObject {
 
     /// A connection-global `SessionActivity` ping (see `SessionActivityHandler`):
     /// bump the row's recency and, unless it's the foreground session, its unread
-    /// count. Unknown ids (drafts / cron / sessions created on another device) are
-    /// ignored — a later REST merge surfaces them. Both `user` and `assistant`
-    /// sources count, matching the web sidebar.
+    /// count. Both `user` and `assistant` sources count, matching the web sidebar.
+    ///
+    /// An id we've never listed is the gateway telling us about a session that
+    /// does not exist on this device yet — a cron fire, or a chat started on
+    /// another client. That is not a no-op: it is the ONLY live signal such a row
+    /// exists, so it nudges a list refetch (`listStaleEpoch`). Returning silently
+    /// here — as this used to — meant a user parked on the chat list watched a
+    /// scheduled job fire and saw *nothing*, until they backgrounded the app or
+    /// pulled to refresh. (The web sidebar has always refetched on an unknown id.)
     func noteActivity(sessionId: String, source: String, atMillis: Int64) {
-        guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else {
+            noteListStale()
+            return
+        }
         let at = Date(timeIntervalSince1970: Double(atMillis) / 1000)
         var changed = false
         if at > rows[idx].lastActive {
@@ -248,6 +279,21 @@ final class SessionIndex: ObservableObject {
             changed = true
         }
         if changed { save() }
+    }
+
+    /// The device's list mirror may be behind the gateway's — refetch it.
+    ///
+    /// Two callers, one meaning. A `SessionActivity` for a session we have never
+    /// listed (above), and `Frame::Gap { session_id: nil }` — the gateway's "I
+    /// dropped a session-less broadcast", which is *how* such a ping goes missing
+    /// in the first place. Both say the same thing: what you are rendering is not
+    /// what the server has.
+    ///
+    /// A counter rather than a `Bool` flag: two nudges in a row must produce two
+    /// refreshes, and a flag that is already `true` would swallow the second.
+    /// Observers debounce; this side never decides *when* to refetch.
+    func noteListStale() {
+        listStaleEpoch &+= 1
     }
 
     /// A `ChatScreen` came to the foreground: mark it current and clear its badge.
@@ -269,6 +315,18 @@ final class SessionIndex: ObservableObject {
         else { return }
         rows[idx].unread = 0
         save()
+    }
+
+    /// Optimistic clear behind a cron group's "mark all read" — one save, one
+    /// `@Published` edit, so the badge drops in a single frame rather than N.
+    func clearUnread(_ sessionIds: [String]) {
+        let targets = Set(sessionIds)
+        var changed = false
+        for idx in rows.indices where targets.contains(rows[idx].id) && rows[idx].unread != 0 {
+            rows[idx].unread = 0
+            changed = true
+        }
+        if changed { save() }
     }
 
     /// A live `SessionUpdated` title patch reached the connection-global list
@@ -461,7 +519,11 @@ final class SessionIndex: ObservableObject {
                     title: title,
                     preview: remotePreview ?? mine?.preview,
                     userText: summary.lastUserText ?? mine?.userText,
-                    pinned: pinned, archived: archived, unread: unread))
+                    pinned: pinned, archived: archived, unread: unread,
+                    // Server-owned, like pin/archive: the group a fire belongs to
+                    // is a fact about the session, and the label follows the job's
+                    // LIVE title, so a rename lands here with no local rewrite.
+                    cronJobId: summary.cronJobId, cronJobTitle: summary.cronJobTitle))
         }
         rows = merged
         save()
@@ -572,6 +634,14 @@ final class SessionActivityHandler: SessionListSink, @unchecked Sendable {
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
                 SessionIndex.shared.applyTitle(sessionId: sessionId, title: title)
+            }
+        }
+    }
+
+    func onListStale() {
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                SessionIndex.shared.noteListStale()
             }
         }
     }

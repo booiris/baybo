@@ -1542,6 +1542,7 @@ mod resume_validation_tests {
             cron_job_id: "job-1".into(),
             origin_session_id: None,
             conversation: false,
+            job_title: None,
         };
         assert!(!parent_supports_background(&cron));
     }

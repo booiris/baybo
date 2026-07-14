@@ -184,6 +184,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["mark_sessions_read"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}": {
         parameters: {
             query?: never;
@@ -949,9 +965,29 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             /**
+             * @description The cron job whose fire this conversation is, for the clients that
+             *     collapse a job's fires into one chat-list row (a **cron group** — a
+             *     derived view, never a `session_folders` row; see `docs/cron-groups.md`).
+             *     `None` for a user session, and for the one-shot fire workspaces the list
+             *     never returns anyway.
+             */
+            cron_job_id?: string | null;
+            /**
+             * @description The label for that group: the job's **live** title while the job exists
+             *     (so a rename propagates with no rewrite of any session), falling back to
+             *     the title snapshotted onto the fire at mint once the job is deleted.
+             *     `None` only when both are unavailable — a pre-snapshot fire whose job is
+             *     gone; clients leave those rows flat.
+             */
+            cron_job_title?: string | null;
+            /**
              * @description The user-created folder this session is filed under, or absent for
              *     uncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web
              *     sidebar groups rows by this id.
+             *
+             *     **Ignored for a cron conversation** — those group by [`Self::cron_job_id`]
+             *     instead (see `docs/cron-groups.md`), so a fire can never be in a cron
+             *     group and a user folder at once.
              */
             folder_id?: string | null;
             /**
@@ -1545,6 +1581,16 @@ export interface components {
              *     for the full list.
              */
             total: number;
+        };
+        /** @description Request body for `POST /v1/chat/sessions/read`. */
+        MarkManyReadRequest: {
+            /**
+             * @description The sessions to mark fully read. Each cursor is advanced to that
+             *     session's newest ordinal, so — unlike the per-session route — the caller
+             *     needs no ordinal of its own. Sessions it cannot see are rejected; ids
+             *     that do not exist are skipped.
+             */
+            session_ids: string[];
         };
         /** @description Request body for `PUT /v1/chat/sessions/{session_id}/read`. */
         MarkReadRequest: {
@@ -2534,6 +2580,55 @@ export interface operations {
             };
             /** @description Session creation failed */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    mark_sessions_read: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MarkManyReadRequest"];
+            };
+        };
+        responses: {
+            /** @description Every named session's read cursor advanced to its newest ordinal */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Batch too large */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A named session is not visible to this client */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

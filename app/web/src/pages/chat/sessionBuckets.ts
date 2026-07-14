@@ -1,0 +1,119 @@
+import type { SessionSummary } from './types';
+
+// How the sidebar splits the flat, newest-first session list into the blocks
+// it renders: the lifted Pinned block, the derived cron groups, the per-folder
+// buckets, and the trailing Uncategorized bucket.
+//
+// Kept out of the component so the rules are testable without a DOM: every row
+// lands in exactly one bucket, and the precedence between pin / cron / folder
+// is the whole feature.
+
+/** Collapse-state keys are shared with folders (one localStorage set, see
+ *  `folderStore`), so a cron group's key is namespaced — a cron job id and a
+ *  folder id are different id spaces and must not alias. */
+const CRON_COLLAPSE_PREFIX = 'cron:';
+
+export function cronCollapseKey(jobId: string): string {
+  return `${CRON_COLLAPSE_PREFIX}${jobId}`;
+}
+
+/** A cron group: every visible fire of one recurring cron job, collapsed into
+ *  a single labelled block. It is **derived**, never stored — not a folder, not
+ *  a `session_folders` row, no id of its own beyond the job's. See
+ *  `docs/cron-groups.md`. */
+export interface CronGroup {
+  jobId: string;
+  /** The group's label (the job's live title, or its snapshot once the job is
+   *  gone). A fire with no resolvable title is not groupable and stays flat. */
+  title: string;
+  /** Members drawn inside the group, in incoming (newest-first) order. */
+  sessions: SessionSummary[];
+}
+
+export interface SessionBuckets {
+  pinned: SessionSummary[];
+  /** Newest-group-first (by each group's newest member's `last_active`). */
+  cronGroups: CronGroup[];
+  chatsByFolder: Map<string, SessionSummary[]>;
+  uncategorized: SessionSummary[];
+}
+
+function newestActive(sessions: SessionSummary[]): number {
+  let newest = Number.NEGATIVE_INFINITY;
+  for (const s of sessions) {
+    const t = new Date(s.last_active).getTime();
+    if (!Number.isNaN(t) && t > newest) newest = t;
+  }
+  return newest;
+}
+
+/** Bucket the sidebar's sessions. Precedence, and every row lands in exactly
+ *  one bucket:
+ *
+ *  1. `pinned` lifts the row out of everything else (a pinned cron fire escapes
+ *     to the Pinned block rather than rendering inside its group — it would
+ *     otherwise appear twice).
+ *  2. A cron conversation (`cron_job_id`) groups by its job, and its
+ *     `folder_id` is **ignored** — a fire can never be in a cron group and a
+ *     user folder at once. A fire with no `cron_job_title` cannot be labelled,
+ *     so it stays flat (Uncategorized) rather than inventing a name.
+ *  3. Everything else buckets by `folder_id`, falling back to Uncategorized
+ *     when that folder isn't reachable in the rendered tree.
+ *
+ *  A group with no visible members is never emitted, so an empty cron group
+ *  cannot exist. Hidden rows never reach here (the list drops them).
+ */
+export function bucketSessions(
+  sessions: SessionSummary[],
+  reachableFolderIds: ReadonlySet<string>,
+): SessionBuckets {
+  const pinned: SessionSummary[] = [];
+  const byJob = new Map<string, CronGroup>();
+  const chatsByFolder = new Map<string, SessionSummary[]>();
+  const uncategorized: SessionSummary[] = [];
+
+  for (const s of sessions) {
+    if (s.pinned) {
+      pinned.push(s);
+      continue;
+    }
+    if (s.cron_job_id) {
+      if (s.cron_job_title) {
+        const group = byJob.get(s.cron_job_id) ?? {
+          jobId: s.cron_job_id,
+          title: s.cron_job_title,
+          sessions: [],
+        };
+        group.sessions.push(s);
+        byJob.set(s.cron_job_id, group);
+      } else {
+        uncategorized.push(s);
+      }
+      continue;
+    }
+    if (s.folder_id && reachableFolderIds.has(s.folder_id)) {
+      const arr = chatsByFolder.get(s.folder_id) ?? [];
+      arr.push(s);
+      chatsByFolder.set(s.folder_id, arr);
+    } else {
+      uncategorized.push(s);
+    }
+  }
+
+  // Folders carry a user-chosen `position`; a cron group has none, so it sorts
+  // by its newest visible member — when a job fires, its group floats to the
+  // top of the cron block. Ties fall back to the job id so the order is stable.
+  const cronGroups = [...byJob.values()].sort((a, b) => {
+    const diff = newestActive(b.sessions) - newestActive(a.sessions);
+    return diff !== 0 ? diff : a.jobId.localeCompare(b.jobId);
+  });
+
+  return { pinned, cronGroups, chatsByFolder, uncategorized };
+}
+
+/** Unread across the members drawn *inside* the group. An escaped (pinned) fire
+ *  is deliberately not counted — it carries its own badge in the Pinned block,
+ *  and counting it here would double it. */
+export function cronGroupUnread(group: CronGroup): number {
+  return group.sessions.reduce((sum, s) => sum + s.unread, 0);
+}

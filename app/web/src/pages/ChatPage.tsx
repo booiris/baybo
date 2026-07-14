@@ -851,6 +851,8 @@ export function ChatPage() {
           last_user_text: s.last_user_text ?? undefined,
           folder_id: s.folder_id ?? undefined,
           title: s.title ?? undefined,
+          cron_job_id: s.cron_job_id ?? undefined,
+          cron_job_title: s.cron_job_title ?? undefined,
         }));
       });
     }
@@ -955,6 +957,8 @@ export function ChatPage() {
         last_user_text: s.last_user_text ?? undefined,
         folder_id: s.folder_id ?? undefined,
         title: s.title ?? undefined,
+        cron_job_id: s.cron_job_id ?? undefined,
+        cron_job_title: s.cron_job_title ?? undefined,
       }));
       setSessions(existing);
       setSlashCommands(manifest?.items ?? []);
@@ -4385,6 +4389,10 @@ function applySessionPatch(
   const idx = prev.findIndex((s) => s.session_id === sessionId);
   if (idx === -1) {
     if (patch.created_at == null || patch.last_active == null) return prev;
+    // No cron fields here, and that is sound: only `POST /v1/chat/sessions`
+    // broadcasts a row-constructing Created patch, and a cron fire is never
+    // minted through it. A fire announces itself with `SessionActivity` for an
+    // unknown id, which triggers the list refetch that carries its grouping.
     return [
       {
         session_id: sessionId,
@@ -4410,6 +4418,11 @@ function applySessionPatch(
     last_user_text: current.last_user_text,
     folder_id: nextFolderId,
     title: patch.title ?? current.title,
+    // Cron grouping is read off the session's trigger and never changes, so no
+    // patch carries it — but it must survive the merge, or a title/pin patch
+    // would silently drop the row out of its cron group.
+    cron_job_id: current.cron_job_id,
+    cron_job_title: current.cron_job_title,
   };
   if (
     merged.created_at === current.created_at &&

@@ -814,6 +814,21 @@ async fn dispatch_inbound_frame(
         }
         return;
     }
+    // The gateway dropped a session-less broadcast on this connection (its
+    // bounded queue was full) — among them the `SessionActivity` that announces
+    // a brand-new session. Route the nudge to the connection-global list sink
+    // and `return`, exactly like `SessionActivity` above: a `Gap` with no
+    // session id has no routing target, so falling through would fan it to the
+    // per-session frame sinks and reach NOBODY while the user is parked on the
+    // chat list with nothing subscribed — the one moment it matters. A `Gap`
+    // that DOES name a session is a transcript concern and keeps its old path.
+    if let Frame::Gap { session_id: None } = &frame {
+        let sink = list_sink.lock().clone();
+        if let Some(sink) = sink {
+            sink.on_list_stale();
+        }
+        return;
+    }
     // A `SessionUpdated` patch carrying a freshly-generated title: forward it
     // to the connection-global list sink so a row (subscribed or not) can swap
     // its bold first line live. NOT a `return` — the frame still falls through
@@ -945,6 +960,7 @@ mod tests {
     struct RecordingListSink {
         activity: parking_lot::Mutex<Vec<(String, String, i64)>>,
         titles: parking_lot::Mutex<Vec<(String, String)>>,
+        stale: parking_lot::Mutex<usize>,
     }
 
     impl SessionListSink for RecordingListSink {
@@ -954,6 +970,10 @@ mod tests {
 
         fn on_title(&self, session_id: String, title: String) {
             self.titles.lock().push((session_id, title));
+        }
+
+        fn on_list_stale(&self) {
+            *self.stale.lock() += 1;
         }
     }
 
@@ -1032,6 +1052,48 @@ mod tests {
         assert_eq!(fixture.list.activity.lock().len(), 1);
         assert_eq!(fixture.list.activity.lock()[0].0, "unopened");
         assert!(sinks[0].frames().is_empty());
+    }
+
+    /// `Gap { session_id: None }` is the gateway's "I dropped a session-less
+    /// broadcast" nudge — and the broadcast it most often drops is the
+    /// `SessionActivity` announcing a session the device has never seen (a cron
+    /// fire, say). It has no routing session id, so without the special case it
+    /// falls into the fan-out branch and reaches **nobody** when no session is
+    /// subscribed — which is exactly the state the app is in while the user is
+    /// looking at the chat list. Fixture with NO sinks is the whole point.
+    #[tokio::test]
+    async fn a_session_less_gap_reaches_the_list_sink_with_nothing_subscribed() {
+        let (fixture, _sinks) = Fixture::new(&[]);
+
+        fixture.dispatch(Frame::Gap { session_id: None }).await;
+
+        assert_eq!(
+            *fixture.list.stale.lock(),
+            1,
+            "a session-less Gap must nudge the chat list to refetch, or a new \
+             session never appears while the list is on screen",
+        );
+    }
+
+    /// A `Gap` that DOES name a session is a transcript concern: it must keep
+    /// its old route to that session's frame sink, and must NOT be mistaken for
+    /// a list-refetch nudge.
+    #[tokio::test]
+    async fn a_session_scoped_gap_still_routes_to_its_transcript_sink() {
+        let (fixture, sinks) = Fixture::new(&["s1"]);
+
+        fixture
+            .dispatch(Frame::Gap {
+                session_id: Some("s1".into()),
+            })
+            .await;
+
+        assert_eq!(sinks[0].kinds(), ["gap"]);
+        assert_eq!(
+            *fixture.list.stale.lock(),
+            0,
+            "a session-scoped gap is not a list-plane nudge",
+        );
     }
 
     #[tokio::test]

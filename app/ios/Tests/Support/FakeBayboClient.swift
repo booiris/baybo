@@ -43,6 +43,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var lookups: [LookupCall] = []
     private var approvals: [ApprovalCall] = []
     private var marksRead: [Int64] = []
+    private var batchMarksRead: [[String]] = []
 
     private var apiLegInvalidations = 0
 
@@ -70,6 +71,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var lookupCalls: [LookupCall] { lock.withLock { lookups } }
     var approvalCalls: [ApprovalCall] { lock.withLock { approvals } }
     var readOrdinals: [Int64] { lock.withLock { marksRead } }
+    /// One entry per `chatMarkManyRead` call — the cron group's "mark all read"
+    /// must be ONE round-trip, not one per fire.
+    var batchReadCalls: [[String]] { lock.withLock { batchMarksRead } }
     /// How many times the app dropped its warm relay API legs — the `.background`
     /// barrier. iOS suspends without warning and takes the sockets with it, so a
     /// leg that outlives a suspend is a zombie.
@@ -188,6 +192,10 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
 
     func chatMarkRead(sessionId: String, ordinal: Int64) async throws {
         lock.withLock { marksRead.append(ordinal) }
+    }
+
+    func chatMarkManyRead(sessionIds: [String]) async throws {
+        lock.withLock { batchMarksRead.append(sessionIds) }
     }
 
     func chatUnsubscribe(sessionId: String) async {

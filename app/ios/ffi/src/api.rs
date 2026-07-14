@@ -152,6 +152,15 @@ pub struct ChatSessionSummary {
     /// a device that missed the live `SessionActivity` pings — unlike a
     /// client-local ping counter. `0` when caught up.
     pub unread_count: i64,
+    /// The cron job this row is a fire of — the key the list groups on so a
+    /// job's fires collapse into one row instead of flooding the list (a **cron
+    /// group**; see `docs/cron-groups.md`). `None` for an ordinary chat.
+    pub cron_job_id: Option<String>,
+    /// That group's label: the job's live title, or the title snapshotted onto
+    /// the fire once the job is deleted. `None` when the group cannot be named
+    /// at all (a pre-snapshot fire whose job is gone) — the list leaves such a
+    /// row flat rather than inventing a name.
+    pub cron_job_title: Option<String>,
 }
 
 /// Result of the per-send durability point lookup
@@ -278,6 +287,17 @@ pub trait SessionListSink: Send + Sync {
     /// REST refetch. Only the title patch is forwarded; pin / archive / hide
     /// stay on the optimistic + REST-merge path the list already owns.
     fn on_title(&self, session_id: String, title: String);
+    /// The device's session-list mirror may be behind the gateway's: refetch it.
+    ///
+    /// Fires on `Frame::Gap { session_id: None }` — the gateway's "I dropped a
+    /// session-less broadcast" nudge, which is exactly how a `SessionActivity`
+    /// for a brand-new session goes missing. That frame carries no session id,
+    /// so without this hop it would be fanned to the per-session frame sinks
+    /// and reach *nobody* while the user is parked on the chat list with
+    /// nothing subscribed — precisely the moment the list is on screen and a
+    /// missed row matters. See `docs/sync-protocol.md` ("refetch the session
+    /// list") and `docs/cron-groups.md` (a cron fire is the row this loses).
+    fn on_list_stale(&self);
 }
 
 /// Gateway-side cancellation of an in-flight pairing (the operator declined or

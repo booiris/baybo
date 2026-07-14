@@ -55,6 +55,7 @@ use baybo_model::{
 use baybo_session::SessionError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -75,6 +76,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(set_session_pin))
         .routes(routes!(set_session_archive))
         .routes(routes!(mark_session_read))
+        .routes(routes!(mark_sessions_read))
         .routes(routes!(set_session_folder))
         .routes(routes!(delete_session))
         .routes(routes!(unhide_session))
@@ -601,8 +603,26 @@ pub struct ChatSessionSummary {
     /// The user-created folder this session is filed under, or absent for
     /// uncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web
     /// sidebar groups rows by this id.
+    ///
+    /// **Ignored for a cron conversation** — those group by [`Self::cron_job_id`]
+    /// instead (see `docs/cron-groups.md`), so a fire can never be in a cron
+    /// group and a user folder at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<String>,
+    /// The cron job whose fire this conversation is, for the clients that
+    /// collapse a job's fires into one chat-list row (a **cron group** — a
+    /// derived view, never a `session_folders` row; see `docs/cron-groups.md`).
+    /// `None` for a user session, and for the one-shot fire workspaces the list
+    /// never returns anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_job_id: Option<String>,
+    /// The label for that group: the job's **live** title while the job exists
+    /// (so a rename propagates with no rewrite of any session), falling back to
+    /// the title snapshotted onto the fire at mint once the job is deleted.
+    /// `None` only when both are unavailable — a pre-snapshot fire whose job is
+    /// gone; clients leave those rows flat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_job_title: Option<String>,
     /// Number of unread assistant replies — final assistant messages persisted
     /// with `ordinal` above this session's read cursor
     /// (`PUT /v1/chat/sessions/{id}/read`), capped at [`UNREAD_COUNT_CAP`]
@@ -770,6 +790,7 @@ async fn list_sessions(
         async move { last_message_preview(&manager, &sid).await }
     }))
     .await;
+    let cron_titles = live_cron_job_titles(&state, &visible).await;
     let items: Vec<ChatSessionSummary> = visible
         .into_iter()
         .zip(previews)
@@ -777,6 +798,8 @@ async fn list_sessions(
         .zip(last_messages)
         .map(
             |(((s, last_user_text), unread), last_message_text)| ChatSessionSummary {
+                cron_job_title: cron_group_label(&s, &cron_titles),
+                cron_job_id: cron_group_id(&s).map(str::to_owned),
                 session_id: s.id.to_string(),
                 created_at: s.created_at,
                 last_active: s.last_active,
@@ -792,6 +815,56 @@ async fn list_sessions(
         )
         .collect();
     Ok(Json(ChatSessionsList { items }))
+}
+
+/// The cron job this row groups under, or `None` for anything that is not a
+/// listed cron fire. Keyed off [`TriggerSource::is_cron_conversation`], not the
+/// bare trigger kind: a one-shot's private workspace is not a conversation and
+/// must never surface a group (it is not in the list at all — this keeps the two
+/// facts from drifting apart).
+fn cron_group_id(session: &Session) -> Option<&str> {
+    session
+        .trigger
+        .is_cron_conversation()
+        .then(|| session.trigger.cron_job_id())
+        .flatten()
+}
+
+/// Titles of every cron job any listed fire belongs to. One batched read (cron
+/// jobs number in the handful), skipped entirely when the page holds no cron
+/// conversation. A failed read degrades to an empty map rather than failing the
+/// list — every group then falls back to its tombstone.
+async fn live_cron_job_titles(state: &AdminState, visible: &[Session]) -> HashMap<String, String> {
+    if !visible.iter().any(|s| cron_group_id(s).is_some()) {
+        return HashMap::new();
+    }
+    match state.cron_scheduler.list_all_jobs().await {
+        Ok(jobs) => jobs
+            .into_iter()
+            .map(|job| (job.id, job.title))
+            .filter(|(_, title)| !title.is_empty())
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "cron job titles unavailable; groups fall back to their snapshots");
+            HashMap::new()
+        }
+    }
+}
+
+/// The label for this row's cron group: the job's **live** title, so a rename
+/// propagates to every client on the next list fetch without rewriting a single
+/// session; falling back to the title snapshotted onto the fire at mint, which
+/// answers the one question the live lookup cannot — *the job is gone; what was
+/// this history called?*
+///
+/// `None` when both are unavailable (a fire minted before the snapshot existed,
+/// whose job has since been deleted). Clients leave such a row flat rather than
+/// inventing a name — the population is self-limiting.
+fn cron_group_label(session: &Session, live: &HashMap<String, String>) -> Option<String> {
+    let job_id = cron_group_id(session)?;
+    live.get(job_id)
+        .cloned()
+        .or_else(|| session.trigger.cron_job_title().map(str::to_owned))
 }
 
 #[utoipa::path(
@@ -1355,6 +1428,72 @@ async fn mark_session_read(
         .set_read_cursor(&sid, req.ordinal)
         .await
         .map_err(|e| GatewayError::Internal(format!("mark session read: {e}")))?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Request body for `POST /v1/chat/sessions/read`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MarkManyReadRequest {
+    /// The sessions to mark fully read. Each cursor is advanced to that
+    /// session's newest ordinal, so — unlike the per-session route — the caller
+    /// needs no ordinal of its own. Sessions it cannot see are rejected; ids
+    /// that do not exist are skipped.
+    pub session_ids: Vec<String>,
+}
+
+/// Cap on one batch. A cron group is the motivating caller and a `*/30` job
+/// accrues 48 fires a day, so the bound is generous — but it is a bound: an
+/// unbounded list would be an unbounded fan-out of store round-trips behind one
+/// request.
+const MAX_MARK_READ_BATCH: usize = 500;
+
+#[utoipa::path(
+    post,
+    path = "/chat/sessions/read",
+    tag = "chat",
+    request_body = MarkManyReadRequest,
+    responses(
+        (status = 204, description = "Every named session's read cursor advanced to its newest ordinal"),
+        (status = 400, description = "Batch too large", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "A named session is not visible to this client", body = ErrorBody),
+    )
+)]
+async fn mark_sessions_read(
+    State(state): State<AdminState>,
+    authed: Option<Extension<AuthedClient>>,
+    Json(req): Json<MarkManyReadRequest>,
+) -> Result<axum::http::StatusCode> {
+    if req.session_ids.len() > MAX_MARK_READ_BATCH {
+        return Err(GatewayError::BadRequest(format!(
+            "at most {MAX_MARK_READ_BATCH} sessions per batch, got {}",
+            req.session_ids.len()
+        )));
+    }
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    // Scope-check every id BEFORE writing anything: a batch that would touch a
+    // session this client cannot see is refused whole, not half-applied.
+    let mut sids = Vec::with_capacity(req.session_ids.len());
+    for session_id in &req.session_ids {
+        let (sid, _) = load_scoped_chat_session(&state, session_id, authed).await?;
+        sids.push(sid);
+    }
+    // "Fully read" is the session's own tail, resolved server-side — a chat-list
+    // client has no ordinals. A session with no rows yet has no tail and needs
+    // no cursor. The write is the same max-wins flat-column update the
+    // per-session route uses, so a racing single mark cannot regress it.
+    futures::future::join_all(sids.into_iter().map(|sid| {
+        let manager = state.session_manager.clone();
+        async move {
+            let Ok(Some(tail)) = manager.latest_session_ordinal(&sid).await else {
+                return;
+            };
+            if let Err(e) = manager.set_read_cursor(&sid, tail).await {
+                warn!(session_id = %sid, error = %e, "mark-read skipped one session in a batch");
+            }
+        }
+    }))
+    .await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

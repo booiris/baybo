@@ -31,6 +31,19 @@ export interface SessionSummary {
   folder_id?: string;
   /** Auto-generated title used before falling back to `last_user_text`. */
   title?: string;
+  /** The recurring cron job this conversation is a *fire* of, when it is one.
+   *  Present only on listed cron conversations; absent on user chats. The
+   *  sidebar collapses all fires of one job into a single derived **cron
+   *  group** keyed by this id (`docs/cron-groups.md`) — and a row that has it
+   *  is grouped by it and never by `folder_id`. Server-authoritative and
+   *  immutable (the list endpoint's `cron_job_id`); it is read off the
+   *  session's trigger, so no patch ever changes it. */
+  cron_job_id?: string;
+  /** The cron group's label — the job's live title, falling back to the title
+   *  snapshotted at fire time once the job is deleted. Absent when the row can
+   *  be named from neither source, in which case it stays flat (ungrouped)
+   *  rather than being given an invented name. */
+  cron_job_title?: string;
 }
 
 /** A user-created chat-list folder. Two-level tree via `parent_id`

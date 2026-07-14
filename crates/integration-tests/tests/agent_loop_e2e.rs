@@ -2248,6 +2248,7 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
         // A recurring fire: its own session is the conversation, so its reply
         // dispatches out through the channel (what this test asserts on).
         conversation: true,
+        job_title: Some("Demo".into()),
     };
     let mut harness = AgentTestHarness::builder().session(session).build();
 
@@ -2349,6 +2350,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
                 cron_job_id: "cj-dinner".into(),
                 origin_session_id: Some(origin_id.clone()),
                 conversation: false,
+                job_title: None,
             },
         )
         .await
@@ -2502,6 +2504,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
                 cron_job_id: "cj-1".into(),
                 origin_session_id: Some(origin_id.clone()),
                 conversation: false,
+                job_title: None,
             },
         )
         .await
@@ -2647,6 +2650,7 @@ async fn a_failed_recurring_fire_reports_a_real_notification_in_its_conversation
         cron_job_id: "cj-news".into(),
         origin_session_id: None,
         conversation: true,
+        job_title: Some("News".into()),
     };
     let session_id = session.id.clone();
     let mut harness = AgentTestHarness::builder().session(session).build();
