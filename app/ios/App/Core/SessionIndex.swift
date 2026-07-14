@@ -432,6 +432,19 @@ final class SessionIndex: ObservableObject {
         save()
     }
 
+    #if DEBUG
+        /// Stamp a row's cron-group key by hand. The DEBUG demo seed only —
+        /// production rows get this from the gateway, which derives it from the
+        /// fire's trigger and never lets a client author it. Exists so the group
+        /// row is screenshot-verifiable with no gateway and no scheduled job.
+        func setCronGroupForDemo(_ sessionId: String, jobId: String, title: String) {
+            guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
+            rows[idx].cronJobId = jobId
+            rows[idx].cronJobTitle = title
+            save()
+        }
+    #endif
+
     /// Plain local flip with no staged intent — rollback and the DEBUG demo
     /// seed use it; user-driven flips go through `beginArchive`.
     func setArchivedFlag(_ sessionId: String, archived: Bool) {

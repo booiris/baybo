@@ -241,6 +241,21 @@ final class AppStore: ObservableObject {
             for id in ["demo-1", "demo-5"] {
                 SessionIndex.shared.noteActivity(sessionId: id, source: "assistant", atMillis: 0)
             }
+            // Two fires of one scheduled job, so the CRON GROUP row (clock glyph,
+            // newest fire's preview, summed unread) is screenshotable headlessly —
+            // and so is the screen it pushes. They collapse into ONE row; that is
+            // the whole feature (`docs/cron-groups.md`).
+            for i in 1...2 {
+                SessionIndex.shared.recordUserSend(
+                    sessionId: "demo-cron-\(i)", text: "Overnight build is green; 3 PRs merged.")
+                SessionIndex.shared.applyTitle(
+                    sessionId: "demo-cron-\(i)", title: "Morning brief · 7/\(15 - i)")
+                SessionIndex.shared.setCronGroupForDemo(
+                    "demo-cron-\(i)", jobId: "demo-job", title: "Morning brief")
+                SessionIndex.shared.clearUnread("demo-cron-\(i)")
+                SessionIndex.shared.noteActivity(
+                    sessionId: "demo-cron-\(i)", source: "assistant", atMillis: 0)
+            }
             if demoPin {
                 Task { @MainActor in
                     try? await Task.sleep(for: .seconds(2))

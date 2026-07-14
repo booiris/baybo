@@ -445,7 +445,12 @@ struct CronGroupRowView: View {
             lastActive: group.lastActive,
             unread: group.unread,
             langCode: langCode,
-            glyph: "clock"
+            // `alarm`, not `clock`: a clock's silhouette at row size is a thin
+            // ring — its hands are the first thing to dissolve, and what is left
+            // reads as a bullet point. The bells survive the shrink, and they are
+            // what the glyph is FOR: this row is a scheduled task, and it is the
+            // only thing telling the user that a tap opens a list, not a chat.
+            glyph: "alarm"
         )
         .contentShape(Rectangle())
     }
@@ -495,9 +500,14 @@ struct ChatRowBody: View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 5) {
                 if let glyph {
+                    // Sized WITH the headline (not under it) and drawn in ink, not
+                    // the preview's grey: at 12pt/.light/inkSoft the clock's hands
+                    // dissolved and it read as a bullet point beside a 15pt bold
+                    // black title. It is the only thing distinguishing a group row
+                    // from a conversation, so it has to survive the shrink.
                     Image(systemName: glyph)
-                        .font(.system(size: 12, weight: .light))
-                        .foregroundStyle(Theme.inkSoft)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(Theme.ink)
                         .accessibilityHidden(true)
                 }
                 Text(verbatim: headline)
