@@ -136,7 +136,7 @@ impl TrafficReader {
             path: path.to_owned(),
             source: e,
         };
-        let pool = SqlitePool::open(path).map_err(open_err)?;
+        let pool = SqlitePool::open(path).await.map_err(open_err)?;
         pool.interact(|conn| ensure_schema(conn))
             .await
             .map_err(open_err)?;

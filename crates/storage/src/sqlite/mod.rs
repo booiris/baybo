@@ -127,7 +127,34 @@ impl SqlitePool {
         pool.interact("sqlite.init_db", init_db)
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize schema for {what}: {e}"))?;
+        pool.warm(&what).await?;
         Ok(pool)
+    }
+
+    /// Open every connection now, rather than letting the pool do it lazily on
+    /// first contention.
+    ///
+    /// `deadpool` opens a connection on a blocking thread, and a *cancelled*
+    /// creation is an unconditional panic inside `deadpool-sync` (unlike a
+    /// cancelled query, which it reports as an error). The tokio runtime cancels
+    /// queued blocking tasks when it shuts down — so a pool still opening
+    /// connections during shutdown panics a worker. Shutdown is exactly when
+    /// that is likely: every actor flushes its state at once, which for a
+    /// half-warm pool is the first real contention it has ever seen.
+    ///
+    /// Holding all the connections at once is what forces distinct ones; getting
+    /// them one at a time would hand back the same connection every time.
+    async fn warm(&self, what: &str) -> anyhow::Result<()> {
+        let mut conns = Vec::with_capacity(POOL_SIZE);
+        for _ in 0..POOL_SIZE {
+            conns.push(
+                self.pool
+                    .get()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to warm sqlite pool for {what}: {e}"))?,
+            );
+        }
+        Ok(())
     }
 
     /// Run `f` against a connection held exclusively for the whole closure.
@@ -799,6 +826,34 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(n, 200, "no writer was silently dropped");
+    }
+
+    /// An open pool must already hold every connection, leaving none to open
+    /// lazily later.
+    ///
+    /// The stake is not latency. `deadpool-sync` panics *unconditionally* when a
+    /// connection **creation** is cancelled (a cancelled query, by contrast, it
+    /// reports as an error), and the tokio runtime cancels queued blocking tasks
+    /// as it shuts down. So a pool with connections still to open panics a worker
+    /// on Ctrl-C — and shutdown is precisely when it would be opening them, since
+    /// every actor flushes its state at once and a cold pool meets its first real
+    /// contention there.
+    ///
+    /// Asserting the pool's size is the honest guard: a test that merely tore a
+    /// runtime down and looked for the panic would pass either way, because the
+    /// panic lands in a worker thread and never fails the test.
+    #[tokio::test]
+    async fn open_leaves_no_connection_to_be_created_later() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = SqlitePool::open(dir.path().join("t.db"))
+            .await
+            .expect("open");
+        let status = pool.pool.status();
+        assert_eq!(
+            status.size, POOL_SIZE,
+            "every connection must be open before the pool is handed out",
+        );
+        assert_eq!(status.available, POOL_SIZE, "and all of them idle");
     }
 
     /// Two pools must not see each other's data, or tests running in parallel

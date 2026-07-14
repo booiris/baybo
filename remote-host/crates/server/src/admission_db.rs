@@ -85,7 +85,7 @@ pub(crate) async fn open(
     poll: Duration,
     on_revoke: RevokeHook,
 ) -> Result<AdmissionDb, AdmissionDbError> {
-    let pool = SqlitePool::open(path)?;
+    let pool = SqlitePool::open(path).await?;
     pool.interact(|conn| conn.execute_batch(SCHEMA)).await?;
 
     let admission = Arc::new(InMemoryAdmission::new());
@@ -500,7 +500,7 @@ mod tests {
 
     async fn temp_pool() -> TempPool {
         let path = TempDbPath::new();
-        let pool = SqlitePool::open(&path.0).unwrap();
+        let pool = SqlitePool::open(&path.0).await.unwrap();
         pool.interact(|conn| conn.execute_batch(SCHEMA))
             .await
             .unwrap();
@@ -903,7 +903,7 @@ mod tests {
             .unwrap();
 
         // A second, independent reader pool on the same on-disk file.
-        let reader = SqlitePool::open(&path.0).unwrap();
+        let reader = SqlitePool::open(&path.0).await.unwrap();
 
         db.admit_key(&new_key("wal-key", Some(2), Some(2048)))
             .await

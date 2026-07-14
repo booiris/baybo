@@ -43,7 +43,7 @@ pub(crate) struct SqlitePool {
 }
 
 impl SqlitePool {
-    pub(crate) fn open(path: &str) -> Result<Self, SqliteError> {
+    pub(crate) async fn open(path: &str) -> Result<Self, SqliteError> {
         let pool = Config::new(path)
             .builder(Runtime::Tokio1)
             .map_err(|e| SqliteError::Pool(e.to_string()))?
@@ -70,7 +70,34 @@ impl SqlitePool {
             }))
             .build()
             .map_err(|e| SqliteError::Pool(e.to_string()))?;
-        Ok(Self { pool })
+        let pool = Self { pool };
+        pool.warm().await?;
+        Ok(pool)
+    }
+
+    /// Open every connection now, rather than letting the pool do it lazily on
+    /// first contention.
+    ///
+    /// `deadpool` opens a connection on a blocking thread, and a *cancelled*
+    /// creation is an unconditional panic inside `deadpool-sync` (unlike a
+    /// cancelled query, which it reports as an error). The tokio runtime cancels
+    /// queued blocking tasks when it shuts down, so a pool still opening
+    /// connections at that moment panics a worker — and shutdown is exactly when
+    /// a cold pool would be opening them.
+    ///
+    /// Holding all the connections at once is what forces distinct ones; getting
+    /// them one at a time would hand back the same connection every time.
+    async fn warm(&self) -> Result<(), SqliteError> {
+        let mut conns = Vec::with_capacity(POOL_SIZE);
+        for _ in 0..POOL_SIZE {
+            conns.push(
+                self.pool
+                    .get()
+                    .await
+                    .map_err(|e| SqliteError::Pool(e.to_string()))?,
+            );
+        }
+        Ok(())
     }
 
     /// Run `f` against a connection held exclusively for the whole closure.
@@ -120,13 +147,33 @@ mod tests {
         }
     }
 
+    /// An open pool must already hold every connection, leaving none to open
+    /// lazily later.
+    ///
+    /// `deadpool-sync` panics *unconditionally* when a connection **creation** is
+    /// cancelled (a cancelled query, by contrast, it reports as an error), and
+    /// the tokio runtime cancels queued blocking tasks as it shuts down. So a
+    /// pool with connections still to open panics a worker on Ctrl-C — and
+    /// shutdown is precisely when a cold pool would be opening them.
+    #[tokio::test]
+    async fn open_leaves_no_connection_to_be_created_later() {
+        let path = TempDbPath::new();
+        let pool = SqlitePool::open(&path.0).await.expect("open");
+        let status = pool.pool.status();
+        assert_eq!(
+            status.size, POOL_SIZE,
+            "every connection must be open before the pool is handed out",
+        );
+        assert_eq!(status.available, POOL_SIZE, "and all of them idle");
+    }
+
     /// A PRAGMA that fails to apply looks exactly like one that applied — the
     /// query still runs, just with the old setting. Assert the connection's
     /// actual state, on enough connections to cover the pool.
     #[tokio::test]
     async fn every_connection_gets_the_pragmas() {
         let path = TempDbPath::new();
-        let pool = SqlitePool::open(&path.0).expect("open");
+        let pool = SqlitePool::open(&path.0).await.expect("open");
 
         for _ in 0..POOL_SIZE * 2 {
             let (journal_mode, busy_timeout) = pool
@@ -149,7 +196,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_text_decoding_does_not_corrupt_the_connection() {
         let path = TempDbPath::new();
-        let pool = SqlitePool::open(&path.0).expect("open");
+        let pool = SqlitePool::open(&path.0).await.expect("open");
         pool.interact(|conn| {
             conn.execute_batch("CREATE TABLE t (k TEXT NOT NULL, v INTEGER NOT NULL)")?;
             let tx = conn.transaction()?;

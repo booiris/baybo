@@ -205,7 +205,7 @@ pub(crate) fn spawn<F>(
 
 /// Open the local DB pool and ensure the schema ([`ensure_schema`]).
 async fn init_db(path: &str) -> Result<SqlitePool, SqliteError> {
-    let pool = SqlitePool::open(path)?;
+    let pool = SqlitePool::open(path).await?;
     pool.interact(|conn| ensure_schema(conn)).await?;
     Ok(pool)
 }
