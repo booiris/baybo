@@ -43,12 +43,35 @@ struct SessionIndexUnreadTests {
         #expect(index.rows.first?.unread == 0)
     }
 
-    /// Pings are connection-global (every session, subscribed or not). An id
-    /// this device has never listed must not conjure a row — a later merge
-    /// surfaces it.
-    @Test func unknownSessionIsIgnored() {
+    /// Pings are connection-global (every session, subscribed or not). An id this
+    /// device has never listed must not conjure a row — the ping carries no title,
+    /// no preview, no created-at, so a fabricated row would render as a ghost.
+    ///
+    /// But it must not be *swallowed* either, which is what this used to do. An
+    /// unknown id is the gateway telling us a session exists that we do not have
+    /// — a cron fire, or a chat opened on another client — and it is the ONLY
+    /// live signal of that. Dropping it meant a user parked on the chat list
+    /// watched a scheduled job fire and saw **nothing** until they backgrounded
+    /// the app or pulled to refresh. So: no row, but a refetch.
+    @Test func unknownSessionConjuresNoRowButNudgesARefetch() {
+        let before = index.listStaleEpoch
+
         index.noteActivity(sessionId: "never-seen", source: "user", atMillis: Self.laterMillis)
-        #expect(index.rows.isEmpty)
+
+        #expect(index.rows.isEmpty, "a ping carries no row content — it must not fabricate one")
+        #expect(
+            index.listStaleEpoch > before,
+            "the list must refetch, or a new cron fire never appears while it is on screen")
+    }
+
+    /// A counter, not a flag: two nudges in a row must produce two refreshes. A
+    /// `Bool` already `true` would swallow the second.
+    @Test func repeatedNudgesEachAdvanceTheEpoch() {
+        index.noteListStale()
+        let once = index.listStaleEpoch
+        index.noteListStale()
+
+        #expect(index.listStaleEpoch > once)
     }
 
     /// A ping older than the row's recency must not rewind the list order —

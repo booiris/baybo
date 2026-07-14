@@ -929,6 +929,59 @@
         }
       }
     },
+    "/v1/chat/sessions/read": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "mark_sessions_read",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarkManyReadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Every named session's read cursor advanced to its newest ordinal"
+          },
+          "400": {
+            "description": "Batch too large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A named session is not visible to this client",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}": {
       "get": {
         "tags": [
@@ -3780,12 +3833,26 @@
             "type": "string",
             "format": "date-time"
           },
+          "cron_job_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The cron job whose fire this conversation is, for the clients that\ncollapse a job's fires into one chat-list row (a **cron group** — a\nderived view, never a `session_folders` row; see `docs/cron-groups.md`).\n`None` for a user session, and for the one-shot fire workspaces the list\nnever returns anyway."
+          },
+          "cron_job_title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The label for that group: the job's **live** title while the job exists\n(so a rename propagates with no rewrite of any session), falling back to\nthe title snapshotted onto the fire at mint once the job is deleted.\n`None` only when both are unavailable — a pre-snapshot fire whose job is\ngone; clients leave those rows flat."
+          },
           "folder_id": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The user-created folder this session is filed under, or absent for\nuncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web\nsidebar groups rows by this id."
+            "description": "The user-created folder this session is filed under, or absent for\nuncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web\nsidebar groups rows by this id.\n\n**Ignored for a cron conversation** — those group by [`Self::cron_job_id`]\ninstead (see `docs/cron-groups.md`), so a fire can never be in a cron\ngroup and a user folder at once."
           },
           "hidden": {
             "type": "boolean",
@@ -4887,6 +4954,22 @@
             "type": "integer",
             "description": "Total number of records matching the filters — independent of\n`limit`/`offset`, so clients can size the pager without asking\nfor the full list.",
             "minimum": 0
+          }
+        }
+      },
+      "MarkManyReadRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/chat/sessions/read`.",
+        "required": [
+          "session_ids"
+        ],
+        "properties": {
+          "session_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The sessions to mark fully read. Each cursor is advanced to that\nsession's newest ordinal, so — unlike the per-session route — the caller\nneeds no ordinal of its own. Sessions it cannot see are rejected; ids\nthat do not exist are skipped."
           }
         }
       },

@@ -13,6 +13,7 @@ import {
   RiFolderAddLine,
   RiFolder3Line,
   RiFolderOpenLine,
+  RiTimeLine,
 } from 'react-icons/ri';
 import {
   DndContext,
@@ -39,12 +40,19 @@ import type { Folder, SessionSummary } from './types';
 import { useQueueCounts } from './queueStore';
 import { useFolders, useFolderStore } from './folderStore';
 import { ChatContextMenu, FolderContextMenu } from './FolderContextMenu';
+import { bucketSessions, cronCollapseKey, cronGroupUnread, type CronGroup } from './sessionBuckets';
 
 // Chat zone 2: the session list sidebar (the global icon rail is zone 1, the
 // thread + floating composer is zone 3). A newest-first conversation list of
 // compact rows organised into a 2-level folder tree, plus lifted Pinned and
 // trailing Uncategorized buckets. Drag a chat onto a folder header to file it,
 // drag folders to reorder/nest; right-click for the full action set.
+//
+// It renders two kinds of group and they are NOT the same thing: user folders
+// (server rows — draggable, droppable, renameable, deletable) and **cron
+// groups** (derived from the session list — a recurring job's fires collapsed
+// under one header, with no CRUD, no drag, no drop, no context menu; see
+// `docs/cron-groups.md`).
 
 const MAX_DEPTH = 2;
 
@@ -53,6 +61,20 @@ const MAX_DEPTH = 2;
 const CHAT_PREFIX = 'chat:';
 const FOLDER_PREFIX = 'folder:';
 const UNCATEGORIZED_DROP_ID = 'drop:uncategorized';
+
+/** The gold unread pill, shared by a chat row and a collapsed cron group's
+ *  header (which sums the unread of the rows it is hiding). */
+const UNREAD_BADGE =
+  'shrink-0 min-w-[20px] h-5 px-1.5 rounded-full bg-brand text-ink border-2 border-black font-mono text-[0.65rem] font-bold flex items-center justify-center leading-none';
+
+function unreadLabel(count: number): string {
+  return `${count} unread message${count === 1 ? '' : 's'}`;
+}
+
+/** Cap the badge's digits — a half-hourly cron job racks up fires fast. */
+function unreadDigits(count: number): string {
+  return count > 99 ? '99+' : String(count);
+}
 
 type DragKind = { kind: 'chat'; id: string } | { kind: 'folder'; id: string } | null;
 
@@ -105,8 +127,14 @@ function SessionRow({
   // (newest-first), so dragging one must not reflow the list — it only lifts
   // out to drop onto a folder. The floating preview is the DragOverlay; the
   // source row just dims in place (no transform), so nothing slides around.
+  //
+  // A cron fire is not draggable at all: it groups by its job and its
+  // `folder_id` is ignored, so filing one would write a folder the sidebar
+  // never reads — a dead affordance. The context menu hides "Move to folder"
+  // on the same rows for the same reason.
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: `${CHAT_PREFIX}${session.session_id}`,
+    disabled: session.cron_job_id !== undefined,
   });
   const style = {
     paddingLeft: depth > 0 ? `${depth * 14 + 12}px` : undefined,
@@ -182,11 +210,8 @@ function SessionRow({
         </span>
       ) : null}
       {showUnread ? (
-        <span
-          className="shrink-0 min-w-[20px] h-5 px-1.5 rounded-full bg-brand text-ink border-2 border-black font-mono text-[0.65rem] font-bold flex items-center justify-center leading-none"
-          title={`${unreadCount} unread message${unreadCount === 1 ? '' : 's'}`}
-        >
-          {unreadCount > 99 ? '99+' : unreadCount}
+        <span className={UNREAD_BADGE} title={unreadLabel(unreadCount)}>
+          {unreadDigits(unreadCount)}
         </span>
       ) : null}
       {hasPending ? (
@@ -367,6 +392,58 @@ function FolderHeader({
   );
 }
 
+/** A cron group's header: a clock glyph (so it reads as "a scheduled job's
+ *  stream", not a folder) and the group's label, in the folder header's
+ *  styling. Deliberately inert compared to `FolderHeader` — no drag handle, no
+ *  drop target, no rename input, no context menu: the group is derived from the
+ *  session list and supports zero mutations, so there is nothing to offer.
+ *  Collapsed, it surfaces the summed unread of the rows it is hiding. */
+function CronGroupHeader({
+  group,
+  collapsed,
+  unread,
+  onToggle,
+}: {
+  group: CronGroup;
+  collapsed: boolean;
+  unread: number;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="group flex items-center gap-1.5 pl-1 pr-2 py-1 rounded-md border-2 border-transparent hover:bg-gray-100">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="shrink-0 flex items-center justify-center h-5 w-5 text-ink-soft hover:text-ink cursor-pointer"
+        title={collapsed ? 'Expand group' : 'Collapse group'}
+        aria-label={collapsed ? 'Expand scheduled group' : 'Collapse scheduled group'}
+      >
+        {collapsed ? (
+          <RiArrowRightSLine className="text-base" />
+        ) : (
+          <RiArrowDownSLine className="text-base" />
+        )}
+      </button>
+      <span className="shrink-0 flex items-center text-ink-soft">
+        <RiTimeLine className="text-base" aria-hidden />
+      </span>
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex-1 min-w-0 truncate text-left font-mono text-xs font-bold text-ink cursor-pointer"
+        title={group.title}
+      >
+        {group.title}
+      </button>
+      {collapsed && unread > 0 ? (
+        <span className={UNREAD_BADGE} title={unreadLabel(unread)}>
+          {unreadDigits(unread)}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 /** An inline new-folder input row inserted at a given depth. Enter commits,
  *  Escape cancels, blur commits-or-cancels. */
 function NewFolderRow({
@@ -476,10 +553,11 @@ export function SessionSidebar({
   const { toggleCollapse, ensureExpanded } = useFolderStore();
 
   // ── Buckets ────────────────────────────────────────────────────────────
-  // Pinned chats are lifted out of the tree entirely. Non-pinned chats are
-  // grouped by folder_id; folder ids that no longer exist fall back to
-  // uncategorized so a stale folder_id never hides a chat. Incoming
-  // newest-first order is preserved within each bucket.
+  // Pinned chats are lifted out of the tree entirely. Cron fires collapse into
+  // their job's group (ignoring folder_id). Everything else is grouped by
+  // folder_id; folder ids that no longer exist fall back to uncategorized so a
+  // stale folder_id never hides a chat. Incoming newest-first order is
+  // preserved within each bucket. Rules + precedence live in `sessionBuckets`.
   const folderById = useMemo(() => {
     const m = new Map<string, Folder>();
     for (const f of folders) m.set(f.id, f);
@@ -505,25 +583,10 @@ export function SessionSidebar({
     return reachable;
   }, [folders]);
 
-  const { pinned, chatsByFolder, uncategorized } = useMemo(() => {
-    const pinnedRows: SessionSummary[] = [];
-    const byFolder = new Map<string, SessionSummary[]>();
-    const loose: SessionSummary[] = [];
-    for (const s of sessions) {
-      if (s.pinned) {
-        pinnedRows.push(s);
-        continue;
-      }
-      if (s.folder_id && reachableFolderIds.has(s.folder_id)) {
-        const arr = byFolder.get(s.folder_id) ?? [];
-        arr.push(s);
-        byFolder.set(s.folder_id, arr);
-      } else {
-        loose.push(s);
-      }
-    }
-    return { pinned: pinnedRows, chatsByFolder: byFolder, uncategorized: loose };
-  }, [sessions, reachableFolderIds]);
+  const { pinned, cronGroups, chatsByFolder, uncategorized } = useMemo(
+    () => bucketSessions(sessions, reachableFolderIds),
+    [sessions, reachableFolderIds],
+  );
 
   // Children of each parent, sorted by position ascending. `null` parent key
   // holds the top-level folders.
@@ -545,9 +608,13 @@ export function SessionSidebar({
     [childFolders],
   );
 
-  // ── Auto-expand active chat's folder path ────────────────────────────────
+  // ── Auto-expand the active chat's group ──────────────────────────────────
+  // Its folder path, or — for a cron fire — the cron group holding it. A cron
+  // fire never consults `folder_id`, so the two are mutually exclusive.
   const activeSession = sessions.find((s) => s.session_id === activeSessionId);
-  const activeFolderId = activeSession?.pinned ? undefined : activeSession?.folder_id;
+  const activeVisible = activeSession && !activeSession.pinned ? activeSession : undefined;
+  const activeFolderId = activeVisible?.cron_job_id ? undefined : activeVisible?.folder_id;
+  const activeCronJobId = activeVisible?.cron_job_title ? activeVisible.cron_job_id : undefined;
   useEffect(() => {
     if (!activeFolderId) return;
     const folder = folderById.get(activeFolderId);
@@ -555,6 +622,10 @@ export function SessionSidebar({
     const path = folder.parent_id ? [folder.parent_id, folder.id] : [folder.id];
     ensureExpanded(path);
   }, [activeFolderId, folderById, ensureExpanded]);
+  useEffect(() => {
+    if (!activeCronJobId) return;
+    ensureExpanded([cronCollapseKey(activeCronJobId)]);
+  }, [activeCronJobId, ensureExpanded]);
 
   // ── Inline create / rename state ─────────────────────────────────────────
   // `creatingIn`: undefined = no create open; null = a top-level create;
@@ -831,6 +902,33 @@ export function SessionSidebar({
               ) : null}
               {topLevelFolders.map((f) => renderFolderSubtree(f, 0))}
 
+              {/* Cron groups sit after the user's folders and before
+                  Uncategorized: they render like a top-level folder (one
+                  header + indented chats) but carry no `position`, so
+                  interleaving them would reshuffle a folder order the user
+                  chose. They are outside the Uncategorized drop zone — a group
+                  is not a drop target and its members' `folder_id` is never
+                  read. */}
+              {cronGroups.map((group) => {
+                const key = cronCollapseKey(group.jobId);
+                const isCollapsed = collapsed.has(key);
+                return (
+                  <div key={key} className="flex flex-col">
+                    <CronGroupHeader
+                      group={group}
+                      collapsed={isCollapsed}
+                      unread={cronGroupUnread(group)}
+                      onToggle={() => toggleCollapse(key)}
+                    />
+                    {!isCollapsed ? (
+                      <div className="flex flex-col gap-0.5">
+                        {group.sessions.map((s) => renderChatRow(s, 1))}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+
               <UncategorizedDropZone>
                 <SectionLabel>Uncategorized</SectionLabel>
                 {uncategorized.length > 0 ? (
@@ -880,6 +978,10 @@ export function SessionSidebar({
           x={chatMenu.x}
           y={chatMenu.y}
           pinned={chatMenu.session.pinned}
+          // A cron fire groups by its job and ignores `folder_id`, so filing it
+          // would be a no-op the user can't see. Hide the submenu entirely
+          // rather than offer a move that never lands.
+          canMoveToFolder={chatMenu.session.cron_job_id === undefined}
           folders={folders}
           onMoveToFolder={(folderId) => onAssignFolder(chatMenu.session.session_id, folderId)}
           onTogglePin={() => onTogglePin(chatMenu.session.session_id, !chatMenu.session.pinned)}

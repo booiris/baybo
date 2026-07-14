@@ -602,6 +602,33 @@ impl BayboClient {
         .await
     }
 
+    /// Mark every named session fully read in one round-trip — the gateway
+    /// resolves each session's own tail ordinal, which the chat list does not
+    /// have. Behind a cron group's "mark all read": a half-hourly job accrues 48
+    /// fires a day, and looping `chat_mark_read` over them would be 48 round-trips.
+    ///
+    /// (Never put a literal cron expression in a doc comment on a UniFFI-exported
+    /// item: bindgen re-emits it inside a Swift block comment, and the star-slash
+    /// in `star-slash-30` closes that comment early — the generated Swift then
+    /// does not compile. This bit once.)
+    pub async fn chat_mark_many_read(
+        self: Arc<Self>,
+        session_ids: Vec<String>,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Relay => {
+                    gateway_api::mark_many_read(&relay::GatewayApi, session_ids).await
+                }
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::mark_many_read(&client, session_ids).await
+                }
+            }
+        })
+        .await
+    }
+
     /// Tear down the active binding's global chat leg. The relay leg reloads its
     /// pairing record on the next connect. At most one binding mode is live, but
     /// the binding may already be gone — a disconnect/unpair deletes the

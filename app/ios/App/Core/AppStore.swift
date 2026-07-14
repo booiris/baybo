@@ -33,10 +33,16 @@ final class AppStore: ObservableObject {
     }
 
     /// One entry on the outer NavigationStack over the home shell: a pushed
-    /// conversation or the archived list.
+    /// conversation, the archived list, or one scheduled job's fires.
     enum ChatRoute: Hashable {
         case session(String)
         case archived
+        /// A **cron group** (`docs/cron-groups.md`): every fire of one cron job,
+        /// keyed by the job id. A pushed screen rather than an inline expansion —
+        /// `Section(isExpanded:)`'s chevron only renders under `.listStyle(.sidebar)`,
+        /// and `DisclosureGroup` nests rows inside one cell, which kills per-row
+        /// `.swipeActions`. The Archived screen already established this shape.
+        case cronGroup(String)
     }
 
     @Published var route: Route = .launching
@@ -234,6 +240,21 @@ final class AppStore: ObservableObject {
             // shows a pinned-but-read row carrying only its tint, no glyph.
             for id in ["demo-1", "demo-5"] {
                 SessionIndex.shared.noteActivity(sessionId: id, source: "assistant", atMillis: 0)
+            }
+            // Two fires of one scheduled job, so the CRON GROUP row (clock glyph,
+            // newest fire's preview, summed unread) is screenshotable headlessly —
+            // and so is the screen it pushes. They collapse into ONE row; that is
+            // the whole feature (`docs/cron-groups.md`).
+            for i in 1...2 {
+                SessionIndex.shared.recordUserSend(
+                    sessionId: "demo-cron-\(i)", text: "Overnight build is green; 3 PRs merged.")
+                SessionIndex.shared.applyTitle(
+                    sessionId: "demo-cron-\(i)", title: "Morning brief · 7/\(15 - i)")
+                SessionIndex.shared.setCronGroupForDemo(
+                    "demo-cron-\(i)", jobId: "demo-job", title: "Morning brief")
+                SessionIndex.shared.clearUnread("demo-cron-\(i)")
+                SessionIndex.shared.noteActivity(
+                    sessionId: "demo-cron-\(i)", source: "assistant", atMillis: 0)
             }
             if demoPin {
                 Task { @MainActor in
@@ -489,6 +510,42 @@ final class AppStore: ObservableObject {
     func openArchived() {
         guard !chatPath.contains(.archived) else { return }
         chatPath.append(.archived)
+    }
+
+    /// Tapping a cron group row: push that job's fires. Guarded like `openArchived`.
+    func openCronGroup(_ jobId: String) {
+        guard !chatPath.contains(.cronGroup(jobId)) else { return }
+        chatPath.append(.cronGroup(jobId))
+    }
+
+    /// Open a fire from inside its group: append, so the pop chain runs
+    /// chat → group → list (the archived screen's rule).
+    func openCronGroupSession(_ sessionId: String) {
+        Task {
+            await activateSession(sessionId, ensureListed: true, appendToPath: true)
+        }
+    }
+
+    /// Clear a cron group's badge in ONE round-trip: the gateway resolves each
+    /// session's own tail ordinal, which the list does not have.
+    ///
+    /// Without this the feature is cosmetic — a `*/30` job becomes one row
+    /// wearing a `48` badge that the user has no way to clear. `sessionIds` are
+    /// the group's **visible** members; a fire that escaped (pinned, archived)
+    /// clears itself where it lives.
+    func requestMarkGroupRead(_ sessionIds: [String]) {
+        guard !sessionIds.isEmpty else { return }
+        SessionIndex.shared.clearUnread(sessionIds)
+        Task {
+            do {
+                try await Baybo.client.chatMarkManyRead(sessionIds: sessionIds)
+            } catch {
+                // The optimistic clear stands: the next list merge reconciles the
+                // badge to server truth either way, so a failure costs one stale
+                // refresh, not a wrong number.
+                NSLog("baybo: mark group read: %@", bayboErrorText(error))
+            }
+        }
     }
 
     /// Compose: mint or reuse a local draft id. The durable gateway row is

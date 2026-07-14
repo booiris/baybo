@@ -18,7 +18,9 @@ The next fire still mints a **new** conversation; a fire never appends to a prev
 
 A fire that produces no reply — it failed, or it ran and said nothing — would otherwise leave a conversation that is empty when opened and, having dispatched nothing, never announced itself at all (clients learn a new conversation exists from the activity pulse the gateway derives from *channel dispatch*). So those outcomes publish the **same framed notification row** a one-shot delivers to its origin: `⏰ Scheduled task "…" failed:` or `It ran, but produced no output.`
 
-There is **no anti-flood mitigation**: a `*/30 * * * *` job opens 48 conversations a day. Daily/weekly jobs — the realistic case — cost a handful of rows a week, and a user tired of a noisy job deletes it. If that turns out to be wrong, the fix is to auto-file each job's fires into a per-job chat folder (`sessions.folder_id` and the folder tree already exist), not to collapse the fires into one thread.
+A `*/30 * * * *` job opens 48 conversations a day, so the fires are collapsed into one chat-list row — a **cron group** — rather than landing flat next to real conversations. The grouping is *derived*, not stored: every fire already carries `TriggerSource::Cron { cron_job_id }`, so clients group on it and the gateway supplies the label. No folder row is created; `sessions.folder_id` and the folder tree are **not** used. See [`docs/cron-groups.md`](../cron-groups.md), which also records why the obvious folder-row design was rejected — it stores the same fact twice and every mechanism that keeps the copies in sync has a way to leave behind a cron folder that no API can delete.
+
+Grouping is not a mute: a noisy job still fires, still costs an inference, and still pushes. The group's badge can be cleared in bulk (`POST /v1/chat/sessions/read`), but a user who is tired of a job still deletes it.
 
 ### One-shot (`CronSchedule::At`) — the fire reports back to the conversation that scheduled it
 
