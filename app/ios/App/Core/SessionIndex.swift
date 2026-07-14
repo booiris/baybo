@@ -118,11 +118,6 @@ final class SessionIndex: ObservableObject {
         if scalars.count <= previewMaxChars { return collapsed }
         return String(String.UnicodeScalarView(scalars.prefix(previewMaxChars))) + "…"
     }
-    /// Transcript mirrors kept on disk — only the most recently active
-    /// sessions; older mirrors are pruned (the gateway replays history on
-    /// re-entry, so a pruned mirror only costs a fetch).
-    static let maxMirroredTranscripts = 10
-
     /// The latest user-intended archive/hide state for a session whose request
     /// hasn't resolved yet. `merge(remote:)` consults it so a refresh racing an
     /// in-flight mutation can't rewind the optimistic flip (or re-insert a row
@@ -141,7 +136,7 @@ final class SessionIndex: ObservableObject {
     @Published private(set) var listStaleEpoch: UInt64 = 0
 
     /// The Application Support root this registry — and the transcript mirrors
-    /// and outboxes it prunes/wipes — lives under. Injected rather than resolved
+    /// and outboxes it wipes — lives under. Injected rather than resolved
     /// from the static path so a test drives an isolated tree: the suites run in
     /// PARALLEL, and a shared `sessions.json` turns one suite's writes into
     /// another's "logic bug".
@@ -154,9 +149,9 @@ final class SessionIndex: ObservableObject {
     /// In-memory only: a kill mid-flight loses the intent and the next merge
     /// restores server truth, which is the honest fallback.
     private var pendingMutations: [String: PendingMutation] = [:]
-    /// Rows removed by `beginHide`, kept for the failure rollback (the mirror
-    /// is prune-deleted and stays gone — the hydration matrix's mirror-less
-    /// listed path refetches history).
+    /// Rows removed by `beginHide`, kept for the failure rollback (the mirror is
+    /// deleted with the row and stays gone — a rolled-back delete refetches its
+    /// history on re-entry).
     private var hiddenBackups: [String: SessionRow] = [:]
     /// The archived value last acknowledged by the server, staged when a
     /// session's FIRST pending mutation lands. A chained failure (archive →
@@ -374,12 +369,16 @@ final class SessionIndex: ObservableObject {
         setPinnedFlag(sessionId, pinned: pinned)
     }
 
-    /// Optimistic delete (soft-hide): remove the row now — `save()`'s prune
-    /// drops the transcript mirror — and suppress the row's remote existence
-    /// in `merge` until the DELETE resolves.
+    /// Optimistic delete (soft-hide): remove the row now — and its transcript
+    /// mirror with it — and suppress the row's remote existence in `merge` until
+    /// the DELETE resolves. The mirror goes FIRST, ahead of the row guard: the
+    /// user asked for this conversation to be gone, and a row that a racing merge
+    /// already dropped (deleted from another client while the confirm was up)
+    /// must still take its transcript with it rather than strand the file.
     func beginHide(_ sessionId: String) {
         pendingMutations[sessionId] = .hidden
         mutationEpoch += 1
+        TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
         guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
         hiddenBackups[sessionId] = rows[idx]
         rows.remove(at: idx)
@@ -538,6 +537,19 @@ final class SessionIndex: ObservableObject {
                     // LIVE title, so a rename lands here with no local rewrite.
                     cronJobId: summary.cronJobId, cronJobTitle: summary.cronJobTitle))
         }
+        // A row the server no longer lists was deleted from another client, and
+        // this rebuild is where it leaves the list for good. Its transcript goes
+        // with it: `beginHide` is the only other per-session mirror delete, and it
+        // never runs for a delete performed elsewhere — so without this the
+        // conversation the user deleted on the web would keep its full transcript
+        // on this phone forever. A targeted set difference, NOT a directory sweep:
+        // rows still staged in `pendingMutations` are owned by beginHide /
+        // rollBackHide, and a draft (never a row) is never considered here.
+        let survivors = Set(merged.map(\.id))
+        for row in rows
+        where !survivors.contains(row.id) && pendingMutations[row.id] == nil {
+            TranscriptStore.delete(sessionId: row.id, in: supportDirectory)
+        }
         rows = merged
         save()
     }
@@ -558,21 +570,22 @@ final class SessionIndex: ObservableObject {
 
     // MARK: - Persistence
 
+    /// Writes the registry — and NOTHING else. It used to end by pruning the
+    /// transcript mirrors down to the ten most recently active rows, which made
+    /// the mirror useless for exactly the sessions it exists to serve: `save()`
+    /// runs on every list merge (including the one the pop back from a chat
+    /// fires) and on every activity ping, `rows` is the gateway's whole session
+    /// list ranked by the SERVER's `lastActive`, and reading a chat bumps
+    /// nothing — so a conversation outside the ten most recently MESSAGED ones
+    /// had the mirror it just wrote deleted seconds later, and opened blank on
+    /// every re-entry until the network answered. Mirrors are now kept for every
+    /// session this device has rendered; they are dropped only when the user
+    /// deletes the session (`beginHide`) or unbinds the gateway (`removeAll`).
     private func save() {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(rows) else { return }
         try? data.write(to: fileURL, options: .atomic)
-        TranscriptStore.prune(keeping: mirrorWorthyIds(), in: supportDirectory)
-    }
-
-    /// The sessions whose transcript mirrors survive pruning: the most recently
-    /// active, pinned or not (a pinned-but-dormant session re-fetches on entry).
-    private func mirrorWorthyIds() -> Set<String> {
-        Set(
-            rows.sorted { $0.lastActive > $1.lastActive }
-                .prefix(Self.maxMirroredTranscripts)
-                .map(\.id))
     }
 
     private static func load(from url: URL) -> [SessionRow] {
@@ -664,9 +677,19 @@ final class SessionActivityHandler: SessionListSink, @unchecked Sendable {
 /// over the bridge's `persist`, one file per session (the single-session
 /// UserDefaults key couldn't survive a multi-session list, and a plist that
 /// holds every transcript loads whole at launch).
+///
+/// A mirror exists for every session this device has rendered, and **nothing
+/// evicts it in the background** — it is the chat's whole cold-open story (it is
+/// what `deliverInit` paints before a single byte crosses the network), so a
+/// sweeper that drops it trades a permanent blank open for a few KB of text.
+/// The files carry message text, the sync cursor and image dimensions; never
+/// blob bytes (those live in their own cache, which is also never swept). Only a
+/// user-triggered delete (`SessionIndex.beginHide`) or unbinding the gateway
+/// (`removeAll`) removes one. Bounding this wants a stated retention policy, not
+/// a surprise sweep.
 enum TranscriptStore {
     /// The support root defaults to the production one; `SessionIndex` passes
-    /// its own so an isolated registry prunes/wipes its own tree (see its
+    /// its own so an isolated registry deletes/wipes its own tree (see its
     /// `supportDirectory`).
     private static func directory(in supportDirectory: URL) -> URL {
         let dir = supportDirectory.appendingPathComponent("transcripts", isDirectory: true)
@@ -675,8 +698,7 @@ enum TranscriptStore {
     }
 
     /// Session ids are gateway-assigned or UUIDs, but never trust them as raw
-    /// path components. Prune compares filenames, so it sanitizes through the
-    /// same function.
+    /// path components.
     private static func sanitize(_ sessionId: String) -> String {
         sessionId.replacingOccurrences(of: "/", with: "_")
     }
@@ -701,20 +723,10 @@ enum TranscriptStore {
             .write(to: fileURL(for: sessionId, in: supportDirectory), options: .atomic)
     }
 
-    /// Drop mirrors for sessions outside `keeping` (the registry's most
-    /// recently active). A pruned session just re-fetches history on re-entry.
-    static func prune(keeping: Set<String>, in supportDirectory: URL) {
-        let fm = FileManager.default
-        let keptNames = Set(keeping.map(sanitize))
-        guard
-            let files = try? fm.contentsOfDirectory(
-                at: directory(in: supportDirectory), includingPropertiesForKeys: nil)
-        else { return }
-        for file in files where file.pathExtension == "json" {
-            if !keptNames.contains(file.deletingPathExtension().lastPathComponent) {
-                try? fm.removeItem(at: file)
-            }
-        }
+    /// Drop one session's mirror — the user deleted the conversation. The only
+    /// per-session removal there is; see the type's note on why nothing sweeps.
+    static func delete(sessionId: String, in supportDirectory: URL) {
+        try? FileManager.default.removeItem(at: fileURL(for: sessionId, in: supportDirectory))
     }
 
     static func deleteAll(in supportDirectory: URL) {

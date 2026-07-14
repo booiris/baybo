@@ -4,6 +4,7 @@ export const en = {
   translation: {
     chat: {
       loadOlder: "Load earlier messages",
+      loadingThread: "Loading conversation…",
       loadingImage: "Loading image…",
       tapToLoad: "Tap to load image",
       imageAlt: "image",

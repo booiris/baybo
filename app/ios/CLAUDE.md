@@ -193,9 +193,10 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   local mutations (`pendingMutations`) and the `mutationEpoch` guard beat a
   stale snapshot; otherwise server values win wholesale — a local row only fills
   fields the server left nil (never overrides them). Per-session transcript
-  mirrors live in `Application Support/baybo/transcripts/<id>.json`
-  (pruned to the ~10 most recent); the legacy single-session UserDefaults keys
-  (`ChatDefaults`) are migrated once and retired.
+  mirrors live in `Application Support/baybo/transcripts/<id>.json`, one per
+  session this device has rendered, and **nothing sweeps them** — see
+  "Transcript mirror retention" below; the legacy single-session UserDefaults
+  keys (`ChatDefaults`) are migrated once and retired.
 - **Live list unread**: the gateway broadcasts a throttled `Frame::SessionActivity`
   (per-session ping, no content) to EVERY connection on the `device` channel —
   subscribed or not — when a user send echoes or a session's turn completes
@@ -550,9 +551,10 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   screenshot-able). That text row's y-position is the test: run once (tiles →
   release → it moves), relaunch (sizes restored → nothing moves). **The second
   run only works on an UNBOUND simulator** — a bound one's list merge keeps only
-  remote rows, so the demo's local-only session is dropped from the registry and
-  `TranscriptStore.prune` deletes its mirror before the relaunch can restore it.
-  On a bound sim use `-baybo-open-session <id>` (DEBUG) to open a REAL session
+  remote rows, so the demo's local-only session is dropped from the registry, and
+  a mirror now dies with its row (that merge is how a conversation deleted on
+  another client loses its cache), so it is gone before the relaunch can restore
+  it. On a bound sim use `-baybo-open-session <id>` (DEBUG) to open a REAL session
   with images and compare `document.scrollHeight` at mount vs after the decode —
   they must be equal.
   `-baybo-demo-jump` scrolls the log off the newest edge at
@@ -711,6 +713,68 @@ mount effect runs one sync. A jetsam silently reloads → `ready` re-fires →
 re-mounts and re-syncs. Cross-session safety rests on `bridge.ts` clearing
 `buffer`/`blobPending`/`pendingPersist` on `init` and `persist` writes being
 session-tagged.
+
+## Transcript mirror retention (do NOT re-add a sweeper)
+
+**The mirror is the entire cold-open story.** `ChatScreen.onAppear` calls
+`retarget` BEFORE `connectIfNeeded`, `deliverInit` reads
+`transcripts/<id>.json` straight off disk, and `<Transcript>` seeds its rows in
+the `useState` initializer — so a cached conversation paints on the first commit
+with **zero network**. Nothing in the paint path reads `connState`. If a chat
+opens blank and fills in only once the leg connects, the mirror was **missing**,
+not gated.
+
+So: **a mirror is kept for every session this device has rendered, and no
+capacity sweeper evicts it.** `save()` writes the registry and nothing else. A
+mirror is removed only when its conversation genuinely goes away, and there are
+exactly three such paths — all of them a user's deletion, none of them a sweep:
+
+- `beginHide` — the user deleted the conversation here. Deletes the file BEFORE
+  the row guard: a racing merge may already have dropped the row, and the delete
+  must still land.
+- `merge` — the row is absent from the server's list, i.e. the user deleted it on
+  another client. That rebuild is where it leaves the list for good, so its
+  transcript leaves with it (a targeted set difference against the surviving ids,
+  skipping `pendingMutations`, which `beginHide`/`rollBackHide` own — **not** a
+  directory sweep).
+- `removeAll` — logout/rebind: the rows belong to the gateway we just left.
+
+**An empty thread with no cursor never writes a mirror at all** (the persist
+effect in `Transcript.tsx` bails). The transcript mounts for every compose draft
+— including the throwaway one prewarmed at launch — each under a fresh uuid that
+never becomes a chat-list row, so persisting them minted a file per abandoned
+draft that nothing could ever reach again (no row → no delete → and nothing
+sweeps). Don't create the orphan rather than sweep for it later.
+
+This is a scar, so don't re-cut it. `save()` used to end with
+`TranscriptStore.prune(keeping: <top 10 by lastActive>)` and every ingredient of
+that was hostile: `save()` runs on essentially everything (every list merge —
+*including the one the pop back from a chat fires* — every activity ping, every
+badge clear); `rows` after a merge is the gateway's WHOLE session list ranked by
+the **server's** `lastActive`, so rows this device has never opened (and every
+individual cron fire — the list's cron-group collapse is render-time only) spent
+keep-slots on mirrors that did not exist; and reading a chat earns nothing
+(`touch` deliberately does not bump `lastActive` — "ordering means message
+activity, not visits" — and a merge would overwrite it anyway). Net effect: any
+conversation outside the ten most recently **messaged** ones had the mirror it
+wrote on exit deleted seconds later, and opened blank on **every** re-entry,
+forever. An active `*/30` cron job burned all ten slots in about five hours.
+`SessionIndexMirrorTests` pins this; the retention tests fail against the old
+prune.
+
+Mirrors are text (`{rows, cursor, imageDims}` — never blob bytes) and exist only
+for sessions actually read here, each dying with its conversation, so the set on
+disk tracks the conversations the user still has. Like the blob cache it only
+grows, deliberately: bounding it further wants a stated retention policy, not a
+surprise sweep.
+
+**What no cache can fix**: a session this device has never rendered (started on
+web/TUI, a cron fire, a push tap into a new session, the first open after a
+re-pair) has no mirror by construction — its first rows MUST come off the wire.
+That open shows the `.thread-loading` line (empty thread + sync in flight), whose
+400ms CSS delay keeps it invisible on every open that resolves instantly — a
+restored thread, and a compose draft, whose synthesized empty page lands well
+inside the delay.
 
 ## Send outbox (sync-v2)
 

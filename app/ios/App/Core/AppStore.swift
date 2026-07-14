@@ -172,10 +172,11 @@ final class AppStore: ObservableObject {
             return
         }
         // `-baybo-open-session <id>`: push a REAL (bound, registry-known) session
-        // headlessly. The demo sessions above are local-only, so a list merge
-        // drops their row and prunes their mirror — anything that has to survive a
-        // relaunch (a restored transcript, the image sizes it carries) can only be
-        // verified on a session the gateway actually knows.
+        // headlessly. The demo sessions above are local-only, so a list merge on a
+        // bound sim drops their row — and a mirror dies with its row — so anything
+        // that has to survive a relaunch (a restored transcript, the image sizes it
+        // carries) can only be verified on an UNBOUND sim, or on a session the
+        // gateway actually knows.
         let args = ProcessInfo.processInfo.arguments
         if let flag = args.firstIndex(of: "-baybo-open-session"), flag + 1 < args.count {
             route = .home
