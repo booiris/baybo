@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 use baybo_model::{CronExecution, CronJob, ExecutionStatus};
 use baybo_store::StorageError;
-use baybo_store::cron::{CronStore, ExecutionCompletion, Result};
+use baybo_store::cron::{CronFire, CronStore, ExecutionCompletion, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
 
@@ -69,6 +69,35 @@ const JOB_COLS: &str = "id, user_id, status, next_trigger_at, deleted_at, data";
 /// The predicate that keeps recycled jobs out of a query. Applied in SQL — not
 /// in the caller — so no listing can forget it.
 const LIVE_ONLY: &str = "deleted_at IS NULL";
+
+/// The predicate a fire's write-back matches the stored row against: the row is
+/// still live, and still carries the `status` and `next_trigger_at` of the
+/// snapshot the fire read. Those are the two columns a fire, a pause, a resume,
+/// and a reschedule all move, so a row that still has both is a row whose
+/// *schedule* nothing has happened to since the read — which is all a fire
+/// needs, since it stamps its four fields onto the stored blob and rewrites
+/// nothing a user authored.
+///
+/// A blob-only write (an edit) needs more than this — see
+/// [`CronStore::save_if_unchanged`].
+const UNMOVED: &str = "status = :expected_status \
+                       AND next_trigger_at = :expected_next_trigger_at \
+                       AND deleted_at IS NULL";
+
+/// A snapshot projected onto the columns [`UNMOVED`] tests.
+struct Unmoved {
+    status: String,
+    next_trigger_us: i64,
+}
+
+impl From<&CronJob> for Unmoved {
+    fn from(job: &CronJob) -> Self {
+        Self {
+            status: job.status.as_str().to_string(),
+            next_trigger_us: job.next_trigger_at.map(to_us).unwrap_or(0),
+        }
+    }
+}
 
 /// The `(deleted_at, data)` pair each job query lifts out of a row.
 type JobRow = (Option<i64>, String);
@@ -190,25 +219,105 @@ impl CronStore for SqliteCronStore {
         Ok(())
     }
 
-    async fn save_if_still_enabled(&self, job: &CronJob) -> Result<bool> {
+    async fn save_if_unchanged(&self, job: &CronJob, expected: &CronJob) -> Result<bool> {
         let data = serialize_job(job)?;
         let next_trigger_us = job.next_trigger_at.map(to_us).unwrap_or(0);
         let id = job.id.clone();
+        let user_id = job.user_id.clone();
         let status = job.status.as_str().to_string();
-        let affected = self
-            .pool
-            .interact("cron.save_if_still_enabled", move |conn| {
-                Ok(conn.execute(
-                    &format!(
-                        "UPDATE cron_jobs SET status = ?1, next_trigger_at = ?2, data = ?3 \
-                         WHERE id = ?4 AND status = 'enabled' AND {LIVE_ONLY}"
-                    ),
-                    rusqlite::params![status, next_trigger_us, data, id],
-                )?)
-            })
-            .await?;
+        let expected_updated_at = expected.updated_at;
+        let expected = Unmoved::from(expected);
 
-        Ok(affected > 0)
+        self.pool
+            .interact("cron.save_if_unchanged", move |conn| {
+                // The read and the write are one transaction: this write replaces
+                // the whole blob, so it may only land on the row the caller read
+                // — every field of it, not just the two the columns project.
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let stored: Option<String> = tx
+                    .query_row(
+                        &format!("SELECT data FROM cron_jobs WHERE id = :id AND {UNMOVED}"),
+                        rusqlite::named_params! {
+                            ":id": id,
+                            ":expected_status": expected.status,
+                            ":expected_next_trigger_at": expected.next_trigger_us,
+                        },
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(stored) = stored else {
+                    return Ok(false);
+                };
+
+                // A write that touches only the blob — an edit's new prompt, a
+                // pause's status — moves neither column, so the columns alone
+                // cannot see it. `updated_at` is the one field every writer
+                // stamps, which makes it the row's version: a snapshot still
+                // carrying the stored one is a snapshot nothing has landed on.
+                if job_from_row(None, &stored)?.updated_at != expected_updated_at {
+                    return Ok(false);
+                }
+
+                tx.execute(
+                    "UPDATE cron_jobs SET user_id = ?1, status = ?2, next_trigger_at = ?3, \
+                     data = ?4 WHERE id = ?5",
+                    rusqlite::params![user_id, status, next_trigger_us, data, id],
+                )?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await
+    }
+
+    async fn record_fire(&self, expected: &CronJob, fire: CronFire) -> Result<bool> {
+        let id = expected.id.clone();
+        let expected = Unmoved::from(expected);
+
+        self.pool
+            .interact("cron.record_fire", move |conn| {
+                // The read and the write are one transaction, so the blob this
+                // rewrites is the one the row carries *now*. An edit that landed
+                // while the slot was firing lives in that blob, and a write-back
+                // that re-serialized the pre-fire snapshot instead would revert
+                // it.
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let data: Option<String> = tx
+                    .query_row(
+                        &format!("SELECT data FROM cron_jobs WHERE id = :id AND {UNMOVED}"),
+                        rusqlite::named_params! {
+                            ":id": id,
+                            ":expected_status": expected.status,
+                            ":expected_next_trigger_at": expected.next_trigger_us,
+                        },
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(data) = data else {
+                    return Ok(false);
+                };
+
+                let mut job = job_from_row(None, &data)?;
+                job.status = fire.status;
+                job.next_trigger_at = fire.next_trigger_at;
+                job.last_triggered_at = Some(fire.last_triggered_at);
+                job.updated_at = fire.updated_at;
+
+                tx.execute(
+                    "UPDATE cron_jobs SET status = ?1, next_trigger_at = ?2, data = ?3 \
+                     WHERE id = ?4",
+                    rusqlite::params![
+                        job.status.as_str(),
+                        job.next_trigger_at.map(to_us).unwrap_or(0),
+                        serialize_job(&job)?,
+                        id,
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await
     }
 
     async fn delete(&self, job_id: &str) -> Result<()> {
@@ -780,6 +889,16 @@ mod tests {
         assert!(matches!(err, StorageError::NotFound(_)));
     }
 
+    /// The write-back of a fire that advanced a recurring job to its next slot.
+    fn advance_to(next: DateTime<Utc>) -> CronFire {
+        CronFire {
+            status: CronStatus::Enabled,
+            next_trigger_at: Some(next),
+            last_triggered_at: past_dt(),
+            updated_at: past_dt(),
+        }
+    }
+
     /// The tick loop's post-fire write-back must not undo a pause that landed
     /// while the slot was firing — the row would be re-armed from a stale
     /// snapshot and keep firing, with the user's stop control silently lost.
@@ -791,30 +910,307 @@ mod tests {
         job.next_trigger_at = Some(past_dt());
         store.create(&job).await.unwrap();
 
-        let mut in_flight = store.get("cj-pause").await.unwrap().unwrap();
+        let in_flight = store.get("cj-pause").await.unwrap().unwrap();
 
         let mut paused = in_flight.clone();
         paused.status = CronStatus::Disabled;
         paused.next_trigger_at = None;
         store.save(&paused).await.unwrap();
 
-        in_flight.next_trigger_at = Some(future_dt());
         assert!(
-            !store.save_if_still_enabled(&in_flight).await.unwrap(),
+            !store
+                .record_fire(&in_flight, advance_to(future_dt()))
+                .await
+                .unwrap(),
             "the write-back landed on a paused row",
         );
 
         let after = store.get("cj-pause").await.unwrap().unwrap();
         assert_eq!(after.status, CronStatus::Disabled);
         assert!(after.next_trigger_at.is_none());
+        assert!(after.last_triggered_at.is_none());
         assert!(store.list_due(now_us()).await.unwrap().is_empty());
 
+        store.restore("cj-pause").await.unwrap();
+        store.save(&in_flight).await.unwrap();
         store.delete("cj-pause").await.unwrap();
-        let mut revived = in_flight.clone();
-        revived.status = CronStatus::Enabled;
         assert!(
-            !store.save_if_still_enabled(&revived).await.unwrap(),
+            !store
+                .record_fire(&in_flight, advance_to(future_dt()))
+                .await
+                .unwrap(),
             "the write-back landed on a deleted row",
+        );
+    }
+
+    /// A fire owns when it ran and where the schedule goes next. It does not own
+    /// the prompt — so an edit that landed while the slot was firing survives the
+    /// write-back, which reads the row as it now stands rather than re-serializing
+    /// the snapshot it was handed before the fire.
+    #[tokio::test]
+    async fn a_fires_write_back_keeps_an_edit_that_landed_mid_fire() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
+        let mut job = test_job("cj-edit", "u1", CronStatus::Enabled);
+        job.next_trigger_at = Some(past_dt());
+        job.prompt = "old prompt".to_string();
+        store.create(&job).await.unwrap();
+
+        // The snapshot the tick loop read before firing the slot.
+        let in_flight = store.get("cj-edit").await.unwrap().unwrap();
+
+        // The user edits the prompt while the slot is firing.
+        let mut edited = in_flight.clone();
+        edited.prompt = "new prompt".to_string();
+        edited.title = "new title".to_string();
+        assert!(store.save_if_unchanged(&edited, &in_flight).await.unwrap());
+
+        // The fire writes back, carrying the snapshot from before the edit.
+        assert!(
+            store
+                .record_fire(&in_flight, advance_to(future_dt()))
+                .await
+                .unwrap(),
+            "the write-back was dropped; the fire went unrecorded",
+        );
+
+        let after = store.get("cj-edit").await.unwrap().unwrap();
+        assert_eq!(
+            after.prompt, "new prompt",
+            "the fire's write-back reverted the user's edit",
+        );
+        assert_eq!(after.title, "new title");
+        assert_eq!(after.next_trigger_at, Some(future_dt()));
+        assert_eq!(after.last_triggered_at, Some(past_dt()));
+    }
+
+    /// When the edit that landed mid-fire *rescheduled* the job, the write-back
+    /// has nothing to say: advancing the schedule the user just replaced would
+    /// overwrite the fire time they chose. The row moved, so the write is dropped.
+    #[tokio::test]
+    async fn a_fires_write_back_is_dropped_when_the_job_was_rescheduled_mid_fire() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
+        let mut job = test_job("cj-resched", "u1", CronStatus::Enabled);
+        job.next_trigger_at = Some(past_dt());
+        store.create(&job).await.unwrap();
+
+        let in_flight = store.get("cj-resched").await.unwrap().unwrap();
+
+        let user_slot = future_dt() + chrono::Duration::days(1);
+        let mut rescheduled = in_flight.clone();
+        rescheduled.next_trigger_at = Some(user_slot);
+        assert!(
+            store
+                .save_if_unchanged(&rescheduled, &in_flight)
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            !store
+                .record_fire(&in_flight, advance_to(future_dt()))
+                .await
+                .unwrap(),
+            "the write-back advanced a schedule the user had already replaced",
+        );
+
+        let after = store.get("cj-resched").await.unwrap().unwrap();
+        assert_eq!(after.next_trigger_at, Some(user_slot));
+    }
+
+    /// A conditional save is refused once the row has moved — the fire that
+    /// landed in the edit's window would otherwise be undone: its slot re-armed,
+    /// its `last_triggered_at` forgotten.
+    #[tokio::test]
+    async fn a_save_is_refused_once_the_row_has_moved_or_gone() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
+        let mut job = test_job("cj-cas", "u1", CronStatus::Enabled);
+        job.next_trigger_at = Some(past_dt());
+        store.create(&job).await.unwrap();
+
+        // What an in-flight edit read, before the slot fired.
+        let read_before_the_fire = store.get("cj-cas").await.unwrap().unwrap();
+        assert!(
+            store
+                .record_fire(&read_before_the_fire, advance_to(future_dt()))
+                .await
+                .unwrap()
+        );
+
+        let mut stale = read_before_the_fire.clone();
+        stale.prompt = "edited".to_string();
+        assert!(
+            !store
+                .save_if_unchanged(&stale, &read_before_the_fire)
+                .await
+                .unwrap(),
+            "a write carrying a pre-fire snapshot landed on the fired row",
+        );
+
+        let after = store.get("cj-cas").await.unwrap().unwrap();
+        assert_eq!(after.prompt, "test", "the stale write landed anyway");
+        assert_eq!(after.next_trigger_at, Some(future_dt()));
+        assert_eq!(after.last_triggered_at, Some(past_dt()));
+
+        // Re-applied to the row as it now stands, the same edit lands.
+        let mut fresh = after.clone();
+        fresh.prompt = "edited".to_string();
+        assert!(store.save_if_unchanged(&fresh, &after).await.unwrap());
+        assert_eq!(store.get("cj-cas").await.unwrap().unwrap().prompt, "edited");
+
+        // And a row in the recycle bin takes no edit at all.
+        store.delete("cj-cas").await.unwrap();
+        let live = store.get("cj-cas").await.unwrap().unwrap();
+        let mut binned_edit = live.clone();
+        binned_edit.prompt = "edited again".to_string();
+        assert!(
+            !store.save_if_unchanged(&binned_edit, &live).await.unwrap(),
+            "a binned job was edited",
+        );
+    }
+
+    /// Two writes that move neither column — a prompt edit and a title edit, or
+    /// a pause landing on a snapshot read before an edit — are invisible to the
+    /// `status` / `next_trigger_at` pair. The row's `updated_at` is what sees
+    /// them: the second write is refused rather than silently reverting the
+    /// first, and the caller re-applies it to the row as it now stands.
+    #[tokio::test]
+    async fn a_write_that_moved_only_the_blob_is_still_seen_by_the_next_one() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
+        let mut job = test_job("cj-blob-cas", "u1", CronStatus::Enabled);
+        job.next_trigger_at = Some(future_dt());
+        job.prompt = "old prompt".to_string();
+        store.create(&job).await.unwrap();
+
+        // Both editors read the same snapshot.
+        let snapshot = store.get("cj-blob-cas").await.unwrap().unwrap();
+
+        let mut prompt_edit = snapshot.clone();
+        prompt_edit.prompt = "new prompt".to_string();
+        prompt_edit.updated_at = snapshot.updated_at + chrono::Duration::seconds(1);
+        assert!(
+            store
+                .save_if_unchanged(&prompt_edit, &snapshot)
+                .await
+                .unwrap()
+        );
+
+        // The second editor's row moved under it — same status, same slot.
+        let mut title_edit = snapshot.clone();
+        title_edit.title = "Evening digest".to_string();
+        title_edit.updated_at = snapshot.updated_at + chrono::Duration::seconds(2);
+        assert!(
+            !store
+                .save_if_unchanged(&title_edit, &snapshot)
+                .await
+                .unwrap(),
+            "a stale blob landed and reverted the edit before it",
+        );
+        assert_eq!(
+            store.get("cj-blob-cas").await.unwrap().unwrap().prompt,
+            "new prompt",
+        );
+    }
+
+    /// A job with no slot — paused, or a one-shot that has run — is still a job
+    /// a user edits, and its edit goes through the same conditional write. The
+    /// snapshot it compares against holds no `next_trigger_at`, so this is the
+    /// one path where [`UNMOVED`] matches the column against the *absence* of a
+    /// fire time. It has to match: were an empty slot ever stored as SQL `NULL`,
+    /// `next_trigger_at = :expected` would be true of nothing, and every edit of
+    /// a paused job would lose a race it was never in.
+    #[tokio::test]
+    async fn a_job_holding_no_slot_is_still_editable() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
+
+        for (id, status) in [
+            ("cj-paused", CronStatus::Disabled),
+            ("cj-fired", CronStatus::Executed),
+        ] {
+            let mut job = test_job(id, "u1", status.clone());
+            job.next_trigger_at = None;
+            store.create(&job).await.unwrap();
+
+            let current = store.get(id).await.unwrap().unwrap();
+            assert!(current.next_trigger_at.is_none());
+
+            let mut edited = current.clone();
+            edited.prompt = "edited".to_string();
+            assert!(
+                store.save_if_unchanged(&edited, &current).await.unwrap(),
+                "a {} job could not be edited: its empty slot never matched",
+                status.as_str(),
+            );
+
+            let after = store.get(id).await.unwrap().unwrap();
+            assert_eq!(after.prompt, "edited");
+            assert_eq!(after.status, status);
+            assert!(after.next_trigger_at.is_none(), "the edit armed it");
+        }
+    }
+
+    /// Re-arming a one-shot that has already run: the edit gives it a status and
+    /// a slot it did not have, and the row it lands on is matched on the empty
+    /// slot the fire left behind.
+    #[tokio::test]
+    async fn a_fired_one_shot_is_re_armed_by_an_edit() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
+        let mut job = test_job("cj-once", "u1", CronStatus::Enabled);
+        job.schedule = CronSchedule::at(past_dt());
+        job.next_trigger_at = Some(past_dt());
+        store.create(&job).await.unwrap();
+
+        let in_flight = store.get("cj-once").await.unwrap().unwrap();
+        assert!(
+            store
+                .record_fire(
+                    &in_flight,
+                    CronFire {
+                        status: CronStatus::Executed,
+                        next_trigger_at: None,
+                        last_triggered_at: past_dt(),
+                        updated_at: past_dt(),
+                    },
+                )
+                .await
+                .unwrap()
+        );
+
+        let fired = store.get("cj-once").await.unwrap().unwrap();
+        assert_eq!(fired.status, CronStatus::Executed);
+        assert!(fired.next_trigger_at.is_none());
+
+        let mut re_armed = fired.clone();
+        re_armed.schedule = CronSchedule::at(future_dt());
+        re_armed.next_trigger_at = Some(future_dt());
+        re_armed.status = CronStatus::Enabled;
+        assert!(
+            store.save_if_unchanged(&re_armed, &fired).await.unwrap(),
+            "a fired one-shot could not be given a new moment",
+        );
+
+        let after = store.get("cj-once").await.unwrap().unwrap();
+        assert_eq!(after.status, CronStatus::Enabled);
+        assert_eq!(after.next_trigger_at, Some(future_dt()));
+        assert_eq!(
+            after.last_triggered_at,
+            Some(past_dt()),
+            "re-arming the job threw away the run it had already done",
+        );
+        // And it is on the schedule again — the `enabled` + slot pair the tick
+        // loop selects on, not just a blob that says so.
+        assert!(
+            store
+                .list_due(future_dt().timestamp_micros() + 1)
+                .await
+                .unwrap()
+                .iter()
+                .any(|j| j.id == "cj-once"),
         );
     }
 

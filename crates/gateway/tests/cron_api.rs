@@ -1,12 +1,14 @@
 //! Integration coverage for the admin-side `/v1/cron` REST surface:
-//! pause / resume, and the recycle bin (soft delete → listed only under
-//! `?deleted=true`, still resolvable by id, restorable).
+//! pause / resume, the recycle bin (soft delete → listed only under
+//! `?deleted=true`, still resolvable by id, restorable), and the in-place
+//! edit.
 
 use std::sync::Arc;
 
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use baybo_gateway::test_support::build_test_deps;
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -152,7 +154,263 @@ async fn cron_pause_resume_and_recycle_bin_round_trip() {
     get(&router, "/v1/cron/missing", StatusCode::NOT_FOUND).await;
 }
 
+#[tokio::test]
+async fn cron_in_place_edit_round_trip() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_router(build_admin_state(&tg));
+
+    let created = post_expect(
+        &router,
+        "/v1/cron",
+        json!({
+            "schedule": "0 9 * * *",
+            "user_id": "owner",
+            "title": "Morning digest",
+            "text": "Summarize the news",
+            "timezone": "UTC",
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let id = created["id"].as_str().expect("id").to_owned();
+    let uri = format!("/v1/cron/{id}");
+    let armed_at = trigger_at(&created);
+
+    // ── 1. A patch writes what it carries and nothing else ──────────
+    let edited = patch_expect(
+        &router,
+        &uri,
+        json!({ "prompt": "Summarize the news, briefly" }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        edited["prompt"].as_str(),
+        Some("Summarize the news, briefly")
+    );
+    assert_eq!(
+        edited["title"].as_str(),
+        Some("Morning digest"),
+        "a field the patch left out keeps its value: {edited:?}",
+    );
+    assert_eq!(edited["schedule"]["expr"].as_str(), Some("0 9 * * *"));
+    assert_eq!(
+        trigger_at(&edited),
+        armed_at,
+        "editing the prompt does not move the fire time: {edited:?}",
+    );
+    assert_eq!(
+        edited["id"].as_str(),
+        Some(id.as_str()),
+        "an edit keeps the job's id — that is the whole point of it over delete + recreate",
+    );
+
+    // ── 2. Rescheduling re-arms from now, never into the past ───────
+    let rescheduled = patch_expect(
+        &router,
+        &uri,
+        json!({ "schedule": { "kind": "cron", "expr": "30 6 * * *" } }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(rescheduled["schedule"]["expr"].as_str(), Some("30 6 * * *"));
+    assert_eq!(rescheduled["status"].as_str(), Some("enabled"));
+    let next = trigger_at(&rescheduled);
+    assert!(
+        next > Some(Utc::now()),
+        "the new slot is ahead of now, not a missed one back-filled: {rescheduled:?}",
+    );
+    assert_ne!(next, armed_at, "{rescheduled:?}");
+    assert_eq!(
+        rescheduled["prompt"].as_str(),
+        Some("Summarize the news, briefly"),
+        "a reschedule keeps the prompt the last edit wrote: {rescheduled:?}",
+    );
+
+    // ── 3. A paused job stays paused: an edit is not a resume ───────
+    post_expect(
+        &router,
+        &format!("{uri}/pause"),
+        json!({}),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let paused_edit = patch_expect(
+        &router,
+        &uri,
+        json!({
+            "title": "Evening digest",
+            "schedule": { "kind": "cron", "expr": "0 18 * * *" },
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(paused_edit["title"].as_str(), Some("Evening digest"));
+    assert_eq!(paused_edit["schedule"]["expr"].as_str(), Some("0 18 * * *"));
+    assert_eq!(
+        paused_edit["status"].as_str(),
+        Some("disabled"),
+        "editing a paused job must not quietly restart it: {paused_edit:?}",
+    );
+    assert!(
+        paused_edit["next_trigger_at"].is_null(),
+        "a paused job holds no slot, edited or not: {paused_edit:?}",
+    );
+
+    post_expect(
+        &router,
+        &format!("{uri}/resume"),
+        json!({}),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    // ── 4. The bodies a caller gets wrong ───────────────────────────
+    let empty = patch_expect(&router, &uri, json!({}), StatusCode::BAD_REQUEST).await;
+    assert!(
+        empty["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("sets no fields"),
+        "{empty:?}",
+    );
+
+    let elapsed = patch_expect(
+        &router,
+        &uri,
+        json!({ "schedule": { "kind": "at", "time": "2020-01-01T00:00:00Z" } }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        elapsed["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("invalid schedule"),
+        "{elapsed:?}",
+    );
+    let untouched = get(&router, &uri, StatusCode::OK).await;
+    assert_eq!(
+        untouched["schedule"]["expr"].as_str(),
+        Some("0 18 * * *"),
+        "a refused edit leaves the job exactly as it was: {untouched:?}",
+    );
+    assert_eq!(untouched["status"].as_str(), Some("enabled"));
+
+    // ── 5. A job in the bin reads as absent: restore it first ───────
+    delete_expect(&router, &uri, StatusCode::NO_CONTENT).await;
+    patch_expect(
+        &router,
+        &uri,
+        json!({
+            "prompt": "…",
+            "schedule": { "kind": "cron", "expr": "0 3 * * *" },
+        }),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    // The refusal is total: the row is still binned, and still holds every value
+    // the edit tried to write over. A 404 that had half-applied the patch — or
+    // that had walked the job back out of the bin to do it — would be worse than
+    // no edit at all.
+    let binned = get(&router, &uri, StatusCode::OK).await;
+    assert!(
+        !binned["deleted_at"].is_null(),
+        "a refused edit brought the job back out of the bin: {binned:?}",
+    );
+    assert_eq!(
+        binned["prompt"].as_str(),
+        Some("Summarize the news, briefly"),
+        "a job in the bin was edited: {binned:?}",
+    );
+    assert_eq!(binned["schedule"]["expr"].as_str(), Some("0 18 * * *"));
+    assert!(listed_ids(&router, false).await.is_empty());
+    assert_eq!(listed_ids(&router, true).await, vec![id.clone()]);
+
+    // Restored, it takes the edit it refused while it was in the bin.
+    post_expect(
+        &router,
+        &format!("{uri}/restore"),
+        json!({}),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let edited = patch_expect(&router, &uri, json!({ "prompt": "…" }), StatusCode::OK).await;
+    assert_eq!(edited["prompt"].as_str(), Some("…"));
+
+    patch_expect(
+        &router,
+        "/v1/cron/missing",
+        json!({ "prompt": "…" }),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
+/// The API client is the one caller that can still hand a job an empty
+/// instruction: the LLM tools filter a blank field out before it gets here, and
+/// the web form refuses to submit one. A blank prompt is not a job that does
+/// nothing — it is an armed job firing nothing on every slot.
+#[tokio::test]
+async fn a_blank_prompt_is_refused_on_create_and_on_edit() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_router(build_admin_state(&tg));
+
+    for blank in ["", "   "] {
+        post_expect(
+            &router,
+            "/v1/cron",
+            json!({
+                "schedule": "0 9 * * *",
+                "user_id": "owner",
+                "title": "Morning digest",
+                "text": blank,
+                "timezone": "UTC",
+            }),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+
+    let created = post_expect(
+        &router,
+        "/v1/cron",
+        json!({
+            "schedule": "0 9 * * *",
+            "user_id": "owner",
+            "title": "Morning digest",
+            "text": "Summarize the news",
+            "timezone": "UTC",
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let uri = format!("/v1/cron/{}", created["id"].as_str().expect("id"));
+
+    for blank in ["", "   "] {
+        patch_expect(
+            &router,
+            &uri,
+            json!({ "prompt": blank }),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+
+    let unchanged = get(&router, &uri, StatusCode::OK).await;
+    assert_eq!(unchanged["prompt"].as_str(), Some("Summarize the news"));
+    assert_eq!(trigger_at(&unchanged), trigger_at(&created));
+}
+
 // ── helpers ─────────────────────────────────────────────────────────
+
+fn trigger_at(job: &Value) -> Option<DateTime<Utc>> {
+    job["next_trigger_at"].as_str().map(|s| {
+        DateTime::parse_from_rfc3339(s)
+            .expect("rfc3339 trigger")
+            .to_utc()
+    })
+}
 
 async fn listed_ids(router: &axum::Router, deleted: bool) -> Vec<String> {
     let uri = if deleted {
@@ -247,6 +505,15 @@ async fn get(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
 
 async fn post_expect(router: &axum::Router, uri: &str, body: Value, expected: StatusCode) -> Value {
     request(router, "POST", uri, Some(body), expected).await
+}
+
+async fn patch_expect(
+    router: &axum::Router,
+    uri: &str,
+    body: Value,
+    expected: StatusCode,
+) -> Value {
+    request(router, "PATCH", uri, Some(body), expected).await
 }
 
 async fn delete_expect(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {

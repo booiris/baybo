@@ -554,6 +554,7 @@ GET    /v1/background-jobs              long-running background job list
 GET    /v1/cron                         ?deleted=  live jobs; deleted=true serves the recycle bin
 POST   /v1/cron                         { schedule, user_id, channel?, text, timezone, origin_session_id? }
 GET    /v1/cron/:id                     resolves a job live or deleted
+PATCH  /v1/cron/:id                     { title?, prompt?, schedule?, timezone? } partial edit → 200 the edited job
 DELETE /v1/cron/:id                     move to the recycle bin: stops firing, leaves the list, row survives
 POST   /v1/cron/:id/pause               status → disabled, next trigger cleared
 POST   /v1/cron/:id/resume              status → enabled, next trigger recomputed from now (no backfill)

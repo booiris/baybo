@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use baybo_model::{CronExecution, CronJob, ExecutionOutcome, ExecutionStatus, SessionId};
+use baybo_model::{
+    CronExecution, CronJob, CronStatus, ExecutionOutcome, ExecutionStatus, SessionId,
+};
+use chrono::{DateTime, Utc};
 
 use crate::StorageError;
 
@@ -29,13 +32,39 @@ pub trait CronStore: Send + Sync {
     /// that stale snapshot undo a deletion that landed in between, putting a
     /// job the user deleted back on the schedule.
     async fn save(&self, job: &CronJob) -> Result<()>;
-    /// Write back a recurring job's advanced schedule after a fire — but only
-    /// while the row is still the enabled, live job the tick loop read. A pause
-    /// or a delete landing inside the fire window must survive this write-back;
-    /// an unconditional `save` would re-arm, from a stale snapshot, a job the
-    /// user just stopped. Returns false when the row moved and the write was
-    /// dropped.
-    async fn save_if_still_enabled(&self, job: &CronJob) -> Result<bool>;
+    /// Save a job, but only while the stored row is still `expected` — the
+    /// snapshot the caller read: still live, still carrying its `status` and
+    /// `next_trigger_at`, and still stamped with its `updated_at`. Returns false
+    /// when the row moved and the write was dropped.
+    ///
+    /// This is the write every in-place change of a job goes through, because
+    /// each of them rewrites the **whole** record from a snapshot: an edit, a
+    /// pause, a resume. Any of those can be raced by a fire's write-back or by
+    /// another change, and an unconditional `save` would then put the snapshot
+    /// back — reverting the prompt the user just typed, re-arming a slot that
+    /// already ran, forgetting `last_triggered_at`. The caller reloads and
+    /// re-applies its change to the row as it now stands.
+    ///
+    /// `updated_at` is what makes this a real version check rather than a
+    /// schedule check: a change that touches only authored fields moves neither
+    /// column, so two of them would otherwise both "match" the same snapshot and
+    /// the second would silently overwrite the first.
+    async fn save_if_unchanged(&self, job: &CronJob, expected: &CronJob) -> Result<bool>;
+    /// Stamp a fire onto its job: when it fired, the slot it goes to next, and
+    /// the status it is left in.
+    ///
+    /// The fire's fields are applied to the **stored** row, not to `expected` —
+    /// the snapshot the tick loop read before the fire. Those two differ exactly
+    /// when a user edited the job while the slot was firing, and a write-back
+    /// carrying the whole snapshot would revert that edit's prompt, title, or
+    /// schedule. A fire owns when it ran and where the schedule goes next; it
+    /// owns nothing the user typed.
+    ///
+    /// Conditional on the row still being the job the fire read (same `status`
+    /// and `next_trigger_at`, still live), so a pause, a delete, or a reschedule
+    /// that lands mid-fire wins: none of them may be re-armed away by the fire
+    /// they raced. Returns false when the write was dropped for that reason.
+    async fn record_fire(&self, expected: &CronJob, fire: CronFire) -> Result<bool>;
     /// Move a job to the recycle bin by stamping `deleted_at`. Leaves
     /// `status` untouched. Idempotent: a job already in the bin keeps the
     /// deletion time it went in with.
@@ -116,6 +145,21 @@ pub trait CronStore: Send + Sync {
     /// delivered or dropped ([`CronExecution::awaits_delivery`]). Scanned at
     /// boot to re-drive deliveries lost to a crash.
     async fn list_executions_awaiting_delivery(&self) -> Result<Vec<CronExecution>>;
+}
+
+/// What a fire writes back to its [`CronJob`] — see [`CronStore::record_fire`].
+/// Exactly the fields a fire owns: nothing a user authored is in here, which is
+/// what lets a write-back and an in-place edit land in either order.
+#[derive(Debug, Clone)]
+pub struct CronFire {
+    /// The status the fire leaves the job in: unchanged for a recurring job,
+    /// [`CronStatus::Executed`] for a one-shot that has now run.
+    pub status: CronStatus,
+    /// The slot the job goes to next. `None` for a one-shot with nothing left
+    /// to fire.
+    pub next_trigger_at: Option<DateTime<Utc>>,
+    pub last_triggered_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// The fire's terminal state, stamped onto its [`CronExecution`] by the cron

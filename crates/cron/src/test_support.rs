@@ -6,9 +6,17 @@
 use async_trait::async_trait;
 use baybo_model::{CronExecution, CronJob, CronStatus, ExecutionStatus};
 use baybo_store::StorageError;
-use baybo_store::cron::{CronStore, ExecutionCompletion, Result};
+use baybo_store::cron::{CronFire, CronStore, ExecutionCompletion, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+
+/// The sqlite `UNMOVED` predicate, against a `Vec`: the stored row is still
+/// live and still carries the status and slot of the snapshot the caller read.
+fn unmoved(stored: &CronJob, expected: &CronJob) -> bool {
+    !stored.is_deleted()
+        && stored.status == expected.status
+        && stored.next_trigger_at == expected.next_trigger_at
+}
 
 /// In-memory [`CronStore`] — the whole cron domain against `Vec`s, so a test
 /// can drive the scheduler (and the agent layer's cron waiter / boot re-drive)
@@ -106,15 +114,36 @@ impl CronStore for InMemoryCronStore {
     }
 
     /// Mirrors the sqlite impl's conditional UPDATE: the write lands only while
-    /// the row is still the enabled, live job the tick loop read, so a pause or
-    /// a delete that raced the fire is not undone by the write-back.
-    async fn save_if_still_enabled(&self, job: &CronJob) -> Result<bool> {
+    /// the row is still the live job the caller read, unmoved by a fire, a
+    /// pause, or another edit — `updated_at` included, since an edit that
+    /// rewrites only authored fields moves neither of the projected columns.
+    async fn save_if_unchanged(&self, job: &CronJob, expected: &CronJob) -> Result<bool> {
         let mut jobs = self.jobs.lock();
         match jobs.iter_mut().find(|j| j.id == job.id) {
-            Some(existing) if existing.is_enabled() && !existing.is_deleted() => {
+            Some(existing)
+                if unmoved(existing, expected) && existing.updated_at == expected.updated_at =>
+            {
                 let deleted_at = existing.deleted_at;
                 *existing = job.clone();
                 existing.deleted_at = deleted_at;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Mirrors the sqlite impl: the fire's fields are stamped onto the *stored*
+    /// row, so an edit that landed while the slot was firing keeps the prompt,
+    /// title and schedule the user gave it — a write-back carrying the whole
+    /// pre-fire snapshot would revert them.
+    async fn record_fire(&self, expected: &CronJob, fire: CronFire) -> Result<bool> {
+        let mut jobs = self.jobs.lock();
+        match jobs.iter_mut().find(|j| j.id == expected.id) {
+            Some(existing) if unmoved(existing, expected) => {
+                existing.status = fire.status;
+                existing.next_trigger_at = fire.next_trigger_at;
+                existing.last_triggered_at = Some(fire.last_triggered_at);
+                existing.updated_at = fire.updated_at;
                 Ok(true)
             }
             _ => Ok(false),

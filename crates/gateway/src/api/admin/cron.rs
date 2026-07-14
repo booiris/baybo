@@ -11,26 +11,31 @@ use utoipa_axum::routes;
 use baybo_cron::{CronError, CronSchedule};
 use baybo_model::ChannelType as ChannelTypeModel;
 
-use crate::api::dto::{CreateCronRequest, CronJob, ErrorBody, ListResponse};
+use crate::api::dto::{CreateCronRequest, CronJob, ErrorBody, ListResponse, UpdateCronRequest};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
 pub fn routes() -> OpenApiRouter<AdminState> {
     OpenApiRouter::new()
         .routes(routes!(list_cron, create_cron))
-        .routes(routes!(get_cron, delete_cron))
+        .routes(routes!(get_cron, update_cron, delete_cron))
         .routes(routes!(pause_cron))
         .routes(routes!(resume_cron))
         .routes(routes!(restore_cron))
 }
 
 /// Map a scheduler error onto the right HTTP status: an unknown job id is
-/// 404, a schedule with no future fire time (resuming a one-shot whose
-/// moment has passed) is 400, anything else is a 500.
+/// 404, a request the caller got wrong (a schedule with no future fire time —
+/// resuming or rescheduling onto a one-shot whose moment has passed — or an
+/// edit that sets no field) is 400, an edit that kept losing to a concurrent
+/// write is a retryable 409, anything else is a 500.
 fn cron_err(e: CronError) -> GatewayError {
     match e {
         CronError::NotFound(m) => GatewayError::NotFound(m),
-        invalid @ CronError::InvalidSchedule(_) => GatewayError::BadRequest(invalid.to_string()),
+        caller_bug @ (CronError::InvalidSchedule(_)
+        | CronError::EmptyUpdate(_)
+        | CronError::BlankPrompt) => GatewayError::BadRequest(caller_bug.to_string()),
+        contended @ CronError::Contended(_) => GatewayError::Conflict(contended.to_string()),
         other => GatewayError::Cron(other.to_string()),
     }
 }
@@ -77,7 +82,7 @@ async fn list_cron(
     request_body = CreateCronRequest,
     responses(
         (status = 201, description = "Created cron job", body = CronJob),
-        (status = 400, description = "Invalid schedule", body = ErrorBody),
+        (status = 400, description = "Invalid schedule, or a blank prompt", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
     )
 )]
@@ -133,6 +138,36 @@ async fn get_cron(
 }
 
 #[utoipa::path(
+    patch,
+    path = "/cron/{id}",
+    tag = "cron",
+    params(
+        ("id" = String, Path, description = "Cron job id"),
+    ),
+    request_body = UpdateCronRequest,
+    responses(
+        (status = 200, description = "The edited job, with the `next_trigger_at` the edit produced — a client need not refetch. Fields the body left out are unchanged. Editing the schedule or the timezone recomputes the next fire time from now: the slots the job missed are never back-filled. A paused job stays paused — it keeps `disabled` and no next trigger until `POST /v1/cron/{id}/resume` — while a one-shot that already fired is re-armed by an `at` still in the future", body = CronJob),
+        (status = 400, description = "The body sets no field, blanks the prompt, or carries a schedule with no future fire time (an `at` whose moment has passed)", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "No such job, or the job is in the recycle bin — `POST /v1/cron/{id}/restore` it before editing it", body = ErrorBody),
+        (status = 409, description = "The edit kept losing to a concurrent write (the job fired while it was being applied). Nothing changed; retry", body = ErrorBody),
+        (status = 500, description = "Scheduler error", body = ErrorBody),
+    )
+)]
+async fn update_cron(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateCronRequest>,
+) -> Result<Json<CronJob>> {
+    let job = state
+        .cron_scheduler
+        .update_job(&id, req.into())
+        .await
+        .map_err(cron_err)?;
+    Ok(Json(CronJob::from(job)))
+}
+
+#[utoipa::path(
     delete,
     path = "/cron/{id}",
     tag = "cron",
@@ -169,6 +204,7 @@ async fn delete_cron(
         (status = 204, description = "Job paused: status is now `disabled` and it has no next trigger until resumed"),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
+        (status = 409, description = "The pause kept losing to a concurrent write (the job fired, or was edited, while it was being applied). Nothing changed; retry", body = ErrorBody),
         (status = 500, description = "Scheduler error", body = ErrorBody),
     )
 )]
@@ -193,6 +229,7 @@ async fn pause_cron(State(state): State<AdminState>, Path(id): Path<String>) -> 
         (status = 400, description = "Schedule has no future fire time (a one-shot whose moment has passed)", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
+        (status = 409, description = "The resume kept losing to a concurrent write (the job was edited while it was being applied). Nothing changed; retry", body = ErrorBody),
         (status = 500, description = "Scheduler error", body = ErrorBody),
     )
 )]
