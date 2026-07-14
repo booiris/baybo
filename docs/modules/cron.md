@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `cron` crate owns scheduled recurring work end-to-end: the `CronScheduler` (`scheduler.rs`) that ticks against the store, the `Shutdown` trait (`shutdown.rs`) used to bound the scheduler's tick loop, and `CronError`. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`, `ExecutionOutcome`, `PendingCronResult`) live in `baybo-model` (re-exported here for back-compat); the `CronStore` persistence trait lives in the `baybo-store` ports crate. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs. The sqlite implementation of `CronStore` lives in `baybo-storage`; the LLM-invocable cron tools (`CronCreate` / `CronDelete` / `CronList`) live in `baybo-cron::tools` (the crate depends on `baybo-tools` for the `Tool` trait). `baybo-agent` re-exports `CronScheduler` and `CronTriggerEvent` for assembly-layer consumers.
+The `cron` crate owns scheduled recurring work end-to-end: the `CronScheduler` (`scheduler.rs`) that ticks against the store, the `Shutdown` trait (`shutdown.rs`) used to bound the scheduler's tick loop, and `CronError`. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`, `ExecutionOutcome`, `PendingCronResult`) live in `baybo-model` (re-exported here for back-compat); the `CronStore` persistence trait lives in the `baybo-store` ports crate. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs. The sqlite implementation of `CronStore` lives in `baybo-storage`; the LLM-invocable cron tools (`CronCreate` / `CronDelete` / `CronPause` / `CronResume` / `CronList`) live in `baybo-cron::tools` (the crate depends on `baybo-tools` for the `Tool` trait). `baybo-agent` re-exports `CronScheduler` and `CronTriggerEvent` for assembly-layer consumers.
 
 CronJobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration. Each fire mints a brand-new session in the agent layer — one trigger = one session — so the run sees a clean transcript and fresh `SessionState`. A `CronJob` also records its `origin_session_id`: the conversation it was created from, which for a one-shot is where the fire's result is reported back.
 
@@ -99,7 +99,46 @@ Each `CronJob` stores `next_trigger_at` — the next time it should fire. This a
 
 ### One-shot lifecycle
 
-Jobs whose `schedule` is `CronSchedule::At { time }` transition to `CronStatus::Executed` after firing — the row is preserved (not deleted), so the web UI and history queries can still see "this fired and is done". `next_trigger_at` is cleared and `last_triggered_at` is stamped at the same time. The `list_due` query filter (`status = 'enabled'`) keeps `Executed` jobs from being re-fired by the tick loop. A `CronExecution` record is persisted alongside the status update; explicit `delete_job` is still available for callers that want to remove the row.
+Jobs whose `schedule` is `CronSchedule::At { time }` transition to `CronStatus::Executed` after firing — the row is preserved, so the web UI and history queries can still see "this fired and is done". `next_trigger_at` is cleared and `last_triggered_at` is stamped at the same time. The `list_due` query filter (`status = 'enabled'`) keeps `Executed` jobs from being re-fired by the tick loop. A `CronExecution` record is persisted alongside the status update.
+
+### Pause and resume: `status` is the firing switch
+
+`CronStatus` decides whether a job fires, and it is the only thing pause/resume touch. `CronScheduler::disable_job` flips the job to `Disabled` and clears `next_trigger_at`: it keeps its place in every list, and `list_due`'s `status = 'enabled'` filter takes it out of the tick loop. `enable_job` flips it back to `Enabled` and recomputes `next_trigger_at` **from now**.
+
+Recomputing from now is the whole point: the slots that came and went while the job was paused are **not** made up. A daily job paused for a week and resumed today fires once tomorrow — not seven times the instant it comes back. A one-shot whose instant has already passed has nothing left to fire at all, so `enable_job` refuses it with `CronError::InvalidSchedule` rather than enabling a job whose `next_trigger_at` would be `None` forever; the user schedules a new one instead.
+
+Three surfaces drive the pair, all over those two scheduler methods: the `CronPause` / `CronResume` tools, `POST /v1/cron/{id}/pause` and `/resume` on the admin API (204; a resume that has no future fire time is the 400), and the pause/resume button the web cron page renders on each row. `CronResume` hands the recomputed `next_trigger_at` back to the model in the job's own timezone, so its reply can say when the job next fires. A fired one-shot (`Executed`) offers neither control — there is no slot left to pause or restore it to.
+
+Both reach a job by id, and `get` resolves deleted jobs — so both check `is_deleted` and report a job in the bin as `NotFound` (404), exactly as `trigger_now` does. Resuming a binned job could not put it back on the schedule anyway (`list_due` never sees it), so a success would tell the user — or, through `CronResume`'s reply, the model — that a job is firing again when it never can; and pausing one would overwrite the status `restore_job` promises to bring it back with. `restore_job` is the only way out of the bin.
+
+### Deletion is a recycle bin
+
+`CronJob::deleted_at` (`Option<DateTime<Utc>>`; `None` = live) is the tombstone. `CronStore::delete` stamps it, `CronStore::restore` clears it, and the row itself is never removed — no store method issues a `DELETE FROM cron_jobs`, and no caller asks for one.
+
+The row has to survive because everything the job produced outlives it: its `cron_executions` rows, the conversations its recurring fires opened, and the notifications its one-shots appended into other conversations. The job row is the only thing tying those back to their origin — drop it and a fire's conversation is provenance-less and its execution rows are orphans pointing at a `job_id` that resolves to nothing. `CronStore::get` therefore resolves a deleted job by id **on purpose**: that lookup is what keeps "this conversation came from the scheduled task *Standup reminder*" answerable after the user has thrown the task away.
+
+Deletion is **orthogonal to `status`**. A deleted one-shot that already fired keeps `Executed`; a deleted enabled job keeps `Enabled`. There is no `CronStatus::Deleted` variant: status and deletion are two independent axes, and folding one into the other would make "bring it back exactly as it was" unrepresentable.
+
+**The listing invariant.** Every query that can feed the tick loop or a user-facing list filters `deleted_at IS NULL` **in SQL** — `list_due`, `list_enabled`, `list_by_user`, `list_all`. Never in Rust: a filter applied after the rows come back is one forgotten `.filter()` away from a deleted job firing, and a scheduled task that keeps firing after the user deleted it is the worst outcome this feature has. `list_deleted` is the sole inversion (`deleted_at IS NOT NULL`, most recently deleted first) and it serves the recycle bin alone. The partial index `idx_cron_jobs_live_due` on `(status, next_trigger_at) WHERE deleted_at IS NULL` keeps the tick query indexed.
+
+The one path that fires a job without going through a listing is `CronScheduler::trigger_now`, which reaches it by id — and `get` resolves deleted jobs by design. So `trigger_now` checks `is_deleted` itself and reports a deleted job as `NotFound`: a job in the bin does not fire on demand any more than it fires on schedule.
+
+**Restore recomputes the schedule *before* it un-hides the row.** A job deleted on Monday still carries Monday's `next_trigger_at`; restore it on Thursday and that instant is three days overdue. Publishing the row with that stale slot would fire it on the very next tick — the exact catch-up burst pause/resume refuses to do. So `CronScheduler::restore_job` writes the recomputed schedule **while the row is still in the bin**, then clears `deleted_at` in a second write. The intermediate state — still deleted, already carrying a fresh schedule — is invisible to the tick loop and safe to crash in (the restore is simply retried). What it publishes:
+
+| Status while deleted | Restored as |
+|---|---|
+| `Enabled`, recurring | `Enabled`, `next_trigger_at` = the next slot **after now**; the slots missed in the bin are not back-filled |
+| `Enabled`, one-shot whose instant is still ahead | `Enabled`, firing at that instant |
+| `Enabled`, one-shot whose instant passed while deleted | `Disabled`, no trigger — there is nothing left to fire |
+| `Disabled` | `Disabled`, no trigger — a paused job comes back paused |
+| `Executed` | `Executed` — a one-shot that already ran stays run |
+
+Restoring a job that is not in the bin is a no-op rather than an error, so a double-click on the restore button cannot reschedule a live job.
+
+**A result already computed is still owed; a fire that never ran is not.** Both boot scans walk *executions*, not jobs, and the delete cuts between them:
+
+- **The delivery re-drive** (`list_executions_awaiting_delivery`: `completed_at IS NOT NULL AND notified_at IS NULL`) replays a result the fire already produced. It runs for a deleted job on purpose — swallowing a result the user is waiting on because the task was tidied away in the meantime would be exactly the silent evaporation the delivery ledger exists to prevent. The notification names the job by its snapshotted title, and `get_job` still resolves the row behind it.
+- **The pending-execution recovery** (`recover_pending`: `status = Pending`) is not a delivery. A `Pending` row has never been dispatched — nothing has run and there is no result to owe — so re-dispatching it *fires the job*. It therefore checks job liveness the same way `list_due` does, and a job in the bin does not fire: a deleted task firing a fresh conversation on the next restart is precisely what the bin promises will not happen. The orphaned row is retired rather than left `Pending`, so a later restore cannot resurrect the stale fire either.
 
 ### Cron expressions are timezone-aware
 
@@ -126,11 +165,19 @@ A fire is delivered to the model as a *user* turn, so a bare prompt is ambiguous
 
 ### LLM-invocable cron tools live in baybo-cron
 
-`tools::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` `Tool` implementations (each holding an `Arc<CronScheduler>`). They live in `baybo-cron::tools` — the same pattern as `baybo-skills::tools` — so the cron domain owns its own LLM surface. This is only possible because `CronStore` moved to the `baybo-store` ports crate: the old `baybo-storage → baybo-cron` edge is gone, so `baybo-cron` taking a dependency on `baybo-tools` (for the `Tool` trait) no longer closes the cycle `baybo-cron → baybo-tools → baybo-storage → baybo-cron`. `crates/baybo/src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
+`tools::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, `CronPauseTool`, `CronResumeTool`, and `CronListTool` `Tool` implementations (each holding an `Arc<CronScheduler>`). They live in `baybo-cron::tools` — the same pattern as `baybo-skills::tools` — so the cron domain owns its own LLM surface. This is only possible because `CronStore` moved to the `baybo-store` ports crate: the old `baybo-storage → baybo-cron` edge is gone, so `baybo-cron` taking a dependency on `baybo-tools` (for the `Tool` trait) no longer closes the cycle `baybo-cron → baybo-tools → baybo-storage → baybo-cron`. `crates/baybo/src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
+
+The three single-job tools (`CronDelete` / `CronPause` / `CronResume`) share one `{ id }` parameter shape — one `JobIdParams`, one schema builder, one progress label — so the only thing that distinguishes them to the model is the description, and each description carries the distinction it has to get right: delete stops the job and leaves the list *but is recoverable from the recycle bin*, pause keeps the job listed and stops it *until resumed*, resume computes the next fire *from now* and cannot revive a one-shot whose moment has passed.
+
+The bin itself is **not** part of the model's surface. `CronList` returns live jobs only: a paused job appears with `status: disabled`, a deleted one does not appear at all, so the model can neither see nor act on a job the user has removed. Restore is a human affordance — the web cron page's Recycle Bin view and `POST /v1/cron/{id}/restore`.
 
 ### Storage decoupling
 
-The `CronStore` trait lives in the `baybo-store` ports crate (its sqlite impl in `baybo-storage`) and operates on the domain types directly — `CronJob` / `CronExecution` / `ExecutionStatus` / `ExecutionCompletion` rather than opaque row shapes. The sqlite implementation in `baybo-storage::sqlite::cron` handles JSON serialization of the `data` column internally; the delivery ledger additionally projects `completed_at` / `notified_at` into columns so the boot re-drive's scan is an indexed query rather than a full-table deserialize.
+The `CronStore` trait lives in the `baybo-store` ports crate (its sqlite impl in `baybo-storage`) and operates on the domain types directly — `CronJob` / `CronExecution` / `ExecutionStatus` / `ExecutionCompletion` rather than opaque row shapes. The sqlite implementation in `baybo-storage::sqlite::cron` handles JSON serialization of the `data` column internally and projects the queryable fields into columns: `status` / `next_trigger_at` / `deleted_at` on `cron_jobs` (so the listing invariant above is enforceable in SQL), and `completed_at` / `notified_at` on `cron_executions` (so the boot re-drive's scan is an indexed query rather than a full-table deserialize).
+
+**The `deleted_at` column is the source of truth for recycle-bin state, and only `delete` / `restore` write it.** The `data` blob does not carry a copy at all — `serialize_job` strips it — so the column can never be contradicted by a stale snapshot's idea of it, and `write_deleted_at` touches the column alone (re-serializing the blob there would revert a fire's write-back that landed in between).
+
+**The tick loop's write-back is conditional, because the user's stop controls race it.** The loop reads a due job, records an execution, then writes the job back with its advanced slot — and a delete *or a pause* can land inside that window. Leaving `deleted_at` out of `save` covers the delete; it does nothing for `status`, which an unconditional write-back would reset to `enabled` along with a fresh `next_trigger_at`, silently un-pausing a job the user just stopped and re-arming it forever. So the advance goes through `CronStore::save_if_still_enabled`, whose `UPDATE … WHERE id = ? AND status = 'enabled' AND deleted_at IS NULL` lands only while the row is still the enabled, live job the snapshot was read as. If it does not land, the fire already in flight completes — it was legitimately due — but the job is not re-armed, and the pause or delete stands.
 
 ## Constraints
 
@@ -143,7 +190,7 @@ The `CronStore` trait lives in the `baybo-store` ports crate (its sqlite impl in
 | Module | Role |
 |--------|------|
 | `storage` | `SqliteCronStore` implements the `CronStore` trait (from `baybo-store`) against sqlite, over `baybo-model` types; no dependency on `baybo-cron` |
-| `tools`   | `baybo-cron::tools` implements the `Tool` trait (`CronCreate` / `CronDelete` / `CronList`), bridging `Arc<CronScheduler>` to the registry; `crates/baybo/src/runtime.rs` registers them |
+| `tools`   | `baybo-cron::tools` implements the `Tool` trait (`CronCreate` / `CronDelete` / `CronPause` / `CronResume` / `CronList`), bridging `Arc<CronScheduler>` to the registry; `crates/baybo/src/runtime.rs` registers them |
 | `agent`   | Re-exports `CronScheduler` / `CronTriggerEvent`; `Router` consumes the event stream, mints the fire session, routes `AgentMessage::CronTrigger`, waits on one-shot fires, and re-drives undelivered results at boot. The origin actor handles `AgentMessage::CronResultReady` |
 | `job`     | `JobInput::Cron` marks a fire; `JobInput::CronNotification` marks the (inference-free) delivery of a one-shot's result, whose `Completed { reply_ordinal }` edge drives push |
-| `gateway` | Lists conversation-marked cron sessions in the chat list; pushes `Cron` completions for conversations and every `CronNotification`; the admin `/cron` surface lists and inspects jobs |
+| `gateway` | Lists conversation-marked cron sessions in the chat list; pushes `Cron` completions for conversations and every `CronNotification`; the admin `/cron` surface lists (`?deleted=true` serves the recycle bin), inspects (live or deleted), creates, pauses, resumes, deletes and restores jobs |

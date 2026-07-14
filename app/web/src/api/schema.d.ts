@@ -424,6 +424,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/cron/{id}/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["pause_cron"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/cron/{id}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["restore_cron"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/cron/{id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["resume_cron"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/jobs": {
         parameters: {
             query?: never;
@@ -1284,6 +1332,15 @@ export interface components {
             channel: components["schemas"]["ChannelType"];
             /** Format: date-time */
             created_at: string;
+            /**
+             * Format: date-time
+             * @description When the job was moved to the recycle bin. Absent on a live job.
+             *     A present value means the job never fires and is listed only by
+             *     `GET /v1/cron?deleted=true`, until `POST /v1/cron/{id}/restore`
+             *     brings it back. `status` is orthogonal — a deleted one-shot that
+             *     already fired stays `executed`.
+             */
+            deleted_at?: string | null;
             id: string;
             /** Format: date-time */
             last_triggered_at?: string | null;
@@ -3312,14 +3369,21 @@ export interface operations {
     };
     list_cron: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Serve the recycle bin instead of the live list: the soft-deleted
+                 *     jobs, most recently deleted first. Defaults to false, and the
+                 *     default list never carries a deleted job.
+                 */
+                deleted?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description All cron jobs */
+            /** @description Live cron jobs, or the recycle bin when `deleted=true` */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -3330,6 +3394,15 @@ export interface operations {
                             channel: components["schemas"]["ChannelType"];
                             /** Format: date-time */
                             created_at: string;
+                            /**
+                             * Format: date-time
+                             * @description When the job was moved to the recycle bin. Absent on a live job.
+                             *     A present value means the job never fires and is listed only by
+                             *     `GET /v1/cron?deleted=true`, until `POST /v1/cron/{id}/restore`
+                             *     brings it back. `status` is orthogonal — a deleted one-shot that
+                             *     already fired stays `executed`.
+                             */
+                            deleted_at?: string | null;
                             id: string;
                             /** Format: date-time */
                             last_triggered_at?: string | null;
@@ -3427,7 +3500,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Cron job record */
+            /** @description Cron job record, deleted or live */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -3468,7 +3541,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Cron job deleted */
+            /** @description Cron job moved to the recycle bin: it stops firing and leaves the default list, but the row survives — `GET /v1/cron/{id}` still resolves it, `GET /v1/cron?deleted=true` lists it, and `POST /v1/cron/{id}/restore` brings it back */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -3477,6 +3550,168 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Scheduler error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    pause_cron: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cron job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Job paused: status is now `disabled` and it has no next trigger until resumed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Scheduler error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    restore_cron: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cron job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Job restored from the recycle bin with the status it was deleted with; an enabled job's next trigger is recomputed from now, and a one-shot with no fire time left comes back paused */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Scheduler error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    resume_cron: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cron job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Job resumed: status is now `enabled` and the next trigger is computed from now — missed slots are not backfilled */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Schedule has no future fire time (a one-shot whose moment has passed) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

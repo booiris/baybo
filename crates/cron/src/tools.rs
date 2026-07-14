@@ -51,6 +51,8 @@ pub fn agent_tools(scheduler: Arc<CronScheduler>) -> Vec<(Arc<dyn Tool>, ToolMan
     let tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(CronCreateTool::new(Arc::clone(&scheduler))),
         Arc::new(CronDeleteTool::new(Arc::clone(&scheduler))),
+        Arc::new(CronPauseTool::new(Arc::clone(&scheduler))),
+        Arc::new(CronResumeTool::new(Arc::clone(&scheduler))),
         Arc::new(CronListTool::new(scheduler)),
     ];
 
@@ -100,7 +102,7 @@ impl Tool for CronCreateTool {
     }
 
     fn description(&self) -> String {
-        r#"Schedule a job whose `prompt` is run as a task on a timer. `title`, `timezone` and `prompt` are required: on every fire the agent executes `prompt` in a fresh session as an instruction to carry out — NOT as a message from the user — and all times in inputs and outputs are anchored to `timezone`. Supply exactly one of `schedule` (recurring cron expression, e.g. "0 9 * * *") or `at` (one-shot timestamp); `at` jobs fire once then auto-delete. Write `prompt` as a self-contained task instruction (see its description) so the fire does the right thing. A recurring fire opens its own conversation named after `title`; a one-shot fire reports its result back into THIS conversation."#
+        r#"Schedule a job whose `prompt` is run as a task on a timer. `title`, `timezone` and `prompt` are required: on every fire the agent executes `prompt` in a fresh session as an instruction to carry out — NOT as a message from the user — and all times in inputs and outputs are anchored to `timezone`. Supply exactly one of `schedule` (recurring cron expression, e.g. "0 9 * * *") or `at` (one-shot timestamp); an `at` job fires once and then stops, staying in the list as `executed`. Write `prompt` as a self-contained task instruction (see its description) so the fire does the right thing. A recurring fire opens its own conversation named after `title`; a one-shot fire reports its result back into THIS conversation."#
             .to_string()
     }
 
@@ -126,7 +128,7 @@ impl Tool for CronCreateTool {
                 },
                 "at": {
                     "type": "string",
-                    "description": "One-shot timestamp; fires once then auto-deletes. Either RFC3339 with offset (e.g. \"2026-04-17T14:25:00Z\" or \"2026-04-17T22:25:00+08:00\") or a naive `YYYY-MM-DDTHH:MM:SS` interpreted in `timezone`. Supply exactly one of `schedule` or `at`."
+                    "description": "One-shot timestamp; fires once, then the job stops and stays in the list as `executed`. Either RFC3339 with offset (e.g. \"2026-04-17T14:25:00Z\" or \"2026-04-17T22:25:00+08:00\") or a naive `YYYY-MM-DDTHH:MM:SS` interpreted in `timezone`. Supply exactly one of `schedule` or `at`."
                 }
             },
             "required": ["title", "timezone", "prompt"]
@@ -227,9 +229,35 @@ impl CronDeleteTool {
     }
 }
 
+/// The parameters of every tool that acts on one existing job.
 #[derive(Debug, Deserialize)]
-struct DeleteParams {
+struct JobIdParams {
     id: String,
+}
+
+impl JobIdParams {
+    fn parse(params: Value) -> Result<Self, ToolError> {
+        serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))
+    }
+}
+
+/// Schema shared by the single-job tools: one required `id`, described in the
+/// terms of the acting verb.
+fn job_id_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "description": description }
+        },
+        "required": ["id"]
+    })
+}
+
+fn job_id_progress_label(params: &Value) -> Option<String> {
+    params
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(baybo_tools::progress::preview_arg)
 }
 
 #[async_trait]
@@ -239,29 +267,22 @@ impl Tool for CronDeleteTool {
     }
 
     fn description(&self) -> String {
-        "Cancel and remove a scheduled cron job by its ID.".to_string()
+        "Cancel a scheduled cron job by its ID. It stops firing at once and \
+         leaves the list, but is recoverable — the user can restore it from the \
+         recycle bin. To stop a job only temporarily, use CronPause instead."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "description": "Cron job ID to delete" }
-            },
-            "required": ["id"]
-        })
+        job_id_schema("Cron job ID to delete")
     }
 
     fn progress_label(&self, params: &Value) -> Option<String> {
-        params
-            .get("id")
-            .and_then(Value::as_str)
-            .and_then(baybo_tools::progress::preview_arg)
+        job_id_progress_label(params)
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
-        let p: DeleteParams =
-            serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+        let p = JobIdParams::parse(params)?;
 
         self.scheduler
             .delete_job(&p.id)
@@ -269,6 +290,112 @@ impl Tool for CronDeleteTool {
             .map_err(|e| ToolError::Execution(format!("{e}")))?;
 
         Ok(ToolOutput::Json(json!({ "deleted": p.id })))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CronPause
+// ---------------------------------------------------------------------------
+
+struct CronPauseTool {
+    scheduler: Arc<CronScheduler>,
+}
+
+impl CronPauseTool {
+    fn new(scheduler: Arc<CronScheduler>) -> Self {
+        Self { scheduler }
+    }
+}
+
+#[async_trait]
+impl Tool for CronPauseTool {
+    fn name(&self) -> &str {
+        "CronPause"
+    }
+
+    fn description(&self) -> String {
+        "Pause a scheduled cron job by its ID: it keeps its place in the list \
+         but stops firing until CronResume. Use this when the user wants a job \
+         to stop for now; use CronDelete when they want it gone."
+            .to_string()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        job_id_schema("Cron job ID to pause")
+    }
+
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        job_id_progress_label(params)
+    }
+
+    async fn execute(&self, params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
+        let p = JobIdParams::parse(params)?;
+
+        self.scheduler
+            .disable_job(&p.id)
+            .await
+            .map_err(|e| ToolError::Execution(format!("{e}")))?;
+
+        Ok(ToolOutput::Json(json!({ "paused": p.id })))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CronResume
+// ---------------------------------------------------------------------------
+
+struct CronResumeTool {
+    scheduler: Arc<CronScheduler>,
+}
+
+impl CronResumeTool {
+    fn new(scheduler: Arc<CronScheduler>) -> Self {
+        Self { scheduler }
+    }
+}
+
+#[async_trait]
+impl Tool for CronResumeTool {
+    fn name(&self) -> &str {
+        "CronResume"
+    }
+
+    fn description(&self) -> String {
+        "Resume a paused cron job by its ID. Its next fire is computed from now \
+         — the slots it missed while paused are not made up. Fails for a one-shot \
+         job whose time has already passed: there is nothing left to fire, so \
+         schedule a new one with CronCreate."
+            .to_string()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        job_id_schema("Cron job ID to resume")
+    }
+
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        job_id_progress_label(params)
+    }
+
+    async fn execute(&self, params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
+        let p = JobIdParams::parse(params)?;
+
+        self.scheduler
+            .enable_job(&p.id)
+            .await
+            .map_err(|e| ToolError::Execution(format!("{e}")))?;
+
+        let next_trigger_at = self
+            .scheduler
+            .get_job(&p.id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|j| j.format_time_opt(j.next_trigger_at));
+
+        Ok(ToolOutput::Json(json!({
+            "resumed": p.id,
+            "next_trigger_at": next_trigger_at,
+        })))
     }
 }
 
@@ -337,7 +464,10 @@ impl Tool for CronListTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use baybo_model::TriggerSource;
+    use crate::shutdown::NeverShutdown;
+    use crate::test_support::InMemoryCronStore;
+    use baybo_model::{CronStatus, TriggerSource};
+    use tokio::sync::mpsc;
 
     fn ctx_with_trigger(session_id: &str, trigger: TriggerSource) -> ToolContext {
         ToolContext {
@@ -345,6 +475,106 @@ mod tests {
             session_trigger: trigger,
             ..ToolContext::for_test()
         }
+    }
+
+    /// A scheduler over the in-memory store, plus the trigger receiver (held so
+    /// the channel stays open).
+    fn test_scheduler() -> (Arc<CronScheduler>, mpsc::Receiver<crate::CronTriggerEvent>) {
+        let (tx, rx) = mpsc::channel(8);
+        let scheduler = CronScheduler::new(
+            Arc::new(InMemoryCronStore::new()),
+            tx,
+            Arc::new(NeverShutdown),
+        );
+        (Arc::new(scheduler), rx)
+    }
+
+    async fn recurring_job(scheduler: &CronScheduler) -> String {
+        scheduler
+            .create_job(NewCronJob {
+                user_id: "u1".to_string(),
+                channel: baybo_model::ChannelType::tui(),
+                title: "test job".to_string(),
+                schedule: CronSchedule::cron("0 9 * * *"),
+                prompt: "news".to_string(),
+                timezone: "UTC".to_string(),
+                origin_session_id: None,
+            })
+            .await
+            .expect("job creates")
+            .id
+    }
+
+    fn json_output(output: ToolOutput) -> Value {
+        match output {
+            ToolOutput::Json(v) => v,
+            other => panic!("expected json output, got {other:?}"),
+        }
+    }
+
+    /// Pause takes a job out of the firing schedule without removing it; resume
+    /// puts it back with a fresh future slot.
+    #[tokio::test]
+    async fn pause_and_resume_round_trip_through_the_tools() {
+        let (scheduler, _rx) = test_scheduler();
+        let id = recurring_job(&scheduler).await;
+        let ctx = ToolContext::for_test();
+
+        let paused = json_output(
+            CronPauseTool::new(Arc::clone(&scheduler))
+                .execute(json!({ "id": id }), &ctx)
+                .await
+                .expect("pause runs"),
+        );
+        assert_eq!(paused["paused"], id);
+        let job = scheduler.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, CronStatus::Disabled);
+        assert!(job.next_trigger_at.is_none());
+
+        let resumed = json_output(
+            CronResumeTool::new(Arc::clone(&scheduler))
+                .execute(json!({ "id": id }), &ctx)
+                .await
+                .expect("resume runs"),
+        );
+        assert_eq!(resumed["resumed"], id);
+        assert!(
+            resumed["next_trigger_at"].is_string(),
+            "resume reports when the job fires next: {resumed}"
+        );
+        let job = scheduler.get_job(&id).await.unwrap().unwrap();
+        assert_eq!(job.status, CronStatus::Enabled);
+        assert!(job.next_trigger_at.is_some_and(|t| t > Utc::now()));
+    }
+
+    /// A paused job is still listed — that is what separates it from a deleted
+    /// one, which the model must not see (nor try to act on).
+    #[tokio::test]
+    async fn list_keeps_paused_jobs_and_drops_deleted_ones() {
+        let (scheduler, _rx) = test_scheduler();
+        let paused = recurring_job(&scheduler).await;
+        let deleted = recurring_job(&scheduler).await;
+        let ctx = ToolContext::for_test();
+
+        CronPauseTool::new(Arc::clone(&scheduler))
+            .execute(json!({ "id": paused }), &ctx)
+            .await
+            .expect("pause runs");
+        CronDeleteTool::new(Arc::clone(&scheduler))
+            .execute(json!({ "id": deleted }), &ctx)
+            .await
+            .expect("delete runs");
+
+        let listed = json_output(
+            CronListTool::new(Arc::clone(&scheduler))
+                .execute(json!({}), &ctx)
+                .await
+                .expect("list runs"),
+        );
+        let jobs = listed["jobs"].as_array().expect("jobs array").clone();
+        assert_eq!(jobs.len(), 1, "{listed}");
+        assert_eq!(jobs[0]["id"], paused);
+        assert_eq!(jobs[0]["status"], "disabled");
     }
 
     /// A job created from a normal conversation belongs to that conversation.

@@ -1809,9 +1809,20 @@
           "cron"
         ],
         "operationId": "list_cron",
+        "parameters": [
+          {
+            "name": "deleted",
+            "in": "query",
+            "description": "Serve the recycle bin instead of the live list: the soft-deleted\njobs, most recently deleted first. Defaults to false, and the\ndefault list never carries a deleted job.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "All cron jobs",
+            "description": "Live cron jobs, or the recycle bin when `deleted=true`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1845,6 +1856,14 @@
                           "created_at": {
                             "type": "string",
                             "format": "date-time"
+                          },
+                          "deleted_at": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "format": "date-time",
+                            "description": "When the job was moved to the recycle bin. Absent on a live job.\nA present value means the job never fires and is listed only by\n`GET /v1/cron?deleted=true`, until `POST /v1/cron/{id}/restore`\nbrings it back. `status` is orthogonal — a deleted one-shot that\nalready fired stays `executed`."
                           },
                           "id": {
                             "type": "string"
@@ -1996,7 +2015,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Cron job record",
+            "description": "Cron job record, deleted or live",
             "content": {
               "application/json": {
                 "schema": {
@@ -2045,10 +2064,192 @@
         ],
         "responses": {
           "204": {
-            "description": "Cron job deleted"
+            "description": "Cron job moved to the recycle bin: it stops firing and leaves the default list, but the row survives — `GET /v1/cron/{id}` still resolves it, `GET /v1/cron?deleted=true` lists it, and `POST /v1/cron/{id}/restore` brings it back"
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Scheduler error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/cron/{id}/pause": {
+      "post": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "pause_cron",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Job paused: status is now `disabled` and it has no next trigger until resumed"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Scheduler error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/cron/{id}/restore": {
+      "post": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "restore_cron",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Job restored from the recycle bin with the status it was deleted with; an enabled job's next trigger is recomputed from now, and a one-shot with no fire time left comes back paused"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Scheduler error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/cron/{id}/resume": {
+      "post": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "resume_cron",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Job resumed: status is now `enabled` and the next trigger is computed from now — missed slots are not backfilled"
+          },
+          "400": {
+            "description": "Schedule has no future fire time (a one-shot whose moment has passed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -4232,6 +4433,14 @@
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "deleted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the job was moved to the recycle bin. Absent on a live job.\nA present value means the job never fires and is listed only by\n`GET /v1/cron?deleted=true`, until `POST /v1/cron/{id}/restore`\nbrings it back. `status` is orthogonal — a deleted one-shot that\nalready fired stays `executed`."
           },
           "id": {
             "type": "string"
