@@ -27,11 +27,26 @@ struct SessionRow: Codable, Identifiable, Equatable {
     /// Local-only unread counter — the server never surfaces it. Bumped by a
     /// `SessionActivity` ping for a backgrounded session, cleared on open.
     var unread: Int
+    /// The cron job this row is a fire of — the key the list groups on so one
+    /// job's fires collapse into a single row instead of flooding the list (a
+    /// **cron group**; see `docs/cron-groups.md`). `nil` for an ordinary chat.
+    var cronJobId: String?
+    /// That group's label (the job's live title, else the name it had when the
+    /// job was deleted). `nil` when the group cannot be named at all — such a
+    /// row stays flat rather than joining a nameless group.
+    var cronJobTitle: String?
+    /// Whether this row's cron GROUP is pinned. Server-owned like `pinned`, but
+    /// the bit lives on the JOB (`cron_jobs.pinned`) — a group is a view over
+    /// its fires, so the job is the only object that can hold it. Every fire of
+    /// the job carries the same value and the list folds it into the one group
+    /// row. `false` on an ordinary chat, and on a tombstone group (job deleted).
+    var cronGroupPinned: Bool
 
     init(
         id: String, createdAt: Date, lastActive: Date, title: String? = nil,
         preview: String?, userText: String? = nil, pinned: Bool, archived: Bool = false,
-        unread: Int = 0
+        unread: Int = 0, cronJobId: String? = nil, cronJobTitle: String? = nil,
+        cronGroupPinned: Bool = false
     ) {
         self.id = id
         self.createdAt = createdAt
@@ -42,6 +57,9 @@ struct SessionRow: Codable, Identifiable, Equatable {
         self.pinned = pinned
         self.archived = archived
         self.unread = unread
+        self.cronJobId = cronJobId
+        self.cronJobTitle = cronJobTitle
+        self.cronGroupPinned = cronGroupPinned
     }
 
     /// The pre-Telegram schema stored the preview under `lastUserText`; decode
@@ -71,6 +89,14 @@ struct SessionRow: Codable, Identifiable, Equatable {
         pinned = try c.decode(Bool.self, forKey: .pinned)
         archived = try c.decodeIfPresent(Bool.self, forKey: .archived) ?? false
         unread = try c.decodeIfPresent(Int.self, forKey: .unread) ?? 0
+        // Miss these two and the whole cron grouping silently vanishes on a cold
+        // start — the rows load, they just forget which job they belong to. Note
+        // `PersistedFormatTests` only asserts a key is PRESENT in the encoded
+        // JSON, so it cannot catch a forgotten decode; `SessionIndexMergeTests`
+        // round-trips through disk for exactly that reason.
+        cronJobId = try c.decodeIfPresent(String.self, forKey: .cronJobId)
+        cronJobTitle = try c.decodeIfPresent(String.self, forKey: .cronJobTitle)
+        cronGroupPinned = try c.decodeIfPresent(Bool.self, forKey: .cronGroupPinned) ?? false
     }
 }
 
@@ -101,11 +127,6 @@ final class SessionIndex: ObservableObject {
         if scalars.count <= previewMaxChars { return collapsed }
         return String(String.UnicodeScalarView(scalars.prefix(previewMaxChars))) + "…"
     }
-    /// Transcript mirrors kept on disk — only the most recently active
-    /// sessions; older mirrors are pruned (the gateway replays history on
-    /// re-entry, so a pruned mirror only costs a fetch).
-    static let maxMirroredTranscripts = 10
-
     /// The latest user-intended archive/hide state for a session whose request
     /// hasn't resolved yet. `merge(remote:)` consults it so a refresh racing an
     /// in-flight mutation can't rewind the optimistic flip (or re-insert a row
@@ -118,8 +139,13 @@ final class SessionIndex: ObservableObject {
 
     @Published private(set) var rows: [SessionRow] = []
 
+    /// Bumped whenever the gateway tells us our list mirror is behind — see
+    /// [`noteListStale`]. `ChatListScreen` observes it and refetches. Not
+    /// persisted: staleness is a fact about *this* connection, not about disk.
+    @Published private(set) var listStaleEpoch: UInt64 = 0
+
     /// The Application Support root this registry — and the transcript mirrors
-    /// and outboxes it prunes/wipes — lives under. Injected rather than resolved
+    /// and outboxes it wipes — lives under. Injected rather than resolved
     /// from the static path so a test drives an isolated tree: the suites run in
     /// PARALLEL, and a shared `sessions.json` turns one suite's writes into
     /// another's "logic bug".
@@ -132,9 +158,17 @@ final class SessionIndex: ObservableObject {
     /// In-memory only: a kill mid-flight loses the intent and the next merge
     /// restores server truth, which is the honest fallback.
     private var pendingMutations: [String: PendingMutation] = [:]
-    /// Rows removed by `beginHide`, kept for the failure rollback (the mirror
-    /// is prune-deleted and stays gone — the hydration matrix's mirror-less
-    /// listed path refetches history).
+    /// In-flight **cron group** pin intents, keyed by JOB id — a different id
+    /// space from `pendingMutations`' session ids, which is exactly why it is a
+    /// separate map rather than another `PendingMutation` case.
+    private var pendingCronPins: [String: Bool] = [:]
+    /// The group-pin value last acknowledged by the server, staged when a job's
+    /// first pending pin lands, so a chained failure rolls back to truth rather
+    /// than to the negation of a flip that never happened.
+    private var pinnedCronBaselines: [String: Bool] = [:]
+    /// Rows removed by `beginHide`, kept for the failure rollback (the mirror is
+    /// deleted with the row and stays gone — a rolled-back delete refetches its
+    /// history on re-entry).
     private var hiddenBackups: [String: SessionRow] = [:]
     /// The archived value last acknowledged by the server, staged when a
     /// session's FIRST pending mutation lands. A chained failure (archive →
@@ -232,11 +266,20 @@ final class SessionIndex: ObservableObject {
 
     /// A connection-global `SessionActivity` ping (see `SessionActivityHandler`):
     /// bump the row's recency and, unless it's the foreground session, its unread
-    /// count. Unknown ids (drafts / cron / sessions created on another device) are
-    /// ignored — a later REST merge surfaces them. Both `user` and `assistant`
-    /// sources count, matching the web sidebar.
+    /// count. Both `user` and `assistant` sources count, matching the web sidebar.
+    ///
+    /// An id we've never listed is the gateway telling us about a session that
+    /// does not exist on this device yet — a cron fire, or a chat started on
+    /// another client. That is not a no-op: it is the ONLY live signal such a row
+    /// exists, so it nudges a list refetch (`listStaleEpoch`). Returning silently
+    /// here — as this used to — meant a user parked on the chat list watched a
+    /// scheduled job fire and saw *nothing*, until they backgrounded the app or
+    /// pulled to refresh. (The web sidebar has always refetched on an unknown id.)
     func noteActivity(sessionId: String, source: String, atMillis: Int64) {
-        guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
+        guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else {
+            noteListStale()
+            return
+        }
         let at = Date(timeIntervalSince1970: Double(atMillis) / 1000)
         var changed = false
         if at > rows[idx].lastActive {
@@ -248,6 +291,21 @@ final class SessionIndex: ObservableObject {
             changed = true
         }
         if changed { save() }
+    }
+
+    /// The device's list mirror may be behind the gateway's — refetch it.
+    ///
+    /// Two callers, one meaning. A `SessionActivity` for a session we have never
+    /// listed (above), and `Frame::Gap { session_id: nil }` — the gateway's "I
+    /// dropped a session-less broadcast", which is *how* such a ping goes missing
+    /// in the first place. Both say the same thing: what you are rendering is not
+    /// what the server has.
+    ///
+    /// A counter rather than a `Bool` flag: two nudges in a row must produce two
+    /// refreshes, and a flag that is already `true` would swallow the second.
+    /// Observers debounce; this side never decides *when* to refetch.
+    func noteListStale() {
+        listStaleEpoch &+= 1
     }
 
     /// A `ChatScreen` came to the foreground: mark it current and clear its badge.
@@ -269,6 +327,18 @@ final class SessionIndex: ObservableObject {
         else { return }
         rows[idx].unread = 0
         save()
+    }
+
+    /// Optimistic clear behind a cron group's "mark all read" — one save, one
+    /// `@Published` edit, so the badge drops in a single frame rather than N.
+    func clearUnread(_ sessionIds: [String]) {
+        let targets = Set(sessionIds)
+        var changed = false
+        for idx in rows.indices where targets.contains(rows[idx].id) && rows[idx].unread != 0 {
+            rows[idx].unread = 0
+            changed = true
+        }
+        if changed { save() }
     }
 
     /// A live `SessionUpdated` title patch reached the connection-global list
@@ -301,6 +371,50 @@ final class SessionIndex: ObservableObject {
         setArchivedFlag(sessionId, archived: archived)
     }
 
+    /// Optimistic **cron group** pin flip. Keyed by the JOB, not a session: the
+    /// group is a view over its fires and the bit lives on the job, so the flip
+    /// touches every member row (that is what carries it into the bucketing) and
+    /// the staged intent is held per job id.
+    ///
+    /// Deliberately NOT routed through `pendingMutations` / `mutationEpoch`: those
+    /// are keyed by session id and a job id is a different id space (aliasing them
+    /// would let a job id shadow a session's staged archive). A racing merge
+    /// consults `pendingCronPins` instead.
+    func beginCronPin(jobId: String, pinned: Bool) {
+        if pinnedCronBaselines[jobId] == nil {
+            pinnedCronBaselines[jobId] = rows.first { $0.cronJobId == jobId }?.cronGroupPinned
+                ?? false
+        }
+        pendingCronPins[jobId] = pinned
+        setCronGroupPinnedFlag(jobId: jobId, pinned: pinned)
+    }
+
+    /// The staged group pin reached the server: remote truth takes over again.
+    func finishCronPin(jobId: String) {
+        pendingCronPins.removeValue(forKey: jobId)
+        pinnedCronBaselines.removeValue(forKey: jobId)
+    }
+
+    /// The group-pin PUT failed: rewind to the last server-acknowledged value
+    /// (not the negation of the failed intent — a failed pin→unpin chain would
+    /// otherwise re-pin a group the server never pinned).
+    func rollBackCronPin(jobId: String) {
+        pendingCronPins.removeValue(forKey: jobId)
+        guard let baseline = pinnedCronBaselines.removeValue(forKey: jobId) else { return }
+        setCronGroupPinnedFlag(jobId: jobId, pinned: baseline)
+    }
+
+    private func setCronGroupPinnedFlag(jobId: String, pinned: Bool) {
+        var changed = false
+        for idx in rows.indices where rows[idx].cronJobId == jobId {
+            if rows[idx].cronGroupPinned != pinned {
+                rows[idx].cronGroupPinned = pinned
+                changed = true
+            }
+        }
+        if changed { save() }
+    }
+
     /// Optimistic pin flip: the row re-sorts to the top block at once; the
     /// staged intent shields it from a racing merge until the PUT resolves.
     /// No-ops for a gone row or one with a delete in flight.
@@ -316,12 +430,16 @@ final class SessionIndex: ObservableObject {
         setPinnedFlag(sessionId, pinned: pinned)
     }
 
-    /// Optimistic delete (soft-hide): remove the row now — `save()`'s prune
-    /// drops the transcript mirror — and suppress the row's remote existence
-    /// in `merge` until the DELETE resolves.
+    /// Optimistic delete (soft-hide): remove the row now — and its transcript
+    /// mirror with it — and suppress the row's remote existence in `merge` until
+    /// the DELETE resolves. The mirror goes FIRST, ahead of the row guard: the
+    /// user asked for this conversation to be gone, and a row that a racing merge
+    /// already dropped (deleted from another client while the confirm was up)
+    /// must still take its transcript with it rather than strand the file.
     func beginHide(_ sessionId: String) {
         pendingMutations[sessionId] = .hidden
         mutationEpoch += 1
+        TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
         guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
         hiddenBackups[sessionId] = rows[idx]
         rows.remove(at: idx)
@@ -373,6 +491,19 @@ final class SessionIndex: ObservableObject {
         rows.append(row)
         save()
     }
+
+    #if DEBUG
+        /// Stamp a row's cron-group key by hand. The DEBUG demo seed only —
+        /// production rows get this from the gateway, which derives it from the
+        /// fire's trigger and never lets a client author it. Exists so the group
+        /// row is screenshot-verifiable with no gateway and no scheduled job.
+        func setCronGroupForDemo(_ sessionId: String, jobId: String, title: String) {
+            guard let idx = rows.firstIndex(where: { $0.id == sessionId }) else { return }
+            rows[idx].cronJobId = jobId
+            rows[idx].cronJobTitle = title
+            save()
+        }
+    #endif
 
     /// Plain local flip with no staged intent — rollback and the DEBUG demo
     /// seed use it; user-driven flips go through `beginArchive`.
@@ -461,7 +592,30 @@ final class SessionIndex: ObservableObject {
                     title: title,
                     preview: remotePreview ?? mine?.preview,
                     userText: summary.lastUserText ?? mine?.userText,
-                    pinned: pinned, archived: archived, unread: unread))
+                    pinned: pinned, archived: archived, unread: unread,
+                    // Server-owned, like pin/archive: the group a fire belongs to
+                    // is a fact about the session, and the label follows the job's
+                    // LIVE title, so a rename lands here with no local rewrite.
+                    cronJobId: summary.cronJobId, cronJobTitle: summary.cronJobTitle,
+                    // The group's pin lives on the JOB, so an in-flight local flip
+                    // is staged per JOB (not per session) and beats this snapshot
+                    // — the same rule `pendingMutations` enforces for a row's own
+                    // pin, applied to the object that actually holds the bit.
+                    cronGroupPinned: summary.cronJobId
+                        .flatMap { pendingCronPins[$0] } ?? summary.cronGroupPinned))
+        }
+        // A row the server no longer lists was deleted from another client, and
+        // this rebuild is where it leaves the list for good. Its transcript goes
+        // with it: `beginHide` is the only other per-session mirror delete, and it
+        // never runs for a delete performed elsewhere — so without this the
+        // conversation the user deleted on the web would keep its full transcript
+        // on this phone forever. A targeted set difference, NOT a directory sweep:
+        // rows still staged in `pendingMutations` are owned by beginHide /
+        // rollBackHide, and a draft (never a row) is never considered here.
+        let survivors = Set(merged.map(\.id))
+        for row in rows
+        where !survivors.contains(row.id) && pendingMutations[row.id] == nil {
+            TranscriptStore.delete(sessionId: row.id, in: supportDirectory)
         }
         rows = merged
         save()
@@ -472,6 +626,8 @@ final class SessionIndex: ObservableObject {
     func removeAll() {
         rows = []
         pendingMutations = [:]
+        pendingCronPins = [:]
+        pinnedCronBaselines = [:]
         hiddenBackups = [:]
         archiveBaselines = [:]
         pinBaselines = [:]
@@ -483,21 +639,22 @@ final class SessionIndex: ObservableObject {
 
     // MARK: - Persistence
 
+    /// Writes the registry — and NOTHING else. It used to end by pruning the
+    /// transcript mirrors down to the ten most recently active rows, which made
+    /// the mirror useless for exactly the sessions it exists to serve: `save()`
+    /// runs on every list merge (including the one the pop back from a chat
+    /// fires) and on every activity ping, `rows` is the gateway's whole session
+    /// list ranked by the SERVER's `lastActive`, and reading a chat bumps
+    /// nothing — so a conversation outside the ten most recently MESSAGED ones
+    /// had the mirror it just wrote deleted seconds later, and opened blank on
+    /// every re-entry until the network answered. Mirrors are now kept for every
+    /// session this device has rendered; they are dropped only when the user
+    /// deletes the session (`beginHide`) or unbinds the gateway (`removeAll`).
     private func save() {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(rows) else { return }
         try? data.write(to: fileURL, options: .atomic)
-        TranscriptStore.prune(keeping: mirrorWorthyIds(), in: supportDirectory)
-    }
-
-    /// The sessions whose transcript mirrors survive pruning: the most recently
-    /// active, pinned or not (a pinned-but-dormant session re-fetches on entry).
-    private func mirrorWorthyIds() -> Set<String> {
-        Set(
-            rows.sorted { $0.lastActive > $1.lastActive }
-                .prefix(Self.maxMirroredTranscripts)
-                .map(\.id))
     }
 
     private static func load(from url: URL) -> [SessionRow] {
@@ -575,15 +732,33 @@ final class SessionActivityHandler: SessionListSink, @unchecked Sendable {
             }
         }
     }
+
+    func onListStale() {
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                SessionIndex.shared.noteListStale()
+            }
+        }
+    }
 }
 
 /// Per-session transcript mirrors: the JSON state blob the web bundle sends
 /// over the bridge's `persist`, one file per session (the single-session
 /// UserDefaults key couldn't survive a multi-session list, and a plist that
 /// holds every transcript loads whole at launch).
+///
+/// A mirror exists for every session this device has rendered, and **nothing
+/// evicts it in the background** — it is the chat's whole cold-open story (it is
+/// what `deliverInit` paints before a single byte crosses the network), so a
+/// sweeper that drops it trades a permanent blank open for a few KB of text.
+/// The files carry message text, the sync cursor and image dimensions; never
+/// blob bytes (those live in their own cache, which is also never swept). Only a
+/// user-triggered delete (`SessionIndex.beginHide`) or unbinding the gateway
+/// (`removeAll`) removes one. Bounding this wants a stated retention policy, not
+/// a surprise sweep.
 enum TranscriptStore {
     /// The support root defaults to the production one; `SessionIndex` passes
-    /// its own so an isolated registry prunes/wipes its own tree (see its
+    /// its own so an isolated registry deletes/wipes its own tree (see its
     /// `supportDirectory`).
     private static func directory(in supportDirectory: URL) -> URL {
         let dir = supportDirectory.appendingPathComponent("transcripts", isDirectory: true)
@@ -592,8 +767,7 @@ enum TranscriptStore {
     }
 
     /// Session ids are gateway-assigned or UUIDs, but never trust them as raw
-    /// path components. Prune compares filenames, so it sanitizes through the
-    /// same function.
+    /// path components.
     private static func sanitize(_ sessionId: String) -> String {
         sessionId.replacingOccurrences(of: "/", with: "_")
     }
@@ -618,20 +792,10 @@ enum TranscriptStore {
             .write(to: fileURL(for: sessionId, in: supportDirectory), options: .atomic)
     }
 
-    /// Drop mirrors for sessions outside `keeping` (the registry's most
-    /// recently active). A pruned session just re-fetches history on re-entry.
-    static func prune(keeping: Set<String>, in supportDirectory: URL) {
-        let fm = FileManager.default
-        let keptNames = Set(keeping.map(sanitize))
-        guard
-            let files = try? fm.contentsOfDirectory(
-                at: directory(in: supportDirectory), includingPropertiesForKeys: nil)
-        else { return }
-        for file in files where file.pathExtension == "json" {
-            if !keptNames.contains(file.deletingPathExtension().lastPathComponent) {
-                try? fm.removeItem(at: file)
-            }
-        }
+    /// Drop one session's mirror — the user deleted the conversation. The only
+    /// per-session removal there is; see the type's note on why nothing sweeps.
+    static func delete(sessionId: String, in supportDirectory: URL) {
+        try? FileManager.default.removeItem(at: fileURL(for: sessionId, in: supportDirectory))
     }
 
     static func deleteAll(in supportDirectory: URL) {

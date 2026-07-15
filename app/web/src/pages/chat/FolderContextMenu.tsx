@@ -156,6 +156,10 @@ export interface ChatMenuProps {
   x: number;
   y: number;
   pinned: boolean;
+  /** False on a **cron fire** — it groups by its cron job and its `folder_id`
+   *  is ignored (`docs/cron-groups.md`), so the whole "Move to folder ▸"
+   *  submenu is hidden rather than offering a move that would never show. */
+  canMoveToFolder: boolean;
   folders: Folder[];
   onMoveToFolder: (folderId: string | null) => void;
   onTogglePin: () => void;
@@ -167,6 +171,7 @@ export function ChatContextMenu({
   x,
   y,
   pinned,
+  canMoveToFolder,
   folders,
   onMoveToFolder,
   onTogglePin,
@@ -185,44 +190,52 @@ export function ChatContextMenu({
 
   return createPortal(
     <div ref={ref} style={{ left, top }} className={PANEL} role="menu">
-      <div className="relative" onMouseEnter={() => setSubmenu(true)} onMouseLeave={() => setSubmenu(false)}>
-        <MenuRow icon={<RiArrowRightSLine />} label="Move to folder">
-          <RiArrowRightSLine className="text-sm text-ink-soft" />
-        </MenuRow>
-        {submenu ? (
+      {canMoveToFolder ? (
+        <>
           <div
-            style={{ position: 'fixed', left: subLeft, top }}
-            className="min-w-[178px] max-h-[50vh] overflow-auto bg-surface border-2 border-black rounded-md shadow-brutal py-1 z-[56]"
+            className="relative"
+            onMouseEnter={() => setSubmenu(true)}
+            onMouseLeave={() => setSubmenu(false)}
           >
-            <button
-              type="button"
-              onClick={() => {
-                onClose();
-                onMoveToFolder(null);
-              }}
-              className={ROW}
-            >
-              <span className="h-3 w-3 shrink-0 rounded-sm border-2 border-black bg-canvas" />
-              <span className="flex-1 truncate text-ink-soft">Uncategorized</span>
-            </button>
-            {folders.map((f) => (
-              <button
-                key={f.id}
-                type="button"
-                onClick={() => {
-                  onClose();
-                  onMoveToFolder(f.id);
-                }}
-                className={ROW}
+            <MenuRow icon={<RiArrowRightSLine />} label="Move to folder">
+              <RiArrowRightSLine className="text-sm text-ink-soft" />
+            </MenuRow>
+            {submenu ? (
+              <div
+                style={{ position: 'fixed', left: subLeft, top }}
+                className="min-w-[178px] max-h-[50vh] overflow-auto bg-surface border-2 border-black rounded-md shadow-brutal py-1 z-[56]"
               >
-                <RiFolder3Line className="shrink-0 text-sm text-ink-soft" aria-hidden />
-                <span className="flex-1 truncate">{f.name}</span>
-              </button>
-            ))}
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onMoveToFolder(null);
+                  }}
+                  className={ROW}
+                >
+                  <span className="h-3 w-3 shrink-0 rounded-sm border-2 border-black bg-canvas" />
+                  <span className="flex-1 truncate text-ink-soft">Uncategorized</span>
+                </button>
+                {folders.map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onMoveToFolder(f.id);
+                    }}
+                    className={ROW}
+                  >
+                    <RiFolder3Line className="shrink-0 text-sm text-ink-soft" aria-hidden />
+                    <span className="flex-1 truncate">{f.name}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </div>
-        ) : null}
-      </div>
-      <div className="my-1 border-t-2 border-black/10" />
+          <div className="my-1 border-t-2 border-black/10" />
+        </>
+      ) : null}
       <MenuRow
         icon={pinned ? <RiPushpin2Fill /> : <RiPushpin2Line />}
         label={pinned ? 'Unpin' : 'Pin to top'}

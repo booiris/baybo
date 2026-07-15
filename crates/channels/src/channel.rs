@@ -534,6 +534,19 @@ impl<'a> SubscribedView<'a> {
         self.0.broadcast_frame(Frame::FoldersChanged { folders });
     }
 
+    /// Tell every connection on this channel that its session LIST is behind —
+    /// the session-less `Frame::Gap`, which clients already read as "refetch the
+    /// list" (iOS `SessionIndex.noteListStale`, the web sidebar's refetch).
+    ///
+    /// It exists for changes with no session row to patch: pinning a **cron
+    /// group** (`docs/cron-groups.md`) flips a bit on the cron JOB, and the
+    /// group is a view over its fires — no session's `pinned` changed, so
+    /// `SessionUpdated` has nothing to carry. The nudge makes every client
+    /// re-derive the group's block from the next list pull.
+    pub fn broadcast_list_stale(&self) {
+        self.0.broadcast_frame(Frame::Gap { session_id: None });
+    }
+
     /// Broadcast a [`Frame::SessionActivity`] pulse for sidebar
     /// freshness / unread accounting. Fan-out is best-effort and
     /// throttled by the caller (see `SessionPulse`).

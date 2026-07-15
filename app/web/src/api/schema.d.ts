@@ -184,6 +184,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["mark_sessions_read"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}": {
         parameters: {
             query?: never;
@@ -403,6 +419,70 @@ export interface paths {
         put?: never;
         post?: never;
         delete: operations["delete_cron"];
+        options?: never;
+        head?: never;
+        patch: operations["update_cron"];
+        trace?: never;
+    };
+    "/v1/cron/{id}/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["pause_cron"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/cron/{id}/pin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_cron_pin"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/cron/{id}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["restore_cron"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/cron/{id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["resume_cron"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -957,9 +1037,38 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             /**
+             * @description Whether this row's **cron group** is pinned to the top of the chat list.
+             *     Read off the live job (`cron_jobs.pinned`), so every fire of the job
+             *     carries the same value and the client folds it into the one group row —
+             *     exactly as it already does for `cron_job_title`. The group is a view, so
+             *     the bit necessarily dies with the job: a tombstone group (job deleted,
+             *     history kept) is always unpinned. `false` for a non-cron row.
+             */
+            cron_group_pinned?: boolean;
+            /**
+             * @description The cron job whose fire this conversation is, for the clients that
+             *     collapse a job's fires into one chat-list row (a **cron group** — a
+             *     derived view, never a `session_folders` row; see `docs/cron-groups.md`).
+             *     `None` for a user session, and for the one-shot fire workspaces the list
+             *     never returns anyway.
+             */
+            cron_job_id?: string | null;
+            /**
+             * @description The label for that group: the job's **live** title while the job exists
+             *     (so a rename propagates with no rewrite of any session), falling back to
+             *     the title snapshotted onto the fire at mint once the job is deleted.
+             *     `None` only when both are unavailable — a pre-snapshot fire whose job is
+             *     gone; clients leave those rows flat.
+             */
+            cron_job_title?: string | null;
+            /**
              * @description The user-created folder this session is filed under, or absent for
              *     uncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web
              *     sidebar groups rows by this id.
+             *
+             *     **Ignored for a cron conversation** — those group by [`Self::cron_job_id`]
+             *     instead (see `docs/cron-groups.md`), so a fire can never be in a cron
+             *     group and a user folder at once.
              */
             folder_id?: string | null;
             /**
@@ -1262,12 +1371,28 @@ export interface components {
             channel: components["schemas"]["ChannelType"];
             /** Format: date-time */
             created_at: string;
+            /**
+             * Format: date-time
+             * @description When the job was moved to the recycle bin. Absent on a live job.
+             *     A present value means the job never fires and is listed only by
+             *     `GET /v1/cron?deleted=true`, until `POST /v1/cron/{id}/restore`
+             *     brings it back. `status` is orthogonal — a deleted one-shot that
+             *     already fired stays `executed`.
+             */
+            deleted_at?: string | null;
             id: string;
             /** Format: date-time */
             last_triggered_at?: string | null;
             /** Format: date-time */
             next_trigger_at?: string | null;
             origin_session_id?: string | null;
+            /**
+             * @description Whether this job's **cron group** — the chat-list row collapsing its
+             *     fires — is pinned to the top of the list (`docs/cron-groups.md`).
+             *     `#[serde(default)]` so it is not required on the wire (defaults false),
+             *     matching `cron_group_pinned` on the chat-list summary.
+             */
+            pinned?: boolean;
             prompt: string;
             schedule: components["schemas"]["CronSchedule"];
             status: components["schemas"]["CronStatus"];
@@ -1560,6 +1685,16 @@ export interface components {
              */
             total: number;
         };
+        /** @description Request body for `POST /v1/chat/sessions/read`. */
+        MarkManyReadRequest: {
+            /**
+             * @description The sessions to mark fully read. Each cursor is advanced to that
+             *     session's newest ordinal, so — unlike the per-session route — the caller
+             *     needs no ordinal of its own. Sessions it cannot see are rejected; ids
+             *     that do not exist are skipped.
+             */
+            session_ids: string[];
+        };
         /** @description Request body for `PUT /v1/chat/sessions/{session_id}/read`. */
         MarkReadRequest: {
             /**
@@ -1659,6 +1794,14 @@ export interface components {
             path: string;
             /** @description JSON value written at `path`. Shape validated by `BayboConfig`. */
             value: Record<string, never>;
+        };
+        /** @description Request body for `PUT /v1/cron/{id}/pin`. */
+        SetCronPinRequest: {
+            /**
+             * @description `true` to pin this job's cron group to the top of the chat list,
+             *     `false` to release it back to recency order.
+             */
+            pinned: boolean;
         };
         /** @description `PUT /v1/llm/default` body. */
         SetDefaultLlmRequest: {
@@ -1771,6 +1914,29 @@ export interface components {
             llm?: string | null;
             name: string;
             system_prompt?: string | null;
+        };
+        /**
+         * @description `PATCH /v1/cron/{id}` body: a partial edit of the job's authored fields.
+         *     Every field is optional and named exactly as it is on [`CronJob`], so a
+         *     client patches by sending back the subset it changed on the job it fetched.
+         *     An absent field keeps the value the job already has, and a body that sets
+         *     nothing at all is rejected — there is nothing to write, and answering with
+         *     the unchanged job would tell the user their edit landed.
+         *
+         *     The scheduler's own fields (`status`, `next_trigger_at`,
+         *     `last_triggered_at`) are not patchable: they are derived from the schedule,
+         *     or moved by `POST /v1/cron/{id}/{pause,resume}`.
+         */
+        UpdateCronRequest: {
+            prompt?: string | null;
+            schedule?: null | components["schemas"]["CronSchedule"];
+            /**
+             * @description IANA timezone the cron expression is evaluated in. Changing it alone
+             *     reschedules the job: the same expression names a different instant in a
+             *     different zone.
+             */
+            timezone?: string | null;
+            title?: string | null;
         };
         /** @description Request body for `POST /v1/mobile/apns-token`. */
         UpdateDeviceApnsTokenRequest: {
@@ -2557,6 +2723,55 @@ export interface operations {
             };
         };
     };
+    mark_sessions_read: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MarkManyReadRequest"];
+            };
+        };
+        responses: {
+            /** @description Every named session's read cursor advanced to its newest ordinal */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Batch too large */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A named session is not visible to this client */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_session: {
         parameters: {
             query?: {
@@ -3231,14 +3446,21 @@ export interface operations {
     };
     list_cron: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Serve the recycle bin instead of the live list: the soft-deleted
+                 *     jobs, most recently deleted first. Defaults to false, and the
+                 *     default list never carries a deleted job.
+                 */
+                deleted?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description All cron jobs */
+            /** @description Live cron jobs, or the recycle bin when `deleted=true` */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -3249,12 +3471,28 @@ export interface operations {
                             channel: components["schemas"]["ChannelType"];
                             /** Format: date-time */
                             created_at: string;
+                            /**
+                             * Format: date-time
+                             * @description When the job was moved to the recycle bin. Absent on a live job.
+                             *     A present value means the job never fires and is listed only by
+                             *     `GET /v1/cron?deleted=true`, until `POST /v1/cron/{id}/restore`
+                             *     brings it back. `status` is orthogonal — a deleted one-shot that
+                             *     already fired stays `executed`.
+                             */
+                            deleted_at?: string | null;
                             id: string;
                             /** Format: date-time */
                             last_triggered_at?: string | null;
                             /** Format: date-time */
                             next_trigger_at?: string | null;
                             origin_session_id?: string | null;
+                            /**
+                             * @description Whether this job's **cron group** — the chat-list row collapsing its
+                             *     fires — is pinned to the top of the list (`docs/cron-groups.md`).
+                             *     `#[serde(default)]` so it is not required on the wire (defaults false),
+                             *     matching `cron_group_pinned` on the chat-list summary.
+                             */
+                            pinned?: boolean;
                             prompt: string;
                             schedule: components["schemas"]["CronSchedule"];
                             status: components["schemas"]["CronStatus"];
@@ -3314,7 +3552,7 @@ export interface operations {
                     "application/json": components["schemas"]["CronJob"];
                 };
             };
-            /** @description Invalid schedule */
+            /** @description Invalid schedule, or a blank prompt */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3346,7 +3584,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Cron job record */
+            /** @description Cron job record, deleted or live */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -3387,7 +3625,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Cron job deleted */
+            /** @description Cron job moved to the recycle bin: it stops firing and leaves the default list, but the row survives — `GET /v1/cron/{id}` still resolves it, `GET /v1/cron?deleted=true` lists it, and `POST /v1/cron/{id}/restore` brings it back */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -3396,6 +3634,301 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Scheduler error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_cron: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cron job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateCronRequest"];
+            };
+        };
+        responses: {
+            /** @description The edited job, with the `next_trigger_at` the edit produced — a client need not refetch. Fields the body left out are unchanged. Editing the schedule or the timezone recomputes the next fire time from now: the slots the job missed are never back-filled. A paused job stays paused — it keeps `disabled` and no next trigger until `POST /v1/cron/{id}/resume` — while a one-shot that already fired is re-armed by an `at` still in the future */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CronJob"];
+                };
+            };
+            /** @description The body sets no field, blanks the prompt, or carries a schedule with no future fire time (an `at` whose moment has passed) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such job, or the job is in the recycle bin — `POST /v1/cron/{id}/restore` it before editing it */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The edit kept losing to a concurrent write (the job fired while it was being applied). Nothing changed; retry */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Scheduler error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    pause_cron: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cron job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Job paused: status is now `disabled` and it has no next trigger until resumed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The pause kept losing to a concurrent write (the job fired, or was edited, while it was being applied). Nothing changed; retry */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Scheduler error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_cron_pin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cron job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetCronPinRequest"];
+            };
+        };
+        responses: {
+            /** @description Pin state updated */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    restore_cron: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cron job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Job restored from the recycle bin with the status it was deleted with; an enabled job's next trigger is recomputed from now, and a one-shot with no fire time left comes back paused */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Scheduler error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    resume_cron: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cron job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Job resumed: status is now `enabled` and the next trigger is computed from now — missed slots are not backfilled */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Schedule has no future fire time (a one-shot whose moment has passed) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The resume kept losing to a concurrent write (the job was edited while it was being applied). Nothing changed; retry */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4246,7 +4779,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted — `prefix_len` is a tripwire the client checks against the reconstructed count, `suffix` carries framing/sub-loop messages not in the log, e.g. compression & progress-observer spans) or `ChatMessage[]` (Inline); the client slices the message log it received from the overview call and appends any `suffix`. */
+            /** @description Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted) or `ChatMessage[]` (Inline). A larger `ToolCall.result.output` may be `{ $baybo_ref: 'session_tool_result', tool_use_id, attachments?, llm_images? }`; the client resolves both reference kinds against the session message log returned by the overview call, a persisted tool output to its transcript row's `ToolResult` content by `tool_use_id`. */
             200: {
                 headers: {
                     [name: string]: unknown;

@@ -463,7 +463,7 @@ Layout, top to bottom:
 
 Each label surfaces only as the native `title` hover tooltip; the rail shows icons exclusively. Links use react-router `NavLink`, so the active route's tile gets the pressed/active styling (`railActive`: `bg-surface`, hard shadow, push-down on `:active`) vs. the idle hover treatment (`railIdle`).
 
-Note: the `/cron` route reached from this rail is the cron-*job* admin page (`CronPage`), which lists and inspects the scheduled jobs themselves.
+Note: the `/cron` route reached from this rail is the cron-*job* admin page (`CronPage`), which lists, inspects and edits the scheduled jobs themselves, and serves the recycle bin.
 
 ### Cron fires are conversations, not a side panel
 

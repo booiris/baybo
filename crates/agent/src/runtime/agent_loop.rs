@@ -3389,6 +3389,7 @@ mod session_end_gate_tests {
                 cron_job_id: "c-1".into(),
                 origin_session_id: None,
                 conversation: true,
+                job_title: None,
             },
             None,
         );

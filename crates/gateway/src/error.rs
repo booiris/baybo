@@ -40,6 +40,12 @@ pub enum GatewayError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    /// The request lost a race to a concurrent write and changed nothing. The
+    /// stored record is intact and the same request may simply be retried —
+    /// which is what separates this from a 500.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     #[error("internal: {0}")]
     Internal(String),
 
@@ -53,6 +59,7 @@ impl IntoResponse for GatewayError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::TokenMissing => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

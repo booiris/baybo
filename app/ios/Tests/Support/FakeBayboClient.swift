@@ -43,6 +43,7 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     private var lookups: [LookupCall] = []
     private var approvals: [ApprovalCall] = []
     private var marksRead: [Int64] = []
+    private var batchMarksRead: [[String]] = []
 
     private var apiLegInvalidations = 0
 
@@ -70,6 +71,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     var lookupCalls: [LookupCall] { lock.withLock { lookups } }
     var approvalCalls: [ApprovalCall] { lock.withLock { approvals } }
     var readOrdinals: [Int64] { lock.withLock { marksRead } }
+    /// One entry per `chatMarkManyRead` call — the cron group's "mark all read"
+    /// must be ONE round-trip, not one per fire.
+    var batchReadCalls: [[String]] { lock.withLock { batchMarksRead } }
     /// How many times the app dropped its warm relay API legs — the `.background`
     /// barrier. iOS suspends without warning and takes the sockets with it, so a
     /// leg that outlives a suspend is a zombie.
@@ -88,6 +92,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func failConnect(with error: Error) { lock.withLock { connectError = error } }
     func failSend(with error: Error) { lock.withLock { sendError = error } }
     func failCreateSession(with error: Error) { lock.withLock { createSessionError = error } }
+    /// Clear a prior `failCreateSession` — simulates the network coming back so a
+    /// stranded draft's next recovery attempt succeeds.
+    func succeedCreateSession() { lock.withLock { createSessionError = nil } }
     func failApproval(with error: Error) { lock.withLock { approvalError = error } }
 
     func answerSync(with frameJson: String) {
@@ -190,6 +197,10 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
         lock.withLock { marksRead.append(ordinal) }
     }
 
+    func chatMarkManyRead(sessionIds: [String]) async throws {
+        lock.withLock { batchMarksRead.append(sessionIds) }
+    }
+
     func chatUnsubscribe(sessionId: String) async {
         lock.withLock { _ = sinks.removeValue(forKey: sessionId) }
     }
@@ -208,6 +219,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func chatListSessions() async throws -> [ChatSessionSummary] { throw Self.unsupported }
     func chatSetArchived(sessionId: String, archived: Bool) async throws { throw Self.unsupported }
     func chatSetPinned(sessionId: String, pinned: Bool) async throws { throw Self.unsupported }
+
+    func chatSetCronPinned(jobId: String, pinned: Bool) async throws { throw Self.unsupported }
 
     func blobDownloadBytes(blobId: String, progress: BlobProgress?) async throws -> Data {
         throw Self.unsupported

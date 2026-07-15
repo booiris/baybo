@@ -73,10 +73,12 @@
             // pointing it at a real conversation (`-baybo-open-session`) would
             // corrupt one.
             guard sessionId == AppStore.debugSessionId else { return }
-            // Register the session the way a real send would: an unregistered
-            // session is not "mirror-worthy", so `TranscriptStore.prune` deletes
-            // its mirror on the next list sync — and the second run, the one that
-            // has to restore the recorded image sizes, would open with none.
+            // Register the session the way a real send would: the mirror holding
+            // the recorded image sizes dies with its chat-list row, and an
+            // unregistered session has none. (On a BOUND sim the next list merge
+            // drops this local-only row anyway — remote wins for existence — and
+            // takes the mirror with it, which is why the relaunch half of this
+            // check wants an unbound sim; see the app's CLAUDE.md.)
             SessionIndex.shared.recordUserSend(sessionId: sessionId, text: "把那几张图发我")
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(400))

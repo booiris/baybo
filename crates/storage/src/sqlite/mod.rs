@@ -543,6 +543,18 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- (replaces the empty-string sentinel from the prior
                     -- TEXT/RFC3339 schema).
                     next_trigger_at INTEGER NOT NULL DEFAULT 0,
+                    -- Recycle bin (Unix µs; NULL = live). Orthogonal to
+                    -- `status`. Every listing filters on `deleted_at IS NULL`
+                    -- in SQL, which is what keeps a deleted job out of the
+                    -- tick loop; the full value also rides in `data`.
+                    deleted_at      INTEGER,
+                    -- Whether the job's cron GROUP is pinned in the chat list
+                    -- (docs/cron-groups.md). A flat column, never the `data`
+                    -- blob (like `deleted_at`): every blob write reconstructs the
+                    -- row from a snapshot the caller holds and `record_fire`
+                    -- re-serializes it on every fire, so a pin in the blob would
+                    -- be reverted by the next tick. Written only by `set_pinned`.
+                    pinned          INTEGER NOT NULL DEFAULT 0,
                     data            TEXT    NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_cron_jobs_user_id ON cron_jobs(user_id);
@@ -711,6 +723,8 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
         "ALTER TABLE session_messages ADD COLUMN source_event_id TEXT",
         "ALTER TABLE sessions ADD COLUMN agent_id TEXT",
         "ALTER TABLE sessions ADD COLUMN agent_framework TEXT",
+        "ALTER TABLE cron_jobs ADD COLUMN deleted_at INTEGER",
+        "ALTER TABLE cron_jobs ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
     ];
     for stmt in migrations {
         if let Err(e) = conn.execute(stmt, []) {
@@ -732,6 +746,11 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
          -- Serves the boot re-drive's 'completed but not yet delivered' scan.
          CREATE INDEX IF NOT EXISTS idx_cron_executions_awaiting_delivery
              ON cron_executions(completed_at) WHERE notified_at IS NULL;
+         -- Serves the tick loop's due scan, which only ever considers live rows.
+         CREATE INDEX IF NOT EXISTS idx_cron_jobs_live_due
+             ON cron_jobs(status, next_trigger_at) WHERE deleted_at IS NULL;
+         CREATE INDEX IF NOT EXISTS idx_cron_jobs_deleted
+             ON cron_jobs(deleted_at) WHERE deleted_at IS NOT NULL;
          CREATE UNIQUE INDEX IF NOT EXISTS idx_session_messages_source_event
              ON session_messages(session_id, source_event_id)
              WHERE source_event_id IS NOT NULL;",

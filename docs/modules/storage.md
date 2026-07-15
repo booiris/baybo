@@ -222,9 +222,15 @@ Session rows and transcripts are user-facing core data: runtime/background
 cleanup must not call the delete path. It exists for explicit destructive flows
 initiated by the user.
 
-### Hard delete
+### Hard delete everywhere but `cron_jobs`
 
-All sqlite-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tombstone column, no soft-delete protocol, and no revival semantics — once a row is gone it is gone. The one cadence-driven retention sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow rows), which issues the same `DELETE FROM` against rows past their retention horizon. Blobs are **not** swept on a TTL; there is no `BlobStore::purge_older_than` API, so a blob row lives until an explicit `BlobStore::delete` removes it (which unlinks the content-addressed payload once no live row still references it).
+Deletion is a plain `DELETE FROM` in every table but one: no tombstone column, no revival semantics, once a row is gone it is gone. The one cadence-driven retention sweep in `baybo-janitor` is `channel_pairings` (expired/abandoned auth-flow rows), which issues the same `DELETE FROM` against rows past their retention horizon. Blobs are **not** swept on a TTL; there is no `BlobStore::purge_older_than` API, so a blob row lives until an explicit `BlobStore::delete` removes it (which unlinks the content-addressed payload once no live row still references it).
+
+**`cron_jobs` is the exception: it soft-deletes.** The table carries a `deleted_at INTEGER` tombstone (Unix µs; NULL = live), `CronStore::delete` stamps it, `CronStore::restore` clears it, and no code path anywhere issues a `DELETE FROM cron_jobs`.
+
+The reason is that a cron job's output outlives the job. Each fire leaves a `cron_executions` row, a session with a full transcript, and — for a one-shot — a notification appended into the conversation that scheduled it. Those are permanent (session rows and transcripts are core data that is never deleted), and the job row is the only thing that ties them to where they came from. Drop it and every one of them is stranded: an execution row points at a `job_id` that resolves to nothing, and a conversation that opened by itself can no longer say which scheduled task opened it. So the row stays, and `CronStore::get` keeps resolving it by id after deletion; only the *listings* stop returning it. `deleted_at` is orthogonal to the job's `status` — a deleted one-shot that already fired stays `executed` — so a restore can put the job back in exactly the state it was taken away in.
+
+What makes the tombstone safe is that the filter lives in SQL, not in Rust: `list_due`, `list_enabled`, `list_by_user` and `list_all` all carry `WHERE … deleted_at IS NULL`, so a deleted job cannot reach the scheduler's tick loop or a user's list. `list_deleted` is the sole query that inverts it, for the recycle-bin view. Two partial indexes back this: `idx_cron_jobs_live_due` on `(status, next_trigger_at) WHERE deleted_at IS NULL` for the tick query, and `idx_cron_jobs_deleted` on `(deleted_at) WHERE deleted_at IS NOT NULL` for the bin. The full delete/restore contract — including why a restored job's `next_trigger_at` is recomputed from now — is in [`cron.md`](cron.md).
 
 ## Constraints
 

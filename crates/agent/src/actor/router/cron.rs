@@ -96,6 +96,7 @@ impl Router {
                     cron_job_id: event.job_id.clone(),
                     origin_session_id: event.origin_session_id.clone(),
                     conversation,
+                    job_title: Some(event.title.clone()),
                 },
             )
             .await?;
@@ -968,6 +969,8 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             origin_session_id: None,
+            deleted_at: None,
+            pinned: false,
         }
     }
 
@@ -1024,6 +1027,7 @@ mod tests {
                     cron_job_id: "cj-news".into(),
                     origin_session_id: Some(convo.id.clone()),
                     conversation: true,
+                    job_title: Some("Daily news".into()),
                 },
             )
             .await
@@ -1047,6 +1051,7 @@ mod tests {
                     cron_job_id: "cj-1".into(),
                     origin_session_id: Some(convo.id.clone()),
                     conversation: false,
+                    job_title: None,
                 },
             )
             .await

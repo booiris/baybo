@@ -1041,6 +1041,7 @@ async fn a_recurring_fire_scheduled_from_the_phone_is_listed_on_the_phone() {
                     cron_job_id: "cj-news".into(),
                     origin_session_id: None,
                     conversation,
+                    job_title: Some("Morning brief".into()),
                 },
             )
             .await
@@ -1085,6 +1086,221 @@ async fn a_recurring_fire_scheduled_from_the_phone_is_listed_on_the_phone() {
         !listed.contains(&one_shot_id.as_str()),
         "a one-shot's private workspace must not, got {listed:?}",
     );
+}
+
+/// A cron group's label is the job's **live** title while the job exists, and
+/// the title snapshotted onto the fire once it doesn't — the two halves of the
+/// rule in `docs/cron-groups.md`. Proving the live half is what proves a job
+/// rename will propagate with no rewrite of any session; proving the tombstone
+/// half is what proves deleting a noisy job doesn't spill its history back into
+/// the flat list unnamed.
+#[tokio::test]
+async fn a_cron_group_is_labelled_by_the_live_job_title_and_falls_back_to_the_snapshot() {
+    use baybo_cron::NewCronJob;
+    use baybo_model::{CronSchedule, TriggerSource};
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let operator = User {
+        id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
+        name: None,
+        channel: ChannelType::http(),
+    };
+    let job = tg
+        .deps
+        .cron_scheduler
+        .create_job(NewCronJob {
+            user_id: operator.id.clone(),
+            channel: ChannelType::http(),
+            title: "Morning brief".into(),
+            schedule: CronSchedule::Cron {
+                expr: "0 8 * * *".into(),
+            },
+            prompt: "brief me".into(),
+            timezone: "UTC".into(),
+            origin_session_id: None,
+        })
+        .await
+        .expect("create cron job");
+
+    // The fire snapshots the title it was minted under — deliberately a
+    // DIFFERENT string from the job's live one, so the assertions below can
+    // tell which source the label actually came from.
+    let fire = tg
+        .deps
+        .session_manager
+        .create_session_with_trigger(
+            operator.clone(),
+            ChannelType::http(),
+            TriggerSource::Cron {
+                cron_job_id: job.id.clone(),
+                origin_session_id: None,
+                conversation: true,
+                job_title: Some("the name it was fired under".into()),
+            },
+        )
+        .await
+        .expect("create recurring fire");
+
+    let router = build_router(build_admin_state(&tg));
+    let row_for = |list: &Value, id: &str| -> Value {
+        list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|row| row["session_id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("session {id} missing from the chat list"))
+    };
+
+    let row = row_for(
+        &get(&router, "/v1/chat/sessions", StatusCode::OK).await,
+        fire.id.as_str(),
+    );
+    assert_eq!(
+        row["cron_job_id"], job.id,
+        "a listed fire must carry the job it groups under",
+    );
+    assert_eq!(
+        row["cron_job_title"], "Morning brief",
+        "the LIVE job title wins over the fire's snapshot — this is what makes a \
+         rename propagate with no session rewrite",
+    );
+
+    // Delete the job. The history must stay grouped, under the name it had.
+    tg.deps
+        .cron_scheduler
+        .delete_job(&job.id)
+        .await
+        .expect("delete cron job");
+
+    let row = row_for(
+        &get(&router, "/v1/chat/sessions", StatusCode::OK).await,
+        fire.id.as_str(),
+    );
+    assert_eq!(
+        row["cron_job_id"], job.id,
+        "a deleted job must not un-group its history",
+    );
+    assert_eq!(
+        row["cron_job_title"], "the name it was fired under",
+        "with no live job left, the label falls back to the fire's snapshot",
+    );
+}
+
+/// A fire minted before the snapshot existed, whose job has since been deleted,
+/// can be named from neither source. It must come back **ungrouped** rather than
+/// with a `cron_job_id` no client can label — clients leave such a row flat.
+#[tokio::test]
+async fn a_pre_snapshot_fire_whose_job_is_gone_has_no_group_label() {
+    use baybo_model::TriggerSource;
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let operator = User {
+        id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
+        name: None,
+        channel: ChannelType::http(),
+    };
+    let orphan = tg
+        .deps
+        .session_manager
+        .create_session_with_trigger(
+            operator,
+            ChannelType::http(),
+            TriggerSource::Cron {
+                cron_job_id: "cj-long-gone".into(),
+                origin_session_id: None,
+                conversation: true,
+                job_title: None,
+            },
+        )
+        .await
+        .expect("create legacy fire");
+
+    let router = build_router(build_admin_state(&tg));
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let row = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["session_id"] == orphan.id.as_str())
+        .expect("the fire is still listed");
+
+    assert!(
+        row.get("cron_job_title").is_none(),
+        "an unnameable group must not be labelled, got {row:?}",
+    );
+}
+
+/// The bulk mark-read behind a cron group's swipe action. A chat-list client
+/// holds no ordinals, so "fully read" has to be resolved server-side from each
+/// session's own tail — that is the whole reason this route exists instead of
+/// the client looping over `PUT /read`.
+#[tokio::test]
+async fn marking_a_batch_read_clears_every_named_session() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let router = build_router(build_admin_state(&tg));
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let created = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+        let id = created["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_owned();
+        let sid = SessionId::from(id.as_str());
+        tg.deps
+            .session_manager
+            .append_session_message(
+                &sid,
+                &ChatMessage::assistant(vec![ContentBlock::Text("hi".into())]),
+            )
+            .await
+            .expect("persist an unread reply");
+        ids.push(id);
+    }
+
+    let unread_for = |list: &Value, id: &str| -> i64 {
+        list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|row| row["session_id"] == id)
+            .and_then(|row| row["unread_count"].as_i64())
+            .unwrap_or_else(|| panic!("session {id} missing from the chat list"))
+    };
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    for id in &ids {
+        assert_eq!(
+            unread_for(&list, id),
+            1,
+            "each session starts with one unread"
+        );
+    }
+
+    post(
+        &router,
+        "/v1/chat/sessions/read",
+        Body::from(json!({ "session_ids": ids }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    for id in &ids {
+        assert_eq!(
+            unread_for(&list, id),
+            0,
+            "one batch call must clear every named session, not just the first",
+        );
+    }
 }
 
 #[tokio::test]
@@ -1599,6 +1815,7 @@ async fn recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not()
                     cron_job_id: "cj-test".into(),
                     origin_session_id: None,
                     conversation,
+                    job_title: Some("Morning brief".into()),
                 },
             )
             .await
@@ -1762,4 +1979,216 @@ async fn channel_multi_attach_fans_out_to_all_subscribers() {
         2,
         "no extra deliveries for unrelated session"
     );
+}
+
+/// Pinning a **cron group** (`docs/cron-groups.md`) flips a bit on the JOB — the
+/// group is a view over the job's fires, and the job is the only object whose
+/// identity matches it. Every fire row then carries `cron_group_pinned`, which
+/// the clients fold into the one group row exactly as they already do the title.
+///
+/// Deleting the job is a recycle bin (soft delete): the `pinned` column lives
+/// on, but a deleted job drops out of the live job list, so its group renders
+/// with the tombstone name and reads UNPINNED while in the bin (a restore would
+/// bring the pin back). That is accepted semantics, and this pins it so nobody
+/// "fixes" it into a stored row later.
+#[tokio::test]
+async fn a_cron_group_pin_rides_the_job_and_reads_unpinned_once_deleted() {
+    use baybo_cron::NewCronJob;
+    use baybo_model::{CronSchedule, TriggerSource};
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let operator = User {
+        id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
+        name: None,
+        channel: ChannelType::http(),
+    };
+    // Deliberately UNTITLED: the list handler used to drop title-less jobs from
+    // its map wholesale, which was harmless when the map only carried the title —
+    // and would silently unpin this group now that it carries the pin too.
+    let job = tg
+        .deps
+        .cron_scheduler
+        .create_job(NewCronJob {
+            user_id: operator.id.clone(),
+            channel: ChannelType::http(),
+            title: String::new(),
+            schedule: CronSchedule::Cron {
+                expr: "0 8 * * 1".into(),
+            },
+            prompt: "weekly digest".into(),
+            timezone: "UTC".into(),
+            origin_session_id: None,
+        })
+        .await
+        .expect("create cron job");
+
+    let fire = tg
+        .deps
+        .session_manager
+        .create_session_with_trigger(
+            operator.clone(),
+            ChannelType::http(),
+            TriggerSource::Cron {
+                cron_job_id: job.id.clone(),
+                origin_session_id: None,
+                conversation: true,
+                job_title: Some("Weekly digest".into()),
+            },
+        )
+        .await
+        .expect("create recurring fire");
+
+    let router = build_router(build_admin_state(&tg));
+    let row_for = |list: &Value, id: &str| -> Value {
+        list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|row| row["session_id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("session {id} missing from the chat list"))
+    };
+
+    let row = row_for(
+        &get(&router, "/v1/chat/sessions", StatusCode::OK).await,
+        fire.id.as_str(),
+    );
+    assert_eq!(
+        row["cron_group_pinned"], false,
+        "a new group starts unpinned"
+    );
+
+    put(
+        &router,
+        &format!("/v1/cron/{}/pin", job.id),
+        Body::from(json!({ "pinned": true }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    let row = row_for(
+        &get(&router, "/v1/chat/sessions", StatusCode::OK).await,
+        fire.id.as_str(),
+    );
+    assert_eq!(
+        row["cron_group_pinned"], true,
+        "the fire must carry its job's pin — an UNTITLED job's pin especially, \
+         which the title map used to filter away",
+    );
+    assert_eq!(
+        row["pinned"], false,
+        "the SESSION is untouched: pinning the group is not pinning its fires",
+    );
+
+    // Soft-delete the job: the history stays grouped (tombstone), but the job
+    // drops out of the live list, so its group reads unpinned while binned.
+    tg.deps
+        .cron_scheduler
+        .delete_job(&job.id)
+        .await
+        .expect("delete cron job");
+
+    let row = row_for(
+        &get(&router, "/v1/chat/sessions", StatusCode::OK).await,
+        fire.id.as_str(),
+    );
+    assert_eq!(
+        row["cron_job_id"], job.id,
+        "a deleted job must not un-group its history",
+    );
+    assert_eq!(
+        row["cron_group_pinned"], false,
+        "a binned job's group reads unpinned — it is filtered from the live list",
+    );
+}
+
+/// The pin route is channel-scoped — `list_cron` (unfiltered, operator-only) was
+/// no precedent to copy. The `http` (web) and `device` (iOS) universes own
+/// disjoint session sets, and a job from the other universe must be
+/// indistinguishable from one that does not exist.
+#[tokio::test]
+async fn a_cron_pin_cannot_reach_across_the_channel_universes() {
+    use baybo_cron::NewCronJob;
+    use baybo_model::CronSchedule;
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let device_key = device_proto::delegation::generate_signing_key();
+    let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
+
+    // A job living in the WEB universe.
+    let job = tg
+        .deps
+        .cron_scheduler
+        .create_job(NewCronJob {
+            user_id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
+            channel: ChannelType::http(),
+            title: "Morning brief".into(),
+            schedule: CronSchedule::Cron {
+                expr: "0 8 * * *".into(),
+            },
+            prompt: "brief me".into(),
+            timezone: "UTC".into(),
+            origin_session_id: None,
+        })
+        .await
+        .expect("create cron job");
+
+    let router = build_admin_router_for_tests(&tg.deps);
+
+    // The phone must not be able to touch it — and must not learn it exists.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/v1/cron/{}/pin", job.id))
+                .header("authorization", format!("Bearer {}", tg.deps.admin_token))
+                .header(DEVICE_ID_HEADER, &device_id)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "pinned": true }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "a device must not be able to pin a job from the web universe",
+    );
+
+    // And the pin really did not land.
+    let job_after = tg
+        .deps
+        .cron_scheduler
+        .get_job(&job.id)
+        .await
+        .expect("get job")
+        .expect("job exists");
+    assert!(
+        !job_after.pinned,
+        "the rejected request must not have written"
+    );
+
+    // An id that does not exist at all answers the same way — the web caller
+    // (who legitimately owns this universe) cannot tell "gone" from "not yours".
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/cron/nope/pin")
+                .header("authorization", format!("Bearer {}", tg.deps.admin_token))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "pinned": true }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

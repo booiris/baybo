@@ -172,13 +172,29 @@ export interface ToolCallBegin {
   params: unknown;
 }
 
+/**
+ * A larger tool output points at the transcript row that already stores the
+ * model-facing payload, keyed by the call's `tool_use_id`. Small and historical
+ * outputs remain ordinary inline JSON values, so callers must use
+ * `resolveToolCallOutput` before rendering. `attachments` / `llm_images` are the
+ * media blocks a `WithAttachments` / `MultiModalText` result carries beside its
+ * text (they never enter the `ToolResult` content).
+ */
+export interface PersistedToolCallOutput {
+  $baybo_ref: 'session_tool_result';
+  tool_use_id: string;
+  attachments?: ContentBlock[];
+  llm_images?: ContentBlock[];
+}
+
 export interface ToolCallResult {
   output: unknown;
   success: boolean;
   /**
    * Serialized byte length of the untruncated output, present only when the
-   * span's copy was capped (at the same budget the LLM transcript uses). The
-   * model never saw more than the cap either. Absent = stored verbatim.
+   * model-facing payload was capped. A persisted reference resolves to that
+   * same capped payload; an inline value is capped in place. Absent means the
+   * resolved/stored output is complete.
    */
   output_truncated_from?: number;
 }
@@ -334,7 +350,7 @@ export interface JobTrace {
 
 /**
  * Slice the active-as-of-`lastOrdinal` window out of
- * `session_messages`, mirroring `QueryApi::hydrate_persisted_inputs`:
+ * `session_messages`, mirroring `QueryApi::hydrate_persisted_trace_data`:
  *
  *   WHERE ordinal <= lastOrdinal
  *     AND (superseded_by IS NULL OR superseded_by > lastOrdinal)
@@ -422,4 +438,64 @@ export function resolveInputMessages(
     input.prefix_len,
     input.suffix ?? [],
   );
+}
+
+function isPersistedToolCallOutput(
+  output: unknown,
+): output is PersistedToolCallOutput {
+  return (
+    output != null &&
+    typeof output === 'object' &&
+    (output as Record<string, unknown>).$baybo_ref === 'session_tool_result'
+  );
+}
+
+/**
+ * Resolve a transcript-backed tool output. It points at its `ToolResult` by
+ * `tool_use_id`; text/json/error results return the raw model-facing content
+ * string, media results wrap it back into the tagged object so the out-of-band
+ * blob list survives. Inline values pass through unchanged. Mirrors
+ * `PersistedToolCallOutput::resolve` on the Rust side.
+ */
+export function resolveToolCallOutput(
+  output: unknown,
+  log: SessionMessageRow[],
+  spanStartedAt: string,
+): unknown {
+  if (!isPersistedToolCallOutput(output)) return output;
+  const spanStart = new Date(spanStartedAt).getTime();
+  for (const row of log) {
+    if (new Date(row.created_at).getTime() < spanStart) continue;
+    const block = row.message.content.find(
+      (
+        candidate,
+      ): candidate is Extract<
+        ContentBlock,
+        { ToolResult: { tool_use_id: string; content: string } }
+      > =>
+        'ToolResult' in candidate &&
+        candidate.ToolResult.tool_use_id === output.tool_use_id,
+    );
+    if (!block) continue;
+    const content = block.ToolResult.content;
+    if (output.attachments?.length) {
+      return { type: 'with_attachments', text: content, attachments: output.attachments };
+    }
+    if (output.llm_images?.length) {
+      return { type: 'multi_modal_text', text: content, llm_images: output.llm_images };
+    }
+    return content;
+  }
+  return toolOutputReconstructionWarning(
+    output.tool_use_id,
+    `no transcript ToolResult found for ${output.tool_use_id}`,
+  );
+}
+
+function toolOutputReconstructionWarning(toolUseId: string, error: string): unknown {
+  return {
+    type: 'trace_reconstruction_error',
+    tool_use_id: toolUseId,
+    error,
+  };
 }

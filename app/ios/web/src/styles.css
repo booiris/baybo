@@ -277,6 +277,39 @@ button {
   pointer-events: none;
 }
 
+/* Cold open of a conversation this device has never rendered: no mirror to
+   restore, so the first rows have to come off the network and the thread would
+   otherwise be blank paper. Same ring as the paging spinner, with the label.
+   The 400ms delay is the attachment spinner's trick (`.attachment-bubble.sized`
+   below): every open that resolves instantly — a restored thread, a compose
+   draft's synthesized empty page — is gone before the fade even starts, so the
+   spinner is only ever seen by the open that genuinely waits. */
+.thread-loading {
+  align-self: center;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 1.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--color-ink-soft);
+  pointer-events: none;
+  animation: thread-loading-in 160ms ease-out 400ms both;
+}
+.thread-loading::before {
+  content: "";
+  width: 0.9rem;
+  height: 0.9rem;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-ink-soft);
+  border-top-color: transparent;
+  animation: send-spin 0.7s linear infinite;
+}
+@keyframes thread-loading-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
 /* Assistant replies: NO bubble — full-thread-width markdown prose (the web
    chat's reading band), Inter for the long read. */
 .msg.assistant {

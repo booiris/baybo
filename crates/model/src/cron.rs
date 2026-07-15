@@ -117,11 +117,41 @@ pub struct CronJob {
     /// Session where this cron job was created (for traceability).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_session_id: Option<SessionId>,
+    /// When the user moved this job to the recycle bin. `None` = live.
+    ///
+    /// Orthogonal to [`Self::status`]: a deleted one-shot that already fired
+    /// keeps `Executed`, and restoring it restores exactly the status it had.
+    /// A deleted job never fires and is hidden from every listing, but stays
+    /// resolvable by id — its execution rows and the conversations they opened
+    /// still name a real job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// Whether the job's **cron group** — the chat-list row collapsing all of
+    /// its fires (`docs/cron-groups.md`) — is pinned to the top of the list. The
+    /// group is a view with no row of its own, and the job is the only object
+    /// whose identity and lifetime match it, so the bit lives here.
+    ///
+    /// `#[serde(skip)]` is load-bearing, not a style choice: it keeps `pinned`
+    /// OUT of the `cron_jobs.data` blob, exactly like `deleted_at` above. Every
+    /// blob write reconstructs the row from a snapshot the caller holds —
+    /// `record_fire` re-serializes it on **every fire** from the pre-fire job,
+    /// and `save_if_unchanged` on an edit — so a pin stored in the blob would be
+    /// clobbered by the next tick, minutes after the user set it. The bit is a
+    /// flat `cron_jobs.pinned` column instead, written only by the targeted
+    /// `CronStore::set_pinned` and patched onto this field on read — the same
+    /// flat-column discipline `deleted_at` and `sessions.pinned` use.
+    #[serde(skip)]
+    pub pinned: bool,
 }
 
 impl CronJob {
     pub fn is_enabled(&self) -> bool {
         self.status == CronStatus::Enabled
+    }
+
+    /// True while the job sits in the recycle bin.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
     }
 
     pub fn is_one_shot(&self) -> bool {
@@ -178,6 +208,63 @@ pub fn display_title(title: &str, prompt: &str) -> String {
         format!("{truncated}…")
     } else {
         truncated
+    }
+}
+
+// ── CronJobPatch ─────────────────────────────────────────────────────
+
+/// An in-place edit of a [`CronJob`]: every field is optional, and one left
+/// unset keeps the value the job already has.
+///
+/// Editing is what a user means by "move the reminder to 8am" or "make it say
+/// something else". It is not delete-and-recreate: the job keeps its id, and
+/// with it the executions it has run and the conversations they opened.
+///
+/// Only the fields a user authored are here. `status`, `next_trigger_at` and
+/// `last_triggered_at` are the scheduler's, derived from the schedule — see
+/// `CronScheduler::update_job`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CronJobPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<CronSchedule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+impl CronJobPatch {
+    /// True when the patch sets nothing.
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.prompt.is_none()
+            && self.schedule.is_none()
+            && self.timezone.is_none()
+    }
+
+    /// True when the patch moves the job's fire times, so `next_trigger_at` has
+    /// to be recomputed. A timezone change does that on its own: the same cron
+    /// expression names a different instant in a different zone.
+    pub fn reschedules(&self) -> bool {
+        self.schedule.is_some() || self.timezone.is_some()
+    }
+
+    /// Write the patch's fields onto `job`, leaving every unset one alone.
+    pub fn apply_to(&self, job: &mut CronJob) {
+        if let Some(title) = &self.title {
+            job.title = title.clone();
+        }
+        if let Some(prompt) = &self.prompt {
+            job.prompt = prompt.clone();
+        }
+        if let Some(schedule) = &self.schedule {
+            job.schedule = schedule.clone();
+        }
+        if let Some(timezone) = &self.timezone {
+            job.timezone = timezone.clone();
+        }
     }
 }
 
@@ -387,6 +474,8 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             origin_session_id: None,
+            deleted_at: None,
+            pinned: false,
         }
     }
 
@@ -429,6 +518,8 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             origin_session_id: Some(SessionId::from("sess-1")),
+            deleted_at: None,
+            pinned: false,
         };
         let json = serde_json::to_string(&job).unwrap();
         let restored: CronJob = serde_json::from_str(&json).unwrap();
@@ -437,6 +528,7 @@ mod tests {
         assert_eq!(restored.timezone, "Asia/Shanghai");
         assert!(!restored.is_one_shot());
         assert!(restored.is_enabled());
+        assert!(!restored.is_deleted());
         assert_eq!(
             restored.origin_session_id.as_ref().map(|s| s.as_str()),
             Some("sess-1"),
@@ -460,6 +552,8 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             origin_session_id: None,
+            deleted_at: None,
+            pinned: false,
         };
         let json = serde_json::to_string(&job).unwrap();
         let restored: CronJob = serde_json::from_str(&json).unwrap();
@@ -483,6 +577,28 @@ mod tests {
         }"#;
         let restored: CronJob = serde_json::from_str(json).unwrap();
         assert_eq!(restored.timezone, "UTC");
+        assert!(
+            !restored.is_deleted(),
+            "a stored row is live unless stamped"
+        );
+    }
+
+    #[test]
+    fn deleted_at_round_trips_and_is_orthogonal_to_status() {
+        let deleted_at: DateTime<Utc> = "2026-07-01T08:00:00Z".parse().unwrap();
+        let mut job = job_with_tz("UTC");
+        job.status = CronStatus::Executed;
+        job.deleted_at = Some(deleted_at);
+
+        let restored: CronJob =
+            serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+        assert!(restored.is_deleted());
+        assert_eq!(restored.deleted_at, Some(deleted_at));
+        assert_eq!(
+            restored.status,
+            CronStatus::Executed,
+            "a fired one-shot keeps its status in the recycle bin"
+        );
     }
 
     #[test]
@@ -564,6 +680,149 @@ mod tests {
             serde_json::to_string(&ExecutionOutcome::Blank).unwrap(),
             "\"blank\""
         );
+    }
+
+    #[test]
+    fn an_empty_patch_sets_nothing_and_reschedules_nothing() {
+        let patch = CronJobPatch::default();
+        assert!(patch.is_empty());
+        assert!(!patch.reschedules());
+
+        let mut job = job_with_tz("UTC");
+        patch.apply_to(&mut job);
+        assert_eq!(job.title, "fmt job");
+        assert_eq!(job.prompt, "fmt");
+    }
+
+    /// A patch writes exactly the fields it carries: the rest of the job — down
+    /// to its id and the schedule state the scheduler owns — is left alone.
+    #[test]
+    fn a_patch_leaves_every_field_it_does_not_set() {
+        let mut job = job_with_tz("UTC");
+        job.next_trigger_at = Some("2026-05-05T09:30:00Z".parse().unwrap());
+
+        let patch = CronJobPatch {
+            prompt: Some("summarise the standup".to_string()),
+            ..Default::default()
+        };
+        assert!(!patch.is_empty());
+        assert!(
+            !patch.reschedules(),
+            "a prompt edit does not move the fire times"
+        );
+
+        patch.apply_to(&mut job);
+        assert_eq!(job.prompt, "summarise the standup");
+        assert_eq!(job.id, "cj-fmt");
+        assert_eq!(job.title, "fmt job");
+        assert_eq!(job.schedule.display(), "0 9 * * *");
+        assert_eq!(job.timezone, "UTC");
+        assert_eq!(job.status, CronStatus::Enabled);
+        assert_eq!(
+            job.next_trigger_at,
+            Some("2026-05-05T09:30:00Z".parse().unwrap()),
+            "applying a patch is not rescheduling; that is the scheduler's call",
+        );
+    }
+
+    /// A timezone change reschedules on its own — `0 9 * * *` is a different
+    /// instant in Shanghai than in UTC.
+    #[test]
+    fn a_timezone_or_schedule_change_reschedules() {
+        assert!(
+            CronJobPatch {
+                timezone: Some("Asia/Shanghai".to_string()),
+                ..Default::default()
+            }
+            .reschedules()
+        );
+        assert!(
+            CronJobPatch {
+                schedule: Some(CronSchedule::cron("0 8 * * *")),
+                ..Default::default()
+            }
+            .reschedules()
+        );
+    }
+
+    /// A patch is what a client sends back over the wire, so it has to survive
+    /// the trip: every field it set comes out the far side, and the fields it
+    /// left alone are not serialized at all — an explicit `null` for `prompt`
+    /// and an absent `prompt` both mean "leave it", but only one of them is
+    /// what the type means to say.
+    #[test]
+    fn a_patch_round_trips_through_json() {
+        let patch = CronJobPatch {
+            title: Some("Evening digest".to_string()),
+            prompt: Some("summarise the standup".to_string()),
+            schedule: Some(CronSchedule::at("2026-07-15T08:00:00Z".parse().unwrap())),
+            timezone: Some("Asia/Shanghai".to_string()),
+        };
+
+        let wire = serde_json::to_value(&patch).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "title": "Evening digest",
+                "prompt": "summarise the standup",
+                "schedule": { "kind": "at", "time": "2026-07-15T08:00:00Z" },
+                "timezone": "Asia/Shanghai",
+            }),
+        );
+
+        let back: CronJobPatch = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.title.as_deref(), Some("Evening digest"));
+        assert_eq!(back.prompt.as_deref(), Some("summarise the standup"));
+        assert_eq!(back.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(
+            back.schedule,
+            Some(CronSchedule::at("2026-07-15T08:00:00Z".parse().unwrap())),
+        );
+        assert!(back.reschedules());
+    }
+
+    #[test]
+    fn an_unset_field_is_not_serialized() {
+        let wire = serde_json::to_value(CronJobPatch {
+            prompt: Some("just the prompt".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(wire, serde_json::json!({ "prompt": "just the prompt" }));
+        assert_eq!(
+            serde_json::to_value(CronJobPatch::default()).unwrap(),
+            serde_json::json!({}),
+        );
+    }
+
+    /// A body that names one field patches that one field. Reading the absent
+    /// ones as `Some(default)` would blank the job's title and rewrite its
+    /// schedule with an empty cron expression — a partial edit that wipes what
+    /// it did not mention.
+    #[test]
+    fn a_body_that_names_one_field_does_not_null_out_the_others() {
+        let patch: CronJobPatch = serde_json::from_str(r#"{"prompt": "new prompt"}"#).unwrap();
+        assert_eq!(patch.prompt.as_deref(), Some("new prompt"));
+        assert!(patch.title.is_none());
+        assert!(patch.schedule.is_none());
+        assert!(patch.timezone.is_none());
+        assert!(!patch.is_empty());
+        assert!(!patch.reschedules());
+
+        let mut job = job_with_tz("Asia/Shanghai");
+        patch.apply_to(&mut job);
+        assert_eq!(job.prompt, "new prompt");
+        assert_eq!(job.title, "fmt job");
+        assert_eq!(job.schedule, CronSchedule::cron("0 9 * * *"));
+        assert_eq!(job.timezone, "Asia/Shanghai");
+    }
+
+    /// An empty body deserializes — and is then refused by the scheduler, which
+    /// is the layer that knows an edit setting nothing is a caller bug.
+    #[test]
+    fn an_empty_body_deserializes_to_an_empty_patch() {
+        let patch: CronJobPatch = serde_json::from_str("{}").unwrap();
+        assert!(patch.is_empty());
     }
 
     #[test]
