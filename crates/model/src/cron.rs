@@ -126,6 +126,22 @@ pub struct CronJob {
     /// still name a real job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<DateTime<Utc>>,
+    /// Whether the job's **cron group** — the chat-list row collapsing all of
+    /// its fires (`docs/cron-groups.md`) — is pinned to the top of the list. The
+    /// group is a view with no row of its own, and the job is the only object
+    /// whose identity and lifetime match it, so the bit lives here.
+    ///
+    /// `#[serde(skip)]` is load-bearing, not a style choice: it keeps `pinned`
+    /// OUT of the `cron_jobs.data` blob, exactly like `deleted_at` above. Every
+    /// blob write reconstructs the row from a snapshot the caller holds —
+    /// `record_fire` re-serializes it on **every fire** from the pre-fire job,
+    /// and `save_if_unchanged` on an edit — so a pin stored in the blob would be
+    /// clobbered by the next tick, minutes after the user set it. The bit is a
+    /// flat `cron_jobs.pinned` column instead, written only by the targeted
+    /// `CronStore::set_pinned` and patched onto this field on read — the same
+    /// flat-column discipline `deleted_at` and `sessions.pinned` use.
+    #[serde(skip)]
+    pub pinned: bool,
 }
 
 impl CronJob {
@@ -459,6 +475,7 @@ mod tests {
             updated_at: Utc::now(),
             origin_session_id: None,
             deleted_at: None,
+            pinned: false,
         }
     }
 
@@ -502,6 +519,7 @@ mod tests {
             updated_at: Utc::now(),
             origin_session_id: Some(SessionId::from("sess-1")),
             deleted_at: None,
+            pinned: false,
         };
         let json = serde_json::to_string(&job).unwrap();
         let restored: CronJob = serde_json::from_str(&json).unwrap();
@@ -535,6 +553,7 @@ mod tests {
             updated_at: Utc::now(),
             origin_session_id: None,
             deleted_at: None,
+            pinned: false,
         };
         let json = serde_json::to_string(&job).unwrap();
         let restored: CronJob = serde_json::from_str(&json).unwrap();

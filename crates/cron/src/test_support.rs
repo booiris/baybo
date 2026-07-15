@@ -104,12 +104,30 @@ impl CronStore for InMemoryCronStore {
     async fn save(&self, job: &CronJob) -> Result<()> {
         let mut jobs = self.jobs.lock();
         if let Some(existing) = jobs.iter_mut().find(|j| j.id == job.id) {
+            // Mirror the sqlite store: `deleted_at` and `pinned` are flat
+            // columns `save` never writes, so a stale snapshot cannot clobber
+            // them — without this the fake would let a scheduler tick silently
+            // unpin a group (or resurrect a deleted job) and every test against
+            // it would disagree with production.
             let deleted_at = existing.deleted_at;
+            let pinned = existing.pinned;
             *existing = job.clone();
             existing.deleted_at = deleted_at;
+            existing.pinned = pinned;
             Ok(())
         } else {
             Err(StorageError::NotFound(job.id.clone()))
+        }
+    }
+
+    async fn set_pinned(&self, job_id: &str, pinned: bool) -> Result<bool> {
+        let mut jobs = self.jobs.lock();
+        match jobs.iter_mut().find(|j| j.id == job_id) {
+            Some(job) => {
+                job.pinned = pinned;
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -124,8 +142,10 @@ impl CronStore for InMemoryCronStore {
                 if unmoved(existing, expected) && existing.updated_at == expected.updated_at =>
             {
                 let deleted_at = existing.deleted_at;
+                let pinned = existing.pinned;
                 *existing = job.clone();
                 existing.deleted_at = deleted_at;
+                existing.pinned = pinned;
                 Ok(true)
             }
             _ => Ok(false),

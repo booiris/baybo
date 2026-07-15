@@ -28,12 +28,21 @@ enum ChatListItem: Identifiable, Equatable {
         }
     }
 
-    /// Pinned chats hold the top block. A group is never pinned — pinning is an
-    /// affordance of an object, and a group is a view.
+    /// Pinned rows hold the top block — a group included.
+    ///
+    /// A group is still a *view*, so it has no row to carry the bit: the pin
+    /// lives on the JOB (`cron_jobs.pinned`, surfaced on every fire as
+    /// `cronGroupPinned`), which is the only object whose identity matches the
+    /// group. That is what makes pinning one coherent without storing the group.
+    ///
+    /// It earns its keep on a LOW-frequency job. A group already rides its
+    /// newest member (below), so a job that fires often is permanently near the
+    /// top anyway — it is the weekly digest, sinking between fires, that needs a
+    /// seat.
     var pinned: Bool {
         switch self {
         case .chat(let row): row.pinned
-        case .cronGroup: false
+        case .cronGroup(let group): group.pinned
         }
     }
 }
@@ -45,6 +54,9 @@ struct CronGroup: Identifiable, Equatable {
     let jobId: String
     /// The job's live title, or the name it had when it was deleted.
     let title: String
+    /// Whether the user pinned this group. Read off the JOB (every member row
+    /// carries the same `cronGroupPinned`), never stored for the group itself.
+    let pinned: Bool
     /// The fires drawn **inside** this group, newest first. Excludes members
     /// that escaped (see `ChatListBuckets`), so the aggregates below can never
     /// double-count a row that is already visible elsewhere.
@@ -88,16 +100,26 @@ enum ChatListBuckets {
     static func items(from rows: [SessionRow]) -> [ChatListItem] {
         var flat: [SessionRow] = []
         var grouped: [String: [SessionRow]] = [:]
+        var groupPins: [String: Bool] = [:]
 
         for row in rows where !row.archived {
             guard !row.pinned,
                 let jobId = row.cronJobId,
                 row.cronJobTitle != nil
             else {
+                // A pinned FIRE still escapes, even out of a pinned group. The
+                // two pins are different things — "keep this one conversation in
+                // my face" vs "keep this recurring stream at the top" — and both
+                // hold: the escapee renders once in the pinned block, the group
+                // renders once as its own pinned row. Neither is drawn twice.
                 flat.append(row)
                 continue
             }
             grouped[jobId, default: []].append(row)
+            // One bit on the job, mirrored onto every fire. `||` rather than
+            // last-write-wins so a half-applied optimistic flip (a page that
+            // raced the merge) still reads as pinned.
+            groupPins[jobId] = (groupPins[jobId] ?? false) || row.cronGroupPinned
         }
 
         var items = flat.map(ChatListItem.chat)
@@ -118,6 +140,7 @@ enum ChatListBuckets {
                     CronGroup(
                         jobId: jobId,
                         title: title,
+                        pinned: groupPins[jobId] ?? false,
                         members: sorted)))
         }
 

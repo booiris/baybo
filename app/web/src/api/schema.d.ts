@@ -440,6 +440,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/cron/{id}/pin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_cron_pin"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/cron/{id}/restore": {
         parameters: {
             query?: never;
@@ -1013,6 +1029,15 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             /**
+             * @description Whether this row's **cron group** is pinned to the top of the chat list.
+             *     Read off the live job (`cron_jobs.pinned`), so every fire of the job
+             *     carries the same value and the client folds it into the one group row —
+             *     exactly as it already does for `cron_job_title`. The group is a view, so
+             *     the bit necessarily dies with the job: a tombstone group (job deleted,
+             *     history kept) is always unpinned. `false` for a non-cron row.
+             */
+            cron_group_pinned?: boolean;
+            /**
              * @description The cron job whose fire this conversation is, for the clients that
              *     collapse a job's fires into one chat-list row (a **cron group** — a
              *     derived view, never a `session_folders` row; see `docs/cron-groups.md`).
@@ -1347,6 +1372,13 @@ export interface components {
             /** Format: date-time */
             next_trigger_at?: string | null;
             origin_session_id?: string | null;
+            /**
+             * @description Whether this job's **cron group** — the chat-list row collapsing its
+             *     fires — is pinned to the top of the list (`docs/cron-groups.md`).
+             *     `#[serde(default)]` so it is not required on the wire (defaults false),
+             *     matching `cron_group_pinned` on the chat-list summary.
+             */
+            pinned?: boolean;
             prompt: string;
             schedule: components["schemas"]["CronSchedule"];
             status: components["schemas"]["CronStatus"];
@@ -1748,6 +1780,14 @@ export interface components {
             path: string;
             /** @description JSON value written at `path`. Shape validated by `BayboConfig`. */
             value: Record<string, never>;
+        };
+        /** @description Request body for `PUT /v1/cron/{id}/pin`. */
+        SetCronPinRequest: {
+            /**
+             * @description `true` to pin this job's cron group to the top of the chat list,
+             *     `false` to release it back to recency order.
+             */
+            pinned: boolean;
         };
         /** @description `PUT /v1/llm/default` body. */
         SetDefaultLlmRequest: {
@@ -3432,6 +3472,13 @@ export interface operations {
                             /** Format: date-time */
                             next_trigger_at?: string | null;
                             origin_session_id?: string | null;
+                            /**
+                             * @description Whether this job's **cron group** — the chat-list row collapsing its
+                             *     fires — is pinned to the top of the list (`docs/cron-groups.md`).
+                             *     `#[serde(default)]` so it is not required on the wire (defaults false),
+                             *     matching `cron_group_pinned` on the chat-list summary.
+                             */
+                            pinned?: boolean;
                             prompt: string;
                             schedule: components["schemas"]["CronSchedule"];
                             status: components["schemas"]["CronStatus"];
@@ -3720,6 +3767,49 @@ export interface operations {
             };
             /** @description Scheduler error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_cron_pin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cron job id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetCronPinRequest"];
+            };
+        };
+        responses: {
+            /** @description Pin state updated */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

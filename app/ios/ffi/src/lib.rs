@@ -288,6 +288,33 @@ impl BayboClient {
         .await
     }
 
+    /// Pin or unpin a **cron group** — every fire of one scheduled job,
+    /// collapsed into a single chat-list row (`docs/cron-groups.md`). Keyed by
+    /// the JOB id, not a session: the group is a view over its fires, so the job
+    /// is the only object that can hold the bit (`PUT /v1/cron/{id}/pin`).
+    ///
+    /// Deleting the job releases the pin with it — a tombstone group (history
+    /// kept, job gone) cannot be pinned. That is the accepted trade of pinning
+    /// the only object whose identity matches the group.
+    pub async fn chat_set_cron_pinned(
+        self: Arc<Self>,
+        job_id: String,
+        pinned: bool,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::set_cron_pinned(&client, job_id, pinned).await
+                }
+                ActiveLeg::Relay => {
+                    gateway_api::set_cron_pinned(&relay::GatewayApi, job_id, pinned).await
+                }
+            }
+        })
+        .await
+    }
+
     /// Soft-hide `session_id` for the active binding (`DELETE
     /// /v1/chat/sessions/{id}` — the gateway sets `hidden`, never deleting the
     /// row or transcript). Direct reaches it over REST, relay through the

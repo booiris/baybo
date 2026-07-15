@@ -20,6 +20,7 @@ struct CronGroupBucketTests {
         archived: Bool = false,
         jobId: String? = nil,
         jobTitle: String? = nil,
+        groupPinned: Bool = false,
         preview: String? = nil
     ) -> SessionRow {
         SessionRow(
@@ -31,7 +32,8 @@ struct CronGroupBucketTests {
             archived: archived,
             unread: unread,
             cronJobId: jobId,
-            cronJobTitle: jobTitle)
+            cronJobTitle: jobTitle,
+            cronGroupPinned: groupPinned)
     }
 
     private func group(_ items: [ChatListItem], _ jobId: String) -> CronGroup? {
@@ -209,7 +211,8 @@ struct CronGroupPersistenceTests {
                     archived: false,
                     unreadCount: 1,
                     cronJobId: "cj-1",
-                    cronJobTitle: "Morning brief")
+                    cronJobTitle: "Morning brief",
+                    cronGroupPinned: false)
             ],
             fetchEpoch: index.mutationEpoch)
 
@@ -235,5 +238,95 @@ struct CronGroupPersistenceTests {
         #expect(row.count == 1)
         #expect(row[0].cronJobId == nil)
         #expect(row[0].cronJobTitle == nil)
+    }
+}
+
+/// Pinning a cron GROUP. The bit lives on the JOB (`cron_jobs.pinned`), mirrored
+/// onto every fire as `cronGroupPinned` — a group is a view, so it has no row of
+/// its own to hold it, and the job is the only object whose identity matches.
+@Suite @MainActor
+struct CronGroupPinTests {
+    private func fire(
+        _ id: String, minutesAgo: Int, jobId: String = "cj-1",
+        groupPinned: Bool = false, pinned: Bool = false
+    ) -> SessionRow {
+        SessionRow(
+            id: id,
+            createdAt: Date(timeIntervalSince1970: 0),
+            lastActive: Date(timeIntervalSince1970: 1_000_000 - Double(minutesAgo) * 60),
+            preview: nil,
+            pinned: pinned,
+            cronJobId: jobId,
+            cronJobTitle: "Weekly digest",
+            cronGroupPinned: groupPinned)
+    }
+
+    private func chat(_ id: String, minutesAgo: Int) -> SessionRow {
+        SessionRow(
+            id: id,
+            createdAt: Date(timeIntervalSince1970: 0),
+            lastActive: Date(timeIntervalSince1970: 1_000_000 - Double(minutesAgo) * 60),
+            preview: nil,
+            pinned: false)
+    }
+
+    /// The whole point of the feature. A group already rides its newest member,
+    /// so a job that fires often is near the top anyway — it is the LOW-frequency
+    /// job (the weekly digest, stale for six days) that sinks under ordinary
+    /// chats. The pin lifts it into the pinned block.
+    @Test func aPinnedGroupLeadsTheListEvenWhenItsLastFireIsAncient() {
+        let items = ChatListBuckets.items(from: [
+            chat("fresh", minutesAgo: 1),
+            fire("old-fire", minutesAgo: 10_000, groupPinned: true),
+        ])
+        #expect(items.first?.id == "cron:cj-1")
+        #expect(items.first?.pinned == true)
+    }
+
+    /// The pin is on the JOB, not its fires: no session's own `pinned` flips, so
+    /// the members stay INSIDE the group rather than escaping to the pinned block.
+    @Test func pinningTheGroupDoesNotPinItsFires() {
+        let items = ChatListBuckets.items(from: [
+            fire("f1", minutesAgo: 5, groupPinned: true),
+            fire("f2", minutesAgo: 9, groupPinned: true),
+        ])
+        let group = items.compactMap { item -> CronGroup? in
+            guard case .cronGroup(let g) = item else { return nil }
+            return g
+        }.first
+        #expect(group?.pinned == true)
+        #expect(group?.memberIds == ["f1", "f2"])
+    }
+
+    /// The two pins are different things and BOTH hold. A fire the user pinned by
+    /// hand still escapes — even out of a pinned group — and each row is rendered
+    /// exactly once: the escapee in the pinned block, the group as its own row.
+    @Test func anIndividuallyPinnedFireStillEscapesAPinnedGroup() {
+        let items = ChatListBuckets.items(from: [
+            fire("escapee", minutesAgo: 5, groupPinned: true, pinned: true),
+            fire("inside", minutesAgo: 9, groupPinned: true),
+        ])
+        let chatIds = items.compactMap { item -> String? in
+            guard case .chat(let row) = item else { return nil }
+            return row.id
+        }
+        let group = items.compactMap { item -> CronGroup? in
+            guard case .cronGroup(let g) = item else { return nil }
+            return g
+        }.first
+        #expect(chatIds == ["escapee"])
+        #expect(group?.pinned == true)
+        #expect(group?.memberIds == ["inside"], "the escapee must not also render inside")
+    }
+
+    /// An unpinned group keeps the old behaviour exactly: it sorts among the
+    /// chats by its newest fire, not above them.
+    @Test func anUnpinnedGroupStillSortsByRecency() {
+        let items = ChatListBuckets.items(from: [
+            chat("fresh", minutesAgo: 1),
+            fire("old-fire", minutesAgo: 10_000),
+        ])
+        #expect(items.first?.id == "fresh")
+        #expect(items.first?.pinned == false)
     }
 }

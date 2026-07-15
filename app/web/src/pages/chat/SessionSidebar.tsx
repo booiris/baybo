@@ -403,11 +403,13 @@ function CronGroupHeader({
   collapsed,
   unread,
   onToggle,
+  onTogglePin,
 }: {
   group: CronGroup;
   collapsed: boolean;
   unread: number;
   onToggle: () => void;
+  onTogglePin: (jobId: string, pinned: boolean) => void;
 }) {
   return (
     <div className="group flex items-center gap-1.5 pl-1 pr-2 py-1 rounded-md border-2 border-transparent hover:bg-gray-100">
@@ -434,6 +436,28 @@ function CronGroupHeader({
         title={group.title}
       >
         {group.title}
+      </button>
+      {/* Persistent glyph on a pinned group, swapped for the interactive toggle
+          on hover — the session row's idiom. Pinning the GROUP pins the job, not
+          any one fire: a fire is a moment, the job is the recurring thing. */}
+      {group.pinned ? (
+        <RiPushpin2Fill
+          className="text-[0.7rem] shrink-0 text-ink-soft group-hover:hidden"
+          title="Pinned"
+        />
+      ) : null}
+      <button
+        type="button"
+        onClick={() => onTogglePin(group.jobId, !group.pinned)}
+        className="hidden group-hover:flex shrink-0 items-center justify-center h-5 w-5 text-ink-soft hover:text-ink cursor-pointer"
+        title={group.pinned ? 'Unpin group' : 'Pin group to the top'}
+        aria-label={group.pinned ? 'Unpin scheduled group' : 'Pin scheduled group'}
+      >
+        {group.pinned ? (
+          <RiPushpin2Fill className="text-[0.8rem]" />
+        ) : (
+          <RiPushpin2Line className="text-[0.8rem]" />
+        )}
       </button>
       {collapsed && unread > 0 ? (
         <span className={UNREAD_BADGE} title={unreadLabel(unread)}>
@@ -524,6 +548,7 @@ export function SessionSidebar({
   onNewChat,
   onHide,
   onTogglePin,
+  onToggleCronPin,
   onAssignFolder,
   onCreateFolder,
   onRenameFolder,
@@ -540,6 +565,10 @@ export function SessionSidebar({
   onNewChat: () => void;
   onHide: (id: string) => void;
   onTogglePin: (id: string, pinned: boolean) => void;
+  /** Pin/unpin a cron GROUP — keyed by the JOB id, not a session: the bit lives
+   *  on the job (`PUT /v1/cron/{id}/pin`), since the group is a view over its
+   *  fires. See `docs/cron-groups.md`. */
+  onToggleCronPin: (jobId: string, pinned: boolean) => void;
   onAssignFolder: (id: string, folderId: string | null) => void;
   onCreateFolder: (name: string, parentId?: string) => void;
   onRenameFolder: (id: string, name: string) => void;
@@ -919,6 +948,7 @@ export function SessionSidebar({
                       collapsed={isCollapsed}
                       unread={cronGroupUnread(group)}
                       onToggle={() => toggleCollapse(key)}
+                      onTogglePin={onToggleCronPin}
                     />
                     {!isCollapsed ? (
                       <div className="flex flex-col gap-0.5">

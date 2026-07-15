@@ -1,7 +1,7 @@
 //! `/v1/cron` endpoints.
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 use utoipa::IntoParams;
@@ -11,7 +11,11 @@ use utoipa_axum::routes;
 use baybo_cron::{CronError, CronSchedule};
 use baybo_model::ChannelType as ChannelTypeModel;
 
-use crate::api::dto::{CreateCronRequest, CronJob, ErrorBody, ListResponse, UpdateCronRequest};
+use crate::api::admin::chat::{broadcast_session_list_stale, chat_list_channel};
+use crate::api::dto::{
+    CreateCronRequest, CronJob, ErrorBody, ListResponse, SetCronPinRequest, UpdateCronRequest,
+};
+use crate::auth::AuthedClient;
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
@@ -19,6 +23,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     OpenApiRouter::new()
         .routes(routes!(list_cron, create_cron))
         .routes(routes!(get_cron, update_cron, delete_cron))
+        .routes(routes!(set_cron_pin))
         .routes(routes!(pause_cron))
         .routes(routes!(resume_cron))
         .routes(routes!(restore_cron))
@@ -268,5 +273,61 @@ async fn restore_cron(
         .restore_job(&id)
         .await
         .map_err(cron_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    put,
+    path = "/cron/{id}/pin",
+    tag = "cron",
+    params(
+        ("id" = String, Path, description = "Cron job id"),
+    ),
+    request_body = SetCronPinRequest,
+    responses(
+        (status = 204, description = "Pin state updated"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    )
+)]
+async fn set_cron_pin(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    authed: Option<Extension<AuthedClient>>,
+    Json(req): Json<SetCronPinRequest>,
+) -> Result<StatusCode> {
+    // The FIRST mutation a client can make to a cron job, so it is also the
+    // first that needs scoping — and unlike the chat routes there was no
+    // precedent here to copy (`list_cron` is deliberately unfiltered, an
+    // operator surface). A job carries the same `ChannelType` as a session, and
+    // `http` (web) and `device` (iOS) own disjoint universes, so a job from the
+    // other universe must be indistinguishable from one that does not exist.
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    let not_found = || GatewayError::NotFound(format!("cron {id}"));
+    let job = state
+        .cron_scheduler
+        .get_job(&id)
+        .await
+        .map_err(|e| GatewayError::Cron(e.to_string()))?
+        .ok_or_else(not_found)?;
+    if job.channel != chat_list_channel(authed) {
+        return Err(not_found());
+    }
+    // Targeted flat-column write, NOT get→mutate→save: `save` rewrites the whole
+    // row from its caller's snapshot and the scheduler re-saves on every fire, so
+    // the read-modify-write shape would lose this pin on the job's next tick.
+    if !state
+        .cron_scheduler
+        .set_job_pinned(&id, req.pinned)
+        .await
+        .map_err(|e| GatewayError::Cron(e.to_string()))?
+    {
+        return Err(not_found());
+    }
+    // The group is a VIEW over the job's fire sessions, so there is no session
+    // row whose `pinned` changed and nothing for `SessionPatch` to carry — every
+    // client re-derives the group's block from `cron_group_pinned` on its next
+    // list pull. `list_stale` is the existing nudge for exactly that.
+    broadcast_session_list_stale(&state, &job.channel);
     Ok(StatusCode::NO_CONTENT)
 }

@@ -1888,6 +1888,10 @@
                               "null"
                             ]
                           },
+                          "pinned": {
+                            "type": "boolean",
+                            "description": "Whether this job's **cron group** — the chat-list row collapsing its\nfires — is pinned to the top of the list (`docs/cron-groups.md`).\n`#[serde(default)]` so it is not required on the wire (defaults false),\nmatching `cron_group_pinned` on the chat-list summary."
+                          },
                           "prompt": {
                             "type": "string"
                           },
@@ -2241,6 +2245,60 @@
           },
           "500": {
             "description": "Scheduler error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/cron/{id}/pin": {
+      "put": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "set_cron_pin",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetCronPinRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Pin state updated"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -4143,6 +4201,10 @@
             "type": "string",
             "format": "date-time"
           },
+          "cron_group_pinned": {
+            "type": "boolean",
+            "description": "Whether this row's **cron group** is pinned to the top of the chat list.\nRead off the live job (`cron_jobs.pinned`), so every fire of the job\ncarries the same value and the client folds it into the one group row —\nexactly as it already does for `cron_job_title`. The group is a view, so\nthe bit necessarily dies with the job: a tombstone group (job deleted,\nhistory kept) is always unpinned. `false` for a non-cron row."
+          },
           "cron_job_id": {
             "type": [
               "string",
@@ -4573,6 +4635,10 @@
               "string",
               "null"
             ]
+          },
+          "pinned": {
+            "type": "boolean",
+            "description": "Whether this job's **cron group** — the chat-list row collapsing its\nfires — is pinned to the top of the list (`docs/cron-groups.md`).\n`#[serde(default)]` so it is not required on the wire (defaults false),\nmatching `cron_group_pinned` on the chat-list summary."
           },
           "prompt": {
             "type": "string"
@@ -5488,6 +5554,19 @@
           "value": {
             "type": "object",
             "description": "JSON value written at `path`. Shape validated by `BayboConfig`."
+          }
+        }
+      },
+      "SetCronPinRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/cron/{id}/pin`.",
+        "required": [
+          "pinned"
+        ],
+        "properties": {
+          "pinned": {
+            "type": "boolean",
+            "description": "`true` to pin this job's cron group to the top of the chat list,\n`false` to release it back to recency order."
           }
         }
       },

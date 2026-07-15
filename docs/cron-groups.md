@@ -83,6 +83,64 @@ fires simply are not in your list, and neither is its group.
 **History groups on ship day.** The grouping key is already on every historical fire session, so a
 list that is already flooded collapses the moment this ships. There is nothing to backfill.
 
+## Pinning a group
+
+A group can be **pinned** to the top of the chat list. It is the group's only mutation, and it does
+**not** give the group a row — the bit goes on the **cron job**, which is the only object whose
+identity and lifetime match the group.
+
+```
+PUT /v1/cron/{id}/pin   { "pinned": true }      →  cron_jobs.pinned
+GET /v1/chat/sessions   →  ChatSessionSummary.cron_group_pinned   (on every fire of the job)
+```
+
+**Why it needs a pin at all.** A group already sorts on its newest visible member — "48 fires a day
+become one row moving" — so a job that fires often is *already* near the top and a pin buys it
+nothing. The pin exists for the **low-frequency** job: a weekly digest sinks under ordinary chats
+between fires, and that is the only case it serves. Do not sell it as more than that.
+
+**Storage is `sessions.pinned`'s shape, verbatim, and it must stay that way.** `cron_jobs.pinned` is
+a **flat column** written only by the targeted `CronStore::set_pinned`; `CronJob::pinned` is
+`#[serde(skip)]` so it never enters the `data` blob, and `CronStore::save` never writes the column.
+This is not ceremony:
+
+> Every blob write reconstructs the whole row from a snapshot the caller holds — `record_fire` does
+> it on **every fire** from the job read before the fire, and `save_if_unchanged` on an edit. A pin
+> written into that blob (or added to a write's `SET` list) is a snapshot taken *before* the user
+> pinned, so it is reverted by the job's next tick, minutes after it is set. This is the same
+> flat-column discipline `cron_jobs.deleted_at` uses, for the same reason.
+> `sqlite::cron::tests::a_fire_and_a_save_cannot_unpin_the_group` pins it.
+
+**The read is free.** The chat-list handler already loads every job to resolve group *names*
+(`live_cron_job_meta`), so the pin rides that same lookup with no extra query. Note the trap it
+already contained: that map used to **drop untitled jobs**, which was harmless when it only carried
+the title — and would silently unpin the group of any job with no title. The emptiness check now
+lives in `cron_group_label`, not in the map.
+
+**Two consequences, both accepted, neither an accident:**
+
+- **The pin goes dormant when the job is deleted, and comes back on restore.** `CronStore::delete` is
+  a recycle bin — it stamps `deleted_at`, leaving the `pinned` column untouched. A deleted job drops
+  out of `list_all_jobs` (every listing filters `deleted_at IS NULL`), so its group renders with the
+  tombstone name and reads **unpinned** while in the bin — the same observable state a hard delete
+  would have given. `restore` clears `deleted_at` and the pin is simply there again. Nothing clears
+  it on delete; a group's pin follows the job's lifetime, dormant in between.
+- **The group pin and a fire's own pin are different things, and both hold.** Pinning one *fire*
+  still escapes it from the group (above); pinning the *group* keeps the whole recurring stream at
+  the top. A pinned fire inside a pinned group renders once in the pinned block and the group renders
+  once as its own pinned row — nothing is drawn twice.
+
+**Scoping.** The pin route 404s a job whose `channel` is not the caller's, exactly as
+`load_scoped_chat_session` does for a session, so the `http` (web) and `device` (iOS) universes stay
+disjoint. `list_cron` (an unfiltered operator surface) was no precedent to copy. Note the asymmetry
+this leaves: the pin route is channel-scoped, but the sibling cron mutations that landed alongside it
+(`update` / `pause` / `resume` / `restore`) are **not** — a follow-up should decide whether they want
+the same scoping.
+
+**No `SessionPatch`.** No session row changed, so there is nothing to patch; the gateway broadcasts
+the session-less `Frame::Gap` (list-stale, `broadcast_list_stale`) and every client re-derives the
+group's block on its next list pull.
+
 ## iOS
 
 The chat list stays a flat `List` — `.plain` style, the in-content pinned tint, the hand-rolled
@@ -142,11 +200,12 @@ chat folder (`sessions.folder_id` and the folder tree already exist)"*. That par
 and it is worth recording why, because the folder-row design is the obvious one and someone will
 propose it again.
 
-The group supports **zero mutations** — it cannot be deleted, renamed through the folder API,
-reparented, have chats moved in or out, or host a new chat. **A thing that supports no mutations does
-not need to be a row in a mutable table.** Making it one means storing the same fact twice and then
-inventing machinery to keep the copies in sync. An adversarial review of that design found these,
-all from that one root cause:
+The group supports **almost no mutations** — it cannot be deleted, renamed through the folder API,
+reparented, have chats moved in or out, or host a new chat. It can be **pinned**, and that is the
+only one (see [Pinning a group](#pinning-a-group) — the bit goes on the *job*, not on a group row, so
+the argument below is untouched). **A thing with no state of its own does not need to be a row in a
+mutable table.** Making it one means storing the same fact twice and then inventing machinery to keep
+the copies in sync. An adversarial review of that design found these, all from that one root cause:
 
 - **Every write to a cron job's row is a conditional one** (`storage/src/sqlite/cron.rs`): an in-place
   change CASes on the row it read, and a fire's write-back stamps its own four fields and refuses a row

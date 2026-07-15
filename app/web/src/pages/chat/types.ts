@@ -44,6 +44,13 @@ export interface SessionSummary {
    *  be named from neither source, in which case it stays flat (ungrouped)
    *  rather than being given an invented name. */
   cron_job_title?: string;
+  /** Whether this row's cron GROUP is pinned (`PUT /v1/cron/{id}/pin`). The bit
+   *  lives on the JOB — the group is a view, and the job is the only object
+   *  whose identity matches it — so every fire of the job carries the same
+   *  value and the sidebar folds it into the one group header. Distinct from
+   *  `pinned`, which is this SESSION's own pin. A tombstone group (job deleted)
+   *  is always `false`: there is nothing left to hold the bit. */
+  cron_group_pinned?: boolean;
 }
 
 /** A user-created chat-list folder. Two-level tree via `parent_id`

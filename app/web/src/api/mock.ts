@@ -160,6 +160,7 @@ function generateMockCrons(count: number): components['schemas']['CronJob'][] {
       user_id: `user-${Math.floor(Math.random() * 100)}`,
       channel: channels[Math.floor(Math.random() * channels.length)],
       title: titles[pick],
+      pinned: false,
       status: statuses[Math.floor(Math.random() * statuses.length)],
       schedule: isCron
         ? { kind: 'cron', expr: schedules[Math.floor(Math.random() * schedules.length)] }

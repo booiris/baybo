@@ -217,12 +217,14 @@ struct ChatListScreen: View {
 
     /// A cron group: tap pushes that job's fires.
     ///
-    /// **Mark-all-read is its only swipe action.** Pin / archive / delete are
-    /// affordances of an *object*, and a group is a view — there is nothing to
-    /// pin, and nothing a delete could remove. But the badge needs an exit: a
-    /// `*/30` job is one row wearing a `48`, and without a way to clear it the
-    /// grouping would be cosmetic. No full-swipe — a fling must not silently
-    /// wipe 48 unread markers.
+    /// **Two swipe actions: mark-all-read (trailing) and pin (leading).**
+    /// Archive / delete are still absent — those are affordances of an *object*,
+    /// and a group is a view, so there is nothing a delete could remove. Pin is
+    /// the exception, and only because the bit has a real home: it lives on the
+    /// cron JOB, the one object whose identity matches the group. Mark-all-read
+    /// exists because the badge needs an exit — a `*/30` job is one row wearing a
+    /// `48`. Neither is a full-swipe: a fling must not silently wipe 48 unread
+    /// markers, and a pin is not destructive enough to want one either.
     @ViewBuilder private func cronGroupRow(_ group: CronGroup) -> some View {
         Button {
             appStore.openCronGroup(group.jobId)
@@ -242,6 +244,27 @@ struct ChatListScreen: View {
                 }
                 .tint(Theme.inkSoft)
             }
+        }
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            Button {
+                toggleCronPin(group)
+            } label: {
+                Label(
+                    lang.t(group.pinned ? "list.unpin" : "list.pin"),
+                    systemImage: group.pinned ? "pin.slash.fill" : "pin.fill")
+            }
+            .tint(Theme.ink)
+        }
+    }
+
+    /// Same deferral as a chat row's pin: UIKit's `.swipeActions` teardown stalls
+    /// List's reorder, so the row's new slot sits blank if the request lands
+    /// while the swipe is still collapsing. Haptic fires on the tap.
+    private func toggleCronPin(_ group: CronGroup) {
+        Haptics.tap()
+        Task { @MainActor in
+            try? await Task.sleep(for: Self.swipeDismissal)
+            appStore.requestCronPin(jobId: group.jobId, pinned: !group.pinned)
         }
     }
 
@@ -452,6 +475,17 @@ struct CronGroupRowView: View {
             // only thing telling the user that a tap opens a list, not a chat.
             glyph: "alarm"
         )
+        // The same in-content pinned ground a chat row draws (see
+        // `pinnedRowTint`) — a pinned group must read as pinned, and drawing it
+        // as the cell's background configuration is what blanked the incoming
+        // row and stalled the reorder.
+        .background {
+            ChatListScreen.pinnedRowTint
+                .opacity(group.pinned ? 1 : 0)
+                .padding(.horizontal, -ChatListScreen.rowHInset)
+                .allowsHitTesting(false)
+                .animation(nil, value: group.pinned)
+        }
         .contentShape(Rectangle())
     }
 }

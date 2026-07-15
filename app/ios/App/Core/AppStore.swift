@@ -263,6 +263,17 @@ final class AppStore: ObservableObject {
                     requestPin("demo-1", pinned: true)
                 }
             }
+            // `-baybo-demo-cron-pin`: pin the seeded cron GROUP ~2s in. The demo
+            // fires are stamped at the epoch, so the group sits at the BOTTOM of
+            // the list — the pin lifting it to the top is exactly the reorder the
+            // feature exists for (a low-frequency job that would otherwise sink),
+            // and this makes it screenshot-verifiable with no gateway.
+            if args.contains("-baybo-demo-cron-pin") {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(2))
+                    requestCronPin(jobId: "demo-job", pinned: true)
+                }
+            }
             if let idx = args.firstIndex(of: "-baybo-home-tab"), idx + 1 < args.count {
                 switch args[idx + 1] {
                 case "agents": homeTab = .agents
@@ -634,6 +645,36 @@ final class AppStore: ObservableObject {
         sessionNotice = nil
         SessionIndex.shared.beginPin(sessionId, pinned: pinned)
         pumpSessionMutation(sessionId)
+    }
+
+    /// Pin/unpin a **cron group** — every fire of one scheduled job, collapsed
+    /// into a single list row. Keyed by the JOB: the group is a view over its
+    /// fires, so the job is the only object that can hold the bit
+    /// (`PUT /v1/cron/{id}/pin`, `chat_set_cron_pinned` over the active leg).
+    ///
+    /// Deliberately simpler than `pumpSessionMutation`: there is no
+    /// archive/delete/pin interleaving to serialize on a job — pin is the ONLY
+    /// mutation a cron job has — so one flip, one send, roll back on failure.
+    func requestCronPin(jobId: String, pinned: Bool) {
+        sessionNotice = nil
+        SessionIndex.shared.beginCronPin(jobId: jobId, pinned: pinned)
+        #if DEBUG
+            // `-baybo-open-home` has no gateway to call; the demo asserts on the
+            // optimistic flip staying put (mirrors the archive/delete demo mode).
+            if demoHomeMode {
+                SessionIndex.shared.finishCronPin(jobId: jobId)
+                return
+            }
+        #endif
+        Task {
+            do {
+                try await Baybo.client.chatSetCronPinned(jobId: jobId, pinned: pinned)
+                SessionIndex.shared.finishCronPin(jobId: jobId)
+            } catch {
+                SessionIndex.shared.rollBackCronPin(jobId: jobId)
+                sessionNotice = Lang.shared.t("list.pinFailed")
+            }
+        }
     }
 
     /// Delete (server-side soft-hide), after the confirm dialog: drop the row +

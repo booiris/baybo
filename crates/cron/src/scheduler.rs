@@ -156,6 +156,7 @@ impl CronScheduler {
             updated_at: now,
             origin_session_id,
             deleted_at: None,
+            pinned: false,
         };
 
         self.store.create(&job).await?;
@@ -444,6 +445,19 @@ impl CronScheduler {
     /// Fetch a cron job by id, or `None` if it does not exist.
     pub async fn get_job(&self, job_id: &str) -> Result<Option<CronJob>> {
         self.store.get(job_id).await.map_err(CronError::from)
+    }
+
+    /// Pin/unpin the job's **cron group** — the chat-list row collapsing its
+    /// fires (`docs/cron-groups.md`). Goes straight to the targeted store setter,
+    /// never through get→mutate→a full-blob write: `save` / `save_if_unchanged` /
+    /// `record_fire` all rewrite the whole row from a snapshot the caller holds,
+    /// and `record_fire` re-serializes it on every fire, so a read-modify-write
+    /// pin would be lost on the next tick. `false` when no such job exists.
+    pub async fn set_job_pinned(&self, job_id: &str, pinned: bool) -> Result<bool> {
+        self.store
+            .set_pinned(job_id, pinned)
+            .await
+            .map_err(CronError::from)
     }
 
     /// Manually fire a cron job now, outside the regular schedule.
@@ -2011,6 +2025,9 @@ mod tests {
         async fn save(&self, job: &CronJob) -> StoreResult<()> {
             self.inner.save(job).await
         }
+        async fn set_pinned(&self, job_id: &str, pinned: bool) -> StoreResult<bool> {
+            self.inner.set_pinned(job_id, pinned).await
+        }
         async fn record_fire(&self, expected: &CronJob, fire: CronFire) -> StoreResult<bool> {
             self.inner.record_fire(expected, fire).await
         }
@@ -2449,6 +2466,7 @@ mod tests {
             updated_at: Utc::now(),
             origin_session_id: None,
             deleted_at: None,
+            pinned: false,
         };
         job.next_trigger_at = Some(Utc::now());
         store.create(&job).await.unwrap();

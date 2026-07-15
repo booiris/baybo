@@ -2380,6 +2380,7 @@ async fn one_shot_cron_result_lands_in_the_scheduling_conversation() {
         updated_at: chrono::Utc::now(),
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
+        pinned: false,
     };
     let execution = CronExecution::pending(&job, chrono::Utc::now(), chrono::Utc::now());
     harness
@@ -2534,6 +2535,7 @@ async fn replayed_cron_result_does_not_duplicate_the_notification() {
         updated_at: chrono::Utc::now(),
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
+        pinned: false,
     };
     let execution = CronExecution::pending(&job, chrono::Utc::now(), chrono::Utc::now());
     harness
@@ -2747,6 +2749,7 @@ async fn a_cron_notification_that_cannot_be_persisted_is_not_marked_delivered() 
         updated_at: chrono::Utc::now(),
         origin_session_id: Some(origin_id.clone()),
         deleted_at: None,
+        pinned: false,
     };
     let execution = CronExecution::pending(&job, chrono::Utc::now(), chrono::Utc::now());
     harness

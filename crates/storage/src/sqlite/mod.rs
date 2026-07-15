@@ -537,6 +537,13 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
                     -- in SQL, which is what keeps a deleted job out of the
                     -- tick loop; the full value also rides in `data`.
                     deleted_at      INTEGER,
+                    -- Whether the job's cron GROUP is pinned in the chat list
+                    -- (docs/cron-groups.md). A flat column, never the `data`
+                    -- blob (like `deleted_at`): every blob write reconstructs the
+                    -- row from a snapshot the caller holds and `record_fire`
+                    -- re-serializes it on every fire, so a pin in the blob would
+                    -- be reverted by the next tick. Written only by `set_pinned`.
+                    pinned          INTEGER NOT NULL DEFAULT 0,
                     data            TEXT    NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_cron_jobs_user_id ON cron_jobs(user_id);
@@ -704,6 +711,7 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
         "ALTER TABLE cron_executions ADD COLUMN notified_at INTEGER",
         "ALTER TABLE session_messages ADD COLUMN source_event_id TEXT",
         "ALTER TABLE cron_jobs ADD COLUMN deleted_at INTEGER",
+        "ALTER TABLE cron_jobs ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
     ];
     for stmt in migrations {
         if let Err(e) = conn.execute(stmt, []) {
