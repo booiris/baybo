@@ -530,8 +530,19 @@ final class AppStore: ObservableObject {
         chatPath.append(.cronGroup(jobId))
     }
 
-    /// Open a fire from inside its group: append, so the pop chain runs
-    /// chat → group → list (the archived screen's rule).
+    /// Open a fire from inside its group: a normal push over the fire list, so it
+    /// slides in like any conversation and backs out the archived-screen way —
+    /// chat → fire list → main list.
+    ///
+    /// An earlier version dropped the fire list from the back stack once the push
+    /// settled, so Back would skip straight to the main list (a fire is an
+    /// ordinary conversation the group merely *collects*). But `NavigationStack`
+    /// keys its path POSITIONALLY, so collapsing `[.cronGroup, .session]` →
+    /// `[.session]` doesn't "remove the middle" — it rebuilds the `.session`
+    /// destination at its new depth (0), tearing down and remounting the whole
+    /// `ChatScreen`. That surfaced first as a pop animation, then — once the pop
+    /// was suppressed — as a one-frame page flash the slide had been masking. No
+    /// path trim can avoid it, so the drill-in stays a plain push.
     func openCronGroupSession(_ sessionId: String) {
         Task {
             await activateSession(sessionId, ensureListed: true, appendToPath: true)

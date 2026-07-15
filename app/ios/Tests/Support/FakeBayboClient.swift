@@ -92,6 +92,9 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func failConnect(with error: Error) { lock.withLock { connectError = error } }
     func failSend(with error: Error) { lock.withLock { sendError = error } }
     func failCreateSession(with error: Error) { lock.withLock { createSessionError = error } }
+    /// Clear a prior `failCreateSession` — simulates the network coming back so a
+    /// stranded draft's next recovery attempt succeeds.
+    func succeedCreateSession() { lock.withLock { createSessionError = nil } }
     func failApproval(with error: Error) { lock.withLock { approvalError = error } }
 
     func answerSync(with frameJson: String) {
