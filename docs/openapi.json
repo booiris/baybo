@@ -3683,7 +3683,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted — `prefix_len` is a tripwire the client checks against the reconstructed count, `suffix` carries framing/sub-loop messages not in the log, e.g. compression & progress-observer spans) or `ChatMessage[]` (Inline); the client slices the message log it received from the overview call and appends any `suffix`.",
+            "description": "Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted) or `ChatMessage[]` (Inline). A larger `ToolCall.result.output` may be `{ $baybo_ref: 'session_tool_result', tool_use_id, attachments?, llm_images? }`; the client resolves both reference kinds against the session message log returned by the overview call, a persisted tool output to its transcript row's `ToolResult` content by `tool_use_id`.",
             "content": {
               "application/json": {
                 "schema": {}

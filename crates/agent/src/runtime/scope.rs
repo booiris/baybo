@@ -253,15 +253,14 @@ where
     value_result
 }
 
-/// LLM-call-aware variant of [`with_span`]: the body must always
+/// LLM-call span guard: the body must always
 /// produce an [`LlmCallResult`] alongside the success-or-error result,
 /// so the resulting `LlmSpanEnded` event fires on **every** terminal
 /// path — including provider errors, sanitize failures, mid-stream
 /// drops, and cancellations.
 ///
-/// `with_span`'s "Err → SpanFinalize::Empty" rule is the right
-/// behaviour for tool calls (no token economy attached) but for LLM
-/// calls it silently drops billing for any failed attempt that already
+/// A generic "Err → SpanFinalize::Empty" rule would silently drop billing
+/// for an LLM attempt that already
 /// consumed input tokens or streamed partial output. This helper
 /// closes that hole: callers compute a best-effort [`LlmCallResult`]
 /// (zero tokens when nothing was observed, partial counts when the

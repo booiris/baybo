@@ -35,7 +35,7 @@ agent/src/
 │   ├── billed_chat.rs        # cost-aware LLM call wrapper
 │   ├── error_recovery.rs     # retry / degrade policy
 │   ├── sandbox.rs            # SandboxAdapter glue for tool exec
-│   ├── scope.rs              # with_job / with_step / with_span guards
+│   ├── scope.rs              # with_job / with_step / with_span / LLM span guards
 │   ├── llm_pool.rs           # per-provider LlmClient pool
 │   ├── background_jobs.rs    # backgrounded-Bash sink + detached escort
 │   ├── progress_observer.rs  # out-of-band status emitter for long turns
@@ -72,6 +72,12 @@ One Actor per session: natural serialization within a session (no context races)
 
 `SpanRecorder` exposes short-lived `begin_step`/`end_step` and `begin_span`/`end_span` (closed with a `LifecycleOutcome`). `AgentLoop` and `ToolExecutor` must never hold locks while waiting for LLM calls or tool execution.
 
+Tool spans use `with_span`: `ToolExecutor` closes the span during execution with
+its result — either a `ToolCallOutput::Persisted` pointer keyed on the call's
+begin-time `tool_use_id`, or a smaller inline copy. Errors close immediately with
+`SpanFinalize::Empty`. The pointer resolves on read against the `ToolResult` row
+`AgentLoop` appends afterward.
+
 ### ToolExecutor responsibility
 
 ToolExecutor: lookup tool → validate trust/capability → consult approval gate → construct `ToolContext` → create child Job/Trace nodes → reveal placeholders in args → execute → sanitize output → write results. It does **not** decide whether a tool should be called — that's `AgentLoop`.
@@ -85,6 +91,12 @@ ToolExecutor: lookup tool → validate trust/capability → consult approval gat
 ### Tool-result formatting into LLM context
 
 After `ToolExecutor::execute` returns, `AgentLoop` renders the result into a text blob (`ToolOutput::Text` → raw; `ToolOutput::Json` → serialized; `ToolOutput::Error` and errors → a prefixed error line), then bridges the **detect/format split**: `context_manager.cap_tool_output` first (caps to `MAX_TOOL_OUTPUT_BYTES`, spilling oversize payloads under the workspace's tool-spills dir so the truncation notice lands inside the envelope), then `SecurityGateway::detect_injection` (the scan stays in `baybo-security`), then `baybo_context::prompts::tool_output::wrap_tool_output(&tool_name, &capped, &warning_rules)` (the `<tool_output>` envelope + breakout-escape + injection banner). The wrapped string populates `ContentBlock::ToolResult { content }`. The framing lives in `baybo-context`; only the scan stays in security, and the shared `</tool_output>` delimiter is `baybo_model::TOOL_OUTPUT_{OPEN,CLOSE}_PREFIX`.
+
+The tool span's copy of this result does not re-store the wrapped body: for a
+larger result the span holds a `ToolCallOutput::Persisted` pointer to the
+`ToolResult` row (by `tool_use_id`) that `ContextManager::append` writes here, so
+the payload lives once. Smaller results stay inline when that serializes smaller.
+See [trace.md](trace.md#toolcall-output-storage).
 
 ### Streaming delta reveal
 
