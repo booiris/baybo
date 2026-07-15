@@ -4,7 +4,7 @@
 //!
 //! * [`LifecycleOutcome`] — what *happened* once the lifecycle ended.
 //!   Has only the three terminal variants. Closing helpers
-//!   (`Step::close`, `Span::close`, `with_step`, `with_span`,
+//!   (`Step::close`, `Span::close`, `with_step`, the agent span guards,
 //!   `SpanRecorder::end_step`/`end_span`) take this type, so passing a
 //!   non-terminal value is a type error rather than a runtime error.
 //!

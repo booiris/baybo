@@ -345,6 +345,90 @@ async fn tool_call_round_trip_invokes_recording_tool() {
     harness.shutdown().await;
 }
 
+#[tokio::test]
+async fn large_tool_result_is_stored_once_and_trace_points_to_transcript() {
+    use baybo_store::{JobStore, SessionStore, TraceStore};
+    use baybo_trace::{SpanKind, ToolCallOutput};
+
+    let payload = format!("persist-this-tool-result:{}", "x".repeat(8 * 1024));
+    let tool = Arc::new(RecordingTool::new("large_echo"));
+    tool.set_response(ToolOutput::Text(payload.clone()));
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, tool.manifest())
+        .build();
+
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: "large-call-1".into(),
+            name: "large_echo".into(),
+            arguments: json!({}),
+            signature: None,
+        })]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("done".into())]);
+
+    harness.send_text("run it").await.unwrap();
+    harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let jobs = harness.job_store.list_all().await.unwrap();
+    let mut persisted = None;
+    for job in jobs {
+        for step in harness
+            .trace_store
+            .list_steps_by_job(&job.id)
+            .await
+            .unwrap()
+        {
+            let step = baybo_trace::Step::from_row(step).unwrap();
+            for row in harness
+                .trace_store
+                .list_spans_by_step(&step.id)
+                .await
+                .unwrap()
+            {
+                assert!(
+                    !row.data.contains(&payload),
+                    "large payload must not be cloned into the span row"
+                );
+                let span = baybo_trace::Span::from_row(row).unwrap();
+                if let SpanKind::ToolCall {
+                    result: Some(result),
+                    ..
+                } = span.kind
+                    && let ToolCallOutput::Persisted(reference) = result.output
+                {
+                    persisted = Some(reference);
+                }
+            }
+        }
+    }
+    let reference = persisted.expect("large result should use a transcript reference");
+    assert_eq!(reference.tool_use_id, "large-call-1");
+    let log = harness
+        .memory_session_store
+        .load_session_messages_with_supersede(&harness.session.id)
+        .await
+        .unwrap();
+    // The reference resolves against the transcript row carrying its
+    // tool_use_id, yielding the exact wrapped payload the model saw — the one
+    // stored copy — without a second copy in the span row.
+    let resolved = log
+        .iter()
+        .find_map(|row| reference.resolve(&row.message).ok())
+        .expect("referenced transcript row");
+    let serde_json::Value::String(text) = &resolved else {
+        panic!("text result should resolve to a bare string, got {resolved:?}");
+    };
+    assert!(
+        text.contains(&payload),
+        "resolved output must carry the payload"
+    );
+
+    harness.shutdown().await;
+}
+
 /// A `ContentBlock::File` shaped like one `BlobStore::put` mints. `digest_char`
 /// is splatted into the 64 hex chars of the digest (the content identity);
 /// `token` is the per-put read capability. Two blocks with the same

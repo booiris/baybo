@@ -40,7 +40,7 @@ pub enum SpanKind {
     },
     ToolCall {
         begin: ToolCallBegin,           // tool_name, tool_artifact_hash, triggered_by, params
-        result: Option<ToolCallResult>, // output, success (None while Pending)
+        result: Option<ToolCallResult>, // Inline/Persisted output, success (None while Pending)
     },
 }
 ```
@@ -86,17 +86,35 @@ pub enum ToolEventPayload {
 
 ### ToolCall output storage
 
-`ToolCallResult.output` is capped at `baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES`
-— the same budget the LLM transcript uses. The model never saw more than that
-either: its copy is capped *and* spilled to a file under the workspace, so
-storing the raw payload in the span only ever bought a third copy nobody reads
-(a single 285 KB `Grep` result once sat in a span verbatim). The cap is applied
-in `tool_output_to_trace_value` (`crates/agent/src/runtime/tool_executor.rs`)
-*after* the per-variant shaping, so the struct variants
-(`WithAttachments` / `MultiModalText`), which route through
-`serde_json::to_value`, cannot bypass it. When it cuts, the untruncated
-serialized length lands in `output_truncated_from` so the viewer says the output
-is partial rather than implying the tool returned only that much.
+`ToolCallResult.output` has the same compatibility split as LLM inputs:
+
+- **`Inline(Value)`** keeps the historical bare JSON wire shape (a `{ "type":
+  … }`-tagged value). Smaller results stay inline because a reference would cost
+  more bytes.
+- **`Persisted(PersistedToolCallOutput)`** points at the transcript row whose
+  `ToolResult.content` already carries the model-facing result, keyed by the
+  call's `tool_use_id` (a *begin-time* fact). It stores only that id plus the
+  out-of-band media blocks a `WithAttachments` / `MultiModalText` result carries
+  beside its text (`attachments` / `llm_images` — small `BlobRef` pointers that
+  never enter the `ToolResult` text). Resolution finds the block by `tool_use_id`
+  and returns its content verbatim — the raw wrapped, capped envelope the model
+  saw — so a text/json/error result resolves to that string and a media result
+  re-wraps it into the tagged object to keep the blob list.
+
+Because `tool_use_id` is known when the span opens, the tool span closes during
+execution — no deferred close, no waiting for the transcript ordinal. The write
+chooses `Persisted` only when its serialized pointer is smaller than the capped
+inline value. The pointer is written before `AgentLoop` appends the transcript
+row, so a rare append failure leaves it unresolvable rather than dangling
+silently: replay surfaces a visible `trace_reconstruction_error` for a
+`tool_use_id` with no matching `ToolResult`.
+
+The model-facing payload is still capped at
+`baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES` and any full value
+is content-addressed in the tool-spill directory; `output_truncated_from`
+retains the uncapped serialized length. `QueryApi::replay` resolves references
+server-side, while the per-job web endpoint leaves them compact and
+`resolveToolCallOutput` resolves them against the overview's one transcript log.
 
 ### Single-table persistence
 
@@ -132,7 +150,7 @@ step on the parent's own `AgentLoop`, so its `StepKind::Compression` / `LlmCall`
 spans live directly under the **parent** session and their `last_ordinal` /
 `prefix_len` are recorded against the parent's own transcript. Hydration reads
 each session's own log: `replay` passes the replayed `session_id` straight to
-`hydrate_persisted_inputs`, while `load_trace_overview` returns that same
+`hydrate_persisted_trace_data`, while `load_trace_overview` returns that same
 session's message log and `load_job_trace` leaves `Persisted` pointers intact for
 the web client to resolve via `hydratePersistedInput` against it. Every session
 resolves to itself.
@@ -152,7 +170,10 @@ marker path by a negative test.
 
 ### Synchronous lifecycle writes
 
-Every Step / Span lifecycle write is awaited inline before execution proceeds — `SpanRecorder::begin_*` / `end_*` return only once the row is durable — so the previous span's `end` and the current span's `begin` are always persisted before an LLM or tool request goes out. There is no deferred/background write path.
+Every Step / Span lifecycle write is awaited inline before execution proceeds —
+`SpanRecorder::begin_*` / `end_*` return only once the row is durable — so the
+previous span's `end` and the current span's `begin` are always persisted before
+an LLM or tool request goes out. There is no deferred/background write path.
 
 ### Recovery
 
