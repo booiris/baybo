@@ -530,11 +530,33 @@ final class AppStore: ObservableObject {
         chatPath.append(.cronGroup(jobId))
     }
 
-    /// Open a fire from inside its group: append, so the pop chain runs
-    /// chat → group → list (the archived screen's rule).
+    /// How long after a fire's push starts before the group is dropped from the
+    /// back stack. Comfortably past iOS's ~0.35s push so the drill-in slides in
+    /// whole; the drop itself is invisible (see `openCronGroupSession`).
+    private static let cronFireTrimDelay: Duration = .milliseconds(500)
+
+    /// Open a fire from inside its group. A fire drills IN with a normal push
+    /// (append over the fire list, so it slides in like any conversation), but
+    /// backing OUT of it lands on the MAIN list, not the fire list — unlike the
+    /// archived screen (chat → archived → list). A fire is an ordinary
+    /// conversation the group merely *collects*; once the user is reading one the
+    /// fire list is a step they passed through, not a place to return to.
+    ///
+    /// To get both, the group is dropped from the back stack once the push has
+    /// settled: removing a non-top entry leaves the pushed session mounted and
+    /// animates nothing, so the drill-in keeps its slide while the pop chain
+    /// becomes chat → list. (Resetting the path outright instead would skip the
+    /// fire list with no push at all — an abrupt swap where every other open
+    /// slides.) Guarded so a fast back-out before the trim can't turn the
+    /// reassignment into a re-push.
     func openCronGroupSession(_ sessionId: String) {
         Task {
             await activateSession(sessionId, ensureListed: true, appendToPath: true)
+            try? await Task.sleep(for: Self.cronFireTrimDelay)
+            guard chatPath.count == 2, chatPath.last == .session(sessionId) else { return }
+            if case .cronGroup = chatPath[0] {
+                chatPath = [.session(sessionId)]
+            }
         }
     }
 
