@@ -5,16 +5,18 @@ import Testing
 
 /// The retry sweep's leg gate.
 ///
-/// A transmission is only ever spent on the wire, so the sweep must not elect an
-/// entry it cannot actually send. It used to: `sweepOutbox` asked only "is a
-/// blind resend due?", and `resendOutboxEntry` bailed on its own `connected`
-/// guard AFTER that — BEFORE `recordTransmission`. So on a down leg
-/// `transmissions` stuck at 1 forever, `dueForBlindResend` stayed true,
-/// `resendExhausted` was never even evaluated, the entry could never reach
-/// `failed` (no red dot, ever), and the 3 s timer ran for the life of the store.
+/// A transmission is only ever spent on the wire, so the sweep must not RESEND an
+/// entry it cannot actually send. It used to make no progress at all on a down
+/// leg: `sweepOutbox` asked only "is a blind resend due?", and `resendOutboxEntry`
+/// bailed on its own `connected` guard AFTER that — BEFORE `recordTransmission`.
+/// So `transmissions` stuck at 1 forever, `dueForBlindResend` stayed true,
+/// `resendExhausted` was never even evaluated, and the 3 s timer ran for the life
+/// of the store. Now the leg gate only bounds RESENDS: on a down leg the sweep
+/// holds each entry and fails it once it outlives `queuedTimeout`, so an offline
+/// send surfaces the red dot rather than spinning forever.
 ///
-/// The clock is injected, so the 10 s echo window is crossed by hand; the sweep
-/// is stepped directly rather than slept through.
+/// The clock is injected, so the echo window / queued-lifetime cap are crossed by
+/// hand; the sweep is stepped directly rather than slept through.
 @Suite @MainActor
 struct ChatStoreOutboxSweepTests {
     private static let sessionId = "s-1"
@@ -53,20 +55,36 @@ struct ChatStoreOutboxSweepTests {
         return await waitUntil { store.connState == .connected }
     }
 
-    /// A down leg parks the sweep. The entry keeps its budget — it never reached
-    /// the wire, so nothing was spent — and stays `sending` for the reconnect to
-    /// resolve. The outbox exists precisely to outlive the outage; failing a
-    /// message because the network is down would be a lie.
-    @Test func aDownLegParksTheSweepAndSpendsNothing() async {
+    /// A down leg can't resend — the entry keeps its budget (it never reached the
+    /// wire) — but it is NOT parked: the sweep HOLDS the entry while its
+    /// queued-lifetime cap ticks. Short of the cap it stays `sending`; nothing is
+    /// spent and a brief outage still resolves on reconnect.
+    @Test func aDownLegHoldsTheEntryShortOfTheCap() async {
         client.failConnect(with: BayboError.Other(message: "no route to host"))
         store.connect()
         #expect(await waitUntil { store.connState == .offline })
-        enrolAndLapse()
+        outbox.beginSend(platformMsgId: Self.msgId, text: "hello", attachments: [])
 
-        #expect(store.sweepOutbox(), "the sweep stops rather than tick on a guard that can't pass")
+        clock.advance(OutboxStore.queuedTimeout - 1)
+        #expect(!store.sweepOutbox(), "held while the queued-lifetime cap ticks, not parked")
         #expect(entry()?.state == .sending)
         #expect(entry()?.transmissions == 1, "a transmission is only ever spent on the wire")
         #expect(client.transmissions.isEmpty)
+    }
+
+    /// Past the cap, a sustained outage IS a send failure: the entry flips to
+    /// `failed` — the red dot the user retries by hand — with still nothing on the
+    /// wire, rather than spinning forever.
+    @Test func aDownLegFailsTheEntryPastTheTimeout() async {
+        client.failConnect(with: BayboError.Other(message: "no route to host"))
+        store.connect()
+        #expect(await waitUntil { store.connState == .offline })
+        outbox.beginSend(platformMsgId: Self.msgId, text: "hello", attachments: [])
+
+        clock.advance(OutboxStore.queuedTimeout + 1)
+        store.sweepOutbox()
+        #expect(entry()?.state == .failed)
+        #expect(client.transmissions.isEmpty, "a down leg never spends a transmission")
     }
 
     /// The same entry on a LIVE leg is the case the sweep exists for: one blind

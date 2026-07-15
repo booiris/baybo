@@ -14,6 +14,13 @@ import Foundation
 /// total, then `failed` + the manual retry affordance. A rebased sync hides the
 /// floor, so an unconfirmed entry goes `unknown` and resolves via the per-key
 /// point lookup instead of blind-resending.
+///
+/// The outbox rides out a BRIEF outage silently (a spinner, not a failure — the
+/// message is queued, and reconnect drains it). But a SUSTAINED one is a real
+/// failure the user must see: an entry still `sending` past `queuedTimeout`
+/// (wall-clock, no wire in reach) flips to `failed` too, so an offline send
+/// surfaces the red dot rather than spinning forever. The reconnect gate then
+/// leaves it alone — it never silently auto-sends after being declared failed.
 enum OutboxEntryState: String, Codable {
     case sending
     case sent
@@ -58,6 +65,12 @@ final class OutboxStore {
     /// Retry-sweep cadence — fine-grained enough to fire within a few seconds of
     /// the 10 s no-echo deadline without busy-spinning.
     static let retryTick: Duration = .seconds(3)
+    /// Wall-clock lifetime cap for a still-unsent (`sending`) entry on a DOWN
+    /// leg. Past it a queued message is declared `failed` rather than left
+    /// spinning — a sustained outage IS a send failure. Sized at (not under) the
+    /// live-leg genuine-failure horizon (≈ `maxAutoTransmissions × echoTimeout`)
+    /// so it targets the offline case and never preempts the connected retry.
+    static let queuedTimeout: TimeInterval = 30
 
     private let sessionId: String
     private let directory: URL
@@ -106,6 +119,15 @@ final class OutboxStore {
 
     private func echoWindowLapsed(_ entry: OutboxEntry) -> Bool {
         now().timeIntervalSince1970 - entry.lastSentAt >= Self.echoTimeout
+    }
+
+    /// Whether a still-unsent entry has outlived the queued-lifetime cap — a
+    /// sustained down leg that should now surface as a failure. Only a `sending`
+    /// entry qualifies: an echoed (`sent`) entry already proved transport and is
+    /// merely awaiting durability, so a stalled mid-turn persist never fails it.
+    func queuedTooLong(_ entry: OutboxEntry) -> Bool {
+        entry.state == .sending
+            && now().timeIntervalSince1970 - entry.createdAt >= Self.queuedTimeout
     }
 
     /// Session ids with a persisted outbox. A relaunch reads this to find sends
@@ -183,18 +205,23 @@ final class OutboxStore {
     }
 
     /// Manual retry from the failed affordance: same key, the automatic-
-    /// transmission budget resets. Re-creates the entry if it was released.
+    /// transmission budget AND the queued-lifetime clock reset (a hand retry is a
+    /// fresh attempt — `createdAt` moves so the `queuedTimeout` cap starts over,
+    /// not instantly re-fires off the original enrolment). Re-creates the entry
+    /// if it was released.
     func resetForManualRetry(platformMsgId: String, text: String, attachments: [OutboxAttachment]) {
+        let at = now().timeIntervalSince1970
         if var entry = items[platformMsgId] {
             entry.state = .sending
             entry.transmissions = 0
+            entry.createdAt = at
             entry.lastSentAt = 0
             items[platformMsgId] = entry
         } else {
             items[platformMsgId] = OutboxEntry(
                 platformMsgId: platformMsgId, text: text, attachments: attachments,
                 state: .sending, transmissions: 0,
-                createdAt: now().timeIntervalSince1970, lastSentAt: 0)
+                createdAt: at, lastSentAt: 0)
         }
         persist()
     }

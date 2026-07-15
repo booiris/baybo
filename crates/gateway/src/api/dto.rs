@@ -424,6 +424,42 @@ pub struct CreateCronRequest {
     pub origin_session_id: Option<String>,
 }
 
+/// `PATCH /v1/cron/{id}` body: a partial edit of the job's authored fields.
+/// Every field is optional and named exactly as it is on [`CronJob`], so a
+/// client patches by sending back the subset it changed on the job it fetched.
+/// An absent field keeps the value the job already has, and a body that sets
+/// nothing at all is rejected — there is nothing to write, and answering with
+/// the unchanged job would tell the user their edit landed.
+///
+/// The scheduler's own fields (`status`, `next_trigger_at`,
+/// `last_triggered_at`) are not patchable: they are derived from the schedule,
+/// or moved by `POST /v1/cron/{id}/{pause,resume}`.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct UpdateCronRequest {
+    pub title: Option<String>,
+    pub prompt: Option<String>,
+    /// The new schedule, in the same tagged shape [`CronJob`] reports:
+    /// `{"kind":"cron","expr":"0 8 * * *"}` or
+    /// `{"kind":"at","time":"2026-07-15T08:00:00Z"}`. Swapping one kind for the
+    /// other is allowed — that is how a fired one-shot gets a new moment.
+    pub schedule: Option<CronSchedule>,
+    /// IANA timezone the cron expression is evaluated in. Changing it alone
+    /// reschedules the job: the same expression names a different instant in a
+    /// different zone.
+    pub timezone: Option<String>,
+}
+
+impl From<UpdateCronRequest> for baybo_cron::CronJobPatch {
+    fn from(v: UpdateCronRequest) -> Self {
+        Self {
+            title: v.title,
+            prompt: v.prompt,
+            schedule: v.schedule.map(Into::into),
+            timezone: v.timezone,
+        }
+    }
+}
+
 // ── Job ──────────────────────────────────────────────────────────────
 
 /// Wire mirror of [`baybo_job::JobStatus`]. Carries the same payload
@@ -628,7 +664,7 @@ impl From<baybo_cron::CronStatus> for CronStatus {
 }
 
 /// Mirror of [`baybo_cron::CronSchedule`].
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CronSchedule {
     Cron { expr: String },
@@ -640,6 +676,15 @@ impl From<baybo_cron::CronSchedule> for CronSchedule {
         match v {
             baybo_cron::CronSchedule::Cron { expr } => Self::Cron { expr },
             baybo_cron::CronSchedule::At { time } => Self::At { time },
+        }
+    }
+}
+
+impl From<CronSchedule> for baybo_cron::CronSchedule {
+    fn from(v: CronSchedule) -> Self {
+        match v {
+            CronSchedule::Cron { expr } => Self::Cron { expr },
+            CronSchedule::At { time } => Self::At { time },
         }
     }
 }
@@ -661,8 +706,21 @@ pub struct CronJob {
     pub next_trigger_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When the job was moved to the recycle bin. Absent on a live job.
+    /// A present value means the job never fires and is listed only by
+    /// `GET /v1/cron?deleted=true`, until `POST /v1/cron/{id}/restore`
+    /// brings it back. `status` is orthogonal — a deleted one-shot that
+    /// already fired stays `executed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_session_id: Option<String>,
+    /// Whether this job's **cron group** — the chat-list row collapsing its
+    /// fires — is pinned to the top of the list (`docs/cron-groups.md`).
+    /// `#[serde(default)]` so it is not required on the wire (defaults false),
+    /// matching `cron_group_pinned` on the chat-list summary.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl From<baybo_cron::CronJob> for CronJob {
@@ -680,9 +738,19 @@ impl From<baybo_cron::CronJob> for CronJob {
             next_trigger_at: v.next_trigger_at,
             created_at: v.created_at,
             updated_at: v.updated_at,
+            deleted_at: v.deleted_at,
             origin_session_id: v.origin_session_id.map(|s| s.into_inner()),
+            pinned: v.pinned,
         }
     }
+}
+
+/// Request body for `PUT /v1/cron/{id}/pin`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetCronPinRequest {
+    /// `true` to pin this job's cron group to the top of the chat list,
+    /// `false` to release it back to recency order.
+    pub pinned: bool,
 }
 
 // ── Log records ──────────────────────────────────────────────────────
@@ -1037,5 +1105,61 @@ impl From<baybo_tools::ToolDefinition> for ToolDefinition {
             description: v.description,
             parameters_schema: v.parameters_schema,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `PATCH` body names only what it changes, and the fields it leaves out
+    /// have to arrive as unset — not as `Some(default)`, which would blank the
+    /// job's title and rewrite its schedule with an empty cron expression. The
+    /// `Option`s carry that on their own; nothing here may make them required.
+    #[test]
+    fn a_patch_body_that_names_one_field_leaves_the_others_unset() {
+        let req: UpdateCronRequest = serde_json::from_str(r#"{"prompt": "new prompt"}"#).unwrap();
+        let patch: baybo_cron::CronJobPatch = req.into();
+
+        assert_eq!(patch.prompt.as_deref(), Some("new prompt"));
+        assert!(patch.title.is_none());
+        assert!(patch.schedule.is_none());
+        assert!(patch.timezone.is_none());
+        assert!(!patch.is_empty());
+        assert!(
+            !patch.reschedules(),
+            "a prompt edit does not move the fire times",
+        );
+    }
+
+    #[test]
+    fn an_empty_patch_body_sets_nothing() {
+        let req: UpdateCronRequest = serde_json::from_str("{}").unwrap();
+        assert!(baybo_cron::CronJobPatch::from(req).is_empty());
+    }
+
+    /// The schedule crosses the wire in the tagged shape `CronJob` reports it
+    /// in, so a client patches with the value it was given.
+    #[test]
+    fn a_patch_body_carries_either_kind_of_schedule() {
+        let cron: UpdateCronRequest =
+            serde_json::from_str(r#"{"schedule": {"kind": "cron", "expr": "0 8 * * *"}}"#).unwrap();
+        let patch = baybo_cron::CronJobPatch::from(cron);
+        assert_eq!(
+            patch.schedule,
+            Some(baybo_cron::CronSchedule::cron("0 8 * * *")),
+        );
+        assert!(patch.reschedules());
+
+        let at: UpdateCronRequest =
+            serde_json::from_str(r#"{"schedule": {"kind": "at", "time": "2026-07-15T08:00:00Z"}}"#)
+                .unwrap();
+        let patch = baybo_cron::CronJobPatch::from(at);
+        assert_eq!(
+            patch.schedule,
+            Some(baybo_cron::CronSchedule::at(
+                "2026-07-15T08:00:00Z".parse().unwrap()
+            )),
+        );
     }
 }

@@ -10,8 +10,10 @@ use tracing::{debug, error, info};
 
 use crate::error::CronError;
 use crate::shutdown::Shutdown;
-use baybo_model::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
-use baybo_store::{CronStore, ExecutionCompletion};
+use baybo_model::{
+    CronExecution, CronJob, CronJobPatch, CronSchedule, CronStatus, ExecutionStatus,
+};
+use baybo_store::{CronFire, CronStore, ExecutionCompletion};
 
 type Result<T> = std::result::Result<T, CronError>;
 
@@ -101,6 +103,12 @@ pub struct CronScheduler {
 /// reminders usable without burning DB queries on subsecond polling.
 const TICK_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How many times an in-place edit re-applies itself to a row that moved under
+/// it. A fire writes back once per slot, so an edit can lose to it at most once
+/// per attempt; the spare attempts cover a second scheduler instance racing on
+/// the same row.
+const UPDATE_ATTEMPTS: usize = 3;
+
 impl CronScheduler {
     pub fn new(
         store: Arc<dyn CronStore>,
@@ -127,24 +135,11 @@ impl CronScheduler {
             timezone,
             origin_session_id,
         } = spec;
-        validate_schedule(&schedule)?;
-        let tz = parse_timezone(&timezone)?;
+
+        validate_prompt(&prompt)?;
 
         let now = Utc::now();
-        let next_trigger_at = compute_next_trigger(&schedule, tz, now);
-        if next_trigger_at.is_none() {
-            // Only `At` with past time (Cron is infinite and never returns None here).
-            // Surface `now` in both UTC and the caller's timezone so the LLM can
-            // immediately self-correct on retry — the typical failure mode is the
-            // model not knowing what minute it is and computing `at` slightly into
-            // the past.
-            return Err(CronError::InvalidSchedule(format!(
-                "schedule {} has no future fire time (now is {} / {})",
-                schedule.display(),
-                now.to_rfc3339(),
-                now.with_timezone(&tz).to_rfc3339(),
-            )));
-        }
+        let next_trigger_at = arm_schedule(&schedule, &timezone, now)?;
 
         let job = CronJob {
             id: uuid::Uuid::new_v4().to_string(),
@@ -156,14 +151,106 @@ impl CronScheduler {
             timezone,
             status: CronStatus::Enabled,
             last_triggered_at: None,
-            next_trigger_at,
+            next_trigger_at: Some(next_trigger_at),
             created_at: now,
             updated_at: now,
             origin_session_id,
+            deleted_at: None,
+            pinned: false,
         };
 
         self.store.create(&job).await?;
         Ok(job)
+    }
+
+    /// Edit a cron job in place. The job keeps its id, and with it every
+    /// execution it has run and every conversation those fires opened — which is
+    /// what editing buys over deleting and recreating.
+    ///
+    /// `patch` writes only the fields it carries. Changing the schedule or the
+    /// timezone recomputes `next_trigger_at` **from now**: the slots that passed
+    /// under the old schedule are never back-filled, and an `At` whose instant
+    /// has already gone is refused, exactly as [`Self::enable_job`] refuses it.
+    ///
+    /// An edit does not decide whether the job runs — the user does:
+    ///
+    /// - A **paused** job stays paused, with no slot. Re-arming it here would
+    ///   quietly restart a job the user stopped, which is the same class of bug
+    ///   as a delete that keeps firing. [`Self::enable_job`] is the way back.
+    /// - A one-shot that already **fired** is re-armed by a schedule with a fire
+    ///   time left in it. "Move that reminder to tomorrow" is the whole point of
+    ///   editing a job rather than replacing it.
+    ///
+    /// A job in the recycle bin reads as absent, as it does everywhere else:
+    /// restore it first.
+    pub async fn update_job(&self, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
+        if patch.is_empty() {
+            return Err(CronError::EmptyUpdate(job_id.to_string()));
+        }
+        if let Some(prompt) = &patch.prompt {
+            validate_prompt(prompt)?;
+        }
+
+        self.edit_in_place(job_id, |job, now| {
+            patch.apply_to(job);
+
+            if patch.reschedules() {
+                // Validated even for a paused job, which is not armed with it: a
+                // schedule with no fire time left would be a job that can never
+                // be resumed, and the edit is the last chance to say so.
+                let next = arm_schedule(&job.schedule, &job.timezone, now)?;
+                match job.status {
+                    CronStatus::Disabled => job.next_trigger_at = None,
+                    CronStatus::Enabled | CronStatus::Executed => {
+                        job.status = CronStatus::Enabled;
+                        job.next_trigger_at = Some(next);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Change a job in place: read it, apply `change`, write the whole record
+    /// back — and do that against the row as it stands *now*, not as some
+    /// snapshot left it.
+    ///
+    /// Every in-place change goes through here (edit, pause, resume) because
+    /// they all rewrite the whole record, and the write is conditional on the
+    /// row still being the one that was read (see
+    /// [`CronStore::save_if_unchanged`]). A pause that wrote its snapshot back
+    /// unconditionally would revert an edit that landed in its window — the user
+    /// is told their new prompt saved, and it is gone by the next refetch — and
+    /// would forget a fire that landed there too. When the row moves, the change
+    /// is re-applied to it rather than fighting it.
+    async fn edit_in_place<F>(&self, job_id: &str, mut change: F) -> Result<CronJob>
+    where
+        F: FnMut(&mut CronJob, DateTime<Utc>) -> Result<()>,
+    {
+        for _ in 0..UPDATE_ATTEMPTS {
+            let current = self
+                .store
+                .get(job_id)
+                .await?
+                .filter(|job| !job.is_deleted())
+                .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
+
+            let mut updated = current.clone();
+            let now = Utc::now();
+            change(&mut updated, now)?;
+            updated.updated_at = now;
+
+            if self.store.save_if_unchanged(&updated, &current).await? {
+                return Ok(updated);
+            }
+            debug!(
+                job_id,
+                "cron job moved under an in-place edit; re-applying it to the row as it now stands"
+            );
+        }
+
+        Err(CronError::Contended(job_id.to_string()))
     }
 
     /// Stamp a fire's terminal state onto its execution row — see
@@ -205,86 +292,139 @@ impl CronScheduler {
             .collect())
     }
 
-    /// Delete a cron job by ID.
+    /// Move a cron job to the recycle bin. It stops firing and drops out of
+    /// every listing, but the row survives and stays resolvable by
+    /// [`Self::get_job`] — its execution records keep naming a real job, and
+    /// [`Self::restore_job`] can bring it back.
     pub async fn delete_job(&self, job_id: &str) -> Result<()> {
         self.store.delete(job_id).await.map_err(CronError::from)
     }
 
-    /// Advance a recurring job to its next fire slot and persist. Used
-    /// by both the tick-loop dedup path (already-recorded slot, advance
-    /// past it) and the normal-fire path (recompute after dispatch).
-    /// Failures are logged but not propagated — like
-    /// `mark_one_shot_executed`, the trigger has already gone out and
-    /// the row state is best-effort cleanup.
-    async fn advance_recurring(&self, job: &mut CronJob, now: DateTime<Utc>) {
-        let tz = parse_timezone_or_utc(&job.timezone, &job.id);
-        job.last_triggered_at = Some(now);
-        job.next_trigger_at = compute_next_trigger(&job.schedule, tz, now);
-        job.updated_at = now;
-        if let Err(e) = self.store.save(job).await {
-            error!(job_id = %job.id, error = %e, "failed to advance cron job after trigger");
+    /// Bring a job back from the recycle bin, with the status it was deleted
+    /// with.
+    ///
+    /// A job restored after slots came and went while it sat in the bin must
+    /// not fire for them: an enabled job's `next_trigger_at` is recomputed from
+    /// now — never back-filled, never a past instant — and an `At` one-shot
+    /// whose moment passed while deleted comes back disabled, since it has no
+    /// fire time left. The recomputed schedule is written **before** the row
+    /// becomes visible again, so a concurrent tick can never observe it live
+    /// with a stale slot.
+    pub async fn restore_job(&self, job_id: &str) -> Result<()> {
+        let mut job = self
+            .store
+            .get(job_id)
+            .await?
+            .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
+        if !job.is_deleted() {
+            return Ok(());
         }
+
+        let now = Utc::now();
+        let tz = parse_timezone_or_utc(&job.timezone, &job.id);
+        job.next_trigger_at = match job.status {
+            CronStatus::Enabled => compute_next_trigger(&job.schedule, tz, now),
+            CronStatus::Disabled | CronStatus::Executed => None,
+        };
+        if job.status == CronStatus::Enabled && job.next_trigger_at.is_none() {
+            info!(job_id = %job.id, "restored one-shot has no fire time left; restoring it disabled");
+            job.status = CronStatus::Disabled;
+        }
+        job.updated_at = now;
+        self.store.save(&job).await?;
+
+        self.store.restore(job_id).await.map_err(CronError::from)
     }
 
-    /// Transition a one-shot job to `Executed` and persist. Shared between
-    /// `trigger_now` and the tick loop so manual vs. scheduled firing
-    /// produce identical lifecycle effects. Failures are logged but not
-    /// propagated — the trigger event has already been dispatched, so
+    /// The recycle bin: every soft-deleted job, most recently deleted first.
+    pub async fn list_deleted_jobs(&self) -> Result<Vec<CronJob>> {
+        self.store.list_deleted().await.map_err(CronError::from)
+    }
+
+    /// Advance a recurring job to its next fire slot. Used by both the tick-loop
+    /// dedup path (already-recorded slot, advance past it) and the normal-fire
+    /// path (recompute after dispatch).
+    async fn advance_recurring(&self, job: &CronJob, now: DateTime<Utc>) {
+        let tz = parse_timezone_or_utc(&job.timezone, &job.id);
+        self.write_back(
+            job,
+            CronFire {
+                status: job.status.clone(),
+                next_trigger_at: compute_next_trigger(&job.schedule, tz, now),
+                last_triggered_at: now,
+                updated_at: now,
+            },
+        )
+        .await;
+    }
+
+    /// Transition a one-shot job to `Executed`. Shared between `trigger_now` and
+    /// the tick loop so manual vs. scheduled firing produce identical lifecycle
+    /// effects.
+    async fn mark_one_shot_executed(&self, job: &CronJob, now: DateTime<Utc>) {
+        self.write_back(
+            job,
+            CronFire {
+                status: CronStatus::Executed,
+                next_trigger_at: None,
+                last_triggered_at: now,
+                updated_at: now,
+            },
+        )
+        .await;
+    }
+
+    /// Stamp a fire onto the job it fired — see [`CronStore::record_fire`]. The
+    /// write lands only while the row is still the job this fire read: a pause,
+    /// a delete, or an in-place edit that arrives while the slot is firing must
+    /// win over it, or the job the user just stopped is re-armed from a stale
+    /// snapshot and keeps firing.
+    ///
+    /// Failures are logged, not propagated: the trigger has already gone out, so
     /// the row state is best-effort cleanup.
-    async fn mark_one_shot_executed(&self, job: &mut CronJob, now: DateTime<Utc>) {
-        job.status = CronStatus::Executed;
-        job.next_trigger_at = None;
-        job.last_triggered_at = Some(now);
-        job.updated_at = now;
-        if let Err(e) = self.store.save(job).await {
-            error!(job_id = %job.id, error = %e, "failed to mark one-shot cron job as executed");
+    async fn write_back(&self, job: &CronJob, fire: CronFire) {
+        match self.store.record_fire(job, fire).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(job_id = %job.id, "cron job was paused, deleted, or rescheduled mid-fire; leaving its schedule as it now stands")
+            }
+            Err(e) => {
+                error!(job_id = %job.id, error = %e, "failed to write a cron fire back to its job")
+            }
         }
     }
 
     /// Enable a cron job, recomputing the next trigger time. Returns an error
     /// if the job is an `At` schedule whose time has already passed — there
     /// is no future fire time to enable.
+    ///
+    /// A job in the recycle bin reads as absent, the way it does in every
+    /// listing: resuming it could not put it back on the schedule anyway
+    /// (`list_due` never sees it), so reporting success would promise a fire
+    /// that can never happen. `restore_job` is the only way back.
     pub async fn enable_job(&self, job_id: &str) -> Result<()> {
-        let mut job = self
-            .store
-            .get(job_id)
-            .await?
-            .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
-        let tz = parse_timezone(&job.timezone)?;
-
-        let now = Utc::now();
-        let next = compute_next_trigger(&job.schedule, tz, now);
-        if next.is_none() {
-            return Err(CronError::InvalidSchedule(format!(
-                "cannot enable cron job {job_id}: schedule {} has no future fire time \
-                 (now is {} / {})",
-                job.schedule.display(),
-                now.to_rfc3339(),
-                now.with_timezone(&tz).to_rfc3339(),
-            )));
-        }
-
-        job.status = CronStatus::Enabled;
-        job.next_trigger_at = next;
-        job.updated_at = now;
-
-        self.store.save(&job).await.map_err(CronError::from)
+        self.edit_in_place(job_id, |job, now| {
+            job.next_trigger_at = Some(arm_schedule(&job.schedule, &job.timezone, now)?);
+            job.status = CronStatus::Enabled;
+            Ok(())
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Disable a cron job, clearing its next trigger time.
+    ///
+    /// A job in the recycle bin reads as absent: it is already stopped, and
+    /// pausing it would rewrite the status `restore_job` promises to bring it
+    /// back with.
     pub async fn disable_job(&self, job_id: &str) -> Result<()> {
-        let mut job = self
-            .store
-            .get(job_id)
-            .await?
-            .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
-
-        let now = Utc::now();
-        job.status = CronStatus::Disabled;
-        job.next_trigger_at = None;
-        job.updated_at = now;
-
-        self.store.save(&job).await.map_err(CronError::from)
+        self.edit_in_place(job_id, |job, _now| {
+            job.status = CronStatus::Disabled;
+            job.next_trigger_at = None;
+            Ok(())
+        })
+        .await
+        .map(|_| ())
     }
 
     /// List all cron jobs for a user.
@@ -307,6 +447,19 @@ impl CronScheduler {
         self.store.get(job_id).await.map_err(CronError::from)
     }
 
+    /// Pin/unpin the job's **cron group** — the chat-list row collapsing its
+    /// fires (`docs/cron-groups.md`). Goes straight to the targeted store setter,
+    /// never through get→mutate→a full-blob write: `save` / `save_if_unchanged` /
+    /// `record_fire` all rewrite the whole row from a snapshot the caller holds,
+    /// and `record_fire` re-serializes it on every fire, so a read-modify-write
+    /// pin would be lost on the next tick. `false` when no such job exists.
+    pub async fn set_job_pinned(&self, job_id: &str, pinned: bool) -> Result<bool> {
+        self.store
+            .set_pinned(job_id, pinned)
+            .await
+            .map_err(CronError::from)
+    }
+
     /// Manually fire a cron job now, outside the regular schedule.
     ///
     /// Records an execution row (so the run is auditable) and dispatches the
@@ -316,11 +469,15 @@ impl CronScheduler {
     /// dispatch (the row is preserved for history; the `enabled` filter
     /// in `list_due` keeps it from re-firing), matching the tick path so
     /// manual vs scheduled firing have identical lifecycle effects.
+    ///
+    /// A job in the recycle bin does not fire, on demand no more than on
+    /// schedule: it reads as absent here, the way it does in every listing.
     pub async fn trigger_now(&self, job_id: &str) -> Result<CronExecution> {
-        let mut job = self
+        let job = self
             .store
             .get(job_id)
             .await?
+            .filter(|job| !job.is_deleted())
             .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
 
         let now = Utc::now();
@@ -339,7 +496,7 @@ impl CronScheduler {
 
         if job.is_one_shot() {
             info!(job_id = %job.id, "marking one-shot cron job as executed after manual trigger");
-            self.mark_one_shot_executed(&mut job, now).await;
+            self.mark_one_shot_executed(&job, now).await;
         }
 
         let mut updated = execution;
@@ -381,6 +538,13 @@ impl CronScheduler {
 
     /// Re-dispatch executions that were recorded as `Pending` but never
     /// reached `Dispatched` (crash between record and send).
+    ///
+    /// A `Pending` execution has never run — re-dispatching it *fires* the
+    /// job, so a job the user deleted in the meantime must be skipped here
+    /// exactly as it is in `list_due`. (This is not the delivery re-drive,
+    /// which replays an already-computed result and rightly runs for a deleted
+    /// job.) The skipped row is retired rather than left `Pending`, so a later
+    /// restore cannot resurrect the stale fire.
     async fn recover_pending(&self) {
         let pending = match self
             .store
@@ -395,6 +559,29 @@ impl CronScheduler {
         };
 
         for exec in pending {
+            match self.store.get(&exec.job_id).await {
+                Ok(Some(job)) if !job.is_deleted() => {}
+                Ok(_) => {
+                    info!(
+                        execution_id = %exec.id,
+                        job_id = %exec.job_id,
+                        "dropping pending cron execution: its job is no longer live"
+                    );
+                    if let Err(e) = self
+                        .store
+                        .update_execution_status(&exec.id, ExecutionStatus::Dispatched)
+                        .await
+                    {
+                        error!(execution_id = %exec.id, error = %e, "failed to retire dropped execution");
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    error!(execution_id = %exec.id, error = %e, "failed to resolve the job of a pending execution; leaving it for the next restart");
+                    continue;
+                }
+            }
+
             info!(
                 execution_id = %exec.id,
                 job_id = %exec.job_id,
@@ -430,7 +617,7 @@ impl CronScheduler {
             }
         };
 
-        for mut job in due {
+        for job in due {
             // The scheduled_fire_time is the next_trigger_at that was due.
             let scheduled_fire_time = match job.next_trigger_at {
                 Some(t) => t,
@@ -445,7 +632,7 @@ impl CronScheduler {
             {
                 Ok(true) => {
                     // Already recorded — advance past the slot and skip
-                    self.advance_recurring(&mut job, now).await;
+                    self.advance_recurring(&job, now).await;
                     continue;
                 }
                 Ok(false) => {}
@@ -477,9 +664,9 @@ impl CronScheduler {
             // Phase 2: Advance job schedule (before dispatch, so crash won't re-fire)
             if job.is_one_shot() {
                 info!(job_id = %job.id, "marking one-shot cron job as executed");
-                self.mark_one_shot_executed(&mut job, now).await;
+                self.mark_one_shot_executed(&job, now).await;
             } else {
-                self.advance_recurring(&mut job, now).await;
+                self.advance_recurring(&job, now).await;
             }
 
             // Phase 3: Dispatch trigger
@@ -520,6 +707,17 @@ fn normalize_cron_expression(expression: &str) -> String {
     }
 }
 
+/// The gate every prompt a job is armed with goes through, creation and
+/// in-place edit alike. Whitespace reads as blank: a caller padding a field it
+/// means to leave alone must not be able to hollow out a live job into one that
+/// keeps firing with nothing to say.
+fn validate_prompt(prompt: &str) -> Result<()> {
+    if prompt.trim().is_empty() {
+        return Err(CronError::BlankPrompt);
+    }
+    Ok(())
+}
+
 /// Parse-validate a schedule at creation time. Does not check whether the
 /// schedule has a future fire time — that's `compute_next_trigger`'s job.
 fn validate_schedule(schedule: &CronSchedule) -> Result<()> {
@@ -532,6 +730,35 @@ fn validate_schedule(schedule: &CronSchedule) -> Result<()> {
         }
         CronSchedule::At { .. } => Ok(()),
     }
+}
+
+/// Validate a schedule against the timezone it is read in, and resolve the fire
+/// time it arms the job with — the first one strictly after `now`.
+///
+/// The single gate every entry point that arms a job goes through, creation and
+/// in-place edit alike, so the two cannot drift on what they accept: a cron
+/// expression the parser rejects, a timezone we cannot evaluate against, or a
+/// one-shot whose instant has already gone.
+fn arm_schedule(
+    schedule: &CronSchedule,
+    timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    validate_schedule(schedule)?;
+    let tz = parse_timezone(timezone)?;
+
+    // A cron expression is infinite, so the miss is always an `At` in the past.
+    // Surface `now` in both UTC and the caller's timezone so the LLM can
+    // immediately self-correct on retry — the typical failure mode is the model
+    // not knowing what minute it is and computing `at` slightly into the past.
+    compute_next_trigger(schedule, tz, now).ok_or_else(|| {
+        CronError::InvalidSchedule(format!(
+            "schedule {} has no future fire time (now is {} / {})",
+            schedule.display(),
+            now.to_rfc3339(),
+            now.with_timezone(&tz).to_rfc3339(),
+        ))
+    })
 }
 
 /// Compute the next trigger time for a schedule after the given timestamp.
@@ -589,6 +816,11 @@ mod tests {
     use super::*;
     use crate::shutdown::NeverShutdown;
     use crate::test_support::InMemoryCronStore;
+    use async_trait::async_trait;
+    use baybo_store::cron::Result as StoreResult;
+    use parking_lot::Mutex;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn make_scheduler(
         store: InMemoryCronStore,
@@ -794,13 +1026,1364 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// The whole point of the recycle bin: a deleted job disappears from the
+    /// user's list and — the part that must never regress — the tick loop
+    /// refuses to fire it, however overdue it looks. The row itself survives.
     #[tokio::test]
-    async fn delete_job_removes_from_store() {
+    async fn deleted_job_leaves_the_listings_and_never_fires() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+
+        scheduler.delete_job(&job.id).await.unwrap();
+        backdate_next_trigger(&scheduler, &job.id).await;
+        scheduler.tick().await;
+
+        assert!(rx.try_recv().is_err(), "a deleted job must not fire");
+        assert!(scheduler.list_executions(&job.id).await.unwrap().is_empty());
+        assert!(scheduler.list_jobs("u1").await.unwrap().is_empty());
+        assert!(scheduler.list_all_jobs().await.unwrap().is_empty());
+
+        let stored = scheduler
+            .get_job(&job.id)
+            .await
+            .unwrap()
+            .expect("a deleted job still resolves by id");
+        assert!(stored.is_deleted());
+        assert_eq!(
+            stored.status,
+            CronStatus::Enabled,
+            "deletion leaves status alone"
+        );
+
+        let bin = scheduler.list_deleted_jobs().await.unwrap();
+        assert_eq!(bin.len(), 1);
+        assert_eq!(bin[0].id, job.id);
+    }
+
+    /// A job deleted with an overdue slot and restored later must come back
+    /// with a fresh future slot — not fire on restore, not back-fill the slots
+    /// it missed.
+    #[tokio::test]
+    async fn restore_recomputes_the_next_trigger_from_now() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+
+        scheduler.delete_job(&job.id).await.unwrap();
+        backdate_next_trigger(&scheduler, &job.id).await;
+
+        scheduler.restore_job(&job.id).await.unwrap();
+
+        let restored = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert!(!restored.is_deleted());
+        assert_eq!(restored.status, CronStatus::Enabled);
+        let next = restored
+            .next_trigger_at
+            .expect("restored enabled job fires");
+        assert!(next > Utc::now(), "restored into a past slot: {next}");
+
+        scheduler.tick().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a restore must not fire the slots missed while deleted"
+        );
+        assert_eq!(scheduler.list_jobs("u1").await.unwrap().len(), 1);
+        assert!(scheduler.list_deleted_jobs().await.unwrap().is_empty());
+    }
+
+    /// A one-shot whose instant passed while it sat in the bin has no fire time
+    /// left: it comes back disabled rather than enabled-with-a-past-slot.
+    #[tokio::test]
+    async fn restore_of_an_expired_one_shot_comes_back_disabled() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = scheduler
+            .create_job(spec(
+                "u1",
+                CronSchedule::at(Utc::now() + chrono::Duration::seconds(30)),
+                "later",
+            ))
+            .await
+            .unwrap();
+        scheduler.delete_job(&job.id).await.unwrap();
+
+        // Its moment passes while it is in the bin.
+        let mut stored = scheduler.store.get(&job.id).await.unwrap().unwrap();
+        stored.schedule = CronSchedule::at(Utc::now() - chrono::Duration::seconds(10));
+        scheduler.store.save(&stored).await.unwrap();
+
+        scheduler.restore_job(&job.id).await.unwrap();
+
+        let restored = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert!(!restored.is_deleted());
+        assert_eq!(restored.status, CronStatus::Disabled);
+        assert!(restored.next_trigger_at.is_none());
+
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A one-shot that already fired keeps `Executed` through the round trip —
+    /// status is orthogonal to deletion.
+    #[tokio::test]
+    async fn restore_keeps_an_executed_one_shot_executed() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = scheduler
+            .create_job(spec(
+                "u1",
+                CronSchedule::at(Utc::now() + chrono::Duration::seconds(30)),
+                "run once",
+            ))
+            .await
+            .unwrap();
+        backdate_next_trigger(&scheduler, &job.id).await;
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_ok());
+
+        scheduler.delete_job(&job.id).await.unwrap();
+        scheduler.restore_job(&job.id).await.unwrap();
+
+        let restored = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(restored.status, CronStatus::Executed);
+        assert!(restored.next_trigger_at.is_none());
+        assert!(!restored.is_deleted());
+    }
+
+    #[tokio::test]
+    async fn restore_of_a_live_job_leaves_its_schedule_alone() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "test").await;
+
+        scheduler.restore_job(&job.id).await.unwrap();
+
+        let unchanged = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.next_trigger_at, job.next_trigger_at);
+        assert_eq!(unchanged.status, CronStatus::Enabled);
+    }
+
+    #[tokio::test]
+    async fn restore_errors_for_missing_job() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let err = scheduler.restore_job("ghost").await.unwrap_err();
+        assert!(matches!(err, CronError::NotFound(_)));
+    }
+
+    /// A restored job resumes its cadence — it fires once when its recomputed
+    /// slot arrives, and does not make up the slots it slept through.
+    #[tokio::test]
+    async fn restore_fires_once_at_the_next_slot_not_a_catch_up_burst() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+
+        scheduler.delete_job(&job.id).await.unwrap();
+        backdate_next_trigger(&scheduler, &job.id).await;
+        scheduler.restore_job(&job.id).await.unwrap();
+
+        // The next slot arrives.
+        backdate_next_trigger(&scheduler, &job.id).await;
+        scheduler.tick().await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "the restored job resumed its cadence"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the slots missed while deleted were made up in a burst",
+        );
+
+        // And the cadence continues from there rather than re-firing the slot.
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_err());
+        let after = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert!(after.next_trigger_at.is_some_and(|t| t > Utc::now()));
+        assert_eq!(scheduler.list_executions(&job.id).await.unwrap().len(), 1);
+    }
+
+    /// Pause takes the job out of the firing set; resume puts it back with a
+    /// slot in the future, never the stale one it carried before.
+    #[tokio::test]
+    async fn pause_clears_the_slot_and_resume_recomputes_it_forward() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+        backdate_next_trigger(&scheduler, &job.id).await;
+
+        scheduler.disable_job(&job.id).await.unwrap();
+        let paused = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(paused.status, CronStatus::Disabled);
+        assert!(paused.next_trigger_at.is_none());
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_err(), "a paused job must not fire");
+
+        scheduler.enable_job(&job.id).await.unwrap();
+        let resumed = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(resumed.status, CronStatus::Enabled);
+        let next = resumed.next_trigger_at.expect("a resumed job is scheduled");
+        assert!(next > Utc::now(), "resumed into a past slot: {next}");
+
+        scheduler.tick().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "resume back-filled the slots missed while paused",
+        );
+    }
+
+    /// Manually firing a job is the one path that reaches a job by id rather
+    /// than through a listing, so it is the one path where a deleted job could
+    /// still fire. It must not.
+    #[tokio::test]
+    async fn trigger_now_refuses_a_deleted_job() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "test").await;
+        scheduler.delete_job(&job.id).await.unwrap();
+
+        let err = scheduler.trigger_now(&job.id).await.unwrap_err();
+        assert!(matches!(err, CronError::NotFound(_)), "{err:?}");
+
+        assert!(rx.try_recv().is_err(), "a deleted job fired on demand");
+        assert!(
+            scheduler.list_executions(&job.id).await.unwrap().is_empty(),
+            "a deleted job recorded an execution",
+        );
+    }
+
+    /// Resuming reaches a job by id too, and `get` resolves deleted jobs. A
+    /// job in the bin reads as absent to pause/resume: reporting success would
+    /// promise a fire that `list_due` can never produce, and the LLM tool would
+    /// tell the user their job is back on. Only `restore_job` brings a job back.
+    #[tokio::test]
+    async fn resuming_a_deleted_job_is_not_found() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+        scheduler.delete_job(&job.id).await.unwrap();
+
+        let err = scheduler.enable_job(&job.id).await.unwrap_err();
+        assert!(matches!(err, CronError::NotFound(_)), "{err:?}");
+
+        backdate_next_trigger(&scheduler, &job.id).await;
+        scheduler.tick().await;
+
+        assert!(rx.try_recv().is_err(), "a resumed-while-deleted job fired");
+        assert!(
+            scheduler
+                .get_job(&job.id)
+                .await
+                .unwrap()
+                .is_some_and(|j| j.is_deleted()),
+            "resume pulled the job out of the recycle bin",
+        );
+        assert!(scheduler.list_all_jobs().await.unwrap().is_empty());
+    }
+
+    /// Pausing a job in the bin would rewrite the status `restore_job` promises
+    /// to bring it back with — an enabled job would silently return paused.
+    #[tokio::test]
+    async fn pausing_a_deleted_job_is_not_found_and_leaves_the_restore_status_alone() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+        scheduler.delete_job(&job.id).await.unwrap();
+
+        let err = scheduler.disable_job(&job.id).await.unwrap_err();
+        assert!(matches!(err, CronError::NotFound(_)), "{err:?}");
+
+        scheduler.restore_job(&job.id).await.unwrap();
+        let restored = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(restored.status, CronStatus::Enabled);
+        assert!(restored.next_trigger_at.is_some());
+    }
+
+    /// The tick loop reads a due job, works, then writes it back. A delete
+    /// landing inside that window must survive the write-back — otherwise the
+    /// job the user just deleted is live again, and still firing.
+    #[tokio::test]
+    async fn a_delete_racing_the_tick_loops_write_back_is_not_undone() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+        backdate_next_trigger(&scheduler, &job.id).await;
+
+        // The snapshot the tick loop is holding, taken while the job was live.
+        let in_flight = scheduler.store.get(&job.id).await.unwrap().unwrap();
+        assert!(!in_flight.is_deleted());
+
+        scheduler.delete_job(&job.id).await.unwrap();
+
+        // The tick loop advances its snapshot to the next slot (`advance_recurring`).
+        scheduler.store.save(&in_flight).await.unwrap();
+
+        let after = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert!(
+            after.is_deleted(),
+            "the write-back resurrected a deleted job"
+        );
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_err(), "a resurrected job fired");
+        assert!(scheduler.list_all_jobs().await.unwrap().is_empty());
+    }
+
+    /// Boot recovery re-dispatches `Pending` executions — and a `Pending`
+    /// execution has never run, so re-dispatching it *fires* the job. A job
+    /// the user deleted in the crash window must not come back to life through
+    /// this door, and its orphaned row must not be left to try again next boot.
+    #[tokio::test]
+    async fn a_deleted_jobs_pending_execution_is_not_re_dispatched() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = scheduler
+            .create_job(spec(
+                "u1",
+                CronSchedule::at(Utc::now() + chrono::Duration::seconds(30)),
+                "remind me",
+            ))
+            .await
+            .unwrap();
+        let stored = scheduler.store.get(&job.id).await.unwrap().unwrap();
+        let exec = CronExecution::pending(&stored, Utc::now(), Utc::now());
+        scheduler.store.record_execution(&exec).await.unwrap();
+
+        scheduler.delete_job(&job.id).await.unwrap();
+        scheduler.recover_pending().await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a deleted job fired on boot recovery"
+        );
+
+        scheduler.restore_job(&job.id).await.unwrap();
+        scheduler.recover_pending().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "restoring the job resurrected the stale pending fire",
+        );
+    }
+
+    /// A live job's pending execution is the case boot recovery exists for:
+    /// the fire was recorded but the process died before it was dispatched.
+    #[tokio::test]
+    async fn a_live_jobs_pending_execution_is_re_dispatched() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = scheduler
+            .create_job(spec(
+                "u1",
+                CronSchedule::at(Utc::now() + chrono::Duration::seconds(30)),
+                "remind me",
+            ))
+            .await
+            .unwrap();
+        let stored = scheduler.store.get(&job.id).await.unwrap().unwrap();
+        let exec = CronExecution::pending(&stored, Utc::now(), Utc::now());
+        scheduler.store.record_execution(&exec).await.unwrap();
+
+        scheduler.recover_pending().await;
+
+        let event = rx
+            .try_recv()
+            .expect("the recorded fire was never dispatched");
+        assert_eq!(event.job_id, job.id);
+        assert_eq!(event.prompt, "remind me");
+    }
+
+    /// The tick loop reads a due job, fires it, then writes the advanced
+    /// schedule back. A pause landing inside that window must survive the
+    /// write-back — otherwise the stale snapshot re-arms the job and it keeps
+    /// firing, with the user's only stop control silently undone.
+    #[tokio::test]
+    async fn a_pause_racing_the_tick_loops_write_back_is_not_undone() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+        backdate_next_trigger(&scheduler, &job.id).await;
+
+        // The snapshot the tick loop is holding, taken while the job was enabled.
+        let in_flight = scheduler.store.get(&job.id).await.unwrap().unwrap();
+
+        scheduler.disable_job(&job.id).await.unwrap();
+
+        scheduler.advance_recurring(&in_flight, Utc::now()).await;
+
+        let after = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            CronStatus::Disabled,
+            "the tick write-back un-paused the job",
+        );
+        assert!(
+            after.next_trigger_at.is_none(),
+            "the tick write-back re-armed a paused job",
+        );
+    }
+
+    // ── In-place edit ──
+
+    fn patch_prompt(prompt: &str) -> CronJobPatch {
+        CronJobPatch {
+            prompt: Some(prompt.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn patch_schedule(schedule: CronSchedule) -> CronJobPatch {
+        CronJobPatch {
+            schedule: Some(schedule),
+            ..Default::default()
+        }
+    }
+
+    /// An edit writes the fields it carries and leaves everything else — the id
+    /// above all, which is what keeps the job's executions and their
+    /// conversations attached to it.
+    #[tokio::test]
+    async fn an_edit_writes_only_the_fields_it_carries() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "old prompt").await;
+
+        let updated = scheduler
+            .update_job(&job.id, patch_prompt("new prompt"))
+            .await
+            .unwrap();
+
+        assert_eq!(updated.id, job.id, "an edit re-minted the job");
+        assert_eq!(updated.prompt, "new prompt");
+        assert_eq!(updated.title, job.title);
+        assert_eq!(updated.schedule.display(), "0 9 * * *");
+        assert_eq!(updated.timezone, "UTC");
+        assert_eq!(updated.status, CronStatus::Enabled);
+        assert_eq!(
+            updated.next_trigger_at, job.next_trigger_at,
+            "a prompt edit moved the fire time",
+        );
+        assert_eq!(updated.created_at, job.created_at);
+
+        let stored = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(stored.prompt, "new prompt");
+        assert_eq!(scheduler.list_jobs("u1").await.unwrap().len(), 1);
+    }
+
+    /// A patch that sets nothing can only be a caller bug: there is nothing to
+    /// write, and succeeding would tell the user their job changed when it did
+    /// not.
+    #[tokio::test]
+    async fn an_edit_that_sets_nothing_is_refused() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "test").await;
+
+        let err = scheduler
+            .update_job(&job.id, CronJobPatch::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CronError::EmptyUpdate(_)), "{err:?}");
+    }
+
+    /// A job whose prompt is blank still holds its schedule: it fires on every
+    /// slot, forever, with nothing to say.
+    #[tokio::test]
+    async fn a_job_cannot_be_created_with_a_blank_prompt() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+
+        for blank in ["", "   ", "\n\t "] {
+            let err = scheduler
+                .create_job(spec("u1", CronSchedule::cron("0 9 * * *"), blank))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CronError::BlankPrompt), "{blank:?}: {err:?}");
+        }
+
+        assert!(scheduler.list_jobs("u1").await.unwrap().is_empty());
+    }
+
+    /// The same gate on the way in has to hold on the way through: an edit that
+    /// blanks the prompt would hollow out a job that is already armed.
+    #[tokio::test]
+    async fn an_edit_cannot_blank_a_live_jobs_prompt() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "summarize the news").await;
+
+        for blank in ["", "   "] {
+            let err = scheduler
+                .update_job(
+                    &job.id,
+                    CronJobPatch {
+                        prompt: Some(blank.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CronError::BlankPrompt), "{blank:?}: {err:?}");
+        }
+
+        let stored = scheduler.get_job(&job.id).await.unwrap().expect("job");
+        assert_eq!(stored.prompt, "summarize the news");
+        assert_eq!(stored.updated_at, job.updated_at);
+    }
+
+    #[tokio::test]
+    async fn a_new_schedule_is_armed_from_now() {
+        use chrono::Timelike;
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "test").await;
+
+        let updated = scheduler
+            .update_job(&job.id, patch_schedule(CronSchedule::cron("30 14 * * *")))
+            .await
+            .unwrap();
+
+        assert_eq!(updated.schedule.display(), "30 14 * * *");
+        let next = updated.next_trigger_at.expect("a rescheduled job fires");
+        assert!(next > Utc::now(), "armed into a past slot: {next}");
+        assert_eq!(next.hour(), 14);
+        assert_eq!(next.minute(), 30);
+    }
+
+    /// Changing only the timezone reschedules on its own: `0 9 * * *` in
+    /// Shanghai is 01:00 UTC, not 09:00.
+    #[tokio::test]
+    async fn a_new_timezone_alone_moves_the_fire() {
+        use chrono::Timelike;
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "test").await;
+        assert_eq!(job.next_trigger_at.unwrap().hour(), 9);
+
+        let updated = scheduler
+            .update_job(
+                &job.id,
+                CronJobPatch {
+                    timezone: Some("Asia/Shanghai".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.timezone, "Asia/Shanghai");
+        assert_eq!(
+            updated.next_trigger_at.unwrap().hour(),
+            1,
+            "9am Shanghai is 1am UTC",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_rejects_a_schedule_it_cannot_evaluate() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "test").await;
+
+        for patch in [
+            patch_schedule(CronSchedule::cron("not a cron")),
+            CronJobPatch {
+                timezone: Some("Mars/Olympus_Mons".to_string()),
+                ..Default::default()
+            },
+        ] {
+            let err = scheduler.update_job(&job.id, patch).await.unwrap_err();
+            assert!(matches!(err, CronError::InvalidSchedule(_)), "{err:?}");
+        }
+
+        let stored = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(stored.schedule.display(), "0 9 * * *");
+        assert_eq!(stored.timezone, "UTC");
+        assert_eq!(stored.next_trigger_at, job.next_trigger_at);
+    }
+
+    /// The same rule `enable_job` enforces: an `At` whose instant has gone has
+    /// no fire time to arm, so the edit is refused rather than parked as a job
+    /// that can never run.
+    #[tokio::test]
+    async fn an_at_that_has_already_passed_is_refused() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let fire_at = Utc::now() + chrono::Duration::minutes(5);
+        let job = scheduler
+            .create_job(spec("u1", CronSchedule::at(fire_at), "later"))
+            .await
+            .unwrap();
+
+        let err = scheduler
+            .update_job(
+                &job.id,
+                patch_schedule(CronSchedule::at(Utc::now() - chrono::Duration::minutes(1))),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CronError::InvalidSchedule(_)), "{err:?}");
+
+        let stored = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(stored.next_trigger_at, Some(fire_at), "the job was moved");
+    }
+
+    /// **Editing is not resuming.** A paused job keeps its place in the list
+    /// with no slot: an edit that quietly restarted it would be the same class
+    /// of bug as a delete that keeps firing.
+    #[tokio::test]
+    async fn editing_a_paused_job_does_not_re_arm_it() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+        scheduler.disable_job(&job.id).await.unwrap();
+
+        let updated = scheduler
+            .update_job(
+                &job.id,
+                CronJobPatch {
+                    prompt: Some("new prompt".to_string()),
+                    schedule: Some(CronSchedule::cron("*/5 * * * *")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.status, CronStatus::Disabled);
+        assert!(
+            updated.next_trigger_at.is_none(),
+            "the edit re-armed a paused job: {:?}",
+            updated.next_trigger_at,
+        );
+        assert_eq!(updated.prompt, "new prompt", "the edit itself was dropped");
+        assert_eq!(updated.schedule.display(), "*/5 * * * *");
+
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_err(), "an edited-while-paused job fired");
+
+        // The user's explicit resume is what puts it back on the schedule — and
+        // it arms the schedule the edit gave it.
+        scheduler.enable_job(&job.id).await.unwrap();
+        let resumed = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(resumed.status, CronStatus::Enabled);
+        assert!(resumed.next_trigger_at.is_some_and(|t| t > Utc::now()));
+    }
+
+    /// A job sitting on an overdue slot is rescheduled to a fire time **in the
+    /// future**. Arming it with anything else — the old slot, a back-filled
+    /// catch-up of everything it missed — turns an edit into a burst of fires.
+    #[tokio::test]
+    async fn an_edit_never_back_fills_the_slots_a_job_missed() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+        backdate_next_trigger(&scheduler, &job.id).await;
+
+        let updated = scheduler
+            .update_job(&job.id, patch_schedule(CronSchedule::cron("*/5 * * * *")))
+            .await
+            .unwrap();
+
+        let next = updated.next_trigger_at.expect("a rescheduled job fires");
+        assert!(
+            next > Utc::now(),
+            "the edit armed a slot in the past: {next}"
+        );
+
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_err(), "the edit fired the slots it missed");
+        assert!(scheduler.list_executions(&job.id).await.unwrap().is_empty());
+    }
+
+    /// The reason editing beats delete-and-recreate: "move that reminder to
+    /// tomorrow" re-arms the one-shot that already fired, and it keeps its id
+    /// and every execution it has run.
+    #[tokio::test]
+    async fn a_fired_one_shot_is_re_armed_by_a_new_at() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = scheduler
+            .create_job(spec(
+                "u1",
+                CronSchedule::at(Utc::now() + chrono::Duration::seconds(30)),
+                "remind me",
+            ))
+            .await
+            .unwrap();
+        backdate_next_trigger(&scheduler, &job.id).await;
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_ok(), "the one-shot fired");
+        assert_eq!(
+            scheduler.get_job(&job.id).await.unwrap().unwrap().status,
+            CronStatus::Executed,
+        );
+
+        let tomorrow = Utc::now() + chrono::Duration::days(1);
+        let updated = scheduler
+            .update_job(&job.id, patch_schedule(CronSchedule::at(tomorrow)))
+            .await
+            .unwrap();
+
+        assert_eq!(updated.id, job.id, "the reschedule re-minted the job");
+        assert_eq!(updated.status, CronStatus::Enabled);
+        assert_eq!(updated.next_trigger_at, Some(tomorrow));
+        assert_eq!(
+            scheduler.list_executions(&job.id).await.unwrap().len(),
+            1,
+            "the re-armed job lost the history it had already run",
+        );
+
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_err(), "the re-armed job fired immediately");
+    }
+
+    /// An edit that only changes the prompt of a fired one-shot does not bring
+    /// it back to life — nothing about the schedule moved, so there is nothing
+    /// to arm.
+    #[tokio::test]
+    async fn editing_a_fired_one_shots_prompt_leaves_it_executed() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = scheduler
+            .create_job(spec(
+                "u1",
+                CronSchedule::at(Utc::now() + chrono::Duration::seconds(30)),
+                "remind me",
+            ))
+            .await
+            .unwrap();
+        backdate_next_trigger(&scheduler, &job.id).await;
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_ok());
+
+        let updated = scheduler
+            .update_job(&job.id, patch_prompt("remind me differently"))
+            .await
+            .unwrap();
+
+        assert_eq!(updated.prompt, "remind me differently");
+        assert_eq!(updated.status, CronStatus::Executed);
+        assert!(updated.next_trigger_at.is_none());
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A job in the recycle bin reads as absent to an edit, as it does to
+    /// pause, resume, and manual firing: restore it first.
+    #[tokio::test]
+    async fn a_binned_job_cannot_be_edited() {
         let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
         let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "test").await;
         scheduler.delete_job(&job.id).await.unwrap();
-        let jobs = scheduler.list_jobs("u1").await.unwrap();
-        assert!(jobs.is_empty());
+
+        let err = scheduler
+            .update_job(&job.id, patch_prompt("new prompt"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CronError::NotFound(_)), "{err:?}");
+
+        let binned = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(binned.prompt, "test", "a binned job was edited");
+        assert!(binned.is_deleted());
+    }
+
+    #[tokio::test]
+    async fn editing_an_unknown_job_is_not_found() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let err = scheduler
+            .update_job("ghost", patch_prompt("x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CronError::NotFound(_)));
+    }
+
+    // ── An edit and a fire, racing ──
+    //
+    // An edit reads the job, recomputes its schedule, and writes it back; the
+    // tick loop reads the job, fires it, and writes its schedule back. Either
+    // can land inside the other's window, so both writes are conditional on the
+    // row still being the one they read — and the fire's write-back carries only
+    // the fields a fire owns, never the ones a user typed.
+
+    /// The window an edit's compare-and-swap exists for: it reads the job, and
+    /// the slot fires before it writes. Writing the pre-fire snapshot back would
+    /// re-arm a slot that already ran and forget that the job ever fired — so the
+    /// stale write is refused, and the edit lands on the row the fire left.
+    #[tokio::test]
+    async fn an_edit_that_straddles_a_fire_is_refused_and_re_applied() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = scheduler
+            .create_job(spec(
+                "u1",
+                CronSchedule::at(Utc::now() + chrono::Duration::seconds(30)),
+                "remind me",
+            ))
+            .await
+            .unwrap();
+        backdate_next_trigger(&scheduler, &job.id).await;
+
+        // What an in-flight edit read, a moment before the slot fired.
+        let read_before_the_fire = scheduler.store.get(&job.id).await.unwrap().unwrap();
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_ok(), "the slot fired");
+
+        // That edit now tries to write, carrying its pre-fire snapshot.
+        let mut stale = read_before_the_fire.clone();
+        stale.prompt = "remind me differently".to_string();
+        assert!(
+            !scheduler
+                .store
+                .save_if_unchanged(&stale, &read_before_the_fire)
+                .await
+                .unwrap(),
+            "a write carrying a pre-fire snapshot landed on the fired job",
+        );
+
+        let after = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(after.status, CronStatus::Executed, "the fire was undone");
+        assert!(
+            after.next_trigger_at.is_none(),
+            "the slot that already fired was re-armed",
+        );
+        assert!(
+            after.last_triggered_at.is_some(),
+            "the fire was forgotten by the write-back it raced",
+        );
+
+        // Which is what `update_job` does with the refusal: reload, re-apply.
+        // The edit lands on the fired row, so re-arming it is the caller's
+        // decision — a new `at` — rather than an accident of the race.
+        let tomorrow = Utc::now() + chrono::Duration::days(1);
+        let updated = scheduler
+            .update_job(&job.id, patch_schedule(CronSchedule::at(tomorrow)))
+            .await
+            .unwrap();
+        assert_eq!(updated.status, CronStatus::Enabled);
+        assert_eq!(updated.next_trigger_at, Some(tomorrow));
+        assert!(updated.last_triggered_at.is_some(), "the fire was lost");
+
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_err(), "the re-armed job fired immediately");
+        assert_eq!(
+            scheduler.list_executions(&job.id).await.unwrap().len(),
+            1,
+            "the fire the edit raced was duplicated",
+        );
+    }
+
+    /// The other side of that window: the edit lands first, and the fire's
+    /// write-back arrives carrying a snapshot read before it. The write-back
+    /// still has a fire to record — but it owns only when the job fired and
+    /// where its schedule goes next. The prompt the user just changed is not
+    /// its to revert.
+    #[tokio::test]
+    async fn a_fires_write_back_does_not_revert_an_edit_that_landed_mid_fire() {
+        let (scheduler, _rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "old prompt").await;
+        backdate_next_trigger(&scheduler, &job.id).await;
+
+        // The snapshot the tick loop is holding while the slot fires.
+        let in_flight = scheduler.store.get(&job.id).await.unwrap().unwrap();
+
+        scheduler
+            .update_job(&job.id, patch_prompt("new prompt"))
+            .await
+            .unwrap();
+
+        // The post-fire write-back, carrying that pre-edit snapshot.
+        scheduler.advance_recurring(&in_flight, Utc::now()).await;
+
+        let after = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.prompt, "new prompt",
+            "the fire's write-back reverted the user's edit",
+        );
+        assert!(
+            after.last_triggered_at.is_some(),
+            "the fire was not recorded",
+        );
+        assert!(
+            after.next_trigger_at.is_some_and(|t| t > Utc::now()),
+            "the job was not advanced past the slot it fired",
+        );
+    }
+
+    /// And when the edit that landed mid-fire *rescheduled* the job, the
+    /// write-back has nothing left to say: advancing the old schedule would
+    /// overwrite the fire time the user just chose. It is dropped whole.
+    #[tokio::test]
+    async fn a_reschedule_that_lands_mid_fire_is_not_advanced_away() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+        backdate_next_trigger(&scheduler, &job.id).await;
+
+        let in_flight = scheduler.store.get(&job.id).await.unwrap().unwrap();
+
+        let updated = scheduler
+            .update_job(&job.id, patch_schedule(CronSchedule::cron("0 9 * * *")))
+            .await
+            .unwrap();
+
+        scheduler.advance_recurring(&in_flight, Utc::now()).await;
+
+        let after = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(after.schedule.display(), "0 9 * * *");
+        assert_eq!(
+            after.next_trigger_at, updated.next_trigger_at,
+            "the write-back advanced the schedule the user had just replaced",
+        );
+        assert_eq!(after.status, CronStatus::Enabled);
+
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_err(), "the job fired on its old cadence");
+    }
+
+    /// What lands on a job's row between an edit's read and its conditional
+    /// write. Both are what an edit loses to in production; a test double is how
+    /// we land one inside a window that is otherwise microseconds wide.
+    enum Interference {
+        /// The slot fires: the tick loop's write-back stamps the job. The row
+        /// the edit re-reads has moved on to its next slot, and remembers that
+        /// it ran.
+        Fire,
+        /// The write is simply refused, the way the store refuses any write
+        /// whose row moved under it.
+        Refusal,
+        /// Another editor's patch lands: a new prompt, and nothing else. It
+        /// moves neither the status nor the slot — which is exactly why a write
+        /// that only checked those two would not see it, and would put the old
+        /// prompt back.
+        Edit(&'static str),
+    }
+
+    /// An [`InMemoryCronStore`] that interferes with an edit's conditional
+    /// write: each attempt pops the next [`Interference`], and an attempt with
+    /// none left goes through untouched.
+    struct ContendedStore {
+        inner: InMemoryCronStore,
+        pending: Mutex<VecDeque<Interference>>,
+        attempts: AtomicUsize,
+    }
+
+    impl ContendedStore {
+        fn new(pending: impl IntoIterator<Item = Interference>) -> Self {
+            Self {
+                inner: InMemoryCronStore::new(),
+                pending: Mutex::new(pending.into_iter().collect()),
+                attempts: AtomicUsize::new(0),
+            }
+        }
+
+        /// How many times an edit tried to write — the retry budget it spent.
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::Relaxed)
+        }
+
+        /// Queue interference once a test's setup is done, and count attempts
+        /// from here: pause and resume are in-place edits too, so a setup that
+        /// uses them writes through this same hook.
+        fn arm(&self, pending: impl IntoIterator<Item = Interference>) {
+            self.pending.lock().extend(pending);
+            self.attempts.store(0, Ordering::Relaxed);
+        }
+
+        /// The tick loop's write-back for `job`'s current slot, exactly as
+        /// [`CronScheduler::advance_recurring`] and
+        /// [`CronScheduler::mark_one_shot_executed`] compose it.
+        async fn fire(&self, job: &CronJob) {
+            let now = Utc::now();
+            let fire = if job.is_one_shot() {
+                CronFire {
+                    status: CronStatus::Executed,
+                    next_trigger_at: None,
+                    last_triggered_at: now,
+                    updated_at: now,
+                }
+            } else {
+                CronFire {
+                    status: job.status.clone(),
+                    next_trigger_at: compute_next_trigger(&job.schedule, chrono_tz::UTC, now),
+                    last_triggered_at: now,
+                    updated_at: now,
+                }
+            };
+            assert!(
+                self.inner.record_fire(job, fire).await.unwrap(),
+                "the injected fire did not land",
+            );
+        }
+
+        /// Another editor's prompt edit, applied to the row as it stands.
+        async fn edit(&self, job_id: &str, prompt: &str) {
+            let current = self.inner.get(job_id).await.unwrap().unwrap();
+            let mut edited = current.clone();
+            edited.prompt = prompt.to_string();
+            edited.updated_at = Utc::now();
+            assert!(
+                self.inner
+                    .save_if_unchanged(&edited, &current)
+                    .await
+                    .unwrap(),
+                "the injected edit did not land",
+            );
+        }
+    }
+
+    #[async_trait]
+    impl CronStore for ContendedStore {
+        async fn save_if_unchanged(&self, job: &CronJob, expected: &CronJob) -> StoreResult<bool> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            let interference = self.pending.lock().pop_front();
+            match interference {
+                Some(Interference::Fire) => self.fire(expected).await,
+                Some(Interference::Edit(prompt)) => self.edit(&job.id, prompt).await,
+                Some(Interference::Refusal) => return Ok(false),
+                None => {}
+            }
+            self.inner.save_if_unchanged(job, expected).await
+        }
+
+        async fn create(&self, job: &CronJob) -> StoreResult<()> {
+            self.inner.create(job).await
+        }
+        async fn get(&self, job_id: &str) -> StoreResult<Option<CronJob>> {
+            self.inner.get(job_id).await
+        }
+        async fn save(&self, job: &CronJob) -> StoreResult<()> {
+            self.inner.save(job).await
+        }
+        async fn set_pinned(&self, job_id: &str, pinned: bool) -> StoreResult<bool> {
+            self.inner.set_pinned(job_id, pinned).await
+        }
+        async fn record_fire(&self, expected: &CronJob, fire: CronFire) -> StoreResult<bool> {
+            self.inner.record_fire(expected, fire).await
+        }
+        async fn delete(&self, job_id: &str) -> StoreResult<()> {
+            self.inner.delete(job_id).await
+        }
+        async fn restore(&self, job_id: &str) -> StoreResult<()> {
+            self.inner.restore(job_id).await
+        }
+        async fn list_by_user(&self, user_id: &str) -> StoreResult<Vec<CronJob>> {
+            self.inner.list_by_user(user_id).await
+        }
+        async fn list_all(&self) -> StoreResult<Vec<CronJob>> {
+            self.inner.list_all().await
+        }
+        async fn list_enabled(&self) -> StoreResult<Vec<CronJob>> {
+            self.inner.list_enabled().await
+        }
+        async fn list_deleted(&self) -> StoreResult<Vec<CronJob>> {
+            self.inner.list_deleted().await
+        }
+        async fn list_due(&self, now_us: i64) -> StoreResult<Vec<CronJob>> {
+            self.inner.list_due(now_us).await
+        }
+        async fn record_execution(&self, exec: &CronExecution) -> StoreResult<()> {
+            self.inner.record_execution(exec).await
+        }
+        async fn list_executions_by_job(&self, job_id: &str) -> StoreResult<Vec<CronExecution>> {
+            self.inner.list_executions_by_job(job_id).await
+        }
+        async fn list_executions_by_user(&self, user_id: &str) -> StoreResult<Vec<CronExecution>> {
+            self.inner.list_executions_by_user(user_id).await
+        }
+        async fn has_execution_for_schedule(
+            &self,
+            job_id: &str,
+            scheduled_fire_time_us: i64,
+        ) -> StoreResult<bool> {
+            self.inner
+                .has_execution_for_schedule(job_id, scheduled_fire_time_us)
+                .await
+        }
+        async fn update_execution_status(
+            &self,
+            execution_id: &str,
+            status: ExecutionStatus,
+        ) -> StoreResult<()> {
+            self.inner
+                .update_execution_status(execution_id, status)
+                .await
+        }
+        async fn list_executions_by_status(
+            &self,
+            status: ExecutionStatus,
+        ) -> StoreResult<Vec<CronExecution>> {
+            self.inner.list_executions_by_status(status).await
+        }
+        async fn record_execution_completion(
+            &self,
+            execution_id: &str,
+            completion: ExecutionCompletion,
+        ) -> StoreResult<()> {
+            self.inner
+                .record_execution_completion(execution_id, completion)
+                .await
+        }
+        async fn mark_execution_notified(
+            &self,
+            execution_id: &str,
+            at: DateTime<Utc>,
+        ) -> StoreResult<()> {
+            self.inner.mark_execution_notified(execution_id, at).await
+        }
+        async fn list_executions_awaiting_delivery(&self) -> StoreResult<Vec<CronExecution>> {
+            self.inner.list_executions_awaiting_delivery().await
+        }
+    }
+
+    fn scheduler_over(
+        store: Arc<dyn CronStore>,
+    ) -> (CronScheduler, mpsc::Receiver<CronTriggerEvent>) {
+        let (tx, rx) = mpsc::channel(64);
+        (CronScheduler::new(store, tx, Arc::new(NeverShutdown)), rx)
+    }
+
+    /// The race the edit's retry loop is for, driven through `update_job`: the
+    /// slot fires between the read and the write. The edit must land on the row
+    /// the fire left — keeping the fire, not reverting the job to the overdue
+    /// slot it was read on, which would fire the same slot a second time.
+    #[tokio::test]
+    async fn an_edit_that_loses_to_a_fire_re_applies_itself_and_lands() {
+        let store = Arc::new(ContendedStore::new([Interference::Fire]));
+        let (scheduler, mut rx) = scheduler_over(Arc::clone(&store) as Arc<dyn CronStore>);
+        let job = create_prompt_cron(&scheduler, "u1", "*/5 * * * *", "old prompt").await;
+        backdate_next_trigger(&scheduler, &job.id).await;
+
+        let updated = scheduler
+            .update_job(&job.id, patch_prompt("new prompt"))
+            .await
+            .expect("the edit re-applies itself to the row the fire left");
+
+        assert_eq!(store.attempts(), 2, "the edit did not retry exactly once");
+        assert_eq!(
+            updated.prompt, "new prompt",
+            "the edit was lost to the fire"
+        );
+        assert!(
+            updated.last_triggered_at.is_some(),
+            "the edit reverted the job to its pre-fire snapshot, forgetting the fire",
+        );
+        assert!(
+            updated.next_trigger_at.is_some_and(|t| t > Utc::now()),
+            "the edit put the fired slot back: {:?}",
+            updated.next_trigger_at,
+        );
+
+        // Which is what a re-armed overdue slot would cost: the tick loop would
+        // fire it a second time.
+        scheduler.tick().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the slot the edit raced fired twice"
+        );
+        assert!(scheduler.list_executions(&job.id).await.unwrap().is_empty());
+    }
+
+    /// A pause rewrites the whole record from a snapshot, so an edit that lands
+    /// between its read and its write is squarely in its path. It must not be
+    /// reverted: the user was told the new prompt saved — a 200 with the new
+    /// prompt in the body — and would find the old one back on the next refetch,
+    /// with nothing anywhere reporting a failure.
+    #[tokio::test]
+    async fn pausing_a_job_does_not_revert_an_edit_that_landed_in_its_window() {
+        let store = Arc::new(ContendedStore::new([Interference::Edit("new prompt")]));
+        let (scheduler, _rx) = scheduler_over(Arc::clone(&store) as Arc<dyn CronStore>);
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "old prompt").await;
+
+        scheduler.disable_job(&job.id).await.unwrap();
+
+        assert_eq!(store.attempts(), 2, "the pause did not see the edit");
+        let after = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.prompt, "new prompt",
+            "the pause's write-back reverted the edit",
+        );
+        assert_eq!(after.status, CronStatus::Disabled, "the pause was lost");
+        assert!(after.next_trigger_at.is_none());
+    }
+
+    /// The same window, on the way back: a resume re-arms a job, and an edit
+    /// that landed while it was doing so keeps its prompt.
+    #[tokio::test]
+    async fn resuming_a_job_does_not_revert_an_edit_that_landed_in_its_window() {
+        let store = Arc::new(ContendedStore::new([]));
+        let (scheduler, _rx) = scheduler_over(Arc::clone(&store) as Arc<dyn CronStore>);
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "old prompt").await;
+        scheduler.disable_job(&job.id).await.unwrap();
+        store.arm([Interference::Edit("new prompt")]);
+
+        scheduler.enable_job(&job.id).await.unwrap();
+
+        assert_eq!(store.attempts(), 2, "the resume did not see the edit");
+        let after = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.prompt, "new prompt",
+            "the resume's write-back reverted the edit",
+        );
+        assert_eq!(after.status, CronStatus::Enabled, "the resume was lost");
+        assert!(after.next_trigger_at.is_some_and(|t| t > Utc::now()));
+    }
+
+    /// Two editors, one job — the web modal and the model's `CronUpdate`, say.
+    /// Neither moves the status or the slot, so a write conditioned on those two
+    /// alone would let both through and silently drop whichever landed first.
+    /// The second edit has to be re-applied to the row the first one left.
+    #[tokio::test]
+    async fn a_second_edit_does_not_silently_revert_the_first() {
+        let store = Arc::new(ContendedStore::new([Interference::Edit(
+            "the other editor's prompt",
+        )]));
+        let (scheduler, _rx) = scheduler_over(Arc::clone(&store) as Arc<dyn CronStore>);
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "old prompt").await;
+
+        let updated = scheduler
+            .update_job(
+                &job.id,
+                CronJobPatch {
+                    title: Some("Evening digest".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the title edit re-applies itself to the row the other editor left");
+
+        assert_eq!(store.attempts(), 2, "the title edit did not see the other");
+        assert_eq!(updated.title, "Evening digest");
+        assert_eq!(
+            updated.prompt, "the other editor's prompt",
+            "the title edit reverted the prompt the other editor had just written",
+        );
+        let after = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(after.title, "Evening digest");
+        assert_eq!(after.prompt, "the other editor's prompt");
+    }
+
+    /// An edit that never wins its write changes nothing at all — and says so.
+    /// A partial edit, or a success reported over a row that still holds the old
+    /// prompt, would be worse than the failure.
+    #[tokio::test]
+    async fn an_edit_that_keeps_losing_is_reported_as_contended() {
+        let store = Arc::new(ContendedStore::new(
+            std::iter::repeat_with(|| Interference::Refusal).take(UPDATE_ATTEMPTS),
+        ));
+        let (scheduler, _rx) = scheduler_over(Arc::clone(&store) as Arc<dyn CronStore>);
+        let job = create_prompt_cron(&scheduler, "u1", "0 9 * * *", "old prompt").await;
+
+        let err = scheduler
+            .update_job(&job.id, patch_prompt("new prompt"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CronError::Contended(_)), "{err:?}");
+        assert_eq!(
+            store.attempts(),
+            UPDATE_ATTEMPTS,
+            "the edit gave up early, or kept retrying past its budget",
+        );
+
+        let stored = scheduler.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(stored.prompt, "old prompt", "a lost edit landed anyway");
+        assert_eq!(stored.next_trigger_at, job.next_trigger_at);
+    }
+
+    /// Losing a write and re-applying the edit must not walk a paused job back
+    /// onto the schedule: the retry re-reads a row that is still paused, and the
+    /// second attempt arms it no more than the first.
+    #[tokio::test]
+    async fn a_contended_edit_still_does_not_re_arm_a_paused_job() {
+        let store = Arc::new(ContendedStore::new([]));
+        let (scheduler, mut rx) = scheduler_over(Arc::clone(&store) as Arc<dyn CronStore>);
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+        scheduler.disable_job(&job.id).await.unwrap();
+        store.arm([Interference::Refusal]);
+
+        let updated = scheduler
+            .update_job(&job.id, patch_schedule(CronSchedule::cron("*/5 * * * *")))
+            .await
+            .expect("the edit re-applies itself");
+
+        assert_eq!(store.attempts(), 2);
+        assert_eq!(updated.status, CronStatus::Disabled);
+        assert!(
+            updated.next_trigger_at.is_none(),
+            "a retry re-armed a paused job: {:?}",
+            updated.next_trigger_at,
+        );
+        assert_eq!(updated.schedule.display(), "*/5 * * * *");
+
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_err(), "an edited-while-paused job fired");
+    }
+
+    /// A fire carries its own copy of the prompt, title, schedule and timezone,
+    /// taken when it was recorded. An edit that lands after that cannot reach
+    /// into the fire already on its way and change what it does — nor rewrite
+    /// the history of what the job did run.
+    #[tokio::test]
+    async fn an_edit_cannot_change_a_fire_already_recorded() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "old prompt").await;
+        backdate_next_trigger(&scheduler, &job.id).await;
+
+        scheduler.tick().await;
+        let fired = rx.try_recv().expect("the slot fired");
+        assert_eq!(fired.prompt, "old prompt");
+
+        scheduler
+            .update_job(
+                &job.id,
+                CronJobPatch {
+                    title: Some("new title".to_string()),
+                    prompt: Some("new prompt".to_string()),
+                    schedule: Some(CronSchedule::cron("0 9 * * *")),
+                    timezone: Some("Asia/Shanghai".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let executions = scheduler.list_executions(&job.id).await.unwrap();
+        assert_eq!(executions.len(), 1, "the edit fired the job again");
+        let execution = &executions[0];
+        assert_eq!(
+            execution.prompt, "old prompt",
+            "an edit rewrote what a fire had already run",
+        );
+        assert_eq!(execution.title, "test job");
+        assert_eq!(execution.schedule.display(), "* * * * *");
+        assert_eq!(execution.timezone, "UTC");
+    }
+
+    /// An edit does not cancel a fire the job is already owed: a slot that came
+    /// due before the edit is still due after it, and it runs the prompt the
+    /// edit wrote — the fire is recorded when it happens, not when it was owed.
+    #[tokio::test]
+    async fn an_edit_that_moves_nothing_leaves_an_owed_fire_owed() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "old prompt").await;
+        backdate_next_trigger(&scheduler, &job.id).await;
+        let owed = scheduler
+            .get_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .next_trigger_at;
+
+        let updated = scheduler
+            .update_job(&job.id, patch_prompt("new prompt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.next_trigger_at, owed,
+            "a prompt edit moved a slot it was not asked to move",
+        );
+
+        scheduler.tick().await;
+        let fired = rx.try_recv().expect("the owed slot still fired");
+        assert_eq!(fired.prompt, "new prompt");
+        assert_eq!(scheduler.list_executions(&job.id).await.unwrap().len(), 1);
+    }
+
+    /// A rescheduled job fires once, when its new slot comes due — not once per
+    /// slot it spent overdue, and not again after.
+    #[tokio::test]
+    async fn a_rescheduled_job_fires_exactly_once_when_its_new_slot_comes_due() {
+        let (scheduler, mut rx) = make_scheduler(InMemoryCronStore::new());
+        let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
+        backdate_next_trigger(&scheduler, &job.id).await;
+
+        scheduler
+            .update_job(&job.id, patch_schedule(CronSchedule::cron("*/5 * * * *")))
+            .await
+            .unwrap();
+
+        scheduler.tick().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the edit's own slot is in the future; nothing was due",
+        );
+
+        backdate_next_trigger(&scheduler, &job.id).await;
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_ok(), "the new slot did not fire");
+
+        scheduler.tick().await;
+        assert!(rx.try_recv().is_err(), "the new slot fired twice");
+        assert_eq!(scheduler.list_executions(&job.id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -882,8 +2465,11 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             origin_session_id: None,
+            deleted_at: None,
+            pinned: false,
         };
         job.next_trigger_at = Some(Utc::now());
+        store.create(&job).await.unwrap();
         let mut exec = CronExecution::pending(&job, Utc::now(), Utc::now());
         exec.id = "ce-pending".to_string();
         store.record_execution(&exec).await.unwrap();

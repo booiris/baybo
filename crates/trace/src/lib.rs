@@ -28,8 +28,9 @@ pub use event::{SPAN_EVENT_TEXT_MAX_BYTES, SpanEvent, SpanEventKind, ToolEventPa
 pub use outcome::{LifecycleOutcome, LifecycleState};
 pub use recorder::{SpanRecorder, TraceEvent, TraceEventStream};
 pub use span::{
-    LlmCallBegin, LlmCallInputs, LlmCallResult, LlmToolCallRecord, Span, SpanFinalize, SpanHandle,
-    SpanKind, ToolCallBegin, ToolCallOrigin, ToolCallResult,
+    LlmCallBegin, LlmCallInputs, LlmCallResult, LlmToolCallRecord, PersistedToolCallOutput, Span,
+    SpanFinalize, SpanHandle, SpanKind, ToolCallBegin, ToolCallOrigin, ToolCallOutput,
+    ToolCallResult,
 };
 pub use step::{Step, StepHandle, StepKind};
 

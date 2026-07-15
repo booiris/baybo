@@ -943,6 +943,59 @@
         }
       }
     },
+    "/v1/chat/sessions/read": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "mark_sessions_read",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarkManyReadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Every named session's read cursor advanced to its newest ordinal"
+          },
+          "400": {
+            "description": "Batch too large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A named session is not visible to this client",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}": {
       "get": {
         "tags": [
@@ -1770,9 +1823,20 @@
           "cron"
         ],
         "operationId": "list_cron",
+        "parameters": [
+          {
+            "name": "deleted",
+            "in": "query",
+            "description": "Serve the recycle bin instead of the live list: the soft-deleted\njobs, most recently deleted first. Defaults to false, and the\ndefault list never carries a deleted job.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "All cron jobs",
+            "description": "Live cron jobs, or the recycle bin when `deleted=true`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1807,6 +1871,14 @@
                             "type": "string",
                             "format": "date-time"
                           },
+                          "deleted_at": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "format": "date-time",
+                            "description": "When the job was moved to the recycle bin. Absent on a live job.\nA present value means the job never fires and is listed only by\n`GET /v1/cron?deleted=true`, until `POST /v1/cron/{id}/restore`\nbrings it back. `status` is orthogonal — a deleted one-shot that\nalready fired stays `executed`."
+                          },
                           "id": {
                             "type": "string"
                           },
@@ -1829,6 +1901,10 @@
                               "string",
                               "null"
                             ]
+                          },
+                          "pinned": {
+                            "type": "boolean",
+                            "description": "Whether this job's **cron group** — the chat-list row collapsing its\nfires — is pinned to the top of the list (`docs/cron-groups.md`).\n`#[serde(default)]` so it is not required on the wire (defaults false),\nmatching `cron_group_pinned` on the chat-list summary."
                           },
                           "prompt": {
                             "type": "string"
@@ -1916,7 +1992,7 @@
             }
           },
           "400": {
-            "description": "Invalid schedule",
+            "description": "Invalid schedule, or a blank prompt",
             "content": {
               "application/json": {
                 "schema": {
@@ -1957,7 +2033,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Cron job record",
+            "description": "Cron job record, deleted or live",
             "content": {
               "application/json": {
                 "schema": {
@@ -2006,10 +2082,355 @@
         ],
         "responses": {
           "204": {
-            "description": "Cron job deleted"
+            "description": "Cron job moved to the recycle bin: it stops firing and leaves the default list, but the row survives — `GET /v1/cron/{id}` still resolves it, `GET /v1/cron?deleted=true` lists it, and `POST /v1/cron/{id}/restore` brings it back"
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Scheduler error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "update_cron",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCronRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The edited job, with the `next_trigger_at` the edit produced — a client need not refetch. Fields the body left out are unchanged. Editing the schedule or the timezone recomputes the next fire time from now: the slots the job missed are never back-filled. A paused job stays paused — it keeps `disabled` and no next trigger until `POST /v1/cron/{id}/resume` — while a one-shot that already fired is re-armed by an `at` still in the future",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CronJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body sets no field, blanks the prompt, or carries a schedule with no future fire time (an `at` whose moment has passed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job, or the job is in the recycle bin — `POST /v1/cron/{id}/restore` it before editing it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The edit kept losing to a concurrent write (the job fired while it was being applied). Nothing changed; retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Scheduler error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/cron/{id}/pause": {
+      "post": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "pause_cron",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Job paused: status is now `disabled` and it has no next trigger until resumed"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The pause kept losing to a concurrent write (the job fired, or was edited, while it was being applied). Nothing changed; retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Scheduler error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/cron/{id}/pin": {
+      "put": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "set_cron_pin",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetCronPinRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Pin state updated"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/cron/{id}/restore": {
+      "post": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "restore_cron",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Job restored from the recycle bin with the status it was deleted with; an enabled job's next trigger is recomputed from now, and a one-shot with no fire time left comes back paused"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Scheduler error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/cron/{id}/resume": {
+      "post": {
+        "tags": [
+          "cron"
+        ],
+        "operationId": "resume_cron",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cron job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Job resumed: status is now `enabled` and the next trigger is computed from now — missed slots are not backfilled"
+          },
+          "400": {
+            "description": "Schedule has no future fire time (a one-shot whose moment has passed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The resume kept losing to a concurrent write (the job was edited while it was being applied). Nothing changed; retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -3290,7 +3711,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted — `prefix_len` is a tripwire the client checks against the reconstructed count, `suffix` carries framing/sub-loop messages not in the log, e.g. compression & progress-observer spans) or `ChatMessage[]` (Inline); the client slices the message log it received from the overview call and appends any `suffix`.",
+            "description": "Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted) or `ChatMessage[]` (Inline). A larger `ToolCall.result.output` may be `{ $baybo_ref: 'session_tool_result', tool_use_id, attachments?, llm_images? }`; the client resolves both reference kinds against the session message log returned by the overview call, a persisted tool output to its transcript row's `ToolResult` content by `tool_use_id`.",
             "content": {
               "application/json": {
                 "schema": {}
@@ -3850,12 +4271,30 @@
             "type": "string",
             "format": "date-time"
           },
+          "cron_group_pinned": {
+            "type": "boolean",
+            "description": "Whether this row's **cron group** is pinned to the top of the chat list.\nRead off the live job (`cron_jobs.pinned`), so every fire of the job\ncarries the same value and the client folds it into the one group row —\nexactly as it already does for `cron_job_title`. The group is a view, so\nthe bit necessarily dies with the job: a tombstone group (job deleted,\nhistory kept) is always unpinned. `false` for a non-cron row."
+          },
+          "cron_job_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The cron job whose fire this conversation is, for the clients that\ncollapse a job's fires into one chat-list row (a **cron group** — a\nderived view, never a `session_folders` row; see `docs/cron-groups.md`).\n`None` for a user session, and for the one-shot fire workspaces the list\nnever returns anyway."
+          },
+          "cron_job_title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The label for that group: the job's **live** title while the job exists\n(so a rename propagates with no rewrite of any session), falling back to\nthe title snapshotted onto the fire at mint once the job is deleted.\n`None` only when both are unavailable — a pre-snapshot fire whose job is\ngone; clients leave those rows flat."
+          },
           "folder_id": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The user-created folder this session is filed under, or absent for\nuncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web\nsidebar groups rows by this id."
+            "description": "The user-created folder this session is filed under, or absent for\nuncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web\nsidebar groups rows by this id.\n\n**Ignored for a cron conversation** — those group by [`Self::cron_job_id`]\ninstead (see `docs/cron-groups.md`), so a fire can never be in a cron\ngroup and a user folder at once."
           },
           "hidden": {
             "type": "boolean",
@@ -4257,6 +4696,14 @@
             "type": "string",
             "format": "date-time"
           },
+          "deleted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the job was moved to the recycle bin. Absent on a live job.\nA present value means the job never fires and is listed only by\n`GET /v1/cron?deleted=true`, until `POST /v1/cron/{id}/restore`\nbrings it back. `status` is orthogonal — a deleted one-shot that\nalready fired stays `executed`."
+          },
           "id": {
             "type": "string"
           },
@@ -4279,6 +4726,10 @@
               "string",
               "null"
             ]
+          },
+          "pinned": {
+            "type": "boolean",
+            "description": "Whether this job's **cron group** — the chat-list row collapsing its\nfires — is pinned to the top of the list (`docs/cron-groups.md`).\n`#[serde(default)]` so it is not required on the wire (defaults false),\nmatching `cron_group_pinned` on the chat-list summary."
           },
           "prompt": {
             "type": "string"
@@ -4981,6 +5432,22 @@
           }
         }
       },
+      "MarkManyReadRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/chat/sessions/read`.",
+        "required": [
+          "session_ids"
+        ],
+        "properties": {
+          "session_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The sessions to mark fully read. Each cursor is advanced to that\nsession's newest ordinal, so — unlike the per-session route — the caller\nneeds no ordinal of its own. Sessions it cannot see are rejected; ids\nthat do not exist are skipped."
+          }
+        }
+      },
       "MarkReadRequest": {
         "type": "object",
         "description": "Request body for `PUT /v1/chat/sessions/{session_id}/read`.",
@@ -5178,6 +5645,19 @@
           "value": {
             "type": "object",
             "description": "JSON value written at `path`. Shape validated by `BayboConfig`."
+          }
+        }
+      },
+      "SetCronPinRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/cron/{id}/pin`.",
+        "required": [
+          "pinned"
+        ],
+        "properties": {
+          "pinned": {
+            "type": "boolean",
+            "description": "`true` to pin this job's cron group to the top of the chat list,\n`false` to release it back to recency order."
           }
         }
       },
@@ -5453,6 +5933,42 @@
             "description": "Per-request reasoning effort for providers that support it; see\n[`baybo_model::ReasoningEffort::ALL`] for legal values. Empty/absent\n= follow the LLM entry's own configured value."
           },
           "system_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "UpdateCronRequest": {
+        "type": "object",
+        "description": "`PATCH /v1/cron/{id}` body: a partial edit of the job's authored fields.\nEvery field is optional and named exactly as it is on [`CronJob`], so a\nclient patches by sending back the subset it changed on the job it fetched.\nAn absent field keeps the value the job already has, and a body that sets\nnothing at all is rejected — there is nothing to write, and answering with\nthe unchanged job would tell the user their edit landed.\n\nThe scheduler's own fields (`status`, `next_trigger_at`,\n`last_triggered_at`) are not patchable: they are derived from the schedule,\nor moved by `POST /v1/cron/{id}/{pause,resume}`.",
+        "properties": {
+          "prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schedule": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CronSchedule",
+                "description": "The new schedule, in the same tagged shape [`CronJob`] reports:\n`{\"kind\":\"cron\",\"expr\":\"0 8 * * *\"}` or\n`{\"kind\":\"at\",\"time\":\"2026-07-15T08:00:00Z\"}`. Swapping one kind for the\nother is allowed — that is how a fired one-shot gets a new moment."
+              }
+            ]
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "IANA timezone the cron expression is evaluated in. Changing it alone\nreschedules the job: the same expression names a different instant in a\ndifferent zone."
+          },
+          "title": {
             "type": [
               "string",
               "null"

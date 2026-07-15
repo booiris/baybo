@@ -877,6 +877,9 @@ export function ChatPage() {
           last_user_text: s.last_user_text ?? undefined,
           folder_id: s.folder_id ?? undefined,
           title: s.title ?? undefined,
+          agent_id: s.agent_id ?? undefined,
+          cron_job_id: s.cron_job_id ?? undefined,
+          cron_job_title: s.cron_job_title ?? undefined,
         }));
       });
     }
@@ -998,6 +1001,8 @@ export function ChatPage() {
         folder_id: s.folder_id ?? undefined,
         title: s.title ?? undefined,
         agent_id: s.agent_id ?? undefined,
+        cron_job_id: s.cron_job_id ?? undefined,
+        cron_job_title: s.cron_job_title ?? undefined,
       }));
       setSessions(existing);
       setSlashCommands(manifest?.items ?? []);
@@ -2370,6 +2375,33 @@ export function ChatPage() {
     [client],
   );
 
+  // Pin / unpin a cron GROUP. The bit lives on the JOB (`PUT /v1/cron/{id}/pin`),
+  // not on any session — the group is a view over the job's fires — so the
+  // optimistic flip has to touch every member row, which is what carries
+  // `cron_group_pinned` into the bucketing. The server answers with a
+  // session-less `Gap` (list-stale) rather than a SessionPatch, since no session
+  // changed; other tabs converge on their next list pull.
+  const handleToggleCronPin = useCallback(
+    async (jobId: string, pinned: boolean) => {
+      const flip = (want: boolean) =>
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.cron_job_id === jobId ? { ...s, cron_group_pinned: want } : s,
+          ),
+        );
+      flip(pinned);
+      const { error, response } = await client.PUT('/v1/cron/{id}/pin', {
+        params: { path: { id: jobId } },
+        body: { pinned },
+      });
+      if (error || !response.ok) {
+        console.warn('toggle cron group pin failed', jobId, error);
+        flip(!pinned);
+      }
+    },
+    [client],
+  );
+
   // ── Folder handlers ────────────────────────────────────────────────
   // Assign (or clear, with null) a session's folder. Optimistic; the
   // server's SessionPatch broadcast converges every tab. A pinned row
@@ -2645,6 +2677,7 @@ export function ChatPage() {
         onNewChat={handleNewChat}
         onHide={handleHideSession}
         onTogglePin={handleTogglePin}
+        onToggleCronPin={handleToggleCronPin}
         onAssignFolder={handleAssignFolder}
         onCreateFolder={handleCreateFolder}
         onRenameFolder={handleRenameFolder}
@@ -4453,6 +4486,10 @@ function applySessionPatch(
   const idx = prev.findIndex((s) => s.session_id === sessionId);
   if (idx === -1) {
     if (patch.created_at == null || patch.last_active == null) return prev;
+    // No cron fields here, and that is sound: only `POST /v1/chat/sessions`
+    // broadcasts a row-constructing Created patch, and a cron fire is never
+    // minted through it. A fire announces itself with `SessionActivity` for an
+    // unknown id, which triggers the list refetch that carries its grouping.
     return [
       {
         session_id: sessionId,
@@ -4483,6 +4520,11 @@ function applySessionPatch(
     // so a later patch missing the field keeps whatever this row already
     // has rather than clearing it.
     agent_id: current.agent_id ?? patch.agent_id,
+    // Cron grouping is read off the session's trigger and never changes, so no
+    // patch carries it — but it must survive the merge, or a title/pin patch
+    // would silently drop the row out of its cron group.
+    cron_job_id: current.cron_job_id,
+    cron_job_title: current.cron_job_title,
   };
   if (
     merged.created_at === current.created_at &&

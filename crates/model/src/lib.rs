@@ -26,8 +26,8 @@ pub use approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAcce
 pub use control_event::{ControlEvent, ControlEventKind};
 pub use cost::{CallReason, CostRecord, CostSummary, TimeRange};
 pub use cron::{
-    CronExecution, CronJob, CronSchedule, CronStatus, ExecutionOutcome, ExecutionStatus,
-    PendingCronResult,
+    CronExecution, CronJob, CronJobPatch, CronSchedule, CronStatus, ExecutionOutcome,
+    ExecutionStatus, PendingCronResult,
 };
 pub use external_agent::{
     BAYBO_BACKEND_TAG, ExternalAgentKind, SubagentBackend, SubagentBackendKind, SubagentBackendTag,

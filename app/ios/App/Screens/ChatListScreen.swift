@@ -63,15 +63,17 @@ struct ChatListScreen: View {
     /// Anything under ~300ms lands mid-teardown and is within noise of 0.
     private static let swipeDismissal: Duration = .milliseconds(660)
 
+    /// What the list renders: ordinary conversations plus one row per **cron
+    /// group** (each scheduled job's fires, collapsed — `docs/cron-groups.md`).
     /// Archived rows live under the ☰ menu's Archived screen, not here.
-    private var visibleRows: [SessionRow] {
-        index.sorted.filter { !$0.archived }
+    private var listItems: [ChatListItem] {
+        ChatListBuckets.items(from: index.rows)
     }
 
     var body: some View {
         ZStack(alignment: .top) {
             Group {
-                if visibleRows.isEmpty {
+                if listItems.isEmpty {
                     emptyState
                 } else {
                     sessionList
@@ -111,6 +113,15 @@ struct ChatListScreen: View {
                 Task { await refresh() }
             }
         }
+        // The gateway says our list mirror is behind — a `SessionActivity` for a
+        // session this device has never listed, or a `Gap` that dropped one. This
+        // is the ONLY live path by which a brand-new row (a cron fire, a chat
+        // started on another client) can appear while the user is parked here;
+        // without it, a scheduled job fires and the list shows nothing at all
+        // until the app is backgrounded or pulled. See `SessionIndex.noteListStale`.
+        .onChange(of: index.listStaleEpoch) { _, _ in
+            Task { await refresh() }
+        }
         #if DEBUG
             .task {
                 if ProcessInfo.processInfo.arguments.contains("-baybo-demo-refresh") {
@@ -122,50 +133,10 @@ struct ChatListScreen: View {
 
     private var sessionList: some View {
         List {
-            ForEach(visibleRows) { row in
-                Button {
-                    appStore.openSession(row.id)
-                } label: {
-                    SessionRowView(
-                        row: row,
-                        langCode: lang.current.lproj
-                    )
-                }
-                // CONSTANT background — the pinned tint lives in the row content
-                // (see SessionRowView), so a pin flip is a pure move, not a
-                // background-config swap that would blank the sliding row.
-                .listRowBackground(Theme.paper)
-                .listRowSeparatorTint(Theme.line)
-                .listRowInsets(
-                    EdgeInsets(top: 0, leading: Self.rowHInset, bottom: 0, trailing: Self.rowHInset))
-                // Native swipe (real UIKit feel): first action = edge-most =
-                // the full-swipe commit (archive). Grey archive, red delete.
-                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    Button {
-                        archive(row)
-                    } label: {
-                        Label(lang.t("list.archive"), systemImage: "archivebox")
-                    }
-                    .tint(Theme.inkSoft)
-                    Button(role: .destructive) {
-                        appStore.promptDeleteSession(row.id)
-                    } label: {
-                        Label(lang.t("list.delete"), systemImage: "trash")
-                    }
-                    .tint(Theme.err)
-                }
-                // Leading (right-)swipe toggles pin: a pinned row offers unpin.
-                // No full-swipe — the button must be tapped (pin isn't
-                // destructive enough to want an accidental fling committing it).
-                .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                    Button {
-                        togglePin(row)
-                    } label: {
-                        Label(
-                            lang.t(row.pinned ? "list.unpin" : "list.pin"),
-                            systemImage: row.pinned ? "pin.slash.fill" : "pin.fill")
-                    }
-                    .tint(Theme.ink)
+            ForEach(listItems) { item in
+                switch item {
+                case .chat(let row): chatRow(row)
+                case .cronGroup(let group): cronGroupRow(group)
                 }
             }
         }
@@ -195,6 +166,105 @@ struct ChatListScreen: View {
                     if pullPeak >= Self.pullThreshold { triggerRefresh() }
                 }
             }
+        }
+    }
+
+    /// An ordinary conversation: tap opens it; trailing swipe archives / deletes,
+    /// leading swipe pins.
+    @ViewBuilder private func chatRow(_ row: SessionRow) -> some View {
+        Button {
+            appStore.openSession(row.id)
+        } label: {
+            SessionRowView(row: row, langCode: lang.current.lproj)
+        }
+        // CONSTANT background — the pinned tint lives in the row content
+        // (see SessionRowView), so a pin flip is a pure move, not a
+        // background-config swap that would blank the sliding row.
+        .listRowBackground(Theme.paper)
+        .listRowSeparatorTint(Theme.line)
+        .listRowInsets(
+            EdgeInsets(top: 0, leading: Self.rowHInset, bottom: 0, trailing: Self.rowHInset))
+        // Native swipe (real UIKit feel): first action = edge-most =
+        // the full-swipe commit (archive). Grey archive, red delete.
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button {
+                archive(row)
+            } label: {
+                Label(lang.t("list.archive"), systemImage: "archivebox")
+            }
+            .tint(Theme.inkSoft)
+            Button(role: .destructive) {
+                appStore.promptDeleteSession(row.id)
+            } label: {
+                Label(lang.t("list.delete"), systemImage: "trash")
+            }
+            .tint(Theme.err)
+        }
+        // Leading (right-)swipe toggles pin: a pinned row offers unpin.
+        // No full-swipe — the button must be tapped (pin isn't
+        // destructive enough to want an accidental fling committing it).
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            Button {
+                togglePin(row)
+            } label: {
+                Label(
+                    lang.t(row.pinned ? "list.unpin" : "list.pin"),
+                    systemImage: row.pinned ? "pin.slash.fill" : "pin.fill")
+            }
+            .tint(Theme.ink)
+        }
+    }
+
+    /// A cron group: tap pushes that job's fires.
+    ///
+    /// **Two swipe actions: mark-all-read (trailing) and pin (leading).**
+    /// Archive / delete are still absent — those are affordances of an *object*,
+    /// and a group is a view, so there is nothing a delete could remove. Pin is
+    /// the exception, and only because the bit has a real home: it lives on the
+    /// cron JOB, the one object whose identity matches the group. Mark-all-read
+    /// exists because the badge needs an exit — a `*/30` job is one row wearing a
+    /// `48`. Neither is a full-swipe: a fling must not silently wipe 48 unread
+    /// markers, and a pin is not destructive enough to want one either.
+    @ViewBuilder private func cronGroupRow(_ group: CronGroup) -> some View {
+        Button {
+            appStore.openCronGroup(group.jobId)
+        } label: {
+            CronGroupRowView(group: group, langCode: lang.current.lproj)
+        }
+        .listRowBackground(Theme.paper)
+        .listRowSeparatorTint(Theme.line)
+        .listRowInsets(
+            EdgeInsets(top: 0, leading: Self.rowHInset, bottom: 0, trailing: Self.rowHInset))
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            if group.unread > 0 {
+                Button {
+                    appStore.requestMarkGroupRead(group.memberIds)
+                } label: {
+                    Label(lang.t("list.markAllRead"), systemImage: "checkmark.circle")
+                }
+                .tint(Theme.inkSoft)
+            }
+        }
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            Button {
+                toggleCronPin(group)
+            } label: {
+                Label(
+                    lang.t(group.pinned ? "list.unpin" : "list.pin"),
+                    systemImage: group.pinned ? "pin.slash.fill" : "pin.fill")
+            }
+            .tint(Theme.ink)
+        }
+    }
+
+    /// Same deferral as a chat row's pin: UIKit's `.swipeActions` teardown stalls
+    /// List's reorder, so the row's new slot sits blank if the request lands
+    /// while the swipe is still collapsing. Haptic fires on the tap.
+    private func toggleCronPin(_ group: CronGroup) {
+        Haptics.tap()
+        Task { @MainActor in
+            try? await Task.sleep(for: Self.swipeDismissal)
+            appStore.requestCronPin(jobId: group.jobId, pinned: !group.pinned)
         }
     }
 
@@ -327,22 +397,16 @@ struct SessionRowView: View {
     /// can't diverge from the chrome language).
     let langCode: String
 
-    /// The window (in days from today) over which the time column shows a
-    /// weekday name rather than a clock time (today) or a calendar date (older).
-    private static let weekdayWindow: Range<Int> = 1..<7
-
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            textColumn
-                .frame(maxWidth: .infinity, alignment: .leading)
-            metaColumn
-        }
-        // Taller blocks with room for the preview to wrap to two lines. minHeight
-        // keeps short rows (a one-line preview, or a headline-only session with no
-        // message yet) from collapsing shorter than the two-line rows, so the list
-        // reads as one even block height.
-        .frame(minHeight: 52)
-        .padding(.vertical, 15)
+        ChatRowBody(
+            headline: headline,
+            headlineIsSet: hasHeadline,
+            preview: row.preview,
+            lastActive: row.lastActive,
+            unread: row.unread,
+            langCode: langCode,
+            glyph: nil
+        )
         // The pinned ground, drawn in-content rather than as the cell's
         // background configuration; negative gutter bleeds it edge-to-edge.
         .background {
@@ -362,29 +426,6 @@ struct SessionRowView: View {
     /// Longest user-message snippet the bold headline shows before the title
     /// pass has run — a compact title stand-in, not the full message.
     private static let headlineMaxChars = 8
-
-    /// Left column: a bold headline over the grey last-message preview. The
-    /// headline is the conversation title, or — before the title pass runs — a
-    /// short snippet of the user's most recent message; the preview line below
-    /// is the latest message from either side.
-    private var textColumn: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(verbatim: headline)
-                .font(Theme.sys(15, weight: .bold))
-                .foregroundStyle(hasHeadline ? Theme.ink : Theme.inkSoft)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            if let preview = row.preview, !preview.isEmpty {
-                Text(verbatim: preview)
-                    .font(Theme.sys(14))
-                    .foregroundStyle(Theme.inkSoft)
-                    .lineLimit(2)
-                    .lineSpacing(3)
-                    .multilineTextAlignment(.leading)
-                    .truncationMode(.tail)
-            }
-        }
-    }
 
     /// Bold first line: the title, else a short snippet of the user's last
     /// message, else a quiet placeholder for a session with no user turn yet.
@@ -406,42 +447,148 @@ struct SessionRowView: View {
             ? String(collapsed.prefix(headlineMaxChars)) + "…"
             : collapsed
     }
+}
+
+/// A **cron group** row: one scheduled job's fires, collapsed. Deliberately the
+/// same body as a chat row — the only difference is the leading clock glyph.
+///
+/// Why a clock and not a folder: the user's model is *"my morning task"*, not
+/// *"a folder"*. Cron is the meaningful category; the grouping is just how we
+/// keep it from flooding the list. A clock also implies *recurring*, so "there
+/// are several of these inside" comes free.
+struct CronGroupRowView: View {
+    let group: CronGroup
+    let langCode: String
+
+    var body: some View {
+        ChatRowBody(
+            headline: group.title,
+            headlineIsSet: true,
+            preview: group.preview,
+            lastActive: group.lastActive,
+            unread: group.unread,
+            langCode: langCode,
+            // `alarm`, not `clock`: a clock's silhouette at row size is a thin
+            // ring — its hands are the first thing to dissolve, and what is left
+            // reads as a bullet point. The bells survive the shrink, and they are
+            // what the glyph is FOR: this row is a scheduled task, and it is the
+            // only thing telling the user that a tap opens a list, not a chat.
+            glyph: "alarm"
+        )
+        // The same in-content pinned ground a chat row draws (see
+        // `pinnedRowTint`) — a pinned group must read as pinned, and drawing it
+        // as the cell's background configuration is what blanked the incoming
+        // row and stalled the reorder.
+        .background {
+            ChatListScreen.pinnedRowTint
+                .opacity(group.pinned ? 1 : 0)
+                .padding(.horizontal, -ChatListScreen.rowHInset)
+                .allowsHitTesting(false)
+                .animation(nil, value: group.pinned)
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+/// The shared two-column body of EVERY chat-list row: a bold headline over a
+/// grey preview on the left, the time over an unread badge on the right.
+///
+/// Both an ordinary conversation and a cron group render through it, so "a group
+/// row looks exactly like a chat row" is true by construction rather than by two
+/// copies drifting apart. The pinned tint is NOT here — it stays on
+/// `SessionRowView`, because a group is never pinned.
+struct ChatRowBody: View {
+    let headline: String
+    /// False when the headline is the quiet placeholder for a session with no
+    /// turn yet — it renders grey rather than ink.
+    let headlineIsSet: Bool
+    let preview: String?
+    let lastActive: Date
+    let unread: Int
+    /// The app language's locale identifier (drives the time formatter, so it
+    /// can't diverge from the chrome language).
+    let langCode: String
+    /// SF Symbol drawn before the headline, or `nil` for a plain conversation.
+    let glyph: String?
+
+    /// The window (in days from today) over which the time column shows a
+    /// weekday name rather than a clock time (today) or a calendar date (older).
+    private static let weekdayWindow: Range<Int> = 1..<7
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            textColumn
+                .frame(maxWidth: .infinity, alignment: .leading)
+            metaColumn
+        }
+        // Taller blocks with room for the preview to wrap to two lines. minHeight
+        // keeps short rows (a one-line preview, or a headline-only session with no
+        // message yet) from collapsing shorter than the two-line rows, so the list
+        // reads as one even block height.
+        .frame(minHeight: 52)
+        .padding(.vertical, 15)
+    }
+
+    /// Left column: a bold headline over the grey last-message preview.
+    private var textColumn: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
+                if let glyph {
+                    // Sized WITH the headline (not under it) and drawn in ink, not
+                    // the preview's grey: at 12pt/.light/inkSoft the clock's hands
+                    // dissolved and it read as a bullet point beside a 15pt bold
+                    // black title. It is the only thing distinguishing a group row
+                    // from a conversation, so it has to survive the shrink.
+                    Image(systemName: glyph)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(Theme.ink)
+                        .accessibilityHidden(true)
+                }
+                Text(verbatim: headline)
+                    .font(Theme.sys(15, weight: .bold))
+                    .foregroundStyle(headlineIsSet ? Theme.ink : Theme.inkSoft)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            if let preview, !preview.isEmpty {
+                Text(verbatim: preview)
+                    .font(Theme.sys(14))
+                    .foregroundStyle(Theme.inkSoft)
+                    .lineLimit(2)
+                    .lineSpacing(3)
+                    .multilineTextAlignment(.leading)
+                    .truncationMode(.tail)
+            }
+        }
+    }
 
     /// Right column: time pinned to the top (beside the headline), the unread
     /// badge pinned to the bottom (beside the preview).
     private var metaColumn: some View {
         VStack(alignment: .trailing, spacing: 6) {
-            Text(verbatim: Self.timeLabel(row.lastActive, locale: langCode))
+            Text(verbatim: Self.timeLabel(lastActive, locale: langCode))
                 .font(Theme.sys(11))
                 .foregroundStyle(Theme.inkSoft)
             Spacer(minLength: 0)
-            trailingMarker
+            if unread > 0 { unreadBadge }
         }
         .fixedSize(horizontal: true, vertical: false)
     }
 
-    /// Bottom-right marker: the unread badge when there are unread replies, else
-    /// nothing. A pinned row is signalled by its tinted background alone — no
-    /// pin glyph.
-    @ViewBuilder private var trailingMarker: some View {
-        if row.unread > 0 {
-            unreadBadge
-        }
-    }
-
-    /// The unread count for a backgrounded session: an ink capsule with paper
-    /// digits, matching the ink CTA pill (`99+` past the cap). Cleared on open,
-    /// so it never shows on the row the user is currently viewing.
+    /// The unread count: an ink capsule with paper digits, matching the ink CTA
+    /// pill (`99+` past the cap). On a group row it is the SUM over the fires
+    /// drawn inside it — never a member that escaped to the pinned block or the
+    /// archived screen, which would make the badge disagree with what the user
+    /// sees on opening the group.
     private var unreadBadge: some View {
-        Text(verbatim: row.unread > 99 ? "99+" : String(row.unread))
+        Text(verbatim: unread > 99 ? "99+" : String(unread))
             .font(Theme.sys(11, weight: .medium))
             .foregroundStyle(Theme.paper)
             .padding(.horizontal, 6)
             .frame(minWidth: 18, minHeight: 18)
             .background(Theme.ink, in: Capsule())
-            .accessibilityLabel(Text(verbatim: "\(row.unread)"))
+            .accessibilityLabel(Text(verbatim: "\(unread)"))
     }
-
     /// Telegram-style time column: a clock time for today, the weekday name
     /// within the last week, then a calendar date (with year once it rolls
     /// over). Locale drives digit shape and weekday/date ordering.

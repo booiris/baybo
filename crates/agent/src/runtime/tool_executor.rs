@@ -5,7 +5,9 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use baybo_llm::{Attribution, BillableLlm, BilledChat};
-use baybo_model::{AgentProfileId, JobId, ParallelGroup, SessionId, SpanId, TrustLevel, User};
+use baybo_model::{
+    AgentProfileId, ContentBlock, JobId, ParallelGroup, SessionId, SpanId, TrustLevel, User,
+};
 
 use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use baybo_tools::{
@@ -14,8 +16,8 @@ use baybo_tools::{
     ToolOutput, ToolRegistry, VirtualReadResolver, approval::preview_params,
 };
 use baybo_trace::{
-    LifecycleOutcome, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder, StepHandle,
-    ToolCallBegin, ToolCallOrigin, ToolCallResult, ToolEventPayload,
+    LifecycleOutcome, PersistedToolCallOutput, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder,
+    StepHandle, ToolCallBegin, ToolCallOrigin, ToolCallOutput, ToolCallResult, ToolEventPayload,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -38,8 +40,8 @@ const APPROVAL_HEADROOM: Duration = Duration::from_secs(300);
 
 /// Cap on the failure-reason string we copy out of a `ToolOutput::Error`
 /// payload. This bound governs only the row-level reason label; the body
-/// lands in the span's `result.output`, itself capped at
-/// `MAX_TOOL_OUTPUT_BYTES` (see [`cap_trace_output`]).
+/// lands either behind the span's transcript reference or in the capped
+/// inline fallback (see [`cap_trace_output_with_len`]).
 const FAILURE_REASON_MAX_BYTES: usize = 512;
 
 /// Hard cap on the *aggregate* byte size of the drained payloads of a single
@@ -150,9 +152,18 @@ fn truncate_for_reason(s: &str, max_bytes: usize) -> String {
 /// `Json(Object)` are unaffected — those are the cases that previously
 /// rendered correctly (e.g. `NowTool` returns `Json({...})`), so we
 /// preserve their on-disk shape verbatim.
+#[cfg(test)]
 fn tool_output_to_trace_value(output: &ToolOutput) -> (Value, Option<usize>) {
+    cap_trace_output(tool_output_to_trace_value_uncapped(output))
+}
+
+/// Sanitized tool output shaped into trace-friendly JSON, before the inline
+/// cap. Larger results reference the transcript row instead of storing this
+/// value inline, so it is computed once and only kept when the inline form wins
+/// the size race in [`ToolExecutor::execute`].
+pub(crate) fn tool_output_to_trace_value_uncapped(output: &ToolOutput) -> Value {
     use serde_json::Map;
-    let value = match output {
+    match output {
         ToolOutput::Text(s) => {
             let mut m = Map::new();
             m.insert("type".into(), Value::String("text".into()));
@@ -186,15 +197,12 @@ fn tool_output_to_trace_value(output: &ToolOutput) -> (Value, Option<usize>) {
             // keep the historical shape exactly.
             serde_json::to_value(output).unwrap_or(Value::Null)
         }
-    };
-    cap_trace_output(value)
+    }
 }
 
-/// Cap the span's copy of a tool result at the same byte budget the LLM
-/// transcript uses. The transcript copy is capped *and* spilled to a file one
-/// layer up (`AgentLoop::cap_tool_output`); the span kept the raw payload, so a
-/// single 285 KB `Grep` result was stored verbatim forever — a third copy of
-/// bytes the model never saw.
+/// Cap the inline copy of a tool result at the same byte budget the LLM
+/// transcript uses. Larger results reference that transcript row instead; this
+/// bounds the inline copy kept for the smaller results that stay inline.
 ///
 /// Capping happens here, after the variant-shaping match, so no variant can
 /// bypass it: the struct variants (`WithAttachments` / `MultiModalText`) route
@@ -204,10 +212,15 @@ fn tool_output_to_trace_value(output: &ToolOutput) -> (Value, Option<usize>) {
 ///
 /// Returns the untruncated serialized length when it cut, for
 /// `ToolCallResult::output_truncated_from`.
+#[cfg(test)]
 fn cap_trace_output(value: Value) -> (Value, Option<usize>) {
+    let full_len = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
+    cap_trace_output_with_len(value, full_len)
+}
+
+pub(crate) fn cap_trace_output_with_len(value: Value, full_len: usize) -> (Value, Option<usize>) {
     use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
 
-    let full_len = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
     if full_len <= MAX_TOOL_OUTPUT_BYTES {
         return (value, None);
     }
@@ -279,6 +292,18 @@ pub struct ExecutedTool {
     /// ungated tool). When a call prompts more than once, the LAST decision
     /// wins — it is the one that shaped the outcome.
     pub approval: Option<ApprovalDecision>,
+}
+
+/// The out-of-band media blocks a `WithAttachments` / `MultiModalText` result
+/// carries beside its text. They never enter the `ToolResult` content, so a
+/// transcript-backed span keeps them on its `PersistedToolCallOutput` to
+/// preserve the trace panel's blob list. Every other variant has none.
+fn tool_output_media(output: &ToolOutput) -> (Vec<ContentBlock>, Vec<ContentBlock>) {
+    match output {
+        ToolOutput::WithAttachments { attachments, .. } => (attachments.clone(), Vec::new()),
+        ToolOutput::MultiModalText { llm_images, .. } => (Vec::new(), llm_images.clone()),
+        _ => (Vec::new(), Vec::new()),
+    }
 }
 
 /// Executes tools with trust-level validation, approval gating, and
@@ -476,9 +501,12 @@ impl ToolExecutor {
         let approval_slot: Arc<Mutex<Option<ApprovalDecision>>> = Arc::new(Mutex::new(None));
         let approval_sink = Arc::clone(&approval_slot);
 
-        // Open the tool span up front so denials and approval failures
-        // still appear in the trace tree. The handle carries the
-        // begin-time kind, so close-time only supplies the result.
+        // Open the tool span up front so denials and approval failures still
+        // appear in the trace tree. The handle carries the begin-time kind, so
+        // close-time only supplies the result: a `Persisted` pointer keyed on
+        // this call's begin-time `tool_use_id`, or an inline copy when that is
+        // smaller. The pointer is resolved on read against the transcript row
+        // `AgentLoop` appends after this returns.
         let output = crate::runtime::scope::with_span(
             recorder.as_ref(),
             step,
@@ -777,8 +805,6 @@ impl ToolExecutor {
                             .sanitize_tool_output(&mut output)
                             .await
                             .map_err(|e| anyhow::anyhow!("sanitize_tool_output: {e}"))?;
-                        let (output_value, output_truncated_from) =
-                            tool_output_to_trace_value(&output);
                         let success = !matches!(output, ToolOutput::Error(_));
                         let outcome = if success {
                             LifecycleOutcome::Ok
@@ -803,9 +829,38 @@ impl ToolExecutor {
                             };
                             LifecycleOutcome::Failed { reason }
                         };
+
+                        // Close-time result. The span points at the transcript
+                        // row `AgentLoop` will append for this `tool_use_id`
+                        // (resolved lazily on read), unless an inline copy of
+                        // the shaped value serializes smaller — the common case
+                        // for tiny outputs, which then need no join. Media
+                        // blocks ride the pointer since they never enter the
+                        // `ToolResult` text.
+                        use baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES;
+                        let output_value = tool_output_to_trace_value_uncapped(&output);
+                        let full_len = serde_json::to_string(&output_value).map_or(0, |s| s.len());
+                        let output_truncated_from =
+                            (full_len > MAX_TOOL_OUTPUT_BYTES).then_some(full_len);
+                        let (inline_value, _) = cap_trace_output_with_len(output_value, full_len);
+                        let inline = ToolCallOutput::inline(inline_value);
+                        let (attachments, llm_images) = tool_output_media(&output);
+                        let reference = ToolCallOutput::persisted(PersistedToolCallOutput::new(
+                            tool_use_id.clone(),
+                            attachments,
+                            llm_images,
+                        ));
+                        let serialized_len = |value: &ToolCallOutput| -> usize {
+                            serde_json::to_string(value).map_or(usize::MAX, |s| s.len())
+                        };
+                        let trace_output = if serialized_len(&reference) < serialized_len(&inline) {
+                            reference
+                        } else {
+                            inline
+                        };
                         Ok((
                             SpanFinalize::ToolCall(ToolCallResult {
-                                output: output_value,
+                                output: trace_output,
                                 success,
                                 output_truncated_from,
                             }),

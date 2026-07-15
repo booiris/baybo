@@ -151,15 +151,18 @@ function generateMockCrons(count: number): components['schemas']['CronJob'][] {
     const isCron = Math.random() > 0.2;
     const createdAt = new Date(now - i * 1000 * 60 * 60 * 24);
     const updatedAt = new Date(now - i * 1000 * 60 * 60 * 2);
-    
+    // Every fifth job sits in the recycle bin, so the deleted view has content.
+    const deletedAt = i % 5 === 4 ? new Date(now - i * 1000 * 60 * 30) : null;
+
     const pick = Math.floor(Math.random() * prompts.length);
     crons.push({
       id: `cron-${Math.random().toString(36).substring(2, 9)}`,
       user_id: `user-${Math.floor(Math.random() * 100)}`,
       channel: channels[Math.floor(Math.random() * channels.length)],
       title: titles[pick],
+      pinned: false,
       status: statuses[Math.floor(Math.random() * statuses.length)],
-      schedule: isCron 
+      schedule: isCron
         ? { kind: 'cron', expr: schedules[Math.floor(Math.random() * schedules.length)] }
         : { kind: 'at', time: new Date(now + Math.random() * 1000 * 60 * 60 * 24).toISOString() },
       prompt: prompts[pick],
@@ -168,6 +171,7 @@ function generateMockCrons(count: number): components['schemas']['CronJob'][] {
       next_trigger_at: new Date(now + Math.random() * 1000 * 60 * 60).toISOString(),
       created_at: createdAt.toISOString(),
       updated_at: updatedAt.toISOString(),
+      deleted_at: deletedAt ? deletedAt.toISOString() : null,
       origin_session_id: `session-${Math.random().toString(36).substring(2, 6)}`,
     });
   }

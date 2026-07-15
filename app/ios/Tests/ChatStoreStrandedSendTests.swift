@@ -139,3 +139,77 @@ struct ChatStoreQuietOutboxTests {
         #expect(client.transmissions.isEmpty)
     }
 }
+
+/// A brand-new chat (a DRAFT) whose FIRST send happens while offline. The send
+/// can't create the remote session, so `dispatchSend` fails at
+/// `ensureRemoteSession` before it ever dials — and a draft has no reconnect
+/// loop to re-drive it (the sweep needs a live leg, `connect` no-ops on a
+/// draft). The message must NOT be flagged failed: it is queued, not lost. It
+/// stays a `sending` spinner, and the in-session recovery adopts it once the
+/// network returns, without waiting for a background→foreground cycle.
+@Suite @MainActor
+struct ChatStoreDraftRecoveryTests {
+    private static let sessionId = "s-draft"
+
+    private let temp: TempSupportDir
+    private let client = FakeBayboClient()
+    private let index: SessionIndex
+    private let outbox: OutboxStore
+    private let store: ChatStore
+
+    init() {
+        let temp = TempSupportDir()
+        self.temp = temp
+        index = temp.makeIndex()
+        outbox = temp.makeOutbox(sessionId: Self.sessionId)
+        // No registry row and no gateway session — the store comes up a DRAFT.
+        store = ChatStore(
+            sessionId: Self.sessionId, client: client, index: index, outbox: outbox)
+    }
+
+    /// `send` mints its own idempotency key, so the sole entry is read
+    /// positionally rather than by a fixed id.
+    private func entry() -> OutboxEntry? {
+        outbox.entries().first
+    }
+
+    /// The core of the fix: an offline first-send leaves the entry `sending` (a
+    /// spinner, never the red `failed` dot the old catch flashed) and the store a
+    /// draft. Nothing reached the wire, and nothing was dropped.
+    @Test func anOfflineDraftSendStaysQueuedNotFailed() async {
+        client.failCreateSession(with: BayboError.Other(message: "offline"))
+        store.send(text: "hello", attachments: [])
+
+        #expect(await waitUntil { client.createdSessionIds == [Self.sessionId] })
+        #expect(store.connState == .draft)
+        #expect(entry()?.state == .sending)
+        #expect(client.transmissions.isEmpty)
+    }
+
+    /// The regression this guards: with the network back, the in-session recovery
+    /// — not a foreground cycle, not a manual retry — adopts the stranded draft,
+    /// creating the session, listing the conversation, and dialling so the queued
+    /// message finally has a live leg to drain on. `stepSendRecovery` is exactly
+    /// what the 2 s recovery loop runs on its next tick.
+    @Test func theInSessionRecoveryDrainsTheDraftWhenTheNetworkReturns() async {
+        client.failCreateSession(with: BayboError.Other(message: "offline"))
+        store.send(text: "hello", attachments: [])
+        #expect(await waitUntil { store.connState == .draft && entry()?.state == .sending })
+
+        client.succeedCreateSession()
+        store.stepSendRecovery()
+
+        #expect(await waitUntil { store.connState == .connected })
+        #expect(index.contains(sessionId: Self.sessionId), "and the list can now reach it")
+        #expect(index.rows.first?.preview == "hello")
+    }
+
+    /// The loop stands down the moment there is nothing left to recover, rather
+    /// than dialling a draft forever — the quiet-outbox guarantee, but for the
+    /// send-driven recovery path.
+    @Test func recoveryStopsOnceTheOutboxIsEmpty() async {
+        #expect(store.stepSendRecovery(), "an empty draft has nothing to recover")
+        #expect(client.createdSessionIds.isEmpty)
+        #expect(store.connState == .draft)
+    }
+}

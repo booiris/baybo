@@ -5,6 +5,7 @@ export const zh: typeof en = {
   translation: {
     chat: {
       loadOlder: "加载更早的消息",
+      loadingThread: "对话加载中…",
       loadingImage: "图片加载中…",
       tapToLoad: "点按加载图片",
       imageAlt: "图片",

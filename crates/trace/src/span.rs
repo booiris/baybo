@@ -6,9 +6,9 @@
 //! but never nest. LLM ↔ tool pairing is by `ToolCallOrigin`, not by
 //! tree structure.
 
-use baybo_model::{ChatMessage, ParallelGroup, SpanId, StepId};
+use baybo_model::{ChatMessage, ContentBlock, ParallelGroup, SpanId, StepId};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::Value;
 
 use crate::event::SpanEvent;
@@ -232,21 +232,165 @@ pub struct ToolCallBegin {
 /// End-time result for a `ToolCall` span.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallResult {
-    /// The tool's result, capped at the same byte budget the LLM transcript
-    /// uses (`baybo_context::prompts::tool_output::MAX_TOOL_OUTPUT_BYTES`).
-    /// The model never saw more than this either — the transcript copy is
-    /// capped and spilled to a file — so storing the raw payload here just
-    /// bought a third copy nobody reads.
+    /// The tool's result. Larger values point at the durable transcript row
+    /// that already carries the capped model-facing payload; smaller values
+    /// stay inline.
     #[serde(default)]
-    pub output: Value,
+    pub output: ToolCallOutput,
     #[serde(default)]
     pub success: bool,
-    /// Serialized byte length of the untruncated output, set only when
-    /// `output` was capped. `None` means the span holds it verbatim. Lets the
-    /// trace viewer say the output is partial instead of silently implying
-    /// the tool returned this much.
+    /// Serialized byte length of the untruncated output, set only when the
+    /// model-facing payload was capped. `None` means the resolved result is
+    /// complete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_truncated_from: Option<usize>,
+}
+
+/// A tool result recorded directly in the span, or a pointer to the durable
+/// transcript row that already carries the same model-facing payload.
+///
+/// The `Inline(Value)` wire shape is unchanged for historical rows and for
+/// small results. `Persisted` serializes as a marker object so a larger result
+/// can point at its `session_messages` row (by `tool_use_id`) instead of
+/// cloning the same payload into both tables.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolCallOutput {
+    Persisted(PersistedToolCallOutput),
+    Inline(Value),
+}
+
+impl Default for ToolCallOutput {
+    fn default() -> Self {
+        Self::Inline(Value::Null)
+    }
+}
+
+impl ToolCallOutput {
+    pub fn inline(value: Value) -> Self {
+        Self::Inline(value)
+    }
+
+    pub fn persisted(reference: PersistedToolCallOutput) -> Self {
+        Self::Persisted(reference)
+    }
+
+    pub fn is_persisted(&self) -> bool {
+        matches!(self, Self::Persisted(_))
+    }
+
+    /// Resolve a transcript-backed output into an inline JSON value. Inline
+    /// values pass through unchanged.
+    pub fn resolve(&self, message: &ChatMessage) -> std::result::Result<Value, String> {
+        match self {
+            Self::Inline(value) => Ok(value.clone()),
+            Self::Persisted(reference) => reference.resolve(message),
+        }
+    }
+}
+
+const SESSION_TOOL_RESULT_REFERENCE_TAG: &str = "session_tool_result";
+
+/// Typed serde sentinel that makes the untagged persisted-reference object
+/// unambiguous with ordinary dynamic tool JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionToolResultReferenceTag;
+
+impl Serialize for SessionToolResultReferenceTag {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(SESSION_TOOL_RESULT_REFERENCE_TAG)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionToolResultReferenceTag {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value == SESSION_TOOL_RESULT_REFERENCE_TAG {
+            Ok(Self)
+        } else {
+            Err(D::Error::custom(
+                "expected $baybo_ref to be session_tool_result",
+            ))
+        }
+    }
+}
+
+/// Pointer to the `ToolResult` the model saw, keyed by the `tool_use_id` the
+/// LLM assigned the call. Resolving finds that block in the session log and
+/// returns its exact model-facing content (the wrapped, capped envelope) — no
+/// second copy is stored in the span. `tool_use_id` is a begin-time fact, so
+/// the span can close during execution without waiting for the transcript
+/// append; a rare append failure leaves the pointer unresolvable (surfaced as a
+/// `trace_reconstruction_error` on read) rather than dangling silently.
+///
+/// `attachments` / `llm_images` are the media blocks a `WithAttachments` /
+/// `MultiModalText` result carries out of band of its text — they never enter
+/// the `ToolResult` content, so the reference keeps them (small `BlobRef`
+/// pointers) to preserve the trace panel's blob list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersistedToolCallOutput {
+    #[serde(rename = "$baybo_ref")]
+    reference_tag: SessionToolResultReferenceTag,
+    pub tool_use_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ContentBlock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub llm_images: Vec<ContentBlock>,
+}
+
+impl PersistedToolCallOutput {
+    pub fn new(
+        tool_use_id: String,
+        attachments: Vec<ContentBlock>,
+        llm_images: Vec<ContentBlock>,
+    ) -> Self {
+        Self {
+            reference_tag: SessionToolResultReferenceTag,
+            tool_use_id,
+            attachments,
+            llm_images,
+        }
+    }
+
+    /// Resolve against the `message` that carries this call's `ToolResult`.
+    /// Text/JSON/error results return the raw model-facing content string;
+    /// media results wrap it back into the historical tagged object so the
+    /// out-of-band `attachments` / `llm_images` blob list survives.
+    pub fn resolve(&self, message: &ChatMessage) -> std::result::Result<Value, String> {
+        let content = message
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == &self.tool_use_id => Some(content.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| format!("session log has no ToolResult for {}", self.tool_use_id))?;
+        if !self.attachments.is_empty() {
+            Ok(serde_json::json!({
+                "type": "with_attachments",
+                "text": content,
+                "attachments": self.attachments,
+            }))
+        } else if !self.llm_images.is_empty() {
+            Ok(serde_json::json!({
+                "type": "multi_modal_text",
+                "text": content,
+                "llm_images": self.llm_images,
+            }))
+        } else {
+            Ok(Value::String(content.to_string()))
+        }
+    }
 }
 
 /// One tool_use block emitted by an LLM. Recorded inside the LLM
@@ -479,5 +623,60 @@ mod tests {
                 suffix,
             }
         );
+    }
+
+    #[test]
+    fn tool_call_output_keeps_legacy_inline_wire_shape() {
+        let legacy = serde_json::json!({"type": "text", "text": "hello"});
+        let output: ToolCallOutput = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(output, ToolCallOutput::Inline(legacy.clone()));
+        assert_eq!(serde_json::to_value(output).unwrap(), legacy);
+    }
+
+    #[test]
+    fn persisted_tool_output_requires_the_exact_reference_tag() {
+        let ordinary_json = serde_json::json!({
+            "$baybo_ref": "some_other_reference",
+            "tool_use_id": "tool-9",
+        });
+        let output: ToolCallOutput = serde_json::from_value(ordinary_json.clone()).unwrap();
+        assert_eq!(output, ToolCallOutput::Inline(ordinary_json));
+    }
+
+    #[test]
+    fn persisted_tool_output_round_trips_and_resolves_to_the_wrapped_content() {
+        let wrapped = "<tool_output name=\"Read\">\nbody </tool_output> text\n</tool_output>";
+        let reference = PersistedToolCallOutput::new("tool-9".into(), vec![], vec![]);
+        let output = ToolCallOutput::Persisted(reference);
+        let wire = serde_json::to_value(&output).unwrap();
+        assert_eq!(wire["$baybo_ref"], "session_tool_result");
+        let back: ToolCallOutput = serde_json::from_value(wire).unwrap();
+        let message = ChatMessage::tool_result("tool-9".into(), wrapped.to_string());
+        assert_eq!(
+            back.resolve(&message).unwrap(),
+            serde_json::Value::String(wrapped.to_string())
+        );
+    }
+
+    #[test]
+    fn persisted_tool_output_keeps_media_blocks_as_a_tagged_object() {
+        let image = baybo_model::ContentBlock::Text("blob-ref-stand-in".into());
+        let reference = PersistedToolCallOutput::new("tool-9".into(), vec![image.clone()], vec![]);
+        let message = ChatMessage::tool_result("tool-9".into(), "shown".into());
+        assert_eq!(
+            reference.resolve(&message).unwrap(),
+            serde_json::json!({
+                "type": "with_attachments",
+                "text": "shown",
+                "attachments": [image],
+            })
+        );
+    }
+
+    #[test]
+    fn persisted_tool_output_reports_a_missing_tool_result() {
+        let reference = PersistedToolCallOutput::new("absent".into(), vec![], vec![]);
+        let message = ChatMessage::tool_result("other".into(), "x".into());
+        assert!(reference.resolve(&message).is_err());
     }
 }
