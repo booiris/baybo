@@ -137,6 +137,15 @@ final class ChatStore: ObservableObject {
     /// Fires the outbox retry sweep (10 s no-echo → one blind resend, up to the
     /// 3-transmission cap). Started lazily when the outbox is non-empty.
     private var outboxTimer: Task<Void, Never>?
+    /// Recovers a DRAFT whose first send failed offline. A draft has no live leg
+    /// and no reconnect loop (`connect`/`scheduleReconnect` are gated off until a
+    /// real send commits it), and `ensureRemoteSession` — the network step
+    /// `dispatchSend` fails on offline — is exactly what would lift it; the sweep
+    /// only runs on a live leg and `resumeStrandedSends` won't fire until the app
+    /// is foregrounded. So nothing else re-drives such a send in-session. This
+    /// loop retries the draft recovery on a backoff until the draft resolves (the
+    /// reconnect machinery + sweep take over) or the outbox drains.
+    private var sendRecoveryTask: Task<Void, Never>?
     private weak var bridge: TranscriptBridge?
     private var bufferedFrames: [String] = []
     /// Set when the offscreen buffer overflowed and was dropped: the next
@@ -269,6 +278,8 @@ final class ChatStore: ObservableObject {
         debounceTask = nil
         outboxTimer?.cancel()
         outboxTimer = nil
+        sendRecoveryTask?.cancel()
+        sendRecoveryTask = nil
         connectTask?.cancel()
         connectTask = nil
         // Mute every sink, including one handed to a dial still in flight.
@@ -292,6 +303,8 @@ final class ChatStore: ObservableObject {
         debounceTask = nil
         outboxTimer?.cancel()
         outboxTimer = nil
+        sendRecoveryTask?.cancel()
+        sendRecoveryTask = nil
         connectTask?.cancel()
         connectTask = nil
         issuedGeneration += 1
@@ -441,11 +454,17 @@ final class ChatStore: ObservableObject {
         dispatchSend(msgId: msgId, text: text, attachments: attachments)
     }
 
-    /// Enqueue on the live leg (dialing first if needed); on any transport
-    /// failure tell the webview to flag that bubble failed (`sendFailed`) — its
-    /// red retry dot is the manual failure surface. The persisted outbox drives
-    /// automatic retry (10 s no-echo → one blind resend, capped at 3
-    /// transmissions) and resend-after-sync on reconnect.
+    /// Enqueue on the live leg (dialing first if needed). A transport failure
+    /// here — no network, dial refused — is NOT (yet) a send failure: the
+    /// optimistic bubble stays in its `sending` (spinner) state and the persisted
+    /// outbox keeps the message queued, auto-retrying on reconnect (10 s no-echo →
+    /// one blind resend, capped at 3 transmissions) and resending-after-sync on
+    /// the reconnect edge. The `failed` red-dot affordance is raised only by
+    /// `failOutboxEntry` — the automatic budget spent on a live leg, OR the
+    /// message left queued past `queuedTimeout` on a sustained down leg — never
+    /// prematurely on the single failed dial the outbox is about to retry (the old
+    /// catch flagged `sendFailed` on every offline send, then the outbox auto-sent
+    /// it anyway).
     private func dispatchSend(msgId: String, text: String, attachments: [AttachmentRef]) {
         Task {
             do {
@@ -453,7 +472,12 @@ final class ChatStore: ObservableObject {
                 index.recordUserSend(sessionId: sessionId, text: text)
                 try await sendWhenReady(text: text, msgId: msgId, attachments: attachments)
             } catch {
-                bridge?.sendFailed(msgId)
+                // Queued, not failed: the outbox owns redelivery (see above). A
+                // draft is the one state the outbox can't drain on its own — arm
+                // the in-session recovery so it delivers when the network returns
+                // rather than sitting as a spinner until the next foreground.
+                NSLog("baybo: send deferred to outbox: %@", bayboErrorText(error))
+                scheduleSendRecovery()
             }
         }
     }
@@ -879,9 +903,46 @@ final class ChatStore: ObservableObject {
         bridge?.sendFailed(platformMsgId)
     }
 
+    /// A committed send failed to reach the wire on a DRAFT store — the one case
+    /// nothing else re-drives in-session (see `sendRecoveryTask`). Retry the
+    /// draft recovery (`resumePersistedSends`: ensure the session, dial,
+    /// reconcile) on a backoff until the draft resolves — at which point the
+    /// reconnect loop and sweep own redelivery — or the outbox drains. A single
+    /// loop regardless of how many draft sends fail; a no-op for a non-draft
+    /// store, which already has a live/reconnecting leg to drain the outbox.
+    private func scheduleSendRecovery() {
+        guard connState == .draft, sendRecoveryTask == nil else { return }
+        sendRecoveryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.reconnectBackoff)
+                guard let self else { return }
+                if self.stepSendRecovery() { return }
+            }
+        }
+    }
+
+    /// One recovery attempt (`resumePersistedSends`: ensure the session, dial,
+    /// reconcile). Returns `true` when the loop should stop — the draft resolved
+    /// (the reconnect machinery + sweep own redelivery from here) or the outbox
+    /// drained. Not `private`: the recovery loop is its only production caller,
+    /// but a test steps it directly rather than sleeping through
+    /// `reconnectBackoff`.
+    @discardableResult
+    func stepSendRecovery() -> Bool {
+        guard connState == .draft,
+            outbox.entries().contains(where: { $0.state != .failed })
+        else {
+            sendRecoveryTask = nil
+            return true
+        }
+        resumePersistedSends()
+        return false
+    }
+
     /// The retry sweep: while there are `sending`/`sent` entries, every ~3 s
-    /// resend one whose 10 s echo window lapsed, or fail one that exhausted the
-    /// 3-transmission cap. Self-stops when the outbox drains. The `Task` inherits
+    /// resend one whose 10 s echo window lapsed or fail one that exhausted the
+    /// 3-transmission cap (live leg); on a down leg, fail one that outlived the
+    /// `queuedTimeout`. Self-stops when the outbox drains. The `Task` inherits
     /// this store's `@MainActor` isolation, so the sweep touches state directly.
     private func startOutboxTimerIfNeeded() {
         guard outboxTimer == nil else { return }
@@ -895,31 +956,31 @@ final class ChatStore: ObservableObject {
     }
 
     /// One retry-sweep pass. Returns `true` when the timer should stop — the
-    /// outbox is idle, or the leg is down. Not `private`: `outboxTimer` is its
-    /// only production caller, but a test steps it directly rather than sleeping
-    /// through `retryTick` on every assertion.
+    /// outbox is idle. Not `private`: `outboxTimer` is its only production
+    /// caller, but a test steps it directly rather than sleeping through
+    /// `retryTick` on every assertion.
     @discardableResult
     func sweepOutbox() -> Bool {
-        // A transmission is only ever spent on the wire, so a down leg can
-        // neither resend an entry nor legitimately fail one — the outbox exists
-        // precisely to outlive the outage. Park the sweep and let the reconnect
-        // edge (`reconcileOutboxOnConnect`) re-arm it, rather than ticking on a
-        // condition that cannot pass: the resend used to bail on its own
-        // `connected` guard AFTER the sweep had already elected it, so
-        // `transmissions` never grew, `resendExhausted` never became true, the
-        // entry could never reach `failed`, and the 3 s timer ran forever.
-        guard connState == .connected else {
-            outboxTimer = nil
-            return true
-        }
         var active = false
         for entry in outbox.entries() {
             guard entry.state == .sending || entry.state == .sent else { continue }
             active = true
             if entry.state != .sending { continue }
-            if outbox.dueForBlindResend(entry) {
-                resendOutboxEntry(entry)
-            } else if outbox.resendExhausted(entry) {
+            if connState == .connected {
+                // A transmission is only ever spent on the wire: resend one whose
+                // echo window lapsed, or fail one that burned its budget.
+                if outbox.dueForBlindResend(entry) {
+                    resendOutboxEntry(entry)
+                } else if outbox.resendExhausted(entry) {
+                    failOutboxEntry(entry.platformMsgId)
+                }
+            } else if outbox.queuedTooLong(entry) {
+                // Down leg: nothing to resend on, but a message queued past its
+                // lifetime cap IS a send failure — surface the red dot the user
+                // retries by hand instead of a spinner that never resolves. The
+                // sweep keeps ticking until then (not parked), so the timeout
+                // actually fires; a brief outage still delivers on reconnect,
+                // well inside the cap.
                 failOutboxEntry(entry.platformMsgId)
             }
         }

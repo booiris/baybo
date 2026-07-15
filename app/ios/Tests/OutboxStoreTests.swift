@@ -144,6 +144,40 @@ struct OutboxStoreTests {
         #expect(outbox.dueForBlindResend(entry))
     }
 
+    /// The queued-lifetime cap is the down-leg failure trigger: a still-`sending`
+    /// entry is "too long" only once it outlives `queuedTimeout` — one tick early
+    /// and a brief outage would fail a message reconnect could still deliver.
+    @Test func queuedTooLongFiresOnlyPastTheCap() throws {
+        send()
+        clock.advance(OutboxStore.queuedTimeout - 1)
+        #expect(outbox.queuedTooLong(try #require(stored())) == false)
+
+        clock.advance(2)
+        #expect(outbox.queuedTooLong(try #require(stored())))
+    }
+
+    /// An echoed (`sent`) entry proved transport and merely awaits durability, so
+    /// a slow mid-turn persist never trips the queued-lifetime cap.
+    @Test func anEchoedEntryIsNeverQueuedTooLong() throws {
+        send()
+        outbox.markEchoed(platformMsgId: Self.msgId)
+        clock.advance(OutboxStore.queuedTimeout * 10)
+        #expect(outbox.queuedTooLong(try #require(stored())) == false)
+    }
+
+    /// A hand retry is a fresh attempt: the queued-lifetime clock restarts, so a
+    /// retried offline message gets its full window rather than instantly
+    /// re-failing off the original enrolment time.
+    @Test func manualRetryRestartsTheQueuedLifetimeClock() throws {
+        send()
+        clock.advance(OutboxStore.queuedTimeout + 1)
+        #expect(outbox.queuedTooLong(try #require(stored())), "the original enrolment is past the cap")
+        outbox.markFailed(platformMsgId: Self.msgId)
+
+        outbox.resetForManualRetry(platformMsgId: Self.msgId, text: "hello", attachments: [])
+        #expect(outbox.queuedTooLong(try #require(stored())) == false, "the clock restarted")
+    }
+
     /// A retried image send must stay that message rather than degrading to
     /// text-only, so the blob refs ride the entry to disk and back.
     @Test func entriesAndTheirAttachmentsSurviveARelaunch() {
