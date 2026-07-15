@@ -41,7 +41,11 @@ import type {
   TraceJobSummary,
   TraceOverview,
 } from '../types/trace';
-import { isTerminal, resolveInputMessages } from '../types/trace';
+import {
+  isTerminal,
+  resolveInputMessages,
+  resolveToolCallOutput,
+} from '../types/trace';
 import { MessageList } from '../components/trace/MessageList';
 import { renderWithSanitizeChips, SanitizeChip } from '../components/trace/SanitizeChip';
 
@@ -528,9 +532,11 @@ function LlmCallDetail({
 
 function ToolCallDetail({
   span,
+  messageLog,
   onJumpToLlm,
 }: {
   span: Span;
+  messageLog: SessionMessageRow[];
   onJumpToLlm: (llmSpanId: string) => void;
 }) {
   if (span.kind.kind !== 'tool_call') return null;
@@ -538,6 +544,9 @@ function ToolCallDetail({
   const hint = SanitizeKindHint(span.events);
   const failureReason =
     span.outcome.outcome === 'failed' ? span.outcome.reason : null;
+  const output = result
+    ? resolveToolCallOutput(result.output, messageLog, span.started_at)
+    : null;
 
   return (
     <div className="space-y-6">
@@ -585,16 +594,14 @@ function ToolCallDetail({
           </h4>
           {result.output_truncated_from != null && (
             <p className="mb-2 font-mono text-[0.75rem] text-warning font-bold">
-              truncated for storage —{' '}
-              {result.output_truncated_from.toLocaleString()} bytes originally.
-              The model saw a capped copy too.
+              partial output — {result.output_truncated_from.toLocaleString()}{' '}
+              serialized bytes originally. Tool results entering model context
+              use the same 32 KiB ceiling.
             </p>
           )}
           <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3">
             {renderWithSanitizeChips(
-              typeof result.output === 'string'
-                ? result.output
-                : JSON.stringify(result.output, null, 2),
+              typeof output === 'string' ? output : JSON.stringify(output, null, 2),
               hint,
             )}
           </pre>
@@ -927,7 +934,11 @@ function SpanDetailPanel({
           (span.kind.kind === 'llm_call' ? (
             <LlmCallDetail span={span} messageLog={messageLog} />
           ) : span.kind.kind === 'tool_call' ? (
-            <ToolCallDetail span={span} onJumpToLlm={onJumpToLlm} />
+            <ToolCallDetail
+              span={span}
+              messageLog={messageLog}
+              onJumpToLlm={onJumpToLlm}
+            />
           ) : (
             <SubagentStubDetail span={span} onDrillIn={onDrillIn} />
           ))}

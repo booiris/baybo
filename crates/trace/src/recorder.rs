@@ -480,7 +480,7 @@ mod tests {
                 span,
                 job,
                 SpanFinalize::ToolCall(crate::ToolCallResult {
-                    output: serde_json::Value::Null,
+                    output: crate::ToolCallOutput::inline(serde_json::Value::Null),
                     success: false,
                     output_truncated_from: None,
                 }),

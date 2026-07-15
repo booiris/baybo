@@ -9,9 +9,10 @@
 //!   `session_messages` log + job summaries (no step/span tree).
 //!   The client lazily fetches each job's tree via the third endpoint.
 //! * `GET /v1/traces/{session_id}/jobs/{job_id}` — per-job step/span
-//!   tree. Spans carry `LlmCallInputs::Persisted` references in their
-//!   original ordinal form; the client slices the message log it
-//!   already has from the overview call.
+//!   tree. Spans carry `LlmCallInputs::Persisted` (by ordinal) and
+//!   `ToolCallOutput::Persisted` (by `tool_use_id`) references unresolved;
+//!   the client resolves them against the message log it already has from the
+//!   overview call.
 //!
 //! Both per-session endpoints stay untyped `serde_json::Value` because
 //! the columnar Step/Span tree is polymorphic and re-mirroring the
@@ -152,7 +153,7 @@ async fn get_trace(
     responses(
         (
             status = 200,
-            description = "Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted — `prefix_len` is a tripwire the client checks against the reconstructed count, `suffix` carries framing/sub-loop messages not in the log, e.g. compression & progress-observer spans) or `ChatMessage[]` (Inline); the client slices the message log it received from the overview call and appends any `suffix`.",
+            description = "Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64, prefix_len: usize, suffix?: ChatMessage[] }` (Persisted) or `ChatMessage[]` (Inline). A larger `ToolCall.result.output` may be `{ $baybo_ref: 'session_tool_result', tool_use_id, attachments?, llm_images? }`; the client resolves both reference kinds against the session message log returned by the overview call, a persisted tool output to its transcript row's `ToolResult` content by `tool_use_id`.",
             body = serde_json::Value,
             content_type = "application/json",
         ),

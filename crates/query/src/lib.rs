@@ -947,13 +947,11 @@ impl QueryApi {
             }
         }
 
-        // Hydrate any `LlmCallInputs::Persisted` spans into the flat
-        // `Inline` shape the trace API serializes. The session_messages
-        // log is read once per session and reused for every Persisted
-        // span — turn `O(N²)` storage into `O(N)` storage plus one
-        // join on read. Every session records its `Persisted` refs
-        // against its own log.
-        self.hydrate_persisted_inputs(session_id, &mut jobs).await?;
+        // Hydrate transcript-backed LLM inputs and tool outputs into their
+        // legacy inline API shapes. The session_messages log is read once per
+        // session and reused for every reference.
+        self.hydrate_persisted_trace_data(session_id, &mut jobs)
+            .await?;
 
         Ok(ReplayedConversation {
             session_id: session_id.clone(),
@@ -1078,20 +1076,19 @@ impl QueryApi {
         })
     }
 
-    /// Walk every span in `jobs`, and for each `LlmCall` whose
-    /// `input_messages` is `Persisted { last_ordinal, .. }` replace
-    /// it with the corresponding `Inline` slice reconstructed from
-    /// `session_messages`. Skips the work entirely if no span needs
-    /// hydration; reads the log once when at least one does.
+    /// Walk every span in `jobs`, hydrating both persisted LLM input slices and
+    /// transcript-backed tool outputs into their legacy inline API shapes.
+    /// Skips the work entirely if no span needs hydration; reads the log once
+    /// when at least one does.
     /// `log_session_id` is the session whose log to read — the replayed
     /// session itself, since every session records its `Persisted` refs
     /// against its own transcript.
-    async fn hydrate_persisted_inputs(
+    async fn hydrate_persisted_trace_data(
         &self,
         log_session_id: &SessionId,
         jobs: &mut [ReplayJob],
     ) -> Result<()> {
-        use baybo_trace::{LlmCallInputs, SpanKind};
+        use baybo_trace::{LlmCallInputs, SpanKind, ToolCallOutput};
 
         let any_persisted = jobs.iter().any(|j| {
             j.steps.iter().any(|s| {
@@ -1099,6 +1096,10 @@ impl QueryApi {
                     matches!(
                         &sp.kind,
                         SpanKind::LlmCall { begin, .. } if begin.input_messages.is_persisted()
+                    ) || matches!(
+                        &sp.kind,
+                        SpanKind::ToolCall { result: Some(result), .. }
+                            if result.output.is_persisted()
                     )
                 })
             })
@@ -1187,11 +1188,50 @@ impl QueryApi {
                         };
                         begin.input_messages = LlmCallInputs::Inline(hydrated);
                     }
+
+                    if let SpanKind::ToolCall {
+                        result: Some(result),
+                        ..
+                    } = &mut span.kind
+                        && let ToolCallOutput::Persisted(reference) = &result.output
+                    {
+                        // The reference is keyed on the call's `tool_use_id`, so
+                        // find the (unsuperseded-or-not) row appended for it
+                        // after the span opened. `resolve` only succeeds for the
+                        // row that actually carries the block.
+                        let resolved = log
+                            .iter()
+                            .filter(|message| message.created_at >= span_started_at)
+                            .find_map(|message| reference.resolve(&message.message).ok());
+                        result.output = ToolCallOutput::Inline(match resolved {
+                            Some(value) => value,
+                            None => {
+                                tracing::warn!(
+                                    log_session_id = %log_session_id,
+                                    span_id = %span.id,
+                                    tool_use_id = %reference.tool_use_id,
+                                    "tool trace output reconstruction failed"
+                                );
+                                tool_output_reconstruction_warning(
+                                    &reference.tool_use_id,
+                                    "no transcript ToolResult found for this tool_use_id",
+                                )
+                            }
+                        });
+                    }
                 }
             }
         }
         Ok(())
     }
+}
+
+fn tool_output_reconstruction_warning(tool_use_id: &str, reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "trace_reconstruction_error",
+        "tool_use_id": tool_use_id,
+        "error": reason,
+    })
 }
 
 /// Visible in-band marker prepended to a rehydrated input whose
@@ -2052,10 +2092,111 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn replay_hydrates_transcript_backed_tool_output() {
+        use baybo_model::{ChatMessage, SpanId, StepId};
+        use baybo_trace::{
+            LifecycleOutcome, LifecycleState, PersistedToolCallOutput, Span, SpanKind, Step,
+            StepKind, ToolCallBegin, ToolCallOutput, ToolCallResult, TraceStore,
+        };
+
+        let session_store = Arc::new(MemSessionStore::default());
+        let session = make_session("tool-output-ref");
+        session_store.save(&session).await.unwrap();
+        let span_started_at = Utc::now();
+        let wrapped = "<tool_output name=\"Read\">\none durable copy\n</tool_output>";
+        session_store
+            .append_session_message(
+                &session.id,
+                &ChatMessage::tool_result("tool-use-1".into(), wrapped.to_string()),
+            )
+            .await
+            .unwrap();
+
+        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
+        let job = lifecycle
+            .start_job(session.id.clone(), TriggerKind::User, user_input(), None)
+            .await
+            .unwrap();
+        let trace_store: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
+        let step = Step {
+            id: StepId::new(),
+            job_id: job.id,
+            kind: StepKind::LlmIteration,
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            outcome: LifecycleState::Done(LifecycleOutcome::Ok),
+        };
+        trace_store
+            .save_step(&step.to_row().unwrap())
+            .await
+            .unwrap();
+        let span_id = SpanId::new();
+        trace_store
+            .save_span(
+                &Span {
+                    id: span_id,
+                    step_id: step.id,
+                    kind: SpanKind::ToolCall {
+                        begin: ToolCallBegin {
+                            tool_name: "Read".into(),
+                            tool_artifact_hash: String::new(),
+                            triggered_by: None,
+                            params: serde_json::json!({}),
+                        },
+                        result: Some(ToolCallResult {
+                            output: ToolCallOutput::persisted(PersistedToolCallOutput::new(
+                                "tool-use-1".into(),
+                                vec![],
+                                vec![],
+                            )),
+                            success: true,
+                            output_truncated_from: None,
+                        }),
+                    },
+                    parallel_group: None,
+                    started_at: span_started_at,
+                    ended_at: Some(Utc::now()),
+                    outcome: LifecycleState::Done(LifecycleOutcome::Ok),
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let api = QueryApi::new(
+            session_store,
+            lifecycle,
+            trace_store,
+            Arc::new(MemoryCostStore::default()),
+        );
+        let replay = api.replay(&session.id, None).await.unwrap();
+        let span = replay
+            .jobs
+            .iter()
+            .flat_map(|job| job.steps.iter())
+            .flat_map(|step| step.spans.iter())
+            .find(|span| span.id == span_id)
+            .unwrap();
+        let SpanKind::ToolCall {
+            result: Some(result),
+            ..
+        } = &span.kind
+        else {
+            panic!("expected tool result");
+        };
+        assert_eq!(
+            result.output,
+            ToolCallOutput::Inline(serde_json::Value::String(wrapped.to_string()))
+        );
+    }
+
     /// Differential test: the write-side "active as of N" snapshot
     /// (`load_active_session_messages_up_to`, captured by the background
     /// summary at call time) and the read-side reconstruction in
-    /// `hydrate_persisted_inputs` must agree — even after the referenced
+    /// `hydrate_persisted_trace_data` must agree — even after the referenced
     /// rows are later superseded by a compaction. `load_*_up_to` is
     /// time-sensitive (only currently-active rows), so the snapshot is
     /// captured BEFORE compaction; replay must reproduce it AFTER. Pins
