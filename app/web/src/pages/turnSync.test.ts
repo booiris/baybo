@@ -304,4 +304,42 @@ describe('multi-tab turn sync via routeInboundFrame', () => {
     expect(work?.workActive).toBe(false);
     expect(work?.workCancelled).toBeFalsy();
   });
+
+  it('keeps attachments when an ordinal final message replaces a streaming bubble', () => {
+    const tab = makeTab();
+    tab.feed({ kind: 'answer_delta', session_id: SID, text: 'Here is the report.' });
+    tab.feed({
+      kind: 'message',
+      session_id: SID,
+      user_id: 'web-operator',
+      channel_type: 'http',
+      role: 'assistant',
+      content: 'Here is the report.',
+      ordinal: 7,
+      attachments: [
+        {
+          kind: 'file',
+          blob_id: 'sha256:report-token',
+          mime_type: 'application/pdf',
+          size: 42,
+          filename: 'report.pdf',
+        },
+      ],
+    });
+
+    const transcript = tab.views()[SID]?.transcript ?? [];
+    expect(transcript).toHaveLength(1);
+    expect(transcript[0]).toMatchObject({
+      key: `row-${SID}-m7`,
+      streaming: false,
+      hasAttachments: true,
+      attachments: [
+        {
+          kind: 'file',
+          blob_id: 'sha256:report-token',
+          filename: 'report.pdf',
+        },
+      ],
+    });
+  });
 });
