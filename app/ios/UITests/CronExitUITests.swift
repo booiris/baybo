@@ -1,9 +1,13 @@
 import XCTest
 
-/// Headless drive of the cron-group exit contract: opening a scheduled job's
-/// fire drills IN through the fire list, but backing OUT of the fire lands on
-/// the MAIN chat list — not the fire list it was reached through
-/// (`AppStore.openCronGroupSession` resets the nav path rather than appending).
+/// Headless drive of the cron-group navigation: opening a scheduled job's fire
+/// drills IN through the fire list, and backing OUT retraces the same chain —
+/// chat → fire list → main chat list — the way the Archived screen does.
+///
+/// (An earlier build dropped the fire list from the back stack on entry so Back
+/// would skip straight to the main list; but `NavigationStack` keys its path
+/// positionally, so collapsing it remounted the chat page → a visible flash.
+/// See `AppStore.openCronGroupSession`. The drill-in is now a plain push.)
 ///
 /// Runs against `-baybo-open-home`, which seeds one cron group ("Morning brief",
 /// job `demo-job`) with two fires ("Morning brief · 7/14" / "· 7/13"). The three
@@ -11,9 +15,14 @@ import XCTest
 /// - main list — the `Menu` (☰) button in the list header;
 /// - fire list — a fire row (`Morning brief · 7/14`), with no `Menu`;
 /// - chat — the composer's `Send` button.
+///
+/// The chat's back chevron and the fire list's back chevron carry the SAME
+/// accessibility label (`chat.back` → "Back to conversations"), so only one is
+/// ever on screen and a tap always pops the current top.
 final class CronExitUITests: BayboUITestCase {
     private static let groupTitle = "Morning brief"
     private static let fireTitle = "Morning brief · 7/14"
+    private static let backLabel = "Back to conversations"
 
     private func launchHome() -> XCUIApplication {
         launch(["-baybo-open-home"])
@@ -36,43 +45,58 @@ final class CronExitUITests: BayboUITestCase {
             "tapping a fire did not open the chat")
     }
 
-    /// The whole point: back out of a cron fire → the main list, skipping the
-    /// fire list. Old behaviour (append) would land on the fire list instead.
-    func testBackFromCronFireLandsOnMainList() throws {
+    /// Back out of a cron fire: first to the fire list it was reached through,
+    /// then to the main list — the standard drill-in chain, no step skipped.
+    func testBackFromCronFireRetracesFireListThenMainList() throws {
         let app = launchHome()
         openFireChat(app)
 
-        app.buttons["Back to conversations"].tap()
+        // First back: the fire list (a fire row is present, the main list's ☰ is
+        // not).
+        app.buttons[Self.backLabel].tap()
+        XCTAssertTrue(
+            app.staticTexts[Self.fireTitle].waitForExistence(timeout: 3),
+            "back from a cron fire did not land on its fire list")
+        XCTAssertFalse(app.buttons["Menu"].exists, "skipped the fire list back to the main list")
 
-        // Main list, positively AND negatively: the ☰ menu is back, and the fire
-        // list is NOT what we landed on (its rows are gone). Both together pin the
-        // destination — the old append chain would satisfy neither.
+        // Second back: the main list (☰ is back, the fire rows are gone).
+        app.buttons[Self.backLabel].tap()
         XCTAssertTrue(
             app.buttons["Menu"].waitForExistence(timeout: 3),
-            "back from a cron fire did not land on the main list")
+            "back from the fire list did not land on the main list")
         XCTAssertFalse(
-            app.staticTexts[Self.fireTitle].exists,
-            "back from a cron fire landed on the fire list, not the main list")
+            app.staticTexts[Self.fireTitle].exists, "still on the fire list after the second back")
         XCTAssertTrue(
             app.staticTexts[Self.groupTitle].exists, "the cron group row is missing from the list")
     }
 
-    /// The reset-path pop still leaves the stack responsive: the cron group opens
-    /// again and its fire pushes again after the round trip. A PopGestureEnabler
-    /// that stranded the interactive-pop recognizer at the root would wedge this.
+    /// The pop chain stays responsive across a full round trip: the cron group
+    /// opens again and its fire pushes again after backing all the way out. A
+    /// PopGestureEnabler that stranded the interactive-pop recognizer would wedge
+    /// this.
     func testStackStaysResponsiveAfterCronExit() throws {
         let app = launchHome()
-        openFireChat(app)
-        app.buttons["Back to conversations"].tap()
+        backOutToMainList(app)
         XCTAssertTrue(app.buttons["Menu"].waitForExistence(timeout: 3), "did not return to the list")
 
-        // Second round trip: group → fire list → chat → back → list.
-        openFireChat(app)
-        app.buttons["Back to conversations"].tap()
+        // Second round trip proves the stack + pop recognizer survived the first.
+        backOutToMainList(app)
         XCTAssertTrue(
             app.buttons["Menu"].waitForExistence(timeout: 3),
             "stack dead after a cron exit — pop recognizer likely stranded")
         XCTAssertFalse(
-            app.staticTexts[Self.fireTitle].exists, "second exit landed on the fire list")
+            app.staticTexts[Self.fireTitle].exists, "second exit did not reach the main list")
+    }
+
+    /// Drill in to a fire chat, then back out the full chain (chat → fire list →
+    /// main list), waiting for the intermediate fire list so the second tap can't
+    /// race the first transition.
+    private func backOutToMainList(_ app: XCUIApplication) {
+        openFireChat(app)
+        app.buttons[Self.backLabel].tap()
+        XCTAssertTrue(
+            app.staticTexts[Self.fireTitle].waitForExistence(timeout: 3),
+            "back from the fire chat did not reach its fire list")
+        app.buttons[Self.backLabel].tap()
     }
 }
