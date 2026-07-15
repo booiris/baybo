@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::ChatSessionSummary;
 
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
+const PATH_CRON: &str = "/v1/cron";
 const PATH_MOBILE_APNS_TOKEN: &str = "/v1/mobile/apns-token";
 pub(crate) const PATH_BLOBS: &str = "/v1/blobs";
 /// Content-type for every JSON-bodied request, shared by both legs.
@@ -101,6 +102,11 @@ struct SessionSummary {
     /// The group's label (the job's live title, else the fire's snapshot).
     #[serde(default)]
     cron_job_title: Option<String>,
+    /// Whether the job's GROUP is pinned (`cron_jobs.pinned`, read off the live
+    /// job). Every fire of the job carries the same value; the client folds it
+    /// into the one group row. Distinct from `pinned`, this row's own pin.
+    #[serde(default)]
+    cron_group_pinned: bool,
 }
 
 #[derive(Serialize)]
@@ -222,6 +228,7 @@ pub(crate) async fn list_sessions<C: GatewayJsonClient + Sync>(
             unread_count: s.unread_count,
             cron_job_id: s.cron_job_id,
             cron_job_title: s.cron_job_title,
+            cron_group_pinned: s.cron_group_pinned,
         })
         .collect())
 }
@@ -247,6 +254,23 @@ pub(crate) async fn set_pinned<C: GatewayJsonClient + Sync>(
     let body = serde_json::to_vec(&SetPinnedRequest { pinned })
         .map_err(|e| format!("encode set pinned request: {e}"))?;
     let path = format!("{PATH_CHAT_SESSIONS}/{session_id}/pin");
+    client.put_empty(&path, body).await
+}
+
+/// Pin/unpin a **cron group** (`docs/cron-groups.md`) — keyed by the JOB, not a
+/// session: the group is a view over the job's fires, and the job is the only
+/// object that can hold the bit. `PUT /v1/cron/{id}/pin`. The first cron-job
+/// mutation this client can make, so it is also the first `/v1/cron` path it
+/// touches at all.
+pub(crate) async fn set_cron_pinned<C: GatewayJsonClient + Sync>(
+    client: &C,
+    job_id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    validate_path_segment(&job_id, "job_id")?;
+    let body = serde_json::to_vec(&SetPinnedRequest { pinned })
+        .map_err(|e| format!("encode set cron pin request: {e}"))?;
+    let path = format!("{PATH_CRON}/{job_id}/pin");
     client.put_empty(&path, body).await
 }
 
@@ -839,6 +863,34 @@ mod tests {
                 body: r#"{"pinned":false}"#.to_string(),
             }
         );
+    }
+
+    /// A cron group's pin is keyed by the JOB and rides `/v1/cron` — a different
+    /// path space from every other call this client makes. Pinning the group must
+    /// never be routed at a session id.
+    #[tokio::test]
+    async fn set_cron_pinned_puts_the_flag_on_the_jobs_pin_path() {
+        let client = RecordingClient::empty();
+        set_cron_pinned(&client, "job-1".to_string(), true)
+            .await
+            .expect("pin group");
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "PUT",
+                path: "/v1/cron/job-1/pin".to_string(),
+                body: r#"{"pinned":true}"#.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn set_cron_pinned_rejects_a_path_traversing_job_id() {
+        let client = RecordingClient::empty();
+        let err = set_cron_pinned(&client, "../sessions/s1".to_string(), true)
+            .await
+            .expect_err("a job id is a single path segment");
+        assert!(err.contains("job_id"), "unexpected error: {err}");
     }
 
     #[tokio::test]

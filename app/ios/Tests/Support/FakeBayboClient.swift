@@ -217,6 +217,8 @@ final class FakeBayboClient: BayboClientProtocol, @unchecked Sendable {
     func chatSetArchived(sessionId: String, archived: Bool) async throws { throw Self.unsupported }
     func chatSetPinned(sessionId: String, pinned: Bool) async throws { throw Self.unsupported }
 
+    func chatSetCronPinned(jobId: String, pinned: Bool) async throws { throw Self.unsupported }
+
     func blobDownloadBytes(blobId: String, progress: BlobProgress?) async throws -> Data {
         throw Self.unsupported
     }

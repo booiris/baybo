@@ -967,6 +967,7 @@ mod tests {
             updated_at: Utc::now(),
             origin_session_id: None,
             deleted_at: None,
+            pinned: false,
         }
     }
 

@@ -32,7 +32,7 @@ impl SqliteCronStore {
 // callback may only fail with a rusqlite error, so the queries below pull
 // the raw columns out and hand them here.
 
-fn job_from_row(deleted_us: Option<i64>, data: &str) -> Result<CronJob> {
+fn job_from_row(deleted_us: Option<i64>, pinned_col: i64, data: &str) -> Result<CronJob> {
     let mut job: CronJob = serde_json::from_str(data)
         .map_err(|e| StorageError::Storage(format!("failed to deserialize cron job: {e}")))?;
     // The row-level `deleted_at` column is the source of truth — `delete` and
@@ -47,6 +47,10 @@ fn job_from_row(deleted_us: Option<i64>, data: &str) -> Result<CronJob> {
         })?),
         None => None,
     };
+    // Same discipline for `pinned`: the flat column is authoritative,
+    // `set_pinned` owns it, `save` never writes it, and it is `#[serde(skip)]`
+    // so the blob never carries it either.
+    job.pinned = pinned_col != 0;
     Ok(job)
 }
 
@@ -63,8 +67,8 @@ fn execution_from_row(status_col: &str, data: &str) -> Result<CronExecution> {
 }
 
 /// Columns every job query selects; [`job_from_row`] takes the `deleted_at`
-/// (index 4) and `data` (index 5) columns out of that list.
-const JOB_COLS: &str = "id, user_id, status, next_trigger_at, deleted_at, data";
+/// (index 4), `pinned` (index 5) and `data` (index 6) columns out of that list.
+const JOB_COLS: &str = "id, user_id, status, next_trigger_at, deleted_at, pinned, data";
 
 /// The predicate that keeps recycled jobs out of a query. Applied in SQL — not
 /// in the caller — so no listing can forget it.
@@ -99,8 +103,8 @@ impl From<&CronJob> for Unmoved {
     }
 }
 
-/// The `(deleted_at, data)` pair each job query lifts out of a row.
-type JobRow = (Option<i64>, String);
+/// The `(deleted_at, pinned, data)` triple each job query lifts out of a row.
+type JobRow = (Option<i64>, i64, String);
 
 /// Columns every execution query selects; [`execution_from_row`] takes the
 /// `status` (index 5) and `data` (index 6) columns out of that list.
@@ -135,13 +139,18 @@ fn serialize_execution(exec: &CronExecution) -> Result<String> {
 
 fn decode_jobs(rows: Vec<JobRow>) -> Result<Vec<CronJob>> {
     rows.iter()
-        .map(|(deleted_us, data)| job_from_row(*deleted_us, data))
+        .map(|(deleted_us, pinned, data)| job_from_row(*deleted_us, *pinned, data))
         .collect()
 }
 
-/// Lift the `(deleted_at, data)` pair out of a row selected with [`JOB_COLS`].
+/// Lift the `(deleted_at, pinned, data)` triple out of a row selected with
+/// [`JOB_COLS`].
 fn job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
-    Ok((row.get::<_, Option<i64>>(4)?, row.get::<_, String>(5)?))
+    Ok((
+        row.get::<_, Option<i64>>(4)?,
+        row.get::<_, i64>(5)?,
+        row.get::<_, String>(6)?,
+    ))
 }
 
 fn decode_executions(rows: Vec<ExecutionRow>) -> Result<Vec<CronExecution>> {
@@ -159,11 +168,12 @@ impl CronStore for SqliteCronStore {
         let id = job.id.clone();
         let user_id = job.user_id.clone();
         let status = job.status.as_str().to_string();
+        let pinned_flag: i64 = if job.pinned { 1 } else { 0 };
         self.pool
             .interact("cron.create", move |conn| {
                 conn.execute(
-                    "INSERT INTO cron_jobs (id, user_id, status, next_trigger_at, deleted_at, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![id, user_id, status, next_trigger_us, deleted_us, data],
+                    "INSERT INTO cron_jobs (id, user_id, status, next_trigger_at, deleted_at, pinned, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![id, user_id, status, next_trigger_us, deleted_us, pinned_flag, data],
                 )?;
                 Ok(())
             })
@@ -186,7 +196,7 @@ impl CronStore for SqliteCronStore {
             .await?;
 
         match row {
-            Some((deleted_us, data)) => Ok(Some(job_from_row(deleted_us, &data)?)),
+            Some((deleted_us, pinned, data)) => Ok(Some(job_from_row(deleted_us, pinned, &data)?)),
             None => Ok(None),
         }
     }
@@ -205,6 +215,13 @@ impl CronStore for SqliteCronStore {
         let affected = self
             .pool
             .interact("cron.save", move |conn| {
+                // `pinned` is deliberately NOT in this SET list — it is owned by
+                // the targeted `set_pinned`, exactly like `sessions.pinned`. This
+                // is a whole-blob last-writer-wins UPDATE from whatever snapshot
+                // the caller holds, and `Scheduler::advance_recurring` calls it on
+                // EVERY fire with the job it read back at `list_due` — so a
+                // `pinned` written here would revert the user's pin on the job's
+                // next tick, minutes after they set it.
                 Ok(conn.execute(
                     "UPDATE cron_jobs SET user_id = ?1, status = ?2, next_trigger_at = ?3, \
                      data = ?4 WHERE id = ?5",
@@ -217,6 +234,24 @@ impl CronStore for SqliteCronStore {
             return Err(StorageError::NotFound(job.id.clone()));
         }
         Ok(())
+    }
+
+    async fn set_pinned(&self, job_id: &str, pinned: bool) -> Result<bool> {
+        let id = job_id.to_string();
+        let flag: i64 = if pinned { 1 } else { 0 };
+        // Targeted UPDATE on the flat column only — the JSON `data` blob is left
+        // alone, so a full-blob write (`save`, `save_if_unchanged`, `record_fire`)
+        // cannot lose it. Reads patch `CronJob.pinned` from the column.
+        let affected = self
+            .pool
+            .interact("cron.set_pinned", move |conn| {
+                Ok(conn.execute(
+                    "UPDATE cron_jobs SET pinned = ?2 WHERE id = ?1",
+                    rusqlite::params![id, flag],
+                )?)
+            })
+            .await?;
+        Ok(affected > 0)
     }
 
     async fn save_if_unchanged(&self, job: &CronJob, expected: &CronJob) -> Result<bool> {
@@ -255,7 +290,7 @@ impl CronStore for SqliteCronStore {
                 // cannot see it. `updated_at` is the one field every writer
                 // stamps, which makes it the row's version: a snapshot still
                 // carrying the stored one is a snapshot nothing has landed on.
-                if job_from_row(None, &stored)?.updated_at != expected_updated_at {
+                if job_from_row(None, 0, &stored)?.updated_at != expected_updated_at {
                     return Ok(false);
                 }
 
@@ -298,7 +333,7 @@ impl CronStore for SqliteCronStore {
                     return Ok(false);
                 };
 
-                let mut job = job_from_row(None, &data)?;
+                let mut job = job_from_row(None, 0, &data)?;
                 job.status = fire.status;
                 job.next_trigger_at = fire.next_trigger_at;
                 job.last_triggered_at = Some(fire.last_triggered_at);
@@ -761,6 +796,7 @@ mod tests {
             updated_at: now,
             origin_session_id: None,
             deleted_at: None,
+            pinned: false,
         }
     }
 
@@ -790,6 +826,84 @@ mod tests {
         let loaded = store.get("cj-1").await.unwrap().unwrap();
         assert_eq!(loaded.id, "cj-1");
         assert_eq!(loaded.user_id, "u1");
+    }
+
+    /// The whole reason `pinned` is a flat column and not a blob field. Every
+    /// blob write reconstructs the row from a snapshot the caller holds, and
+    /// `record_fire` does it on EVERY fire from the pre-fire job — a snapshot
+    /// taken *before* the user pinned. If a fire (or a plain `save`) wrote
+    /// `pinned`, the pin would be reverted by the job's next tick.
+    #[tokio::test]
+    async fn a_fire_and_a_save_cannot_unpin_the_group() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
+        store
+            .create(&test_job("cj-1", "u1", CronStatus::Enabled))
+            .await
+            .unwrap();
+
+        // The scheduler reads the job (unpinned) …
+        let stale = store.get("cj-1").await.unwrap().unwrap();
+        assert!(!stale.pinned);
+
+        // … the user pins the group …
+        assert!(store.set_pinned("cj-1", true).await.unwrap());
+        assert!(store.get("cj-1").await.unwrap().unwrap().pinned);
+
+        // … and the job fires, writing back from the pre-pin snapshot. The fire
+        // is conditional on the row being unmoved, and it is — `set_pinned`
+        // touched neither `status` nor `next_trigger_at` — so it lands, and must
+        // NOT carry the snapshot's stale `pinned = false` back.
+        assert!(
+            store
+                .record_fire(&stale, advance_to(future_dt()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store.get("cj-1").await.unwrap().unwrap().pinned,
+            "the fire clobbered the pin — `pinned` leaked into `record_fire`/the data blob"
+        );
+
+        // A plain `save` (a create/edit's whole-row write) is just as blind to
+        // the column: a stale copy that thinks it is unpinned must not unpin it.
+        let mut edited = store.get("cj-1").await.unwrap().unwrap();
+        edited.pinned = false;
+        edited.prompt = "edited".to_string();
+        store.save(&edited).await.unwrap();
+        assert!(
+            store.get("cj-1").await.unwrap().unwrap().pinned,
+            "a whole-row `save` clobbered the pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_pinned_round_trips_and_reports_a_missing_job() {
+        let pool = SqlitePool::open_in_memory().await.unwrap();
+        let store = SqliteCronStore::new(pool);
+        store
+            .create(&test_job("cj-1", "u1", CronStatus::Enabled))
+            .await
+            .unwrap();
+
+        assert!(store.set_pinned("cj-1", true).await.unwrap());
+        assert!(store.list_all().await.unwrap()[0].pinned);
+        assert!(store.set_pinned("cj-1", false).await.unwrap());
+        assert!(!store.list_all().await.unwrap()[0].pinned);
+        // A job that no longer exists (deleted from another client) reports it
+        // rather than erroring — the route answers 404 off this.
+        assert!(!store.set_pinned("gone", true).await.unwrap());
+    }
+
+    /// The pin must never reach the JSON blob — that is what makes `save` safe.
+    #[tokio::test]
+    async fn the_pin_is_not_in_the_data_blob() {
+        let job = test_job("cj-1", "u1", CronStatus::Enabled);
+        let blob = serialize_job(&job).unwrap();
+        assert!(
+            !blob.contains("pinned"),
+            "`CronJob::pinned` lost its #[serde(skip)] — it is now clobberable by `save`: {blob}"
+        );
     }
 
     #[tokio::test]

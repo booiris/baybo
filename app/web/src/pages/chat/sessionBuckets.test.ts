@@ -120,3 +120,53 @@ describe('folder and pin bucketing (unchanged behaviour)', () => {
     expect(uncategorized.map((s) => s.session_id)).toEqual(['dangling', 'loose']);
   });
 });
+
+describe('cron group pin', () => {
+  it('sorts a pinned group ahead of a more recently fired one', () => {
+    // JOB_B fired most recently, so by recency alone it would lead the block.
+    // The pin is exactly what a LOW-frequency job needs: without it, the weekly
+    // digest sinks under the half-hourly one forever.
+    const { cronGroups } = bucketSessions(
+      [
+        fire('b1', JOB_B, { last_active: '2026-07-14T12:00:00Z' }),
+        fire('a1', JOB_A, {
+          last_active: '2026-07-01T00:00:00Z',
+          cron_group_pinned: true,
+        }),
+      ],
+      REACHABLE,
+    );
+    expect(cronGroups.map((g) => g.jobId)).toEqual([JOB_A, JOB_B]);
+    expect(cronGroups[0].pinned).toBe(true);
+    expect(cronGroups[1].pinned).toBe(false);
+  });
+
+  it('pins the GROUP without pinning its fires', () => {
+    // The bit lives on the job, so no session's own `pinned` flips — and the
+    // members must therefore stay INSIDE the group rather than escaping to the
+    // Pinned block (which is what a session-level pin does).
+    const { cronGroups, pinned } = bucketSessions(
+      [fire('a1', JOB_A, { cron_group_pinned: true })],
+      REACHABLE,
+    );
+    expect(pinned).toHaveLength(0);
+    expect(cronGroups[0].sessions.map((s) => s.session_id)).toEqual(['a1']);
+  });
+
+  it('still lets an individually pinned fire escape a pinned group', () => {
+    // The two pins are different things and both survive: the group holds its
+    // seat at the top of the cron block, and the one fire the user pinned by
+    // hand lifts out to the Pinned block. Each row is still rendered exactly
+    // once — the escapee is not also drawn inside the group.
+    const { cronGroups, pinned } = bucketSessions(
+      [
+        fire('a1', JOB_A, { cron_group_pinned: true, pinned: true }),
+        fire('a2', JOB_A, { cron_group_pinned: true }),
+      ],
+      REACHABLE,
+    );
+    expect(pinned.map((s) => s.session_id)).toEqual(['a1']);
+    expect(cronGroups[0].pinned).toBe(true);
+    expect(cronGroups[0].sessions.map((s) => s.session_id)).toEqual(['a2']);
+  });
+});

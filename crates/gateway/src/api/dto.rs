@@ -715,6 +715,12 @@ pub struct CronJob {
     pub deleted_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_session_id: Option<String>,
+    /// Whether this job's **cron group** — the chat-list row collapsing its
+    /// fires — is pinned to the top of the list (`docs/cron-groups.md`).
+    /// `#[serde(default)]` so it is not required on the wire (defaults false),
+    /// matching `cron_group_pinned` on the chat-list summary.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl From<baybo_cron::CronJob> for CronJob {
@@ -734,8 +740,17 @@ impl From<baybo_cron::CronJob> for CronJob {
             updated_at: v.updated_at,
             deleted_at: v.deleted_at,
             origin_session_id: v.origin_session_id.map(|s| s.into_inner()),
+            pinned: v.pinned,
         }
     }
+}
+
+/// Request body for `PUT /v1/cron/{id}/pin`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetCronPinRequest {
+    /// `true` to pin this job's cron group to the top of the chat list,
+    /// `false` to release it back to recency order.
+    pub pinned: bool,
 }
 
 // ── Log records ──────────────────────────────────────────────────────

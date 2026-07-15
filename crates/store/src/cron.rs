@@ -65,6 +65,14 @@ pub trait CronStore: Send + Sync {
     /// that lands mid-fire wins: none of them may be re-armed away by the fire
     /// they raced. Returns false when the write was dropped for that reason.
     async fn record_fire(&self, expected: &CronJob, fire: CronFire) -> Result<bool>;
+    /// Pin/unpin the job's **cron group** (`docs/cron-groups.md`). A targeted
+    /// write on the flat `pinned` column — NOT through `save` /
+    /// `save_if_unchanged` / `record_fire`, all of which rewrite the whole row
+    /// from a snapshot the caller holds (and `record_fire` re-serializes it on
+    /// every fire), so a pin routed through them would be reverted by the next
+    /// tick. The same flat-column discipline `deleted_at` uses. Returns `false`
+    /// when no such job exists.
+    async fn set_pinned(&self, job_id: &str, pinned: bool) -> Result<bool>;
     /// Move a job to the recycle bin by stamping `deleted_at`. Leaves
     /// `status` untouched. Idempotent: a job already in the bin keeps the
     /// deletion time it went in with.

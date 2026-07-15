@@ -26,6 +26,11 @@ export interface CronGroup {
   /** The group's label (the job's live title, or its snapshot once the job is
    *  gone). A fire with no resolvable title is not groupable and stays flat. */
   title: string;
+  /** Whether the user pinned this group (`cron_jobs.pinned`, surfaced on every
+   *  member as `cron_group_pinned`). Pinned groups sort ahead of the rest of the
+   *  cron block — the group is the only thing that can be pinned here, since a
+   *  fire is a moment and the job is the recurring thing the user cares about. */
+  pinned: boolean;
   /** Members drawn inside the group, in incoming (newest-first) order. */
   sessions: SessionSummary[];
 }
@@ -82,6 +87,9 @@ export function bucketSessions(
         const group = byJob.get(s.cron_job_id) ?? {
           jobId: s.cron_job_id,
           title: s.cron_job_title,
+          // Every member of a job carries the same bit (it is read off the one
+          // live job), so the first member to arrive settles it.
+          pinned: s.cron_group_pinned ?? false,
           sessions: [],
         };
         group.sessions.push(s);
@@ -103,7 +111,13 @@ export function bucketSessions(
   // Folders carry a user-chosen `position`; a cron group has none, so it sorts
   // by its newest visible member — when a job fires, its group floats to the
   // top of the cron block. Ties fall back to the job id so the order is stable.
+  //
+  // A PINNED group sorts ahead of all of them. That is the only thing the pin
+  // buys: a job that fires often is already at the top of this block by recency
+  // ("48 fires a day become one row moving"), so the pin exists for the LOW
+  // frequency job — the weekly digest that would otherwise sink between fires.
   const cronGroups = [...byJob.values()].sort((a, b) => {
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
     const diff = newestActive(b.sessions) - newestActive(a.sessions);
     return diff !== 0 ? diff : a.jobId.localeCompare(b.jobId);
   });

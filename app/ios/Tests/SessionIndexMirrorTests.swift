@@ -55,7 +55,8 @@ struct SessionIndexMirrorTests {
             archived: false,
             unreadCount: 0,
             cronJobId: nil,
-            cronJobTitle: nil)
+            cronJobTitle: nil,
+            cronGroupPinned: false)
     }
 
     /// The headline. A gateway with far more than ten sessions, ours the OLDEST

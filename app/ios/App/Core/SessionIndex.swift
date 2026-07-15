@@ -35,11 +35,18 @@ struct SessionRow: Codable, Identifiable, Equatable {
     /// job was deleted). `nil` when the group cannot be named at all — such a
     /// row stays flat rather than joining a nameless group.
     var cronJobTitle: String?
+    /// Whether this row's cron GROUP is pinned. Server-owned like `pinned`, but
+    /// the bit lives on the JOB (`cron_jobs.pinned`) — a group is a view over
+    /// its fires, so the job is the only object that can hold it. Every fire of
+    /// the job carries the same value and the list folds it into the one group
+    /// row. `false` on an ordinary chat, and on a tombstone group (job deleted).
+    var cronGroupPinned: Bool
 
     init(
         id: String, createdAt: Date, lastActive: Date, title: String? = nil,
         preview: String?, userText: String? = nil, pinned: Bool, archived: Bool = false,
-        unread: Int = 0, cronJobId: String? = nil, cronJobTitle: String? = nil
+        unread: Int = 0, cronJobId: String? = nil, cronJobTitle: String? = nil,
+        cronGroupPinned: Bool = false
     ) {
         self.id = id
         self.createdAt = createdAt
@@ -52,6 +59,7 @@ struct SessionRow: Codable, Identifiable, Equatable {
         self.unread = unread
         self.cronJobId = cronJobId
         self.cronJobTitle = cronJobTitle
+        self.cronGroupPinned = cronGroupPinned
     }
 
     /// The pre-Telegram schema stored the preview under `lastUserText`; decode
@@ -88,6 +96,7 @@ struct SessionRow: Codable, Identifiable, Equatable {
         // round-trips through disk for exactly that reason.
         cronJobId = try c.decodeIfPresent(String.self, forKey: .cronJobId)
         cronJobTitle = try c.decodeIfPresent(String.self, forKey: .cronJobTitle)
+        cronGroupPinned = try c.decodeIfPresent(Bool.self, forKey: .cronGroupPinned) ?? false
     }
 }
 
@@ -149,6 +158,14 @@ final class SessionIndex: ObservableObject {
     /// In-memory only: a kill mid-flight loses the intent and the next merge
     /// restores server truth, which is the honest fallback.
     private var pendingMutations: [String: PendingMutation] = [:]
+    /// In-flight **cron group** pin intents, keyed by JOB id — a different id
+    /// space from `pendingMutations`' session ids, which is exactly why it is a
+    /// separate map rather than another `PendingMutation` case.
+    private var pendingCronPins: [String: Bool] = [:]
+    /// The group-pin value last acknowledged by the server, staged when a job's
+    /// first pending pin lands, so a chained failure rolls back to truth rather
+    /// than to the negation of a flip that never happened.
+    private var pinnedCronBaselines: [String: Bool] = [:]
     /// Rows removed by `beginHide`, kept for the failure rollback (the mirror is
     /// deleted with the row and stays gone — a rolled-back delete refetches its
     /// history on re-entry).
@@ -354,6 +371,50 @@ final class SessionIndex: ObservableObject {
         setArchivedFlag(sessionId, archived: archived)
     }
 
+    /// Optimistic **cron group** pin flip. Keyed by the JOB, not a session: the
+    /// group is a view over its fires and the bit lives on the job, so the flip
+    /// touches every member row (that is what carries it into the bucketing) and
+    /// the staged intent is held per job id.
+    ///
+    /// Deliberately NOT routed through `pendingMutations` / `mutationEpoch`: those
+    /// are keyed by session id and a job id is a different id space (aliasing them
+    /// would let a job id shadow a session's staged archive). A racing merge
+    /// consults `pendingCronPins` instead.
+    func beginCronPin(jobId: String, pinned: Bool) {
+        if pinnedCronBaselines[jobId] == nil {
+            pinnedCronBaselines[jobId] = rows.first { $0.cronJobId == jobId }?.cronGroupPinned
+                ?? false
+        }
+        pendingCronPins[jobId] = pinned
+        setCronGroupPinnedFlag(jobId: jobId, pinned: pinned)
+    }
+
+    /// The staged group pin reached the server: remote truth takes over again.
+    func finishCronPin(jobId: String) {
+        pendingCronPins.removeValue(forKey: jobId)
+        pinnedCronBaselines.removeValue(forKey: jobId)
+    }
+
+    /// The group-pin PUT failed: rewind to the last server-acknowledged value
+    /// (not the negation of the failed intent — a failed pin→unpin chain would
+    /// otherwise re-pin a group the server never pinned).
+    func rollBackCronPin(jobId: String) {
+        pendingCronPins.removeValue(forKey: jobId)
+        guard let baseline = pinnedCronBaselines.removeValue(forKey: jobId) else { return }
+        setCronGroupPinnedFlag(jobId: jobId, pinned: baseline)
+    }
+
+    private func setCronGroupPinnedFlag(jobId: String, pinned: Bool) {
+        var changed = false
+        for idx in rows.indices where rows[idx].cronJobId == jobId {
+            if rows[idx].cronGroupPinned != pinned {
+                rows[idx].cronGroupPinned = pinned
+                changed = true
+            }
+        }
+        if changed { save() }
+    }
+
     /// Optimistic pin flip: the row re-sorts to the top block at once; the
     /// staged intent shields it from a racing merge until the PUT resolves.
     /// No-ops for a gone row or one with a delete in flight.
@@ -535,7 +596,13 @@ final class SessionIndex: ObservableObject {
                     // Server-owned, like pin/archive: the group a fire belongs to
                     // is a fact about the session, and the label follows the job's
                     // LIVE title, so a rename lands here with no local rewrite.
-                    cronJobId: summary.cronJobId, cronJobTitle: summary.cronJobTitle))
+                    cronJobId: summary.cronJobId, cronJobTitle: summary.cronJobTitle,
+                    // The group's pin lives on the JOB, so an in-flight local flip
+                    // is staged per JOB (not per session) and beats this snapshot
+                    // — the same rule `pendingMutations` enforces for a row's own
+                    // pin, applied to the object that actually holds the bit.
+                    cronGroupPinned: summary.cronJobId
+                        .flatMap { pendingCronPins[$0] } ?? summary.cronGroupPinned))
         }
         // A row the server no longer lists was deleted from another client, and
         // this rebuild is where it leaves the list for good. Its transcript goes
@@ -559,6 +626,8 @@ final class SessionIndex: ObservableObject {
     func removeAll() {
         rows = []
         pendingMutations = [:]
+        pendingCronPins = [:]
+        pinnedCronBaselines = [:]
         hiddenBackups = [:]
         archiveBaselines = [:]
         pinBaselines = [:]

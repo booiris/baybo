@@ -2331,6 +2331,33 @@ export function ChatPage() {
     [client],
   );
 
+  // Pin / unpin a cron GROUP. The bit lives on the JOB (`PUT /v1/cron/{id}/pin`),
+  // not on any session — the group is a view over the job's fires — so the
+  // optimistic flip has to touch every member row, which is what carries
+  // `cron_group_pinned` into the bucketing. The server answers with a
+  // session-less `Gap` (list-stale) rather than a SessionPatch, since no session
+  // changed; other tabs converge on their next list pull.
+  const handleToggleCronPin = useCallback(
+    async (jobId: string, pinned: boolean) => {
+      const flip = (want: boolean) =>
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.cron_job_id === jobId ? { ...s, cron_group_pinned: want } : s,
+          ),
+        );
+      flip(pinned);
+      const { error, response } = await client.PUT('/v1/cron/{id}/pin', {
+        params: { path: { id: jobId } },
+        body: { pinned },
+      });
+      if (error || !response.ok) {
+        console.warn('toggle cron group pin failed', jobId, error);
+        flip(!pinned);
+      }
+    },
+    [client],
+  );
+
   // ── Folder handlers ────────────────────────────────────────────────
   // Assign (or clear, with null) a session's folder. Optimistic; the
   // server's SessionPatch broadcast converges every tab. A pinned row
@@ -2599,6 +2626,7 @@ export function ChatPage() {
         onNewChat={handleNewChat}
         onHide={handleHideSession}
         onTogglePin={handleTogglePin}
+        onToggleCronPin={handleToggleCronPin}
         onAssignFolder={handleAssignFolder}
         onCreateFolder={handleCreateFolder}
         onRenameFolder={handleRenameFolder}

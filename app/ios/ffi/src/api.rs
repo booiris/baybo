@@ -161,6 +161,18 @@ pub struct ChatSessionSummary {
     /// at all (a pre-snapshot fire whose job is gone) — the list leaves such a
     /// row flat rather than inventing a name.
     pub cron_job_title: Option<String>,
+    /// Whether that GROUP is pinned to the top of the list. The bit lives on the
+    /// cron JOB (`cron_jobs.pinned`) — the group is a view over its fires, and
+    /// the job is the only object whose identity matches it — so every fire
+    /// carries the same value and the list folds it into the one group row,
+    /// exactly as it already does `cron_job_title`.
+    ///
+    /// NOT the same as `pinned`, which is this SESSION's own pin: pinning a fire
+    /// lifts that one conversation out of its group, while pinning the group
+    /// keeps the whole recurring stream at the top. A tombstone group (the job
+    /// was deleted, its history kept) is always `false` — nothing is left to
+    /// hold the bit.
+    pub cron_group_pinned: bool,
 }
 
 /// Result of the per-send durability point lookup

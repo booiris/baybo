@@ -33,7 +33,8 @@ struct SessionIndexMergeTests {
         archived: Bool = false,
         unreadCount: Int64 = 0,
         cronJobId: String? = nil,
-        cronJobTitle: String? = nil
+        cronJobTitle: String? = nil,
+        cronGroupPinned: Bool = false
     ) -> ChatSessionSummary {
         ChatSessionSummary(
             sessionId: id,
@@ -46,7 +47,8 @@ struct SessionIndexMergeTests {
             archived: archived,
             unreadCount: unreadCount,
             cronJobId: cronJobId,
-            cronJobTitle: cronJobTitle)
+            cronJobTitle: cronJobTitle,
+            cronGroupPinned: cronGroupPinned)
     }
 
     /// The device clock must never beat the server's. `recordUserSend` stamps

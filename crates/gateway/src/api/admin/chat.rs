@@ -623,6 +623,14 @@ pub struct ChatSessionSummary {
     /// gone; clients leave those rows flat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron_job_title: Option<String>,
+    /// Whether this row's **cron group** is pinned to the top of the chat list.
+    /// Read off the live job (`cron_jobs.pinned`), so every fire of the job
+    /// carries the same value and the client folds it into the one group row —
+    /// exactly as it already does for `cron_job_title`. The group is a view, so
+    /// the bit necessarily dies with the job: a tombstone group (job deleted,
+    /// history kept) is always unpinned. `false` for a non-cron row.
+    #[serde(default)]
+    pub cron_group_pinned: bool,
     /// Number of unread assistant replies — final assistant messages persisted
     /// with `ordinal` above this session's read cursor
     /// (`PUT /v1/chat/sessions/{id}/read`), capped at [`UNREAD_COUNT_CAP`]
@@ -790,7 +798,7 @@ async fn list_sessions(
         async move { last_message_preview(&manager, &sid).await }
     }))
     .await;
-    let cron_titles = live_cron_job_titles(&state, &visible).await;
+    let cron_jobs = live_cron_job_meta(&state, &visible).await;
     let items: Vec<ChatSessionSummary> = visible
         .into_iter()
         .zip(previews)
@@ -798,8 +806,9 @@ async fn list_sessions(
         .zip(last_messages)
         .map(
             |(((s, last_user_text), unread), last_message_text)| ChatSessionSummary {
-                cron_job_title: cron_group_label(&s, &cron_titles),
+                cron_job_title: cron_group_label(&s, &cron_jobs),
                 cron_job_id: cron_group_id(&s).map(str::to_owned),
+                cron_group_pinned: cron_group_pinned(&s, &cron_jobs),
                 session_id: s.id.to_string(),
                 created_at: s.created_at,
                 last_active: s.last_active,
@@ -830,25 +839,58 @@ fn cron_group_id(session: &Session) -> Option<&str> {
         .flatten()
 }
 
-/// Titles of every cron job any listed fire belongs to. One batched read (cron
-/// jobs number in the handful), skipped entirely when the page holds no cron
-/// conversation. A failed read degrades to an empty map rather than failing the
-/// list — every group then falls back to its tombstone.
-async fn live_cron_job_titles(state: &AdminState, visible: &[Session]) -> HashMap<String, String> {
+/// What a live cron job contributes to its group's chat-list row.
+struct CronGroupMeta {
+    /// The job's current title. `None` when it has none (a pre-title row) — the
+    /// group then falls back to the fire's snapshot. NOT a reason to drop the
+    /// job from the map: it still carries `pinned`.
+    title: Option<String>,
+    /// Whether the user pinned this job's group (`cron_jobs.pinned`).
+    pinned: bool,
+}
+
+/// Every cron job any listed fire belongs to. One batched read (cron jobs number
+/// in the handful), skipped entirely when the page holds no cron conversation. A
+/// failed read degrades to an empty map rather than failing the list — every
+/// group then falls back to its tombstone name and reads as unpinned.
+///
+/// An untitled job stays IN the map with `title: None`. It used to be filtered
+/// out wholesale, which was harmless while the title was all this carried — but
+/// it also carries the pin now, and dropping the row would silently unpin the
+/// group of any job that has no title.
+async fn live_cron_job_meta(
+    state: &AdminState,
+    visible: &[Session],
+) -> HashMap<String, CronGroupMeta> {
     if !visible.iter().any(|s| cron_group_id(s).is_some()) {
         return HashMap::new();
     }
     match state.cron_scheduler.list_all_jobs().await {
         Ok(jobs) => jobs
             .into_iter()
-            .map(|job| (job.id, job.title))
-            .filter(|(_, title)| !title.is_empty())
+            .map(|job| {
+                let meta = CronGroupMeta {
+                    title: (!job.title.is_empty()).then_some(job.title),
+                    pinned: job.pinned,
+                };
+                (job.id, meta)
+            })
             .collect(),
         Err(e) => {
-            warn!(error = %e, "cron job titles unavailable; groups fall back to their snapshots");
+            warn!(error = %e, "cron jobs unavailable; groups fall back to their snapshots");
             HashMap::new()
         }
     }
+}
+
+/// Whether this row's cron group is pinned. Read off the LIVE job — the group is
+/// a view, so the job is the only thing that can hold the bit, and it therefore
+/// dies with the job: deleting a job releases its group (a tombstone group,
+/// which outlives its job via the fire's title snapshot, is always unpinned).
+fn cron_group_pinned(session: &Session, live: &HashMap<String, CronGroupMeta>) -> bool {
+    cron_group_id(session)
+        .and_then(|job_id| live.get(job_id))
+        .is_some_and(|meta| meta.pinned)
 }
 
 /// The label for this row's cron group: the job's **live** title, so a rename
@@ -860,10 +902,10 @@ async fn live_cron_job_titles(state: &AdminState, visible: &[Session]) -> HashMa
 /// `None` when both are unavailable (a fire minted before the snapshot existed,
 /// whose job has since been deleted). Clients leave such a row flat rather than
 /// inventing a name — the population is self-limiting.
-fn cron_group_label(session: &Session, live: &HashMap<String, String>) -> Option<String> {
+fn cron_group_label(session: &Session, live: &HashMap<String, CronGroupMeta>) -> Option<String> {
     let job_id = cron_group_id(session)?;
     live.get(job_id)
-        .cloned()
+        .and_then(|meta| meta.title.clone())
         .or_else(|| session.trigger.cron_job_title().map(str::to_owned))
 }
 
@@ -2010,7 +2052,11 @@ async fn create_or_load_chat_session(
         .map_err(|e| GatewayError::Internal(format!("create requested chat session: {e}")))
 }
 
-fn chat_list_channel(authed: Option<&AuthedClient>) -> ChannelType {
+/// The channel universe a caller's chat list lives in. `http` (web) and
+/// `device` (iOS) own disjoint session sets, and every scoped lookup 404s
+/// across the boundary. Shared with the cron routes, whose jobs carry the same
+/// `ChannelType` and must be scoped the same way.
+pub(crate) fn chat_list_channel(authed: Option<&AuthedClient>) -> ChannelType {
     match authed {
         Some(AuthedClient::Device { .. }) => ChannelType::device(),
         _ => ChannelType::http(),
@@ -2081,6 +2127,19 @@ pub(crate) fn broadcast_session_patch(
     };
     if let Some(sub) = channel.as_subscribed() {
         sub.broadcast_session_patch(session_id.clone(), patch);
+    }
+}
+
+/// Nudge every client on `channel` that its session LIST is stale (the
+/// session-less `Frame::Gap`). For changes with no session row to patch — see
+/// [`baybo_channels::SubscribedView::broadcast_list_stale`], whose motivating
+/// case is the cron-group pin.
+pub(crate) fn broadcast_session_list_stale(state: &AdminState, channel: &ChannelType) {
+    let Some(channel) = state.channel_registry.get(channel) else {
+        return;
+    };
+    if let Some(sub) = channel.as_subscribed() {
+        sub.broadcast_list_stale();
     }
 }
 
