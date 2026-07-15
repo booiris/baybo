@@ -74,6 +74,37 @@ struct CronGroupBucketTests {
         #expect(group(items, "cj-1")?.lastActive == items.first?.lastActive)
     }
 
+    /// The group's NAME is the newest fire's — matching web, which takes the
+    /// first member over a newest-first list. This split from web (a master bug,
+    /// shipped with cron groups): the fold used to be a plain last-write-wins
+    /// over the same newest-first input, so it kept the OLDEST fire's label. It
+    /// only shows when fires carry different labels — a renamed-then-deleted job,
+    /// whose tombstone fires each fall back to the name they were minted under —
+    /// where web then showed the renamed name and iOS the birth-time one.
+    @Test func theGroupNameIsTheNewestFiresNotTheOldest() {
+        // Input arrives newest-first (the gateway's `ORDER BY last_active DESC`).
+        let items = ChatListBuckets.items(from: [
+            row("fire-new", minutesAgo: 1, jobId: "cj-1", jobTitle: "Evening brief"),
+            row("fire-old", minutesAgo: 900, jobId: "cj-1", jobTitle: "Morning brief"),
+        ])
+
+        #expect(
+            group(items, "cj-1")?.title == "Evening brief",
+            "the label must be the newest fire's, not the last-iterated (oldest) one")
+    }
+
+    /// Order-independence: the same fires shuffled into oldest-first order must
+    /// still name the group after the newest one. (A last-write-wins fold would
+    /// flip its answer with the input order; this must not.)
+    @Test func theGroupNameIgnoresInputOrder() {
+        let items = ChatListBuckets.items(from: [
+            row("fire-old", minutesAgo: 900, jobId: "cj-1", jobTitle: "Morning brief"),
+            row("fire-new", minutesAgo: 1, jobId: "cj-1", jobTitle: "Evening brief"),
+        ])
+
+        #expect(group(items, "cj-1")?.title == "Evening brief")
+    }
+
     /// **Every row appears exactly once.** Pinning a fire means "keep this in my
     /// face" — burying it behind a tap would make the gesture a no-op — so it
     /// escapes to the pinned block, exactly as the web sidebar does. And because

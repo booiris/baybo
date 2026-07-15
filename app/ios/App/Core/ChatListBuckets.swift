@@ -88,33 +88,37 @@ enum ChatListBuckets {
     static func items(from rows: [SessionRow]) -> [ChatListItem] {
         var flat: [SessionRow] = []
         var grouped: [String: [SessionRow]] = [:]
-        var titles: [String: String] = [:]
 
         for row in rows where !row.archived {
             guard !row.pinned,
                 let jobId = row.cronJobId,
-                let title = row.cronJobTitle
+                row.cronJobTitle != nil
             else {
                 flat.append(row)
                 continue
             }
             grouped[jobId, default: []].append(row)
-            // Every member carries the same label (the gateway resolves it from
-            // the job, not per-fire), so last-write-wins is a no-op — but taking
-            // the newest member's keeps the group honest if a rename ever lands
-            // mid-page.
-            titles[jobId] = title
         }
 
         var items = flat.map(ChatListItem.chat)
         for (jobId, members) in grouped {
-            guard let title = titles[jobId] else { continue }
+            let sorted = members.sorted { $0.lastActive > $1.lastActive }
+            // The label is the NEWEST member's, NOT last-write-wins over the
+            // input order. While the job lives the gateway resolves the same live
+            // title for every fire, so it makes no difference — but a deleted
+            // job's fires each fall back to the name they were minted under, and
+            // if it was renamed mid-life those snapshots differ. Web takes the
+            // newest (first over its newest-first list); last-write-wins here took
+            // the OLDEST, so iOS showed the birth-time name where web showed the
+            // renamed one. The guard above already proved every member's title is
+            // non-nil, so the newest's is too.
+            guard let title = sorted.first?.cronJobTitle else { continue }
             items.append(
                 .cronGroup(
                     CronGroup(
                         jobId: jobId,
                         title: title,
-                        members: members.sorted { $0.lastActive > $1.lastActive })))
+                        members: sorted)))
         }
 
         // The list's existing grain: pinned block first, then most recent. A
