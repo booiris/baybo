@@ -85,6 +85,27 @@ struct RootView: View {
                 )
                 .zIndex(1)
             }
+
+            // A cron group's delete clears its execution records — never the job
+            // — so the body says so, and counts them: the group is a view over
+            // its fires, and "delete" hiding N conversations is exactly the kind
+            // of blast radius a confirm exists to state out loud.
+            if let pending = store.confirmDeleteCronGroup {
+                ConfirmDialog(
+                    titleKey: "list.deleteGroupConfirmTitle",
+                    bodyKey: "list.deleteGroupConfirmBody",
+                    bodyArg: String(pending.memberIds.count),
+                    destructiveKey: "list.delete",
+                    onCancel: dismissDeleteCronGroupConfirm,
+                    onConfirm: {
+                        dismissDeleteCronGroupConfirm()
+                        withAnimation {
+                            store.requestDeleteGroup(pending.memberIds)
+                        }
+                    }
+                )
+                .zIndex(1)
+            }
         }
         .sheet(isPresented: $store.scanPresented) {
             ScanView()
@@ -100,6 +121,12 @@ struct RootView: View {
     private func dismissDeleteConfirm() {
         withAnimation(ConfirmDialog.exitMotion) {
             store.confirmDeleteSession = nil
+        }
+    }
+
+    private func dismissDeleteCronGroupConfirm() {
+        withAnimation(ConfirmDialog.exitMotion) {
+            store.confirmDeleteCronGroup = nil
         }
     }
 }

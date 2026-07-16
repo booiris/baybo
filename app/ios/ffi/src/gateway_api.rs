@@ -129,6 +129,11 @@ struct MarkManyReadRequest {
     session_ids: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct HideManyRequest {
+    session_ids: Vec<String>,
+}
+
 /// Backward page of the transcript (`GET /v1/chat/sessions/{id}`). The rows
 /// are the gateway's full-fidelity `ChatTranscriptItem` DTOs (message | work |
 /// notice, keyed by their stable `id`); they pass through to the webview
@@ -281,6 +286,26 @@ pub(crate) async fn hide_session<C: GatewayJsonClient + Sync>(
     validate_path_segment(&session_id, "session_id")?;
     let path = format!("{PATH_CHAT_SESSIONS}/{session_id}");
     client.delete_empty(&path).await
+}
+
+/// Hide every named session in ONE round-trip — like [`hide_session`], each row
+/// survives on the server (see the gateway's chat module docstring); only the
+/// list loses it.
+///
+/// Behind the cron group's delete swipe: "delete the group" means "clear its
+/// execution records", and the group is a VIEW, so there is nothing to delete
+/// but its fires — one hide each. `POST /v1/chat/sessions/hide`.
+pub(crate) async fn hide_many<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_ids: Vec<String>,
+) -> Result<(), String> {
+    if session_ids.is_empty() {
+        return Ok(());
+    }
+    let body = serde_json::to_vec(&HideManyRequest { session_ids })
+        .map_err(|e| format!("encode batch hide request: {e}"))?;
+    let path = format!("{PATH_CHAT_SESSIONS}/hide");
+    client.post_empty(&path, body).await
 }
 
 /// Advance the session's chat-list read cursor (max-wins server-side) — the
@@ -919,6 +944,34 @@ mod tests {
                 body: String::new(),
             }
         );
+    }
+
+    /// One round-trip, one body — a group's fires are hidden together or not at
+    /// all, so looping [`hide_session`] over them is the thing this replaces.
+    #[tokio::test]
+    async fn hide_many_posts_every_id_in_one_call() {
+        let client = RecordingClient::empty();
+        hide_many(&client, vec!["s1".to_string(), "s2".to_string()])
+            .await
+            .expect("batch hide");
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "POST",
+                path: "/v1/chat/sessions/hide".to_string(),
+                body: r#"{"session_ids":["s1","s2"]}"#.to_string(),
+            }
+        );
+    }
+
+    /// The confirm dialog snapshots the visible members, so an empty snapshot is
+    /// reachable (every fire pinned or archived away between prompt and tap) and
+    /// must not fire a pointless request.
+    #[tokio::test]
+    async fn hide_many_with_no_ids_is_a_no_op() {
+        let client = RecordingClient::empty();
+        hide_many(&client, Vec::new()).await.expect("no-op");
+        assert!(client.calls.lock().is_empty());
     }
 
     #[tokio::test]

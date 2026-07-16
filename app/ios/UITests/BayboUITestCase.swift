@@ -81,6 +81,23 @@ class BayboUITestCase: XCTestCase {
         return app
     }
 
+    /// The `ConfirmDialog`'s commit button, told apart from the swipe action that
+    /// raised it. A tapped swipe action stays parked on screen, so its `Delete`
+    /// and the dialog's are BOTH live and a by-label query matches two. The
+    /// dialog's is the one sharing the Cancel row, so vertical alignment picks it
+    /// out — and tapping the wrong one would just re-arm the dialog, which reads
+    /// as "the confirm did nothing".
+    func dialogCommit(_ app: XCUIApplication, _ label: String) throws -> XCUIElement {
+        let cancel = app.buttons["Cancel"]
+        XCTAssertTrue(cancel.waitForExistence(timeout: 3), "the confirm dialog did not present")
+        let cancelMidY = cancel.frame.midY
+        return try XCTUnwrap(
+            app.buttons.matching(NSPredicate(format: "label == %@", label))
+                .allElementsBoundByIndex
+                .first { abs($0.frame.midY - cancelMidY) < 4 },
+            "no dialog \(label) button beside Cancel")
+    }
+
     /// Block until `-baybo-demo-download` has walked both cards to `ready`.
     ///
     /// Replaces a hard sleep, and the generous ceiling is the point: the drive

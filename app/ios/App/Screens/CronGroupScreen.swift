@@ -7,8 +7,11 @@ import SwiftUI
 /// any conversation does.
 ///
 /// A **group is a view, not an object** (`docs/cron-groups.md`): everything here
-/// is derived from `SessionRow.cronJobId`. There is nothing to rename, nothing to
-/// delete, and no folder row behind it — so this screen offers no such actions.
+/// is derived from `SessionRow.cronJobId`, and there is no folder row behind it —
+/// so there is nothing to rename, and this screen offers no group-level actions.
+/// Deleting a group is really deleting its execution records, one hide per fire;
+/// that lives on the group's row in the chat list (`ChatListScreen.cronGroupRow`),
+/// where the count it clears can be named before the user commits.
 ///
 /// A pushed screen rather than an inline expansion, deliberately: the disclosure
 /// chevron of `Section(isExpanded:)` only renders under `.listStyle(.sidebar)`,

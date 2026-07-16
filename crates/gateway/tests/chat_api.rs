@@ -1130,6 +1130,77 @@ async fn marking_a_batch_read_clears_every_named_session() {
     }
 }
 
+/// The bulk hide behind a cron group's delete swipe. "Delete the group" means
+/// "clear its execution records", which is one hide per fire — and, exactly like
+/// the per-session `DELETE`, every row survives on the server.
+#[tokio::test]
+async fn hiding_a_batch_removes_every_named_session_from_the_list() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
+
+    let router = build_router(build_admin_state(&tg));
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let created = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+        ids.push(
+            created["session_id"]
+                .as_str()
+                .expect("session_id")
+                .to_owned(),
+        );
+    }
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    for id in &ids {
+        assert!(
+            list["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .any(|row| row["session_id"] == id.as_str()),
+            "session {id} must start out listed",
+        );
+    }
+
+    post(
+        &router,
+        "/v1/chat/sessions/hide",
+        Body::from(json!({ "session_ids": ids }).to_string()),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    for id in &ids {
+        assert!(
+            !list["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .any(|row| row["session_id"] == id.as_str()),
+            "one batch call must hide every named session, not just the first",
+        );
+    }
+
+    // Hidden, never deleted: the rows are core data and stay recoverable.
+    let list = get(
+        &router,
+        "/v1/chat/sessions?include_hidden=true",
+        StatusCode::OK,
+    )
+    .await;
+    for id in &ids {
+        let row = list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|row| row["session_id"] == id.as_str())
+            .unwrap_or_else(|| panic!("session {id} must survive the hide"));
+        assert_eq!(row["hidden"], json!(true), "got {row:?}");
+    }
+}
+
 #[tokio::test]
 async fn admin_device_header_creates_and_lists_device_sessions() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;

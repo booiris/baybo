@@ -446,6 +446,30 @@ final class SessionIndex: ObservableObject {
         save()
     }
 
+    /// Optimistic batch hide behind a **cron group's delete** — [`beginHide`]'s
+    /// contract per id, under one save and one `@Published` edit, so the group
+    /// row leaves in a single frame rather than N (the same reason
+    /// `clearUnread(_:[String])` exists). Mirrors go first here too: whether a
+    /// racing merge already dropped a row decides nothing about its transcript.
+    ///
+    /// Deleting a group deletes only its *execution records*. The job is another
+    /// object entirely and is not touched — it keeps firing, and the group comes
+    /// back with its next fire.
+    func beginHideMany(_ sessionIds: [String]) {
+        let targets = Set(sessionIds)
+        guard !targets.isEmpty else { return }
+        for sessionId in targets {
+            pendingMutations[sessionId] = .hidden
+            TranscriptStore.delete(sessionId: sessionId, in: supportDirectory)
+        }
+        mutationEpoch += 1
+        for row in rows where targets.contains(row.id) {
+            hiddenBackups[row.id] = row
+        }
+        rows.removeAll { targets.contains($0.id) }
+        save()
+    }
+
     func pendingMutation(for sessionId: String) -> PendingMutation? {
         pendingMutations[sessionId]
     }
@@ -490,6 +514,35 @@ final class SessionIndex: ObservableObject {
         else { return }
         rows.append(row)
         save()
+    }
+
+    /// Batch hide failed: re-insert every row it removed. The user made ONE
+    /// gesture, so it rewinds as one — a partial local state would be a list
+    /// nobody asked for. The gateway refuses the whole batch if any id is out of
+    /// scope, but a failure mid-write can still leave some rows hidden there; the
+    /// next merge reconciles those back out, since remote wins for existence.
+    func rollBackHideMany(_ sessionIds: [String]) {
+        var restored: [SessionRow] = []
+        for sessionId in sessionIds {
+            pendingMutations.removeValue(forKey: sessionId)
+            archiveBaselines.removeValue(forKey: sessionId)
+            if let row = hiddenBackups.removeValue(forKey: sessionId) {
+                restored.append(row)
+            }
+        }
+        mutationEpoch += 1
+        let present = Set(rows.map(\.id))
+        let fresh = restored.filter { !present.contains($0.id) }
+        guard !fresh.isEmpty else { return }
+        rows.append(contentsOf: fresh)
+        save()
+    }
+
+    /// The batch reached the server: drop every staged intent it held.
+    func finishHideMany(_ sessionIds: [String]) {
+        for sessionId in sessionIds {
+            finishMutation(sessionId)
+        }
     }
 
     #if DEBUG

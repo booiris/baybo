@@ -184,6 +184,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/hide": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["hide_sessions"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/read": {
         parameters: {
             query?: never;
@@ -1430,6 +1446,15 @@ export interface components {
         };
         FolderList: {
             items: components["schemas"]["FolderDto"][];
+        };
+        /** @description Request body for `POST /v1/chat/sessions/hide`. */
+        HideManyRequest: {
+            /**
+             * @description The sessions to hide. Like the per-session `DELETE`, this preserves every
+             *     row — see the module docstring. Sessions the caller cannot see are
+             *     rejected.
+             */
+            session_ids: string[];
         };
         /**
          * @description Wire mirror of [`baybo_job::Job`]. Inner shape reflects the new
@@ -2700,6 +2725,55 @@ export interface operations {
             };
             /** @description Session creation failed */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    hide_sessions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HideManyRequest"];
+            };
+        };
+        responses: {
+            /** @description Every named session hidden (rows preserved on the server) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Batch too large */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A named session is not visible to this client */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -45,6 +45,21 @@ final class AppStore: ObservableObject {
         case cronGroup(String)
     }
 
+    /// A cron group's delete, waiting on the confirm dialog.
+    ///
+    /// The members are **snapshotted when the dialog opens**, and the confirm
+    /// deletes exactly those: the dialog names a count ("all 12 execution
+    /// records"), and a group is a live view over its fires — the job can fire
+    /// again while the user reads. Re-deriving the members at the tap would
+    /// delete a fire the user was never shown, which is the one thing a
+    /// destructive confirm must not do.
+    struct PendingCronGroupDelete: Equatable {
+        let jobId: String
+        /// The group's **visible** members. An escapee (pinned, archived) is its
+        /// own row elsewhere and is deleted from where it lives.
+        let memberIds: [String]
+    }
+
     @Published var route: Route = .launching
     @Published var landingView: LandingView = .menu
     /// The selected home section (the bottom menu bar's current tab).
@@ -88,6 +103,8 @@ final class AppStore: ObservableObject {
     /// The session a swipe-delete is asking to confirm — hosted in `RootView`
     /// exactly like the logout confirm, and for the same latch/coverage reasons.
     @Published var confirmDeleteSession: String?
+    /// The cron group a swipe-delete is asking to confirm, same host and reasons.
+    @Published var confirmDeleteCronGroup: PendingCronGroupDelete?
     /// Transient archive/delete failure line, rendered by the list headers the
     /// way compose failures are. Cleared when the next mutation starts.
     @Published var sessionNotice: String?
@@ -641,6 +658,17 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Raise the delete confirm for a swiped **cron group**, snapshotting the
+    /// members it will delete (see `PendingCronGroupDelete`). A group with no
+    /// visible member cannot be swiped — it has no row — so the guard is only a
+    /// belt against a racing merge emptying it mid-gesture.
+    func promptDeleteCronGroup(jobId: String, memberIds: [String]) {
+        guard !memberIds.isEmpty else { return }
+        withAnimation(ConfirmDialog.enterMotion) {
+            confirmDeleteCronGroup = PendingCronGroupDelete(jobId: jobId, memberIds: memberIds)
+        }
+    }
+
     /// Archive or unarchive, optimistically: the row moves lists at once and
     /// the PUT follows. Also the undo path (the toast's 撤销 re-sends `false`).
     func requestArchive(_ sessionId: String, archived: Bool) {
@@ -698,6 +726,42 @@ final class AppStore: ObservableObject {
         }
         SessionIndex.shared.beginHide(sessionId)
         pumpSessionMutation(sessionId)
+    }
+
+    /// Delete a **cron group**, after the confirm dialog: soft-hide every member
+    /// the dialog counted, in one round-trip. That is the entire delete — a group
+    /// is a view over its fires (`docs/cron-groups.md`), so clearing the
+    /// execution records is the only object-less thing "delete the folder" can
+    /// mean. The cron JOB is untouched and keeps firing; the group returns with
+    /// its next fire, empty of the history just cleared.
+    ///
+    /// Deliberately outside `pumpSessionMutation`: that serializes ONE request
+    /// per session, and this is one request for N. Nothing can re-pump the staged
+    /// intents behind its back — every pump site is a swipe on a row, and these
+    /// rows are gone the moment the batch is staged.
+    func requestDeleteGroup(_ memberIds: [String]) {
+        guard !memberIds.isEmpty else { return }
+        sessionNotice = nil
+        for sessionId in memberIds {
+            guard let store = chatStores[sessionId], isEvictable(sessionId, store) else { continue }
+            Task { await evictStore(sessionId, store) }
+        }
+        SessionIndex.shared.beginHideMany(memberIds)
+        #if DEBUG
+            if demoHomeMode {
+                SessionIndex.shared.finishHideMany(memberIds)
+                return
+            }
+        #endif
+        Task { @MainActor in
+            do {
+                try await Baybo.client.chatHideMany(sessionIds: memberIds)
+                SessionIndex.shared.finishHideMany(memberIds)
+            } catch {
+                SessionIndex.shared.rollBackHideMany(memberIds)
+                sessionNotice = Lang.shared.t("list.deleteFailed")
+            }
+        }
     }
 
     /// One in-flight request per session; `SessionIndex.pendingMutation` holds

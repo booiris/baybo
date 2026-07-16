@@ -217,14 +217,25 @@ struct ChatListScreen: View {
 
     /// A cron group: tap pushes that job's fires.
     ///
-    /// **Two swipe actions: mark-all-read (trailing) and pin (leading).**
-    /// Archive / delete are still absent — those are affordances of an *object*,
-    /// and a group is a view, so there is nothing a delete could remove. Pin is
-    /// the exception, and only because the bit has a real home: it lives on the
-    /// cron JOB, the one object whose identity matches the group. Mark-all-read
-    /// exists because the badge needs an exit — a `*/30` job is one row wearing a
-    /// `48`. Neither is a full-swipe: a fling must not silently wipe 48 unread
-    /// markers, and a pin is not destructive enough to want one either.
+    /// **Three swipe actions: mark-all-read + delete (trailing), pin (leading).**
+    /// A group is a view, not an object, so each one has to name what it acts on:
+    ///
+    /// - **delete** clears the job's *execution records* — a batch soft-hide of
+    ///   the fires drawn here, which is all a view-less "delete the folder" can
+    ///   mean. The JOB is a different object and is untouched: it keeps firing,
+    ///   and the group returns with its next fire. The confirm says exactly that,
+    ///   counting the records (`requestDeleteGroup`).
+    /// - **pin** is the one bit with a real home of its own: the cron JOB, whose
+    ///   identity matches the group's.
+    /// - **mark-all-read** exists because the badge needs an exit — a half-hourly
+    ///   job is one row wearing a `48`.
+    ///
+    /// **Archive is still absent**: it moves a row to another list, and a group
+    /// has no row to move.
+    ///
+    /// None is a full-swipe. Delete is routed through the confirm dialog and the
+    /// other two are not destructive enough to want one — but a fling must not
+    /// silently wipe 48 unread markers either.
     @ViewBuilder private func cronGroupRow(_ group: CronGroup) -> some View {
         Button {
             appStore.openCronGroup(group.jobId)
@@ -244,6 +255,12 @@ struct ChatListScreen: View {
                 }
                 .tint(Theme.inkSoft)
             }
+            Button(role: .destructive) {
+                appStore.promptDeleteCronGroup(jobId: group.jobId, memberIds: group.memberIds)
+            } label: {
+                Label(lang.t("list.delete"), systemImage: "trash")
+            }
+            .tint(Theme.err)
         }
         .swipeActions(edge: .leading, allowsFullSwipe: false) {
             Button {

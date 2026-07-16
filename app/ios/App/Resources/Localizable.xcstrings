@@ -1055,6 +1055,40 @@
         }
       }
     },
+    "list.deleteGroupConfirmBody": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This deletes all %@ execution records of this scheduled job. The job itself is unaffected and will keep running."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "将删除该定时任务的全部 %@ 条执行记录。定时任务本身不受影响，仍会继续触发。"
+          }
+        }
+      }
+    },
+    "list.deleteGroupConfirmTitle": {
+      "extractionState": "stale",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Delete all runs?"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "删除全部执行记录？"
+          }
+        }
+      }
+    },
     "list.empty": {
       "extractionState": "stale",
       "localizations": {

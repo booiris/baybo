@@ -26,6 +26,10 @@ struct ConfirmDialog: View {
 
     let titleKey: String
     let bodyKey: String
+    /// Substituted into `bodyKey`'s single `%@` when the copy names something the
+    /// user must see before committing (a cron group's delete counts the
+    /// execution records it will clear). Nil for a body that takes no argument.
+    var bodyArg: String?
     let destructiveKey: String
     let onCancel: () -> Void
     let onConfirm: () -> Void
@@ -86,7 +90,7 @@ struct ConfirmDialog: View {
                 .font(Theme.mono(16, weight: .bold))
                 .foregroundStyle(Theme.ink)
 
-            Text(verbatim: lang.t(bodyKey))
+            Text(verbatim: bodyArg.map { lang.t(bodyKey, $0) } ?? lang.t(bodyKey))
                 .font(Theme.mono(14))
                 .foregroundStyle(Theme.inkSoft)
                 .lineSpacing(5)

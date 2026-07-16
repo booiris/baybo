@@ -71,8 +71,9 @@ struct CronGroup: Identifiable, Equatable {
     var lastActive: Date { members.first?.lastActive ?? .distantPast }
     var preview: String? { members.first?.preview }
     var unread: Int { members.reduce(0) { $0 + $1.unread } }
-    /// The sessions a "mark all read" acts on. Escaped rows clear themselves
-    /// where they live.
+    /// The sessions the group's own actions act on — "mark all read", and the
+    /// delete that clears the job's execution records. Escaped rows are their own
+    /// row elsewhere and answer for themselves there.
     var memberIds: [String] { members.map(\.id) }
 }
 

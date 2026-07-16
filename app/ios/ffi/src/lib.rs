@@ -332,6 +332,29 @@ impl BayboClient {
         .await
     }
 
+    /// Soft-hide every named session in one round-trip (`POST
+    /// /v1/chat/sessions/hide`) — same guarantee as `chat_hide_session`, once per
+    /// id: the gateway sets `hidden` and every row survives.
+    ///
+    /// Behind a cron group's delete, which clears the job's execution records.
+    /// The group is a view over its fires, so hiding them all IS the delete —
+    /// the job itself is untouched and keeps firing.
+    pub async fn chat_hide_many(
+        self: Arc<Self>,
+        session_ids: Vec<String>,
+    ) -> Result<(), BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::hide_many(&client, session_ids).await
+                }
+                ActiveLeg::Relay => gateway_api::hide_many(&relay::GatewayApi, session_ids).await,
+            }
+        })
+        .await
+    }
+
     /// List the gateway's chat sessions (newest first, hidden/cron filtered) for
     /// the active binding. Direct uses the admin REST surface; relay uses the
     /// Noise-protected API tunnel so a NAT'd gateway can still refresh the

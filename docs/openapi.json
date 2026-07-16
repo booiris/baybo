@@ -929,6 +929,59 @@
         }
       }
     },
+    "/v1/chat/sessions/hide": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "hide_sessions",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HideManyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Every named session hidden (rows preserved on the server)"
+          },
+          "400": {
+            "description": "Batch too large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A named session is not visible to this client",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/read": {
       "post": {
         "tags": [
@@ -4771,6 +4824,22 @@
             "items": {
               "$ref": "#/components/schemas/FolderDto"
             }
+          }
+        }
+      },
+      "HideManyRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/chat/sessions/hide`.",
+        "required": [
+          "session_ids"
+        ],
+        "properties": {
+          "session_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The sessions to hide. Like the per-session `DELETE`, this preserves every\nrow — see the module docstring. Sessions the caller cannot see are\nrejected."
           }
         }
       },
