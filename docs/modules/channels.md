@@ -195,9 +195,8 @@ Subscribed channels can carry a single pre-dispatch observer installed
 via `SubscribedView::set_dispatch_observer`. It runs before fan-out
 and receives `(&SessionEvent, SubscribedView<'_>)`, so it can re-enter
 the typed broadcast path to emit a derived frame (today: the gateway's
-`SessionPulse` watches every dispatch on the `http` and `device` channels
-and throttles `Frame::SessionActivity` broadcasts for sidebar unread
-accounting).
+`SessionPulse` watches every dispatch on the `owner` channel and throttles
+`Frame::SessionActivity` broadcasts for sidebar unread accounting).
 
 ## Event vs. Frame
 
@@ -266,6 +265,39 @@ TUI / web tabs subscribed to the same session still resolve approvals
 through the same per-channel gate, and the channel fans out
 `ApprovalResolved` so the loser tabs drop their prompt card.
 
+### The owner channel (`owner` — web + mobile, one channel)
+
+The owner's self-service surfaces — the web dashboard and the mobile app —
+are **one identity on two screens**, so they are **one channel**:
+`ChannelType::owner()`. There is no web-vs-device channel split; `owner` is an
+ordinary `Subscribed` channel that both surfaces speak, the same way `tui` is
+the terminal's. (The retired `http`/`device` channel types are gone from the
+model entirely — a boot-time migration re-tags any pre-collapse
+session/cron-job row to `owner`; see `crates/storage/src/sqlite/mod.rs`.)
+Because it is one channel, nothing here needs special pooling logic:
+
+- **One `Channel` object, plain `get`.** Boot installs the single `owner`
+  channel. Both surfaces attach to it, so a web tab and a phone on the same
+  session share one subscriptions map (cross-surface fan-out) and one
+  `in_flight` buffer (correct mid-turn replay for whichever surface joins).
+  Fan-out and scope use `registry.get(&session.channel)` and
+  `session.channel == owner` — the ordinary single-channel paths.
+- **The web-vs-device distinction is purely an auth concern.** It lives at the
+  handshake and the device store, never as a channel. Both auth paths register
+  as `owner` (`validate_register` pins `AuthedClient::Web` and
+  `AuthedClient::Device` to `owner`, which is reserved so a subprocess sidecar
+  can't claim the owner's pool — see the [handshake](#bot-registration)), and
+  `device_id` lives independently in the device store for pairing / push. The
+  clients send `owner` on the wire (web `chatWs.ts`, iOS `content.rs`).
+- **One identity.** Every `owner` session and message is stamped with the
+  single `OWNER` `User.id` (shared memory + cost) — the sender identity is
+  fixed by the channel, never taken from the wire (only `Multiplexed` channels
+  relay a real external user's id).
+- **`tui` and `Multiplexed` stay isolated** by the ordinary channel boundary:
+  `tui` is the private terminal surface; telegram/weixin/… are `Multiplexed`
+  real external users. The chat + cron scope gates simply require the session's
+  channel to equal the caller's (`owner`).
+
 ## Channel Implementations
 
 Today the in-tree transports are the gateway's `/v1/channel-ws` server
@@ -279,8 +311,7 @@ out-of-process sidecar — reaches the agent through that one frame loop:
 | Channel        | Kind          | User id                                             | Transport / auth                                                            |
 | -------------- | ------------- | --------------------------------------------------- | --------------------------------------------------------------------------- |
 | `tui`          | `Subscribed`  | `$USER` (falls back to `tui-user`)                  | `/v1/channel-ws` (per-start token from `gateway.tui_token`)                 |
-| `http` (web)   | `Subscribed`  | `web-operator`                                      | `/v1/channel-ws` on the admin listener (dashboard admin token)                |
-| `device` (iOS) | `Subscribed`  | the paired `device_id`                              | `/v1/channel-ws` on the admin listener (device auth token) or the relay Noise leg (authenticated by the device's static Noise key) |
+| `owner` (web + mobile) | `Subscribed`  | `owner`                                     | `/v1/channel-ws` on the admin listener — web via the dashboard admin token, iOS via a device auth token (or the relay Noise leg). Both register as `owner`; the web-vs-device distinction is an auth concern only |
 | Sidecars       | `Multiplexed` | `<channelType>_<botId>_<chatKey>_<platformUserId>`  | `/v1/channel-ws` (per-spawn capability token, claims its own `channel_type`)|
 
 See [`tui.md`](./tui.md) for the TUI client side and

@@ -99,7 +99,7 @@ async fn create_cron(
     let channel: ChannelTypeModel = req
         .channel
         .map(Into::into)
-        .unwrap_or(ChannelTypeModel::http());
+        .unwrap_or_else(ChannelTypeModel::owner);
     let job = state
         .cron_scheduler
         .create_job(baybo_cron::NewCronJob {
@@ -310,6 +310,9 @@ async fn set_cron_pin(
         .await
         .map_err(|e| GatewayError::Cron(e.to_string()))?
         .ok_or_else(not_found)?;
+    // Channel-scoped like the chat gates: a chat caller operates on the
+    // `owner` channel, so only `owner` cron jobs are reachable; `tui` /
+    // `Multiplexed` jobs stay isolated.
     if job.channel != chat_list_channel(authed) {
         return Err(not_found());
     }

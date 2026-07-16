@@ -85,10 +85,10 @@ pub(crate) fn build_observer_prompt(prior_notices: &[String]) -> String {
 /// skipped.
 ///
 /// Sidecars are exactly the gateway's `Multiplexed` channel kinds: anything
-/// that isn't the `Subscribed` web (`http`) or CLI/TUI (`tui`). See the
-/// `ChannelKind` mapping in the gateway's channel boot.
+/// that isn't the `Subscribed` owner surface (`owner` — web + mobile) or the
+/// CLI/TUI (`tui`). See the `ChannelKind` mapping in the gateway's channel boot.
 pub(crate) fn channel_wants_progress(channel: &ChannelType) -> bool {
-    *channel != ChannelType::http() && *channel != ChannelType::tui()
+    *channel != ChannelType::owner() && *channel != ChannelType::tui()
 }
 
 /// Pure gate (everything except the live cancel check, which the caller
@@ -379,7 +379,7 @@ mod gate_tests {
         // narration; the web has a work block and the CLI/TUI don't show it.
         assert!(channel_wants_progress(&ChannelType::telegram()));
         assert!(channel_wants_progress(&ChannelType::weixin()));
-        assert!(!channel_wants_progress(&ChannelType::http()));
+        assert!(!channel_wants_progress(&ChannelType::owner()));
         assert!(!channel_wants_progress(&ChannelType::tui()));
     }
 }

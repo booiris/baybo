@@ -744,6 +744,25 @@ fn init_db(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("failed to create post-migration indexes: {e}"))?;
 
+    // One-time data collapse: the retired per-surface channel tags `http`
+    // (web) and `device` (mobile) were unified into a single `owner` pool
+    // channel. Re-tag every pre-collapse session and cron job so it stays
+    // reachable — the chat/cron scope now matches `owner`, so a lingering
+    // `http`/`device` tag would scope the row out and make it invisible. The
+    // channel rides in the JSON `data` blob for both tables. Idempotent:
+    // after one pass the WHERE clauses match nothing. Data-preserving — only
+    // the channel tag changes; transcript, summary, and all else are untouched.
+    conn.execute_batch(
+        "UPDATE sessions \
+            SET data = json_set(json_set(data, '$.channel', 'owner'), '$.user.channel', 'owner') \
+            WHERE json_extract(data, '$.channel') IN ('http', 'device') \
+               OR json_extract(data, '$.user.channel') IN ('http', 'device'); \
+         UPDATE cron_jobs \
+            SET data = json_set(data, '$.channel', 'owner') \
+            WHERE json_extract(data, '$.channel') IN ('http', 'device');",
+    )
+    .map_err(|e| anyhow::anyhow!("owner-channel collapse migration failed: {e}"))?;
+
     Ok(())
 }
 

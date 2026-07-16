@@ -47,6 +47,16 @@ pub const TOOL_CLIENT_LABEL_PREFIX: &str = "tool/";
 /// web client constructs outbound `Frame::Send` envelopes.
 pub const WEB_OPERATOR_USER_ID: &str = "web-operator";
 
+/// The single owner identity every synced self-service surface (web `http`
+/// and mobile `device`) stamps on its sessions and messages. One gateway =
+/// one human, so those surfaces share one memory namespace and one cost
+/// ledger — the chat API collapses them under this id instead of the
+/// per-surface `web-operator` / `device_id` split (see
+/// `docs/modules/channels.md`). `tui` and every `Multiplexed`
+/// channel keep their own identity. The session's originating channel is kept
+/// separately as provenance; this is only the `User.id`.
+pub const OWNER_USER_ID: &str = "owner";
+
 /// Secret-vault key under which the gateway publishes the current
 /// generation of the TUI channel token. Rotated on every `baybo
 /// gateway start`; the bundled `baybo tui` reads it back from the vault

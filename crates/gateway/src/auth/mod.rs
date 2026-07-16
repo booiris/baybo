@@ -30,7 +30,7 @@ pub use channel::{
     AuthedClient, ChannelAuthState, DEVICE_ID_HEADER, attach as attach_channel_auth,
 };
 pub use token::{
-    CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TOOL_CLIENT_LABEL_PREFIX,
-    TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY, TokenHandle, WEB_OPERATOR_USER_ID, constant_time_eq,
-    generate_token,
+    CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, OWNER_USER_ID,
+    TOOL_CLIENT_LABEL_PREFIX, TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY, TokenHandle,
+    WEB_OPERATOR_USER_ID, constant_time_eq, generate_token,
 };

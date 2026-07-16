@@ -658,7 +658,7 @@ mod tests {
     /// the dispatch path goes through the typed view.
     #[test]
     fn echo_inbound_reaches_subscribers_via_subscribed_view() {
-        let channel = Channel::new(ChannelType::http(), ChannelKind::Subscribed, None);
+        let channel = Channel::new(ChannelType::owner(), ChannelKind::Subscribed, None);
         let sink = CountingSink::new();
         let conn = Arc::new(Connection::new(sink.clone()));
         let conn_id = conn.id();
@@ -666,7 +666,7 @@ mod tests {
         let view = channel.as_subscribed().expect("Subscribed view available");
         view.subscribe(conn_id, SessionId::from("session-x"))
             .expect("subscribe");
-        view.echo_inbound(fake_inbound("session-x", ChannelType::http()));
+        view.echo_inbound(fake_inbound("session-x", ChannelType::owner()));
 
         assert_eq!(
             sink.count(),
@@ -679,14 +679,14 @@ mod tests {
         SessionEvent::Agent(AgentOutput {
             session_id: SessionId::from(session),
             user_id: "u".into(),
-            channel: ChannelType::http(),
+            channel: ChannelType::owner(),
             event,
         })
     }
 
     #[test]
     fn in_flight_buffer_snapshots_the_streaming_turn() {
-        let channel = Channel::new(ChannelType::http(), ChannelKind::Subscribed, None);
+        let channel = Channel::new(ChannelType::owner(), ChannelKind::Subscribed, None);
         let sid = "sess-mid";
         // A turn streams reasoning (two deltas) + a tool — with NO subscriber yet.
         channel.dispatch_event(agent_evt(
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn in_flight_buffer_keeps_progress_narration() {
-        let channel = Channel::new(ChannelType::http(), ChannelKind::Subscribed, None);
+        let channel = Channel::new(ChannelType::owner(), ChannelKind::Subscribed, None);
         let sid = "sess-progress";
         channel.dispatch_event(agent_evt(
             sid,
@@ -746,7 +746,7 @@ mod tests {
 
     #[test]
     fn in_flight_buffer_cleared_at_turn_end() {
-        let channel = Channel::new(ChannelType::http(), ChannelKind::Subscribed, None);
+        let channel = Channel::new(ChannelType::owner(), ChannelKind::Subscribed, None);
         let sid = "sess-done";
         channel.dispatch_event(agent_evt(
             sid,

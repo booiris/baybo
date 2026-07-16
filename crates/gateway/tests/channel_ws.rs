@@ -14,7 +14,7 @@ use baybo_channels::{
     AgentEvent, AgentOutput, ChannelKind, MessageRole, OutgoingMessage, RouterInbound,
 };
 use baybo_config::ChannelsConfig;
-use baybo_gateway::auth::{DEVICE_ID_HEADER, WEB_OPERATOR_USER_ID};
+use baybo_gateway::auth::{DEVICE_ID_HEADER, OWNER_USER_ID, WEB_OPERATOR_USER_ID};
 use baybo_gateway::channel::boot;
 use baybo_gateway::server::{GatewayDeps, build_admin_router_for_tests};
 use baybo_gateway::test_support::build_test_deps;
@@ -198,13 +198,13 @@ async fn admin_token_attaches_web_chat_and_receives_dispatch() {
         .await
         .expect("bind admin server");
 
-    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("WS handshake");
 
     let http_channel = channel_registry
-        .get(&ChannelType::http())
-        .expect("http channel installed");
+        .get(&ChannelType::owner())
+        .expect("owner pool channel installed");
     assert_eq!(http_channel.kind(), ChannelKind::Subscribed);
     // One connection attached after the handshake.
     assert_eq!(http_channel.connection_count(), 1);
@@ -229,7 +229,7 @@ async fn admin_token_attaches_web_chat_and_receives_dispatch() {
     let outgoing = OutgoingMessage {
         session_id: "sess-1".into(),
         user_id: WEB_OPERATOR_USER_ID.into(),
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
         content: vec![ContentBlock::Text("hello".into())],
         reply_to: None,
         metadata: MessageMetadata::default(),
@@ -260,7 +260,7 @@ async fn admin_token_attaches_web_chat_and_receives_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_token_with_device_header_registers_device_channel() {
+async fn device_auth_registers_on_the_owner_channel() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
@@ -275,32 +275,35 @@ async fn admin_token_with_device_header_registers_device_channel() {
     let mut client = connect_register_with_device_header(
         port,
         &tg.deps.admin_token,
-        ChannelType::device(),
+        ChannelType::owner(),
         Some(&device_id),
     )
     .await
     .expect("device WS handshake");
 
+    // A device-authed connection attaches to the shared `owner` chat channel.
     let device_channel = tg
         .deps
         .channel_registry
-        .get(&ChannelType::device())
-        .expect("device channel installed");
+        .get(&ChannelType::owner())
+        .expect("owner channel installed");
     assert_eq!(device_channel.kind(), ChannelKind::Subscribed);
     assert_eq!(device_channel.connection_count(), 1);
 
+    // Containment: a device token can only claim `owner`, never another
+    // channel's stream.
     let rejected = connect_register_with_device_header(
         port,
         &tg.deps.admin_token,
-        ChannelType::http(),
+        ChannelType::telegram(),
         Some(&device_id),
     )
     .await
     .unwrap_err()
     .to_string();
     assert!(
-        rejected.contains("device token must register as channel_type 'device'"),
-        "device identity must not be allowed to claim http: {rejected}",
+        rejected.contains("device token must register as channel_type 'owner'"),
+        "device identity must not be allowed to claim another channel: {rejected}",
     );
 
     client.close(None).await.expect("close client");
@@ -322,12 +325,12 @@ async fn subscribe_hydrates_durable_task_list_snapshot() {
     let user = User {
         id: WEB_OPERATOR_USER_ID.into(),
         name: None,
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
     };
     let session = tg
         .deps
         .session_manager
-        .create_session(user, ChannelType::http())
+        .create_session(user, ChannelType::owner())
         .await
         .expect("create session");
     let now = chrono::Utc::now();
@@ -352,7 +355,7 @@ async fn subscribe_hydrates_durable_task_list_snapshot() {
         .await
         .expect("bind admin server");
 
-    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("WS handshake");
 
@@ -400,12 +403,12 @@ async fn subscribe_hydrates_turn_state_snapshot() {
     let user = User {
         id: WEB_OPERATOR_USER_ID.into(),
         name: None,
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
     };
     let session = tg
         .deps
         .session_manager
-        .create_session(user, ChannelType::http())
+        .create_session(user, ChannelType::owner())
         .await
         .expect("create session");
 
@@ -430,7 +433,7 @@ async fn subscribe_hydrates_turn_state_snapshot() {
     };
 
     // Idle session: the bundle's turn half is a definitive `active: false`.
-    let mut tab_a = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut tab_a = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("WS handshake");
     send_frame(
@@ -465,7 +468,7 @@ async fn subscribe_hydrates_turn_state_snapshot() {
         .await
         .expect("job → InProgress");
 
-    let mut tab_b = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut tab_b = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("WS handshake (tab b)");
     send_frame(
@@ -499,14 +502,16 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
         .await
         .expect("bind admin server");
 
-    let mut tab_a = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut tab_a = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("tab A handshake");
-    let mut tab_b = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut tab_b = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("tab B handshake");
 
-    let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
+    let http_channel = channel_registry
+        .get(&ChannelType::owner())
+        .expect("owner pool channel");
     assert_eq!(http_channel.connection_count(), 2);
 
     send_frame(
@@ -531,7 +536,7 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
     http_channel.dispatch_agent(AgentOutput {
         session_id: "shared".into(),
         user_id: WEB_OPERATOR_USER_ID.into(),
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
         event: AgentEvent::AnswerDelta("stream chunk".into()),
     });
 
@@ -571,7 +576,7 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
         .await
         .expect("bind admin server");
 
-    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("handshake");
     send_frame(
@@ -584,7 +589,9 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
     .expect("subscribe");
     expect_idle_subscribe_state(&mut client, "interesting").await;
 
-    let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
+    let http_channel = channel_registry
+        .get(&ChannelType::owner())
+        .expect("owner pool channel");
     // Dispatch a content frame (Notice) to an unrelated session. The
     // session-scoped fan-out drops it for this connection because it
     // isn't subscribed. Separately, the http channel's activity
@@ -595,7 +602,7 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
     http_channel.dispatch_agent(AgentOutput {
         session_id: "unrelated".into(),
         user_id: String::new(),
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
         event: AgentEvent::Notice {
             level: baybo_channels::NoticeLevel::Info,
             text: "for some other tab".into(),
@@ -653,10 +660,10 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
     // Two tabs, two personas:
     //   * subscriber — attached and subscribed to "sess-x"
     //   * bystander  — attached but never subscribed
-    let mut subscriber = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut subscriber = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("subscriber handshake");
-    let mut bystander = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut bystander = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("bystander handshake");
 
@@ -670,7 +677,9 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
     .expect("send Subscribe");
     expect_idle_subscribe_state(&mut subscriber, "sess-x").await;
 
-    let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
+    let http_channel = channel_registry
+        .get(&ChannelType::owner())
+        .expect("owner pool channel");
     let created_at = chrono::Utc::now();
     http_channel
         .as_subscribed()
@@ -731,11 +740,13 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
         .await
         .expect("bind admin server");
 
-    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("handshake");
 
-    let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
+    let http_channel = channel_registry
+        .get(&ChannelType::owner())
+        .expect("owner pool channel");
 
     // Assistant-side: dispatch the turn's terminal Message for a session the
     // client never subscribed to. The content frame drops on the floor for
@@ -745,7 +756,7 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
         OutgoingMessage {
             session_id: "sess-bg".into(),
             user_id: String::new(),
-            channel: ChannelType::http(),
+            channel: ChannelType::owner(),
             content: vec![ContentBlock::Text("agent reply".into())],
             reply_to: None,
             metadata: MessageMetadata::default(),
@@ -777,11 +788,11 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
         message: baybo_channels::Message {
             id: "msg-1".into(),
             session_id: "sess-bg".into(),
-            channel: ChannelType::http(),
+            channel: ChannelType::owner(),
             sender: baybo_model::User {
                 id: WEB_OPERATOR_USER_ID.into(),
                 name: None,
-                channel: ChannelType::http(),
+                channel: ChannelType::owner(),
             },
             content: vec![baybo_model::ContentBlock::Text("user typed".into())],
             timestamp: chrono::Utc::now(),
@@ -836,7 +847,7 @@ async fn duplicate_platform_msg_id_drops_retry_on_subscribed_channel() {
         .await
         .expect("bind admin server");
 
-    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("handshake");
     send_frame(
@@ -853,7 +864,7 @@ async fn duplicate_platform_msg_id_drops_retry_on_subscribed_channel() {
         content: content.into(),
         session_id: "sess-dedup".into(),
         user_id: WEB_OPERATOR_USER_ID.into(),
-        channel_type: ChannelType::http(),
+        channel_type: ChannelType::owner(),
         bot_id: String::new(),
         attachments: Vec::new(),
         platform_msg_id: id.into(),
@@ -935,7 +946,7 @@ async fn messages_batch_reaches_router_as_one_ordered_intake() {
         .await
         .expect("bind admin server");
 
-    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("handshake");
     send_frame(
@@ -952,7 +963,7 @@ async fn messages_batch_reaches_router_as_one_ordered_intake() {
         content: content.into(),
         session_id: "sess-batch".into(),
         user_id: WEB_OPERATOR_USER_ID.into(),
-        channel_type: ChannelType::http(),
+        channel_type: ChannelType::owner(),
         bot_id: String::new(),
         attachments: Vec::new(),
         platform_msg_id: id.into(),
@@ -1021,10 +1032,10 @@ async fn subscribe_sends_one_state_bundle_and_replays_no_history() {
     let user = User {
         id: WEB_OPERATOR_USER_ID.into(),
         name: None,
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
     };
     let session = session_manager
-        .create_session(user, ChannelType::http())
+        .create_session(user, ChannelType::owner())
         .await
         .expect("create session");
 
@@ -1047,7 +1058,7 @@ async fn subscribe_sends_one_state_bundle_and_replays_no_history() {
         .await
         .expect("bind admin server");
 
-    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::http())
+    let mut client = connect_register(port, &tg.deps.admin_token, ChannelType::owner())
         .await
         .expect("handshake");
 
@@ -1085,38 +1096,37 @@ async fn subscribe_sends_one_state_bundle_and_replays_no_history() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subscribe_outside_channel_universe_is_rejected() {
-    // The `http` (web) and `device` channels own disjoint session sets.
-    // A Subscribe naming a session that lives on the other channel is
-    // rejected with an error Notice and never registers — the same
-    // universe boundary the REST layer enforces.
+async fn device_auth_subscribes_to_a_web_created_session() {
+    // Web and device are one owner: both register on the `owner` channel, so a
+    // device-authed connection can Subscribe to a session the web operator
+    // created and is accepted with a normal `SubscribeState` bundle.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let session_manager = Arc::clone(&tg.deps.session_manager);
     let user = User {
-        id: WEB_OPERATOR_USER_ID.into(),
+        id: OWNER_USER_ID.into(),
         name: None,
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
     };
     let session = session_manager
-        .create_session(user, ChannelType::http())
+        .create_session(user, ChannelType::owner())
         .await
-        .expect("create http session");
+        .expect("create owner session");
 
     let shutdown = tg.shutdown.clone();
     let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
         .await
         .expect("bind admin server");
 
-    // A device-channel connection tries to subscribe to the http session.
+    // A device-authed connection (device header) subscribes to the session.
     let device_key = device_proto::delegation::generate_signing_key();
     let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
     let mut device_client = connect_register_with_device_header(
         port,
         &tg.deps.admin_token,
-        ChannelType::device(),
+        ChannelType::owner(),
         Some(&device_id),
     )
     .await
@@ -1129,7 +1139,72 @@ async fn subscribe_outside_channel_universe_is_rejected() {
         },
     )
     .await
-    .expect("send cross-universe Subscribe");
+    .expect("send cross-surface Subscribe");
+
+    // Accepted: the gateway answers with the SubscribeState bundle (not a
+    // rejection Notice), and the device connection registers as a subscriber
+    // on the shared owner channel.
+    expect_idle_subscribe_state(&mut device_client, session.id.as_str()).await;
+    let owner_channel = tg
+        .deps
+        .channel_registry
+        .get(&ChannelType::owner())
+        .expect("owner channel installed");
+    assert!(
+        owner_channel.has_subscribers(&session.id),
+        "a device-authed connection must be able to subscribe to a web-created session",
+    );
+
+    drop(device_client);
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribe_to_a_non_pool_session_is_rejected() {
+    // The owner chat channel is `owner` only. A session on another Subscribed
+    // channel (`tui`) stays isolated: a device Subscribe naming it is rejected
+    // with an error Notice and never registers — the channel boundary the
+    // scope gates still enforce for everything outside `owner`.
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let cfg = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+
+    let session_manager = Arc::clone(&tg.deps.session_manager);
+    let user = User {
+        id: "tui-user".into(),
+        name: None,
+        channel: ChannelType::tui(),
+    };
+    let session = session_manager
+        .create_session(user, ChannelType::tui())
+        .await
+        .expect("create tui session");
+
+    let shutdown = tg.shutdown.clone();
+    let (port, server_handle) = start_admin_ws_server(&tg.deps, shutdown.clone())
+        .await
+        .expect("bind admin server");
+
+    let device_key = device_proto::delegation::generate_signing_key();
+    let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
+    let mut device_client = connect_register_with_device_header(
+        port,
+        &tg.deps.admin_token,
+        ChannelType::owner(),
+        Some(&device_id),
+    )
+    .await
+    .expect("device WS handshake");
+
+    send_frame(
+        &mut device_client,
+        Frame::Subscribe {
+            session_id: session.id.clone(),
+        },
+    )
+    .await
+    .expect("send out-of-pool Subscribe");
 
     let frame = recv_frame(&mut device_client, Duration::from_secs(1))
         .await
@@ -1144,14 +1219,14 @@ async fn subscribe_outside_channel_universe_is_rejected() {
         other => panic!("expected error Notice, got {other:?}"),
     }
 
-    let device_channel = tg
+    let owner_channel = tg
         .deps
         .channel_registry
-        .get(&ChannelType::device())
-        .expect("device channel installed");
+        .get(&ChannelType::owner())
+        .expect("owner pool channel installed");
     assert!(
-        !device_channel.has_subscribers(&session.id),
-        "cross-universe subscribe must not register",
+        !owner_channel.has_subscribers(&session.id),
+        "out-of-pool subscribe must not register",
     );
 
     drop(device_client);

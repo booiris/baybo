@@ -579,7 +579,7 @@ async fn project_turn_state(
     // web subscribers (every other surface drops it regardless).
     let (channel, user_id) = match sessions.get(session_id).await {
         Ok(Some(s)) => (s.channel, s.user.id),
-        _ => (baybo_model::ChannelType::http(), String::new()),
+        _ => (baybo_model::ChannelType::owner(), String::new()),
     };
     let out = AgentOutput {
         session_id: session_id.clone(),

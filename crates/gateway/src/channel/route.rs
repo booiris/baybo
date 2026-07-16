@@ -289,13 +289,15 @@ pub(super) async fn run_inbound_loop<R: super::adapter::FrameSource>(
                     );
                     continue;
                 };
-                // Universe boundary: a session row that lives on another
-                // channel is invisible here — the WS layer enforces the
-                // same scoping the REST layer already does
-                // (`load_scoped_chat_session`). A session with no row yet
-                // passes (the TUI subscribes to a client-minted id before
-                // its first message creates the row); a storage error
-                // fails open like v1, which never checked at all.
+                // Channel boundary: a session on another channel is invisible
+                // here — the WS layer enforces the same scoping the REST layer
+                // does (`load_scoped_chat_session`). Web and device both
+                // register as `owner`, so a phone subscribes to a web-origin
+                // session as an ordinary same-channel subscribe; `tui` and
+                // every `Multiplexed` channel stay isolated. A session with no
+                // row yet passes (a client-minted id before its first message
+                // creates the row); a storage error fails open, which never
+                // checked at all.
                 match state.session_manager.get(&session_id).await {
                     Ok(Some(session)) if session.channel != *channel_type => {
                         tracing::warn!(
@@ -660,8 +662,19 @@ async fn build_inbound_message(
     wire_msg: baybo_channels::wire::Message,
 ) -> Option<IncomingMessage> {
     let session_id = resolve_inbound_session(state, sidecar, channel_type, kind, &wire_msg).await?;
+    // Sender identity is fixed by the channel, not carried in the message.
+    // The `owner` channel (web + device, register-validated so a leaked token
+    // can't claim another stream) is one `OWNER` sharing one memory/cost
+    // namespace, so the wire `user_id` is ignored for it — that field is only
+    // a meaningful identity for `Multiplexed` channels, where a bot relays a
+    // real external user's id. `tui` likewise carries its own wire id.
+    let sender_id = if *channel_type == ChannelType::owner() {
+        crate::auth::OWNER_USER_ID.to_owned()
+    } else {
+        wire_msg.user_id.clone()
+    };
     let sender = User {
-        id: wire_msg.user_id.clone(),
+        id: sender_id,
         name: None,
         channel: channel_type.clone(),
     };
