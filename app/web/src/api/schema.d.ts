@@ -184,6 +184,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/hide": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["hide_sessions"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/read": {
         parameters: {
             query?: never;
@@ -1430,6 +1446,15 @@ export interface components {
         };
         FolderList: {
             items: components["schemas"]["FolderDto"][];
+        };
+        /** @description Request body for `POST /v1/chat/sessions/hide`. */
+        HideManyRequest: {
+            /**
+             * @description The sessions to hide. Like the per-session `DELETE`, this preserves every
+             *     row — see the module docstring. Sessions the caller cannot see are
+             *     rejected.
+             */
+            session_ids: string[];
         };
         /**
          * @description Wire mirror of [`baybo_job::Job`]. Inner shape reflects the new
@@ -2709,6 +2734,55 @@ export interface operations {
             };
         };
     };
+    hide_sessions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HideManyRequest"];
+            };
+        };
+        responses: {
+            /** @description Every named session hidden (rows preserved on the server) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Batch too large */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A named session is not visible to this client */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     mark_sessions_read: {
         parameters: {
             query?: never;
@@ -3439,6 +3513,17 @@ export interface operations {
                  *     default list never carries a deleted job.
                  */
                 deleted?: boolean;
+                /**
+                 * @description Keep only the jobs on this channel. Omitted (the default) the route
+                 *     stays the unfiltered operator view the admin dashboard wants — every
+                 *     channel's jobs in one table.
+                 *
+                 *     A chat client asks for `owner`: it is the one channel whose fires it can
+                 *     open, and a `telegram` job's prompt is none of a phone's business. This
+                 *     grants no reach the route did not already give (unfiltered means *all*);
+                 *     it only lets a caller decline what it cannot use.
+                 */
+                channel?: null | components["schemas"]["ChannelType"];
             };
             header?: never;
             path?: never;
@@ -3446,7 +3531,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Live cron jobs, or the recycle bin when `deleted=true` */
+            /** @description Live cron jobs, or the recycle bin when `deleted=true`; filtered to one channel when `channel` is given */
             200: {
                 headers: {
                     [name: string]: unknown;

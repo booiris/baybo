@@ -154,6 +154,87 @@ async fn cron_pause_resume_and_recycle_bin_round_trip() {
     get(&router, "/v1/cron/missing", StatusCode::NOT_FOUND).await;
 }
 
+/// `?channel=` behind the phone's cron job list. The route's DEFAULT is the
+/// unfiltered operator view the admin dashboard renders — every channel in one
+/// table — so the filter must be opt-in, and must not quietly become the default
+/// for the callers that never ask.
+#[tokio::test]
+async fn listing_cron_can_be_filtered_to_one_channel() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let router = build_router(build_admin_state(&tg));
+
+    let mut ids = std::collections::HashMap::new();
+    for channel in ["owner", "telegram"] {
+        let created = post_expect(
+            &router,
+            "/v1/cron",
+            json!({
+                "schedule": "0 9 * * *",
+                "user_id": "owner",
+                "channel": channel,
+                "title": format!("{channel} digest"),
+                "text": "Summarize the news",
+                "timezone": "UTC",
+            }),
+            StatusCode::CREATED,
+        )
+        .await;
+        assert_eq!(created["channel"].as_str(), Some(channel), "{created:?}");
+        ids.insert(channel, created["id"].as_str().expect("id").to_owned());
+    }
+
+    let channels_of = |list: &Value| -> Vec<String> {
+        list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .filter_map(|job| job["channel"].as_str().map(str::to_owned))
+            .collect()
+    };
+
+    // No param: the operator view. Both jobs, untouched by this change.
+    let all = get(&router, "/v1/cron", StatusCode::OK).await;
+    let seen = channels_of(&all);
+    assert!(
+        seen.contains(&"owner".to_string()) && seen.contains(&"telegram".to_string()),
+        "the unfiltered list must stay the every-channel operator view, got {seen:?}",
+    );
+
+    // `?channel=owner`: only what a chat client can actually open.
+    let owned = get(&router, "/v1/cron?channel=owner", StatusCode::OK).await;
+    assert_eq!(channels_of(&owned), vec!["owner".to_string()], "{owned:?}");
+    assert_eq!(
+        owned["items"][0]["id"].as_str(),
+        Some(ids["owner"].as_str()),
+    );
+
+    // The filter composes with the recycle bin rather than being swallowed by
+    // it: delete BOTH, and the bin still answers for one channel only.
+    for id in ids.values() {
+        request(
+            &router,
+            "DELETE",
+            &format!("/v1/cron/{id}"),
+            None,
+            StatusCode::NO_CONTENT,
+        )
+        .await;
+    }
+    let bin = get(
+        &router,
+        "/v1/cron?deleted=true&channel=owner",
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(channels_of(&bin), vec!["owner".to_string()], "{bin:?}");
+    // …and the live list is empty for that channel now, not merely unfiltered.
+    let live = get(&router, "/v1/cron?channel=owner", StatusCode::OK).await;
+    assert!(
+        live["items"].as_array().expect("items").is_empty(),
+        "a deleted job must not survive in the filtered live list: {live:?}",
+    );
+}
+
 #[tokio::test]
 async fn cron_in_place_edit_round_trip() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;

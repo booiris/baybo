@@ -131,6 +131,23 @@ struct SessionIndexMirrorTests {
         #expect(mirror(Self.sessionId) == nil)
     }
 
+    /// Deleting a **cron group** is a batch of exactly the same deletes, so each
+    /// member takes its own mirror — and only its own. The group is a view over
+    /// its fires; nothing else about the job is touched.
+    @Test func deletingACronGroupDropsEveryMemberMirrorAndNoOthers() {
+        for id in ["fire-1", "fire-2", "s-elsewhere"] {
+            writeMirror(id)
+            index.recordUserSend(sessionId: id, text: "mine")
+        }
+
+        index.beginHideMany(["fire-1", "fire-2"])
+
+        #expect(index.rows.map(\.id) == ["s-elsewhere"])
+        #expect(mirror("fire-1") == nil)
+        #expect(mirror("fire-2") == nil)
+        #expect(mirror("s-elsewhere") != nil)
+    }
+
     /// Deleted on ANOTHER client: the server stops listing it, so `merge` drops
     /// the row — and `beginHide` never runs. Without this the conversation the
     /// user deleted on the web would keep its whole transcript on this phone,

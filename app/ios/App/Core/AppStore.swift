@@ -43,6 +43,33 @@ final class AppStore: ObservableObject {
         /// and `DisclosureGroup` nests rows inside one cell, which kills per-row
         /// `.swipeActions`. The Archived screen already established this shape.
         case cronGroup(String)
+        /// The owner's live scheduled JOBS — the schedules, not the fires. A
+        /// sibling of `archived`: same ☰ menu, same push, no argument (the list
+        /// fetches itself).
+        case cronJobs
+    }
+
+    /// A scheduled job's delete, waiting on the confirm dialog. Carries the name
+    /// so the dialog can say WHICH job it is about to stop — the list is the only
+    /// place these are told apart, and the dialog covers it.
+    struct PendingCronJobDelete: Equatable {
+        let jobId: String
+        let name: String
+    }
+
+    /// A cron group's delete, waiting on the confirm dialog.
+    ///
+    /// The members are **snapshotted when the dialog opens**, and the confirm
+    /// deletes exactly those: the dialog names a count ("all 12 execution
+    /// records"), and a group is a live view over its fires — the job can fire
+    /// again while the user reads. Re-deriving the members at the tap would
+    /// delete a fire the user was never shown, which is the one thing a
+    /// destructive confirm must not do.
+    struct PendingCronGroupDelete: Equatable {
+        let jobId: String
+        /// The group's **visible** members. An escapee (pinned, archived) is its
+        /// own row elsewhere and is deleted from where it lives.
+        let memberIds: [String]
     }
 
     @Published var route: Route = .launching
@@ -88,6 +115,29 @@ final class AppStore: ObservableObject {
     /// The session a swipe-delete is asking to confirm — hosted in `RootView`
     /// exactly like the logout confirm, and for the same latch/coverage reasons.
     @Published var confirmDeleteSession: String?
+    /// The cron group a swipe-delete is asking to confirm, same host and reasons.
+    @Published var confirmDeleteCronGroup: PendingCronGroupDelete?
+    /// Job id → name, learned from the scheduled-jobs list. See
+    /// `rememberCronJobTitles`.
+    @Published private(set) var cronJobTitles: [String: String] = [:]
+    /// The scheduled job a swipe-delete is asking to confirm.
+    @Published var confirmDeleteCronJob: PendingCronJobDelete?
+    /// The scheduled-jobs list `CronJobsScreen` renders.
+    ///
+    /// Held here rather than in the screen's `@State` for the reason the chat
+    /// list's rows are in `SessionIndex`: the delete confirm mounts at the app
+    /// root (it must dim the whole shell), so the rows it removes have to be
+    /// reachable from outside the screen. `nil` = never loaded; `[]` = proven
+    /// empty — only the latter may say "no scheduled jobs".
+    ///
+    /// In memory only. It is re-fetched on every appear, so what survives here is
+    /// one screen's worth of rows to paint while that lands — not a cache that
+    /// can outlive the app and disagree with the gateway about what is scheduled.
+    @Published private(set) var cronJobs: [CronJobSummary]?
+    /// A cron mutation that failed, rendered by the jobs screen. Its own line, not
+    /// `sessionNotice`: that belongs to the chat list's mutations, and would
+    /// surface this on a screen the user already left.
+    @Published var cronJobNotice: String?
     /// Transient archive/delete failure line, rendered by the list headers the
     /// way compose failures are. Cleared when the next mutation starts.
     @Published var sessionNotice: String?
@@ -524,6 +574,13 @@ final class AppStore: ObservableObject {
         chatPath.append(.archived)
     }
 
+    /// The ☰ menu's second entry: push the live scheduled jobs. Guarded like
+    /// `openArchived`.
+    func openCronJobs() {
+        guard !chatPath.contains(.cronJobs) else { return }
+        chatPath.append(.cronJobs)
+    }
+
     /// Tapping a cron group row: push that job's fires. Guarded like `openArchived`.
     func openCronGroup(_ jobId: String) {
         guard !chatPath.contains(.cronGroup(jobId)) else { return }
@@ -548,6 +605,168 @@ final class AppStore: ObservableObject {
             await activateSession(sessionId, ensureListed: true, appendToPath: true)
         }
     }
+
+    /// Fetch the owner's live scheduled jobs for `CronJobsScreen`.
+    ///
+    /// Deliberately a plain async read that throws, not an optimistic mutation
+    /// through `SessionIndex`: there is nothing local to reconcile. The screen is
+    /// the only reader, it owns the result, and it renders the failure itself —
+    /// so this neither caches nor writes a `sessionNotice` (which belongs to the
+    /// chat list's own mutations and would surface a cron error on a screen the
+    /// user already left).
+    @discardableResult
+    func loadCronJobs() async throws -> [CronJobSummary] {
+        #if DEBUG
+            if demoHomeMode {
+                let demo = Self.demoCronJobs()
+                rememberCronJobTitles(demo)
+                cronJobs = demo
+                return demo
+            }
+        #endif
+        let jobs = try await Baybo.client.chatListCronJobs()
+        rememberCronJobTitles(jobs)
+        cronJobs = jobs
+        return jobs
+    }
+
+    /// Pause or resume a job: flip the row now, send, and take the list back from
+    /// the gateway on success.
+    ///
+    /// That refetch is not belt-and-braces. Resuming recomputes the next trigger
+    /// **server-side** (from now — a job paused over a weekend must not fire five
+    /// times on Monday), and only the scheduler can say when that is. The
+    /// optimistic row therefore carries no next trigger at all until the refetch
+    /// lands, rather than a stale one it has no way to recompute.
+    func requestCronPaused(_ jobId: String, paused: Bool) {
+        cronJobNotice = nil
+        let rollback = cronJobs
+        applyCronPause(jobId, paused: paused)
+        #if DEBUG
+            if demoHomeMode { return }
+        #endif
+        Task { @MainActor in
+            do {
+                try await Baybo.client.chatSetCronPaused(jobId: jobId, paused: paused)
+                // Already applied; a failure to REFETCH leaves the optimistic row
+                // standing (it is right about the status) and the next appear
+                // reconciles the trigger.
+                try? await loadCronJobs()
+            } catch {
+                cronJobs = rollback
+                cronJobNotice = Lang.shared.t(
+                    paused ? "cronJobs.pauseFailed" : "cronJobs.resumeFailed")
+            }
+        }
+    }
+
+    /// Raise the delete confirm for a swiped job.
+    func promptDeleteCronJob(_ jobId: String, name: String) {
+        withAnimation(ConfirmDialog.enterMotion) {
+            confirmDeleteCronJob = PendingCronJobDelete(jobId: jobId, name: name)
+        }
+    }
+
+    /// Delete a scheduled job, after the confirm: drop the row and send.
+    ///
+    /// The job stops firing and goes to the gateway's recycle bin. Its execution
+    /// records are untouched — they are ordinary conversations, and the chat list
+    /// keeps showing them under the title each fire snapshotted. (The mirror
+    /// gesture, deleting the GROUP, clears those records and leaves the job
+    /// running: `requestDeleteGroup`.)
+    func requestDeleteCronJob(_ jobId: String) {
+        cronJobNotice = nil
+        let rollback = cronJobs
+        cronJobs?.removeAll { $0.id == jobId }
+        #if DEBUG
+            if demoHomeMode { return }
+        #endif
+        Task { @MainActor in
+            do {
+                try await Baybo.client.chatDeleteCronJob(jobId: jobId)
+            } catch {
+                cronJobs = rollback
+                cronJobNotice = Lang.shared.t("cronJobs.deleteFailed")
+            }
+        }
+    }
+
+    /// Both directions drop the next trigger: pausing because the gateway does,
+    /// and resuming because the new one is the scheduler's to compute.
+    ///
+    /// So a paused row reads "Paused" at once, while a resumed one shows an empty
+    /// meta column for the round trip it takes the refetch to land. That blank is
+    /// deliberate: the honest answer to "when does this next run" is not yet
+    /// known here, and the alternatives are inventing a time or showing the stale
+    /// one the job had before it was ever paused.
+    private func applyCronPause(_ jobId: String, paused: Bool) {
+        guard let index = cronJobs?.firstIndex(where: { $0.id == jobId }) else { return }
+        cronJobs?[index] = cronJobs![index].with(
+            status: paused ? .disabled : .enabled, nextTriggerAt: nil)
+    }
+
+    /// A job's name, kept so `CronGroupScreen` can title itself for a job whose
+    /// fires cannot: a group is a view over its fires, so a job that has never
+    /// fired has no members to read a title from, and the screen would otherwise
+    /// head a specific job's page with the generic "Scheduled task".
+    ///
+    /// A cache with no staleness problem, because it cannot be consulted while
+    /// wrong: a fire-less group is reachable ONLY from the jobs list — the chat
+    /// list's group row exists only where fires do — so the one path that needs
+    /// this always fills it moments earlier. Once fires exist they carry the
+    /// live title themselves and win.
+    private func rememberCronJobTitles(_ jobs: [CronJobSummary]) {
+        for job in jobs where !job.title.isEmpty {
+            cronJobTitles[job.id] = job.title
+        }
+    }
+
+    #if DEBUG
+        /// `-baybo-open-home`'s cron job fixture: a live job, a paused one, and a
+        /// titleless one (the prompt fallback) — so the screen is screenshot- and
+        /// XCUITest-verifiable with no gateway.
+        ///
+        /// All recurring, because the list is: a one-shot is dropped in
+        /// `list_cron_jobs` and could never reach a real screen, so seeding one
+        /// would be a fixture for a state production cannot produce.
+        ///
+        /// The live one is keyed to the seeded cron GROUP (`demo-job`), so tapping
+        /// it opens that job's two demo fires: the list → job → its history path
+        /// is the whole point of the tap, and this is what makes it drivable.
+        private static func demoCronJobs() -> [CronJobSummary] {
+            let iso = ISO8601DateFormatter()
+            let now = Date()
+            return [
+                CronJobSummary(
+                    id: "demo-job",
+                    title: "Morning brief",
+                    prompt: "Summarize overnight CI and the open PRs",
+                    expr: "0 9 * * *",
+                    timezone: "Asia/Shanghai",
+                    status: .enabled,
+                    nextTriggerAt: iso.string(from: now.addingTimeInterval(3 * 3600)),
+                    lastTriggeredAt: iso.string(from: now.addingTimeInterval(-21 * 3600))),
+                CronJobSummary(
+                    id: "demo-job-paused",
+                    title: "Weekly digest",
+                    prompt: "Round up the week",
+                    expr: "0 18 * * FRI",
+                    timezone: "UTC",
+                    status: .disabled,
+                    nextTriggerAt: nil,
+                    lastTriggeredAt: nil),
+                CronJobSummary(
+                    id: "demo-job-nameless",
+                    title: "",
+                    prompt: "Remind me to renew the TLS certificate",
+                    expr: "*/30 * * * *",
+                    timezone: "UTC",
+                    status: .enabled,
+                    nextTriggerAt: iso.string(from: now.addingTimeInterval(12 * 60)),
+                    lastTriggeredAt: nil),
+            ]
+        }
+    #endif
 
     /// Clear a cron group's badge in ONE round-trip: the gateway resolves each
     /// session's own tail ordinal, which the list does not have.
@@ -641,6 +860,17 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Raise the delete confirm for a swiped **cron group**, snapshotting the
+    /// members it will delete (see `PendingCronGroupDelete`). A group with no
+    /// visible member cannot be swiped — it has no row — so the guard is only a
+    /// belt against a racing merge emptying it mid-gesture.
+    func promptDeleteCronGroup(jobId: String, memberIds: [String]) {
+        guard !memberIds.isEmpty else { return }
+        withAnimation(ConfirmDialog.enterMotion) {
+            confirmDeleteCronGroup = PendingCronGroupDelete(jobId: jobId, memberIds: memberIds)
+        }
+    }
+
     /// Archive or unarchive, optimistically: the row moves lists at once and
     /// the PUT follows. Also the undo path (the toast's 撤销 re-sends `false`).
     func requestArchive(_ sessionId: String, archived: Bool) {
@@ -698,6 +928,42 @@ final class AppStore: ObservableObject {
         }
         SessionIndex.shared.beginHide(sessionId)
         pumpSessionMutation(sessionId)
+    }
+
+    /// Delete a **cron group**, after the confirm dialog: soft-hide every member
+    /// the dialog counted, in one round-trip. That is the entire delete — a group
+    /// is a view over its fires (`docs/cron-groups.md`), so clearing the
+    /// execution records is the only object-less thing "delete the folder" can
+    /// mean. The cron JOB is untouched and keeps firing; the group returns with
+    /// its next fire, empty of the history just cleared.
+    ///
+    /// Deliberately outside `pumpSessionMutation`: that serializes ONE request
+    /// per session, and this is one request for N. Nothing can re-pump the staged
+    /// intents behind its back — every pump site is a swipe on a row, and these
+    /// rows are gone the moment the batch is staged.
+    func requestDeleteGroup(_ memberIds: [String]) {
+        guard !memberIds.isEmpty else { return }
+        sessionNotice = nil
+        for sessionId in memberIds {
+            guard let store = chatStores[sessionId], isEvictable(sessionId, store) else { continue }
+            Task { await evictStore(sessionId, store) }
+        }
+        SessionIndex.shared.beginHideMany(memberIds)
+        #if DEBUG
+            if demoHomeMode {
+                SessionIndex.shared.finishHideMany(memberIds)
+                return
+            }
+        #endif
+        Task { @MainActor in
+            do {
+                try await Baybo.client.chatHideMany(sessionIds: memberIds)
+                SessionIndex.shared.finishHideMany(memberIds)
+            } catch {
+                SessionIndex.shared.rollBackHideMany(memberIds)
+                sessionNotice = Lang.shared.t("list.deleteFailed")
+            }
+        }
     }
 
     /// One in-flight request per session; `SessionIndex.pendingMutation` holds

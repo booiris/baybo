@@ -43,6 +43,8 @@ struct RootView: View {
                                     ArchivedScreen()
                                 case .cronGroup(let jobId):
                                     CronGroupScreen(jobId: jobId)
+                                case .cronJobs:
+                                    CronJobsScreen()
                                 }
                             }
                             .toolbar(.hidden, for: .navigationBar)
@@ -85,6 +87,48 @@ struct RootView: View {
                 )
                 .zIndex(1)
             }
+
+            // Deleting the JOB is the mirror of deleting its group, so the body
+            // states the opposite blast radius: the schedule stops, the history
+            // stays. It names the job, because the list is the only place these
+            // are told apart and this dialog covers it.
+            if let pending = store.confirmDeleteCronJob {
+                ConfirmDialog(
+                    titleKey: "cronJobs.deleteConfirmTitle",
+                    bodyKey: "cronJobs.deleteConfirmBody",
+                    bodyArg: pending.name,
+                    destructiveKey: "list.delete",
+                    onCancel: dismissDeleteCronJobConfirm,
+                    onConfirm: {
+                        dismissDeleteCronJobConfirm()
+                        withAnimation {
+                            store.requestDeleteCronJob(pending.jobId)
+                        }
+                    }
+                )
+                .zIndex(1)
+            }
+
+            // A cron group's delete clears its execution records — never the job
+            // — so the body says so, and counts them: the group is a view over
+            // its fires, and "delete" hiding N conversations is exactly the kind
+            // of blast radius a confirm exists to state out loud.
+            if let pending = store.confirmDeleteCronGroup {
+                ConfirmDialog(
+                    titleKey: "list.deleteGroupConfirmTitle",
+                    bodyKey: "list.deleteGroupConfirmBody",
+                    bodyArg: String(pending.memberIds.count),
+                    destructiveKey: "list.delete",
+                    onCancel: dismissDeleteCronGroupConfirm,
+                    onConfirm: {
+                        dismissDeleteCronGroupConfirm()
+                        withAnimation {
+                            store.requestDeleteGroup(pending.memberIds)
+                        }
+                    }
+                )
+                .zIndex(1)
+            }
         }
         .sheet(isPresented: $store.scanPresented) {
             ScanView()
@@ -100,6 +144,18 @@ struct RootView: View {
     private func dismissDeleteConfirm() {
         withAnimation(ConfirmDialog.exitMotion) {
             store.confirmDeleteSession = nil
+        }
+    }
+
+    private func dismissDeleteCronJobConfirm() {
+        withAnimation(ConfirmDialog.exitMotion) {
+            store.confirmDeleteCronJob = nil
+        }
+    }
+
+    private func dismissDeleteCronGroupConfirm() {
+        withAnimation(ConfirmDialog.exitMotion) {
+            store.confirmDeleteCronGroup = nil
         }
     }
 }

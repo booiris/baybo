@@ -175,6 +175,59 @@ pub struct ChatSessionSummary {
     pub cron_group_pinned: bool,
 }
 
+/// One RECURRING scheduled job, as the phone's cron list renders it — a
+/// read-only mirror of the gateway's `CronJob` DTO, minus what a list has no use
+/// for.
+///
+/// This is the JOB, not the **cron group** its fires collapse into: the group is
+/// a view over conversations that already happened (`docs/cron-groups.md`),
+/// while this is the schedule that produces them. A job with no fire yet has no
+/// group at all, and still belongs on this list — that is most of why the list
+/// exists.
+///
+/// **One-shots (`{"kind":"at"}`) are not here.** They are reminders rather than
+/// schedules: they fire once and are over, so they neither recur nor need
+/// managing, and the list is about what runs on a repeat. That is why the
+/// schedule is a bare `expr` and not a sum type — see `list_cron_jobs`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CronJobSummary {
+    pub id: String,
+    /// Short human name — **empty** on a row minted before the field existed, in
+    /// which case clients fall back to the prompt. The fallback stays on the
+    /// client because it is presentation, and both other surfaces already make
+    /// the same choice.
+    pub title: String,
+    pub prompt: String,
+    /// The cron expression, evaluated in `timezone`.
+    pub expr: String,
+    /// IANA zone the expression is read in. Shown beside it: `0 9 * * *` means
+    /// nothing without knowing whose 9am.
+    pub timezone: String,
+    pub status: CronJobStatus,
+    /// RFC 3339. `None` when nothing is coming — i.e. the job is paused.
+    pub next_trigger_at: Option<String>,
+    /// RFC 3339. `None` until the job first fires.
+    pub last_triggered_at: Option<String>,
+}
+
+/// A live job's run state, mirroring the gateway's `CronStatus`. Orthogonal to
+/// deletion — the list never carries a deleted job, so nothing here says
+/// anything about the recycle bin.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum CronJobStatus {
+    Enabled,
+    /// Paused by hand: it keeps its schedule but has no next trigger.
+    Disabled,
+    /// A one-shot that has already run. Terminal, and not a failure.
+    ///
+    /// **Unreachable on this list**, and kept only because it is the wire's third
+    /// status: `Executed` is set for one-shots alone (`mark_one_shot_executed`),
+    /// one-shots are filtered out, and editing one into a recurring schedule
+    /// resets it to `Enabled` (`update_job`). Rendering it truthfully if it ever
+    /// did arrive beats dropping the row on the floor.
+    Executed,
+}
+
 /// Result of the per-send durability point lookup
 /// (`GET /v1/chat/sessions/{id}/messages?platform_msg_id=…`), consumed by the
 /// native outbox: `found: false` is a provable absence (the key was never

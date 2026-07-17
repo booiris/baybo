@@ -79,6 +79,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(mark_sessions_read))
         .routes(routes!(set_session_folder))
         .routes(routes!(delete_session))
+        .routes(routes!(hide_sessions))
         .routes(routes!(unhide_session))
         .routes(routes!(slash_manifest))
         .routes(routes!(list_folders))
@@ -1578,6 +1579,73 @@ async fn delete_session(
             ..SessionPatch::default()
         },
     );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Request body for `POST /v1/chat/sessions/hide`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct HideManyRequest {
+    /// The sessions to hide. Like the per-session `DELETE`, this preserves every
+    /// row — see the module docstring. Sessions the caller cannot see are
+    /// rejected.
+    pub session_ids: Vec<String>,
+}
+
+/// Cap on one batch, matching [`MAX_MARK_READ_BATCH`] — the motivating caller is
+/// the same cron group, whose fires this hides in one gesture.
+const MAX_HIDE_BATCH: usize = 500;
+
+#[utoipa::path(
+    post,
+    path = "/chat/sessions/hide",
+    tag = "chat",
+    request_body = HideManyRequest,
+    responses(
+        (status = 204, description = "Every named session hidden (rows preserved on the server)"),
+        (status = 400, description = "Batch too large", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "A named session is not visible to this client", body = ErrorBody),
+    )
+)]
+async fn hide_sessions(
+    State(state): State<AdminState>,
+    authed: Option<Extension<AuthedClient>>,
+    Json(req): Json<HideManyRequest>,
+) -> Result<axum::http::StatusCode> {
+    if req.session_ids.len() > MAX_HIDE_BATCH {
+        return Err(GatewayError::BadRequest(format!(
+            "at most {MAX_HIDE_BATCH} sessions per batch, got {}",
+            req.session_ids.len()
+        )));
+    }
+    let authed = authed.as_ref().map(|ext| &ext.0);
+    // Scope-check every id BEFORE writing anything: a batch that would touch a
+    // session this client cannot see is refused whole, not half-applied.
+    let mut targets = Vec::with_capacity(req.session_ids.len());
+    for session_id in &req.session_ids {
+        let (sid, session) = load_scoped_chat_session(&state, session_id, authed).await?;
+        targets.push((sid, session.channel));
+    }
+    // Sequential, and the first failure propagates — unlike the mark-read batch,
+    // which warns and skips. A read cursor converges on the next list pull; a
+    // hide is a user-visible mutation the client has already applied
+    // optimistically, so it must learn that the batch did not fully land.
+    for (sid, channel) in targets {
+        state
+            .session_manager
+            .set_hidden(&sid, true)
+            .await
+            .map_err(|e| GatewayError::Internal(format!("hide session: {e}")))?;
+        broadcast_session_patch(
+            &state,
+            &channel,
+            &sid,
+            SessionPatch {
+                hidden: Some(true),
+                ..SessionPatch::default()
+            },
+        );
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

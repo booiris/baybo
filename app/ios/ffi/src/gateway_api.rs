@@ -5,7 +5,7 @@ use std::future::Future;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::api::ChatSessionSummary;
+use crate::api::{ChatSessionSummary, CronJobStatus, CronJobSummary};
 
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
 const PATH_CRON: &str = "/v1/cron";
@@ -109,6 +109,52 @@ struct SessionSummary {
     cron_group_pinned: bool,
 }
 
+#[derive(Deserialize)]
+struct CronJobsList {
+    items: Vec<WireCronJob>,
+}
+
+/// The gateway's `CronJob` DTO, narrowed to what the phone's list reads. The
+/// fields it drops (`user_id`, `channel`, `created_at`, `updated_at`,
+/// `origin_session_id`, `pinned`, `deleted_at`) are either constant for this
+/// caller or another surface's concern; `deleted_at` in particular can never
+/// arrive, because the request asks for the live list.
+#[derive(Deserialize)]
+struct WireCronJob {
+    id: String,
+    /// Empty on rows minted before the field existed.
+    #[serde(default)]
+    title: String,
+    prompt: String,
+    schedule: WireCronSchedule,
+    timezone: String,
+    status: WireCronStatus,
+    #[serde(default)]
+    next_trigger_at: Option<String>,
+    #[serde(default)]
+    last_triggered_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireCronSchedule {
+    Cron {
+        expr: String,
+    },
+    /// A one-shot. Its `time` is deliberately not captured: the variant exists to
+    /// be RECOGNISED so `list_cron_jobs` can drop the row, and a field nothing
+    /// reads is a field that goes stale. Serde ignores the rest of the object.
+    At,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireCronStatus {
+    Enabled,
+    Disabled,
+    Executed,
+}
+
 #[derive(Serialize)]
 struct SetArchivedRequest {
     archived: bool,
@@ -126,6 +172,11 @@ struct MarkReadRequest {
 
 #[derive(Serialize)]
 struct MarkManyReadRequest {
+    session_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct HideManyRequest {
     session_ids: Vec<String>,
 }
 
@@ -233,6 +284,90 @@ pub(crate) async fn list_sessions<C: GatewayJsonClient + Sync>(
         .collect())
 }
 
+/// The owner's LIVE, RECURRING scheduled jobs, in the order the gateway returned
+/// them (`GET /v1/cron?channel=owner`).
+///
+/// Three filters. Two are the server's, one is ours:
+///
+/// - **live only** — the request's default. The recycle bin is a desktop
+///   affordance (it needs restore, which this list does not offer), so a phone
+///   that listed deleted jobs could only tease them.
+/// - **`channel=owner`** — the one channel whose fires this app can open. The
+///   route is otherwise an unfiltered operator view spanning every channel, and
+///   a `telegram` job's prompt has no business crossing to a phone that can
+///   neither show its history nor act on it.
+/// - **recurring only** — dropped HERE rather than asked of the gateway, because
+///   unlike the other two it protects nothing and hides nothing: it is this
+///   list's identity. A one-shot (`{"kind":"at"}`) is a reminder — it fires once
+///   and is over — while this list is what runs on a repeat, and every verb it
+///   offers (pause, resume) is meaningless on a moment that has passed.
+pub(crate) async fn list_cron_jobs<C: GatewayJsonClient + Sync>(
+    client: &C,
+) -> Result<Vec<CronJobSummary>, String> {
+    // The same const the gateway compares against — this is one channel, named
+    // once, not a string the two sides each spell for themselves.
+    let path = format!("{PATH_CRON}?channel={}", baybo_model::ChannelType::OWNER);
+    let list: CronJobsList = client.get_json(&path).await?;
+    Ok(list
+        .items
+        .into_iter()
+        .filter_map(|job| {
+            let WireCronSchedule::Cron { expr } = job.schedule else {
+                return None;
+            };
+            Some(CronJobSummary {
+                id: job.id,
+                title: job.title,
+                prompt: job.prompt,
+                expr,
+                timezone: job.timezone,
+                status: match job.status {
+                    WireCronStatus::Enabled => CronJobStatus::Enabled,
+                    WireCronStatus::Disabled => CronJobStatus::Disabled,
+                    WireCronStatus::Executed => CronJobStatus::Executed,
+                },
+                next_trigger_at: job.next_trigger_at,
+                last_triggered_at: job.last_triggered_at,
+            })
+        })
+        .collect())
+}
+
+/// Pause or resume a scheduled job (`POST /v1/cron/{id}/pause|resume`).
+///
+/// Paused, the job keeps its schedule and loses its next trigger; resumed, the
+/// gateway recomputes that trigger **from now** and does not backfill the slots
+/// it slept through. Resuming a one-shot whose moment has passed is a 400 — its
+/// schedule has no future left — which is why the phone offers neither verb on a
+/// job that has already run.
+pub(crate) async fn set_cron_paused<C: GatewayJsonClient + Sync>(
+    client: &C,
+    job_id: String,
+    paused: bool,
+) -> Result<(), String> {
+    validate_path_segment(&job_id, "job_id")?;
+    let action = if paused { "pause" } else { "resume" };
+    let path = format!("{PATH_CRON}/{job_id}/{action}");
+    client.post_empty(&path, Vec::new()).await
+}
+
+/// Delete a scheduled job (`DELETE /v1/cron/{id}`) — a SOFT delete: the row goes
+/// to the recycle bin (`deleted_at`), stops firing, and is restorable from the
+/// web dashboard.
+///
+/// Its execution records are NOT touched. They are ordinary sessions and outlive
+/// the job that made them, so the chat list keeps showing that history under the
+/// title each fire snapshotted. (Deleting the *group* is the opposite gesture:
+/// see `chat_hide_many` — it clears the records and leaves the job running.)
+pub(crate) async fn delete_cron_job<C: GatewayJsonClient + Sync>(
+    client: &C,
+    job_id: String,
+) -> Result<(), String> {
+    validate_path_segment(&job_id, "job_id")?;
+    let path = format!("{PATH_CRON}/{job_id}");
+    client.delete_empty(&path).await
+}
+
 pub(crate) async fn set_archived<C: GatewayJsonClient + Sync>(
     client: &C,
     session_id: String,
@@ -281,6 +416,26 @@ pub(crate) async fn hide_session<C: GatewayJsonClient + Sync>(
     validate_path_segment(&session_id, "session_id")?;
     let path = format!("{PATH_CHAT_SESSIONS}/{session_id}");
     client.delete_empty(&path).await
+}
+
+/// Hide every named session in ONE round-trip — like [`hide_session`], each row
+/// survives on the server (see the gateway's chat module docstring); only the
+/// list loses it.
+///
+/// Behind the cron group's delete swipe: "delete the group" means "clear its
+/// execution records", and the group is a VIEW, so there is nothing to delete
+/// but its fires — one hide each. `POST /v1/chat/sessions/hide`.
+pub(crate) async fn hide_many<C: GatewayJsonClient + Sync>(
+    client: &C,
+    session_ids: Vec<String>,
+) -> Result<(), String> {
+    if session_ids.is_empty() {
+        return Ok(());
+    }
+    let body = serde_json::to_vec(&HideManyRequest { session_ids })
+        .map_err(|e| format!("encode batch hide request: {e}"))?;
+    let path = format!("{PATH_CHAT_SESSIONS}/hide");
+    client.post_empty(&path, body).await
 }
 
 /// Advance the session's chat-list read cursor (max-wins server-side) — the
@@ -907,6 +1062,82 @@ mod tests {
         );
     }
 
+    /// The request is the feature's whole scope contract: live (no `deleted`)
+    /// and `owner` only. A regression here is invisible in the UI until someone
+    /// else's Telegram job shows up in the list.
+    #[tokio::test]
+    async fn list_cron_jobs_asks_for_the_owner_channel_and_never_the_bin() {
+        let client = RecordingClient::new(r#"{"items":[]}"#);
+        let jobs = list_cron_jobs(&client).await.expect("list");
+
+        assert!(jobs.is_empty());
+        let call = client.only_call();
+        assert_eq!(call.method, "GET");
+        assert_eq!(call.path, "/v1/cron?channel=owner");
+        assert!(
+            !call.path.contains("deleted"),
+            "the phone must never ask for the recycle bin: {}",
+            call.path,
+        );
+    }
+
+    /// Both schedule kinds ride the same list — the user asked for every live
+    /// Every recurring job survives with its fields intact, and a one-shot is
+    /// dropped whole — never mangled into an expression, never counted.
+    #[tokio::test]
+    async fn list_cron_jobs_carries_recurring_jobs_and_drops_one_shots() {
+        let client = RecordingClient::new(
+            r#"{"items":[
+                {"id":"j1","title":"Morning brief","prompt":"Summarize","schedule":{"kind":"cron","expr":"0 9 * * *"},"timezone":"Asia/Shanghai","status":"enabled","next_trigger_at":"2026-07-18T01:00:00Z","last_triggered_at":"2026-07-17T01:00:00Z"},
+                {"id":"j2","title":"A reminder","prompt":"One shot","schedule":{"kind":"at","time":"2026-07-20T10:00:00Z"},"timezone":"UTC","status":"executed"},
+                {"id":"j3","title":"","prompt":"p","schedule":{"kind":"cron","expr":"0 18 * * FRI"},"timezone":"UTC","status":"disabled"}
+            ]}"#,
+        );
+        let jobs = list_cron_jobs(&client).await.expect("list");
+
+        assert_eq!(
+            jobs.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["j1", "j3"],
+            "a one-shot is a reminder, not a schedule this list manages",
+        );
+
+        assert_eq!(jobs[0].title, "Morning brief");
+        assert_eq!(jobs[0].expr, "0 9 * * *");
+        assert_eq!(jobs[0].timezone, "Asia/Shanghai");
+        assert_eq!(jobs[0].status, CronJobStatus::Enabled);
+        assert_eq!(
+            jobs[0].next_trigger_at.as_deref(),
+            Some("2026-07-18T01:00:00Z")
+        );
+        assert_eq!(
+            jobs[0].last_triggered_at.as_deref(),
+            Some("2026-07-17T01:00:00Z")
+        );
+
+        // A legacy row: no title, and the list falls back to the prompt — so the
+        // empty string must survive rather than becoming a `None` nobody checks.
+        assert_eq!(jobs[1].title, "");
+        assert_eq!(jobs[1].prompt, "p");
+        // Paused: it keeps its expression and has nothing coming.
+        assert_eq!(jobs[1].expr, "0 18 * * FRI");
+        assert_eq!(jobs[1].status, CronJobStatus::Disabled);
+        assert_eq!(jobs[1].next_trigger_at, None);
+    }
+
+    /// A list of nothing but one-shots is EMPTY — not a decode error, and not a
+    /// list of holes. `[]` is what the screen renders "no scheduled jobs" from.
+    #[tokio::test]
+    async fn a_list_of_only_one_shots_comes_back_empty() {
+        let client = RecordingClient::new(
+            r#"{"items":[
+                {"id":"j1","title":"Renew the cert","prompt":"x","schedule":{"kind":"at","time":"2026-07-20T10:00:00Z"},"timezone":"UTC","status":"executed"},
+                {"id":"j2","title":"Call mum","prompt":"y","schedule":{"kind":"at","time":"2026-08-01T10:00:00Z"},"timezone":"UTC","status":"enabled"}
+            ]}"#,
+        );
+        let jobs = list_cron_jobs(&client).await.expect("list");
+        assert!(jobs.is_empty(), "got {jobs:?}");
+    }
+
     #[tokio::test]
     async fn hide_session_deletes_the_session_path() {
         let client = RecordingClient::empty();
@@ -919,6 +1150,91 @@ mod tests {
                 body: String::new(),
             }
         );
+    }
+
+    /// One round-trip, one body — a group's fires are hidden together or not at
+    /// all, so looping [`hide_session`] over them is the thing this replaces.
+    #[tokio::test]
+    async fn hide_many_posts_every_id_in_one_call() {
+        let client = RecordingClient::empty();
+        hide_many(&client, vec!["s1".to_string(), "s2".to_string()])
+            .await
+            .expect("batch hide");
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "POST",
+                path: "/v1/chat/sessions/hide".to_string(),
+                body: r#"{"session_ids":["s1","s2"]}"#.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn pausing_and_resuming_a_cron_job_post_their_own_verbs() {
+        let client = RecordingClient::empty();
+        set_cron_paused(&client, "j1".to_string(), true)
+            .await
+            .expect("pause");
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "POST",
+                path: "/v1/cron/j1/pause".to_string(),
+                body: String::new(),
+            }
+        );
+
+        let client = RecordingClient::empty();
+        set_cron_paused(&client, "j1".to_string(), false)
+            .await
+            .expect("resume");
+        assert_eq!(client.only_call().path, "/v1/cron/j1/resume");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_cron_job_deletes_the_job_path_not_a_session() {
+        let client = RecordingClient::empty();
+        delete_cron_job(&client, "j1".to_string())
+            .await
+            .expect("delete");
+        assert_eq!(
+            client.only_call(),
+            RecordedCall {
+                method: "DELETE",
+                path: "/v1/cron/j1".to_string(),
+                body: String::new(),
+            }
+        );
+    }
+
+    /// A job id reaches the gateway as a PATH segment, so it gets the same
+    /// traversal guard `set_cron_pinned` has — nothing about these verbs makes
+    /// the id trustworthier.
+    #[tokio::test]
+    async fn cron_mutations_reject_a_path_traversing_job_id() {
+        let client = RecordingClient::empty();
+        assert!(
+            set_cron_paused(&client, "../../v1/chat/sessions".to_string(), true)
+                .await
+                .is_err()
+        );
+        assert!(
+            delete_cron_job(&client, "../../v1/chat/sessions".to_string())
+                .await
+                .is_err()
+        );
+        assert!(client.calls.lock().is_empty());
+    }
+
+    /// The confirm dialog snapshots the visible members, so an empty snapshot is
+    /// reachable (every fire pinned or archived away between prompt and tap) and
+    /// must not fire a pointless request.
+    #[tokio::test]
+    async fn hide_many_with_no_ids_is_a_no_op() {
+        let client = RecordingClient::empty();
+        hide_many(&client, Vec::new()).await.expect("no-op");
+        assert!(client.calls.lock().is_empty());
     }
 
     #[tokio::test]

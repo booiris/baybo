@@ -136,21 +136,7 @@ final class ArchiveFlowUITests: BayboUITestCase {
         XCTAssertTrue(swipeDelete.waitForExistence(timeout: 3))
         swipeDelete.tap()
 
-        let cancel = app.buttons["Cancel"]
-        XCTAssertTrue(cancel.waitForExistence(timeout: 3), "delete confirm did not present")
-
-        // Two "Delete" buttons exist (a swipe remnant + the dialog commit);
-        // the dialog's shares the Cancel row — pick by vertical alignment.
-        let cancelMidY = cancel.frame.midY
-        let candidates = app.buttons.matching(
-            NSPredicate(format: "label == 'Delete'")
-        ).allElementsBoundByIndex
-        guard
-            let commit = candidates.first(where: { abs($0.frame.midY - cancelMidY) < 4 })
-        else {
-            return XCTFail("no dialog Delete button beside Cancel")
-        }
-        commit.tap()
+        try dialogCommit(app, "Delete").tap()
 
         XCTAssertTrue(
             target.waitForNonExistence(timeout: 3), "confirmed delete kept the row listed")

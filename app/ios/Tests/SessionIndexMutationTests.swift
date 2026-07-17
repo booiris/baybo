@@ -97,6 +97,55 @@ struct SessionIndexMutationTests {
         #expect(index.rows.count == 1)
     }
 
+    /// A cron group's delete: every named fire leaves at once, and a failure puts
+    /// every one of them back. All-or-nothing on both edges — the user made ONE
+    /// gesture against a count the dialog named.
+    @Test func batchHideRemovesEveryMemberAndRollbackRestoresThemAll() {
+        index.recordUserSend(sessionId: "s-2", text: "fire two")
+        index.recordUserSend(sessionId: "s-3", text: "fire three")
+        let members = [Self.sessionId, "s-2"]
+
+        index.beginHideMany(members)
+        #expect(index.rows.map(\.id) == ["s-3"])
+        for id in members {
+            #expect(index.pendingMutation(for: id) == .hidden)
+        }
+
+        index.rollBackHideMany(members)
+        #expect(Set(index.rows.map(\.id)) == ["s-1", "s-2", "s-3"])
+        #expect(index.rows.first { $0.id == "s-2" }?.preview == "fire two")
+        for id in members {
+            #expect(index.pendingMutation(for: id) == nil)
+        }
+    }
+
+    /// The batch is the same staged intent as a single hide, so `merge` keeps
+    /// suppressing every member's remote row until the POST resolves — and
+    /// `finishHideMany` is what hands them all back to remote truth.
+    @Test func finishingABatchHideClearsEveryStagedIntent() {
+        index.recordUserSend(sessionId: "s-2", text: "fire two")
+        let members = [Self.sessionId, "s-2"]
+        index.beginHideMany(members)
+        index.finishHideMany(members)
+        for id in members {
+            #expect(index.pendingMutation(for: id) == nil)
+        }
+        // Resolved, so a stray rollback has no backup left to resurrect from.
+        index.rollBackHideMany(members)
+        #expect(index.rows.isEmpty)
+    }
+
+    /// The dialog snapshots the members, so an id can go stale between prompt and
+    /// tap (deleted from another client while the confirm was up). The batch must
+    /// still stage the rest rather than trip over the row that is already gone.
+    @Test func batchHideToleratesAnIdThatNoLongerHasARow() {
+        index.beginHideMany([Self.sessionId, "s-never-existed"])
+        #expect(index.rows.isEmpty)
+        #expect(index.pendingMutation(for: "s-never-existed") == .hidden)
+        index.rollBackHideMany([Self.sessionId, "s-never-existed"])
+        #expect(index.rows.map(\.id) == [Self.sessionId])
+    }
+
     /// Every stage and every resolve moves the epoch — that is what lets `merge`
     /// spot a snapshot older than the mutation and drop it.
     @Test func everyStageAndResolveMovesTheEpoch() {

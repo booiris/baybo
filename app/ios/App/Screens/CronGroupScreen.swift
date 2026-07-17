@@ -7,8 +7,11 @@ import SwiftUI
 /// any conversation does.
 ///
 /// A **group is a view, not an object** (`docs/cron-groups.md`): everything here
-/// is derived from `SessionRow.cronJobId`. There is nothing to rename, nothing to
-/// delete, and no folder row behind it — so this screen offers no such actions.
+/// is derived from `SessionRow.cronJobId`, and there is no folder row behind it —
+/// so there is nothing to rename, and this screen offers no group-level actions.
+/// Deleting a group is really deleting its execution records, one hide per fire;
+/// that lives on the group's row in the chat list (`ChatListScreen.cronGroupRow`),
+/// where the count it clears can be named before the user commits.
 ///
 /// A pushed screen rather than an inline expansion, deliberately: the disclosure
 /// chevron of `Section(isExpanded:)` only renders under `.listStyle(.sidebar)`,
@@ -55,12 +58,20 @@ struct CronGroupScreen: View {
     }
 
     /// Back chevron + the job's name, over the shared paper veil — `ArchivedScreen`'s
-    /// header, with the group's own title. Falls back to a neutral label if the
-    /// group vanished under us mid-pop.
+    /// header, with the group's own title.
+    ///
+    /// Three sources, narrowest first. The group's own title is the live one. A
+    /// group with no members has none to read — it has never fired, and is
+    /// reachable only from the jobs list, which just learned the name
+    /// (`AppStore.cronJobTitles`); without that step this page would head a
+    /// specific job with the generic fallback. The fallback survives for the
+    /// group vanishing under us mid-pop.
     private var header: some View {
         VStack(spacing: 6) {
             ZStack {
-                Text(verbatim: group?.title ?? lang.t("cronGroup.title"))
+                Text(
+                    verbatim: group?.title ?? appStore.cronJobTitles[jobId]
+                        ?? lang.t("cronGroup.title"))
                     .font(Theme.mono(16))
                     .foregroundStyle(Theme.ink)
                     .lineLimit(1)
