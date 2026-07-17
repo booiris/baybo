@@ -157,6 +157,9 @@ pub(crate) fn resolve_or_install_channel(
     if let Some(ch) = registry.get(channel_type) {
         return Ok(ch);
     }
+    // Miss: lazily install an out-of-tree sidecar channel (the `owner`/`tui`/
+    // bot channels are all installed at boot, so this only fires for a custom
+    // `baybo.json` channel on its first connection).
     super::boot::install_channel(registry, channel_type.clone())?;
     registry.get(channel_type).ok_or_else(|| {
         ChannelError::Config(format!("channel '{channel_type}' missing after install"))
@@ -644,21 +647,22 @@ mod tests {
     use baybo_storage::test_support::MemoryBlobStore;
     use std::sync::Arc;
 
-    /// An installed channel is returned directly without invoking the
-    /// lazy install path. Guards the order: we look up *first*, fall
-    /// back to install only on miss — flipping the order would
-    /// double-install on every reconnect and return DuplicateChannel.
+    /// A pooled type (`http`/`device`) resolves to the pre-installed shared
+    /// `owner` channel without invoking the lazy install path. Guards the
+    /// order: we pool-resolve *first*, fall back to install only on miss —
+    /// flipping the order would double-install on every reconnect and return
+    /// DuplicateChannel.
     #[test]
     fn resolve_returns_pre_installed_channel() {
         let registry = Arc::new(ChannelRegistry::new());
-        super::super::boot::install_channel(&registry, ChannelType::http()).expect("install");
-        let before = registry.get(&ChannelType::http()).expect("pre-installed");
+        super::super::boot::install_channel(&registry, ChannelType::owner()).expect("install");
+        let before = registry.get(&ChannelType::owner()).expect("pre-installed");
 
         let resolved =
-            resolve_or_install_channel(&registry, &ChannelType::http()).expect("resolve");
+            resolve_or_install_channel(&registry, &ChannelType::owner()).expect("resolve");
         assert!(
             Arc::ptr_eq(&before, &resolved),
-            "resolve must return the existing Arc, not a freshly-installed sibling",
+            "resolve must return the shared owner Arc for a pooled type, not a freshly-installed sibling",
         );
     }
 
@@ -689,11 +693,11 @@ mod tests {
         let out = AgentOutput {
             session_id: "s1".into(),
             user_id: "u1".to_owned(),
-            channel: ChannelType::http(),
+            channel: ChannelType::owner(),
             event: AgentEvent::Progress("still working on it".to_owned()),
         };
         let blobs = MemoryBlobStore::new();
-        let frame = super::agent_output_to_frame(out, &ChannelType::http(), &blobs).await;
+        let frame = super::agent_output_to_frame(out, &ChannelType::owner(), &blobs).await;
         match frame {
             Frame::Notice {
                 level,
@@ -716,14 +720,14 @@ mod tests {
         let out = AgentOutput {
             session_id: "s1".into(),
             user_id: "u1".to_owned(),
-            channel: ChannelType::http(),
+            channel: ChannelType::owner(),
             event: AgentEvent::Notice {
                 level: NoticeLevel::Warn,
                 text: "heads up".to_owned(),
             },
         };
         let blobs = MemoryBlobStore::new();
-        let frame = super::agent_output_to_frame(out, &ChannelType::http(), &blobs).await;
+        let frame = super::agent_output_to_frame(out, &ChannelType::owner(), &blobs).await;
         match frame {
             Frame::Notice {
                 level, transient, ..

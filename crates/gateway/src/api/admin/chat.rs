@@ -61,7 +61,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::api::dto::{ErrorBody, ListResponse};
-use crate::auth::{AuthedClient, WEB_OPERATOR_USER_ID};
+use crate::auth::{AuthedClient, OWNER_USER_ID};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
@@ -737,18 +737,18 @@ async fn list_sessions(
     Query(query): Query<ListSessionsQuery>,
     authed: Option<Extension<AuthedClient>>,
 ) -> Result<Json<ChatSessionsList>> {
-    let channel_type = chat_list_channel(authed.as_ref().map(|ext| &ext.0));
-    // Push the channel filter into SQL so a long-running gateway
-    // with thousands of bot sessions (telegram / weixin / …) doesn't
-    // pay an O(all-sessions) sqlite round-trip on every chat-list
-    // refresh — see `SessionStore::list_by_channel`. We still walk
-    // the result to apply the hidden filter; that's a userland-only
-    // pass over the (now scoped) result.
+    // Web and device both operate on the single `owner` chat channel, so this
+    // is `owner` for every chat caller. Push the filter into SQL so a
+    // long-running gateway with thousands of bot sessions (telegram / weixin /
+    // …) doesn't pay an O(all-sessions) sqlite round-trip on every chat-list
+    // refresh. We still walk the result to apply the hidden filter; that's a
+    // userland-only pass over the (already scoped) result.
     //
     // Going through `session_manager` here rather than the trace
     // summary listing is deliberate: fresh chat sessions don't have
     // any trace summary rows yet, so the summary path would hide
     // them until the first agent turn ran.
+    let channel_type = chat_list_channel(authed.as_ref().map(|ext| &ext.0));
     let scoped = state
         .session_manager
         .list_by_channel(&channel_type)
@@ -1731,13 +1731,12 @@ async fn broadcast_folders(state: &AdminState) -> Result<()> {
             created_at: f.created_at,
         })
         .collect();
-    for channel_type in chat_broadcast_channels() {
-        let Some(channel) = state.channel_registry.get(&channel_type) else {
-            continue;
-        };
-        if let Some(sub) = channel.as_subscribed() {
-            sub.broadcast_folders_changed(folders.clone());
-        }
+    // Folders are owner-wide, not session-scoped: one broadcast on the shared
+    // owner channel reaches every synced surface (web + device).
+    if let Some(channel) = state.channel_registry.get(&ChannelType::owner())
+        && let Some(sub) = channel.as_subscribed()
+    {
+        sub.broadcast_folders_changed(folders);
     }
     Ok(())
 }
@@ -2104,10 +2103,12 @@ async fn create_or_load_chat_session(
         .await
         .map_err(|e| GatewayError::Internal(format!("load requested chat session: {e}")))?
     {
-        if existing.channel != channel_type
-            || existing.user.id != user.id
-            || is_hidden_cron_session(&existing)
-        {
+        // Scope by channel only (`owner` for every chat caller). The `user.id`
+        // equality the pre-unification code also checked is intentionally
+        // gone: one gateway is one owner, and pre-unification rows still carry
+        // the old `web-operator`/`device_id` ids in `user.id` (only the
+        // `channel` is migrated), so equating it would 404 legacy sessions.
+        if existing.channel != channel_type || is_hidden_cron_session(&existing) {
             return Err(GatewayError::NotFound(format!("chat session {session_id}")));
         }
         return Ok(existing);
@@ -2120,43 +2121,37 @@ async fn create_or_load_chat_session(
         .map_err(|e| GatewayError::Internal(format!("create requested chat session: {e}")))
 }
 
-/// The channel universe a caller's chat list lives in. `http` (web) and
-/// `device` (iOS) own disjoint session sets, and every scoped lookup 404s
-/// across the boundary. Shared with the cron routes, whose jobs carry the same
-/// `ChannelType` and must be scoped the same way.
-pub(crate) fn chat_list_channel(authed: Option<&AuthedClient>) -> ChannelType {
-    match authed {
-        Some(AuthedClient::Device { .. }) => ChannelType::device(),
-        _ => ChannelType::http(),
-    }
+/// The channel every pooled chat surface operates on: the single shared
+/// `owner` pool. Web and device authenticate distinctly (and each registers
+/// under its own type on the wire, for leaked-token containment), but their
+/// sessions, memory, and cost all live under one owner identity — so past the
+/// auth boundary the chat REST layer no longer distinguishes them, and new
+/// rows carry `owner`, not a per-surface tag. Shared with the cron routes,
+/// whose jobs are scoped the same way. (`_authed` is retained for call-site
+/// symmetry; the surface no longer changes the channel.)
+pub(crate) fn chat_list_channel(_authed: Option<&AuthedClient>) -> ChannelType {
+    ChannelType::owner()
 }
 
+/// The identity every chat session is stamped with. One owner across all
+/// synced surfaces (web + device) — shared memory namespace and cost ledger
+/// (see [`OWNER_USER_ID`]). The originating surface (`http`/`device`) is kept
+/// only as `channel` provenance, never as the identity, so a conversation
+/// started on the phone and continued on the web is one owner's thread.
 fn chat_user(authed: Option<&AuthedClient>) -> User {
-    match authed {
-        Some(AuthedClient::Device { device_id }) => User {
-            id: device_id.clone(),
-            name: None,
-            channel: ChannelType::device(),
-        },
-        _ => web_operator_user(),
-    }
-}
-
-fn web_operator_user() -> User {
     User {
-        id: WEB_OPERATOR_USER_ID.to_owned(),
-        name: Some("Web Operator".to_owned()),
-        channel: ChannelType::http(),
+        id: OWNER_USER_ID.to_owned(),
+        name: Some("Owner".to_owned()),
+        channel: chat_list_channel(authed),
     }
 }
 
-/// Load the session row for `session_id` and verify it lives on the request
-/// identity's chat channel (`http` for web, `device` for direct device/relay).
-/// Both branches return the **same** `NotFound` body so a request for a
-/// Telegram/WeChat session id through the chat API
-/// can't be distinguished from a request for a nonexistent id —
-/// `GatewayError::NotFound` serialises its `to_string()` into the JSON
-/// response, so differing messages would otherwise leak existence.
+/// Load the session row for `session_id` and verify it lives on the chat
+/// channel (`owner` — the shared web+device pool). A session on `tui` or a
+/// `Multiplexed` (Telegram/WeChat) channel returns the **same** `NotFound`
+/// body as a nonexistent id — `GatewayError::NotFound` serialises its
+/// `to_string()` into the JSON response, so differing messages would leak
+/// existence.
 async fn load_scoped_chat_session(
     state: &AdminState,
     session_id: &str,
@@ -2176,13 +2171,11 @@ async fn load_scoped_chat_session(
     Ok((sid, session))
 }
 
-/// Push a [`Frame::SessionUpdated`] patch to every open chat client on the
-/// session's own channel. Scoped to `channel` on purpose — the `http` (web)
-/// and `device` (iOS) channels own disjoint session universes, and fanning a
-/// patch across both plants clickable ghost rows for device sessions in web
-/// sidebars. The patch carries the truth (no refetch round-trip); see the
-/// variant's doc comment for receiver-side merge rules. No-op when the
-/// channel is not installed (only possible in test fixtures that skipped
+/// Push a [`Frame::SessionUpdated`] patch to every open chat client on
+/// `channel` — the `owner` pool, so a web tab and a phone on the session both
+/// receive it. The patch carries the truth (no refetch round-trip); see the
+/// variant's doc comment for receiver-side merge rules. No-op when the channel
+/// is not installed (only possible in test fixtures that skipped
 /// `install_channels`).
 pub(crate) fn broadcast_session_patch(
     state: &AdminState,
@@ -2198,7 +2191,7 @@ pub(crate) fn broadcast_session_patch(
     }
 }
 
-/// Nudge every client on `channel` that its session LIST is stale (the
+/// Nudge every client on `channel` that its session list is stale (the
 /// session-less `Frame::Gap`). For changes with no session row to patch — see
 /// [`baybo_channels::SubscribedView::broadcast_list_stale`], whose motivating
 /// case is the cron-group pin.
@@ -2209,13 +2202,6 @@ pub(crate) fn broadcast_session_list_stale(state: &AdminState, channel: &Channel
     if let Some(sub) = channel.as_subscribed() {
         sub.broadcast_list_stale();
     }
-}
-
-/// The subscribed chat channels a folder-tree snapshot fans out to.
-/// Folders are not session-scoped, so — unlike [`broadcast_session_patch`]
-/// — both chat universes receive the (id-only, harmless) snapshot.
-fn chat_broadcast_channels() -> [ChannelType; 2] {
-    [ChannelType::http(), ChannelType::device()]
 }
 
 /// True for a cron fire session that is **not** a conversation of its own: a

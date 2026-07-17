@@ -52,7 +52,7 @@ and routes it to `crates/baybo/src/gateway_cmd.rs` — same pattern as `Commands
 
 Configuration lives in `baybo_config::GatewayConfig` (a top-level
 section on `BayboConfig`). The gateway owns its own bind address /
-port; the `http` channel itself has no operator-facing knobs and is
+port; the `owner` chat channel itself has no operator-facing knobs and is
 unconditionally installed at boot.
 
 ## Design Decisions
@@ -196,15 +196,16 @@ Browser `WebSocket` cannot set request headers, so the web client opens
 `/v1/channel-ws?token=<admin_token>` on the admin listener; admin auth
 validates the bearer, strips the query token before tracing, and marks
 the request as `AuthedClient::Web`. The WebSocket Register handshake
-then constrains that identity to the reserved `http` channel.
+then constrains that identity to the reserved `owner` chat channel.
 
 Direct device clients add `x-baybo-device-id: device-<hex(ed25519 pub)>` on every
 `/v1/*` call. The header is only an identity claim: admin auth accepts it
 only when the bearer is either the admin token or the matching approved
 device `auth_token` in `DeviceStore`. Once accepted, the request is tagged
-as `AuthedClient::Device { device_id }`, so chat REST is scoped to the
-`device` channel, `/v1/channel-ws` must register as `device`, and `/v1/blobs`
-stamps uploads with `device:<device_id>`.
+as `AuthedClient::Device { device_id }`; chat REST and `/v1/channel-ws`
+resolve to the shared `owner` chat channel (device auth must register as
+`owner`, the same channel the web dashboard uses), and `/v1/blobs` stamps
+uploads with `device:<device_id>`.
 Relay-mode device clients reach the same `v1_router_and_spec()` surface through
 the Noise-authenticated API tunnel. After the IK device handshake, the
 gateway injects `Authorization: Bearer <device auth_token>` plus
@@ -741,7 +742,7 @@ The full frame set (see `crates/wire/src/lib.rs`):
 - **Bot multiplexing (Multiplexed channels):** `StartBot`, `StopBot`
   (server → client), `BotStatus` (client → server), `SlashManifest`
   (server → client).
-- **Chat session signalling (http + device subscribed channels):** `SessionUpdated
+- **Chat session signalling (the `owner` subscribed channel):** `SessionUpdated
   { session_id, patch }` (the `SessionPatch` carries Create/Hide/Unhide
   plus `pinned` and `folder_id` changes), `SessionActivity { session_id,
   source, at }`, `FoldersChanged { folders }` (a full folder-tree snapshot
@@ -758,7 +759,7 @@ turn-progress frames.
 Session resolution is **not** "create on first message via
 `SessionManager::get_or_create`". It depends on the channel kind:
 
-- **Subscribed** channels (tui, http): the connection must first
+- **Subscribed** channels (tui, owner): the connection must first
   `Subscribe` to a client-named `session_id`; an inbound `Message` for a
   session the connection isn't subscribed to is dropped
   (`resolve_inbound_session` in `channel/route.rs`). The TUI generates
@@ -836,7 +837,7 @@ chosen port to `<workspace>/state/channel.port` (mode `0o600`) and the
 file is unlinked on shutdown (plus a `Drop` guard covers panic exits).
 `graph.channels_registry` is **populated at boot** by
 `channel::boot::install_channels` (one `Channel` per enabled channel
-type, including the always-on `http` channel and the bundled TUI when
+type, including the always-on `owner` chat channel and the bundled TUI when
 `cli.enabled`); incoming `/v1/channel-ws` connections then `attach` to
 the channel for their type rather than installing it.
 
@@ -917,7 +918,7 @@ crates/gateway/
 │   │   ├── relay_e2e.rs     #   cross-workspace E2E tests for the spliced relay path (pair + content)
 │   │   ├── relay_pair.rs    #   the relay host leg `baybo device pair` opens
 │   │   ├── route.rs         #   ws_handler + inbound loop (Subscribe/Message/ResolveApproval/…)
-│   │   ├── session_pulse.rs #   http-channel dispatch observer → throttled Frame::SessionActivity
+│   │   ├── session_pulse.rs #   owner-channel dispatch observer → throttled Frame::SessionActivity
 │   │   ├── session_resolver.rs # ChannelSessionResolver (Multiplexed (channel,user)→session)
 │   │   ├── session_title.rs #   conversation-title broadcaster
 │   │   ├── slash.rs         #   slash-command manifest + sidecar slash handling

@@ -3227,6 +3227,8 @@ export function routeInboundFrame(
       // on every redelivery — the old text-match heuristics are gone).
       if (frame.ordinal !== undefined) {
         const rowKey = transcriptRowKey(sid, `m${frame.ordinal}`);
+        const frameAttachments =
+          (frame.attachments?.length ?? 0) > 0 ? frame.attachments : undefined;
         if (role === 'user') {
           const preview = frame.content.trim().length > 0
             ? frame.content
@@ -3271,12 +3273,12 @@ export function routeInboundFrame(
                 role: 'assistant',
                 text: frame.content,
                 streaming: false,
+                hasAttachments: frameAttachments !== undefined || last.hasAttachments,
+                attachments: frameAttachments ?? last.attachments,
               };
               return { ...prev, [sid]: { ...view, transcript: next } };
             }
           }
-          const frameAttachments =
-            (frame.attachments?.length ?? 0) > 0 ? frame.attachments : undefined;
           return {
             ...prev,
             [sid]: {

@@ -107,9 +107,9 @@ mod tests {
     #[test]
     fn install_and_get() {
         let reg = ChannelRegistry::new();
-        let ch = channel(ChannelType::http(), ChannelKind::Subscribed);
+        let ch = channel(ChannelType::owner(), ChannelKind::Subscribed);
         reg.install(Arc::clone(&ch)).unwrap();
-        assert!(Arc::ptr_eq(&reg.get(&ChannelType::http()).unwrap(), &ch));
+        assert!(Arc::ptr_eq(&reg.get(&ChannelType::owner()).unwrap(), &ch));
     }
 
     #[test]
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn list_returns_installed() {
         let reg = ChannelRegistry::new();
-        reg.install(channel(ChannelType::http(), ChannelKind::Subscribed))
+        reg.install(channel(ChannelType::owner(), ChannelKind::Subscribed))
             .unwrap();
         reg.install(channel(ChannelType::tui(), ChannelKind::Subscribed))
             .unwrap();
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn channel_attach_and_dispatch_selective() {
-        let ch = channel(ChannelType::http(), ChannelKind::Subscribed);
+        let ch = channel(ChannelType::owner(), ChannelKind::Subscribed);
         let conn = Arc::new(Connection::new(Arc::new(DiscardSink)));
         let id = conn.id();
         ch.attach(Arc::clone(&conn));
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn detach_clears_subscriptions() {
-        let ch = channel(ChannelType::http(), ChannelKind::Subscribed);
+        let ch = channel(ChannelType::owner(), ChannelKind::Subscribed);
         let conn = Arc::new(Connection::new(Arc::new(DiscardSink)));
         let id = conn.id();
         ch.attach(Arc::clone(&conn));

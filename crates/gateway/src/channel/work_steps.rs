@@ -89,7 +89,7 @@ mod tests {
         SessionEvent::Agent(AgentOutput {
             session_id: SessionId::from("s"),
             user_id: "u".into(),
-            channel: ChannelType::http(),
+            channel: ChannelType::owner(),
             event,
         })
     }

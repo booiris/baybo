@@ -18,7 +18,7 @@
 //!
 //! So this module is just a Noise-wrapping transport ([`NoiseFrameSink`] /
 //! [`NoiseFrameSource`]) around the existing `Subscribed`-channel machinery: the
-//! device registers as [`ChannelType::device`], `Subscribe`s a session, and
+//! device registers as [`ChannelType::owner`], `Subscribe`s a session, and
 //! self-pulls / sends like any other subscribed connection.
 
 use std::sync::Arc;
@@ -102,7 +102,7 @@ async fn run_content_session<Si: BinarySink, So: BinarySource>(
     // just with a Noise-wrapped transport: reuse the channel registry + the
     // shared inbound loop so `Subscribe` catch-up, live fan-out, and inbound
     // `Message` routing all work exactly as they do for the TUI / web chat.
-    let channel_type = ChannelType::device();
+    let channel_type = ChannelType::owner();
     let channel = super::adapter::resolve_or_install_channel(&state.registry, &channel_type)
         .map_err(|e| format!("resolve device channel: {e}"))?;
 
@@ -413,8 +413,9 @@ mod tests {
             .create(&device_row("device-dev", device.public().to_vec()))
             .await
             .expect("seed approved device row");
-        crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::device())
-            .expect("install device channel");
+        // Device connections pool into the shared `owner` channel.
+        crate::channel::boot::install_channel(&tg.deps.channel_registry, ChannelType::owner())
+            .expect("install owner channel");
         let gw_static = load_or_create_static_keypair(&tg.deps.secret_vault)
             .await
             .expect("gateway static key");
@@ -451,7 +452,7 @@ mod tests {
             content: "via relay".into(),
             session_id: "sess-r".into(),
             user_id: "user-1".into(),
-            channel_type: ChannelType::device(),
+            channel_type: ChannelType::owner(),
             bot_id: String::new(),
             attachments: Vec::new(),
             platform_msg_id: "m1".into(),

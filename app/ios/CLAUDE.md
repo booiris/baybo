@@ -198,10 +198,11 @@ errors above. When iterating on Swift/web only (no `ffi/` changes), pass
   "Transcript mirror retention" below; the legacy single-session UserDefaults
   keys (`ChatDefaults`) are migrated once and retired.
 - **Live list unread**: the gateway broadcasts a throttled `Frame::SessionActivity`
-  (per-session ping, no content) to EVERY connection on the `device` channel —
+  (per-session ping, no content) to EVERY connection on the `owner` channel —
   subscribed or not — when a user send echoes or a session's turn completes
-  (`SessionPulse`, now installed on `device` as well as `http`; TUI is
-  excluded). The FFI transport special-cases that frame in
+  (`SessionPulse`, installed on the shared `owner` chat channel that both the
+  web dashboard and this app register as; TUI is excluded). The FFI transport
+  special-cases that frame in
   `dispatch_inbound_frame`, routing it to a
   connection-global `SessionListSink` (set once via `set_session_list_sink`)
   instead of the per-session `FrameSink` — so a session the device never opened

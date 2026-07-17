@@ -17,7 +17,7 @@ pub struct User {
 
 /// Open-ended channel identifier, stored as a snake_case string.
 ///
-/// Well-known channels have associated constants (`HTTP`, `TUI`,
+/// Well-known channels have associated constants (`OWNER`, `TUI`,
 /// `TELEGRAM`, `DISCORD`) but the type is deliberately not a closed enum
 /// so runtime-registered sidecars can declare arbitrary names (`"slack"`,
 /// `"wechat"`, …) without a core enum extension.
@@ -26,26 +26,26 @@ pub struct User {
 pub struct ChannelType(pub String);
 
 impl ChannelType {
-    pub const HTTP: &'static str = "http";
     pub const TUI: &'static str = "tui";
-    /// Paired companion devices. A `Subscribed` channel like `HTTP`: mobile
-    /// devices register as `device` and self-pull threads via
-    /// `Frame::Subscribe`.
-    pub const DEVICE: &'static str = "device";
     pub const TELEGRAM: &'static str = "telegram";
     pub const DISCORD: &'static str = "discord";
     pub const WEIXIN: &'static str = "weixin";
 
-    pub fn http() -> Self {
-        Self(Self::HTTP.to_owned())
+    /// The single self-service chat channel the owner's surfaces — web and
+    /// mobile — both operate on. One human on however many screens, so there
+    /// is one channel, one transcript pool, one identity. The web-vs-device
+    /// distinction lives entirely at the auth boundary (the admin bearer vs
+    /// an approved device token, and the device store for pairing/push); it
+    /// is not a channel. `Subscribed` like `TUI`, but the shared owner
+    /// surface rather than the private terminal one.
+    pub const OWNER: &'static str = "owner";
+
+    pub fn owner() -> Self {
+        Self(Self::OWNER.to_owned())
     }
 
     pub fn tui() -> Self {
         Self(Self::TUI.to_owned())
-    }
-
-    pub fn device() -> Self {
-        Self(Self::DEVICE.to_owned())
     }
 
     pub fn telegram() -> Self {

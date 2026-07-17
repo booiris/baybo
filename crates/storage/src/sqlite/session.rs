@@ -127,6 +127,24 @@ fn read_session_list_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSession
     ))
 }
 
+/// Decode a batch of session-list rows into `Session`s, skipping (with a
+/// warning) any whose blob fails to deserialize — a single undeserializable
+/// row (e.g. written by an older build whose `lineage.kind` this build doesn't
+/// know) degrades to "silently absent", never fails the whole listing.
+fn decode_session_list_rows(rows: Vec<RawSessionListRow>) -> Vec<Session> {
+    let mut sessions = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match decode_session_row(row) {
+            Ok(session) => sessions.push(session),
+            Err(e) => tracing::warn!(
+                session_id = %row.4,
+                "skipping session row that failed to deserialize: {e}"
+            ),
+        }
+    }
+    sessions
+}
+
 fn read_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawMessageRow> {
     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
 }
@@ -485,21 +503,7 @@ impl SessionStore for SqliteSessionStore {
             })
             .await?;
 
-        let mut sessions = Vec::new();
-        for row in &rows {
-            // A single undeserializable row (e.g. one written by an older
-            // build whose `lineage.kind` this build doesn't know) must
-            // degrade to "silently absent from the listing", never fail
-            // the whole listing and 500 the CLI picker / web UI.
-            match decode_session_row(row) {
-                Ok(session) => sessions.push(session),
-                Err(e) => tracing::warn!(
-                    session_id = %row.4,
-                    "skipping session row that failed to deserialize: {e}"
-                ),
-            }
-        }
-        Ok(sessions)
+        Ok(decode_session_list_rows(rows))
     }
 
     async fn list_by_channel(&self, channel: &baybo_model::ChannelType) -> Result<Vec<Session>> {
@@ -527,20 +531,7 @@ impl SessionStore for SqliteSessionStore {
             })
             .await?;
 
-        let mut sessions = Vec::new();
-        for row in &rows {
-            // Same skip-on-error discipline as `list_all`: a row whose
-            // blob fails to deserialize drops out of the listing rather
-            // than failing the whole chat-list query.
-            match decode_session_row(row) {
-                Ok(session) => sessions.push(session),
-                Err(e) => tracing::warn!(
-                    session_id = %row.4,
-                    "skipping session row that failed to deserialize: {e}"
-                ),
-            }
-        }
-        Ok(sessions)
+        Ok(decode_session_list_rows(rows))
     }
 
     async fn list_lineage_children(
@@ -1451,7 +1442,7 @@ mod tests {
         let store = SqliteSessionStore::new(pool);
 
         let mut http_a = make_root_session("http-a");
-        http_a.channel = ChannelType::http();
+        http_a.channel = ChannelType::owner();
         store.save(&http_a).await.unwrap();
 
         let mut tg = make_root_session("tg-1");
@@ -1459,10 +1450,10 @@ mod tests {
         store.save(&tg).await.unwrap();
 
         let mut http_b = make_root_session("http-b");
-        http_b.channel = ChannelType::http();
+        http_b.channel = ChannelType::owner();
         store.save(&http_b).await.unwrap();
 
-        let http = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        let http = store.list_by_channel(&ChannelType::owner()).await.unwrap();
         let http_ids: Vec<&str> = http.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(http_ids.len(), 2);
         assert!(http_ids.contains(&"http-a"));
@@ -1492,11 +1483,11 @@ mod tests {
         let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("hide-me");
-        s.channel = ChannelType::http();
+        s.channel = ChannelType::owner();
         store.save(&s).await.unwrap();
         assert!(store.set_hidden(&s.id, true).await.unwrap());
 
-        let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        let listed = store.list_by_channel(&ChannelType::owner()).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].hidden, "hidden flag must reflect the column");
     }
@@ -1788,11 +1779,11 @@ mod tests {
         let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("pin-list");
-        s.channel = ChannelType::http();
+        s.channel = ChannelType::owner();
         store.save(&s).await.unwrap();
         assert!(store.set_pinned(&s.id, true).await.unwrap());
 
-        let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        let listed = store.list_by_channel(&ChannelType::owner()).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert!(
             listed[0].pinned,
@@ -1809,7 +1800,7 @@ mod tests {
         let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("pin-list");
-        s.channel = ChannelType::http();
+        s.channel = ChannelType::owner();
         store.save(&s).await.unwrap();
         assert!(
             store
@@ -1818,7 +1809,7 @@ mod tests {
                 .unwrap()
         );
 
-        let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        let listed = store.list_by_channel(&ChannelType::owner()).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(
             listed[0].state.last_llm,
@@ -1873,11 +1864,11 @@ mod tests {
         let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("archive-list");
-        s.channel = ChannelType::http();
+        s.channel = ChannelType::owner();
         store.save(&s).await.unwrap();
         assert!(store.set_archived(&s.id, true).await.unwrap());
 
-        let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        let listed = store.list_by_channel(&ChannelType::owner()).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert!(
             listed[0].archived,
@@ -1990,12 +1981,12 @@ mod tests {
         let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("fld-list");
-        s.channel = ChannelType::http();
+        s.channel = ChannelType::owner();
         store.save(&s).await.unwrap();
         let fid = baybo_model::FolderId::from("folder-list");
         assert!(store.set_folder(&s.id, Some(&fid)).await.unwrap());
 
-        let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        let listed = store.list_by_channel(&ChannelType::owner()).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(
             listed[0].folder_id,
@@ -2109,11 +2100,11 @@ mod tests {
         let store = SqliteSessionStore::new(pool);
 
         let mut s = make_root_session("title-list");
-        s.channel = ChannelType::http();
+        s.channel = ChannelType::owner();
         store.save(&s).await.unwrap();
         assert!(store.set_title(&s.id, Some("Listed title")).await.unwrap());
 
-        let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        let listed = store.list_by_channel(&ChannelType::owner()).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(
             listed[0].title.as_deref(),

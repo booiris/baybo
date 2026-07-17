@@ -92,7 +92,7 @@ pub fn user_message_frame(
         content: text.to_owned(),
         session_id: SessionId::from(session_id),
         user_id: user_id.to_owned(),
-        channel_type: ChannelType::device(),
+        channel_type: ChannelType::owner(),
         bot_id: String::new(),
         attachments,
         platform_msg_id: platform_msg_id.to_owned(),
@@ -104,6 +104,6 @@ pub fn user_message_frame(
 pub fn register_device_frame() -> Frame {
     Frame::Register {
         token: String::new(),
-        channel_type: ChannelType::device(),
+        channel_type: ChannelType::owner(),
     }
 }

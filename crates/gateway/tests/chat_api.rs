@@ -24,7 +24,7 @@ use tower::ServiceExt;
 async fn chat_api_round_trip() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -155,7 +155,7 @@ async fn chat_api_round_trip() {
 async fn chat_archive_round_trip() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -234,7 +234,7 @@ async fn chat_archive_round_trip() {
 async fn chat_create_accepts_client_supplied_session_id() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -307,7 +307,7 @@ async fn seed_tool_turn_session(
 async fn chat_list_last_message_text_follows_latest_reply() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -342,7 +342,7 @@ async fn chat_list_last_message_text_follows_latest_reply() {
 async fn chat_list_last_message_text_skips_mid_turn_narration() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -395,7 +395,7 @@ async fn chat_list_last_message_text_skips_mid_turn_narration() {
 async fn chat_list_last_message_text_strips_cancelled_marker() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -438,7 +438,7 @@ async fn chat_list_last_message_text_strips_cancelled_marker() {
 async fn chat_sync_difference_is_full_fidelity_with_coverage_watermark() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -502,7 +502,7 @@ async fn chat_sync_watermark_covers_invisible_tail() {
     // re-scans the invisible tail forever.
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -549,7 +549,7 @@ async fn chat_sync_watermark_covers_invisible_tail() {
 async fn chat_sync_baseline_and_rebase_replace_with_newest_page() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -599,7 +599,7 @@ async fn chat_sync_baseline_and_rebase_replace_with_newest_page() {
 async fn chat_sync_redelivers_control_events_anchored_at_cursor() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -644,7 +644,7 @@ async fn chat_sync_redelivers_control_events_anchored_at_cursor() {
 async fn chat_message_point_lookup_probes_durability() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -680,7 +680,7 @@ async fn chat_message_point_lookup_probes_durability() {
 async fn chat_list_unread_count_reflects_read_cursor() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -754,8 +754,11 @@ async fn chat_list_unread_count_reflects_read_cursor() {
     assert_eq!(unread_of(&list), 0, "read cursor never regresses");
 }
 
+/// Web and device share the one `owner` chat channel, so a device-authed list
+/// (as forwarded from the relay tunnel) returns every owner session — including
+/// ones the web operator created. There is no per-surface universe to scope to.
 #[tokio::test]
-async fn chat_list_uses_device_scope_when_forwarded_from_tunnel() {
+async fn chat_list_returns_every_owner_session_for_a_device_caller() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
@@ -767,9 +770,9 @@ async fn chat_list_uses_device_scope_when_forwarded_from_tunnel() {
             User {
                 id: "device-1".into(),
                 name: None,
-                channel: ChannelType::device(),
+                channel: ChannelType::owner(),
             },
-            ChannelType::device(),
+            ChannelType::owner(),
         )
         .await
         .unwrap();
@@ -789,9 +792,9 @@ async fn chat_list_uses_device_scope_when_forwarded_from_tunnel() {
             User {
                 id: "web".into(),
                 name: None,
-                channel: ChannelType::http(),
+                channel: ChannelType::owner(),
             },
-            ChannelType::http(),
+            ChannelType::owner(),
         )
         .await
         .unwrap();
@@ -829,7 +832,16 @@ async fn chat_list_uses_device_scope_when_forwarded_from_tunnel() {
         .iter()
         .map(|row| row["session_id"].as_str().expect("session_id"))
         .collect();
-    assert_eq!(ids, vec![device_session.id.as_str()]);
+    // Unified owner pool: both the device-origin and the http-origin session
+    // appear in the device-scoped list — they are one universe now.
+    assert!(
+        ids.contains(&device_session.id.as_str()),
+        "device session must be listed: {ids:?}",
+    );
+    assert!(
+        ids.contains(&http.id.as_str()),
+        "http session must also appear in the merged owner pool: {ids:?}",
+    );
 }
 
 /// A recurring fire scheduled from the phone opens its conversation on the
@@ -854,7 +866,7 @@ async fn a_recurring_fire_scheduled_from_the_phone_is_listed_on_the_phone() {
     let phone = User {
         id: "device-1".into(),
         name: None,
-        channel: ChannelType::device(),
+        channel: ChannelType::owner(),
     };
     let mut fires = Vec::new();
     for conversation in [true, false] {
@@ -863,7 +875,7 @@ async fn a_recurring_fire_scheduled_from_the_phone_is_listed_on_the_phone() {
             .session_manager
             .create_session_with_trigger(
                 phone.clone(),
-                ChannelType::device(),
+                ChannelType::owner(),
                 TriggerSource::Cron {
                     cron_job_id: "cj-news".into(),
                     origin_session_id: None,
@@ -933,14 +945,14 @@ async fn a_cron_group_is_labelled_by_the_live_job_title_and_falls_back_to_the_sn
     let operator = User {
         id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
         name: None,
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
     };
     let job = tg
         .deps
         .cron_scheduler
         .create_job(NewCronJob {
             user_id: operator.id.clone(),
-            channel: ChannelType::http(),
+            channel: ChannelType::owner(),
             title: "Morning brief".into(),
             schedule: CronSchedule::Cron {
                 expr: "0 8 * * *".into(),
@@ -960,7 +972,7 @@ async fn a_cron_group_is_labelled_by_the_live_job_title_and_falls_back_to_the_sn
         .session_manager
         .create_session_with_trigger(
             operator.clone(),
-            ChannelType::http(),
+            ChannelType::owner(),
             TriggerSource::Cron {
                 cron_job_id: job.id.clone(),
                 origin_session_id: None,
@@ -1031,14 +1043,14 @@ async fn a_pre_snapshot_fire_whose_job_is_gone_has_no_group_label() {
     let operator = User {
         id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
         name: None,
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
     };
     let orphan = tg
         .deps
         .session_manager
         .create_session_with_trigger(
             operator,
-            ChannelType::http(),
+            ChannelType::owner(),
             TriggerSource::Cron {
                 cron_job_id: "cj-long-gone".into(),
                 origin_session_id: None,
@@ -1231,16 +1243,18 @@ async fn admin_device_header_creates_and_lists_device_sessions() {
         .await
         .unwrap()
         .expect("created session");
-    assert_eq!(session.channel, ChannelType::device());
-    assert_eq!(session.user.id, device_id);
-    assert_eq!(session.user.channel, ChannelType::device());
+    // Fully collapsed: a device-created session lives on the shared `owner`
+    // pool (no per-surface provenance), under the shared `OWNER` identity.
+    assert_eq!(session.channel, ChannelType::owner());
+    assert_eq!(session.user.id, baybo_gateway::auth::OWNER_USER_ID);
+    assert_eq!(session.user.channel, ChannelType::owner());
 
     let list = authed_device_request(
         &router,
         "GET",
         "/v1/chat/sessions",
         &tg.deps.admin_token,
-        &session.user.id,
+        &device_id,
         StatusCode::OK,
     )
     .await;
@@ -1257,7 +1271,7 @@ async fn admin_device_header_creates_and_lists_device_sessions() {
         "GET",
         &format!("/v1/chat/sessions/{session_id}"),
         &tg.deps.admin_token,
-        &session.user.id,
+        &device_id,
         StatusCode::OK,
     )
     .await;
@@ -1274,11 +1288,20 @@ async fn admin_device_header_creates_and_lists_device_sessions() {
         )
         .await
         .expect("router responds");
+    // Unified owner pool: a plain web identity CAN open a device-origin
+    // session now — web and device are one universe.
     assert_eq!(
         web_response.status(),
-        StatusCode::NOT_FOUND,
-        "plain web identity must not see device-scoped sessions",
+        StatusCode::OK,
+        "web identity must see device-origin sessions in the merged owner pool",
     );
+    let web_detail: Value = serde_json::from_slice(
+        &body::to_bytes(web_response.into_body(), 64 * 1024)
+            .await
+            .expect("body bytes"),
+    )
+    .expect("web detail json");
+    assert_eq!(web_detail["session_id"].as_str(), Some(session_id.as_str()));
 }
 
 #[tokio::test]
@@ -1354,8 +1377,10 @@ async fn approved_device_token_with_header_creates_device_session() {
         .await
         .unwrap()
         .expect("created session");
-    assert_eq!(session.channel, ChannelType::device());
-    assert_eq!(session.user.id, device_id);
+    // Fully collapsed: the session lives on the shared `owner` pool (no
+    // per-surface provenance), under the shared `OWNER` identity.
+    assert_eq!(session.channel, ChannelType::owner());
+    assert_eq!(session.user.id, baybo_gateway::auth::OWNER_USER_ID);
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
@@ -1537,7 +1562,7 @@ async fn authed_device_request(
 async fn set_session_model_validates_persists_and_clears() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -1618,7 +1643,7 @@ async fn set_session_model_validates_persists_and_clears() {
 async fn list_sessions_exposes_last_user_text_preview() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
     let http_config = ChannelsConfig::default();
-    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install channels");
 
     let state = build_admin_state(&tg);
     let router = build_router(state.clone());
@@ -1699,7 +1724,7 @@ async fn recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not()
     let operator = User {
         id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
         name: None,
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
     };
     let mut ids = Vec::new();
     for conversation in [true, false] {
@@ -1708,7 +1733,7 @@ async fn recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not()
             .session_manager
             .create_session_with_trigger(
                 operator.clone(),
-                ChannelType::http(),
+                ChannelType::owner(),
                 TriggerSource::Cron {
                     cron_job_id: "cj-test".into(),
                     origin_session_id: None,
@@ -1774,16 +1799,16 @@ async fn recurring_fire_conversations_are_listed_and_one_shot_sessions_are_not()
     .await;
 }
 
-// Channel kind sanity: every kind the boot path declares must match
-// the protocol invariant that http is `Subscribed`.
+// Channel kind sanity: the shared owner pool channel — the fan-out domain the
+// `http`/`device` surfaces both resolve to — must be `Subscribed`.
 #[test]
-fn http_channel_kind_is_subscribed() {
+fn owner_pool_channel_kind_is_subscribed() {
     let reg = Arc::new(baybo_channels::ChannelRegistry::new());
     let cfg = ChannelsConfig::default();
     boot::install_channels(&reg, &cfg).expect("install");
     let ch = reg
-        .get(&baybo_model::ChannelType::http())
-        .expect("http channel exists");
+        .get(&baybo_model::ChannelType::owner())
+        .expect("owner pool channel exists");
     assert_eq!(ch.kind(), ChannelKind::Subscribed);
 }
 
@@ -1815,7 +1840,7 @@ async fn channel_multi_attach_fans_out_to_all_subscribers() {
     }
 
     let channel = Arc::new(Channel::new(
-        ChannelType::http(),
+        ChannelType::owner(),
         ChannelKind::Subscribed,
         None,
     ));
@@ -1840,7 +1865,7 @@ async fn channel_multi_attach_fans_out_to_all_subscribers() {
     let outgoing = OutgoingMessage {
         session_id: "sess-shared".into(),
         user_id: "u1".into(),
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
         content: vec![baybo_model::ContentBlock::Text("hi".into())],
         reply_to: None,
         metadata: MessageMetadata::default(),
@@ -1856,7 +1881,7 @@ async fn channel_multi_attach_fans_out_to_all_subscribers() {
     channel.dispatch_agent(AgentOutput {
         session_id: "sess-shared".into(),
         user_id: "u1".into(),
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
         event: AgentEvent::AnswerDelta("chunk".into()),
     });
     assert_eq!(bucket_a.lock().len(), 2);
@@ -1866,7 +1891,7 @@ async fn channel_multi_attach_fans_out_to_all_subscribers() {
     channel.dispatch_agent(AgentOutput {
         session_id: "nobody-here".into(),
         user_id: String::new(),
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
         event: AgentEvent::Notice {
             level: baybo_channels::NoticeLevel::Info,
             text: "ignored".into(),
@@ -1901,7 +1926,7 @@ async fn a_cron_group_pin_rides_the_job_and_reads_unpinned_once_deleted() {
     let operator = User {
         id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
         name: None,
-        channel: ChannelType::http(),
+        channel: ChannelType::owner(),
     };
     // Deliberately UNTITLED: the list handler used to drop title-less jobs from
     // its map wholesale, which was harmless when the map only carried the title —
@@ -1911,7 +1936,7 @@ async fn a_cron_group_pin_rides_the_job_and_reads_unpinned_once_deleted() {
         .cron_scheduler
         .create_job(NewCronJob {
             user_id: operator.id.clone(),
-            channel: ChannelType::http(),
+            channel: ChannelType::owner(),
             title: String::new(),
             schedule: CronSchedule::Cron {
                 expr: "0 8 * * 1".into(),
@@ -1928,7 +1953,7 @@ async fn a_cron_group_pin_rides_the_job_and_reads_unpinned_once_deleted() {
         .session_manager
         .create_session_with_trigger(
             operator.clone(),
-            ChannelType::http(),
+            ChannelType::owner(),
             TriggerSource::Cron {
                 cron_job_id: job.id.clone(),
                 origin_session_id: None,
@@ -2003,12 +2028,12 @@ async fn a_cron_group_pin_rides_the_job_and_reads_unpinned_once_deleted() {
     );
 }
 
-/// The pin route is channel-scoped — `list_cron` (unfiltered, operator-only) was
-/// no precedent to copy. The `http` (web) and `device` (iOS) universes own
-/// disjoint session sets, and a job from the other universe must be
-/// indistinguishable from one that does not exist.
+/// The pin route is pool-scoped. The phone and the web tab are one owner pool,
+/// so a device CAN pin a job created on the web (including legacy `http` jobs).
+/// A job on a non-pool channel (`tui`) stays isolated — indistinguishable from
+/// one that does not exist, as is a genuinely-missing id.
 #[tokio::test]
-async fn a_cron_pin_cannot_reach_across_the_channel_universes() {
+async fn a_cron_pin_reaches_across_the_owner_pool_but_not_outside_it() {
     use baybo_cron::NewCronJob;
     use baybo_model::CronSchedule;
 
@@ -2019,33 +2044,70 @@ async fn a_cron_pin_cannot_reach_across_the_channel_universes() {
     let device_key = device_proto::delegation::generate_signing_key();
     let device_id = device_proto::delegation::device_id_for(&device_key.verifying_key());
 
-    // A job living in the WEB universe.
-    let job = tg
+    let mk = |channel: ChannelType, title: &str| NewCronJob {
+        user_id: baybo_gateway::auth::OWNER_USER_ID.into(),
+        channel,
+        title: title.into(),
+        schedule: CronSchedule::Cron {
+            expr: "0 8 * * *".into(),
+        },
+        prompt: "brief me".into(),
+        timezone: "UTC".into(),
+        origin_session_id: None,
+    };
+
+    // A legacy `http` job (same owner pool as the phone) and a private `tui` job.
+    let web_job = tg
         .deps
         .cron_scheduler
-        .create_job(NewCronJob {
-            user_id: baybo_gateway::auth::WEB_OPERATOR_USER_ID.into(),
-            channel: ChannelType::http(),
-            title: "Morning brief".into(),
-            schedule: CronSchedule::Cron {
-                expr: "0 8 * * *".into(),
-            },
-            prompt: "brief me".into(),
-            timezone: "UTC".into(),
-            origin_session_id: None,
-        })
+        .create_job(mk(ChannelType::owner(), "Morning brief"))
         .await
-        .expect("create cron job");
+        .expect("create web job");
+    let tui_job = tg
+        .deps
+        .cron_scheduler
+        .create_job(mk(ChannelType::tui(), "Terminal task"))
+        .await
+        .expect("create tui job");
 
     let router = build_admin_router_for_tests(&tg.deps);
 
-    // The phone must not be able to touch it — and must not learn it exists.
+    // The phone CAN pin the web-pool job — unified owner pool.
     let response = router
         .clone()
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/v1/cron/{}/pin", job.id))
+                .uri(format!("/v1/cron/{}/pin", web_job.id))
+                .header("authorization", format!("Bearer {}", tg.deps.admin_token))
+                .header(DEVICE_ID_HEADER, &device_id)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "pinned": true }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "a device must be able to pin a web-pool job",
+    );
+    let after = tg
+        .deps
+        .cron_scheduler
+        .get_job(&web_job.id)
+        .await
+        .expect("get job")
+        .expect("job exists");
+    assert!(after.pinned, "the cross-surface pin must have landed");
+
+    // The phone must NOT reach the `tui` job — indistinguishable from missing.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/v1/cron/{}/pin", tui_job.id))
                 .header("authorization", format!("Bearer {}", tg.deps.admin_token))
                 .header(DEVICE_ID_HEADER, &device_id)
                 .header("content-type", "application/json")
@@ -2057,24 +2119,18 @@ async fn a_cron_pin_cannot_reach_across_the_channel_universes() {
     assert_eq!(
         response.status(),
         StatusCode::NOT_FOUND,
-        "a device must not be able to pin a job from the web universe",
+        "a device must not pin a non-pool tui job",
     );
-
-    // And the pin really did not land.
-    let job_after = tg
+    let after = tg
         .deps
         .cron_scheduler
-        .get_job(&job.id)
+        .get_job(&tui_job.id)
         .await
         .expect("get job")
         .expect("job exists");
-    assert!(
-        !job_after.pinned,
-        "the rejected request must not have written"
-    );
+    assert!(!after.pinned, "the rejected request must not have written");
 
-    // An id that does not exist at all answers the same way — the web caller
-    // (who legitimately owns this universe) cannot tell "gone" from "not yours".
+    // A missing id answers the same way.
     let response = router
         .clone()
         .oneshot(

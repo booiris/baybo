@@ -1063,7 +1063,7 @@ mod tests {
             Arc::new(MemorySessionFolderStore::new()),
         );
         let session = mgr
-            .create_session(test_user(), ChannelType::http())
+            .create_session(test_user(), ChannelType::owner())
             .await
             .unwrap();
         let folder = mgr.create_folder(None, "Inbox".into()).await.unwrap();
@@ -1101,7 +1101,7 @@ mod tests {
             Arc::new(MemorySessionFolderStore::new()),
         );
         let session = mgr
-            .create_session(test_user(), ChannelType::http())
+            .create_session(test_user(), ChannelType::owner())
             .await
             .unwrap();
 

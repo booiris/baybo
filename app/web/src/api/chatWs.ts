@@ -357,7 +357,7 @@ export class ChatWs {
       content: input.content,
       session_id: input.sessionId,
       user_id: input.userId,
-      channel_type: input.channelType ?? 'http',
+      channel_type: input.channelType ?? 'owner',
       role: 'user',
       platform_msg_id: msgId,
       ...(input.attachments && input.attachments.length > 0
@@ -376,7 +376,7 @@ export class ChatWs {
   sendMessages(
     sessionId: string,
     messages: { content: string; clientMsgId: string; attachments?: WireAttachment[] }[],
-    channelType = 'http',
+    channelType = 'owner',
   ): void {
     if (messages.length === 0) return;
     this.sendFrame({
@@ -489,7 +489,7 @@ export class ChatWs {
     this.sendFrame({
       kind: 'register',
       token: '',
-      channel_type: 'http',
+      channel_type: 'owner',
     });
   }
 
