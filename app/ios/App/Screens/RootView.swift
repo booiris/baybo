@@ -43,6 +43,8 @@ struct RootView: View {
                                     ArchivedScreen()
                                 case .cronGroup(let jobId):
                                     CronGroupScreen(jobId: jobId)
+                                case .cronJobs:
+                                    CronJobsScreen()
                                 }
                             }
                             .toolbar(.hidden, for: .navigationBar)

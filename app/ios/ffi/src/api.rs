@@ -175,6 +175,57 @@ pub struct ChatSessionSummary {
     pub cron_group_pinned: bool,
 }
 
+/// One scheduled job, as the phone's cron list renders it — a read-only mirror
+/// of the gateway's `CronJob` DTO, minus what a list has no use for.
+///
+/// This is the JOB, not the **cron group** its fires collapse into: the group is
+/// a view over conversations that already happened (`docs/cron-groups.md`),
+/// while this is the schedule that produces them. A job with no fire yet has no
+/// group at all, and still belongs on this list — that is most of why the list
+/// exists.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CronJobSummary {
+    pub id: String,
+    /// Short human name — **empty** on a row minted before the field existed, in
+    /// which case clients fall back to the prompt. The fallback stays on the
+    /// client because it is presentation, and both other surfaces already make
+    /// the same choice.
+    pub title: String,
+    pub prompt: String,
+    pub schedule: CronScheduleSpec,
+    /// IANA zone the schedule is read in. Shown beside it: `0 9 * * *` means
+    /// nothing without knowing whose 9am.
+    pub timezone: String,
+    pub status: CronJobStatus,
+    /// RFC 3339. `None` when nothing is coming: a paused job, or a one-shot that
+    /// already ran.
+    pub next_trigger_at: Option<String>,
+    /// RFC 3339. `None` until the job first fires.
+    pub last_triggered_at: Option<String>,
+}
+
+/// When a job runs. The two kinds are not variants of one string — a recurring
+/// expression and an absolute instant are read differently by both a human and
+/// the renderer.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum CronScheduleSpec {
+    /// A cron expression, evaluated in the job's timezone.
+    Recurring { expr: String },
+    /// Fires once, at this RFC 3339 instant.
+    Once { time: String },
+}
+
+/// A live job's run state. Orthogonal to deletion — the list never carries a
+/// deleted job, so nothing here says anything about the recycle bin.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum CronJobStatus {
+    Enabled,
+    /// Paused by hand: it keeps its schedule but has no next trigger.
+    Disabled,
+    /// A one-shot that has already run. Terminal, and not a failure.
+    Executed,
+}
+
 /// Result of the per-send durability point lookup
 /// (`GET /v1/chat/sessions/{id}/messages?platform_msg_id=…`), consumed by the
 /// native outbox: `found: false` is a provable absence (the key was never

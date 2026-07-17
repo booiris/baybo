@@ -43,6 +43,10 @@ final class AppStore: ObservableObject {
         /// and `DisclosureGroup` nests rows inside one cell, which kills per-row
         /// `.swipeActions`. The Archived screen already established this shape.
         case cronGroup(String)
+        /// The owner's live scheduled JOBS — the schedules, not the fires. A
+        /// sibling of `archived`: same ☰ menu, same push, no argument (the list
+        /// fetches itself).
+        case cronJobs
     }
 
     /// A cron group's delete, waiting on the confirm dialog.
@@ -541,6 +545,13 @@ final class AppStore: ObservableObject {
         chatPath.append(.archived)
     }
 
+    /// The ☰ menu's second entry: push the live scheduled jobs. Guarded like
+    /// `openArchived`.
+    func openCronJobs() {
+        guard !chatPath.contains(.cronJobs) else { return }
+        chatPath.append(.cronJobs)
+    }
+
     /// Tapping a cron group row: push that job's fires. Guarded like `openArchived`.
     func openCronGroup(_ jobId: String) {
         guard !chatPath.contains(.cronGroup(jobId)) else { return }
@@ -565,6 +576,65 @@ final class AppStore: ObservableObject {
             await activateSession(sessionId, ensureListed: true, appendToPath: true)
         }
     }
+
+    /// Fetch the owner's live scheduled jobs for `CronJobsScreen`.
+    ///
+    /// Deliberately a plain async read that throws, not an optimistic mutation
+    /// through `SessionIndex`: there is nothing local to reconcile. The screen is
+    /// the only reader, it owns the result, and it renders the failure itself —
+    /// so this neither caches nor writes a `sessionNotice` (which belongs to the
+    /// chat list's own mutations and would surface a cron error on a screen the
+    /// user already left).
+    func loadCronJobs() async throws -> [CronJobSummary] {
+        #if DEBUG
+            if demoHomeMode { return Self.demoCronJobs() }
+        #endif
+        return try await Baybo.client.chatListCronJobs()
+    }
+
+    #if DEBUG
+        /// `-baybo-open-home`'s cron job fixture: the three states the row draws
+        /// differently — a live recurring job, a paused one, and a spent one-shot
+        /// with no title (the prompt fallback) — so the screen is screenshot- and
+        /// XCUITest-verifiable with no gateway.
+        ///
+        /// The live one is keyed to the seeded cron GROUP (`demo-job`), so tapping
+        /// it opens that job's two demo fires: the list → job → its history path
+        /// is the whole point of the tap, and this is what makes it drivable.
+        private static func demoCronJobs() -> [CronJobSummary] {
+            let iso = ISO8601DateFormatter()
+            let now = Date()
+            return [
+                CronJobSummary(
+                    id: "demo-job",
+                    title: "Morning brief",
+                    prompt: "Summarize overnight CI and the open PRs",
+                    schedule: .recurring(expr: "0 9 * * *"),
+                    timezone: "Asia/Shanghai",
+                    status: .enabled,
+                    nextTriggerAt: iso.string(from: now.addingTimeInterval(3 * 3600)),
+                    lastTriggeredAt: iso.string(from: now.addingTimeInterval(-21 * 3600))),
+                CronJobSummary(
+                    id: "demo-job-paused",
+                    title: "Weekly digest",
+                    prompt: "Round up the week",
+                    schedule: .recurring(expr: "0 18 * * FRI"),
+                    timezone: "UTC",
+                    status: .disabled,
+                    nextTriggerAt: nil,
+                    lastTriggeredAt: nil),
+                CronJobSummary(
+                    id: "demo-job-once",
+                    title: "",
+                    prompt: "Remind me to renew the TLS certificate",
+                    schedule: .once(time: "2026-07-20T10:00:00Z"),
+                    timezone: "UTC",
+                    status: .executed,
+                    nextTriggerAt: nil,
+                    lastTriggeredAt: "2026-07-20T10:00:00Z"),
+            ]
+        }
+    #endif
 
     /// Clear a cron group's badge in ONE round-trip: the gateway resolves each
     /// session's own tail ordinal, which the list does not have.

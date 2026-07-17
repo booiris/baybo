@@ -13,7 +13,8 @@ use baybo_model::ChannelType as ChannelTypeModel;
 
 use crate::api::admin::chat::{broadcast_session_list_stale, chat_list_channel};
 use crate::api::dto::{
-    CreateCronRequest, CronJob, ErrorBody, ListResponse, SetCronPinRequest, UpdateCronRequest,
+    ChannelType, CreateCronRequest, CronJob, ErrorBody, ListResponse, SetCronPinRequest,
+    UpdateCronRequest,
 };
 use crate::auth::AuthedClient;
 use crate::server::AdminState;
@@ -53,6 +54,16 @@ pub struct ListCronQuery {
     /// default list never carries a deleted job.
     #[serde(default)]
     pub deleted: bool,
+    /// Keep only the jobs on this channel. Omitted (the default) the route
+    /// stays the unfiltered operator view the admin dashboard wants — every
+    /// channel's jobs in one table.
+    ///
+    /// A chat client asks for `owner`: it is the one channel whose fires it can
+    /// open, and a `telegram` job's prompt is none of a phone's business. This
+    /// grants no reach the route did not already give (unfiltered means *all*);
+    /// it only lets a caller decline what it cannot use.
+    #[serde(default)]
+    pub channel: Option<ChannelType>,
 }
 
 #[utoipa::path(
@@ -61,7 +72,7 @@ pub struct ListCronQuery {
     tag = "cron",
     params(ListCronQuery),
     responses(
-        (status = 200, description = "Live cron jobs, or the recycle bin when `deleted=true`", body = inline(ListResponse<CronJob>)),
+        (status = 200, description = "Live cron jobs, or the recycle bin when `deleted=true`; filtered to one channel when `channel` is given", body = inline(ListResponse<CronJob>)),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 500, description = "Scheduler error", body = ErrorBody),
     )
@@ -76,7 +87,12 @@ async fn list_cron(
         state.cron_scheduler.list_all_jobs().await
     }
     .map_err(cron_err)?;
-    let items = jobs.into_iter().map(CronJob::from).collect();
+    let wanted: Option<ChannelTypeModel> = query.channel.map(Into::into);
+    let items = jobs
+        .into_iter()
+        .filter(|job| wanted.as_ref().is_none_or(|want| &job.channel == want))
+        .map(CronJob::from)
+        .collect();
     Ok(Json(ListResponse::new(items)))
 }
 

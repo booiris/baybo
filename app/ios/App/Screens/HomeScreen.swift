@@ -105,8 +105,11 @@ extension AppStore.HomeTab {
 struct HomeHeaderView: View {
     var notice: String? = nil
     var onCompose: (() -> Void)? = nil
-    /// Chats only: the ☰ menu's single entry — push the archived list.
+    /// Chats only: the ☰ menu's entries — push the archived list, and the live
+    /// scheduled jobs. The menu renders iff `onArchived` is set; both entries
+    /// belong to the same Chats-only surface.
     var onArchived: (() -> Void)? = nil
+    var onCronJobs: (() -> Void)? = nil
     /// Chats only: pull-to-refresh feedback rendered BESIDE the wordmark (as an
     /// overlay, so it never shifts it). Shown only while the refresh runs — after
     /// the pull rebounds — never during the drag.
@@ -135,6 +138,13 @@ struct HomeHeaderView: View {
                                 Label(
                                     Lang.shared.t("list.menuArchived"),
                                     systemImage: "archivebox")
+                            }
+                            if let onCronJobs {
+                                Button(action: onCronJobs) {
+                                    Label(
+                                        Lang.shared.t("list.menuCronJobs"),
+                                        systemImage: "alarm")
+                                }
                             }
                         } label: {
                             Image(systemName: "line.3.horizontal")

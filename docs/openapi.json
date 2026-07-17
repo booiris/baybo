@@ -1871,11 +1871,27 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "channel",
+            "in": "query",
+            "description": "Keep only the jobs on this channel. Omitted (the default) the route\nstays the unfiltered operator view the admin dashboard wants — every\nchannel's jobs in one table.\n\nA chat client asks for `owner`: it is the one channel whose fires it can\nopen, and a `telegram` job's prompt is none of a phone's business. This\ngrants no reach the route did not already give (unfiltered means *all*);\nit only lets a caller decline what it cannot use.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/ChannelType"
+                }
+              ]
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Live cron jobs, or the recycle bin when `deleted=true`",
+            "description": "Live cron jobs, or the recycle bin when `deleted=true`; filtered to one channel when `channel` is given",
             "content": {
               "application/json": {
                 "schema": {

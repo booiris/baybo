@@ -30,8 +30,8 @@ use crate::core::WireAttachment;
 
 pub use api::{
     ApnsEnvironment, ApprovalDecision, AttachmentKind, AttachmentRef, BayboError, BlobProgress,
-    ChatSessionSummary, ClientConfig, FrameSink, MessageLookup, PairAbortListener, PairChallenge,
-    PairTarget, PairedSummary, SessionListSink,
+    ChatSessionSummary, ClientConfig, CronJobStatus, CronJobSummary, CronScheduleSpec, FrameSink,
+    MessageLookup, PairAbortListener, PairChallenge, PairTarget, PairedSummary, SessionListSink,
 };
 use apns::ApnsState;
 use binding::{ActiveLeg, active_leg};
@@ -327,6 +327,24 @@ impl BayboClient {
                     gateway_api::hide_session(&client, session_id).await
                 }
                 ActiveLeg::Relay => gateway_api::hide_session(&relay::GatewayApi, session_id).await,
+            }
+        })
+        .await
+    }
+
+    /// The owner's live scheduled jobs, for the chat list's cron job screen.
+    ///
+    /// The JOBS, not their fires: a job that has never fired has no conversation
+    /// and no cron group, and this is the only place it is visible at all. Live
+    /// only and owner-scoped — see `gateway_api::list_cron_jobs`.
+    pub async fn chat_list_cron_jobs(self: Arc<Self>) -> Result<Vec<CronJobSummary>, BayboError> {
+        runtime::run(async move {
+            match active_leg()? {
+                ActiveLeg::Direct => {
+                    let client = self.direct.http_client()?;
+                    gateway_api::list_cron_jobs(&client).await
+                }
+                ActiveLeg::Relay => gateway_api::list_cron_jobs(&relay::GatewayApi).await,
             }
         })
         .await

@@ -3513,6 +3513,17 @@ export interface operations {
                  *     default list never carries a deleted job.
                  */
                 deleted?: boolean;
+                /**
+                 * @description Keep only the jobs on this channel. Omitted (the default) the route
+                 *     stays the unfiltered operator view the admin dashboard wants — every
+                 *     channel's jobs in one table.
+                 *
+                 *     A chat client asks for `owner`: it is the one channel whose fires it can
+                 *     open, and a `telegram` job's prompt is none of a phone's business. This
+                 *     grants no reach the route did not already give (unfiltered means *all*);
+                 *     it only lets a caller decline what it cannot use.
+                 */
+                channel?: null | components["schemas"]["ChannelType"];
             };
             header?: never;
             path?: never;
@@ -3520,7 +3531,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Live cron jobs, or the recycle bin when `deleted=true` */
+            /** @description Live cron jobs, or the recycle bin when `deleted=true`; filtered to one channel when `channel` is given */
             200: {
                 headers: {
                     [name: string]: unknown;

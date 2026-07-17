@@ -5,7 +5,7 @@ use std::future::Future;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::api::ChatSessionSummary;
+use crate::api::{ChatSessionSummary, CronJobStatus, CronJobSummary, CronScheduleSpec};
 
 const PATH_CHAT_SESSIONS: &str = "/v1/chat/sessions";
 const PATH_CRON: &str = "/v1/cron";
@@ -107,6 +107,47 @@ struct SessionSummary {
     /// into the one group row. Distinct from `pinned`, this row's own pin.
     #[serde(default)]
     cron_group_pinned: bool,
+}
+
+#[derive(Deserialize)]
+struct CronJobsList {
+    items: Vec<WireCronJob>,
+}
+
+/// The gateway's `CronJob` DTO, narrowed to what the phone's list reads. The
+/// fields it drops (`user_id`, `channel`, `created_at`, `updated_at`,
+/// `origin_session_id`, `pinned`, `deleted_at`) are either constant for this
+/// caller or another surface's concern; `deleted_at` in particular can never
+/// arrive, because the request asks for the live list.
+#[derive(Deserialize)]
+struct WireCronJob {
+    id: String,
+    /// Empty on rows minted before the field existed.
+    #[serde(default)]
+    title: String,
+    prompt: String,
+    schedule: WireCronSchedule,
+    timezone: String,
+    status: WireCronStatus,
+    #[serde(default)]
+    next_trigger_at: Option<String>,
+    #[serde(default)]
+    last_triggered_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireCronSchedule {
+    Cron { expr: String },
+    At { time: String },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireCronStatus {
+    Enabled,
+    Disabled,
+    Executed,
 }
 
 #[derive(Serialize)]
@@ -234,6 +275,48 @@ pub(crate) async fn list_sessions<C: GatewayJsonClient + Sync>(
             cron_job_id: s.cron_job_id,
             cron_job_title: s.cron_job_title,
             cron_group_pinned: s.cron_group_pinned,
+        })
+        .collect())
+}
+
+/// The owner's LIVE scheduled jobs, newest-first as the gateway ordered them
+/// (`GET /v1/cron?channel=owner`).
+///
+/// Two filters, both server-side, both deliberate:
+///
+/// - **live only** — the default. The recycle bin is a desktop affordance (it
+///   needs restore, which this read-only list does not offer), so a phone that
+///   listed deleted jobs could only tease them.
+/// - **`channel=owner`** — the one channel whose fires this app can open. The
+///   route is otherwise an unfiltered operator view spanning every channel, and
+///   a `telegram` job's prompt has no business crossing to a phone that can
+///   neither show its history nor act on it.
+pub(crate) async fn list_cron_jobs<C: GatewayJsonClient + Sync>(
+    client: &C,
+) -> Result<Vec<CronJobSummary>, String> {
+    // The same const the gateway compares against — this is one channel, named
+    // once, not a string the two sides each spell for themselves.
+    let path = format!("{PATH_CRON}?channel={}", baybo_model::ChannelType::OWNER);
+    let list: CronJobsList = client.get_json(&path).await?;
+    Ok(list
+        .items
+        .into_iter()
+        .map(|job| CronJobSummary {
+            id: job.id,
+            title: job.title,
+            prompt: job.prompt,
+            schedule: match job.schedule {
+                WireCronSchedule::Cron { expr } => CronScheduleSpec::Recurring { expr },
+                WireCronSchedule::At { time } => CronScheduleSpec::Once { time },
+            },
+            timezone: job.timezone,
+            status: match job.status {
+                WireCronStatus::Enabled => CronJobStatus::Enabled,
+                WireCronStatus::Disabled => CronJobStatus::Disabled,
+                WireCronStatus::Executed => CronJobStatus::Executed,
+            },
+            next_trigger_at: job.next_trigger_at,
+            last_triggered_at: job.last_triggered_at,
         })
         .collect())
 }
@@ -930,6 +1013,68 @@ mod tests {
                 body: r#"{"ordinal":7}"#.to_string(),
             }
         );
+    }
+
+    /// The request is the feature's whole scope contract: live (no `deleted`)
+    /// and `owner` only. A regression here is invisible in the UI until someone
+    /// else's Telegram job shows up in the list.
+    #[tokio::test]
+    async fn list_cron_jobs_asks_for_the_owner_channel_and_never_the_bin() {
+        let client = RecordingClient::new(r#"{"items":[]}"#);
+        let jobs = list_cron_jobs(&client).await.expect("list");
+
+        assert!(jobs.is_empty());
+        let call = client.only_call();
+        assert_eq!(call.method, "GET");
+        assert_eq!(call.path, "/v1/cron?channel=owner");
+        assert!(
+            !call.path.contains("deleted"),
+            "the phone must never ask for the recycle bin: {}",
+            call.path,
+        );
+    }
+
+    /// Both schedule kinds ride the same list — the user asked for every live
+    /// job, so a one-shot `at` job must not be dropped or mangled into an expr.
+    #[tokio::test]
+    async fn list_cron_jobs_maps_both_schedule_kinds_and_every_status() {
+        let client = RecordingClient::new(
+            r#"{"items":[
+                {"id":"j1","title":"Morning brief","prompt":"Summarize","schedule":{"kind":"cron","expr":"0 9 * * *"},"timezone":"Asia/Shanghai","status":"enabled","next_trigger_at":"2026-07-18T01:00:00Z","last_triggered_at":"2026-07-17T01:00:00Z"},
+                {"id":"j2","title":"","prompt":"One shot","schedule":{"kind":"at","time":"2026-07-20T10:00:00Z"},"timezone":"UTC","status":"executed"},
+                {"id":"j3","title":"Paused","prompt":"p","schedule":{"kind":"cron","expr":"@daily"},"timezone":"UTC","status":"disabled"}
+            ]}"#,
+        );
+        let jobs = list_cron_jobs(&client).await.expect("list");
+
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].title, "Morning brief");
+        assert_eq!(jobs[0].timezone, "Asia/Shanghai");
+        assert_eq!(jobs[0].status, CronJobStatus::Enabled);
+        assert_eq!(
+            jobs[0].next_trigger_at.as_deref(),
+            Some("2026-07-18T01:00:00Z")
+        );
+        assert_eq!(
+            jobs[0].last_triggered_at.as_deref(),
+            Some("2026-07-17T01:00:00Z")
+        );
+        assert!(
+            matches!(&jobs[0].schedule, CronScheduleSpec::Recurring { expr } if expr == "0 9 * * *"),
+        );
+
+        // A legacy row: no title, and the list falls back to the prompt — so the
+        // empty string must survive rather than becoming a `None` nobody checks.
+        assert_eq!(jobs[1].title, "");
+        assert_eq!(jobs[1].prompt, "One shot");
+        assert_eq!(jobs[1].status, CronJobStatus::Executed);
+        assert!(
+            matches!(&jobs[1].schedule, CronScheduleSpec::Once { time } if time == "2026-07-20T10:00:00Z"),
+        );
+        // A one-shot that ran, and a paused job, both have nothing coming.
+        assert_eq!(jobs[1].next_trigger_at, None);
+        assert_eq!(jobs[2].status, CronJobStatus::Disabled);
+        assert_eq!(jobs[2].next_trigger_at, None);
     }
 
     #[tokio::test]
