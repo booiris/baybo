@@ -227,16 +227,22 @@ describe("wireStepToWork — the subscribe_state shape", () => {
   });
 });
 
-describe("restStepToWork — the REST shape (tool_* names, no call id)", () => {
-  it("reads tool_label / tool_status / tool_summary", () => {
-    expect(restStepToWork({ kind: "tool", tool: "Bash", tool_label: "Bash(ls)", tool_status: "error", tool_summary: "exit 1" })).toEqual({
+describe("restStepToWork — the REST shape (tool_* names)", () => {
+  it("reads call_id / tool_label / tool_status / tool_summary", () => {
+    expect(
+      restStepToWork({ kind: "tool", call_id: "c1", tool: "Bash", tool_label: "Bash(ls)", tool_status: "error", tool_summary: "exit 1" }),
+    ).toEqual({
       kind: "tool",
-      callId: "",
+      callId: "c1",
       label: "Bash(ls)",
       status: "error",
       summary: "exit 1",
       approval: undefined,
     });
+  });
+
+  it("tolerates a row persisted before the gateway sent call_id", () => {
+    expect(restStepToWork({ kind: "tool", tool: "Bash" })).toMatchObject({ callId: "" });
   });
 
   it("defaults a reconstructed call to 'ok' — its call is closed by definition", () => {
@@ -320,12 +326,23 @@ describe("mergeWorkSteps", () => {
     expect(mergeWorkSteps(a, b)).toHaveLength(2);
   });
 
-  // The residual loss, stated: two id-less calls identical in label, status AND
-  // summary are indistinguishable here and still collapse. Far smaller than
-  // collapsing all of them; the real fix is a `call_id` on ChatWorkStep.
+  // The residual loss for a row that predates the gateway sending `call_id`:
+  // two id-less calls identical in label, status AND summary are
+  // indistinguishable and still collapse. Far smaller than collapsing all of
+  // them, and it cannot happen to a step the current gateway reconstructs.
   it("collapses two id-less steps identical in label, status and summary", () => {
     const step = tool({ callId: "", label: "Bash(ls)", status: "ok", summary: "out" });
     expect(mergeWorkSteps([step], [{ ...step }])).toHaveLength(1);
+  });
+
+  // Now that the REST shape carries `call_id`, a live block and its OWN
+  // reconstruction agree on identity. They meet on every sync that lands during
+  // a live turn (the REPLACE fuse, the difference merge) — keyed apart, every
+  // tool step in the card rendered twice.
+  it("collapses a live step against its own reconstruction instead of doubling it", () => {
+    const live: WorkStep[] = [tool({ callId: "call_a", label: "Bash(ls)", status: "running" })];
+    const recon: WorkStep[] = [tool({ callId: "call_a", label: "Bash(ls)", status: "ok", summary: "out" })];
+    expect(mergeWorkSteps(recon, live)).toEqual(recon);
   });
 });
 

@@ -69,6 +69,10 @@ export type WireWorkStepFrame = {
 export type RestWorkStep = {
   kind: "reasoning" | "prose" | "tool" | "status";
   text?: string;
+  /// The call's id — the same one the live `tool_started` / `tool_completed`
+  /// frames carry, so a reconstructed step has a real identity (see
+  /// `workStepKey`). Absent on a row persisted before the gateway sent it.
+  call_id?: string;
   tool?: string;
   tool_label?: string;
   tool_status?: string;

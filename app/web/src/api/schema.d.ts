@@ -1286,6 +1286,20 @@ export interface components {
              *     predates the field).
              */
             approval?: string | null;
+            /**
+             * @description The call's id, set when `kind == Tool` — the SAME id the live
+             *     `ToolStarted` / `ToolCompleted` frames carry.
+             *
+             *     This surface withheld it once, on the reasoning that only the live
+             *     client needs it (to pair a later `ToolCompleted`). But it is also the
+             *     step's IDENTITY, and a client folds reconstructed steps routinely — a
+             *     turn longer than one page reconstructs per-page, and the halves join
+             *     client-side. Without it every reconstructed call in a block looks alike,
+             *     so folding two halves silently drops all but the first, while folding a
+             *     live block with its own reconstruction double-renders every call.
+             *     `None` only for a call whose row predates this.
+             */
+            call_id?: string | null;
             kind: components["schemas"]["WorkStepKind"];
             /** @description Reasoning trace or mid-turn narration body. Empty for `tool` steps. */
             text?: string;

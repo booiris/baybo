@@ -79,14 +79,16 @@ export function wireStepToWork(s: WireWorkStepFrame): WorkStep {
 }
 
 /// Map a REST `ChatWorkStep` (the `work` transcript row's step — snake_case
-/// `tool_label` / `tool_status` / `tool_summary`, no `call_id`) onto a rendered
-/// WorkStep. A reconstructed step's tool call is already closed, so `status`
-/// falls back to "ok" when the persisted result didn't carry one.
+/// `tool_label` / `tool_status` / `tool_summary`) onto a rendered WorkStep. A
+/// reconstructed step's tool call is already closed, so `status` falls back to
+/// "ok" when the persisted result didn't carry one.
 export function restStepToWork(s: NonNullable<TranscriptRowItem["steps"]>[number]): WorkStep {
   if (s.kind === "tool") {
     return {
       kind: "tool",
-      callId: "",
+      // "" only for a row the gateway persisted before it sent `call_id`;
+      // `workStepKey` falls back to content-keying for those.
+      callId: s.call_id ?? "",
       label: s.tool_label || s.tool || "",
       status: s.tool_status ?? "ok",
       summary: s.tool_summary || undefined,
@@ -250,22 +252,21 @@ export function rowOrdinal(id: string): number | null {
 /// Identity of a work step for dedup when folding two representations of the
 /// same turn's block. Text steps key by kind + text.
 ///
-/// A tool step keys by its call id — but ONLY a live step has one. The REST
-/// shape (`ChatWorkStep`) drops `call_id`, so `restStepToWork` leaves it "",
-/// and keying those `tool:` collapsed EVERY reconstructed tool call in a block
-/// to one identity: folding two reconstructed blocks then kept the first tool
-/// step and silently deleted the rest. That is not hypothetical — a real
-/// 88-row turn lost 32 of its steps to it on every restore, because a turn
-/// longer than one sync page reconstructs as two blocks that land adjacent
-/// (`sanitizeRestoredRows` folds them) and both halves are REST-shaped.
+/// A tool step keys by its call id, which both shapes now carry.
 ///
-/// So an id-less step keys by what it DID. Distinct calls differ in their
-/// label (the command/URL), and near-always in their summary/status too; two
-/// calls identical in all three are indistinguishable here and still collapse,
-/// which is a far smaller loss than collapsing all of them. Never mixes with
-/// the id form (`tool!` vs `tool:`), so a live step and a REST step for the
-/// same call still fail to dedup — pre-existing, and the reason to give
-/// `ChatWorkStep` a `call_id` rather than lean on this.
+/// A row persisted before the gateway sent `call_id` on the REST shape has
+/// none, and keying those `tool:` collapsed EVERY reconstructed call in the
+/// block to one identity: folding two reconstructed halves of a turn kept the
+/// first tool step and silently deleted the rest (a real 88-row turn lost 32 of
+/// its steps to it on every restore), while folding a live block with its own
+/// reconstruction double-rendered every call.
+///
+/// So an id-less step keys by what it DID. Distinct calls differ in their label
+/// (the command/URL), and near-always in their summary/status too; two calls
+/// identical in all three are indistinguishable here and still collapse. This
+/// never mixes with the id form (`tool!` vs `tool:`) — an id-less step and an
+/// id-carrying one for the SAME call don't dedup, which is why the gateway
+/// sends the id rather than this being the answer.
 export function workStepKey(s: WorkStep): string {
   if (s.kind !== "tool") return `${s.kind}:${s.text}`;
   if (s.callId) return `tool:${s.callId}`;

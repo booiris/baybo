@@ -4499,6 +4499,13 @@
             ],
             "description": "Decision the call's approval prompt returned (`\"approve\"` /\n`\"approve_always\"` / `\"deny\"`), read from the persisted\n`ToolResultMeta`; `None` when the call never prompted (or the row\npredates the field)."
           },
+          "call_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The call's id, set when `kind == Tool` — the SAME id the live\n`ToolStarted` / `ToolCompleted` frames carry.\n\nThis surface withheld it once, on the reasoning that only the live\nclient needs it (to pair a later `ToolCompleted`). But it is also the\nstep's IDENTITY, and a client folds reconstructed steps routinely — a\nturn longer than one page reconstructs per-page, and the halves join\nclient-side. Without it every reconstructed call in a block looks alike,\nso folding two halves silently drops all but the first, while folding a\nlive block with its own reconstruction double-renders every call.\n`None` only for a call whose row predates this."
+          },
           "kind": {
             "$ref": "#/components/schemas/WorkStepKind"
           },

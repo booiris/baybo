@@ -426,6 +426,19 @@ pub struct ChatWorkStep {
     /// Reasoning trace or mid-turn narration body. Empty for `tool` steps.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
+    /// The call's id, set when `kind == Tool` — the SAME id the live
+    /// `ToolStarted` / `ToolCompleted` frames carry.
+    ///
+    /// This surface withheld it once, on the reasoning that only the live
+    /// client needs it (to pair a later `ToolCompleted`). But it is also the
+    /// step's IDENTITY, and a client folds reconstructed steps routinely — a
+    /// turn longer than one page reconstructs per-page, and the halves join
+    /// client-side. Without it every reconstructed call in a block looks alike,
+    /// so folding two halves silently drops all but the first, while folding a
+    /// live block with its own reconstruction double-renders every call.
+    /// `None` only for a call whose row predates this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     /// Tool name, set when `kind == Tool`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
@@ -461,6 +474,7 @@ impl ChatWorkStep {
         Self {
             kind: WorkStepKind::Reasoning,
             text,
+            call_id: None,
             tool: None,
             tool_label: None,
             tool_status: None,
@@ -473,6 +487,7 @@ impl ChatWorkStep {
         Self {
             kind: WorkStepKind::Prose,
             text,
+            call_id: None,
             tool: None,
             tool_label: None,
             tool_status: None,
@@ -485,6 +500,7 @@ impl ChatWorkStep {
         Self {
             kind: WorkStepKind::Status,
             text,
+            call_id: None,
             tool: None,
             tool_label: None,
             tool_status: None,
@@ -493,10 +509,11 @@ impl ChatWorkStep {
         }
     }
 
-    fn tool(tool: String, tool_label: Option<String>) -> Self {
+    fn tool(call_id: String, tool: String, tool_label: Option<String>) -> Self {
         Self {
             kind: WorkStepKind::Tool,
             text: String::new(),
+            call_id: Some(call_id),
             tool: Some(tool),
             tool_label,
             tool_status: None,
@@ -506,10 +523,10 @@ impl ChatWorkStep {
     }
 }
 
-/// Project the shared wire fold onto the REST shape. The REST surface drops
-/// the wire step's `call_id` (only the live client needs it, to pair a later
-/// `ToolCompleted`); `status` / `summary` map straight onto `tool_status` /
-/// `tool_summary` (both `None` while a tool is still running).
+/// Project the shared wire fold onto the REST shape. `call_id` carries across —
+/// it is the step's identity, not merely the live client's pairing key (see
+/// [`ChatWorkStep::call_id`]); `status` / `summary` map straight onto
+/// `tool_status` / `tool_summary` (both `None` while a tool is still running).
 impl From<WireWorkStep> for ChatWorkStep {
     fn from(step: WireWorkStep) -> Self {
         match step.kind {
@@ -519,6 +536,7 @@ impl From<WireWorkStep> for ChatWorkStep {
             WireWorkStepKind::Tool => Self {
                 kind: WorkStepKind::Tool,
                 text: String::new(),
+                call_id: step.call_id,
                 tool: step.tool,
                 tool_label: step.label,
                 tool_status: step.status,
@@ -2586,8 +2604,11 @@ fn reconstruct_transcript_with_attachments(
                             id, name, input, ..
                         } => {
                             work.pending_tools.insert(id.clone(), work.steps.len());
-                            work.steps
-                                .push(ChatWorkStep::tool(name.clone(), tool_label(input)));
+                            work.steps.push(ChatWorkStep::tool(
+                                id.clone(),
+                                name.clone(),
+                                tool_label(input),
+                            ));
                         }
                         _ => {}
                     }
@@ -3381,6 +3402,36 @@ mod tests {
         );
     }
 
+    /// A reconstructed tool step carries the SAME call id the live frames do.
+    /// It is the step's identity: without it every reconstructed call in a
+    /// block looks alike, so a client folding two reconstructions of one turn
+    /// (routine — a turn longer than a page reconstructs per-page) cannot tell
+    /// them apart, and one folding a live block with its own reconstruction
+    /// double-renders every call.
+    #[test]
+    fn reconstruct_tool_steps_carry_their_call_id() {
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![
+                    tool_use("call_a", "Bash", serde_json::json!({"command": "ls"})),
+                    tool_use("call_b", "Bash", serde_json::json!({"command": "pwd"})),
+                ]),
+            ),
+            (4, ts(6), ChatMessage::assistant(vec![text("done")])),
+        ];
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
+
+        let work = items
+            .iter()
+            .find(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .expect("work block");
+        let ids: Vec<_> = work.steps.iter().map(|s| s.call_id.as_deref()).collect();
+        assert_eq!(ids, vec![Some("call_a"), Some("call_b")], "{work:?}");
+    }
+
     #[test]
     fn reconstruct_folds_in_flight_steps_into_the_trailing_block() {
         // A turn still in its first iteration: only the user message persisted,
@@ -3390,7 +3441,7 @@ mod tests {
         let tail = vec![(2, ts(2), ChatMessage::user(vec![text("explain b-trees")]))];
         let in_flight = vec![
             ChatWorkStep::reasoning("weighing the options".into()),
-            ChatWorkStep::tool("Bash".into(), Some("ls".into())),
+            ChatWorkStep::tool("c1".into(), "Bash".into(), Some("ls".into())),
         ];
         let items = reconstruct_transcript(tail, Vec::new(), Some(ts(9)), in_flight);
 
