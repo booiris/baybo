@@ -73,11 +73,22 @@ describe("sanitizeRestoredRows — the four restore heals", () => {
     ];
     const out = sanitizeRestoredRows(rows) as WorkRow[];
     expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ id: "w1", active: true, startedAt: undefined, elapsedMs: undefined });
+    // Keeps the anchoring block's duration: dropping it is unrecoverable (the
+    // fold re-persists as one row, and a cursor past the block means no sync
+    // ever re-delivers it to re-time), and reads as "worked for a moment".
+    expect(out[0]).toMatchObject({ id: "w1", active: true, startedAt: undefined, elapsedMs: 1_000 });
     expect(out[0].steps).toEqual([
       { kind: "reasoning", text: "a" },
       { kind: "reasoning", text: "b" },
     ]);
+  });
+
+  it("falls back to the stranded half's duration when the anchoring block has none", () => {
+    const rows: Row[] = [
+      work({ id: "w1", steps: [{ kind: "reasoning", text: "a" }] }),
+      work({ id: "w2", steps: [{ kind: "status", text: "b" }], elapsedMs: 7_000 }),
+    ];
+    expect((sanitizeRestoredRows(rows)[0] as WorkRow).elapsedMs).toBe(7_000);
   });
 
   it("re-homes a durable progress block a prior build stranded BELOW its turn's answer", () => {

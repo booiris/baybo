@@ -414,12 +414,23 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
       // healthy turn always has a message between its block and the next, so
       // adjacency alone marks the tear, whether or not either half already
       // closed. Fold the whole run into one card, staying "working" if any piece
-      // was still live (a turn with no final reply must not read as "worked");
-      // the split's real duration was lost, so it stays untimed. Since the
-      // `withOpenWork` fold-into-frozen-tail invariant now prevents minting a
-      // fresh adjacency split, this only ever folds a LEGACY on-disk mirror
-      // written by a pre-fix build (it re-persists as one row, so it fires once
-      // per such session) — kept as defense-in-depth.
+      // was still live (a turn with no final reply must not read as "worked").
+      // Since the `openWorkIn` fold-into-frozen-tail invariant now prevents
+      // minting a fresh adjacency split, this only ever folds a LEGACY on-disk
+      // mirror written by a pre-fix build (it re-persists as one row, so it
+      // fires once per such session) — kept as defense-in-depth.
+      //
+      // KEEP the duration. `prev` anchors the turn, so its `elapsedMs` is the
+      // best number available: when the tear stranded a fragment beside a
+      // SERVER-reconstructed block (`w<ordinal>`, timed from
+      // work_started_at/work_ended_at) it is the whole turn's true span, and
+      // when two live halves tore apart it undercounts — still far better than
+      // dropping it, which reads as "worked for a moment" on a five-minute turn
+      // and is UNRECOVERABLE: the fold re-persists as one row, and a cursor
+      // already past the block means no sync or history page ever re-delivers
+      // it for `reconcileWork` to re-time. `startedAt` still goes, like every
+      // other restore path — a restored anchor would have a live ticker count
+      // all the app-closed hours.
       const prev = out[out.length - 1];
       if (prev && prev.role === "work") {
         out[out.length - 1] = {
@@ -427,7 +438,7 @@ export function sanitizeRestoredRows(rows: Row[] | undefined): Row[] {
           steps: mergeWorkSteps(prev.steps, r.steps),
           active: prev.active || r.active,
           startedAt: undefined,
-          elapsedMs: undefined,
+          elapsedMs: prev.elapsedMs ?? r.elapsedMs,
         };
       } else {
         // Heal a DIFFERENT persisted split: a durable progress block that a
