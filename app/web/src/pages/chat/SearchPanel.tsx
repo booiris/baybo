@@ -11,6 +11,7 @@ import { RiLoader4Line, RiSearchLine } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../../api/auth';
 import type { components } from '../../api/schema';
+import { snippet } from './searchSnippet';
 
 type Hit = components['schemas']['ChatSearchHit'];
 type Group = components['schemas']['ChatSearchGroup'];
@@ -21,9 +22,6 @@ const DEBOUNCE_MS = 200;
  *  noise — the index makes every Han codepoint its own token, so one character
  *  is a legitimate but useless query. */
 const MIN_QUERY_LEN = 2;
-/** Characters of prose either side of the match. Enough to recognise the
- *  moment, short enough that a result stays one glanceable card. */
-const SNIPPET_PAD = 60;
 
 type State =
   | { kind: 'idle' }
@@ -31,43 +29,24 @@ type State =
   | { kind: 'ok'; groups: Group[]; truncated: boolean }
   | { kind: 'failed'; message: string };
 
-/**
- * Locate `query` in `text` case-insensitively and cut a window around it.
- *
- * Substring is the right primitive, not a re-implementation of the query
- * grammar: a phrase of character-unigrams *is* the substring the user typed, so
- * what the index matched and what this finds agree. A Latin hit can still miss
- * here (the server widens `session` to `session*`, reaching `sessions`), so a
- * miss falls back to the head of the message rather than rendering nothing.
- */
-function snippet(text: string, query: string): { before: string; match: string; after: string } {
-  const at = text.toLowerCase().indexOf(query.toLowerCase());
-  if (at < 0) {
-    const head = text.slice(0, SNIPPET_PAD * 2);
-    return { before: head + (text.length > head.length ? '…' : ''), match: '', after: '' };
-  }
-  const from = Math.max(0, at - SNIPPET_PAD);
-  const to = Math.min(text.length, at + query.length + SNIPPET_PAD);
-  return {
-    before: (from > 0 ? '…' : '') + text.slice(from, at),
-    match: text.slice(at, at + query.length),
-    after: text.slice(at + query.length, to) + (to < text.length ? '…' : ''),
-  };
-}
-
 function timeLabel(iso: string): string {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? '' : d.toLocaleString();
 }
 
 function Excerpt({ hit, query }: { hit: Hit; query: string }) {
-  const { before, match, after } = snippet(hit.text, query);
   return (
     <div className="border-l-2 border-black/15 pl-2">
       <p className="text-[0.78rem] leading-snug break-words line-clamp-2">
-        {before}
-        {match ? <mark className="bg-brand/60 text-ink rounded-[2px]">{match}</mark> : null}
-        {after}
+        {snippet(hit.text, query).map((seg, i) =>
+          seg.match ? (
+            <mark key={i} className="bg-brand/60 text-ink rounded-[2px]">
+              {seg.text}
+            </mark>
+          ) : (
+            <span key={i}>{seg.text}</span>
+          ),
+        )}
       </p>
       <div className="flex items-center gap-2">
         <span className="text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
