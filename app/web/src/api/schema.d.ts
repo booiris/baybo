@@ -168,6 +168,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["search_messages"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions": {
         parameters: {
             query?: never;
@@ -987,6 +1003,58 @@ export interface components {
              * @description Ordinal of the newest persisted row carrying the key, when found.
              */
             ordinal?: number | null;
+        };
+        /** @description One conversation's matches, collapsed into a single result. */
+        ChatSearchGroup: {
+            /** @description Best-matching excerpts, best first, at most [`MAX_HITS_PER_SESSION`]. */
+            hits: components["schemas"]["ChatSearchHit"][];
+            session_id: string;
+            /** @description Conversation title, when one has been generated. */
+            session_title?: string | null;
+            /**
+             * @description Matches this conversation has in total — `hits.len()` when it is at or
+             *     under the per-conversation cap, more when it is over, so a client can say
+             *     "and 12 more" without another call. Exact unless `truncated`.
+             */
+            total_hits: number;
+        };
+        /** @description One matching message inside a [`ChatSearchGroup`]. */
+        ChatSearchHit: {
+            /** Format: date-time */
+            created_at: string;
+            /**
+             * Format: int64
+             * @description Position in the session's transcript. Carried so a future jump-to-message
+             *     has an address; today's UI opens the session and does not use it.
+             */
+            ordinal: number;
+            role: string;
+            /**
+             * Format: int64
+             * @description Set when compaction replaced this row in the active transcript, to the
+             *     ordinal that replaced it. The chat view renders only live rows, so such a
+             *     hit exists in history but not on screen: clients label it, and a
+             *     jump-to-message navigates here rather than to `ordinal`, which is not on
+             *     screen to navigate to. Carried as the ordinal rather than a bool so that
+             *     remains possible without another round trip.
+             */
+            superseded_by?: number | null;
+            /**
+             * @description The ORIGINAL prose, not the segmented index text. Clients highlight by
+             *     substring: a phrase of unigrams matches exactly the substring typed, so a
+             *     client-side match agrees with what the index matched.
+             */
+            text: string;
+        };
+        ChatSearchResults: {
+            /** @description Conversations, best match first. A conversation's rank is its best hit's. */
+            groups: components["schemas"]["ChatSearchGroup"][];
+            /**
+             * @description True when the query matched more than the scan window, so some
+             *     conversations are missing and `total_hits` undercounts. There is no
+             *     cursor: a search box refines the query, it does not page.
+             */
+            truncated: boolean;
         };
         /** @description Response from `POST /v1/chat/sessions`. */
         ChatSessionCreated: {
@@ -2644,6 +2712,69 @@ export interface operations {
             };
             /** @description Folder not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    search_messages: {
+        parameters: {
+            query: {
+                /**
+                 * @description What the user typed, verbatim. FTS5 syntax is NOT accepted: the store
+                 *     quotes the whole thing into a literal phrase, so `-`, `*`, `NEAR` and
+                 *     friends match themselves rather than meaning anything.
+                 */
+                q: string;
+                /**
+                 * @description Restrict to one conversation — "find it in *this* chat". Omit to search
+                 *     across all of them. Composes with the other filters rather than
+                 *     overriding them: naming a hidden session still needs `include_hidden`.
+                 */
+                session_id?: string | null;
+                /**
+                 * @description Include sessions the user hid from their chat list. Defaults to false —
+                 *     on real data roughly half of a chat search's hits sit in hidden
+                 *     sessions, and resurfacing them is the opposite of what hiding meant.
+                 */
+                include_hidden?: boolean;
+                include_archived?: boolean;
+                /**
+                 * @description Maximum **conversations** to return, not messages. Defaults to
+                 *     [`DEFAULT_SEARCH_LIMIT`], clamped to [`MAX_SEARCH_LIMIT`].
+                 */
+                limit?: number | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Matching messages, best first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatSearchResults"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Search failed */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

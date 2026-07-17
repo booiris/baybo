@@ -67,6 +67,7 @@ async fn router_with_reloader(
         cron_scheduler: Arc::clone(&tg.deps.cron_scheduler),
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
+        message_search: tg.deps.stores.message_search.clone(),
         query_api: Arc::new(baybo_query::QueryApi::new(
             tg.deps.session_manager.store(),
             Arc::clone(&tg.deps.job_lifecycle),
@@ -397,6 +398,7 @@ async fn get_usage_aggregates_by_model() {
         cron_scheduler: Arc::clone(&tg.deps.cron_scheduler),
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
+        message_search: tg.deps.stores.message_search.clone(),
         query_api: Arc::new(baybo_query::QueryApi::new(
             tg.deps.session_manager.store(),
             Arc::clone(&tg.deps.job_lifecycle),

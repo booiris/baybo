@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import {
   RiAddLine,
   RiChat1Line,
+  RiCloseLine,
   RiDeleteBin6Line,
   RiLoader4Line,
   RiPushpin2Fill,
@@ -13,6 +14,7 @@ import {
   RiFolderAddLine,
   RiFolder3Line,
   RiFolderOpenLine,
+  RiSearchLine,
   RiTimeLine,
 } from 'react-icons/ri';
 import {
@@ -40,7 +42,14 @@ import type { Folder, SessionSummary } from './types';
 import { useQueueCounts } from './queueStore';
 import { useFolders, useFolderStore } from './folderStore';
 import { ChatContextMenu, FolderContextMenu } from './FolderContextMenu';
-import { bucketSessions, cronCollapseKey, cronGroupUnread, type CronGroup } from './sessionBuckets';
+import {
+  bucketSessions,
+  cronCollapseKey,
+  cronGroupUnread,
+  resolveCollapsed,
+  type CronGroup,
+} from './sessionBuckets';
+import { SearchPanel } from './SearchPanel';
 
 // Chat zone 2: the session list sidebar (the global icon rail is zone 1, the
 // thread + floating composer is zone 3). A newest-first conversation list of
@@ -580,6 +589,12 @@ export function SessionSidebar({
   const queueCounts = useQueueCounts();
   const { folders, collapsed } = useFolders();
   const { toggleCollapse, ensureExpanded } = useFolderStore();
+  const navigate = useNavigate();
+
+  // Sidebar-local: nothing above needs to know the sidebar is in search mode,
+  // and the tree's state survives untouched underneath it.
+  const [search, setSearch] = useState('');
+  const searching = search.trim().length > 0;
 
   // ── Buckets ────────────────────────────────────────────────────────────
   // Pinned chats are lifted out of the tree entirely. Cron fires collapse into
@@ -789,7 +804,7 @@ export function SessionSidebar({
 
   const renderFolderSubtree = useCallback(
     (folder: Folder, depth: number): ReactNode => {
-      const isCollapsed = collapsed.has(folder.id);
+      const folderCollapsed = resolveCollapsed(collapsed, folder.id);
       const directChats = chatsByFolder.get(folder.id) ?? [];
       const subFolders = depth + 1 < MAX_DEPTH ? (childFolders.get(folder.id) ?? []) : [];
       return (
@@ -797,7 +812,7 @@ export function SessionSidebar({
           <FolderHeader
             folder={folder}
             depth={depth}
-            collapsed={isCollapsed}
+            collapsed={folderCollapsed}
             renaming={renamingId === folder.id}
             renameDraft={renameDraft}
             onRenameDraft={setRenameDraft}
@@ -806,7 +821,7 @@ export function SessionSidebar({
             onToggle={() => toggleCollapse(folder.id)}
             onContextMenu={openFolderMenu}
           />
-          {!isCollapsed ? (
+          {!folderCollapsed ? (
             <div className="flex flex-col gap-0.5">
               {/* Sub-folders first, then the folder's loose chats. */}
               {subFolders.map((sf) => renderFolderSubtree(sf, depth + 1))}
@@ -860,7 +875,7 @@ export function SessionSidebar({
 
   return (
     <aside className="w-[260px] border-r-2 border-black flex flex-col bg-canvas shrink-0">
-      <div className="px-3 py-3 border-b-2 border-black">
+      <div className="px-3 py-3 border-b-2 border-black flex flex-col gap-2">
         <button
           type="button"
           onClick={onNewChat}
@@ -870,9 +885,45 @@ export function SessionSidebar({
           <RiAddLine className="text-lg" />
           New chat
         </button>
+        <div className="relative">
+          <RiSearchLine className="absolute left-2 top-1/2 -translate-y-1/2 text-ink-soft pointer-events-none" />
+          {/* `type="text"`, not `"search"`: webkit paints its own clear button
+              inside a search input, which would sit next to ours. The native one
+              can't be styled to match and doesn't fire our Escape handling. */}
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') setSearch('');
+            }}
+            placeholder="Search messages"
+            aria-label="Search messages"
+            className="w-full pl-8 pr-7 py-1.5 bg-white border-2 border-black rounded-md text-[0.8rem] font-mono placeholder:text-ink-soft focus:outline-none focus:shadow-brutal-sm"
+          />
+          {search.length > 0 ? (
+            <button
+              type="button"
+              onClick={() => setSearch('')}
+              aria-label="Clear search"
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 text-ink-soft hover:text-ink cursor-pointer"
+            >
+              <RiCloseLine />
+            </button>
+          ) : null}
+        </div>
       </div>
       <nav className="flex-1 overflow-auto px-2 py-2 flex flex-col gap-1">
-        {loading ? (
+        {searching ? (
+          // Search replaces the tree rather than filtering it: results are a
+          // flat, cross-session, relevance-ordered list, and folders/pin/drag
+          // are meaningless over them. Clearing the box restores the tree.
+          <SearchPanel
+            query={search}
+            activeSessionId={activeSessionId}
+            onOpen={(id) => navigate(`/chat/${id}`)}
+          />
+        ) : loading ? (
           <div className="flex justify-center py-6 text-ink-soft">
             <RiLoader4Line className="text-2xl animate-spin" />
           </div>
@@ -940,17 +991,17 @@ export function SessionSidebar({
                   read. */}
               {cronGroups.map((group) => {
                 const key = cronCollapseKey(group.jobId);
-                const isCollapsed = collapsed.has(key);
+                const groupCollapsed = resolveCollapsed(collapsed, key);
                 return (
                   <div key={key} className="flex flex-col">
                     <CronGroupHeader
                       group={group}
-                      collapsed={isCollapsed}
+                      collapsed={groupCollapsed}
                       unread={cronGroupUnread(group)}
                       onToggle={() => toggleCollapse(key)}
                       onTogglePin={onToggleCronPin}
                     />
-                    {!isCollapsed ? (
+                    {!groupCollapsed ? (
                       <div className="flex flex-col gap-0.5">
                         {group.sessions.map((s) => renderChatRow(s, 1))}
                       </div>

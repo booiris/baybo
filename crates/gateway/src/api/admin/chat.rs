@@ -53,6 +53,7 @@ use baybo_model::{
     TriggerSource, User,
 };
 use baybo_session::SessionError;
+use baybo_store::SearchScope;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -69,6 +70,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     OpenApiRouter::new()
         .routes(routes!(create_session))
         .routes(routes!(list_sessions))
+        .routes(routes!(search_messages))
         .routes(routes!(get_session))
         .routes(routes!(sync_session))
         .routes(routes!(lookup_session_message))
@@ -107,6 +109,98 @@ pub struct ListSessionsQuery {
     /// escape hatch, not a chat-sidebar affordance.
     #[serde(default)]
     pub include_cron: bool,
+}
+
+/// Query string for `GET /v1/chat/search`.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct SearchMessagesQuery {
+    /// What the user typed, verbatim. FTS5 syntax is NOT accepted: the store
+    /// quotes the whole thing into a literal phrase, so `-`, `*`, `NEAR` and
+    /// friends match themselves rather than meaning anything.
+    pub q: String,
+    /// Restrict to one conversation — "find it in *this* chat". Omit to search
+    /// across all of them. Composes with the other filters rather than
+    /// overriding them: naming a hidden session still needs `include_hidden`.
+    pub session_id: Option<String>,
+    /// Include sessions the user hid from their chat list. Defaults to false —
+    /// on real data roughly half of a chat search's hits sit in hidden
+    /// sessions, and resurfacing them is the opposite of what hiding meant.
+    #[serde(default)]
+    pub include_hidden: bool,
+    #[serde(default)]
+    pub include_archived: bool,
+    /// Maximum **conversations** to return, not messages. Defaults to
+    /// [`DEFAULT_SEARCH_LIMIT`], clamped to [`MAX_SEARCH_LIMIT`].
+    pub limit: Option<usize>,
+}
+
+/// Enough conversations to fill a results panel without scrolling into a second
+/// page.
+pub const DEFAULT_SEARCH_LIMIT: usize = 20;
+pub const MAX_SEARCH_LIMIT: usize = 50;
+
+/// Raw hits pulled from the index before grouping.
+///
+/// Grouping has to happen over a window wider than the response, or one chatty
+/// conversation buries every other. Measured on real data, `codex` matches 47
+/// times across 17 conversations — but a flat top-30 covers only 7 of them,
+/// because a single conversation takes 15 of the 30 slots. Client-side grouping
+/// cannot fix that: the other 10 conversations were never sent.
+///
+/// Scanning wide is nearly free. Query cost tracks the number of MATCHES, not
+/// the limit — `ORDER BY bm25` scores every hit before it drops any — so this
+/// bounds the rows carried back through the trait, not the work sqlite does.
+const SEARCH_SCAN_LIMIT: usize = 300;
+
+/// Excerpts shown per conversation. Past a few, a result card stops being
+/// glanceable and the conversation is better opened than previewed.
+const MAX_HITS_PER_SESSION: usize = 3;
+
+/// One matching message inside a [`ChatSearchGroup`].
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatSearchHit {
+    /// Position in the session's transcript. Carried so a future jump-to-message
+    /// has an address; today's UI opens the session and does not use it.
+    pub ordinal: i64,
+    pub role: String,
+    /// The ORIGINAL prose, not the segmented index text. Clients highlight by
+    /// substring: a phrase of unigrams matches exactly the substring typed, so a
+    /// client-side match agrees with what the index matched.
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+    /// Set when compaction replaced this row in the active transcript, to the
+    /// ordinal that replaced it. The chat view renders only live rows, so such a
+    /// hit exists in history but not on screen: clients label it, and a
+    /// jump-to-message navigates here rather than to `ordinal`, which is not on
+    /// screen to navigate to. Carried as the ordinal rather than a bool so that
+    /// remains possible without another round trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<i64>,
+}
+
+/// One conversation's matches, collapsed into a single result.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatSearchGroup {
+    pub session_id: String,
+    /// Conversation title, when one has been generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_title: Option<String>,
+    /// Best-matching excerpts, best first, at most [`MAX_HITS_PER_SESSION`].
+    pub hits: Vec<ChatSearchHit>,
+    /// Matches this conversation has in total — `hits.len()` when it is at or
+    /// under the per-conversation cap, more when it is over, so a client can say
+    /// "and 12 more" without another call. Exact unless `truncated`.
+    pub total_hits: usize,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatSearchResults {
+    /// Conversations, best match first. A conversation's rank is its best hit's.
+    pub groups: Vec<ChatSearchGroup>,
+    /// True when the query matched more than the scan window, so some
+    /// conversations are missing and `total_hits` undercounts. There is no
+    /// cursor: a search box refines the query, it does not page.
+    pub truncated: bool,
 }
 
 /// Default page size for reverse transcript pagination — large enough
@@ -738,6 +832,109 @@ async fn create_session(
     Ok(Json(ChatSessionCreated {
         session_id: session_id.to_string(),
     }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/chat/search",
+    tag = "chat",
+    params(SearchMessagesQuery),
+    responses(
+        (status = 200, description = "Matching messages, best first", body = ChatSearchResults),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 500, description = "Search failed", body = ErrorBody),
+    )
+)]
+async fn search_messages(
+    State(state): State<AdminState>,
+    Query(query): Query<SearchMessagesQuery>,
+    authed: Option<Extension<AuthedClient>>,
+) -> Result<Json<ChatSearchResults>> {
+    // Scoped to the caller's chat channel like every other chat route, which
+    // also keeps a subagent's own run (channel `subagent`) out of a chat search
+    // — its session is not one this UI can open. See `docs/search.md`.
+    let channel = chat_list_channel(authed.as_ref().map(|ext| &ext.0));
+    let scope = SearchScope {
+        channel: Some(channel),
+        session: query.session_id.clone().map(SessionId::from),
+        include_hidden: query.include_hidden,
+        include_archived: query.include_archived,
+    };
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .min(MAX_SEARCH_LIMIT);
+    let hits = state
+        .message_search
+        .search_messages(&query.q, &scope, SEARCH_SCAN_LIMIT as u32)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("search messages: {e}")))?;
+    let truncated = hits.len() == SEARCH_SCAN_LIMIT;
+
+    // Hits arrive sorted by bm25, so first-seen order IS relevance order: a
+    // conversation ranks by its best hit, which falls out of pushing each hit
+    // onto its group in arrival order. Nothing re-sorts.
+    let mut order: Vec<String> = Vec::new();
+    let mut grouped: std::collections::HashMap<String, ChatSearchGroup> =
+        std::collections::HashMap::new();
+    for hit in hits {
+        let sid = hit.session_id.as_str().to_owned();
+        let group = grouped.entry(sid.clone()).or_insert_with(|| {
+            order.push(sid.clone());
+            ChatSearchGroup {
+                session_id: sid,
+                session_title: None,
+                hits: Vec::new(),
+                total_hits: 0,
+            }
+        });
+        group.total_hits += 1;
+        // Count every match but carry only the best few: `total_hits` is what
+        // lets a client say "and 12 more" without a second call.
+        if group.hits.len() == MAX_HITS_PER_SESSION {
+            continue;
+        }
+        let text = hit
+            .message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        group.hits.push(ChatSearchHit {
+            ordinal: hit.ordinal,
+            role: hit.message.role.as_str().to_owned(),
+            text,
+            created_at: hit.created_at,
+            superseded_by: hit.superseded_by,
+        });
+    }
+
+    // Titles are fetched AFTER the cut, so the scan window's width costs no
+    // extra lookups. Point lookups rather than `list_by_channel`: that scans
+    // every session and json-decodes every blob (the channel lives inside `data`
+    // and is unindexed), and a debounced search box fires per keystroke burst
+    // where the sidebar refreshes once.
+    let mut groups = Vec::with_capacity(order.len().min(limit));
+    for sid in order.into_iter().take(limit) {
+        let Some(mut group) = grouped.remove(&sid) else {
+            continue;
+        };
+        // A title this build cannot load is a missing subtitle, not a failed
+        // search: degrade to `None` rather than 500 the whole result set.
+        group.session_title = state
+            .session_manager
+            .get(&SessionId::from(sid))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.title);
+        groups.push(group);
+    }
+    Ok(Json(ChatSearchResults { groups, truncated }))
 }
 
 #[utoipa::path(

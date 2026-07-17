@@ -320,9 +320,10 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
         let Some(expr) = build_match(query) else {
             return Ok(Vec::new());
         };
-        // `None` means every channel. Binding NULL and testing it in SQL keeps
-        // one prepared statement instead of two spellings of the same query.
+        // `None` means unrestricted. Binding NULL and testing it in SQL keeps
+        // one prepared statement instead of four spellings of the same query.
         let channel = scope.channel.as_ref().map(|c| c.0.clone());
+        let session = scope.session.as_ref().map(|s| s.as_str().to_owned());
         let include_hidden = scope.include_hidden;
         let include_archived = scope.include_archived;
         self.pool
@@ -361,17 +362,24 @@ impl baybo_store::MessageSearchStore for SqliteMessageSearchStore {
                          LEFT JOIN sessions s ON s.id = x.session_id \
                          WHERE message_fts MATCH ?1 \
                            AND (?2 IS NULL OR x.channel = ?2) \
-                           AND (?3 OR COALESCE(s.hidden, 0) = 0) \
-                           AND (?4 OR COALESCE(s.archived, 0) = 0) \
+                           AND (?3 IS NULL OR x.session_id = ?3) \
+                           AND (?4 OR COALESCE(s.hidden, 0) = 0) \
+                           AND (?5 OR COALESCE(s.archived, 0) = 0) \
                          ORDER BY score \
-                         LIMIT ?5 \
+                         LIMIT ?6 \
                      ) f \
                      JOIN session_messages m \
                        ON m.session_id = f.session_id AND m.ordinal = f.ordinal \
                      ORDER BY f.score",
                 )?;
-                let params =
-                    rusqlite::params![expr, channel, include_hidden, include_archived, limit];
+                let params = rusqlite::params![
+                    expr,
+                    channel,
+                    session,
+                    include_hidden,
+                    include_archived,
+                    limit
+                ];
                 let rows = stmt.query_map(params, |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -723,6 +731,50 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id.as_str(), "sub-1");
+    }
+
+    /// "Find it in *this* chat" — and the session filter composes with the
+    /// others rather than overriding them.
+    #[tokio::test]
+    async fn session_scopes_search_to_one_conversation() {
+        let pool = super::super::SqlitePool::open_in_memory().await.unwrap();
+        let sessions = super::super::SqliteSessionStore::new(pool.clone());
+        for (id, text) in [("a", "第一个会话里的检索"), ("b", "第二个会话里的检索")]
+        {
+            sessions
+                .append_session_message(
+                    &SessionId::from(id.to_string()),
+                    &ChatMessage::user(vec![ContentBlock::Text(text.into())]),
+                )
+                .await
+                .unwrap();
+        }
+        let store = SqliteMessageSearchStore::new(pool);
+        let only = |id: &str| SearchScope {
+            session: Some(SessionId::from(id.to_string())),
+            ..SearchScope::default()
+        };
+
+        assert_eq!(
+            store
+                .search_messages("检索", &SearchScope::default(), 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        let hits = store.search_messages("检索", &only("a"), 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id.as_str(), "a");
+        assert_eq!(
+            store
+                .search_messages("第二个", &only("a"), 10)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "a term that exists only in another session must not leak in"
+        );
     }
 
     /// `hidden` is the user saying "remove this from my list", and it is joined

@@ -43,6 +43,14 @@ pub struct SearchScope {
     /// `None` reaches every channel, including a subagent's own run
     /// (`SUBAGENT_CHANNEL_TAG`) and every bot channel.
     pub channel: Option<ChannelType>,
+    /// Restrict to one conversation — "find it in *this* chat". `None` searches
+    /// across all of them.
+    ///
+    /// Composes with, rather than overrides, the other filters: a session that
+    /// fails them still matches nothing. Naming a hidden session therefore needs
+    /// `include_hidden` too, which is the honest reading — the caller asked for
+    /// a session, not for the hidden rule to lapse.
+    pub session: Option<SessionId>,
     /// `hidden` is the user's "remove this from my list". A quarter of a real
     /// index sits in hidden sessions, so defaulting this on would quietly
     /// resurface what they asked to lose.

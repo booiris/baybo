@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { bucketSessions, cronCollapseKey, cronGroupUnread } from './sessionBuckets';
+import {
+  bucketSessions,
+  collapsedByDefault,
+  cronCollapseKey,
+  cronGroupUnread,
+  resolveCollapsed,
+} from './sessionBuckets';
 import type { SessionSummary } from './types';
 
 const JOB_A = 'job-a';
@@ -170,3 +176,27 @@ describe('cron group pin', () => {
     expect(cronGroups[0].sessions.map((s) => s.session_id)).toEqual(['a2']);
   });
 });
+
+describe('collapse defaults', () => {
+  // The stored set records the DEVIATION from each kind's default, so the same
+  // membership means opposite things for the two kinds. If this ever reads as
+  // "the set of collapsed things", the cron default silently flips back.
+  it('collapses cron groups by default and expands folders by default', () => {
+    const none = new Set<string>();
+    expect(resolveCollapsed(none, cronCollapseKey('job-a'))).toBe(true);
+    expect(resolveCollapsed(none, 'folder-1')).toBe(false);
+  });
+
+  it('treats membership as the deviation, not the state', () => {
+    const deviating = new Set([cronCollapseKey('job-a'), 'folder-1']);
+    expect(resolveCollapsed(deviating, cronCollapseKey('job-a'))).toBe(false);
+    expect(resolveCollapsed(deviating, 'folder-1')).toBe(true);
+  });
+
+  it('classifies by the cron key prefix, not by lookup', () => {
+    expect(collapsedByDefault(cronCollapseKey('job-a'))).toBe(true);
+    expect(collapsedByDefault('folder-1')).toBe(false);
+    // A folder id that merely contains the word must not be mistaken for one.
+    expect(collapsedByDefault('my-cron-folder')).toBe(false);
+  });
+})
