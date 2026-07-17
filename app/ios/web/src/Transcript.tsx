@@ -248,10 +248,30 @@ export function rowOrdinal(id: string): number | null {
 }
 
 /// Identity of a work step for dedup when folding two representations of the
-/// same turn's block: a tool step is keyed by its call id (stable across the
-/// live vs reconstructed shapes); text steps by kind + text.
+/// same turn's block. Text steps key by kind + text.
+///
+/// A tool step keys by its call id — but ONLY a live step has one. The REST
+/// shape (`ChatWorkStep`) drops `call_id`, so `restStepToWork` leaves it "",
+/// and keying those `tool:` collapsed EVERY reconstructed tool call in a block
+/// to one identity: folding two reconstructed blocks then kept the first tool
+/// step and silently deleted the rest. That is not hypothetical — a real
+/// 88-row turn lost 32 of its steps to it on every restore, because a turn
+/// longer than one sync page reconstructs as two blocks that land adjacent
+/// (`sanitizeRestoredRows` folds them) and both halves are REST-shaped.
+///
+/// So an id-less step keys by what it DID. Distinct calls differ in their
+/// label (the command/URL), and near-always in their summary/status too; two
+/// calls identical in all three are indistinguishable here and still collapse,
+/// which is a far smaller loss than collapsing all of them. Never mixes with
+/// the id form (`tool!` vs `tool:`), so a live step and a REST step for the
+/// same call still fail to dedup — pre-existing, and the reason to give
+/// `ChatWorkStep` a `call_id` rather than lean on this.
 export function workStepKey(s: WorkStep): string {
-  return s.kind === "tool" ? `tool:${s.callId}` : `${s.kind}:${s.text}`;
+  if (s.kind !== "tool") return `${s.kind}:${s.text}`;
+  if (s.callId) return `tool:${s.callId}`;
+  // A NUL separator, so a field containing the separator cannot forge
+  // another field's boundary ("a b" + "c" vs "a" + "b c").
+  return ["tool!", s.label, s.status, s.summary ?? ""].join("\u0000");
 }
 
 /// Concatenate two work blocks' steps WITHOUT duplicating shared ones — so

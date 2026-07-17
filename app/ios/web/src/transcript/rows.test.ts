@@ -291,6 +291,41 @@ describe("mergeWorkSteps", () => {
     const b: WorkStep[] = [tool({ callId: "c1", label: "Bash(ls -la)" })];
     expect(mergeWorkSteps(a, b)).toHaveLength(1);
   });
+
+  // A reconstructed step has NO call id (ChatWorkStep drops it), so keying those
+  // `tool:` collapsed every one of them to a single identity — folding two
+  // reconstructed halves kept the first tool step and deleted the rest. A real
+  // 88-row turn lost 32 steps to this on every restore.
+  it("keeps every id-less tool step when folding two reconstructed halves", () => {
+    const a: WorkStep[] = [
+      tool({ callId: "", label: "Now", status: "ok", summary: "12:00" }),
+      tool({ callId: "", label: "Fetch(a)", status: "error", summary: "404" }),
+    ];
+    const b: WorkStep[] = [
+      tool({ callId: "", label: "Fetch(b)", status: "ok", summary: "body" }),
+      tool({ callId: "", label: "Bash(ls)", status: "ok", summary: "out" }),
+    ];
+    expect(mergeWorkSteps(a, b)).toEqual([...a, ...b]);
+  });
+
+  it("still collapses an id-less step re-delivered as itself (the same block synced twice)", () => {
+    const steps: WorkStep[] = [tool({ callId: "", label: "Bash(ls)", status: "ok", summary: "out" })];
+    expect(mergeWorkSteps(steps, [...steps])).toEqual(steps);
+  });
+
+  it("distinguishes id-less steps that share a label but differ in outcome", () => {
+    const a: WorkStep[] = [tool({ callId: "", label: "Fetch(x)", status: "error", summary: "404" })];
+    const b: WorkStep[] = [tool({ callId: "", label: "Fetch(x)", status: "ok", summary: "body" })];
+    expect(mergeWorkSteps(a, b)).toHaveLength(2);
+  });
+
+  // The residual loss, stated: two id-less calls identical in label, status AND
+  // summary are indistinguishable here and still collapse. Far smaller than
+  // collapsing all of them; the real fix is a `call_id` on ChatWorkStep.
+  it("collapses two id-less steps identical in label, status and summary", () => {
+    const step = tool({ callId: "", label: "Bash(ls)", status: "ok", summary: "out" });
+    expect(mergeWorkSteps([step], [{ ...step }])).toHaveLength(1);
+  });
 });
 
 describe("freezeActiveWork", () => {
