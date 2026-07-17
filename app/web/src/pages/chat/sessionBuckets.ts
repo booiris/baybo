@@ -17,6 +17,32 @@ export function cronCollapseKey(jobId: string): string {
   return `${CRON_COLLAPSE_PREFIX}${jobId}`;
 }
 
+/**
+ * Does this key belong to a group that is collapsed until told otherwise?
+ *
+ * Cron groups are: a half-hourly job opens 48 conversations a day, and expanded
+ * by default it buries every real chat under its own fires. Folders are the
+ * opposite — the user made one, so it opens showing what is in it.
+ *
+ * The stored set therefore records the **deviation** from a kind's default, not
+ * an absolute state: membership means collapsed for a folder and expanded for a
+ * cron group. Everything that reads or writes it must go through this predicate,
+ * or the two meanings drift.
+ */
+export function collapsedByDefault(key: string): boolean {
+  return key.startsWith(CRON_COLLAPSE_PREFIX);
+}
+
+/** Resolve a group's actual state from the stored deviation set.
+ *
+ *  Named to avoid `isCollapsed` on purpose: that is exactly what a caller names
+ *  its local boolean, and a shadowed import that is missed by a rename reads as
+ *  a function — truthy, type-checking, and rendering nothing. This repo has no
+ *  eslint and no component render tests, so the compiler is the only guard. */
+export function resolveCollapsed(deviations: ReadonlySet<string>, key: string): boolean {
+  return deviations.has(key) !== collapsedByDefault(key);
+}
+
 /** A cron group: every visible fire of one recurring cron job, collapsed into
  *  a single labelled block. It is **derived**, never stored — not a folder, not
  *  a `session_folders` row, no id of its own beyond the job's. See

@@ -821,6 +821,99 @@
         }
       }
     },
+    "/v1/chat/search": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "search_messages",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "What the user typed, verbatim. FTS5 syntax is NOT accepted: the store\nquotes the whole thing into a literal phrase, so `-`, `*`, `NEAR` and\nfriends match themselves rather than meaning anything.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session_id",
+            "in": "query",
+            "description": "Restrict to one conversation — \"find it in *this* chat\". Omit to search\nacross all of them. Composes with the other filters rather than\noverriding them: naming a hidden session still needs `include_hidden`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "include_hidden",
+            "in": "query",
+            "description": "Include sessions the user hid from their chat list. Defaults to false —\non real data roughly half of a chat search's hits sit in hidden\nsessions, and resurfacing them is the opposite of what hiding meant.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "include_archived",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum **conversations** to return, not messages. Defaults to\n[`DEFAULT_SEARCH_LIMIT`], clamped to [`MAX_SEARCH_LIMIT`].",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Matching messages, best first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSearchResults"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Search failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions": {
       "get": {
         "tags": [
@@ -4168,6 +4261,95 @@
             ],
             "format": "int64",
             "description": "Ordinal of the newest persisted row carrying the key, when found."
+          }
+        }
+      },
+      "ChatSearchGroup": {
+        "type": "object",
+        "description": "One conversation's matches, collapsed into a single result.",
+        "required": [
+          "session_id",
+          "hits",
+          "total_hits"
+        ],
+        "properties": {
+          "hits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatSearchHit"
+            },
+            "description": "Best-matching excerpts, best first, at most [`MAX_HITS_PER_SESSION`]."
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "session_title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Conversation title, when one has been generated."
+          },
+          "total_hits": {
+            "type": "integer",
+            "description": "Matches this conversation has in total — `hits.len()` when it is at or\nunder the per-conversation cap, more when it is over, so a client can say\n\"and 12 more\" without another call. Exact unless `truncated`.",
+            "minimum": 0
+          }
+        }
+      },
+      "ChatSearchHit": {
+        "type": "object",
+        "description": "One matching message inside a [`ChatSearchGroup`].",
+        "required": [
+          "ordinal",
+          "role",
+          "text",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ordinal": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Position in the session's transcript. Carried so a future jump-to-message\nhas an address; today's UI opens the session and does not use it."
+          },
+          "role": {
+            "type": "string"
+          },
+          "superseded_by": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Set when compaction replaced this row in the active transcript, to the\nordinal that replaced it. The chat view renders only live rows, so such a\nhit exists in history but not on screen: clients label it, and a\njump-to-message navigates here rather than to `ordinal`, which is not on\nscreen to navigate to. Carried as the ordinal rather than a bool so that\nremains possible without another round trip."
+          },
+          "text": {
+            "type": "string",
+            "description": "The ORIGINAL prose, not the segmented index text. Clients highlight by\nsubstring: a phrase of unigrams matches exactly the substring typed, so a\nclient-side match agrees with what the index matched."
+          }
+        }
+      },
+      "ChatSearchResults": {
+        "type": "object",
+        "required": [
+          "groups",
+          "truncated"
+        ],
+        "properties": {
+          "groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatSearchGroup"
+            },
+            "description": "Conversations, best match first. A conversation's rank is its best hit's."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when the query matched more than the scan window, so some\nconversations are missing and `total_hits` undercounts. There is no\ncursor: a search box refines the query, it does not page."
           }
         }
       },

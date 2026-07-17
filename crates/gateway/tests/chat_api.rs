@@ -1396,6 +1396,7 @@ fn build_admin_state(
         cron_scheduler: Arc::clone(&tg.deps.cron_scheduler),
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
+        message_search: tg.deps.stores.message_search.clone(),
         query_api: Arc::new(baybo_query::QueryApi::new(
             tg.deps.session_manager.store(),
             Arc::clone(&tg.deps.job_lifecycle),
@@ -2145,4 +2146,212 @@ async fn a_cron_pin_reaches_across_the_owner_pool_but_not_outside_it() {
         .await
         .expect("router responds");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// The point of the whole feature, over HTTP: a two-character Chinese word is
+/// findable mid-run, which bare `unicode61` cannot do (the entire Han run is one
+/// token, so `MATCH '迁移'` misses `数据库的迁移`). See `docs/search.md`.
+#[tokio::test]
+async fn chat_search_finds_a_chinese_word_inside_a_han_run() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let sid = SessionId::from(cred["session_id"].as_str().expect("session_id").to_owned());
+    for msg in [
+        ChatMessage::user(vec![ContentBlock::Text("数据库的迁移怎么做".into())]),
+        ChatMessage::assistant(vec![ContentBlock::Text("先看 schema 再说".into())]),
+    ] {
+        tg.deps
+            .session_manager
+            .append_session_message(&sid, &msg)
+            .await
+            .expect("append");
+    }
+
+    let res = get(
+        &router,
+        "/v1/chat/search?q=%E8%BF%81%E7%A7%BB",
+        StatusCode::OK,
+    )
+    .await;
+    let groups = res["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["session_id"].as_str(), Some(sid.as_str()));
+    assert_eq!(groups[0]["total_hits"].as_u64(), Some(1));
+    let hit = &groups[0]["hits"][0];
+    assert_eq!(hit["role"].as_str(), Some("user"));
+    assert_eq!(hit["text"].as_str(), Some("数据库的迁移怎么做"));
+    assert_eq!(hit["ordinal"].as_i64(), Some(0));
+    assert_eq!(res["truncated"].as_bool(), Some(false));
+
+    // Latin keeps word semantics, and the store widens it to reach suffixes.
+    let res = get(&router, "/v1/chat/search?q=schema", StatusCode::OK).await;
+    assert_eq!(
+        res["groups"][0]["hits"][0]["role"].as_str(),
+        Some("assistant")
+    );
+
+    // A query with nothing indexable is a user typing, not a 500.
+    let empty = get(&router, "/v1/chat/search?q=---", StatusCode::OK).await;
+    assert!(empty["groups"].as_array().expect("groups").is_empty());
+
+    // FTS5 operators are inert: the store quotes the whole query literally.
+    for hostile in ["q=%22+OR+%22", "q=NEAR%28a+b%29", "q=-x", "q=%28%28%28"] {
+        get(
+            &router,
+            &format!("/v1/chat/search?{hostile}"),
+            StatusCode::OK,
+        )
+        .await;
+    }
+}
+
+/// Grouping is what keeps one chatty conversation from eating the whole result
+/// set. Measured on real data, `codex` matches 47 times across 17 conversations
+/// while a flat top-30 covers only 7 — one conversation takes 15 of the 30
+/// slots. A flat list cannot be fixed client-side: the others were never sent.
+#[tokio::test]
+async fn chat_search_groups_by_conversation_so_one_cannot_crowd_out_the_rest() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    // One conversation says it many times; two others say it once.
+    let mut ids = Vec::new();
+    for n in [12usize, 1, 1] {
+        let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+        let sid = SessionId::from(cred["session_id"].as_str().expect("session_id").to_owned());
+        for i in 0..n {
+            tg.deps
+                .session_manager
+                .append_session_message(
+                    &sid,
+                    &ChatMessage::user(vec![ContentBlock::Text(format!("检索 第{i}条"))]),
+                )
+                .await
+                .expect("append");
+        }
+        ids.push(sid);
+    }
+
+    let res = get(
+        &router,
+        "/v1/chat/search?q=%E6%A3%80%E7%B4%A2",
+        StatusCode::OK,
+    )
+    .await;
+    let groups = res["groups"].as_array().expect("groups");
+    assert_eq!(
+        groups.len(),
+        3,
+        "every conversation must appear, not just the loud one"
+    );
+
+    let loud = groups
+        .iter()
+        .find(|g| g["session_id"].as_str() == Some(ids[0].as_str()))
+        .expect("the loud conversation");
+    assert_eq!(loud["total_hits"].as_u64(), Some(12), "counts every match");
+    assert_eq!(
+        loud["hits"].as_array().unwrap().len(),
+        3,
+        "but carries only the best few excerpts",
+    );
+}
+
+/// "Find it in *this* chat" — and the filter composes with the others.
+#[tokio::test]
+async fn chat_search_scopes_to_one_session() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let mut ids = Vec::new();
+    for text in ["第一个会话的检索", "第二个会话的检索"] {
+        let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+        let sid = SessionId::from(cred["session_id"].as_str().expect("session_id").to_owned());
+        tg.deps
+            .session_manager
+            .append_session_message(
+                &sid,
+                &ChatMessage::user(vec![ContentBlock::Text(text.into())]),
+            )
+            .await
+            .expect("append");
+        ids.push(sid);
+    }
+
+    let q = "/v1/chat/search?q=%E6%A3%80%E7%B4%A2";
+    assert_eq!(
+        get(&router, q, StatusCode::OK).await["groups"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let scoped = get(
+        &router,
+        &format!("{q}&session_id={}", ids[0].as_str()),
+        StatusCode::OK,
+    )
+    .await;
+    let groups = scoped["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["session_id"].as_str(), Some(ids[0].as_str()));
+}
+
+/// `hidden` is the user saying "remove this from my list"; search must honour it
+/// by default, and say so only when explicitly asked.
+#[tokio::test]
+async fn chat_search_respects_the_hidden_flag() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+    tg.deps
+        .session_manager
+        .append_session_message(
+            &SessionId::from(session_id.clone()),
+            &ChatMessage::user(vec![ContentBlock::Text("被隐藏的检索内容".into())]),
+        )
+        .await
+        .expect("append");
+
+    let q = "/v1/chat/search?q=%E6%A3%80%E7%B4%A2";
+    assert_eq!(
+        get(&router, q, StatusCode::OK).await["groups"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let del = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/chat/sessions/{session_id}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(del).await.expect("router responds");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    assert!(
+        get(&router, q, StatusCode::OK).await["groups"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a hidden session must drop out of the default search scope"
+    );
+    assert_eq!(
+        get(&router, &format!("{q}&include_hidden=true"), StatusCode::OK).await["groups"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "include_hidden must still reach it"
+    );
 }

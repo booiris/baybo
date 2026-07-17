@@ -8,6 +8,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { collapsedByDefault } from './sessionBuckets';
 import type { Folder } from './types';
 
 // Chat-list folders. The folder *list* is server state — seeded from
@@ -111,9 +112,16 @@ export function FolderProvider({ children }: { children: ReactNode }) {
   const ensureExpanded = useCallback(
     (ids: string[]) =>
       applyCollapsed((cur) => {
-        if (!ids.some((id) => cur.has(id))) return cur;
+        // The set stores the deviation from each kind's default, so "expanded"
+        // means ABSENT for a folder and PRESENT for a cron group. See
+        // `collapsedByDefault`.
+        const wanted = (id: string) => collapsedByDefault(id);
+        if (ids.every((id) => cur.has(id) === wanted(id))) return cur;
         const next = new Set(cur);
-        for (const id of ids) next.delete(id);
+        for (const id of ids) {
+          if (wanted(id)) next.add(id);
+          else next.delete(id);
+        }
         return next;
       }),
     [applyCollapsed],
